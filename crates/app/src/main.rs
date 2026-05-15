@@ -1,14 +1,17 @@
 //! OxiMux — application entry point.
 //!
-//! Boots GPUI + gpui-component, opens the main window, and mounts
-//! `WorkspaceRoot`. Phase 0 ships only the visual shell — no interactions.
+//! Boots GPUI + gpui-component, registers workspace key bindings, opens the
+//! main window, and mounts `WorkspaceRoot`.
 
+mod actions;
 mod shell;
 mod workspace_root;
 
-use gpui::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
 use tracing_subscriber::EnvFilter;
 use workspace_root::WorkspaceRoot;
+
+use crate::actions::{ClosePane, FocusNextPane, SplitHorizontal, SplitVertical};
 
 fn main() {
     init_tracing();
@@ -17,6 +20,12 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        cx.bind_keys([
+            KeyBinding::new("cmd-d", SplitHorizontal, None),
+            KeyBinding::new("cmd-shift-d", SplitVertical, None),
+            KeyBinding::new("cmd-w", ClosePane, None),
+            KeyBinding::new("cmd-]", FocusNextPane, None),
+        ]);
         cx.activate(true);
 
         let window_size = size(px(1400.0), px(900.0));

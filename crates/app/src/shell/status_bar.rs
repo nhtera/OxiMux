@@ -1,12 +1,17 @@
 //! Status bar — 22px fixed-height bottom strip, three zones.
 //!
-//! Layout: `left | center | right` (flex 1 each). Phase 0 ships static labels:
-//! left = brand+version, center = blank, right = STATUS_MUTED "idle".
+//! Layout: `left | center | right` (flex 1 each). Left zone shows brand +
+//! version; right zone shows pane count.
 
 use gpui::{IntoElement, ParentElement, Styled, div, px};
 use oximux_settings::{Density, Theme, Typography};
 
-pub fn view(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
+pub fn view(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    pane_count: usize,
+) -> impl IntoElement {
     let zone = |child| {
         div()
             .flex()
@@ -15,6 +20,12 @@ pub fn view(theme: Theme, density: Density, typography: &Typography) -> impl Int
             .text_size(px(typography.t_body_sm))
             .text_color(theme.fg_muted)
             .child(child)
+    };
+
+    let pane_label = if pane_count == 1 {
+        "1 pane".to_string()
+    } else {
+        format!("{pane_count} panes")
     };
 
     div()
@@ -37,6 +48,6 @@ pub fn view(theme: Theme, density: Density, typography: &Typography) -> impl Int
                 .items_center()
                 .text_size(px(typography.t_body_sm))
                 .text_color(theme.status_muted)
-                .child("idle"),
+                .child(pane_label),
         )
 }

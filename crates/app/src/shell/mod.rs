@@ -5,6 +5,7 @@
 
 pub mod key_input;
 pub mod main_area;
+pub mod main_pane;
 pub mod sidebar;
 pub mod status_bar;
 pub mod terminal_palette;

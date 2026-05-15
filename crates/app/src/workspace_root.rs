@@ -5,15 +5,15 @@
 //! ```text
 //! ┌─────────────────────────────────────────────┐  ← TopBar (36px)
 //! ├──────────┬──────────────────────────────────┤
-//! │ Sidebar  │            MainArea              │  ← HSplit
-//! │ (240px)  │  (Phase 1: hosts TerminalView)   │
+//! │ Sidebar  │            MainPane              │  ← HSplit
+//! │ (240px)  │      (Phase 1: pane grid)        │
 //! ├──────────┴──────────────────────────────────┤  ← StatusBar (22px)
 //! └─────────────────────────────────────────────┘
 //! ```
 //!
-//! Phase 1 step 4 mounts a single `TerminalView` entity into the main area.
-//! If PTY spawn fails (uncommon — would be EPERM / missing $SHELL), the
-//! original placeholder hint renders so the shell still composes.
+//! Phase 1 step 5 swaps in `MainPane`, which owns a tree of terminal panes.
+//! The initial PTY spawn happens here (fallible); on failure we render the
+//! placeholder so the shell still composes cleanly.
 
 use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div, px,
@@ -22,7 +22,9 @@ use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::{
-    main_area, sidebar, status_bar,
+    main_area,
+    main_pane::MainPane,
+    sidebar, status_bar,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView},
     top_bar,
 };
@@ -31,7 +33,7 @@ pub struct WorkspaceRoot {
     theme: Theme,
     density: Density,
     typography: Typography,
-    terminal: Option<Entity<TerminalView>>,
+    main_pane: Option<Entity<MainPane>>,
 }
 
 impl WorkspaceRoot {
@@ -40,24 +42,24 @@ impl WorkspaceRoot {
         let density = Density::cockpit();
         let typography = Typography::cockpit();
 
-        let terminal = spawn_default_terminal(theme, density, typography.clone(), window, cx);
+        let main_pane = spawn_initial_pane(theme, density, typography.clone(), window, cx);
 
         Self {
             theme,
             density,
             typography,
-            terminal,
+            main_pane,
         }
     }
 }
 
-fn spawn_default_terminal(
+fn spawn_initial_pane(
     theme: Theme,
     density: Density,
     typography: Typography,
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
-) -> Option<Entity<TerminalView>> {
+) -> Option<Entity<MainPane>> {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
         cols: DEFAULT_COLS,
@@ -71,24 +73,38 @@ fn spawn_default_terminal(
             return None;
         }
     };
-    Some(
-        cx.new(|cx| {
-            TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
-        }),
-    )
+    let typography_for_view = typography.clone();
+    let initial_view = cx.new(|cx| {
+        TerminalView::mount(
+            backend,
+            session_id,
+            theme,
+            density,
+            typography_for_view,
+            window,
+            cx,
+        )
+    });
+    Some(cx.new(|cx| MainPane::new(initial_view, theme, density, typography, cx)))
 }
 
 impl Render for WorkspaceRoot {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
 
         let main = div().flex().flex_1().h_full().min_w(px(0.));
-        let main = match self.terminal.clone() {
+        let main = match self.main_pane.clone() {
             Some(view) => main.child(view),
             None => main.child(main_area::view(theme, density, typography)),
         };
+
+        let pane_count = self
+            .main_pane
+            .as_ref()
+            .map(|mp| mp.read(cx).leaf_count())
+            .unwrap_or(0);
 
         div()
             .flex()
@@ -106,6 +122,6 @@ impl Render for WorkspaceRoot {
                     .child(sidebar::view(theme, density, typography))
                     .child(main),
             )
-            .child(status_bar::view(theme, density, typography))
+            .child(status_bar::view(theme, density, typography, pane_count))
     }
 }

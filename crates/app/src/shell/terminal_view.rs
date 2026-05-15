@@ -1,4 +1,4 @@
-//! TerminalView — single-pane PTY render (Phase 1 step 4 + polish).
+//! TerminalView — single-pane PTY render (Phase 1 step 4 + polish + step 5).
 //!
 //! Owns a `PortablePtyBackend` and one session. A background polling task
 //! ticks every `POLL_INTERVAL_MS`, drains the event queue, copies the latest
@@ -6,16 +6,16 @@
 //! `snapshot.cells`, groups consecutive same-styled cells into runs, and
 //! emits one styled `div` per run inside one row `div` per line.
 //!
-//! Polish slice adds three things on top of step 4's read-only baseline:
-//! color (each run carries fg + bg resolved against the charcoal theme),
-//! cursor (the cell under `snapshot.cursor` is forced to `inverse` so the
-//! block cursor renders without any extra layout work), and resize (at
-//! render time the view measures the available area from
-//! `window.viewport_size()` minus the fixed chrome — sidebar + top +
-//! status + paddings — computes a target `(cols, rows)` against hardcoded
-//! cell metrics, and calls `backend.resize()` when the target changes).
-//! Cell metrics are calibrated for Geist Mono 14 px; replace with
-//! `text_system().line_height()` measurement during the step 9 perf pass.
+//! Polish slice added color (per-run fg+bg against the charcoal theme),
+//! cursor (cell under `snapshot.cursor` forced to `inverse` so the block
+//! cursor renders for free), and resize.
+//!
+//! Step 5 moves resize math out of this module. The view no longer measures
+//! the window itself — the parent (`MainPane`) computes each leaf's slice
+//! of the visible area, divides by cell metrics, and calls
+//! `set_target_grid(cols, rows)`. The view stages that target and applies
+//! it on the next `maybe_resize` tick. This lets one window host an
+//! arbitrary tree of splits without each leaf double-counting chrome.
 
 use std::time::Duration;
 
@@ -35,24 +35,10 @@ use crate::shell::terminal_palette::{ColorRole, resolve};
 /// idle.
 const POLL_INTERVAL_MS: u64 = 16;
 
-/// Default grid size on spawn. Window-driven resize takes over on the first
+/// Default grid size on spawn. Parent-driven resize takes over on the first
 /// render.
 pub const DEFAULT_COLS: u16 = 100;
 pub const DEFAULT_ROWS: u16 = 32;
-
-/// Hardcoded cell metrics for Geist Mono 14 px. Measured manually; replace
-/// with `text_system().line_height()` + advance lookup during the step 9
-/// perf/measurement pass.
-const CELL_WIDTH_PX: f32 = 8.4;
-const CELL_HEIGHT_PX: f32 = 18.0;
-
-/// Chrome subtracted from viewport when computing the terminal area. Stays
-/// in sync with `WorkspaceRoot` composition + density tokens.
-const CHROME_W_PX: f32 = 240.0; // sidebar
-const CHROME_H_PX: f32 = 36.0 + 22.0; // top bar + status bar
-
-const MIN_COLS: u16 = 20;
-const MIN_ROWS: u16 = 4;
 
 pub struct TerminalView {
     backend: PortablePtyBackend,
@@ -62,6 +48,7 @@ pub struct TerminalView {
     density: Density,
     typography: Typography,
     focus_handle: FocusHandle,
+    target_grid: (u16, u16),
     last_resize: (u16, u16),
     _poll_task: Task<()>,
 }
@@ -113,9 +100,17 @@ impl TerminalView {
             density,
             typography,
             focus_handle,
+            target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             _poll_task: poll_task,
         }
+    }
+
+    /// Stage a new target grid for the next resize tick. Called by the
+    /// parent layout (`MainPane`) per render with the leaf's slice of the
+    /// visible area, already divided by cell metrics.
+    pub fn set_target_grid(&mut self, cols: u16, rows: u16) {
+        self.target_grid = (cols, rows);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -141,30 +136,18 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Compute (cols, rows) from the window viewport. Subtracts known chrome
-    /// and panel padding, divides by hardcoded cell metrics, then clamps to
-    /// a minimum so the PTY never sees `cols=0` when the window is dragged
-    /// to a degenerate size.
-    fn target_grid(&self, window: &Window) -> (u16, u16) {
-        let viewport = window.viewport_size();
-        let pad = self.density.pad_panel * 2.0;
-        let available_w = (f32::from(viewport.width) - CHROME_W_PX - pad).max(CELL_WIDTH_PX);
-        let available_h = (f32::from(viewport.height) - CHROME_H_PX - pad).max(CELL_HEIGHT_PX);
-        let cols = (available_w / CELL_WIDTH_PX).floor() as u16;
-        let rows = (available_h / CELL_HEIGHT_PX).floor() as u16;
-        (cols.max(MIN_COLS), rows.max(MIN_ROWS))
-    }
-
-    fn maybe_resize(&mut self, window: &Window) {
-        let target = self.target_grid(window);
-        if target == self.last_resize {
+    fn maybe_resize(&mut self) {
+        if self.target_grid == self.last_resize {
             return;
         }
-        if let Err(err) = self.backend.resize(self.session_id, target.0, target.1) {
+        if let Err(err) =
+            self.backend
+                .resize(self.session_id, self.target_grid.0, self.target_grid.1)
+        {
             tracing::warn!(?err, "pty resize failed");
             return;
         }
-        self.last_resize = target;
+        self.last_resize = self.target_grid;
     }
 }
 
@@ -175,8 +158,8 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.maybe_resize(window);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.maybe_resize();
 
         let cursor = (
             self.snapshot.cursor.0 as usize,
