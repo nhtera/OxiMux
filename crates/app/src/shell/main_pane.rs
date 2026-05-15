@@ -301,14 +301,31 @@ fn build_node(
 ) -> gpui::Div {
     match node {
         PaneTree::Leaf(id) => {
-            let mut leaf = div().flex().flex_1().min_w(px(0.)).min_h(px(0.));
+            // `overflow_hidden` is load-bearing: each `TerminalView` paints
+            // rows with `whitespace_nowrap`, so if the alacritty grid still
+            // holds content from before a resize (or the TUI hasn't repainted
+            // on SIGWINCH), cells will overflow the leaf's flex slice and
+            // bleed over the next pane + its separator. Clipping here keeps
+            // every pane confined to its assigned slot regardless of grid
+            // state.
+            let mut leaf = div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .overflow_hidden();
             if let Some(view) = panes.get(id) {
                 leaf = leaf.child(view.clone());
             }
             leaf
         }
         PaneTree::Split { axis, children } => {
-            let mut row = div().flex().flex_1().min_w(px(0.)).min_h(px(0.));
+            let mut row = div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .overflow_hidden();
             row = match axis {
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
