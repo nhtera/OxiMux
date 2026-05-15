@@ -1,29 +1,33 @@
-//! MainPane — workspace grid of terminal panes (Phase 1 step 5).
+//! MainPane — workspace grid of terminal panes (Phase 1 step 5 + step 7).
 //!
-//! Owns a `panes: HashMap<PaneId, Entity<TerminalView>>` entity store paired
-//! with a pure-data [`crate::shell::pane_tree::PaneTree`] that describes the
-//! split layout. Render walks the tree top-down, looks up each leaf's
-//! entity in the HashMap, divides the available rect along each Split axis,
-//! and stages per-leaf `(cols, rows)` via `TerminalView::set_target_grid`.
+//! Owns a `panes: HashMap<PaneId, Entity<TabbedPane>>` entity store paired
+//! with a pure-data [`crate::shell::pane_tree::PaneTree`] describing the split
+//! layout. Render walks the tree top-down, looks up each leaf's TabbedPane in
+//! the HashMap, divides the available rect along each Split axis, and stages
+//! per-leaf `(cols, rows)` via `TabbedPane::set_target_grid` (which fans the
+//! grid to every tab inside).
 //!
 //! Action handlers (`SplitHorizontal`, `SplitVertical`, `ClosePane`,
-//! `FocusNextPane`) are wired on the root render `div`. GPUI dispatches
-//! actions up the element tree from the focused leaf, so ordinary
-//! keystrokes still reach the focused `TerminalView` while `Cmd-*` combos
-//! bubble up here.
+//! `FocusNextPane`, `NewTab`, `CloseTab`, `NextTab`, `PrevTab`) are wired on
+//! the root render `div`. GPUI dispatches actions up the element tree from
+//! the focused leaf, so ordinary keystrokes still reach the focused
+//! `TerminalView` while `Cmd-*` combos bubble up here.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Subscription, Window, div, px,
+    ParentElement, Render, Styled, Subscription, Window, div, hsla, px,
 };
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{ClosePane, FocusNextPane, SplitHorizontal, SplitVertical};
+use crate::actions::{
+    CloseTab, FocusNextPane, NewTab, NextTab, PrevTab, SplitHorizontal, SplitVertical,
+};
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
+use crate::shell::tabbed_pane::{TAB_STRIP_HEIGHT_PX, TabbedPane};
 use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView};
 
 /// Hardcoded cell metrics for Geist Mono 14 px. Replace with
@@ -40,28 +44,32 @@ const CHROME_H_PX: f32 = 36.0 + 22.0; // top bar + status bar
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
 
+/// Translucent veil drawn over unfocused leaves. Mid-charcoal at ~22% alpha
+/// reads as "dim, but the text under it is still legible" — close to iTerm2's
+/// inactive-pane treatment without going full grey-out.
+const DIM_ALPHA: f32 = 0.22;
+
 pub struct MainPane {
     tree: PaneTree,
-    panes: HashMap<PaneId, Entity<TerminalView>>,
+    panes: HashMap<PaneId, Entity<TabbedPane>>,
     focused: PaneId,
     next_id: AtomicU64,
     theme: Theme,
     density: Density,
     typography: Typography,
     focus_handle: FocusHandle,
-    /// One observer per TerminalView. When a view notifies (e.g. on click,
-    /// keystroke, PTY output) we re-notify MainPane so its render runs and
-    /// `sync_focused_from_window` repaints the active-pane ring. Stored to
-    /// keep subscriptions alive; never read otherwise.
-    _view_observers: HashMap<PaneId, Subscription>,
+    /// One observer per TabbedPane. When a pane notifies (click, keystroke,
+    /// PTY output via its tab's bubbled notify, tab swap) we re-notify
+    /// MainPane so render runs and `sync_focused_from_window` repaints the
+    /// active-pane ring + dim overlays. Stored to keep subscriptions alive.
+    _pane_observers: HashMap<PaneId, Subscription>,
 }
 
 impl MainPane {
-    /// Build a `MainPane` around a pre-spawned initial terminal view. The
-    /// PTY spawn is fallible and stays at the caller so this builder is
-    /// infallible.
+    /// Build a `MainPane` around a pre-spawned initial TabbedPane. PTY spawn
+    /// + TabbedPane wrap happen at the caller so this builder is infallible.
     pub fn new(
-        initial_view: Entity<TerminalView>,
+        initial_pane: Entity<TabbedPane>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -69,11 +77,11 @@ impl MainPane {
     ) -> Self {
         let id = PaneId(0);
         let next_id = AtomicU64::new(1);
-        let sub = cx.observe(&initial_view, |_, _, cx| cx.notify());
+        let sub = cx.observe(&initial_pane, |_, _, cx| cx.notify());
         let mut panes = HashMap::new();
-        panes.insert(id, initial_view);
-        let mut view_observers = HashMap::new();
-        view_observers.insert(id, sub);
+        panes.insert(id, initial_pane);
+        let mut pane_observers = HashMap::new();
+        pane_observers.insert(id, sub);
         let focus_handle = cx.focus_handle();
         Self {
             tree: PaneTree::Leaf(id),
@@ -84,7 +92,7 @@ impl MainPane {
             density,
             typography,
             focus_handle,
-            _view_observers: view_observers,
+            _pane_observers: pane_observers,
         }
     }
 
@@ -97,17 +105,18 @@ impl MainPane {
     }
 
     /// Sync `self.focused` from the window's currently focused element.
-    /// Click-to-focus already moves the platform focus into a `TerminalView`
-    /// (handled inside that view), but `MainPane.focused` only changes when
-    /// we ourselves issue a focus call. Without this sync the user could
-    /// click pane A, press Cmd-D, and end up splitting pane B (whichever
-    /// was last action-focused). Called at the top of every action handler.
+    /// Click-to-focus moves platform focus into a `TerminalView` (handled
+    /// inside that view), but `MainPane.focused` only changes when we
+    /// ourselves issue a focus call. Without this sync the user could click
+    /// pane A, press Cmd-D, and end up splitting pane B (whichever was last
+    /// action-focused). Called at the top of every action handler and at
+    /// the top of render so dim/ring repaint immediately on click.
     fn sync_focused_from_window(&mut self, window: &Window, cx: &App) {
         let Some(active) = window.focused(cx) else {
             return;
         };
-        for (id, view) in &self.panes {
-            if view.read(cx).focus_handle(cx) == active {
+        for (id, pane) in &self.panes {
+            if pane.read(cx).contains_focus(&active, cx) {
                 self.focused = *id;
                 return;
             }
@@ -124,14 +133,15 @@ impl MainPane {
         ) else {
             return;
         };
+        let new_pane = cx.new(|cx| TabbedPane::new(view, cx));
         let new_id = self.alloc_id();
         if !self.tree.split_leaf(self.focused, axis, new_id) {
-            tracing::warn!("split target not in tree; dropping new view");
+            tracing::warn!("split target not in tree; dropping new pane");
             return;
         }
-        let sub = cx.observe(&view, |_, _, cx| cx.notify());
-        self._view_observers.insert(new_id, sub);
-        self.panes.insert(new_id, view);
+        let sub = cx.observe(&new_pane, |_, _, cx| cx.notify());
+        self._pane_observers.insert(new_id, sub);
+        self.panes.insert(new_id, new_pane);
         self.focused = new_id;
         focus_pane(&self.panes, new_id, window, cx);
         cx.notify();
@@ -157,8 +167,9 @@ impl MainPane {
         self.split_focused(Axis::Vertical, window, cx);
     }
 
-    fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_focused_from_window(window, cx);
+    /// Remove the currently focused pane and re-home focus on its in-order
+    /// neighbor. Reached via `CloseTab`'s last-tab cascade.
+    fn close_focused_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tree.leaf_count() <= 1 {
             return;
         }
@@ -171,7 +182,7 @@ impl MainPane {
             return;
         }
         self.panes.remove(&closing_id);
-        self._view_observers.remove(&closing_id);
+        self._pane_observers.remove(&closing_id);
         let leaves_after = self.tree.in_order_leaves();
         if leaves_after.is_empty() {
             return;
@@ -202,6 +213,47 @@ impl MainPane {
         cx.notify();
     }
 
+    fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        let Some(view) = spawn_terminal_view(
+            self.theme,
+            self.density,
+            self.typography.clone(),
+            window,
+            cx,
+        ) else {
+            return;
+        };
+        if let Some(pane) = self.panes.get(&self.focused).cloned() {
+            pane.update(cx, |tp, cx| tp.open_tab(view, window, cx));
+        }
+    }
+
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        let Some(pane) = self.panes.get(&self.focused).cloned() else {
+            return;
+        };
+        let pane_should_close = pane.update(cx, |tp, cx| tp.close_active(window, cx));
+        if pane_should_close {
+            self.close_focused_pane(window, cx);
+        }
+    }
+
+    fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        if let Some(pane) = self.panes.get(&self.focused).cloned() {
+            pane.update(cx, |tp, cx| tp.next_tab(window, cx));
+        }
+    }
+
+    fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        if let Some(pane) = self.panes.get(&self.focused).cloned() {
+            pane.update(cx, |tp, cx| tp.prev_tab(window, cx));
+        }
+    }
+
     fn dispatch_grids(&self, window: &Window, cx: &mut Context<Self>) {
         let (w, h) = available_area(window, self.density.pad_panel);
         dispatch_grids_inner(&self.tree, &self.panes, w, h, cx);
@@ -209,13 +261,13 @@ impl MainPane {
 }
 
 fn focus_pane(
-    panes: &HashMap<PaneId, Entity<TerminalView>>,
+    panes: &HashMap<PaneId, Entity<TabbedPane>>,
     id: PaneId,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if let Some(view) = panes.get(&id) {
-        let handle = view.read(cx).focus_handle(cx);
+    if let Some(pane) = panes.get(&id) {
+        let handle = pane.read(cx).active_focus_handle(cx);
         handle.focus(window, cx);
     }
 }
@@ -229,17 +281,25 @@ fn available_area(window: &Window, pad_panel: f32) -> (f32, f32) {
 
 fn dispatch_grids_inner(
     node: &PaneTree,
-    panes: &HashMap<PaneId, Entity<TerminalView>>,
+    panes: &HashMap<PaneId, Entity<TabbedPane>>,
     w: f32,
     h: f32,
     cx: &mut Context<MainPane>,
 ) {
     match node {
         PaneTree::Leaf(id) => {
+            // Subtract the tab strip's height when this pane has multiple
+            // tabs so the terminal rect matches what render actually shows.
+            let strip_h = panes
+                .get(id)
+                .filter(|p| p.read(cx).tab_count() > 1)
+                .map(|_| TAB_STRIP_HEIGHT_PX)
+                .unwrap_or(0.0);
+            let usable_h = (h - strip_h).max(CELL_HEIGHT_PX);
             let cols = ((w / CELL_WIDTH_PX).floor() as u16).max(MIN_COLS);
-            let rows = ((h / CELL_HEIGHT_PX).floor() as u16).max(MIN_ROWS);
-            if let Some(view) = panes.get(id) {
-                view.update(cx, |view, _| view.set_target_grid(cols, rows));
+            let rows = ((usable_h / CELL_HEIGHT_PX).floor() as u16).max(MIN_ROWS);
+            if let Some(pane) = panes.get(id) {
+                pane.update(cx, |tp, cx| tp.set_target_grid(cols, rows, cx));
             }
         }
         PaneTree::Split { axis, children } if !children.is_empty() => {
@@ -292,10 +352,9 @@ impl Focusable for MainPane {
 impl Render for MainPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Re-sync from window focus on every render so click-to-focus moves
-        // the active-pane ring without waiting for the next action.
-        // `MainPane` re-renders here because each `TerminalView` notifies
-        // (mouse-down, keystroke, PTY output) and our `_view_observers`
-        // forward those notifies back to us.
+        // the active-pane ring + dim overlay without waiting for the next
+        // action. Each TabbedPane notifies on click + tab swap; our
+        // `_pane_observers` forward those notifies back here.
         self.sync_focused_from_window(window, cx);
         self.dispatch_grids(window, cx);
         let focus_handle = self.focus_handle.clone();
@@ -306,8 +365,11 @@ impl Render for MainPane {
             .size_full()
             .on_action(cx.listener(Self::on_split_horizontal))
             .on_action(cx.listener(Self::on_split_vertical))
-            .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_next_pane))
+            .on_action(cx.listener(Self::on_new_tab))
+            .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_next_tab))
+            .on_action(cx.listener(Self::on_prev_tab))
             .child(build_node(
                 &self.tree,
                 &self.panes,
@@ -319,7 +381,7 @@ impl Render for MainPane {
 
 fn build_node(
     node: &PaneTree,
-    panes: &HashMap<PaneId, Entity<TerminalView>>,
+    panes: &HashMap<PaneId, Entity<TabbedPane>>,
     theme: &Theme,
     focused: PaneId,
 ) -> gpui::Div {
@@ -327,19 +389,38 @@ fn build_node(
         PaneTree::Leaf(id) => {
             // `overflow_hidden` is load-bearing: each `TerminalView` paints
             // rows with `whitespace_nowrap`, so if the alacritty grid still
-            // holds content from before a resize (or the TUI hasn't repainted
-            // on SIGWINCH), cells will overflow the leaf's flex slice and
-            // bleed over the next pane + its separator. Clipping here keeps
-            // every pane confined to its assigned slot regardless of grid
-            // state.
+            // holds content from before a resize (or the TUI hasn't
+            // repainted on SIGWINCH), cells will overflow the leaf's flex
+            // slice and bleed over the next pane + its separator. Clipping
+            // here keeps every pane confined to its assigned slot.
+            //
+            // `relative` is load-bearing too: the unfocused dim veil below
+            // uses `absolute().inset_0()` to cover the leaf without
+            // affecting layout, and absolute positions resolve against the
+            // nearest positioned ancestor.
             let mut leaf = div()
+                .relative()
                 .flex()
                 .flex_1()
                 .min_w(px(0.))
                 .min_h(px(0.))
                 .overflow_hidden();
-            if let Some(view) = panes.get(id) {
-                leaf = leaf.child(view.clone());
+            if let Some(pane) = panes.get(id) {
+                leaf = leaf.child(pane.clone());
+            }
+            // Dim overlay for unfocused leaves. Plain non-interactive div —
+            // no `.occlude()`, no `.id()`, no listeners — so mouse-downs
+            // pass through to the TerminalView beneath and click-to-focus
+            // works on the first click. DO NOT add `.occlude()`, an `.id()`,
+            // or any event handler here without re-routing pointer events,
+            // or click-to-activate on unfocused panes will silently break.
+            if *id != focused {
+                leaf = leaf.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(hsla(0.0, 0.0, 0.0, DIM_ALPHA)),
+                );
             }
             leaf
         }

@@ -25,6 +25,7 @@ use crate::shell::{
     main_area,
     main_pane::MainPane,
     sidebar, status_bar,
+    tabbed_pane::TabbedPane,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView},
     top_bar,
 };
@@ -85,7 +86,8 @@ fn spawn_initial_pane(
             cx,
         )
     });
-    Some(cx.new(|cx| MainPane::new(initial_view, theme, density, typography, cx)))
+    let initial_pane = cx.new(|cx| TabbedPane::new(initial_view, cx));
+    Some(cx.new(|cx| MainPane::new(initial_pane, theme, density, typography, cx)))
 }
 
 impl Render for WorkspaceRoot {

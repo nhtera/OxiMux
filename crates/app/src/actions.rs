@@ -18,9 +18,17 @@ actions!(
         SplitHorizontal,
         /// Split the focused pane vertically — new pane on the bottom.
         SplitVertical,
-        /// Close the focused pane. No-op when only one pane remains.
-        ClosePane,
         /// Cycle focus to the next pane in in-order traversal.
         FocusNextPane,
+        /// Open a new terminal tab inside the focused pane.
+        NewTab,
+        /// Close the active tab in the focused pane. Cascades to `ClosePane`
+        /// when it was the last tab so cmd-w does the right thing in both
+        /// the multi-tab and single-tab case.
+        CloseTab,
+        /// Cycle to the next tab inside the focused pane.
+        NextTab,
+        /// Cycle to the previous tab inside the focused pane.
+        PrevTab,
     ]
 );

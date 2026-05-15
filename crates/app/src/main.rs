@@ -11,7 +11,9 @@ use gpui::{AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size
 use tracing_subscriber::EnvFilter;
 use workspace_root::WorkspaceRoot;
 
-use crate::actions::{ClosePane, FocusNextPane, SplitHorizontal, SplitVertical};
+use crate::actions::{
+    CloseTab, FocusNextPane, NewTab, NextTab, PrevTab, SplitHorizontal, SplitVertical,
+};
 
 fn main() {
     init_tracing();
@@ -23,8 +25,13 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-d", SplitHorizontal, None),
             KeyBinding::new("cmd-shift-d", SplitVertical, None),
-            KeyBinding::new("cmd-w", ClosePane, None),
+            // cmd-w closes the active tab. If it was the last tab in the pane,
+            // the handler cascades into the existing ClosePane logic.
+            KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("cmd-]", FocusNextPane, None),
+            KeyBinding::new("cmd-t", NewTab, None),
+            KeyBinding::new("cmd-shift-]", NextTab, None),
+            KeyBinding::new("cmd-shift-[", PrevTab, None),
         ]);
         cx.activate(true);
 
