@@ -346,7 +346,11 @@ fn build_node(
 }
 
 fn separator(parent_axis: Axis, theme: &Theme) -> gpui::Div {
-    let s = div().bg(theme.border_inactive).flex_shrink_0();
+    // `border_inactive` (#26292E) was too close to `bg_base` (#0E0F11) to be
+    // visible at 1px — bumping to `fg_subtle` (#6B7177) gives a clear thin
+    // line matching the the reference terminal/iTerm pane-divider weight. If this feels too
+    // bright, swap back once we have a dedicated mid-tone token.
+    let s = div().bg(theme.fg_subtle).flex_shrink_0();
     match parent_axis {
         Axis::Horizontal => s.w(px(1.0)).h_full(),
         Axis::Vertical => s.h(px(1.0)).w_full(),
