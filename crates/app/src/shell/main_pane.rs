@@ -290,11 +290,15 @@ impl Render for MainPane {
             .on_action(cx.listener(Self::on_split_vertical))
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_next_pane))
-            .child(build_node(&self.tree, &self.panes))
+            .child(build_node(&self.tree, &self.panes, &self.theme))
     }
 }
 
-fn build_node(node: &PaneTree, panes: &HashMap<PaneId, Entity<TerminalView>>) -> gpui::Div {
+fn build_node(
+    node: &PaneTree,
+    panes: &HashMap<PaneId, Entity<TerminalView>>,
+    theme: &Theme,
+) -> gpui::Div {
     match node {
         PaneTree::Leaf(id) => {
             let mut leaf = div().flex().flex_1().min_w(px(0.)).min_h(px(0.));
@@ -309,10 +313,25 @@ fn build_node(node: &PaneTree, panes: &HashMap<PaneId, Entity<TerminalView>>) ->
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
             };
-            for c in children {
-                row = row.child(build_node(c, panes));
+            // Insert a 1px separator div between adjacent children. Makes
+            // pane boundaries visible regardless of width — matches the
+            // the reference terminal / iTerm convention where each split shows a thin
+            // divider in `border_inactive`.
+            for (i, c) in children.iter().enumerate() {
+                if i > 0 {
+                    row = row.child(separator(*axis, theme));
+                }
+                row = row.child(build_node(c, panes, theme));
             }
             row
         }
+    }
+}
+
+fn separator(parent_axis: Axis, theme: &Theme) -> gpui::Div {
+    let s = div().bg(theme.border_inactive).flex_shrink_0();
+    match parent_axis {
+        Axis::Horizontal => s.w(px(1.0)).h_full(),
+        Axis::Vertical => s.h(px(1.0)).w_full(),
     }
 }

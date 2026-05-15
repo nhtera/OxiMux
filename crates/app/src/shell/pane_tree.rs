@@ -2,10 +2,11 @@
 //! grid. No GPUI types here; `MainPane` keeps the entity store in a parallel
 //! `HashMap<PaneId, Entity<TerminalView>>` and looks up by id during render.
 //!
-//! Same-axis splits stay flat: splitting a leaf whose parent already runs on
-//! the new split axis inserts the new leaf as a sibling instead of nesting a
-//! fresh Split. Five Cmd-D's become five equal columns (matches tmux)
-//! rather than a geometric-decay binary cascade. Mixed-axis splits still nest.
+//! Binary splits: every `split_leaf` wraps the target in a fresh `Split`
+//! node, halving the target's slice between old and new. Matches the default
+//! split semantics in the reference terminal / iTerm. Rebalancing or equal-N-way splits are
+//! a separate concern (an explicit "balance" action could flatten + equalize
+//! a same-axis cascade if/when the UX demands it).
 
 /// Stable identifier for a pane leaf in the workspace tree. Issued
 /// monotonically by `MainPane`; never reused after a pane closes.
@@ -76,30 +77,16 @@ impl PaneTree {
         }
     }
 
-    /// Insert a new leaf next to `target`. When `target`'s parent is already a
-    /// `Split` on the same `axis`, the new leaf is inserted as a sibling
-    /// (N-way splits stay flat). Different-axis splits still wrap the leaf
-    /// in a fresh `Split`. Returns true on success.
+    /// Wrap the leaf matching `target` in a `Split { axis, [old, new] }` —
+    /// each Cmd-D halves the focused pane's slice between old and new.
+    /// Matches the reference terminal / iTerm binary-split semantics. Returns true on
+    /// success.
     pub fn split_leaf(&mut self, target: PaneId, axis: Axis, new_id: PaneId) -> bool {
         let Some(path) = self.path_to(target) else {
             return false;
         };
-
-        // Same-axis-as-parent: insert as sibling, no new nesting.
-        if !path.is_empty() {
-            let target_idx = *path.last().unwrap();
-            let parent = descend_mut(self, &path[..path.len() - 1]);
-            let same_axis = matches!(parent, PaneTree::Split { axis: a, .. } if *a == axis);
-            if same_axis {
-                if let PaneTree::Split { children, .. } = parent {
-                    children.insert(target_idx + 1, PaneTree::Leaf(new_id));
-                }
-                return true;
-            }
-        }
-
-        // Different axis (or root leaf): wrap the leaf in a new Split.
         let node = descend_mut(self, &path);
+        // Placeholder: any valid PaneTree works; we overwrite immediately.
         let placeholder = PaneTree::Split {
             axis: Axis::Horizontal,
             children: Vec::new(),
@@ -228,51 +215,32 @@ mod tests {
     }
 
     #[test]
-    fn sequential_same_axis_splits_yield_n_way() {
-        // Five Cmd-D's in a row should produce one flat Split with 5 children,
-        // not a binary cascade. Matches tmux behavior.
-        let mut t = PaneTree::Leaf(id(0));
-        for next in 1..=4 {
-            assert!(t.split_leaf(id(next - 1), Axis::Horizontal, id(next)));
-        }
-        match &t {
-            PaneTree::Split { axis, children } => {
-                assert_eq!(*axis, Axis::Horizontal);
-                assert_eq!(children.len(), 5);
-                for (i, child) in children.iter().enumerate() {
-                    assert_eq!(*child, PaneTree::Leaf(id(i as u64)));
-                }
-            }
-            _ => panic!("expected flat horizontal split"),
-        }
-    }
-
-    #[test]
-    fn mixed_axis_split_still_nests() {
+    fn sequential_splits_cascade_binary() {
+        // Each Cmd-D on the freshly-spawned right pane halves it again.
+        // Three splits → [0 | [1 | [2 | 3]]] with 0=50%, 1=25%, 2=12.5%, 3=12.5%.
         let mut t = PaneTree::Leaf(id(0));
         t.split_leaf(id(0), Axis::Horizontal, id(1));
-        t.split_leaf(id(1), Axis::Vertical, id(2));
-        match &t {
-            PaneTree::Split {
-                axis: Axis::Horizontal,
-                children,
-            } => {
-                assert_eq!(children.len(), 2);
-                assert_eq!(children[0], PaneTree::Leaf(id(0)));
-                match &children[1] {
-                    PaneTree::Split {
-                        axis: Axis::Vertical,
-                        children,
-                    } => {
-                        assert_eq!(
-                            children,
-                            &vec![PaneTree::Leaf(id(1)), PaneTree::Leaf(id(2))]
-                        );
-                    }
-                    _ => panic!("expected nested vertical split"),
-                }
+        t.split_leaf(id(1), Axis::Horizontal, id(2));
+        t.split_leaf(id(2), Axis::Horizontal, id(3));
+        assert_eq!(t.leaf_count(), 4);
+        assert_eq!(t.in_order_leaves(), vec![id(0), id(1), id(2), id(3)]);
+        // Walk: root.children[1].children[1].children == [Leaf(2), Leaf(3)].
+        let lvl1 = match &t {
+            PaneTree::Split { children, .. } => &children[1],
+            _ => panic!("expected root split"),
+        };
+        let lvl2 = match lvl1 {
+            PaneTree::Split { children, .. } => &children[1],
+            _ => panic!("expected nested split"),
+        };
+        match lvl2 {
+            PaneTree::Split { children, .. } => {
+                assert_eq!(
+                    children,
+                    &vec![PaneTree::Leaf(id(2)), PaneTree::Leaf(id(3))]
+                );
             }
-            _ => panic!("expected horizontal split root"),
+            _ => panic!("expected innermost split"),
         }
     }
 
