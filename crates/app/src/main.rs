@@ -22,6 +22,9 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // gpui-component defaults to ThemeMode::Light; flip to Dark so the
+        // TabBar + future component chrome match OxiMux's dark terminal panes.
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         cx.bind_keys([
             KeyBinding::new("cmd-d", SplitHorizontal, None),
             KeyBinding::new("cmd-shift-d", SplitVertical, None),
@@ -30,8 +33,12 @@ fn main() {
             KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("cmd-]", FocusNextPane, None),
             KeyBinding::new("cmd-t", NewTab, None),
-            KeyBinding::new("cmd-shift-]", NextTab, None),
-            KeyBinding::new("cmd-shift-[", PrevTab, None),
+            // macOS strips `shift` from the runtime keystroke and remaps the
+            // key to the shifted character (`]`→`}`, `[`→`{`). Binding strings
+            // must use the post-shift character — `cmd-shift-]` would never
+            // match. Mirrors Zed's own `pane::ActivateNextItem` binding.
+            KeyBinding::new("cmd-}", NextTab, None),
+            KeyBinding::new("cmd-{", PrevTab, None),
         ]);
         cx.activate(true);
 
