@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window, div, px,
+    ParentElement, Render, Styled, Subscription, Window, div, px,
 };
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
@@ -49,6 +49,11 @@ pub struct MainPane {
     density: Density,
     typography: Typography,
     focus_handle: FocusHandle,
+    /// One observer per TerminalView. When a view notifies (e.g. on click,
+    /// keystroke, PTY output) we re-notify MainPane so its render runs and
+    /// `sync_focused_from_window` repaints the active-pane ring. Stored to
+    /// keep subscriptions alive; never read otherwise.
+    _view_observers: HashMap<PaneId, Subscription>,
 }
 
 impl MainPane {
@@ -64,8 +69,11 @@ impl MainPane {
     ) -> Self {
         let id = PaneId(0);
         let next_id = AtomicU64::new(1);
+        let sub = cx.observe(&initial_view, |_, _, cx| cx.notify());
         let mut panes = HashMap::new();
         panes.insert(id, initial_view);
+        let mut view_observers = HashMap::new();
+        view_observers.insert(id, sub);
         let focus_handle = cx.focus_handle();
         Self {
             tree: PaneTree::Leaf(id),
@@ -76,6 +84,7 @@ impl MainPane {
             density,
             typography,
             focus_handle,
+            _view_observers: view_observers,
         }
     }
 
@@ -120,6 +129,8 @@ impl MainPane {
             tracing::warn!("split target not in tree; dropping new view");
             return;
         }
+        let sub = cx.observe(&view, |_, _, cx| cx.notify());
+        self._view_observers.insert(new_id, sub);
         self.panes.insert(new_id, view);
         self.focused = new_id;
         focus_pane(&self.panes, new_id, window, cx);
@@ -160,6 +171,7 @@ impl MainPane {
             return;
         }
         self.panes.remove(&closing_id);
+        self._view_observers.remove(&closing_id);
         let leaves_after = self.tree.in_order_leaves();
         if leaves_after.is_empty() {
             return;
@@ -279,6 +291,12 @@ impl Focusable for MainPane {
 
 impl Render for MainPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Re-sync from window focus on every render so click-to-focus moves
+        // the active-pane ring without waiting for the next action.
+        // `MainPane` re-renders here because each `TerminalView` notifies
+        // (mouse-down, keystroke, PTY output) and our `_view_observers`
+        // forward those notifies back to us.
+        self.sync_focused_from_window(window, cx);
         self.dispatch_grids(window, cx);
         let focus_handle = self.focus_handle.clone();
 

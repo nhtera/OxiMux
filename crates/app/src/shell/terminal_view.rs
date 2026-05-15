@@ -195,6 +195,11 @@ impl Render for TerminalView {
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
+                    // Notify so `MainPane`'s observer can re-sync the focused
+                    // PaneId and repaint the active-pane ring on the next
+                    // frame. Without this, click-to-focus is invisible until
+                    // the next Cmd-* action.
+                    cx.notify();
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
