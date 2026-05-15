@@ -235,6 +235,24 @@ impl MainPane {
         PaneId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Sync `self.focused` from the window's currently focused element.
+    /// Click-to-focus already moves the platform focus into a `TerminalView`
+    /// (handled inside that view), but `MainPane.focused` only changes when
+    /// we ourselves issue a focus call. Without this sync the user could
+    /// click pane A, press Cmd-D, and end up splitting pane B (whichever
+    /// was last action-focused). Called at the top of every action handler.
+    fn sync_focused_from_window(&mut self, window: &Window, cx: &App) {
+        let Some(active) = window.focused(cx) else {
+            return;
+        };
+        for (id, view) in &self.panes {
+            if view.read(cx).focus_handle(cx) == active {
+                self.focused = *id;
+                return;
+            }
+        }
+    }
+
     fn split_focused(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = spawn_terminal_view(
             self.theme,
@@ -262,6 +280,7 @@ impl MainPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_focused_from_window(window, cx);
         self.split_focused(Axis::Horizontal, window, cx);
     }
 
@@ -271,10 +290,12 @@ impl MainPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_focused_from_window(window, cx);
         self.split_focused(Axis::Vertical, window, cx);
     }
 
     fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
         if self.tree.leaf_count() <= 1 {
             return;
         }
@@ -303,6 +324,7 @@ impl MainPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_focused_from_window(window, cx);
         let leaves = self.tree.in_order_leaves();
         if leaves.len() < 2 {
             return;
