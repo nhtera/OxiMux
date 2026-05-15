@@ -330,29 +330,23 @@ fn build_node(
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
             };
-            // Insert a 1px separator div between adjacent children. Makes
-            // pane boundaries visible regardless of width — matches the
-            // the reference terminal / iTerm convention where each split shows a thin
-            // divider in `border_inactive`.
+            // Apply a 1px border on the leading edge of each non-first
+            // child instead of inserting a separate separator flex item.
+            // Borders are part of the element's box model so they render
+            // reliably regardless of flex sizing quirks (the earlier
+            // separator-div approach silently dropped the outermost
+            // separator in some configurations).
             for (i, c) in children.iter().enumerate() {
+                let mut child = build_node(c, panes, theme);
                 if i > 0 {
-                    row = row.child(separator(*axis, theme));
+                    child = match axis {
+                        Axis::Horizontal => child.border_l_1().border_color(theme.border_inactive),
+                        Axis::Vertical => child.border_t_1().border_color(theme.border_inactive),
+                    };
                 }
-                row = row.child(build_node(c, panes, theme));
+                row = row.child(child);
             }
             row
         }
-    }
-}
-
-fn separator(parent_axis: Axis, theme: &Theme) -> gpui::Div {
-    // `border_inactive` (#26292E) was too close to `bg_base` (#0E0F11) to be
-    // visible at 1px — bumping to `fg_subtle` (#6B7177) gives a clear thin
-    // line matching the the reference terminal/iTerm pane-divider weight. If this feels too
-    // bright, swap back once we have a dedicated mid-tone token.
-    let s = div().bg(theme.fg_subtle).flex_shrink_0();
-    match parent_axis {
-        Axis::Horizontal => s.w(px(1.0)).h_full(),
-        Axis::Vertical => s.h(px(1.0)).w_full(),
     }
 }
