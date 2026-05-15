@@ -8,9 +8,7 @@
 //!   2. Bounded channel deadlock (we'd time out before the marker).
 //!   3. Exit detection broken (we'd see Output but never Exit).
 
-use oximux_pty::{
-    PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent,
-};
+use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -42,7 +40,10 @@ fn spawn_echo_drains_marker_and_exit() {
             match event {
                 TerminalEvent::Output { id: eid, bytes } if eid == id => {
                     output_acc.extend_from_slice(&bytes);
-                    if output_acc.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()) {
+                    if output_acc
+                        .windows(MARKER.len())
+                        .any(|w| w == MARKER.as_bytes())
+                    {
                         saw_marker = true;
                     }
                 }

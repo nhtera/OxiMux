@@ -8,9 +8,7 @@
 //!   2. `fill_snapshot` reads the wrong dimensions (returns a partial grid).
 //!   3. Resize path corrupts the grid (we resize mid-test).
 
-use oximux_pty::{
-    PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent,
-};
+use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -36,10 +34,10 @@ fn snapshot_contains_echoed_marker() {
     let mut saw_exit = false;
     while Instant::now() < deadline && !saw_exit {
         for event in backend.drain_events() {
-            if let TerminalEvent::Exit { id: eid, .. } = event {
-                if eid == id {
-                    saw_exit = true;
-                }
+            if let TerminalEvent::Exit { id: eid, .. } = event
+                && eid == id
+            {
+                saw_exit = true;
             }
         }
         if !saw_exit {

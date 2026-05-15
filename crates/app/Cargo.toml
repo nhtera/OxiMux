@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 oximux-core = { workspace = true }
+oximux-pty = { workspace = true }
 oximux-settings = { workspace = true }
 
 gpui = { workspace = true }

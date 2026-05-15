@@ -18,5 +18,5 @@ pub mod state;
 pub use backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 pub use events::TerminalEvent;
 pub use portable_pty_backend::PortablePtyBackend;
-pub use snapshot::{Cell, TerminalSnapshot};
+pub use snapshot::{Cell, CellColor, NamedColor16, TerminalSnapshot};
 pub use state::TerminalState;

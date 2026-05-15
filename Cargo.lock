@@ -4101,6 +4101,7 @@ dependencies = [
  "gpui-component",
  "gpui_platform",
  "oximux-core",
+ "oximux-pty",
  "oximux-settings",
  "tracing",
  "tracing-subscriber",

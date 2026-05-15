@@ -1,14 +1,58 @@
 //! Renderable view of a session's current state.
 //!
-//! Step 1-2 ships an empty / size-only snapshot. Step 3 will fill it from
-//! the `alacritty_terminal` grid (rows, cursor, dirty mask) and add a
-//! scrollback ring window. Step 4 maps rows to gpui-component rendering.
+//! `TerminalSnapshot` is a frame-aligned, render-side copy of the alacritty
+//! grid. It is intentionally decoupled from `alacritty_terminal` types so the
+//! app crate doesn't depend on vte/alacritty — that boundary stops bleeding
+//! ansi-parser internals into the GPUI layer and keeps the snapshot replay-
+//! friendly for fixture tests later.
 
-/// One visible cell. Step 3 populates color + style; step 1-2 only fills
-/// `ch` from raw output for any consumer that wants a quick read.
-#[derive(Debug, Clone, Default)]
+/// 16 standard ANSI named colors. Bright variants are folded in so the
+/// renderer needs one palette entry per index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedColor16 {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+}
+
+/// Resolved cell color. `Default` defers to the theme — distinct from `White`
+/// or `Black` so the renderer can paint the canvas itself instead of forcing
+/// a literal color in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellColor {
+    #[default]
+    Default,
+    Named(NamedColor16),
+    /// xterm 256-color palette index (0..=255). Indices 0..=15 mirror the
+    /// 16 named colors; 16..=231 is the 6×6×6 cube; 232..=255 is grayscale.
+    Indexed(u8),
+    /// 24-bit truecolor from `Color::Spec`.
+    Rgb(u8, u8, u8),
+}
+
+/// One visible cell. `inverse` mirrors the SGR 7 / DECSCNM bit — render swaps
+/// fg/bg when true. Bold/italic/underline live on `Cell` only when the
+/// renderer needs them; right now we only carry `inverse` because that's what
+/// the cursor relies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cell {
     pub ch: char,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub inverse: bool,
 }
 
 /// A frame-aligned snapshot. Cheap to clone (Vec<Row> small under 24x80).

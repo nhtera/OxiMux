@@ -8,14 +8,20 @@
 //! relevant to its own GUI (PTY write, MouseCursorDirty, Bell). When we
 //! need bell or title forwarding, swap in a custom EventListener that
 //! pushes into our `TerminalEvent` channel.
+//!
+//! Color extraction maps alacritty's `Color` (Named/Spec/Indexed) onto our
+//! own `CellColor` so the app crate never has to depend on vte/alacritty
+//! directly. Indices 0..=15 collapse onto `NamedColor16`; everything else
+//! flows through `Indexed` for the renderer's 256-palette lookup.
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 
-use crate::snapshot::{Cell, TerminalSnapshot};
+use crate::snapshot::{Cell, CellColor, NamedColor16, TerminalSnapshot};
 
 #[derive(Debug, Clone, Copy)]
 struct SizeInfo {
@@ -94,9 +100,77 @@ impl TerminalState {
             let mut row_cells = Vec::with_capacity(self.size.cols);
             for col_idx in 0..self.size.cols {
                 let cell = &row[Column(col_idx)];
-                row_cells.push(Cell { ch: cell.c });
+                row_cells.push(map_cell(cell));
             }
             snap.cells.push(row_cells);
         }
     }
+}
+
+fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
+    Cell {
+        ch: cell.c,
+        fg: map_color(cell.fg),
+        bg: map_color(cell.bg),
+        inverse: cell.flags.contains(Flags::INVERSE),
+    }
+}
+
+fn map_color(color: AnsiColor) -> CellColor {
+    match color {
+        AnsiColor::Named(named) => map_named(named),
+        AnsiColor::Indexed(idx) => match idx {
+            0..=15 => map_named_by_index(idx),
+            other => CellColor::Indexed(other),
+        },
+        AnsiColor::Spec(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
+    }
+}
+
+fn map_named(named: NamedColor) -> CellColor {
+    use NamedColor::*;
+    match named {
+        Foreground | DimForeground => CellColor::Default,
+        Background => CellColor::Default,
+        BrightForeground => CellColor::Named(NamedColor16::BrightWhite),
+        Cursor => CellColor::Default,
+        Black | DimBlack => CellColor::Named(NamedColor16::Black),
+        Red | DimRed => CellColor::Named(NamedColor16::Red),
+        Green | DimGreen => CellColor::Named(NamedColor16::Green),
+        Yellow | DimYellow => CellColor::Named(NamedColor16::Yellow),
+        Blue | DimBlue => CellColor::Named(NamedColor16::Blue),
+        Magenta | DimMagenta => CellColor::Named(NamedColor16::Magenta),
+        Cyan | DimCyan => CellColor::Named(NamedColor16::Cyan),
+        White | DimWhite => CellColor::Named(NamedColor16::White),
+        BrightBlack => CellColor::Named(NamedColor16::BrightBlack),
+        BrightRed => CellColor::Named(NamedColor16::BrightRed),
+        BrightGreen => CellColor::Named(NamedColor16::BrightGreen),
+        BrightYellow => CellColor::Named(NamedColor16::BrightYellow),
+        BrightBlue => CellColor::Named(NamedColor16::BrightBlue),
+        BrightMagenta => CellColor::Named(NamedColor16::BrightMagenta),
+        BrightCyan => CellColor::Named(NamedColor16::BrightCyan),
+        BrightWhite => CellColor::Named(NamedColor16::BrightWhite),
+    }
+}
+
+fn map_named_by_index(idx: u8) -> CellColor {
+    let n = match idx {
+        0 => NamedColor16::Black,
+        1 => NamedColor16::Red,
+        2 => NamedColor16::Green,
+        3 => NamedColor16::Yellow,
+        4 => NamedColor16::Blue,
+        5 => NamedColor16::Magenta,
+        6 => NamedColor16::Cyan,
+        7 => NamedColor16::White,
+        8 => NamedColor16::BrightBlack,
+        9 => NamedColor16::BrightRed,
+        10 => NamedColor16::BrightGreen,
+        11 => NamedColor16::BrightYellow,
+        12 => NamedColor16::BrightBlue,
+        13 => NamedColor16::BrightMagenta,
+        14 => NamedColor16::BrightCyan,
+        _ => NamedColor16::BrightWhite,
+    };
+    CellColor::Named(n)
 }

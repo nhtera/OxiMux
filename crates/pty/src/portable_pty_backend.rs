@@ -152,7 +152,9 @@ impl TerminalBackend for PortablePtyBackend {
         if let Ok(mut state) = session.state.lock() {
             state.resize(cols, rows);
         }
-        let _ = self.event_tx.try_send(TerminalEvent::Resize { id, cols, rows });
+        let _ = self
+            .event_tx
+            .try_send(TerminalEvent::Resize { id, cols, rows });
         Ok(())
     }
 

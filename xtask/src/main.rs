@@ -63,7 +63,9 @@ fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if fail > 0 {
-        return Err(format!("file-size-lint: {fail} file(s) over hard cap ({FAIL_LOC} LOC)").into());
+        return Err(
+            format!("file-size-lint: {fail} file(s) over hard cap ({FAIL_LOC} LOC)").into(),
+        );
     }
     println!("file-size-lint: ok ({warn} warnings, 0 failures)");
     Ok(())
