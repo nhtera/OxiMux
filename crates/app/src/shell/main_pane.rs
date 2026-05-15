@@ -290,7 +290,12 @@ impl Render for MainPane {
             .on_action(cx.listener(Self::on_split_vertical))
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_next_pane))
-            .child(build_node(&self.tree, &self.panes, &self.theme))
+            .child(build_node(
+                &self.tree,
+                &self.panes,
+                &self.theme,
+                self.focused,
+            ))
     }
 }
 
@@ -298,6 +303,7 @@ fn build_node(
     node: &PaneTree,
     panes: &HashMap<PaneId, Entity<TerminalView>>,
     theme: &Theme,
+    focused: PaneId,
 ) -> gpui::Div {
     match node {
         PaneTree::Leaf(id) => {
@@ -330,19 +336,22 @@ fn build_node(
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
             };
-            // Apply a 1px border on the leading edge of each non-first
-            // child instead of inserting a separate separator flex item.
-            // Borders are part of the element's box model so they render
-            // reliably regardless of flex sizing quirks (the earlier
-            // separator-div approach silently dropped the outermost
-            // separator in some configurations).
+            // Each non-first child carries a 1px separator border on its
+            // leading edge (border_inactive). The focused leaf gets a 2px
+            // ring on all sides (focus_ring) that overrides any separator
+            // border — this is the visible "active pane" indicator.
             for (i, c) in children.iter().enumerate() {
-                let mut child = build_node(c, panes, theme);
+                let mut child = build_node(c, panes, theme, focused);
                 if i > 0 {
                     child = match axis {
                         Axis::Horizontal => child.border_l_1().border_color(theme.border_inactive),
                         Axis::Vertical => child.border_t_1().border_color(theme.border_inactive),
                     };
+                }
+                if let PaneTree::Leaf(leaf_id) = c
+                    && *leaf_id == focused
+                {
+                    child = child.border_2().border_color(theme.focus_ring);
                 }
                 row = row.child(child);
             }
