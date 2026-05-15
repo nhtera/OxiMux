@@ -1,0 +1,15 @@
+[package]
+name = "oximux-pty"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oximux-core = { workspace = true }
+anyhow = { workspace = true }
+portable-pty = { workspace = true }
+alacritty_terminal = { workspace = true }
+# tokio/tracing land when the UI consumer needs async fan-out or structured logs.

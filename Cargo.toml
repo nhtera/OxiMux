@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/pty",
+    "crates/git",
+    "crates/agents",
+    "crates/editor",
+    "crates/storage",
+    "crates/settings",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["nhtera"]
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.89"
+
+[workspace.dependencies]
+# Internal crates
+oximux-app      = { path = "crates/app" }
+oximux-core     = { path = "crates/core" }
+oximux-pty      = { path = "crates/pty" }
+oximux-git      = { path = "crates/git" }
+oximux-agents   = { path = "crates/agents" }
+oximux-editor   = { path = "crates/editor" }
+oximux-storage  = { path = "crates/storage" }
+oximux-settings = { path = "crates/settings" }
+
+# GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
+# upstream `longbridge/gpui-component` workspace pins `gpui` to the default
+# branch with no rev; if we pin a rev here, cargo treats them as separate
+# sources and produces two copies of `gpui::App` in the dep graph (one of
+# v0.9's exact failure modes). The canonical pin lives in `Cargo.lock` —
+# bump via `cargo update -p gpui -p gpui_platform -p gpui_macros` and log
+# the resulting commit in `docs/gpui-pins.md`.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui_macros = { git = "https://github.com/zed-industries/zed" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c" }
+
+# Async + util
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Phase 1-2 prep (declared centrally; pulled into crates as used)
+portable-pty = "0.8"
+alacritty_terminal = "0.25"
+
+# Phase 4 prep
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.test]
+opt-level = 1

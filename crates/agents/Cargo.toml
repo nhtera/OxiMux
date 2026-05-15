@@ -1,0 +1,15 @@
+[package]
+name = "oximux-agents"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oximux-core = { workspace = true }
+oximux-pty = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

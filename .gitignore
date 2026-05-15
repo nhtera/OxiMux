@@ -1,0 +1,33 @@
+/target/
+/dist/
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Build artifacts
+*.app/Contents/MacOS/oximux
+
+# Local config
+.env
+.env.local
+*.local.toml
+
+# Logs
+*.log
+logs/
+
+plans
+docs/reference-screenshots
+docs/reference.md
+docs/brief.md
+docs/adr
+
+# Claude Code harness state (session locks, scratch files)
+.claude/

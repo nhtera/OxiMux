@@ -1,0 +1,24 @@
+[package]
+name = "oximux-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oximux"
+path = "src/main.rs"
+
+[dependencies]
+oximux-core = { workspace = true }
+oximux-settings = { workspace = true }
+
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+gpui-component = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

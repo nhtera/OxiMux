@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to Zed's required toolchain (see References/zed-industries/zed/rust-toolchain.toml).
+# GPUI + many transitive deps (smol_str, image, icu_*, heapless, home) demand
+# >= 1.89. Bump together with the GPUI SHA tuple — see docs/gpui-pins.md.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
