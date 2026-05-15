@@ -170,6 +170,19 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(snap)
     }
 
+    fn bracketed_paste(&self, id: TerminalSessionId) -> Result<bool> {
+        let session = self
+            .sessions
+            .get(&id)
+            .with_context(|| format!("unknown session {id:?}"))?;
+        let on = session
+            .state
+            .lock()
+            .map(|s| s.is_bracketed_paste())
+            .unwrap_or(false);
+        Ok(on)
+    }
+
     fn drain_events(&mut self) -> Vec<TerminalEvent> {
         let mut out = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {

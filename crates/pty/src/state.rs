@@ -18,7 +18,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 
 use crate::snapshot::{Cell, CellColor, NamedColor16, TerminalSnapshot};
@@ -72,6 +72,15 @@ impl TerminalState {
     /// Feed PTY bytes through the ANSI parser into the grid.
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// True when the shell has requested DECSET 2004 (bracketed paste).
+    /// The renderer wraps pasted text with `\e[200~` / `\e[201~` only when
+    /// this is set — modern shells (zsh, bash with readline ≥ 8) opt in;
+    /// raw `cat` does not, and double-wrapping there would leak escape
+    /// sequences as literal text.
+    pub fn is_bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// Resize the grid. Called whenever the pane's render area changes.
@@ -173,4 +182,24 @@ fn map_named_by_index(idx: u8) -> CellColor {
         _ => NamedColor16::BrightWhite,
     };
     CellColor::Named(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bracketed_paste_toggles_on_decset_2004() {
+        let mut state = TerminalState::new(80, 24, 100);
+        assert!(!state.is_bracketed_paste(), "default should be off");
+
+        state.advance(b"\x1b[?2004h");
+        assert!(state.is_bracketed_paste(), "DECSET 2004 should enable");
+
+        state.advance(b"\x1b[?2004l");
+        assert!(
+            !state.is_bracketed_paste(),
+            "DECRST 2004 should disable again"
+        );
+    }
 }

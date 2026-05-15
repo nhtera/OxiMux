@@ -24,7 +24,9 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Task, Window, div,
     px,
 };
-use oximux_pty::{Cell, PortablePtyBackend, TerminalBackend, TerminalSessionId, TerminalSnapshot};
+use oximux_pty::{
+    Cell, PortablePtyBackend, TerminalBackend, TerminalEvent, TerminalSessionId, TerminalSnapshot,
+};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::key_input::keystroke_to_bytes;
@@ -34,6 +36,11 @@ use crate::shell::terminal_palette::{ColorRole, resolve};
 /// `< 16 ms PTY → render latency` plan target without over-spending CPU on
 /// idle.
 const POLL_INTERVAL_MS: u64 = 16;
+
+/// Cursor blink half-period. 530 ms matches Terminal.app's default and the
+/// XTerm `cursorBlink` resource. One toggle per period — full blink cycle is
+/// 1.06 s.
+const BLINK_INTERVAL_MS: u64 = 530;
 
 /// Default grid size on spawn. Parent-driven resize takes over on the first
 /// render.
@@ -50,7 +57,13 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
     target_grid: (u16, u16),
     last_resize: (u16, u16),
+    /// Toggled by `_blink_task`. Render combines this with focus state to
+    /// decide whether to overlay the cursor on `snapshot.cursor`. Reset to
+    /// `true` on input + PTY output so the cursor doesn't blink invisible
+    /// mid-typing.
+    cursor_visible: bool,
     _poll_task: Task<()>,
+    _blink_task: Task<()>,
 }
 
 impl TerminalView {
@@ -92,6 +105,36 @@ impl TerminalView {
             }
         });
 
+        // Blink task is independent of the PTY-output poll so a chatty TUI
+        // doesn't bury the toggle, and an idle shell still pulses.
+        //
+        // TODO(perf): the toggle + notify fires on unfocused panes too. Render
+        // gates the cursor on focus so it's still invisible, but the notify
+        // forces a repaint ~1.9 Hz per pane. At 4 panes idle that's ~7 paints/s
+        // we don't need. Cheap fix needs `window` access inside the background
+        // closure, which isn't trivially in scope; revisit during the step 9
+        // perf pass once dispatch-grids and blink can share a frame tick.
+        let blink_task = cx.spawn(async move |this, cx| {
+            loop {
+                let executor = match this.read_with(cx, |_, cx| cx.background_executor().clone()) {
+                    Ok(executor) => executor,
+                    Err(_) => return,
+                };
+                executor
+                    .timer(Duration::from_millis(BLINK_INTERVAL_MS))
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.cursor_visible = !view.cursor_visible;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
         Self {
             backend,
             session_id,
@@ -102,7 +145,9 @@ impl TerminalView {
             focus_handle,
             target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
+            cursor_visible: true,
             _poll_task: poll_task,
+            _blink_task: blink_task,
         }
     }
 
@@ -114,15 +159,102 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let bytes = keystroke_to_bytes(&event.keystroke);
+        let ks = &event.keystroke;
+
+        // Cmd combos are app-level — `keystroke_to_bytes` already swallows
+        // them. We intercept the two terminal-specific ones here, where the
+        // view has access to `App` (clipboard) and to the backend (session-
+        // specific bracketed-paste state).
+        //
+        // Cmd+C → SIGINT (0x03) is a placeholder until mouse text selection
+        // lands. Matches Terminal.app / iTerm2 fallback when nothing is
+        // selected. Once selection exists, branch on selection-empty.
+        //
+        // Shift is excluded so `Cmd+Shift+C` (often "copy as plain text" or
+        // "interrupt" in other terminals) doesn't silently send SIGINT here.
+        if ks.modifiers.platform
+            && !ks.modifiers.control
+            && !ks.modifiers.alt
+            && !ks.modifiers.shift
+        {
+            match ks.key.as_str() {
+                "v" => {
+                    self.paste_from_clipboard(cx);
+                    return;
+                }
+                "c" => {
+                    self.send_bytes(b"\x03", cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let bytes = keystroke_to_bytes(ks);
+        self.send_bytes(&bytes, cx);
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if bytes.is_empty() {
             return;
         }
-        if let Err(err) = self.backend.write(self.session_id, &bytes) {
+        if let Err(err) = self.backend.write(self.session_id, bytes) {
             tracing::warn!(?err, "pty write failed");
             return;
         }
+        // Force cursor visible on input — otherwise a blink-off tick at the
+        // moment of keypress hides the cursor when the user most wants to
+        // see it.
+        self.cursor_visible = true;
         cx.notify();
+    }
+
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(text) = item.text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        // Security: drop every ESC byte from the clipboard payload before
+        // it hits the PTY. Two attacks this defeats:
+        //
+        //   (a) In bracketed mode, a payload containing `\x1b[201~`
+        //       prematurely closes the envelope; everything that follows
+        //       runs raw (e.g. `\rrm -rf ~\r` executes both lines).
+        //   (b) In non-bracketed mode, an embedded `\x1b[?2004l` would
+        //       disable bracketed paste mid-stream and chain into (a).
+        //
+        // Stripping `\x1b` wholesale kills both vectors with one rule and
+        // never leaks escape-sequence-shaped text into the shell. Cost:
+        // pastes that legitimately contain ESC (e.g. captured terminal
+        // recordings) lose that byte. Acceptable for v1; if a real use
+        // case for raw-paste appears, add an explicit opt-in action.
+        let sanitized: Vec<u8> = text.bytes().filter(|b| *b != 0x1b).collect();
+        if sanitized.is_empty() {
+            return;
+        }
+
+        // When the shell has DECSET 2004 on, wrap so readline/zle treat the
+        // chunk as a single insertion (no per-line execution, no autocomplete
+        // expansion). Plain `cat` etc. leave it off — we'd just leak the
+        // escape bytes as literal text, so passthrough is correct there.
+        let wrap = self
+            .backend
+            .bracketed_paste(self.session_id)
+            .unwrap_or(false);
+        let mut out = Vec::with_capacity(sanitized.len() + if wrap { 12 } else { 0 });
+        if wrap {
+            out.extend_from_slice(b"\x1b[200~");
+        }
+        out.extend_from_slice(&sanitized);
+        if wrap {
+            out.extend_from_slice(b"\x1b[201~");
+        }
+        self.send_bytes(&out, cx);
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
@@ -132,6 +264,15 @@ impl TerminalView {
         }
         if let Ok(snapshot) = self.backend.snapshot(self.session_id) {
             self.snapshot = snapshot;
+        }
+        // Reset blink only on real bytes from the PTY. `Resize` and `Exit`
+        // also come through here — resetting on those would force a paint
+        // on a dead session and pin the cursor visible after the shell quits.
+        if events
+            .iter()
+            .any(|e| matches!(e, TerminalEvent::Output { .. }))
+        {
+            self.cursor_visible = true;
         }
         cx.notify();
     }
@@ -158,13 +299,22 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_resize();
 
-        let cursor = (
-            self.snapshot.cursor.0 as usize,
-            self.snapshot.cursor.1 as usize,
-        );
+        // Cursor is only drawn when this pane is focused *and* we're in the
+        // visible half of the blink cycle. Out-of-grid sentinels make
+        // `build_row`'s cursor-col check fall through silently — no `if`
+        // gating in the hot path.
+        let show_cursor = self.focus_handle.is_focused(window) && self.cursor_visible;
+        let cursor = if show_cursor {
+            (
+                self.snapshot.cursor.0 as usize,
+                self.snapshot.cursor.1 as usize,
+            )
+        } else {
+            (usize::MAX, usize::MAX)
+        };
         let theme = self.theme;
         let line_height = px(self.typography.t_body_lg + 4.0);
         let pad = px(self.density.pad_panel);

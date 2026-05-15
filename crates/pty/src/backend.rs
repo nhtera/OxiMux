@@ -58,6 +58,14 @@ pub trait TerminalBackend: Send + 'static {
     /// real rows and a cursor position.
     fn snapshot(&self, id: TerminalSessionId) -> Result<TerminalSnapshot>;
 
+    /// True when the session has DECSET 2004 (bracketed paste) enabled.
+    /// Callers use this to decide whether pasted clipboard text should be
+    /// wrapped with `\e[200~` / `\e[201~`. Default impl returns `false` so
+    /// fixture / replay backends don't have to care.
+    fn bracketed_paste(&self, _id: TerminalSessionId) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Drain accumulated events without blocking. Returns empty when idle.
     fn drain_events(&mut self) -> Vec<TerminalEvent>;
 
