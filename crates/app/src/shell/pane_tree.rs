@@ -19,11 +19,31 @@ pub enum Axis {
     Vertical,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Weights are stored as f32 alongside `children`, parallel-indexed. Only the
+/// *ratio* between siblings matters at render — `dispatch_grids` and
+/// `build_node` both treat `weights[i] / weights.iter().sum()` as the
+/// fractional size of child `i`. `PartialEq`/`Eq` on f32 is intentionally
+/// avoided by switching `PaneTree` from `derive(Eq)` to manual semantics —
+/// only `PartialEq` is meaningful for weights (NaN). Tests compare
+/// structurally via dedicated helpers, not `==` on the whole tree.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PaneTree {
     Leaf(PaneId),
-    Split { axis: Axis, children: Vec<PaneTree> },
+    Split {
+        axis: Axis,
+        children: Vec<PaneTree>,
+        /// Parallel to `children`; one weight per child. New splits start at
+        /// 1.0 each (so a binary split is 50/50). Drag-resize mutates these.
+        /// Always kept positive — `MIN_FLEX` is the floor, enforced by
+        /// `set_split_weights`.
+        weights: Vec<f32>,
+    },
 }
+
+/// Minimum weight any child may shrink to. Prevents a divider drag from
+/// hiding a pane entirely. Picked so a clamped pane still has enough room
+/// for a usable terminal grid at typical viewport sizes.
+pub const MIN_FLEX: f32 = 0.1;
 
 impl PaneTree {
     pub fn leaf_count(&self) -> usize {
@@ -90,13 +110,47 @@ impl PaneTree {
         let placeholder = PaneTree::Split {
             axis: Axis::Horizontal,
             children: Vec::new(),
+            weights: Vec::new(),
         };
         let old = std::mem::replace(node, placeholder);
         *node = PaneTree::Split {
             axis,
             children: vec![old, PaneTree::Leaf(new_id)],
+            // 50/50 — divider drag mutates this in place.
+            weights: vec![1.0, 1.0],
         };
         true
+    }
+
+    /// Replace the weights at the Split node addressed by `path`. Returns
+    /// `true` when the path lands on a `Split` whose `children.len()` matches
+    /// `new_weights.len()`. Weights are clamped per-entry to `MIN_FLEX` so a
+    /// drag can't shrink a pane to zero. Called from the divider drag
+    /// handler in `main_pane`.
+    pub fn set_split_weights(&mut self, path: &[usize], new_weights: Vec<f32>) -> bool {
+        let node = descend_mut(self, path);
+        match node {
+            PaneTree::Split {
+                children, weights, ..
+            } if children.len() == new_weights.len() => {
+                for (slot, w) in weights.iter_mut().zip(new_weights) {
+                    *slot = w.max(MIN_FLEX);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Read-only view of weights at the Split addressed by `path`. Used by
+    /// the divider drag handler at `on_drag` to capture initial weights as
+    /// part of the drag payload.
+    pub fn split_weights(&self, path: &[usize]) -> Option<Vec<f32>> {
+        let node = descend(self, path)?;
+        match node {
+            PaneTree::Split { weights, .. } => Some(weights.clone()),
+            PaneTree::Leaf(_) => None,
+        }
     }
 
     /// Remove the leaf matching `target` and collapse any single-child
@@ -112,13 +166,53 @@ impl PaneTree {
         let parent = descend_mut(self, &path[..path.len() - 1]);
         let last = *path.last().unwrap();
         match parent {
-            PaneTree::Split { children, .. } => {
+            PaneTree::Split {
+                children, weights, ..
+            } => {
+                // Strict invariant: `weights.len() == children.len()` at all
+                // times. An earlier guarded `if last < weights.len()` here
+                // was unsafe — a missing weight would silently desync the
+                // arrays, and `build_node` / `dispatch_grids_inner` both
+                // iterate with `zip`, which would drop the trailing child
+                // from render AND PTY dispatch (Codex flagged this). The
+                // unconditional remove preserves the invariant; if the
+                // invariant ever breaks elsewhere, this will panic loudly
+                // rather than silently lose a pane.
                 children.remove(last);
+                weights.remove(last);
             }
             PaneTree::Leaf(_) => unreachable!("path leads through Split nodes"),
         }
         self.collapse_singletons();
         true
+    }
+
+    /// Walk the tree recursively and panic if any `Split` node has
+    /// `children.len() != weights.len()`. Cheap O(tree size) check, gated
+    /// on `debug_assertions` so release builds skip it. Used to assert the
+    /// invariant after every mutation in tests; also called at the top of
+    /// `build_node` / `dispatch_grids_inner` to catch any future code that
+    /// violates the invariant before render/PTY dispatch silently drops a
+    /// pane.
+    #[cfg(debug_assertions)]
+    pub fn debug_assert_invariants(&self) {
+        match self {
+            PaneTree::Leaf(_) => {}
+            PaneTree::Split {
+                children, weights, ..
+            } => {
+                assert_eq!(
+                    children.len(),
+                    weights.len(),
+                    "PaneTree::Split invariant violated: children={} weights={}",
+                    children.len(),
+                    weights.len(),
+                );
+                for c in children {
+                    c.debug_assert_invariants();
+                }
+            }
+        }
     }
 
     /// Collapse any `Split` node with exactly one child into that child,
@@ -139,6 +233,18 @@ impl PaneTree {
             *self = only;
         }
     }
+}
+
+/// Immutable counterpart of `descend_mut` for `split_weights`.
+fn descend<'a>(root: &'a PaneTree, path: &[usize]) -> Option<&'a PaneTree> {
+    let mut node = root;
+    for &i in path {
+        node = match node {
+            PaneTree::Split { children, .. } => children.get(i)?,
+            PaneTree::Leaf(_) => return None,
+        };
+    }
+    Some(node)
 }
 
 fn descend_mut<'a>(root: &'a mut PaneTree, path: &[usize]) -> &'a mut PaneTree {
@@ -177,9 +283,50 @@ mod tests {
         assert_eq!(t.leaf_count(), 2);
         assert_eq!(t.in_order_leaves(), vec![id(0), id(1)]);
         match &t {
-            PaneTree::Split { axis, .. } => assert_eq!(*axis, Axis::Horizontal),
+            PaneTree::Split { axis, weights, .. } => {
+                assert_eq!(*axis, Axis::Horizontal);
+                // Fresh split is 50/50 — divider drag mutates this in place.
+                assert_eq!(weights, &vec![1.0, 1.0]);
+            }
             _ => panic!("expected split root"),
         }
+    }
+
+    #[test]
+    fn set_split_weights_clamps_and_returns_true() {
+        let mut t = PaneTree::Leaf(id(0));
+        assert!(t.split_leaf(id(0), Axis::Horizontal, id(1)));
+        // Empty path lands on the root Split.
+        assert!(t.set_split_weights(&[], vec![1.5, 0.5]));
+        assert_eq!(t.split_weights(&[]), Some(vec![1.5, 0.5]));
+        // Below-MIN_FLEX is clamped up, not rejected.
+        assert!(t.set_split_weights(&[], vec![1.95, 0.0]));
+        let w = t.split_weights(&[]).unwrap();
+        assert_eq!(w[0], 1.95);
+        assert_eq!(w[1], MIN_FLEX);
+    }
+
+    #[test]
+    fn set_split_weights_rejects_mismatched_len() {
+        let mut t = PaneTree::Leaf(id(0));
+        t.split_leaf(id(0), Axis::Horizontal, id(1));
+        assert!(!t.set_split_weights(&[], vec![1.0]));
+    }
+
+    #[test]
+    fn remove_leaf_drops_corresponding_weight() {
+        // Build [0 | 1 | 2], then remove leaf 1 → [0, 2] with weights [1, 1].
+        let mut t = PaneTree::Leaf(id(0));
+        t.split_leaf(id(0), Axis::Horizontal, id(1));
+        t.split_leaf(id(1), Axis::Horizontal, id(2));
+        // Inner Split is at path [1] (right child of root). Its children are
+        // [Leaf(1), Leaf(2)] with weights [1, 1]. Remove leaf 1 → that
+        // inner Split collapses to Leaf(2). Root weights survive unchanged.
+        assert!(t.remove_leaf(id(1)));
+        assert_eq!(t.in_order_leaves(), vec![id(0), id(2)]);
+        let root_weights = t.split_weights(&[]).expect("root should still be split");
+        assert_eq!(root_weights.len(), 2);
+        assert_eq!(root_weights, vec![1.0, 1.0]);
     }
 
     #[test]
@@ -234,11 +381,14 @@ mod tests {
             _ => panic!("expected nested split"),
         };
         match lvl2 {
-            PaneTree::Split { children, .. } => {
+            PaneTree::Split {
+                children, weights, ..
+            } => {
                 assert_eq!(
                     children,
                     &vec![PaneTree::Leaf(id(2)), PaneTree::Leaf(id(3))]
                 );
+                assert_eq!(weights, &vec![1.0, 1.0]);
             }
             _ => panic!("expected innermost split"),
         }
@@ -253,11 +403,42 @@ mod tests {
         assert!(t.remove_leaf(id(1)));
         assert_eq!(t.in_order_leaves(), vec![id(0), id(2)]);
         match &t {
-            PaneTree::Split { axis, children } => {
+            PaneTree::Split { axis, children, .. } => {
                 assert_eq!(*axis, Axis::Horizontal);
                 assert_eq!(children.len(), 2);
             }
             _ => panic!("expected horizontal split root"),
         }
+    }
+
+    /// Regression: Codex adversarial-review flagged a soundness gap where a
+    /// `weights` vector shorter than `children` would silently truncate at
+    /// `zip` in `build_node` / `dispatch_grids_inner`, hiding a pane from
+    /// both render and PTY dispatch. We now (a) keep `weights.len() ==
+    /// children.len()` strictly across every mutation and (b)
+    /// `debug_assert!` the invariant before render. This test asserts (a)
+    /// across the full mutation surface.
+    #[test]
+    fn split_invariant_holds_across_mutations() {
+        let mut t = PaneTree::Leaf(id(0));
+        t.debug_assert_invariants();
+        // split → 2 children + 2 weights
+        assert!(t.split_leaf(id(0), Axis::Horizontal, id(1)));
+        t.debug_assert_invariants();
+        // nested split → 2 + 2 at root, 2 + 2 at inner
+        assert!(t.split_leaf(id(1), Axis::Vertical, id(2)));
+        t.debug_assert_invariants();
+        // three-deep cascade — exercises the longest path
+        assert!(t.split_leaf(id(2), Axis::Horizontal, id(3)));
+        t.debug_assert_invariants();
+        // set_split_weights at root + at a nested Split
+        assert!(t.set_split_weights(&[], vec![2.0, 1.0]));
+        t.debug_assert_invariants();
+        // remove a leaf — historical bug site (conditional weight removal)
+        assert!(t.remove_leaf(id(3)));
+        t.debug_assert_invariants();
+        // remove again → collapse_singletons fires
+        assert!(t.remove_leaf(id(2)));
+        t.debug_assert_invariants();
     }
 }
