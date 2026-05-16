@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use workspace_root::WorkspaceRoot;
 
 use crate::actions::{
-    CloseTab, FocusNextPane, NewTab, NextTab, PrevTab, SplitHorizontal, SplitVertical,
+    CloseTab, FocusNextPane, NewTab, NextTab, PrevTab, Search, SplitHorizontal, SplitVertical,
 };
 
 fn main() {
@@ -39,6 +39,10 @@ fn main() {
             // match. Mirrors Zed's own `pane::ActivateNextItem` binding.
             KeyBinding::new("cmd-}", NextTab, None),
             KeyBinding::new("cmd-{", PrevTab, None),
+            // cmd-f opens the per-pane scrollback search overlay. Handled
+            // on the focused TerminalView's root div — when no pane is
+            // focused (no editor exists yet in v1), the action no-ops.
+            KeyBinding::new("cmd-f", Search, None),
         ]);
         cx.activate(true);
 

@@ -90,6 +90,33 @@ impl TerminalState {
         self.term.resize(self.size);
     }
 
+    /// Return a row-major grid covering `history_rows` of scrollback prepended
+    /// to the current visible rows. Caller iterates this for substring search
+    /// (Phase 1 step 8). Bounded by 5000 history + ~32 rows × ~200 cols ≈
+    /// 1M cells worst case; allocation cost is the price of decoupling search
+    /// from the live grid lock.
+    ///
+    /// Clamps to `term.grid().history_size()` so a freshly-spawned session
+    /// with empty history doesn't index `Line(-N)` with `N > 0` history rows
+    /// — alacritty panics in that case.
+    pub fn fill_search_grid(&self) -> Vec<Vec<Cell>> {
+        let history = self.term.grid().history_size();
+        let total = history + self.size.rows;
+        let mut out = Vec::with_capacity(total);
+        let start_line = -(history as i32);
+        let end_line = self.size.rows as i32;
+        for line_idx in start_line..end_line {
+            let row = &self.term.grid()[Line(line_idx)];
+            let mut row_cells = Vec::with_capacity(self.size.cols);
+            for col_idx in 0..self.size.cols {
+                let cell = &row[Column(col_idx)];
+                row_cells.push(map_cell(cell));
+            }
+            out.push(row_cells);
+        }
+        out
+    }
+
     /// Populate `snap` with the current visible grid + cursor.
     /// Allocates one `Vec<Cell>` per row; cheap at 24-200 rows.
     pub fn fill_snapshot(&self, snap: &mut TerminalSnapshot) {

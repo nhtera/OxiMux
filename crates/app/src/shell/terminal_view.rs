@@ -20,17 +20,20 @@
 use std::time::Duration;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Task, Window, div,
-    px,
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, ParentElement, Render, Styled, Task, Window, div, px,
 };
 use oximux_pty::{
-    Cell, PortablePtyBackend, TerminalBackend, TerminalEvent, TerminalSessionId, TerminalSnapshot,
+    PortablePtyBackend, TerminalBackend, TerminalEvent, TerminalSessionId, TerminalSnapshot,
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::actions::Search;
 use crate::shell::key_input::keystroke_to_bytes;
-use crate::shell::terminal_palette::{ColorRole, resolve};
+use crate::shell::terminal_row::build_row;
+use crate::shell::terminal_search::{
+    MatchRange, find_matches, render_search_overlay, visible_match_ranges,
+};
 
 /// How often the view drains events + re-snapshots. 16 ms ≈ 60 fps, matches the
 /// `< 16 ms PTY → render latency` plan target without over-spending CPU on
@@ -62,6 +65,19 @@ pub struct TerminalView {
     /// `true` on input + PTY output so the cursor doesn't blink invisible
     /// mid-typing.
     cursor_visible: bool,
+    /// Search overlay state. When `search_active` is true the on_key_down
+    /// branch above the PTY path consumes printable input, Backspace, and
+    /// Esc/Enter; all other keys are swallowed (no PTY write). Per-pane;
+    /// resetting these on dismiss drops the highlight on the next paint.
+    /// `search_history_len` records how much of the search grid was history
+    /// at scan time, so the render path can offset `MatchRange::row` back
+    /// to a visible-row index. Deriving it at render time from the max
+    /// match row only works when scrollback is full — see code-review
+    /// 260516-0807 for the failure cases.
+    search_active: bool,
+    search_query: String,
+    search_matches: Vec<MatchRange>,
+    search_history_len: usize,
     _poll_task: Task<()>,
     _blink_task: Task<()>,
 }
@@ -146,6 +162,10 @@ impl TerminalView {
             target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_history_len: 0,
             _poll_task: poll_task,
             _blink_task: blink_task,
         }
@@ -158,7 +178,92 @@ impl TerminalView {
         self.target_grid = (cols, rows);
     }
 
+    fn on_search(&mut self, _: &Search, _window: &mut Window, cx: &mut Context<Self>) {
+        // Esc/Enter clear the query, so the only way to reach this with
+        // `search_query` non-empty is a stray Cmd+F while already open —
+        // benign (re-runs the same match set against a fresh grid).
+        self.search_active = true;
+        self.rerun_search(cx);
+        cx.notify();
+    }
+
+    fn rerun_search(&mut self, _cx: &mut Context<Self>) {
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            self.search_history_len = 0;
+            return;
+        }
+        let grid = self.backend.search_grid(self.session_id);
+        // Record history_len at scan time. Recovering it at render time
+        // from `max(MatchRange::row)` fails on partial-history scrollback
+        // and on history-only match sets — see code-review 260516-0807 H1.
+        let visible = self.snapshot.cells.len();
+        self.search_history_len = grid.len().saturating_sub(visible);
+        self.search_matches = find_matches(&grid, &self.search_query);
+    }
+
+    fn dismiss_search(&mut self, cx: &mut Context<Self>) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_history_len = 0;
+        cx.notify();
+    }
+
+    /// Search-mode key handling. Returns true when the keystroke was consumed
+    /// (do not forward to the PTY). Modifier-bearing input (Cmd / Ctrl / Alt)
+    /// is left for the regular path so Cmd+F-then-Cmd+W still closes the tab.
+    fn handle_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let ks = &event.keystroke;
+        if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt {
+            // Cmd/Ctrl/Alt combos take precedence — let them bubble.
+            // (Cmd+F again is benign: re-fires `on_search`, no-op state.)
+            return false;
+        }
+        match ks.key.as_str() {
+            "escape" | "enter" => {
+                self.dismiss_search(cx);
+                return true;
+            }
+            "backspace" => {
+                self.search_query.pop();
+                self.rerun_search(cx);
+                cx.notify();
+                return true;
+            }
+            _ => {}
+        }
+        // Append printable text. Prefer `key_char` (shift-aware, IME-aware)
+        // and reject anything that's a control byte — accidental ctrl-X
+        // shouldn't pollute the needle even though we already filter
+        // modifier-bearing keys above.
+        let candidate =
+            ks.key_char
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(if ks.key.chars().count() == 1 {
+                    Some(ks.key.as_str())
+                } else {
+                    None
+                });
+        if let Some(s) = candidate
+            && s.chars().all(|c| !c.is_control())
+        {
+            self.search_query.push_str(s);
+            self.rerun_search(cx);
+            cx.notify();
+            return true;
+        }
+        // Anything else (function keys, arrows, etc.) is swallowed while the
+        // overlay is open — they neither edit the query nor reach the shell.
+        true
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_active && self.handle_search_key(event, cx) {
+            return;
+        }
+
         let ks = &event.keystroke;
 
         // Cmd combos are app-level — `keystroke_to_bytes` already swallows
@@ -320,15 +425,40 @@ impl Render for TerminalView {
         let pad = px(self.density.pad_panel);
         let focus_handle = self.focus_handle.clone();
 
+        // Match buckets per visible row. `search_history_len` was captured
+        // at scan time (rerun_search) — using it here avoids deriving the
+        // offset from the match set, which fails on partial-history grids.
+        // If PTY output has scrolled history since the scan, the highlights
+        // may drift one paint but self-correct on the next keystroke.
+        let visible_rows = self.snapshot.cells.len();
+        let buckets = if self.search_active && !self.search_matches.is_empty() {
+            visible_match_ranges(&self.search_matches, self.search_history_len, visible_rows)
+        } else {
+            Vec::new()
+        };
+
         let rows: Vec<gpui::Div> = self
             .snapshot
             .cells
             .iter()
             .enumerate()
-            .map(|(row_idx, row)| build_row(row, row_idx, cursor, &theme, line_height))
+            .map(|(row_idx, row)| {
+                let match_cols = buckets.get(row_idx).map(|v| v.as_slice());
+                build_row(row, row_idx, cursor, match_cols, &theme, line_height)
+            })
             .collect();
 
-        div()
+        let overlay = if self.search_active {
+            Some(render_search_overlay(
+                &self.search_query,
+                &theme,
+                &self.typography,
+            ))
+        } else {
+            None
+        };
+
+        let mut root = div()
             .id("oximux-terminal-view")
             .track_focus(&focus_handle)
             .flex()
@@ -341,6 +471,7 @@ impl Render for TerminalView {
             .text_size(px(self.typography.t_body_lg))
             .px(pad)
             .py(pad)
+            .on_action(cx.listener(Self::on_search))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -355,74 +486,10 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
             }))
-            .children(rows)
-    }
-}
-
-fn build_row(
-    row: &[Cell],
-    row_idx: usize,
-    cursor: (usize, usize),
-    theme: &Theme,
-    line_height: gpui::Pixels,
-) -> gpui::Div {
-    let mut row_div = div().flex().flex_row().h(line_height).whitespace_nowrap();
-    let cursor_col = if cursor.0 == row_idx {
-        Some(cursor.1)
-    } else {
-        None
-    };
-    for run in group_runs(row, cursor_col) {
-        let (fg, bg) = effective_colors(&run, theme);
-        let mut span = div().child(SharedString::from(run.text)).text_color(fg);
-        if !run.inverse && run.bg == oximux_pty::CellColor::Default {
-            // Skip painting the canvas — saves one rect per default-bg run.
-        } else {
-            span = span.bg(bg);
+            .children(rows);
+        if let Some(o) = overlay {
+            root = root.child(o);
         }
-        row_div = row_div.child(span);
+        root
     }
-    row_div
-}
-
-struct Run {
-    text: String,
-    fg: oximux_pty::CellColor,
-    bg: oximux_pty::CellColor,
-    inverse: bool,
-}
-
-fn group_runs(row: &[Cell], cursor_col: Option<usize>) -> Vec<Run> {
-    let mut runs: Vec<Run> = Vec::new();
-    for (col_idx, cell) in row.iter().enumerate() {
-        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-        let inverse = cell.inverse || cursor_col == Some(col_idx);
-        match runs.last_mut() {
-            Some(last) if last.fg == cell.fg && last.bg == cell.bg && last.inverse == inverse => {
-                last.text.push(ch);
-            }
-            _ => runs.push(Run {
-                text: ch.to_string(),
-                fg: cell.fg,
-                bg: cell.bg,
-                inverse,
-            }),
-        }
-    }
-    runs
-}
-
-/// Resolve fg + bg as concrete Hsla, then swap if `inverse`. Swapping at the
-/// Hsla layer (not the `CellColor` layer) is what makes inverse on a
-/// Default/Default cell actually flip the colors — if we swapped the
-/// `CellColor`s first, `resolve(Default, Fg)` and `resolve(Default, Bg)`
-/// would still split into fg_base / bg_base, but a Default/Default swap
-/// would land back on fg_base / bg_base again and the cursor would be
-/// invisible. With this version, the resolved fg_base (white) and bg_base
-/// (charcoal) swap cleanly: cursor renders as a charcoal glyph on a white
-/// block.
-fn effective_colors(run: &Run, theme: &Theme) -> (Hsla, Hsla) {
-    let fg = resolve(run.fg, ColorRole::Fg, theme);
-    let bg = resolve(run.bg, ColorRole::Bg, theme);
-    if run.inverse { (bg, fg) } else { (fg, bg) }
 }

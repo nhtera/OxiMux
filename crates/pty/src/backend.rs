@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::events::TerminalEvent;
-use crate::snapshot::TerminalSnapshot;
+use crate::snapshot::{Cell, TerminalSnapshot};
 
 /// Opaque handle to one running PTY session. Backends mint these monotonically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,6 +64,14 @@ pub trait TerminalBackend: Send + 'static {
     /// fixture / replay backends don't have to care.
     fn bracketed_paste(&self, _id: TerminalSessionId) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Full row-major cell grid (history + visible) for substring search
+    /// (Phase 1 step 8). Default impl returns an empty grid so fixture /
+    /// replay backends that don't retain scrollback can opt out without
+    /// implementing it. Real PTY backends override to expose scrollback.
+    fn search_grid(&self, _id: TerminalSessionId) -> Vec<Vec<Cell>> {
+        Vec::new()
     }
 
     /// Drain accumulated events without blocking. Returns empty when idle.

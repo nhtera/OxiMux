@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 
 use crate::backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 use crate::events::TerminalEvent;
-use crate::snapshot::TerminalSnapshot;
+use crate::snapshot::{Cell, TerminalSnapshot};
 use crate::state::TerminalState;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -181,6 +181,17 @@ impl TerminalBackend for PortablePtyBackend {
             .map(|s| s.is_bracketed_paste())
             .unwrap_or(false);
         Ok(on)
+    }
+
+    fn search_grid(&self, id: TerminalSessionId) -> Vec<Vec<Cell>> {
+        let Some(session) = self.sessions.get(&id) else {
+            return Vec::new();
+        };
+        session
+            .state
+            .lock()
+            .map(|s| s.fill_search_grid())
+            .unwrap_or_default()
     }
 
     fn drain_events(&mut self) -> Vec<TerminalEvent> {

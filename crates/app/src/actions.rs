@@ -30,5 +30,7 @@ actions!(
         NextTab,
         /// Cycle to the previous tab inside the focused pane.
         PrevTab,
+        /// Open the scrollback search overlay on the focused terminal pane.
+        Search,
     ]
 );
