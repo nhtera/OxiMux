@@ -74,3 +74,69 @@ impl TerminalSnapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cell_color_default_is_default_variant() {
+        assert_eq!(CellColor::default(), CellColor::Default);
+    }
+
+    #[test]
+    fn cell_default_is_blank_default_colored() {
+        let c = Cell::default();
+        assert_eq!(c.ch, '\0');
+        assert_eq!(c.fg, CellColor::Default);
+        assert_eq!(c.bg, CellColor::Default);
+        assert!(!c.inverse);
+    }
+
+    #[test]
+    fn empty_snapshot_preserves_dims_and_zero_cursor() {
+        let snap = TerminalSnapshot::empty(80, 24);
+        assert_eq!(snap.cols, 80);
+        assert_eq!(snap.rows, 24);
+        assert_eq!(snap.cursor, (0, 0));
+        assert!(snap.cells.is_empty());
+    }
+
+    #[test]
+    fn snapshot_default_is_zero_sized() {
+        let snap = TerminalSnapshot::default();
+        assert_eq!(snap.cols, 0);
+        assert_eq!(snap.rows, 0);
+        assert_eq!(snap.cursor, (0, 0));
+        assert!(snap.cells.is_empty());
+    }
+
+    #[test]
+    fn cell_color_variants_are_distinct() {
+        // Smoke check that variant equality discriminates correctly.
+        assert_ne!(CellColor::Indexed(7), CellColor::Indexed(8));
+        assert_ne!(
+            CellColor::Named(NamedColor16::Red),
+            CellColor::Named(NamedColor16::Green)
+        );
+        assert_ne!(CellColor::Rgb(0, 0, 0), CellColor::Rgb(1, 0, 0));
+        assert_ne!(CellColor::Default, CellColor::Named(NamedColor16::Black));
+    }
+
+    #[test]
+    fn cell_equality_compares_all_fields() {
+        let base = Cell {
+            ch: 'a',
+            fg: CellColor::Named(NamedColor16::Red),
+            bg: CellColor::Default,
+            inverse: false,
+        };
+        let same = base;
+        let diff_inverse = Cell {
+            inverse: true,
+            ..base
+        };
+        assert_eq!(base, same);
+        assert_ne!(base, diff_inverse);
+    }
+}

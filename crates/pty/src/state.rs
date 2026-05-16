@@ -215,6 +215,27 @@ fn map_named_by_index(idx: u8) -> CellColor {
 mod tests {
     use super::*;
 
+    fn fresh_snapshot(state: &TerminalState) -> TerminalSnapshot {
+        let mut snap = TerminalSnapshot::default();
+        state.fill_snapshot(&mut snap);
+        snap
+    }
+
+    fn row_text(snap: &TerminalSnapshot, row: usize) -> String {
+        snap.cells[row].iter().map(|c| c.ch).collect()
+    }
+
+    fn first_non_default_fg(snap: &TerminalSnapshot) -> Option<CellColor> {
+        for row in &snap.cells {
+            for cell in row {
+                if cell.fg != CellColor::Default {
+                    return Some(cell.fg);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn bracketed_paste_toggles_on_decset_2004() {
         let mut state = TerminalState::new(80, 24, 100);
@@ -227,6 +248,92 @@ mod tests {
         assert!(
             !state.is_bracketed_paste(),
             "DECRST 2004 should disable again"
+        );
+    }
+
+    #[test]
+    fn new_dimensions_match() {
+        let state = TerminalState::new(80, 24, 100);
+        let snap = fresh_snapshot(&state);
+        assert_eq!(snap.cols, 80);
+        assert_eq!(snap.rows, 24);
+        assert_eq!(snap.cells.len(), 24);
+        for row in &snap.cells {
+            assert_eq!(row.len(), 80);
+        }
+    }
+
+    #[test]
+    fn advance_echo_visible_in_snapshot() {
+        let mut state = TerminalState::new(80, 24, 100);
+        state.advance(b"Hello");
+        let snap = fresh_snapshot(&state);
+        assert!(
+            row_text(&snap, 0).starts_with("Hello"),
+            "row 0 = {:?}",
+            row_text(&snap, 0)
+        );
+    }
+
+    #[test]
+    fn cursor_moves_after_cup_sequence() {
+        let mut state = TerminalState::new(80, 24, 100);
+        // CUP row=5 col=10 (1-based) → (4, 9) 0-based.
+        state.advance(b"\x1b[5;10H");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(snap.cursor, (4, 9));
+    }
+
+    #[test]
+    fn resize_updates_dimensions() {
+        let mut state = TerminalState::new(80, 24, 100);
+        state.resize(120, 40);
+        let snap = fresh_snapshot(&state);
+        assert_eq!(snap.cols, 120);
+        assert_eq!(snap.rows, 40);
+        assert_eq!(snap.cells.len(), 40);
+        assert_eq!(snap.cells[0].len(), 120);
+    }
+
+    #[test]
+    fn fill_search_grid_covers_at_least_visible_rows() {
+        // On a fresh state alacritty currently reports `history_size() == 0`,
+        // so the grid is exactly `rows`. Asserting `>=` keeps the test robust
+        // if a future alacritty version pre-allocates scrollback.
+        let state = TerminalState::new(80, 24, 100);
+        let grid = state.fill_search_grid();
+        assert!(grid.len() >= 24, "got {} rows", grid.len());
+        for row in &grid {
+            assert_eq!(row.len(), 80);
+        }
+    }
+
+    #[test]
+    fn map_color_rgb_branch() {
+        let mut state = TerminalState::new(80, 24, 100);
+        // SGR truecolor + a character so the cell is non-empty.
+        state.advance(b"\x1b[38;2;255;0;128mX");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(first_non_default_fg(&snap), Some(CellColor::Rgb(255, 0, 128)));
+    }
+
+    #[test]
+    fn map_color_indexed_above_15() {
+        let mut state = TerminalState::new(80, 24, 100);
+        state.advance(b"\x1b[38;5;200mX");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(first_non_default_fg(&snap), Some(CellColor::Indexed(200)));
+    }
+
+    #[test]
+    fn map_color_indexed_below_16_maps_to_named() {
+        let mut state = TerminalState::new(80, 24, 100);
+        // Index 1 → NamedColor16::Red via map_named_by_index.
+        state.advance(b"\x1b[38;5;1mX");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(
+            first_non_default_fg(&snap),
+            Some(CellColor::Named(NamedColor16::Red))
         );
     }
 }

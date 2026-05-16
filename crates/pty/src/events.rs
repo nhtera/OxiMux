@@ -34,3 +34,29 @@ pub enum TerminalEvent {
         title: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `TerminalEvent` is a pure data enum — the compiler guarantees
+    // variant payload shape. The one behavior worth exercising is byte
+    // fidelity through Clone on a non-trivial Output payload, since that
+    // is the hot path drained per frame by the renderer.
+    #[test]
+    fn output_clone_preserves_bytes_at_payload_size() {
+        let payload: Vec<u8> = (0..=255).cycle().take(8 * 1024).collect();
+        let ev = TerminalEvent::Output {
+            id: TerminalSessionId(7),
+            bytes: payload.clone(),
+        };
+        let cloned = ev.clone();
+        match cloned {
+            TerminalEvent::Output { id, bytes } => {
+                assert_eq!(id, TerminalSessionId(7));
+                assert_eq!(bytes, payload);
+            }
+            _ => panic!("clone changed variant"),
+        }
+    }
+}
