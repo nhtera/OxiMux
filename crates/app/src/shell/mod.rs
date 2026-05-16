@@ -7,6 +7,7 @@ pub mod cell_metrics;
 pub mod key_input;
 pub mod main_area;
 pub mod main_pane;
+pub mod pane_layout;
 pub mod pane_tree;
 pub mod sidebar;
 pub mod status_bar;

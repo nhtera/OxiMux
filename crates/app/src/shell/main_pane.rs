@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Subscription, Window, div, px,
+    MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render, Styled, Subscription, Window,
+    div,
 };
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
@@ -28,6 +29,7 @@ use crate::actions::{
     SplitVertical,
 };
 use crate::shell::cell_metrics::CellMetrics;
+use crate::shell::pane_layout::{ActiveDrag, DIVIDER_HIT_PX, build_node};
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
 use crate::shell::tabbed_pane::{TAB_STRIP_HEIGHT_PX, TabbedPane};
 use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView};
@@ -39,6 +41,9 @@ const CHROME_H_PX: f32 = 36.0 + 22.0; // top bar + status bar
 
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
+
+// Divider geometry (`DIVIDER_HIT_PX`, `DIVIDER_LINE_PX`) and the visual
+// builders (`build_node`, `build_divider`) live in `super::pane_layout`.
 
 pub struct MainPane {
     tree: PaneTree,
@@ -54,6 +59,13 @@ pub struct MainPane {
     /// MainPane so render runs and `sync_focused_from_window` repaints the
     /// active-pane ring + dim overlays. Stored to keep subscriptions alive.
     _pane_observers: HashMap<PaneId, Subscription>,
+    /// Set on divider `on_mouse_down`, read by the element-level
+    /// `on_mouse_move` listener on the MainPane root to translate cursor
+    /// position into weight updates. Cleared on `on_mouse_up` or when a
+    /// move event arrives with the left button no longer held (recovers
+    /// from the "released outside MainPane" case). `None` means no drag
+    /// in progress.
+    active_drag: Option<ActiveDrag>,
 }
 
 impl MainPane {
@@ -84,6 +96,7 @@ impl MainPane {
             typography,
             focus_handle,
             _pane_observers: pane_observers,
+            active_drag: None,
         }
     }
 
@@ -265,7 +278,86 @@ impl MainPane {
     fn dispatch_grids(&self, window: &Window, cx: &mut Context<Self>) {
         let metrics = CellMetrics::measure(&self.typography, window);
         let (w, h) = available_area(window, self.density.pad_panel, &metrics);
-        dispatch_grids_inner(&self.tree, &self.panes, w, h, &metrics, cx);
+        // Defer PTY resize during an active divider drag (the reference terminal / iTerm
+        // pattern). At 60 fps a drag would otherwise fire 60+ SIGWINCH/sec
+        // per affected pane, which makes shells with expensive prompts
+        // (oh-my-zsh, p10k) re-paint visibly every frame. The visible
+        // layout still updates (build_node uses weights directly); only
+        // the PTY backend resize is suppressed. On mouse-up the drag
+        // clears, the next render reaches this with `dragging=false`, and
+        // each affected pane gets a single resize reflecting the final
+        // weights.
+        let dragging = self.active_drag.is_some();
+        dispatch_grids_inner(&self.tree, &self.panes, w, h, &metrics, cx, dragging);
+    }
+
+    /// Called by `pane_layout::build_divider` on left mouse-down to stamp
+    /// the drag snapshot into `self.active_drag`. Kept as a method (rather
+    /// than letting layout poke the field directly) so the field can stay
+    /// private and so any future bookkeeping at drag start has one home.
+    pub(super) fn begin_divider_drag(
+        &mut self,
+        drag: ActiveDrag,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_drag = Some(drag);
+        cx.notify();
+    }
+
+    /// Called by `pane_layout::build_divider` on double-click — resets the
+    /// addressed split to equal weights (the reference terminal / Zed dock parity). No-op
+    /// if the path doesn't address a `Split`.
+    pub(super) fn reset_split_weights(
+        &mut self,
+        path: &[usize],
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(current) = self.tree.split_weights(path) {
+            let equal = vec![1.0; current.len()];
+            if self.tree.set_split_weights(path, equal) {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Compute new weights from a live cursor position and write them back
+    /// to the tree. `cursor` is in window coordinates; the math is
+    /// invariant to coordinate origin because we only consume the delta
+    /// against `start_position`. Skipping the update when either side
+    /// would fall below `MIN_FLEX` makes the drag stop at the boundary
+    /// instead of cascading.
+    fn apply_drag(&mut self, cursor: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.active_drag.as_ref() else {
+            return;
+        };
+        if drag.parent_size_px <= 0.0 {
+            return;
+        }
+        let delta_px = match drag.axis {
+            Axis::Horizontal => f32::from(cursor.x - drag.start_position.x),
+            Axis::Vertical => f32::from(cursor.y - drag.start_position.y),
+        };
+        let sum: f32 = drag.initial_weights.iter().sum();
+        if sum <= 0.0 {
+            return;
+        }
+        let delta_w = (delta_px / drag.parent_size_px) * sum;
+        let left = drag.initial_weights[drag.gap_idx];
+        let right = drag.initial_weights[drag.gap_idx + 1];
+        let new_left = left + delta_w;
+        let new_right = right - delta_w;
+        if new_left < crate::shell::pane_tree::MIN_FLEX
+            || new_right < crate::shell::pane_tree::MIN_FLEX
+        {
+            return;
+        }
+        let mut new_weights = drag.initial_weights.clone();
+        new_weights[drag.gap_idx] = new_left;
+        new_weights[drag.gap_idx + 1] = new_right;
+        let path = drag.split_path.clone();
+        if self.tree.set_split_weights(&path, new_weights) {
+            cx.notify();
+        }
     }
 }
 
@@ -295,9 +387,17 @@ fn dispatch_grids_inner(
     h: f32,
     metrics: &CellMetrics,
     cx: &mut Context<MainPane>,
+    dragging: bool,
 ) {
     match node {
         PaneTree::Leaf(id) => {
+            // While a divider drag is in progress we deliberately do NOT
+            // call `set_target_grid` — see `MainPane::dispatch_grids` for
+            // the rationale (PTY resize coalescing). The visible layout
+            // still tracks the cursor via `build_node`'s pixel math.
+            if dragging {
+                return;
+            }
             // Subtract the tab strip's height when this pane has multiple
             // tabs so the terminal rect matches what render actually shows.
             let strip_h = panes
@@ -312,14 +412,40 @@ fn dispatch_grids_inner(
                 pane.update(cx, |tp, cx| tp.set_target_grid(cols, rows, cx));
             }
         }
-        PaneTree::Split { axis, children } if !children.is_empty() => {
-            let n = children.len() as f32;
-            let (cw, ch) = match axis {
-                Axis::Horizontal => (w / n, h),
-                Axis::Vertical => (w, h / n),
+        PaneTree::Split {
+            axis,
+            children,
+            weights,
+        } if !children.is_empty() => {
+            // Invariant: `weights.len() == children.len()`. The zip below
+            // would silently truncate to the shorter side, dropping a pane
+            // from PTY dispatch (Codex flagged this in the pre-fix code).
+            // `remove_leaf` is the one mutation that could plausibly break
+            // it; we now panic in debug if any path got us here misaligned.
+            debug_assert_eq!(
+                children.len(),
+                weights.len(),
+                "Split invariant violated in dispatch_grids_inner"
+            );
+            // Reserve pixel space for the `(n-1)` dividers between siblings
+            // so the cols/rows we hand the PTY match the actual painted
+            // terminal rect. Without this the right-most pane reports +1 col
+            // to the shell and the cursor lands past the visible glyph
+            // column on resize.
+            let gutter = DIVIDER_HIT_PX * (children.len().saturating_sub(1)) as f32;
+            let usable = match axis {
+                Axis::Horizontal => (w - gutter).max(metrics.cell_width),
+                Axis::Vertical => (h - gutter).max(metrics.line_height),
             };
-            for c in children {
-                dispatch_grids_inner(c, panes, cw, ch, metrics, cx);
+            let sum_w: f32 = weights.iter().sum();
+            let sum_w = if sum_w > 0.0 { sum_w } else { 1.0 };
+            for (c, weight) in children.iter().zip(weights.iter()) {
+                let frac = weight / sum_w;
+                let (cw, ch) = match axis {
+                    Axis::Horizontal => (usable * frac, h),
+                    Axis::Vertical => (w, usable * frac),
+                };
+                dispatch_grids_inner(c, panes, cw, ch, metrics, cx, dragging);
             }
         }
         PaneTree::Split { .. } => {}
@@ -368,6 +494,15 @@ impl Render for MainPane {
         self.sync_focused_from_window(window, cx);
         self.dispatch_grids(window, cx);
         let focus_handle = self.focus_handle.clone();
+        let metrics = CellMetrics::measure(&self.typography, window);
+        let (w, h) = available_area(window, self.density.pad_panel, &metrics);
+
+        // `window.on_mouse_event` only works from the paint phase, and
+        // `Render::render` runs during layout — so instead we hang a plain
+        // `on_mouse_move` + `on_mouse_up` listener on the root div. Move
+        // events fire any time the cursor is anywhere over MainPane (the
+        // root spans the whole workspace area), which covers every
+        // realistic divider drag without needing window-level tracking.
 
         div()
             .id("oximux-main-pane")
@@ -381,70 +516,43 @@ impl Render for MainPane {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
-            .child(build_node(&self.tree, &self.panes, &self.theme))
-    }
-}
-
-fn build_node(
-    node: &PaneTree,
-    panes: &HashMap<PaneId, Entity<TabbedPane>>,
-    theme: &Theme,
-) -> gpui::Div {
-    match node {
-        PaneTree::Leaf(id) => {
-            // `overflow_hidden` is load-bearing: each `TerminalView` paints
-            // rows with `whitespace_nowrap`, so if the alacritty grid still
-            // holds content from before a resize (or the TUI hasn't
-            // repainted on SIGWINCH), cells will overflow the leaf's flex
-            // slice and bleed over the next pane + its separator. Clipping
-            // here keeps every pane confined to its assigned slot.
-            //
-            // Active-pane signal is carried entirely by foreground-alpha
-            // dimming on inactive panes (`terminal_row::UNFOCUSED_FG_ALPHA`).
-            // No overlay, no ring, no fill — the reference terminal's lean style. The bg
-            // stays crisp so the 1 px `border_inactive` separators between
-            // splits read cleanly, and the focused pane's full-contrast
-            // text vs. the inactive pane's ~40 % alpha is the only cue.
-            let mut leaf = div()
-                .flex()
-                .flex_1()
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .overflow_hidden();
-            if let Some(pane) = panes.get(id) {
-                leaf = leaf.child(pane.clone());
-            }
-            leaf
-        }
-        PaneTree::Split { axis, children } => {
-            let mut row = div()
-                .flex()
-                .flex_1()
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .overflow_hidden();
-            row = match axis {
-                Axis::Horizontal => row.flex_row(),
-                Axis::Vertical => row.flex_col(),
-            };
-            // Each non-first child carries a 1px separator border on its
-            // leading edge (border_inactive). Active-pane indication is
-            // carried entirely by foreground-alpha dimming on inactive
-            // panes (`terminal_row::UNFOCUSED_FG_ALPHA`) — the reference terminal's lean
-            // style: no ring, no fill, no chrome. Focused content reads
-            // bright, inactive content fades to ~40 % alpha and the eye
-            // lands on the active pane without a visual border.
-            for (i, c) in children.iter().enumerate() {
-                let mut child = build_node(c, panes, theme);
-                if i > 0 {
-                    child = match axis {
-                        Axis::Horizontal => child.border_l_1().border_color(theme.border_inactive),
-                        Axis::Vertical => child.border_t_1().border_color(theme.border_inactive),
-                    };
-                }
-                row = row.child(child);
-            }
-            row
-        }
+            .on_mouse_move(cx.listener(
+                |this, e: &MouseMoveEvent, _window, cx| {
+                    if this.active_drag.is_none() {
+                        return;
+                    }
+                    // If the left button is no longer held, the user
+                    // released *outside* MainPane's hitbox (e.g. over the
+                    // OS title bar or the sidebar) so `on_mouse_up` never
+                    // fired. Without this check, the divider would keep
+                    // following the cursor without any button held until
+                    // the user clicked again. Clear the drag now that we
+                    // can see the button state.
+                    if e.pressed_button != Some(MouseButton::Left) {
+                        this.active_drag = None;
+                        cx.notify();
+                        return;
+                    }
+                    this.apply_drag(e.position, cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                    if this.active_drag.is_some() {
+                        this.active_drag = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(build_node(
+                &self.tree,
+                &self.panes,
+                &self.theme,
+                &[],
+                w,
+                h,
+                cx.entity().clone(),
+            ))
     }
 }
