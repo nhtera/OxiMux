@@ -1,0 +1,14 @@
+diff --git a/src/old_name.rs b/src/new_name.rs
+similarity index 94%
+rename from src/old_name.rs
+rename to src/new_name.rs
+index 1111111..2222222 100644
+--- a/src/old_name.rs
++++ b/src/new_name.rs
+@@ -3,5 +3,5 @@ fn keep() {
+     println!("unchanged context");
+ }
+
+-fn renamed_change() {}
++fn renamed_after() {}
+

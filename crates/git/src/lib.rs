@@ -7,12 +7,14 @@
 //!
 //! Domain shapes (`GitState`, `FileStatus`, …) live in `oximux-core`.
 
+pub mod diff;
 pub mod error;
 pub mod poller;
 pub mod process;
 pub mod repository;
 pub mod status;
 
+pub use diff::{DiffParseError, parse_unified_diff};
 pub use error::{GitError, Result};
 pub use poller::{DEFAULT_TICK, StatusPoller};
 pub use process::{GitCmd, Output, RawOutput};

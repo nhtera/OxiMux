@@ -1,0 +1,24 @@
+diff --git a/src/a.rs b/src/a.rs
+index 1111111..2222222 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,4 +1,5 @@
+ fn first() {
+-    let x = 1;
++    let x = 2;
++    let y = 3;
+ }
+
+@@ -10,3 +11,3 @@ fn second() {
+     let a = 10;
+-    let b = 20;
++    let b = 21;
+ }
+diff --git a/src/b.rs b/src/b.rs
+index 3333333..4444444 100644
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ same
