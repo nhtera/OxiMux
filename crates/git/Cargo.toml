@@ -9,6 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
-anyhow = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -28,6 +28,7 @@ docs/reference-screenshots
 docs/reference.md
 docs/brief.md
 docs/adr
+docs/journals
 
 # Claude Code harness state (session locks, scratch files)
 .claude/

@@ -6,6 +6,10 @@
 //!
 //! Phase 0: skeleton only. Real types land in Phase 1+ as call sites need them.
 
+pub mod git_state;
+
+pub use git_state::{FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus};
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

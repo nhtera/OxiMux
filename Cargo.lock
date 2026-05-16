@@ -4279,8 +4279,9 @@ dependencies = [
 name = "oximux-git"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "oximux-core",
+ "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
