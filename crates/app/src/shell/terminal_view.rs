@@ -29,6 +29,7 @@ use oximux_pty::{
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::Search;
+use crate::shell::cell_metrics::LINE_HEIGHT_EXTRA;
 use crate::shell::key_input::keystroke_to_bytes;
 use crate::shell::terminal_row::build_row;
 use crate::shell::terminal_search_overlay;
@@ -332,26 +333,35 @@ impl TerminalView {
         if events.is_empty() {
             return;
         }
-        // Resnapshot + reset blink only on real bytes. `Resize` and `Exit`
-        // also flow through here — skipping the snapshot avoids one mutex
-        // lock + full grid allocation per resize event under flood, and
-        // skipping the blink reset stops the cursor pinning visible on a
-        // dead session after the shell quits.
-        let mut has_output = false;
+        // Resnapshot on `Output` (new bytes landed in the grid) AND `Resize`
+        // (Term::resize reflowed existing rows + may have shrunk row count).
+        // Skipping `Resize` here was the cause of the post-split clipping
+        // regression: the cached snapshot kept its pre-resize dimensions
+        // and overflowed the narrower pane until the shell echoed again.
+        // `Exit` still falls through — no grid mutation, no resnap needed,
+        // and avoids pinning the cursor visible on a dead session.
+        let mut needs_snapshot = false;
+        let mut had_output = false;
         let mut latest_title: Option<String> = None;
         for ev in &events {
             match ev {
-                TerminalEvent::Output { .. } => has_output = true,
+                TerminalEvent::Output { .. } => {
+                    needs_snapshot = true;
+                    had_output = true;
+                }
+                TerminalEvent::Resize { .. } => needs_snapshot = true,
                 TerminalEvent::TitleChange { title, .. } => {
                     latest_title = Some(title.clone());
                 }
                 _ => {}
             }
         }
-        if has_output {
-            if let Ok(snapshot) = self.backend.snapshot(self.session_id) {
-                self.snapshot = snapshot;
-            }
+        if needs_snapshot
+            && let Ok(snapshot) = self.backend.snapshot(self.session_id)
+        {
+            self.snapshot = snapshot;
+        }
+        if had_output {
             self.cursor_visible = true;
         }
         if let Some(title) = latest_title {
@@ -378,6 +388,15 @@ impl TerminalView {
             return;
         }
         self.last_resize = self.target_grid;
+        // Pull a fresh snapshot immediately. Without this, the next paint
+        // still uses the pre-resize grid (old cols/rows) inside the new
+        // pane bounds — wide rows overflow + clip, and reflow that
+        // `Term::resize` already performed isn't visible until the shell
+        // next emits output. The render that triggered `maybe_resize`
+        // proceeds with up-to-date cell data this same frame.
+        if let Ok(snapshot) = self.backend.snapshot(self.session_id) {
+            self.snapshot = snapshot;
+        }
     }
 }
 
@@ -391,12 +410,20 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_resize();
 
-        // Cursor is only drawn when this pane is focused *and* we're in the
-        // visible half of the blink cycle. Out-of-grid sentinels make
-        // `build_row`'s cursor-col check fall through silently — no `if`
-        // gating in the hot path.
-        let show_cursor = self.focus_handle.is_focused(window) && self.cursor_visible;
-        let cursor = if show_cursor {
+        // Cursor visibility rules:
+        //   - Focused + blink on  → solid inverse block (active cursor)
+        //   - Focused + blink off → hidden (mid-blink phase)
+        //   - Unfocused           → ghost cursor: inverted but bg dimmed to
+        //                           `UNFOCUSED_CURSOR_ALPHA` so the user can
+        //                           still see where the shell's caret sits
+        //                           without it competing with the focused pane.
+        // Out-of-grid sentinels keep `build_row`'s cursor-col check fall-
+        // through silently in the hidden case — no `if` gating in the hot
+        // path. Pane-focus also drives the inactive FG dim
+        // (`terminal_row::UNFOCUSED_FG_ALPHA`).
+        let pane_focused = self.focus_handle.is_focused(window);
+        let cursor_visible = !pane_focused || self.cursor_visible;
+        let cursor = if cursor_visible {
             (
                 self.snapshot.cursor.0 as usize,
                 self.snapshot.cursor.1 as usize,
@@ -405,7 +432,12 @@ impl Render for TerminalView {
             (usize::MAX, usize::MAX)
         };
         let theme = self.theme;
-        let line_height = px(self.typography.t_body_lg + 4.0);
+        // Source line-height from `cell_metrics::LINE_HEIGHT_EXTRA` so this
+        // never drifts from `MainPane`'s grid math. Tight ratio (≈ 1.21×)
+        // sits inside Menlo's em-square at 14 pt and keeps half-block
+        // glyphs (▀ ▄) tiling — the Claude Code mascot is the canonical
+        // regression case.
+        let line_height = px(self.typography.t_body_lg + LINE_HEIGHT_EXTRA);
         let pad = px(self.density.pad_panel);
         let focus_handle = self.focus_handle.clone();
 
@@ -423,7 +455,15 @@ impl Render for TerminalView {
             .enumerate()
             .map(|(row_idx, row)| {
                 let match_cols = buckets.get(row_idx).map(|v| v.as_slice());
-                build_row(row, row_idx, cursor, match_cols, &theme, line_height)
+                build_row(
+                    row,
+                    row_idx,
+                    cursor,
+                    match_cols,
+                    &theme,
+                    line_height,
+                    pane_focused,
+                )
             })
             .collect();
 
@@ -495,7 +535,11 @@ impl Render for TerminalView {
             .w_full()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
-            .font_family(self.typography.family_mono.clone())
+            // `.font(...)` over `.font_family(...)` so the configured
+            // fallback chain (SF Mono → Menlo → Monaco) takes effect when
+            // the primary face (Geist Mono) isn't installed. `font_family`
+            // takes a single literal name and never cascades.
+            .font(self.typography.mono_font())
             .text_size(px(self.typography.t_body_lg))
             .px(pad)
             .py(pad)

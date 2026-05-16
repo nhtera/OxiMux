@@ -32,7 +32,7 @@ impl RowFixtureView {
 
 impl Render for RowFixtureView {
     fn render(&mut self, _win: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        build_row(&self.row, 0, (0, 0), None, &self.theme, px(20.))
+        build_row(&self.row, 0, (0, 0), None, &self.theme, px(20.), true)
     }
 }
 

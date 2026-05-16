@@ -91,7 +91,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
     // glyph baseline. Pad +2 px so it isn't shorter than the tallest glyph.
     let caret_height = px(typography.t_body_lg + 2.0);
     let toggle_text_size = px(typography.t_body_md);
-    let mono = typography.family_mono.clone();
+    let mono = typography.mono_font();
 
     div()
         .absolute()
@@ -125,7 +125,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
                 .border_1()
                 .border_color(theme.focus_ring)
                 .rounded(px(4.0))
-                .font_family(mono.clone())
+                .font(mono.clone())
                 .text_size(px(typography.t_body_lg))
                 .child(
                     div()

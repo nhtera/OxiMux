@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Subscription, Window, div, hsla, px,
+    ParentElement, Render, Styled, Subscription, Window, div, px,
 };
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
@@ -27,15 +27,10 @@ use crate::actions::{
     CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, PrevTab, SplitHorizontal,
     SplitVertical,
 };
+use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
 use crate::shell::tabbed_pane::{TAB_STRIP_HEIGHT_PX, TabbedPane};
 use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView};
-
-/// Hardcoded cell metrics for Geist Mono 14 px. Replace with
-/// `text_system().line_height()` + advance lookup during the step 9
-/// perf/measurement pass.
-const CELL_WIDTH_PX: f32 = 8.4;
-const CELL_HEIGHT_PX: f32 = 18.0;
 
 /// Chrome subtracted from viewport when computing the terminal area. Mirrors
 /// `WorkspaceRoot` composition + density tokens.
@@ -44,11 +39,6 @@ const CHROME_H_PX: f32 = 36.0 + 22.0; // top bar + status bar
 
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
-
-/// Translucent veil drawn over unfocused leaves. Mid-charcoal at ~22% alpha
-/// reads as "dim, but the text under it is still legible" — close to iTerm2's
-/// inactive-pane treatment without going full grey-out.
-const DIM_ALPHA: f32 = 0.22;
 
 pub struct MainPane {
     tree: PaneTree,
@@ -273,8 +263,9 @@ impl MainPane {
     }
 
     fn dispatch_grids(&self, window: &Window, cx: &mut Context<Self>) {
-        let (w, h) = available_area(window, self.density.pad_panel);
-        dispatch_grids_inner(&self.tree, &self.panes, w, h, cx);
+        let metrics = CellMetrics::measure(&self.typography, window);
+        let (w, h) = available_area(window, self.density.pad_panel, &metrics);
+        dispatch_grids_inner(&self.tree, &self.panes, w, h, &metrics, cx);
     }
 }
 
@@ -290,10 +281,10 @@ fn focus_pane(
     }
 }
 
-fn available_area(window: &Window, pad_panel: f32) -> (f32, f32) {
+fn available_area(window: &Window, pad_panel: f32, metrics: &CellMetrics) -> (f32, f32) {
     let v = window.viewport_size();
-    let w = (f32::from(v.width) - CHROME_W_PX - pad_panel * 2.0).max(CELL_WIDTH_PX);
-    let h = (f32::from(v.height) - CHROME_H_PX - pad_panel * 2.0).max(CELL_HEIGHT_PX);
+    let w = (f32::from(v.width) - CHROME_W_PX - pad_panel * 2.0).max(metrics.cell_width);
+    let h = (f32::from(v.height) - CHROME_H_PX - pad_panel * 2.0).max(metrics.line_height);
     (w, h)
 }
 
@@ -302,6 +293,7 @@ fn dispatch_grids_inner(
     panes: &HashMap<PaneId, Entity<TabbedPane>>,
     w: f32,
     h: f32,
+    metrics: &CellMetrics,
     cx: &mut Context<MainPane>,
 ) {
     match node {
@@ -313,9 +305,9 @@ fn dispatch_grids_inner(
                 .filter(|p| p.read(cx).tab_count() > 1)
                 .map(|_| TAB_STRIP_HEIGHT_PX)
                 .unwrap_or(0.0);
-            let usable_h = (h - strip_h).max(CELL_HEIGHT_PX);
-            let cols = ((w / CELL_WIDTH_PX).floor() as u16).max(MIN_COLS);
-            let rows = ((usable_h / CELL_HEIGHT_PX).floor() as u16).max(MIN_ROWS);
+            let usable_h = (h - strip_h).max(metrics.line_height);
+            let cols = metrics.cols_in(w).max(MIN_COLS);
+            let rows = metrics.rows_in(usable_h).max(MIN_ROWS);
             if let Some(pane) = panes.get(id) {
                 pane.update(cx, |tp, cx| tp.set_target_grid(cols, rows, cx));
             }
@@ -327,7 +319,7 @@ fn dispatch_grids_inner(
                 Axis::Vertical => (w, h / n),
             };
             for c in children {
-                dispatch_grids_inner(c, panes, cw, ch, cx);
+                dispatch_grids_inner(c, panes, cw, ch, metrics, cx);
             }
         }
         PaneTree::Split { .. } => {}
@@ -389,12 +381,7 @@ impl Render for MainPane {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
-            .child(build_node(
-                &self.tree,
-                &self.panes,
-                &self.theme,
-                self.focused,
-            ))
+            .child(build_node(&self.tree, &self.panes, &self.theme))
     }
 }
 
@@ -402,7 +389,6 @@ fn build_node(
     node: &PaneTree,
     panes: &HashMap<PaneId, Entity<TabbedPane>>,
     theme: &Theme,
-    focused: PaneId,
 ) -> gpui::Div {
     match node {
         PaneTree::Leaf(id) => {
@@ -413,12 +399,13 @@ fn build_node(
             // slice and bleed over the next pane + its separator. Clipping
             // here keeps every pane confined to its assigned slot.
             //
-            // `relative` is load-bearing too: the unfocused dim veil below
-            // uses `absolute().inset_0()` to cover the leaf without
-            // affecting layout, and absolute positions resolve against the
-            // nearest positioned ancestor.
+            // Active-pane signal is carried entirely by foreground-alpha
+            // dimming on inactive panes (`terminal_row::UNFOCUSED_FG_ALPHA`).
+            // No overlay, no ring, no fill — the reference terminal's lean style. The bg
+            // stays crisp so the 1 px `border_inactive` separators between
+            // splits read cleanly, and the focused pane's full-contrast
+            // text vs. the inactive pane's ~40 % alpha is the only cue.
             let mut leaf = div()
-                .relative()
                 .flex()
                 .flex_1()
                 .min_w(px(0.))
@@ -426,20 +413,6 @@ fn build_node(
                 .overflow_hidden();
             if let Some(pane) = panes.get(id) {
                 leaf = leaf.child(pane.clone());
-            }
-            // Dim overlay for unfocused leaves. Plain non-interactive div —
-            // no `.occlude()`, no `.id()`, no listeners — so mouse-downs
-            // pass through to the TerminalView beneath and click-to-focus
-            // works on the first click. DO NOT add `.occlude()`, an `.id()`,
-            // or any event handler here without re-routing pointer events,
-            // or click-to-activate on unfocused panes will silently break.
-            if *id != focused {
-                leaf = leaf.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .bg(hsla(0.0, 0.0, 0.0, DIM_ALPHA)),
-                );
             }
             leaf
         }
@@ -455,21 +428,19 @@ fn build_node(
                 Axis::Vertical => row.flex_col(),
             };
             // Each non-first child carries a 1px separator border on its
-            // leading edge (border_inactive). The focused leaf gets a 2px
-            // ring on all sides (focus_ring) that overrides any separator
-            // border — this is the visible "active pane" indicator.
+            // leading edge (border_inactive). Active-pane indication is
+            // carried entirely by foreground-alpha dimming on inactive
+            // panes (`terminal_row::UNFOCUSED_FG_ALPHA`) — the reference terminal's lean
+            // style: no ring, no fill, no chrome. Focused content reads
+            // bright, inactive content fades to ~40 % alpha and the eye
+            // lands on the active pane without a visual border.
             for (i, c) in children.iter().enumerate() {
-                let mut child = build_node(c, panes, theme, focused);
+                let mut child = build_node(c, panes, theme);
                 if i > 0 {
                     child = match axis {
                         Axis::Horizontal => child.border_l_1().border_color(theme.border_inactive),
                         Axis::Vertical => child.border_t_1().border_color(theme.border_inactive),
                     };
-                }
-                if let PaneTree::Leaf(leaf_id) = c
-                    && *leaf_id == focused
-                {
-                    child = child.border_2().border_color(theme.focus_ring);
                 }
                 row = row.child(child);
             }
