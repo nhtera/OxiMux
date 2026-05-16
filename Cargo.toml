@@ -57,6 +57,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Phase 1-2 prep (declared centrally; pulled into crates as used)
 portable-pty = "0.8"
 alacritty_terminal = "0.25"
+# Regex engine for the scrollback search's `.*` toggle. `unicode` features
+# left off — terminal content is ASCII-dominant and the smaller binary +
+# faster compile matter more than full Unicode property classes here.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 # Phase 4 prep
 rusqlite = { version = "0.31", features = ["bundled"] }

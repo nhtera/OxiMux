@@ -4253,6 +4253,7 @@ dependencies = [
  "oximux-core",
  "oximux-pty",
  "oximux-settings",
+ "regex",
  "tracing",
  "tracing-subscriber",
 ]

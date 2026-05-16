@@ -24,7 +24,8 @@ use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    CloseTab, FocusNextPane, NewTab, NextTab, PrevTab, SplitHorizontal, SplitVertical,
+    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, PrevTab, SplitHorizontal,
+    SplitVertical,
 };
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
 use crate::shell::tabbed_pane::{TAB_STRIP_HEIGHT_PX, TabbedPane};
@@ -199,6 +200,21 @@ impl MainPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cycle_focus(1, window, cx);
+    }
+
+    fn on_focus_prev_pane(
+        &mut self,
+        _: &FocusPrevPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_focus(-1, window, cx);
+    }
+
+    /// Shared cycling math for Cmd+] / Cmd+[. `step` is +1 for next, -1 for
+    /// prev; wraps modulo `leaves.len()`.
+    fn cycle_focus(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_focused_from_window(window, cx);
         let leaves = self.tree.in_order_leaves();
         if leaves.len() < 2 {
@@ -207,7 +223,9 @@ impl MainPane {
         let Some(pos) = leaves.iter().position(|id| *id == self.focused) else {
             return;
         };
-        let next = leaves[(pos + 1) % leaves.len()];
+        let len = leaves.len() as isize;
+        let target = ((pos as isize + step).rem_euclid(len)) as usize;
+        let next = leaves[target];
         self.focused = next;
         focus_pane(&self.panes, next, window, cx);
         cx.notify();
@@ -366,6 +384,7 @@ impl Render for MainPane {
             .on_action(cx.listener(Self::on_split_horizontal))
             .on_action(cx.listener(Self::on_split_vertical))
             .on_action(cx.listener(Self::on_focus_next_pane))
+            .on_action(cx.listener(Self::on_focus_prev_pane))
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))

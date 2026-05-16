@@ -74,6 +74,10 @@ pub struct TerminalView {
     /// the state machine + key dispatch. The view owns I/O (grid fetch +
     /// `cx.notify`) and delegates everything else.
     search: SearchState,
+    /// Latest OSC 2 title from the PTY (`TerminalEvent::TitleChange`). `None`
+    /// until the shell emits one. `TabbedPane` reads this through `title()`
+    /// and uses it as the tab label, falling back to `"Tab N"` when None.
+    title: Option<String>,
     _poll_task: Task<()>,
     _blink_task: Task<()>,
 }
@@ -135,6 +139,7 @@ impl TerminalView {
             cursor_visible: true,
             focused: true,
             search: SearchState::new(),
+            title: None,
             _poll_task: poll_task,
             _blink_task: blink_task,
         }
@@ -332,16 +337,33 @@ impl TerminalView {
         // lock + full grid allocation per resize event under flood, and
         // skipping the blink reset stops the cursor pinning visible on a
         // dead session after the shell quits.
-        let has_output = events
-            .iter()
-            .any(|e| matches!(e, TerminalEvent::Output { .. }));
+        let mut has_output = false;
+        let mut latest_title: Option<String> = None;
+        for ev in &events {
+            match ev {
+                TerminalEvent::Output { .. } => has_output = true,
+                TerminalEvent::TitleChange { title, .. } => {
+                    latest_title = Some(title.clone());
+                }
+                _ => {}
+            }
+        }
         if has_output {
             if let Ok(snapshot) = self.backend.snapshot(self.session_id) {
                 self.snapshot = snapshot;
             }
             self.cursor_visible = true;
         }
+        if let Some(title) = latest_title {
+            self.title = Some(title);
+        }
         cx.notify();
+    }
+
+    /// Latest OSC 2 title the shell emitted, if any. Used by `TabbedPane` to
+    /// label the tab strip.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     fn maybe_resize(&mut self) {
@@ -409,31 +431,56 @@ impl Render for TerminalView {
             let badge = self.search.count_badge();
             let query = self.search.query.clone();
             let typography = self.typography.clone();
+            let options = self.search.options;
             // Caret blinks in lock-step with the terminal cursor — the
             // existing 530ms blink_task already drives `cursor_visible`,
             // so the overlay caret needs no second timer.
             let caret_on = self.cursor_visible;
-            let on_prev = cx.listener(|this, _, _, cx| {
+            // Toggle handlers flip the bit and rerun the scan. Rerun
+            // touches the backend so it has to live inside the listener
+            // (we have `&mut Self` + `&mut Context` here).
+            let on_toggle_case = Box::new(cx.listener(|this, _, _, cx| {
+                this.search.toggle_case_sensitive();
+                this.rerun_search();
+                cx.notify();
+            })) as terminal_search_overlay::ClickHandler;
+            let on_toggle_word = Box::new(cx.listener(|this, _, _, cx| {
+                this.search.toggle_whole_word();
+                this.rerun_search();
+                cx.notify();
+            })) as terminal_search_overlay::ClickHandler;
+            let on_toggle_regex = Box::new(cx.listener(|this, _, _, cx| {
+                this.search.toggle_regex();
+                this.rerun_search();
+                cx.notify();
+            })) as terminal_search_overlay::ClickHandler;
+            let on_prev = Box::new(cx.listener(|this, _, _, cx| {
                 this.search.prev_match();
                 cx.notify();
-            });
-            let on_next = cx.listener(|this, _, _, cx| {
+            })) as terminal_search_overlay::ClickHandler;
+            let on_next = Box::new(cx.listener(|this, _, _, cx| {
                 this.search.next_match();
                 cx.notify();
-            });
-            let on_close = cx.listener(|this, _, _, cx| {
+            })) as terminal_search_overlay::ClickHandler;
+            let on_close = Box::new(cx.listener(|this, _, _, cx| {
                 this.search.close();
                 cx.notify();
-            });
+            })) as terminal_search_overlay::ClickHandler;
             Some(terminal_search_overlay::build(
-                &query,
-                badge,
-                caret_on,
-                &theme,
-                &typography,
-                on_prev,
-                on_next,
-                on_close,
+                terminal_search_overlay::Params {
+                    query: &query,
+                    badge,
+                    caret_on,
+                    options,
+                    theme: &theme,
+                    typography: &typography,
+                    on_toggle_case,
+                    on_toggle_word,
+                    on_toggle_regex,
+                    on_prev,
+                    on_next,
+                    on_close,
+                },
             ))
         } else {
             None

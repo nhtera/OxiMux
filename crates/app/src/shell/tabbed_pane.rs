@@ -234,8 +234,20 @@ impl Render for TabbedPane {
             .on_click(cx.listener(|this, ix: &usize, window, cx| {
                 this.set_active(*ix, window, cx);
             }));
+        // Tab label prefers the shell's OSC 2 title when present; falls back
+        // to the static `"Tab N"` slug when the shell hasn't emitted one yet
+        // (or emitted an empty title). Pulled live each render so the label
+        // updates as soon as the title changes — the existing per-view
+        // observer already notifies us on TerminalView state mutations.
         for entry in &self.tabs {
-            bar = bar.child(Tab::new().label(entry.label.clone()));
+            let label = entry
+                .view
+                .read(cx)
+                .title()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| SharedString::from(t.to_string()))
+                .unwrap_or_else(|| entry.label.clone());
+            bar = bar.child(Tab::new().label(label));
         }
 
         div()

@@ -1,14 +1,15 @@
 //! VS Code-style search overlay layout.
 //!
-//! Pure layout function. The host (`TerminalView`) supplies the data slice
-//! (`query`, `badge`) and three `cx.listener`-wrapped closures for the
-//! click handlers (prev / next / close). The overlay file knows nothing
-//! about `TerminalView` internals, which keeps the `pub` surface of the
-//! view minimal — same host-owns-I/O pattern as `terminal_search_state.rs`.
+//! Pure layout function. The host (`TerminalView`) constructs a [`Params`]
+//! struct holding the data slice (`query`, `badge`, `options`) plus six
+//! `cx.listener`-wrapped click handlers (three toggles + prev/next/close).
+//! The overlay file knows nothing about `TerminalView` internals, which
+//! keeps the `pub` surface of the view minimal — same host-owns-I/O pattern
+//! as `terminal_search_state.rs`.
 //!
 //! Anti-`.occlude()` lesson still applies: the outer container has no
 //! `.id()` / `.occlude()` / wrapper listeners. Click capture happens only
-//! on the three `Button` children, so clicks outside their bounding boxes
+//! on the inline `Button` children, so clicks outside their bounding boxes
 //! pass through to the terminal grid behind.
 
 use gpui::{
@@ -16,50 +17,68 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    IconName, Sizable as _,
+    IconName, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants},
 };
 use oximux_settings::{Theme, Typography};
 
-/// Build the search overlay element.
+use crate::shell::terminal_search::SearchOptions;
+
+/// Boxed click handler. Each handler is invoked at most once per render
+/// (`Button` takes ownership), so one boxed allocation per overlay build is
+/// the cost. Boxing here lets us bundle all six handlers in a non-generic
+/// `Params` struct instead of carrying six type parameters through the
+/// build function.
+pub type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+
+/// Bundle of inputs for [`build`]. Construction lives at the call site
+/// (see `TerminalView::render`); the overlay just consumes it.
+pub struct Params<'a> {
+    pub query: &'a str,
+    pub badge: String,
+    pub caret_on: bool,
+    pub options: SearchOptions,
+    pub theme: &'a Theme,
+    pub typography: &'a Typography,
+    pub on_toggle_case: ClickHandler,
+    pub on_toggle_word: ClickHandler,
+    pub on_toggle_regex: ClickHandler,
+    pub on_prev: ClickHandler,
+    pub on_next: ClickHandler,
+    pub on_close: ClickHandler,
+}
+
+/// Build the search overlay element. See [`Params`] for inputs.
 ///
-/// `query` is the live needle. `badge` is the pre-formatted count
-/// (e.g. `"3 of 47"`); empty when no query is active. `caret_on` toggles
-/// the blue caret on/off — caller threads `TerminalView::cursor_visible`
-/// so the overlay caret blinks in sync with the terminal cursor (same
-/// 530ms tick, no new timer). The three closures run on click —
-/// typically `cx.listener` wrappers that mutate `TerminalView::search`
-/// and call `cx.notify()`.
-// 8 args is at clippy's threshold but each is load-bearing (3 click
-// closures + caret state + theme + typography + query + badge) and
-// bundling them into a struct adds boilerplate at every call site
-// without simplifying the interface. Single call site, single owner.
-#[allow(clippy::too_many_arguments)]
-pub fn build<F1, F2, F3>(
-    query: &str,
-    badge: String,
-    caret_on: bool,
-    theme: &Theme,
-    typography: &Typography,
-    on_prev: F1,
-    on_next: F2,
-    on_close: F3,
-) -> impl IntoElement + use<F1, F2, F3>
-where
-    F1: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    F2: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    F3: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-{
+/// The trailing `+ use<>` is required under Rust 2024's precise-capture
+/// rules. Without it, the compiler conservatively captures every input
+/// lifetime, and the returned element ends up borrowing from `params`'s
+/// short-lived `&Theme` / `&Typography` references. With `use<>` we opt
+/// into capturing nothing — the returned element owns its data after
+/// `build` runs.
+pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
+    let Params {
+        query,
+        badge,
+        caret_on,
+        options,
+        theme,
+        typography,
+        on_toggle_case,
+        on_toggle_word,
+        on_toggle_regex,
+        on_prev,
+        on_next,
+        on_close,
+    } = params;
     let query_empty = query.is_empty();
     let query_text = if query_empty {
         SharedString::from("Find")
     } else {
         SharedString::from(query.to_string())
     };
-    // Caret: thin vertical bar that signals "ready to type". Static (no
-    // blink) — adding a blink timer for an overlay that's already visually
-    // active would burn a notify every 530ms while open. The overlay
-    // itself disappearing on Esc is the strong "off" signal.
+    // Caret height tracks the body font so the bar visually lines up with
+    // glyph baseline. Pad +2 px so it isn't shorter than the tallest glyph.
     let caret_height = px(typography.t_body_lg + 2.0);
 
     div()
@@ -86,10 +105,10 @@ where
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(6.0))
                 .px(px(8.0))
                 .py(px(2.0))
-                .min_w(px(180.0))
+                .min_w(px(220.0))
                 .bg(theme.bg_base)
                 .border_1()
                 .border_color(theme.focus_ring)
@@ -101,6 +120,7 @@ where
                         .flex()
                         .flex_row()
                         .items_center()
+                        .flex_1()
                         .text_color(if query_empty {
                             theme.fg_subtle
                         } else {
@@ -121,9 +141,38 @@ where
                                 .bg(theme.focus_ring),
                         ),
                 )
+                // Three inline toggles inside the input frame, before the
+                // count badge. Order mirrors VS Code: Aa, ab, .*. The
+                // active background is the theme `focus_ring` tinted at the
+                // standard component-active level via `selected(true)` —
+                // gpui-component's Button toggles its own bg when selected.
+                .child(toggle_button(
+                    "oximux-search-toggle-case",
+                    "Aa",
+                    "Match case (Aa)",
+                    options.case_sensitive,
+                    theme,
+                    on_toggle_case,
+                ))
+                .child(toggle_button(
+                    "oximux-search-toggle-word",
+                    "ab",
+                    "Whole word (ab)",
+                    options.whole_word,
+                    theme,
+                    on_toggle_word,
+                ))
+                .child(toggle_button(
+                    "oximux-search-toggle-regex",
+                    ".*",
+                    "Regex (.*)",
+                    options.regex,
+                    theme,
+                    on_toggle_regex,
+                ))
                 .child(
                     div()
-                        .ml_auto()
+                        .ml(px(4.0))
                         .text_color(theme.fg_muted)
                         .text_size(px(typography.t_label_xs))
                         .child(SharedString::from(badge)),
@@ -134,6 +183,7 @@ where
                 .ghost()
                 .small()
                 .icon(IconName::ChevronUp)
+                .tooltip("Previous match (Shift+Enter)")
                 .on_click(on_prev),
         )
         .child(
@@ -141,6 +191,7 @@ where
                 .ghost()
                 .small()
                 .icon(IconName::ChevronDown)
+                .tooltip("Next match (Enter)")
                 .on_click(on_next),
         )
         .child(
@@ -148,6 +199,43 @@ where
                 .ghost()
                 .small()
                 .icon(IconName::Close)
+                .tooltip("Close (Esc)")
                 .on_click(on_close),
         )
+}
+
+/// Build one of the three inline toggle buttons. Uses gpui-component's
+/// `Button` so the active-state styling stays consistent with the rest of
+/// the UI's button surfaces. The active background is derived from
+/// `focus_ring` so the toggles read as "armed" without competing with the
+/// surrounding chrome.
+fn toggle_button(
+    id: &'static str,
+    label: &'static str,
+    tooltip: &'static str,
+    active: bool,
+    theme: &Theme,
+    on_click: ClickHandler,
+) -> impl IntoElement {
+    let mut btn = Button::new(id)
+        .ghost()
+        .small()
+        .label(label)
+        .tooltip(tooltip)
+        .on_click(on_click);
+    if active {
+        btn = btn.selected(true);
+    }
+    div()
+        .when(active, |this| {
+            // Backstop styling: in case the host theme's Button "selected"
+            // bg is too subtle to read on the dark overlay, this border
+            // gives the toggle a visible armed state. Cheap and idempotent
+            // — gets overridden by Button's own pressed-state color when
+            // gpui-component decides to repaint.
+            this.border_1()
+                .border_color(theme.focus_ring)
+                .rounded(px(4.0))
+        })
+        .child(btn)
 }

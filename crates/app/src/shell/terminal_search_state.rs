@@ -14,7 +14,7 @@
 use gpui::KeyDownEvent;
 use oximux_pty::Cell;
 
-use crate::shell::terminal_search::{MatchRange, find_matches};
+use crate::shell::terminal_search::{MatchRange, SearchOptions, find_matches_with_options};
 
 /// Outcome of a keystroke routed to the search overlay. The host matches
 /// on this to decide whether to notify, fetch a fresh grid, or fall through
@@ -67,6 +67,10 @@ pub struct SearchState {
     /// `Some(0)` after each `rerun` when matches exist, advanced by
     /// `next_match` / `prev_match`. `None` when no matches.
     pub current_index: Option<usize>,
+    /// Toggle state for the Aa / ab / .* overlay buttons. Defaults to all-
+    /// off, which preserves the original "case-insensitive plain substring"
+    /// scan behavior.
+    pub options: SearchOptions,
 }
 
 impl SearchState {
@@ -77,6 +81,7 @@ impl SearchState {
             matches: Vec::new(),
             history_len: 0,
             current_index: None,
+            options: SearchOptions::default(),
         }
     }
 
@@ -98,11 +103,11 @@ impl SearchState {
         self.current_index = None;
     }
 
-    /// Re-scan the grid for the current query. Empty-query short-circuit
-    /// keeps the host from over-fetching. Resets `current_index` to the
-    /// first match so the user sees a highlighted "current" on every
-    /// query mutation (— find-as-you-type lands you on the
-    /// first hit immediately).
+    /// Re-scan the grid for the current query under the current `options`.
+    /// Empty-query short-circuit keeps the host from over-fetching. Resets
+    /// `current_index` to the first match so the user sees a highlighted
+    /// "current" on every query mutation (— find-as-you-type
+    /// lands you on the first hit immediately).
     pub fn rerun(&mut self, grid: &[Vec<Cell>], visible_rows: usize) {
         if self.query.is_empty() {
             self.matches.clear();
@@ -111,12 +116,28 @@ impl SearchState {
             return;
         }
         self.history_len = grid.len().saturating_sub(visible_rows);
-        self.matches = find_matches(grid, &self.query);
+        self.matches = find_matches_with_options(grid, &self.query, self.options);
         self.current_index = if self.matches.is_empty() {
             None
         } else {
             Some(0)
         };
+    }
+
+    /// Flip the case-sensitive toggle. Caller must `rerun` afterward — the
+    /// state machine is pure so it doesn't touch the grid.
+    pub fn toggle_case_sensitive(&mut self) {
+        self.options.case_sensitive = !self.options.case_sensitive;
+    }
+
+    /// Flip the whole-word toggle. Caller must `rerun` afterward.
+    pub fn toggle_whole_word(&mut self) {
+        self.options.whole_word = !self.options.whole_word;
+    }
+
+    /// Flip the regex toggle. Caller must `rerun` afterward.
+    pub fn toggle_regex(&mut self) {
+        self.options.regex = !self.options.regex;
     }
 
     /// Cycle to the next match, wrapping. No-op when there are no matches.

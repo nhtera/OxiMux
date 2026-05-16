@@ -20,6 +20,8 @@ actions!(
         SplitVertical,
         /// Cycle focus to the next pane in in-order traversal.
         FocusNextPane,
+        /// Cycle focus to the previous pane in in-order traversal.
+        FocusPrevPane,
         /// Open a new terminal tab inside the focused pane.
         NewTab,
         /// Close the active tab in the focused pane. Cascades to `ClosePane`

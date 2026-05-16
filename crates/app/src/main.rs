@@ -12,7 +12,8 @@ use tracing_subscriber::EnvFilter;
 use workspace_root::WorkspaceRoot;
 
 use crate::actions::{
-    CloseTab, FocusNextPane, NewTab, NextTab, PrevTab, Search, SplitHorizontal, SplitVertical,
+    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, PrevTab, Search, SplitHorizontal,
+    SplitVertical,
 };
 
 fn main() {
@@ -36,6 +37,7 @@ fn main() {
             // the handler cascades into the existing ClosePane logic.
             KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("cmd-]", FocusNextPane, None),
+            KeyBinding::new("cmd-[", FocusPrevPane, None),
             KeyBinding::new("cmd-t", NewTab, None),
             // macOS strips `shift` from the runtime keystroke and remaps the
             // key to the shifted character (`]`→`}`, `[`→`{`). Binding strings
