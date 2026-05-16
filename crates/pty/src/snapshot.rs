@@ -44,15 +44,17 @@ pub enum CellColor {
 }
 
 /// One visible cell. `inverse` mirrors the SGR 7 / DECSCNM bit — render swaps
-/// fg/bg when true. Bold/italic/underline live on `Cell` only when the
-/// renderer needs them; right now we only carry `inverse` because that's what
-/// the cursor relies on.
+/// fg/bg when true. `dim` mirrors SGR 2 — render multiplies fg alpha by ~0.7
+/// (the reference terminal 0.69 / Alacritty 0.66 / Kitty 0.75; we sit in the middle). Other
+/// SGR attributes (bold/italic/underline) live on `Cell` only when the
+/// renderer needs them; right now we only carry the bits the renderer uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cell {
     pub ch: char,
     pub fg: CellColor,
     pub bg: CellColor,
     pub inverse: bool,
+    pub dim: bool,
 }
 
 /// A frame-aligned snapshot. Cheap to clone (Vec<Row> small under 24x80).
@@ -91,6 +93,7 @@ mod tests {
         assert_eq!(c.fg, CellColor::Default);
         assert_eq!(c.bg, CellColor::Default);
         assert!(!c.inverse);
+        assert!(!c.dim);
     }
 
     #[test]
@@ -130,13 +133,16 @@ mod tests {
             fg: CellColor::Named(NamedColor16::Red),
             bg: CellColor::Default,
             inverse: false,
+            dim: false,
         };
         let same = base;
         let diff_inverse = Cell {
             inverse: true,
             ..base
         };
+        let diff_dim = Cell { dim: true, ..base };
         assert_eq!(base, same);
         assert_ne!(base, diff_inverse);
+        assert_ne!(base, diff_dim);
     }
 }

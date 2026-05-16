@@ -84,10 +84,46 @@ impl TerminalState {
     }
 
     /// Resize the grid. Called whenever the pane's render area changes.
+    ///
+    /// Bypasses `Term::resize` and calls `grid_mut().resize(false, ..)`
+    /// directly so alacritty's reflow doesn't run on shrink. The default
+    /// `Term::resize` path passes `reflow = !is_alt_screen`, and for
+    /// non-WRAPLINE rows (e.g. plain `ls` output) the reflow shrinker
+    /// splits overflow off the right and prepends it to the next row in
+    /// reverse iteration order — which makes a 3-column ls layout look
+    /// scrambled in a narrower pane after a split. Terminal.app / iTerm2
+    /// instead truncate rows on the right with no rearrangement; this
+    /// matches that semantics.
+    ///
+    /// Trade-offs we accept by skipping `Term::resize`:
+    /// - `inactive_grid` (alt screen buffer) stays at its old dimensions
+    ///   until the user enters alt-screen mode, at which point the next
+    ///   resize tick fixes it.
+    /// - `vi_mode_cursor` line offset isn't re-anchored. We don't expose
+    ///   vi mode in v1.
+    /// - Tab stops aren't reset to the new width. We don't expose tabs
+    ///   either; \t lands on default column boundaries inside the grid.
+    /// - Selection isn't invalidated. We don't have selection in v1.
+    /// Once any of those features ship, port the relevant lines from
+    /// `Term::resize` back here and gate them on actual feature use.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.size.cols = cols as usize;
         self.size.rows = rows as usize;
-        self.term.resize(self.size);
+        self.term
+            .grid_mut()
+            .resize(false, self.size.rows, self.size.cols);
+        // Clamp cursor so a subsequent write doesn't index past the new
+        // right edge. `grid.resize(false, ..)` truncates rows but doesn't
+        // touch the cursor; without this clamp a wide-then-narrow resize
+        // can leave `cursor.point.column` >= cols and the next character
+        // write panics inside alacritty's grid indexing.
+        let cursor = &mut self.term.grid_mut().cursor;
+        if cursor.point.column.0 >= self.size.cols {
+            cursor.point.column = Column(self.size.cols.saturating_sub(1));
+        }
+        if (cursor.point.line.0 as usize) >= self.size.rows {
+            cursor.point.line = Line(self.size.rows as i32 - 1);
+        }
     }
 
     /// Return a row-major grid covering `history_rows` of scrollback prepended
@@ -149,6 +185,7 @@ fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
         fg: map_color(cell.fg),
         bg: map_color(cell.bg),
         inverse: cell.flags.contains(Flags::INVERSE),
+        dim: cell.flags.contains(Flags::DIM),
     }
 }
 
@@ -334,6 +371,20 @@ mod tests {
         assert_eq!(
             first_non_default_fg(&snap),
             Some(CellColor::Named(NamedColor16::Red))
+        );
+    }
+
+    #[test]
+    fn dim_flag_flows_through_snapshot() {
+        // SGR 2 = faint/dim, then 'X' lands the dim bit on the cell.
+        // SGR 22 turns dim off again, so the next 'Y' must NOT be dim.
+        let mut state = TerminalState::new(80, 24, 100);
+        state.advance(b"\x1b[2mX\x1b[22mY");
+        let snap = fresh_snapshot(&state);
+        assert!(snap.cells[0][0].dim, "X (after SGR 2) should carry dim");
+        assert!(
+            !snap.cells[0][1].dim,
+            "Y (after SGR 22) should clear dim"
         );
     }
 }
