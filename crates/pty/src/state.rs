@@ -85,46 +85,31 @@ impl TerminalState {
 
     /// Resize the grid. Called whenever the pane's render area changes.
     ///
-    /// Bypasses `Term::resize` and calls `grid_mut().resize(false, ..)`
-    /// directly so alacritty's reflow doesn't run on shrink. The default
-    /// `Term::resize` path passes `reflow = !is_alt_screen`, and for
-    /// non-WRAPLINE rows (e.g. plain `ls` output) the reflow shrinker
-    /// splits overflow off the right and prepends it to the next row in
-    /// reverse iteration order — which makes a 3-column ls layout look
-    /// scrambled in a narrower pane after a split. Terminal.app / iTerm2
-    /// instead truncate rows on the right with no rearrangement; this
-    /// matches that semantics.
+    /// Delegates to alacritty's `Term::resize` so the active grid, inactive
+    /// (alt-screen) grid, damage tracker, vi cursor, tabs, and selection all
+    /// stay coherent in one shot. An earlier revision bypassed this and
+    /// called `grid_mut().resize(false, ..)` directly to suppress reflow on
+    /// shrink, but that left the private `damage` tracker at the old line
+    /// count — the next CSI cursor move into a new row indexed past
+    /// `damage.lines.len()` and panicked at
+    /// `term/mod.rs:258` (alacritty_terminal 0.25.1).
     ///
-    /// Trade-offs we accept by skipping `Term::resize`:
-    /// - `inactive_grid` (alt screen buffer) stays at its old dimensions
-    ///   until the user enters alt-screen mode, at which point the next
-    ///   resize tick fixes it.
-    /// - `vi_mode_cursor` line offset isn't re-anchored. We don't expose
-    ///   vi mode in v1.
-    /// - Tab stops aren't reset to the new width. We don't expose tabs
-    ///   either; \t lands on default column boundaries inside the grid.
-    /// - Selection isn't invalidated. We don't have selection in v1.
-    ///
-    /// Once any of those features ship, port the relevant lines from
-    /// `Term::resize` back here and gate them on actual feature use.
+    /// The reflow worry from that revision (3-column `ls` output appearing
+    /// scrambled after a shrink) traced to wrong cell metrics, not reflow
+    /// itself — once `cell_metrics` measured the live 'm' advance, columns
+    /// stopped lying to the shell and `ls` reflows cleanly. The visual leaf
+    /// also runs `overflow_hidden`, so any residual right-edge spill is
+    /// clipped at the pane boundary regardless of what the grid contains.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.size.cols = cols as usize;
         self.size.rows = rows as usize;
-        self.term
-            .grid_mut()
-            .resize(false, self.size.rows, self.size.cols);
-        // Clamp cursor so a subsequent write doesn't index past the new
-        // right edge. `grid.resize(false, ..)` truncates rows but doesn't
-        // touch the cursor; without this clamp a wide-then-narrow resize
-        // can leave `cursor.point.column` >= cols and the next character
-        // write panics inside alacritty's grid indexing.
-        let cursor = &mut self.term.grid_mut().cursor;
-        if cursor.point.column.0 >= self.size.cols {
-            cursor.point.column = Column(self.size.cols.saturating_sub(1));
-        }
-        if (cursor.point.line.0 as usize) >= self.size.rows {
-            cursor.point.line = Line(self.size.rows as i32 - 1);
-        }
+        // FIXME(alacritty-bump): Term::resize atomically resizes active grid,
+        // inactive (alt-screen) grid, damage tracker, vi cursor, tabs, and
+        // scroll_region. If a future alacritty release splits any of those
+        // out of this entry point, the damage tracker can drift out of sync
+        // again and panic on the next CSI cursor move (see commit history
+        // for the v0.9 bypass that this code reverts).
+        self.term.resize(self.size);
     }
 
     /// Return a row-major grid covering `history_rows` of scrollback prepended
@@ -331,6 +316,52 @@ mod tests {
         assert_eq!(snap.rows, 40);
         assert_eq!(snap.cells.len(), 40);
         assert_eq!(snap.cells[0].len(), 120);
+    }
+
+    #[test]
+    fn write_into_grown_row_does_not_panic() {
+        // Regression: an earlier resize() bypassed Term::resize and called
+        // grid_mut().resize() directly, which left the private damage tracker
+        // at the old line count. The next CSI cursor-move into a new row
+        // indexed damage.lines[N] where N >= old_rows and panicked at
+        // alacritty_terminal/src/term/mod.rs:258. Resizing via Term::resize
+        // keeps damage in sync; this test would hit the panic with the
+        // bypassed code path.
+        let mut state = TerminalState::new(80, 24, 100);
+        state.resize(80, 40);
+        // CUP row=35 col=1 (1-based) → line 34, which is valid in the grown
+        // 40-row grid but past the old 24-row damage vec.
+        state.advance(b"\x1b[35;1HX");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(snap.cursor, (34, 1));
+    }
+
+    #[test]
+    fn shrink_then_write_at_bottom_does_not_panic() {
+        // Companion to the grow case: shrink the grid then write to a row
+        // that's in-bounds for the SHRUNK grid. Verifies Term::resize keeps
+        // damage tightened on shrink too, and that the cursor lands inside
+        // the new viewport without the manual clamp the bypass version had.
+        let mut state = TerminalState::new(80, 40, 100);
+        state.resize(80, 24);
+        state.advance(b"\x1b[24;80HX");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(snap.cursor, (23, 79));
+    }
+
+    #[test]
+    fn grow_shrink_grow_cycle_does_not_panic() {
+        // Pins the grow-shrink-grow scenario that matches the original
+        // "len 32, index 32" crash signature: damage must keep up with the
+        // grid through every transition, not just monotonic growth.
+        let mut state = TerminalState::new(80, 24, 100);
+        state.resize(80, 40);
+        state.advance(b"primary fill\r\n");
+        state.resize(80, 20);
+        state.resize(80, 35);
+        state.advance(b"\x1b[30;1HY");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(snap.cursor, (29, 1));
     }
 
     #[test]
