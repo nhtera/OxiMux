@@ -31,9 +31,8 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::actions::Search;
 use crate::shell::key_input::keystroke_to_bytes;
 use crate::shell::terminal_row::build_row;
-use crate::shell::terminal_search::{
-    MatchRange, find_matches, render_search_overlay, visible_match_ranges,
-};
+use crate::shell::terminal_search::render_search_overlay;
+use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 
 /// How often the view drains events + re-snapshots. 16 ms ≈ 60 fps, matches the
 /// `< 16 ms PTY → render latency` plan target without over-spending CPU on
@@ -71,19 +70,10 @@ pub struct TerminalView {
     /// `mount`. When `false`, the blink task skips `cx.notify()` so unfocused
     /// panes don't burn a repaint every 530 ms.
     focused: bool,
-    /// Search overlay state. When `search_active` is true the on_key_down
-    /// branch above the PTY path consumes printable input, Backspace, and
-    /// Esc/Enter; all other keys are swallowed (no PTY write). Per-pane;
-    /// resetting these on dismiss drops the highlight on the next paint.
-    /// `search_history_len` records how much of the search grid was history
-    /// at scan time, so the render path can offset `MatchRange::row` back
-    /// to a visible-row index. Deriving it at render time from the max
-    /// match row only works when scrollback is full — see code-review
-    /// 260516-0807 for the failure cases.
-    search_active: bool,
-    search_query: String,
-    search_matches: Vec<MatchRange>,
-    search_history_len: usize,
+    /// Per-pane search overlay state. See `terminal_search_state.rs` for
+    /// the state machine + key dispatch. The view owns I/O (grid fetch +
+    /// `cx.notify`) and delegates everything else.
+    search: SearchState,
     _poll_task: Task<()>,
     _blink_task: Task<()>,
 }
@@ -144,10 +134,7 @@ impl TerminalView {
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
             focused: true,
-            search_active: false,
-            search_query: String::new(),
-            search_matches: Vec::new(),
-            search_history_len: 0,
+            search: SearchState::new(),
             _poll_task: poll_task,
             _blink_task: blink_task,
         }
@@ -211,89 +198,30 @@ impl TerminalView {
     }
 
     fn on_search(&mut self, _: &Search, _window: &mut Window, cx: &mut Context<Self>) {
-        // Esc/Enter clear the query, so the only way to reach this with
-        // `search_query` non-empty is a stray Cmd+F while already open —
-        // benign (re-runs the same match set against a fresh grid).
-        self.search_active = true;
-        self.rerun_search(cx);
+        self.search.open();
+        self.rerun_search();
         cx.notify();
     }
 
-    fn rerun_search(&mut self, _cx: &mut Context<Self>) {
-        if self.search_query.is_empty() {
-            self.search_matches.clear();
-            self.search_history_len = 0;
-            return;
-        }
+    fn rerun_search(&mut self) {
         let grid = self.backend.search_grid(self.session_id);
-        // Record history_len at scan time. Recovering it at render time
-        // from `max(MatchRange::row)` fails on partial-history scrollback
-        // and on history-only match sets — see code-review 260516-0807 H1.
         let visible = self.snapshot.cells.len();
-        self.search_history_len = grid.len().saturating_sub(visible);
-        self.search_matches = find_matches(&grid, &self.search_query);
-    }
-
-    fn dismiss_search(&mut self, cx: &mut Context<Self>) {
-        self.search_active = false;
-        self.search_query.clear();
-        self.search_matches.clear();
-        self.search_history_len = 0;
-        cx.notify();
-    }
-
-    /// Search-mode key handling. Returns true when the keystroke was consumed
-    /// (do not forward to the PTY). Modifier-bearing input (Cmd / Ctrl / Alt)
-    /// is left for the regular path so Cmd+F-then-Cmd+W still closes the tab.
-    fn handle_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let ks = &event.keystroke;
-        if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.alt {
-            // Cmd/Ctrl/Alt combos take precedence — let them bubble.
-            // (Cmd+F again is benign: re-fires `on_search`, no-op state.)
-            return false;
-        }
-        match ks.key.as_str() {
-            "escape" | "enter" => {
-                self.dismiss_search(cx);
-                return true;
-            }
-            "backspace" => {
-                self.search_query.pop();
-                self.rerun_search(cx);
-                cx.notify();
-                return true;
-            }
-            _ => {}
-        }
-        // Append printable text. Prefer `key_char` (shift-aware, IME-aware)
-        // and reject anything that's a control byte — accidental ctrl-X
-        // shouldn't pollute the needle even though we already filter
-        // modifier-bearing keys above.
-        let candidate =
-            ks.key_char
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .or(if ks.key.chars().count() == 1 {
-                    Some(ks.key.as_str())
-                } else {
-                    None
-                });
-        if let Some(s) = candidate
-            && s.chars().all(|c| !c.is_control())
-        {
-            self.search_query.push_str(s);
-            self.rerun_search(cx);
-            cx.notify();
-            return true;
-        }
-        // Anything else (function keys, arrows, etc.) is swallowed while the
-        // overlay is open — they neither edit the query nor reach the shell.
-        true
+        self.search.rerun(&grid, visible);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_active && self.handle_search_key(event, cx) {
-            return;
+        match self.search.handle_key(event) {
+            SearchKeyOutcome::Pass => {}
+            SearchKeyOutcome::Consumed => return,
+            SearchKeyOutcome::Dismissed => {
+                cx.notify();
+                return;
+            }
+            SearchKeyOutcome::QueryChanged => {
+                self.rerun_search();
+                cx.notify();
+                return;
+            }
         }
 
         let ks = &event.keystroke;
@@ -459,17 +387,12 @@ impl Render for TerminalView {
         let pad = px(self.density.pad_panel);
         let focus_handle = self.focus_handle.clone();
 
-        // Match buckets per visible row. `search_history_len` was captured
-        // at scan time (rerun_search) — using it here avoids deriving the
-        // offset from the match set, which fails on partial-history grids.
-        // If PTY output has scrolled history since the scan, the highlights
-        // may drift one paint but self-correct on the next keystroke.
+        // Match buckets per visible row. History_len was captured at scan
+        // time in `SearchState::rerun` — if PTY output has scrolled history
+        // since the scan, highlights may drift one paint but self-correct
+        // on the next keystroke.
         let visible_rows = self.snapshot.cells.len();
-        let buckets = if self.search_active && !self.search_matches.is_empty() {
-            visible_match_ranges(&self.search_matches, self.search_history_len, visible_rows)
-        } else {
-            Vec::new()
-        };
+        let buckets = self.search.render_buckets(visible_rows);
 
         let rows: Vec<gpui::Div> = self
             .snapshot
@@ -482,15 +405,10 @@ impl Render for TerminalView {
             })
             .collect();
 
-        let overlay = if self.search_active {
-            Some(render_search_overlay(
-                &self.search_query,
-                &theme,
-                &self.typography,
-            ))
-        } else {
-            None
-        };
+        let overlay = self
+            .search
+            .active
+            .then(|| render_search_overlay(&self.search.query, &theme, &self.typography));
 
         let mut root = div()
             .id("oximux-terminal-view")
