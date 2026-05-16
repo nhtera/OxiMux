@@ -42,6 +42,7 @@ gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui_macros = { git = "https://github.com/zed-industries/zed" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c" }
 
 # Async + util
 tokio = { version = "1", features = ["full"] }

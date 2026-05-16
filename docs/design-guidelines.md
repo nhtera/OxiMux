@@ -31,6 +31,9 @@ The base is near-black with graphite panels. Status hues are the only saturated 
 | `BORDER_ACTIVE` | `#3A4047` | Focused pane border |
 | `SELECTION` | `#2D3A4D` | Text selection background |
 | `FOCUS_RING` | `#4A6E9C` | Keyboard focus outline |
+| `MATCH_BG_CURRENT` | `#D9A441` | Cycled "you are here" search match (Cmd+F) |
+| `MATCH_BG_OTHER` | `#5A5358` | Non-current search matches (warm-tinted neutral gray, VS Code-style) |
+| `MATCH_FG` | `#0E0F11` | Foreground over `MATCH_BG_CURRENT` (high contrast) |
 
 ### Status palette (single accent layer)
 

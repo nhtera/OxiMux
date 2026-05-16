@@ -18,7 +18,11 @@ use crate::actions::{
 fn main() {
     init_tracing();
 
-    let app = gpui_platform::application();
+    // `with_assets` registers gpui-component's bundled SVG icons (chevrons,
+    // close, etc.) so `IconName::*` paths resolve at runtime. Without this,
+    // the Button + IconName-driven elements paint blank — see the search
+    // overlay's nav chevrons. Native build embeds the SVGs via RustEmbed.
+    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
 
     app.run(move |cx| {
         gpui_component::init(cx);

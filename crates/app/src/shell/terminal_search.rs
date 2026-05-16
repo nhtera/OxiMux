@@ -11,9 +11,7 @@
 //! since the grid is bounded at ~400k cells (5000 history + ~32 rows × 200
 //! cols) and a flood test against `yes` still scans under 1 ms.
 
-use gpui::{IntoElement, ParentElement, SharedString, Styled, div, px};
 use oximux_pty::Cell;
-use oximux_settings::{Theme, Typography};
 
 /// Half-open cell range within a row of the search grid.
 ///
@@ -93,56 +91,6 @@ pub fn find_matches(grid: &[Vec<Cell>], needle: &str) -> Vec<MatchRange> {
     out
 }
 
-/// Bucket the flat `MatchRange` list by visible row.
-///
-/// `search_grid` is `history_len` history rows followed by `visible_rows`
-/// visible rows. The renderer only needs match ranges for visible rows;
-/// history matches are silently dropped (no scroll-to-match in v1). Returns
-/// a `Vec` of length `visible_rows` where index `i` lists every match
-/// `(col_start, col_end)` in the i-th visible row.
-pub fn visible_match_ranges(
-    matches: &[MatchRange],
-    history_len: usize,
-    visible_rows: usize,
-) -> Vec<Vec<(usize, usize)>> {
-    let mut buckets: Vec<Vec<(usize, usize)>> = vec![Vec::new(); visible_rows];
-    for m in matches {
-        if m.row < history_len {
-            continue;
-        }
-        let visible_idx = m.row - history_len;
-        if visible_idx >= visible_rows {
-            continue;
-        }
-        buckets[visible_idx].push((m.col_start, m.col_end));
-    }
-    buckets
-}
-
-/// Bottom-right search overlay. Pure paint — no `.id()`, no `.occlude()`,
-/// no event listeners — per the journal lesson on `.occlude()` blocking
-/// hit-tests. Wrap the returned element inside the view via
-/// `Div::child(render_search_overlay(...))`.
-pub fn render_search_overlay(
-    query: &str,
-    theme: &Theme,
-    typography: &Typography,
-) -> impl IntoElement {
-    div()
-        .absolute()
-        .bottom(px(12.0))
-        .right(px(12.0))
-        .px(px(10.0))
-        .py(px(5.0))
-        .bg(theme.bg_overlay)
-        .border_1()
-        .border_color(theme.border_active)
-        .text_color(theme.fg_base)
-        .font_family(typography.family_mono.clone())
-        .text_size(px(typography.t_body_lg))
-        .child(SharedString::from(format!("/{query}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,43 +161,6 @@ mod tests {
     fn no_match() {
         let grid = vec![row_from_str("abcdef")];
         assert!(find_matches(&grid, "xyz").is_empty());
-    }
-
-    #[test]
-    fn visible_buckets_drop_history_only_matches() {
-        let matches = vec![
-            MatchRange {
-                row: 0,
-                col_start: 0,
-                col_end: 5,
-            }, // history
-            MatchRange {
-                row: 5,
-                col_start: 2,
-                col_end: 7,
-            }, // visible row 0
-            MatchRange {
-                row: 6,
-                col_start: 1,
-                col_end: 3,
-            }, // visible row 1
-        ];
-        let buckets = visible_match_ranges(&matches, 5, 2);
-        assert_eq!(buckets.len(), 2);
-        assert_eq!(buckets[0], vec![(2, 7)]);
-        assert_eq!(buckets[1], vec![(1, 3)]);
-    }
-
-    #[test]
-    fn visible_buckets_skip_out_of_range_visible_rows() {
-        // Match at row=10 with history_len=5 visible_rows=2 → visible_idx=5 → drop.
-        let matches = vec![MatchRange {
-            row: 10,
-            col_start: 0,
-            col_end: 1,
-        }];
-        let buckets = visible_match_ranges(&matches, 5, 2);
-        assert!(buckets.iter().all(|b| b.is_empty()));
     }
 
     #[test]

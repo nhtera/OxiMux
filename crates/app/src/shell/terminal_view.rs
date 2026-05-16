@@ -31,7 +31,7 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::actions::Search;
 use crate::shell::key_input::keystroke_to_bytes;
 use crate::shell::terminal_row::build_row;
-use crate::shell::terminal_search::render_search_overlay;
+use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 
 /// How often the view drains events + re-snapshots. 16 ms ≈ 60 fps, matches the
@@ -213,7 +213,7 @@ impl TerminalView {
         match self.search.handle_key(event) {
             SearchKeyOutcome::Pass => {}
             SearchKeyOutcome::Consumed => return,
-            SearchKeyOutcome::Dismissed => {
+            SearchKeyOutcome::Dismissed | SearchKeyOutcome::CurrentChanged => {
                 cx.notify();
                 return;
             }
@@ -405,10 +405,39 @@ impl Render for TerminalView {
             })
             .collect();
 
-        let overlay = self
-            .search
-            .active
-            .then(|| render_search_overlay(&self.search.query, &theme, &self.typography));
+        let overlay = if self.search.active {
+            let badge = self.search.count_badge();
+            let query = self.search.query.clone();
+            let typography = self.typography.clone();
+            // Caret blinks in lock-step with the terminal cursor — the
+            // existing 530ms blink_task already drives `cursor_visible`,
+            // so the overlay caret needs no second timer.
+            let caret_on = self.cursor_visible;
+            let on_prev = cx.listener(|this, _, _, cx| {
+                this.search.prev_match();
+                cx.notify();
+            });
+            let on_next = cx.listener(|this, _, _, cx| {
+                this.search.next_match();
+                cx.notify();
+            });
+            let on_close = cx.listener(|this, _, _, cx| {
+                this.search.close();
+                cx.notify();
+            });
+            Some(terminal_search_overlay::build(
+                &query,
+                badge,
+                caret_on,
+                &theme,
+                &typography,
+                on_prev,
+                on_next,
+                on_close,
+            ))
+        } else {
+            None
+        };
 
         let mut root = div()
             .id("oximux-terminal-view")

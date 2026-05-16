@@ -13,6 +13,7 @@ pub mod tabbed_pane;
 pub mod terminal_palette;
 pub mod terminal_row;
 pub mod terminal_search;
+pub mod terminal_search_overlay;
 pub mod terminal_search_state;
 pub mod terminal_view;
 pub mod top_bar;

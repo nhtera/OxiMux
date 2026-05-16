@@ -14,24 +14,44 @@
 use gpui::KeyDownEvent;
 use oximux_pty::Cell;
 
-use crate::shell::terminal_search::{MatchRange, find_matches, visible_match_ranges};
+use crate::shell::terminal_search::{MatchRange, find_matches};
 
 /// Outcome of a keystroke routed to the search overlay. The host matches
 /// on this to decide whether to notify, fetch a fresh grid, or fall through
 /// to the regular PTY path.
 pub enum SearchKeyOutcome {
-    /// Search wasn't active or the keystroke carried a modifier — let the
-    /// regular `on_key_down` path handle it. (Cmd+F-while-open is benign:
-    /// the action re-dispatches `Search`.)
+    /// Search wasn't active or the keystroke carried Cmd/Ctrl/Alt — let
+    /// the regular `on_key_down` path handle it.
     Pass,
     /// Key consumed; no state change, no repaint needed (e.g. function key
     /// swallowed while overlay is open).
     Consumed,
-    /// Esc / Enter dismissed the overlay; host should repaint.
+    /// Esc dismissed the overlay; host should repaint.
     Dismissed,
     /// Query mutated (backspace / printable input). Host must fetch a fresh
     /// grid and call `rerun`, then repaint.
     QueryChanged,
+    /// Cycled to next/prev match (Enter / Shift+Enter / Up / Down). Host
+    /// only needs to repaint — no grid refetch.
+    CurrentChanged,
+}
+
+/// Which highlight style applies to a match cell run. `Current` is the
+/// cycled "you are here" match (one at a time); `Other` is every other
+/// match in the grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchKind {
+    Current,
+    Other,
+}
+
+/// Per-row match range with its highlight kind. The render path groups
+/// consecutive cells with the same kind into one styled span.
+#[derive(Clone, Copy, Debug)]
+pub struct MatchHit {
+    pub kind: MatchKind,
+    pub col_start: usize,
+    pub col_end: usize,
 }
 
 pub struct SearchState {
@@ -40,9 +60,13 @@ pub struct SearchState {
     pub matches: Vec<MatchRange>,
     /// History row count at scan time. The render path subtracts this from
     /// `MatchRange::row` to get a visible-row index. Deriving it at render
-    /// time from `max(MatchRange::row)` fails on partial-history grids and
-    /// on history-only match sets — see code-review 260516-0807 H1.
+    /// time from `max(MatchRange::row)` fails on partial-history scrollback
+    /// and on history-only match sets — see code-review 260516-0807 H1.
     pub history_len: usize,
+    /// Index into `matches` for the cycled "you are here" match. Set to
+    /// `Some(0)` after each `rerun` when matches exist, advanced by
+    /// `next_match` / `prev_match`. `None` when no matches.
+    pub current_index: Option<usize>,
 }
 
 impl SearchState {
@@ -52,6 +76,7 @@ impl SearchState {
             query: String::new(),
             matches: Vec::new(),
             history_len: 0,
+            current_index: None,
         }
     }
 
@@ -70,24 +95,84 @@ impl SearchState {
         self.query.clear();
         self.matches.clear();
         self.history_len = 0;
+        self.current_index = None;
     }
 
     /// Re-scan the grid for the current query. Empty-query short-circuit
-    /// keeps the host from over-fetching: when the query is empty, matches
-    /// and history_len are cleared and no scan runs.
+    /// keeps the host from over-fetching. Resets `current_index` to the
+    /// first match so the user sees a highlighted "current" on every
+    /// query mutation (— find-as-you-type lands you on the
+    /// first hit immediately).
     pub fn rerun(&mut self, grid: &[Vec<Cell>], visible_rows: usize) {
         if self.query.is_empty() {
             self.matches.clear();
             self.history_len = 0;
+            self.current_index = None;
             return;
         }
         self.history_len = grid.len().saturating_sub(visible_rows);
         self.matches = find_matches(grid, &self.query);
+        self.current_index = if self.matches.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+
+    /// Cycle to the next match, wrapping. No-op when there are no matches.
+    pub fn next_match(&mut self) {
+        if self.matches.is_empty() {
+            self.current_index = None;
+            return;
+        }
+        let next = match self.current_index {
+            Some(i) => (i + 1) % self.matches.len(),
+            None => 0,
+        };
+        self.current_index = Some(next);
+    }
+
+    /// Cycle to the previous match, wrapping. No-op when there are no
+    /// matches.
+    pub fn prev_match(&mut self) {
+        if self.matches.is_empty() {
+            self.current_index = None;
+            return;
+        }
+        let len = self.matches.len();
+        let prev = match self.current_index {
+            Some(0) | None => len - 1,
+            Some(i) => i - 1,
+        };
+        self.current_index = Some(prev);
+    }
+
+    /// Format the count badge for the overlay: empty when no query, else
+    /// `i of N` (VS Code-style; `- of 0` when no matches).
+    pub fn count_badge(&self) -> String {
+        if self.query.is_empty() {
+            return String::new();
+        }
+        let total = self.matches.len();
+        match self.current_index {
+            Some(i) => format!("{} of {}", i + 1, total),
+            None => format!("- of {}", total),
+        }
     }
 
     /// Dispatch a keystroke while the overlay is active. Returns
     /// `SearchKeyOutcome::Pass` when search is inactive (or the keystroke
     /// carries Cmd/Ctrl/Alt — those should reach the regular path).
+    ///
+    /// Bindings:
+    /// - Escape       → dismiss
+    /// - Enter        → next match (cycle forward)
+    /// - Shift+Enter  → prev match (cycle back)
+    /// - Up           → prev match
+    /// - Down         → next match
+    /// - Backspace    → pop char (re-runs scan)
+    /// - Printable    → append (re-runs scan)
+    /// - Other        → swallow (no repaint)
     pub fn handle_key(&mut self, event: &KeyDownEvent) -> SearchKeyOutcome {
         if !self.active {
             return SearchKeyOutcome::Pass;
@@ -97,9 +182,25 @@ impl SearchState {
             return SearchKeyOutcome::Pass;
         }
         match ks.key.as_str() {
-            "escape" | "enter" => {
+            "escape" => {
                 self.close();
                 return SearchKeyOutcome::Dismissed;
+            }
+            "enter" => {
+                if ks.modifiers.shift {
+                    self.prev_match();
+                } else {
+                    self.next_match();
+                }
+                return SearchKeyOutcome::CurrentChanged;
+            }
+            "up" => {
+                self.prev_match();
+                return SearchKeyOutcome::CurrentChanged;
+            }
+            "down" => {
+                self.next_match();
+                return SearchKeyOutcome::CurrentChanged;
             }
             "backspace" => {
                 self.query.pop();
@@ -124,18 +225,40 @@ impl SearchState {
             self.query.push_str(s);
             return SearchKeyOutcome::QueryChanged;
         }
-        // Function keys, arrows, etc. — swallowed (don't reach the shell)
-        // but no state mutation, so no repaint needed.
+        // Function keys, etc. — swallowed (don't reach the shell) but no
+        // state mutation, so no repaint needed.
         SearchKeyOutcome::Consumed
     }
 
-    /// Bucket match ranges by visible row for the render path. Returns an
-    /// empty Vec when inactive or no matches — callers can pass the result
-    /// to `build_row` per-row without an extra `if active` branch.
-    pub fn render_buckets(&self, visible_rows: usize) -> Vec<Vec<(usize, usize)>> {
+    /// Bucket match ranges by visible row, tagging each with its highlight
+    /// kind (`Current` for the cycled match, `Other` for the rest).
+    /// Returns an empty Vec when inactive or no matches — callers can pass
+    /// the result to `build_row` per-row without an extra `if active`
+    /// branch.
+    pub fn render_buckets(&self, visible_rows: usize) -> Vec<Vec<MatchHit>> {
         if !self.active || self.matches.is_empty() {
             return Vec::new();
         }
-        visible_match_ranges(&self.matches, self.history_len, visible_rows)
+        let mut buckets: Vec<Vec<MatchHit>> = vec![Vec::new(); visible_rows];
+        for (idx, m) in self.matches.iter().enumerate() {
+            if m.row < self.history_len {
+                continue;
+            }
+            let visible_idx = m.row - self.history_len;
+            if visible_idx >= visible_rows {
+                continue;
+            }
+            let kind = if Some(idx) == self.current_index {
+                MatchKind::Current
+            } else {
+                MatchKind::Other
+            };
+            buckets[visible_idx].push(MatchHit {
+                kind,
+                col_start: m.col_start,
+                col_end: m.col_end,
+            });
+        }
+        buckets
     }
 }

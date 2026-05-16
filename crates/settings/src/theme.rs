@@ -26,6 +26,14 @@ pub struct Theme {
     pub selection: Hsla,
     pub focus_ring: Hsla,
 
+    // Search match highlight. `current` is the cycled / "you are here" match
+    // (bright amber, dark fg for high contrast). `other` is every other
+    // match in scrollback (dim amber, default fg) — visible enough to scan
+    // but de-emphasized so the eye finds `current` first.
+    pub match_bg_current: Hsla,
+    pub match_bg_other: Hsla,
+    pub match_fg: Hsla,
+
     // Status palette (single accent layer)
     pub status_ok: Hsla,
     pub status_warn: Hsla,
@@ -51,6 +59,10 @@ impl Theme {
             border_active: rgb(0x3A4047).into(),
             selection: rgb(0x2D3A4D).into(),
             focus_ring: rgb(0x4A6E9C).into(),
+
+            match_bg_current: rgb(0xD9A441).into(),
+            match_bg_other: rgb(0x5A5358).into(),
+            match_fg: rgb(0x0E0F11).into(),
 
             status_ok: rgb(0x6FA86A).into(),
             status_warn: rgb(0xD9A441).into(),

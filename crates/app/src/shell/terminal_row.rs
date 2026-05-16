@@ -10,6 +10,7 @@ use oximux_pty::{Cell, CellColor};
 use oximux_settings::Theme;
 
 use crate::shell::terminal_palette::{ColorRole, resolve};
+use crate::shell::terminal_search_state::{MatchHit, MatchKind};
 
 /// Build one row's `Div`. Caller is responsible for stacking rows into the
 /// terminal grid and for computing `match_cols` from search state.
@@ -19,12 +20,13 @@ use crate::shell::terminal_palette::{ColorRole, resolve};
 /// `(cursor.0, cursor.1)` is the one that gets `inverse`).
 ///
 /// `match_cols` is `None` when no search is active — zero-cost path, no
-/// per-cell range check.
+/// per-cell range check. When `Some`, each `MatchHit` carries a `kind`
+/// (Current = bright amber + dark fg; Other = dim amber, default fg).
 pub fn build_row(
     row: &[Cell],
     row_idx: usize,
     cursor: (usize, usize),
-    match_cols: Option<&[(usize, usize)]>,
+    match_cols: Option<&[MatchHit]>,
     theme: &Theme,
     line_height: Pixels,
 ) -> gpui::Div {
@@ -36,16 +38,26 @@ pub fn build_row(
     };
     for run in group_runs(row, cursor_col, match_cols) {
         let (fg, bg) = effective_colors(&run, theme);
-        let mut span = div().child(SharedString::from(run.text)).text_color(fg);
-        // Match highlight: paint `theme.selection` as bg unless the cursor
-        // (`inverse`) is on this run — cursor wins so it stays visible on a
-        // matched cell.
-        if run.is_match && !run.inverse {
-            span = span.bg(theme.selection);
-        } else if !run.inverse && run.bg == CellColor::Default {
+        // `.h_full()` ensures the match/cursor bg covers the full row
+        // height — otherwise the span shrinks to glyph height and
+        // highlights render as skinny blocks instead of full strips.
+        let mut span = div().h_full().child(SharedString::from(run.text));
+        // Match highlight: cursor wins over match (so the inverted cursor
+        // block stays visible on a matched cell). Otherwise:
+        //   - Current  → bright amber bg, dark fg for high contrast
+        //   - Other    → dim amber bg, default fg (subtle)
+        //   - No match → default text on default bg (or cell-specified bg)
+        if run.inverse {
+            span = span.text_color(fg).bg(bg);
+        } else if let Some(MatchKind::Current) = run.match_kind {
+            span = span.text_color(theme.match_fg).bg(theme.match_bg_current);
+        } else if let Some(MatchKind::Other) = run.match_kind {
+            span = span.text_color(fg).bg(theme.match_bg_other);
+        } else if run.bg == CellColor::Default {
             // Skip painting the canvas — saves one rect per default-bg run.
+            span = span.text_color(fg);
         } else {
-            span = span.bg(bg);
+            span = span.text_color(fg).bg(bg);
         }
         row_div = row_div.child(span);
     }
@@ -57,29 +69,30 @@ struct Run {
     fg: CellColor,
     bg: CellColor,
     inverse: bool,
-    is_match: bool,
+    match_kind: Option<MatchKind>,
 }
 
 fn group_runs(
     row: &[Cell],
     cursor_col: Option<usize>,
-    match_cols: Option<&[(usize, usize)]>,
+    match_cols: Option<&[MatchHit]>,
 ) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
     for (col_idx, cell) in row.iter().enumerate() {
         let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
         let inverse = cell.inverse || cursor_col == Some(col_idx);
-        let is_match = match_cols.is_some_and(|ranges| {
+        let match_kind = match_cols.and_then(|ranges| {
             ranges
                 .iter()
-                .any(|&(start, end)| col_idx >= start && col_idx < end)
+                .find(|hit| col_idx >= hit.col_start && col_idx < hit.col_end)
+                .map(|hit| hit.kind)
         });
         match runs.last_mut() {
             Some(last)
                 if last.fg == cell.fg
                     && last.bg == cell.bg
                     && last.inverse == inverse
-                    && last.is_match == is_match =>
+                    && last.match_kind == match_kind =>
             {
                 last.text.push(ch);
             }
@@ -88,7 +101,7 @@ fn group_runs(
                 fg: cell.fg,
                 bg: cell.bg,
                 inverse,
-                is_match,
+                match_kind,
             }),
         }
     }
