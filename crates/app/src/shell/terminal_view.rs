@@ -65,6 +65,12 @@ pub struct TerminalView {
     /// `true` on input + PTY output so the cursor doesn't blink invisible
     /// mid-typing.
     cursor_visible: bool,
+    /// Mirrors `focus_handle.is_focused(window)` for the blink task, which
+    /// runs in a `Context<Self>`-only closure with no `&Window` access. Kept
+    /// in sync via `cx.on_focus` / `cx.on_blur` observers registered in
+    /// `mount`. When `false`, the blink task skips `cx.notify()` so unfocused
+    /// panes don't burn a repaint every 530 ms.
+    focused: bool,
     /// Search overlay state. When `search_active` is true the on_key_down
     /// branch above the PTY path consumes printable input, Backspace, and
     /// Esc/Enter; all other keys are swallowed (no PTY write). Per-pane;
@@ -106,50 +112,25 @@ impl TerminalView {
         // owner and keystrokes are dropped until the first click.
         focus_handle.focus(window, cx);
 
-        let poll_task = cx.spawn(async move |this, cx| {
-            loop {
-                let executor = match this.read_with(cx, |_, cx| cx.background_executor().clone()) {
-                    Ok(executor) => executor,
-                    Err(_) => return,
-                };
-                executor
-                    .timer(Duration::from_millis(POLL_INTERVAL_MS))
-                    .await;
-                if this.update(cx, |view, cx| view.tick(cx)).is_err() {
-                    return;
-                }
-            }
-        });
+        // Mirror focus state into `view.focused` for the blink task. Detach so
+        // the listener survives until the entity drops; the listener's
+        // WeakEntity will self-clean via update-returning-Err at that point.
+        // `on_focus` also resets `cursor_visible` so a pane gaining focus
+        // never waits a full 530 ms for the cursor to reappear.
+        cx.on_focus(&focus_handle, window, |view, _, cx| {
+            view.focused = true;
+            view.cursor_visible = true;
+            cx.notify();
+        })
+        .detach();
+        cx.on_blur(&focus_handle, window, |view, _, cx| {
+            view.focused = false;
+            cx.notify();
+        })
+        .detach();
 
-        // Blink task is independent of the PTY-output poll so a chatty TUI
-        // doesn't bury the toggle, and an idle shell still pulses.
-        //
-        // TODO(perf): the toggle + notify fires on unfocused panes too. Render
-        // gates the cursor on focus so it's still invisible, but the notify
-        // forces a repaint ~1.9 Hz per pane. At 4 panes idle that's ~7 paints/s
-        // we don't need. Cheap fix needs `window` access inside the background
-        // closure, which isn't trivially in scope; revisit during the step 9
-        // perf pass once dispatch-grids and blink can share a frame tick.
-        let blink_task = cx.spawn(async move |this, cx| {
-            loop {
-                let executor = match this.read_with(cx, |_, cx| cx.background_executor().clone()) {
-                    Ok(executor) => executor,
-                    Err(_) => return,
-                };
-                executor
-                    .timer(Duration::from_millis(BLINK_INTERVAL_MS))
-                    .await;
-                if this
-                    .update(cx, |view, cx| {
-                        view.cursor_visible = !view.cursor_visible;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
+        let poll_task = Self::start_poll_task(cx);
+        let blink_task = Self::start_blink_task(cx);
 
         Self {
             backend,
@@ -162,6 +143,7 @@ impl TerminalView {
             target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
+            focused: true,
             search_active: false,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -169,6 +151,56 @@ impl TerminalView {
             _poll_task: poll_task,
             _blink_task: blink_task,
         }
+    }
+
+    /// 16 ms PTY-drain timer. Drains the event channel + re-snapshots + one
+    /// `cx.notify()` per non-empty tick. Single notify per tick gives the
+    /// "max 1 invalidation per frame" coalesce the perf plan asks for.
+    fn start_poll_task(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
+                else {
+                    return;
+                };
+                executor
+                    .timer(Duration::from_millis(POLL_INTERVAL_MS))
+                    .await;
+                if this.update(cx, |view, cx| view.tick(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// 530 ms cursor blink. Independent of the PTY poll so a chatty TUI
+    /// doesn't bury the toggle and an idle shell still pulses. The toggle
+    /// always runs (state stays truthful across focus changes); `cx.notify()`
+    /// is gated on `view.focused` so unfocused panes contribute zero repaints
+    /// per second instead of ~1.9 Hz.
+    fn start_blink_task(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
+                else {
+                    return;
+                };
+                executor
+                    .timer(Duration::from_millis(BLINK_INTERVAL_MS))
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.cursor_visible = !view.cursor_visible;
+                        if view.focused {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
     }
 
     /// Stage a new target grid for the next resize tick. Called by the
@@ -367,16 +399,18 @@ impl TerminalView {
         if events.is_empty() {
             return;
         }
-        if let Ok(snapshot) = self.backend.snapshot(self.session_id) {
-            self.snapshot = snapshot;
-        }
-        // Reset blink only on real bytes from the PTY. `Resize` and `Exit`
-        // also come through here — resetting on those would force a paint
-        // on a dead session and pin the cursor visible after the shell quits.
-        if events
+        // Resnapshot + reset blink only on real bytes. `Resize` and `Exit`
+        // also flow through here — skipping the snapshot avoids one mutex
+        // lock + full grid allocation per resize event under flood, and
+        // skipping the blink reset stops the cursor pinning visible on a
+        // dead session after the shell quits.
+        let has_output = events
             .iter()
-            .any(|e| matches!(e, TerminalEvent::Output { .. }))
-        {
+            .any(|e| matches!(e, TerminalEvent::Output { .. }));
+        if has_output {
+            if let Ok(snapshot) = self.backend.snapshot(self.session_id) {
+                self.snapshot = snapshot;
+            }
             self.cursor_visible = true;
         }
         cx.notify();
