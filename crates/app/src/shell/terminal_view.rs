@@ -439,21 +439,21 @@ impl Render for TerminalView {
             // Toggle handlers flip the bit and rerun the scan. Rerun
             // touches the backend so it has to live inside the listener
             // (we have `&mut Self` + `&mut Context` here).
-            let on_toggle_case = Box::new(cx.listener(|this, _, _, cx| {
+            let on_toggle_case = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
                 this.search.toggle_case_sensitive();
                 this.rerun_search();
                 cx.notify();
-            })) as terminal_search_overlay::ClickHandler;
-            let on_toggle_word = Box::new(cx.listener(|this, _, _, cx| {
+            })) as terminal_search_overlay::ToggleHandler;
+            let on_toggle_word = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
                 this.search.toggle_whole_word();
                 this.rerun_search();
                 cx.notify();
-            })) as terminal_search_overlay::ClickHandler;
-            let on_toggle_regex = Box::new(cx.listener(|this, _, _, cx| {
+            })) as terminal_search_overlay::ToggleHandler;
+            let on_toggle_regex = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
                 this.search.toggle_regex();
                 this.rerun_search();
                 cx.notify();
-            })) as terminal_search_overlay::ClickHandler;
+            })) as terminal_search_overlay::ToggleHandler;
             let on_prev = Box::new(cx.listener(|this, _, _, cx| {
                 this.search.prev_match();
                 cx.notify();
