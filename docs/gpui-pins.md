@@ -18,6 +18,8 @@ The correct cargo idiom for git deps shared with an unpinned transitive crate is
 
 `gpui-component`'s own workspace enables `font-kit, x11, wayland, runtime_shaders` unconditionally. We mirror that to stay binary-compatible.
 
+`gpui` is also listed in `crates/app/[dev-dependencies]` with `test-support` feature enabled (required for `#[gpui::test]` harness). This pulls `proptest` into the lockfile — expected, test-only, does not affect release binary.
+
 ## Current pin
 
 | Crate | Rev | Date | Source |
