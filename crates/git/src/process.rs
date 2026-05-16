@@ -11,8 +11,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -107,15 +107,52 @@ impl GitCmd {
         // disambiguate from the io::Error alone. Surface the io error and let
         // higher layers (e.g. `Repository::open`) classify after checking
         // whether the cwd exists.
-        let child = cmd.spawn().map_err(GitError::Spawn)?;
-        match timeout(self.timeout, child.wait_with_output()).await {
-            Ok(Ok(out)) => Ok(RawOutput {
-                stdout: out.stdout,
-                stderr: out.stderr,
-                status: out.status,
-            }),
-            Ok(Err(e)) => Err(GitError::Spawn(e)),
-            Err(_elapsed) => Err(GitError::Timeout { secs }),
+        let mut child = cmd.spawn().map_err(GitError::Spawn)?;
+        // Drive child manually rather than `wait_with_output()` so we retain
+        // `&mut child` for explicit kill+reap on the timeout path. Letting the
+        // tokio runtime's SIGCHLD reaper pick up an abandoned zombie was the
+        // v0.9 orphan-process failure class.
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .expect("stdout was piped in command builder");
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .expect("stderr was piped in command builder");
+
+        // Buffers live inside the future so they're not borrowed across the
+        // select! arm boundary. Future returns them by value on success.
+        let drain = async move {
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            tokio::try_join!(
+                stdout_pipe.read_to_end(&mut stdout_buf),
+                stderr_pipe.read_to_end(&mut stderr_buf),
+            )?;
+            std::io::Result::Ok((stdout_buf, stderr_buf))
+        };
+        let sleep = tokio::time::sleep(self.timeout);
+        tokio::pin!(drain);
+        tokio::pin!(sleep);
+
+        tokio::select! {
+            biased;
+            _ = &mut sleep => {
+                // Explicit cleanup so the reap happens before this future returns.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                Err(GitError::Timeout { secs })
+            }
+            drained = &mut drain => {
+                let (stdout_buf, stderr_buf) = drained.map_err(GitError::Spawn)?;
+                let status = child.wait().await.map_err(GitError::Spawn)?;
+                Ok(RawOutput {
+                    stdout: stdout_buf,
+                    stderr: stderr_buf,
+                    status,
+                })
+            }
         }
     }
 }
