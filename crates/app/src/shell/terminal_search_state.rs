@@ -73,6 +73,12 @@ pub struct SearchState {
     pub options: SearchOptions,
 }
 
+impl Default for SearchState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SearchState {
     pub fn new() -> Self {
         Self {

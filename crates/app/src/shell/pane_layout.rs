@@ -72,11 +72,7 @@ pub fn build_node(
             // pre-resize content (or the TUI hasn't repainted on SIGWINCH),
             // cells will overflow the leaf's slot and bleed into the next
             // pane + its separator.
-            let mut leaf = div()
-                .w(px(w))
-                .h(px(h))
-                .flex_shrink_0()
-                .overflow_hidden();
+            let mut leaf = div().w(px(w)).h(px(h)).flex_shrink_0().overflow_hidden();
             if let Some(pane) = panes.get(id) {
                 leaf = leaf.child(pane.clone());
             }

@@ -82,10 +82,7 @@ impl Typography {
             // (`terminal_element.rs:903–955`).
             features: FontFeatures::disable_ligatures(),
             fallbacks: Some(FontFallbacks::from_fonts(
-                self.mono_fallbacks
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                self.mono_fallbacks.iter().map(|s| s.to_string()).collect(),
             )),
             weight: self.w_regular,
             style: FontStyle::Normal,

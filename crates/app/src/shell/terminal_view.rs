@@ -356,9 +356,7 @@ impl TerminalView {
                 _ => {}
             }
         }
-        if needs_snapshot
-            && let Ok(snapshot) = self.backend.snapshot(self.session_id)
-        {
+        if needs_snapshot && let Ok(snapshot) = self.backend.snapshot(self.session_id) {
             self.snapshot = snapshot;
         }
         if had_output {

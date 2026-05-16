@@ -104,6 +104,7 @@ impl TerminalState {
     /// - Tab stops aren't reset to the new width. We don't expose tabs
     ///   either; \t lands on default column boundaries inside the grid.
     /// - Selection isn't invalidated. We don't have selection in v1.
+    ///
     /// Once any of those features ship, port the relevant lines from
     /// `Term::resize` back here and gate them on actual feature use.
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -351,7 +352,10 @@ mod tests {
         // SGR truecolor + a character so the cell is non-empty.
         state.advance(b"\x1b[38;2;255;0;128mX");
         let snap = fresh_snapshot(&state);
-        assert_eq!(first_non_default_fg(&snap), Some(CellColor::Rgb(255, 0, 128)));
+        assert_eq!(
+            first_non_default_fg(&snap),
+            Some(CellColor::Rgb(255, 0, 128))
+        );
     }
 
     #[test]
@@ -382,9 +386,6 @@ mod tests {
         state.advance(b"\x1b[2mX\x1b[22mY");
         let snap = fresh_snapshot(&state);
         assert!(snap.cells[0][0].dim, "X (after SGR 2) should carry dim");
-        assert!(
-            !snap.cells[0][1].dim,
-            "Y (after SGR 22) should clear dim"
-        );
+        assert!(!snap.cells[0][1].dim, "Y (after SGR 22) should clear dim");
     }
 }

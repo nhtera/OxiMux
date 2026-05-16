@@ -295,11 +295,7 @@ impl MainPane {
     /// the drag snapshot into `self.active_drag`. Kept as a method (rather
     /// than letting layout poke the field directly) so the field can stay
     /// private and so any future bookkeeping at drag start has one home.
-    pub(super) fn begin_divider_drag(
-        &mut self,
-        drag: ActiveDrag,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn begin_divider_drag(&mut self, drag: ActiveDrag, cx: &mut Context<Self>) {
         self.active_drag = Some(drag);
         cx.notify();
     }
@@ -307,11 +303,7 @@ impl MainPane {
     /// Called by `pane_layout::build_divider` on double-click — resets the
     /// addressed split to equal weights (the reference terminal / Zed dock parity). No-op
     /// if the path doesn't address a `Split`.
-    pub(super) fn reset_split_weights(
-        &mut self,
-        path: &[usize],
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn reset_split_weights(&mut self, path: &[usize], cx: &mut Context<Self>) {
         if let Some(current) = self.tree.split_weights(path) {
             let equal = vec![1.0; current.len()];
             if self.tree.set_split_weights(path, equal) {
@@ -516,26 +508,24 @@ impl Render for MainPane {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
-            .on_mouse_move(cx.listener(
-                |this, e: &MouseMoveEvent, _window, cx| {
-                    if this.active_drag.is_none() {
-                        return;
-                    }
-                    // If the left button is no longer held, the user
-                    // released *outside* MainPane's hitbox (e.g. over the
-                    // OS title bar or the sidebar) so `on_mouse_up` never
-                    // fired. Without this check, the divider would keep
-                    // following the cursor without any button held until
-                    // the user clicked again. Clear the drag now that we
-                    // can see the button state.
-                    if e.pressed_button != Some(MouseButton::Left) {
-                        this.active_drag = None;
-                        cx.notify();
-                        return;
-                    }
-                    this.apply_drag(e.position, cx);
-                },
-            ))
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _window, cx| {
+                if this.active_drag.is_none() {
+                    return;
+                }
+                // If the left button is no longer held, the user
+                // released *outside* MainPane's hitbox (e.g. over the
+                // OS title bar or the sidebar) so `on_mouse_up` never
+                // fired. Without this check, the divider would keep
+                // following the cursor without any button held until
+                // the user clicked again. Clear the drag now that we
+                // can see the button state.
+                if e.pressed_button != Some(MouseButton::Left) {
+                    this.active_drag = None;
+                    cx.notify();
+                    return;
+                }
+                this.apply_drag(e.position, cx);
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _window, cx| {
