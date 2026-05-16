@@ -15,3 +15,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# For examples/ only; gated to dev so it doesn't bloat release builds.
+tracing-subscriber = { workspace = true }
