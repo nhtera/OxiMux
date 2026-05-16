@@ -3,18 +3,13 @@
 //! Boots GPUI + gpui-component, registers workspace key bindings, opens the
 //! main window, and mounts `WorkspaceRoot`.
 
-mod actions;
-mod shell;
-mod workspace_root;
-
 use gpui::{AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
-use tracing_subscriber::EnvFilter;
-use workspace_root::WorkspaceRoot;
-
-use crate::actions::{
+use oximux_app::actions::{
     CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, PrevTab, Search, SplitHorizontal,
     SplitVertical,
 };
+use oximux_app::workspace_root::WorkspaceRoot;
+use tracing_subscriber::EnvFilter;
 
 fn main() {
     init_tracing();
