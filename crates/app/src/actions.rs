@@ -51,5 +51,10 @@ actions!(
         /// Expand a collapsed (large) diff in the DiffView. Wired to the
         /// click on the "expand" affordance row.
         ExpandDiff,
+        /// Open the commit dialog modal (step 14 binds Cmd+K).
+        OpenCommitDialog,
+        /// Submit the active commit dialog. Routed via dialog button click;
+        /// declared here so step 14 can also bind Cmd+Enter to it.
+        CommitStaged,
     ]
 );
