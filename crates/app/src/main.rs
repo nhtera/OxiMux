@@ -16,6 +16,7 @@ use oximux_app::actions::{
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical,
     ToggleRightSidebar,
 };
+use oximux_app::assets::CompositeAssets;
 use oximux_app::workspace_root::WorkspaceRoot;
 use oximux_git::Repository;
 use tracing_subscriber::EnvFilter;
@@ -42,11 +43,10 @@ fn main() {
         }
     };
 
-    // `with_assets` registers gpui-component's bundled SVG icons (chevrons,
-    // close, etc.) so `IconName::*` paths resolve at runtime. Without this,
-    // the Button + IconName-driven elements paint blank — see the search
-    // overlay's nav chevrons. Native build embeds the SVGs via RustEmbed.
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    // `with_assets` registers our composite SVG source: local app icons
+    // (e.g. `icons/git-branch.svg`) first, falling through to gpui-component's
+    // bundled `IconName::*` catalog. Without this, both sets paint blank.
+    let app = gpui_platform::application().with_assets(CompositeAssets);
 
     app.run(move |cx| {
         gpui_component::init(cx);

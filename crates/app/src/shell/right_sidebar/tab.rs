@@ -31,9 +31,18 @@ pub fn visible_tabs(v: TabVisibility) -> Vec<RightTab> {
 }
 
 impl RightTab {
-    /// Single-letter glyph used as the icon in the activity bar.
-    /// Using letters avoids asset path uncertainty in v1; Phase 02+ can swap
-    /// to gpui-component IconName paths once the asset registry is confirmed.
+    /// Asset path for the tab's SVG icon. Resolved by `CompositeAssets`:
+    /// `file.svg` and `search.svg` come from gpui-component's bundle;
+    /// `git-branch.svg` is shipped locally in `crates/app/assets/icons/`.
+    pub fn icon_path(self) -> &'static str {
+        match self {
+            RightTab::Explorer => "icons/file.svg",
+            RightTab::Search => "icons/search.svg",
+            RightTab::SourceControl => "icons/git-branch.svg",
+        }
+    }
+
+    /// Single-letter glyph — kept as a textual fallback / accessibility hint.
     pub fn label(self) -> &'static str {
         match self {
             RightTab::Explorer => "E",

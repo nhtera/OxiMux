@@ -1,13 +1,14 @@
 //! Top tab bar — horizontal strip across the top of the right sidebar.
 //!
-//! the reference UX-style: tabs flow left-to-right, active tab marked with a 2px bottom
-//! border accent, toggle button pinned to the right edge. Click handlers
-//! mutate the RightSidebar entity directly so they fire regardless of which
-//! element currently holds focus (no action-dispatch routing dependency).
+//! the reference UX-style: SVG icon tabs flow left-to-right, active tab marked with a
+//! 2px bottom border accent, toggle button pinned to the right edge. Click
+//! handlers mutate the RightSidebar entity directly so they fire regardless
+//! of which element currently holds focus (no action-dispatch routing
+//! dependency).
 
 use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Styled, Window, div, px,
+    Styled, Window, div, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -16,6 +17,9 @@ use crate::shell::right_sidebar::layout::{
     ACTIVE_INDICATOR_THICKNESS, ACTIVITY_BAR_HEIGHT, TAB_BUTTON_WIDTH,
 };
 use crate::shell::right_sidebar::tab::RightTab;
+
+/// Tab/toggle icon size — matches lucide-react's default 16px in the reference UX.
+const ICON_SIZE: f32 = 16.;
 
 /// Render the horizontal top tab bar for the given set of `tabs`.
 pub fn render_top_tab_bar(
@@ -62,11 +66,10 @@ fn render_tab_button(
     sidebar: Entity<RightSidebar>,
     theme: Theme,
 ) -> impl IntoElement {
-    let label = tab.label();
-    let fg = if is_active {
+    let icon_color = if is_active {
         theme.focus_ring
     } else {
-        theme.fg_base
+        theme.fg_muted
     };
     let indicator_color = if is_active {
         theme.focus_ring
@@ -74,15 +77,17 @@ fn render_tab_button(
         theme.bg_panel
     };
 
+    let icon = svg()
+        .path(tab.icon_path())
+        .size(px(ICON_SIZE))
+        .text_color(icon_color);
+
     let inner = div()
         .flex()
         .flex_1()
         .items_center()
         .justify_center()
-        .text_color(fg)
-        .text_size(px(13.))
-        .font_weight(gpui::FontWeight::BOLD)
-        .child(label);
+        .child(icon);
 
     // 2px bottom-border indicator for the active tab; bg_panel (invisible) otherwise.
     let indicator = div()
@@ -111,17 +116,24 @@ fn render_toggle_button(
     theme: Theme,
     is_open: bool,
 ) -> impl IntoElement {
-    // Right-chevron when open (signals collapse-right); left-chevron when
-    // collapsed (signals expand). Matches the reference UX's persistent-toggle affordance.
-    let glyph = if is_open { "›" } else { "‹" };
+    // PanelRightClose when open (signals collapse-right); PanelRightOpen when
+    // collapsed (signals expand-left). Both ship in gpui-component's bundle.
+    let icon_path = if is_open {
+        "icons/panel-right-close.svg"
+    } else {
+        "icons/panel-right-open.svg"
+    };
+    let icon = svg()
+        .path(icon_path)
+        .size(px(ICON_SIZE))
+        .text_color(theme.fg_muted);
+
     div()
         .w(TAB_BUTTON_WIDTH)
         .h(ACTIVITY_BAR_HEIGHT)
         .flex()
         .items_center()
         .justify_center()
-        .text_color(theme.fg_muted)
-        .text_size(px(16.))
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
@@ -129,5 +141,5 @@ fn render_toggle_button(
                 sidebar.update(cx, |s, cx| s.toggle(cx));
             },
         )
-        .child(glyph)
+        .child(icon)
 }
