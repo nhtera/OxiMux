@@ -28,7 +28,9 @@ impl Density {
     /// Tight cockpit density. The only density in v1.
     pub fn cockpit() -> Self {
         Self {
-            h_top_bar: 36.0,
+            // 40 (not 36): leaves room below the 12px macOS traffic lights
+            // inset at point(12, 12) — see main.rs TitlebarOptions block.
+            h_top_bar: 40.0,
             h_status_bar: 22.0,
             h_tab: 28.0,
             h_row: 24.0,

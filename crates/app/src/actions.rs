@@ -54,6 +54,8 @@ actions!(
         /// Submit the active commit dialog. Routed via dialog button click;
         /// declared here so step 14 can also bind Cmd+Enter to it.
         CommitStaged,
+        /// Toggle the left rail (workspaces + nav) visibility (Cmd+B).
+        ToggleLeftSidebar,
         /// Toggle the right sidebar visibility (Cmd+L).
         ToggleRightSidebar,
         /// Switch to the Explorer tab in the right sidebar (Cmd+Shift+E).

@@ -3,16 +3,17 @@
 //! Composition (vertical):
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────┐  ← TopBar (36px)
+//! ┌─────────────────────────────────────────────────────────┐  ← TopBar (40px)
 //! ├──────────┬──────────────────────────┬───────────────────┤
 //! │ Sidebar  │        MainPane          │   RightSidebar    │  ← HSplit
-//! │ (240px)  │     (Phase 1 grid)       │ panel(320) + bar  │
+//! │ (240px)  │     (Phase 1 grid)       │ panel(360) + bar  │
 //! ├──────────┴──────────────────────────┴───────────────────┤  ← StatusBar (22px)
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! The right column renders only when a repository was opened at startup.
-//! Without one, layout collapses to `Sidebar | MainPane | StatusBar`.
+//! The left rail collapses to zero width when `left_rail_open` is false
+//! (toggled via Cmd+B). Without a repo, layout collapses to `Sidebar | MainPane | StatusBar`.
 //!
 //! Action routing note: sidebar tab-select keybindings (cmd-l, cmd-shift-e/f/g)
 //! are registered here on the outermost div — not on RightSidebar's div.
@@ -29,7 +30,8 @@ use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, ToggleRightSidebar,
+    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar,
+    ToggleRightSidebar,
 };
 use crate::shell::{
     main_area,
@@ -47,6 +49,9 @@ pub struct WorkspaceRoot {
     typography: Typography,
     main_pane: Option<Entity<MainPane>>,
     right_sidebar: Option<Entity<RightSidebar>>,
+    /// Whether the left rail (workspaces + nav) is visible. Toggled via Cmd+B.
+    /// Phase 02 mounts the rich left rail in place of the current `sidebar` stub.
+    left_rail_open: bool,
 }
 
 impl WorkspaceRoot {
@@ -65,7 +70,14 @@ impl WorkspaceRoot {
             typography,
             main_pane,
             right_sidebar,
+            left_rail_open: true,
         }
+    }
+
+    /// Test-only inspector for the left-rail visibility flag.
+    #[doc(hidden)]
+    pub fn left_rail_open(&self) -> bool {
+        self.left_rail_open
     }
 }
 
@@ -123,13 +135,15 @@ impl Render for WorkspaceRoot {
             .map(|mp| mp.read(cx).leaf_count())
             .unwrap_or(0);
 
-        let row = div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h(px(0.))
-            .child(sidebar::view(theme, density, typography))
-            .child(main);
+        // Gate the left rail on `left_rail_open`. Full collapse (zero width)
+        // matches the reference UX's pattern — no permanent mini-strip.
+        let row = div().flex().flex_row().flex_1().min_h(px(0.));
+        let row = if self.left_rail_open {
+            row.child(sidebar::view(theme, density, typography))
+        } else {
+            row
+        };
+        let row = row.child(main);
 
         let row = match self.right_sidebar.clone() {
             Some(sidebar) => row.child(sidebar),
@@ -152,6 +166,10 @@ impl Render for WorkspaceRoot {
             .size_full()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
+            .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
+                this.left_rail_open = !this.left_rail_open;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |s, cx| s.toggle(cx));
@@ -174,7 +192,16 @@ impl Render for WorkspaceRoot {
                     }
                 }),
             )
-            .child(top_bar::view(theme, density, typography))
+            .child(top_bar::view(
+                self.left_rail_open,
+                self.right_sidebar
+                    .as_ref()
+                    .map(|s| s.read(cx).open)
+                    .unwrap_or(false),
+                theme,
+                density,
+                typography,
+            ))
             .child(row)
             .child(status_bar::view(
                 theme,

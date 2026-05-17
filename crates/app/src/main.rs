@@ -10,11 +10,13 @@
 //! then runtime — is intentional: GPUI returns from `app.run`, the guard
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
-use gpui::{AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
+};
 use oximux_app::actions::{
     CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, OpenCommitDialog, PrevTab, Search,
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical,
-    ToggleRightSidebar,
+    ToggleLeftSidebar, ToggleRightSidebar,
 };
 use oximux_app::assets::CompositeAssets;
 use oximux_app::workspace_root::WorkspaceRoot;
@@ -72,8 +74,9 @@ fn main() {
             // on the focused TerminalView's root div — when no pane is
             // focused (no editor exists yet in v1), the action no-ops.
             KeyBinding::new("cmd-f", Search, None),
-            // Right sidebar keybinds. cmd-shift-g rebound from OpenGitPanel
+            // Sidebar keybinds. cmd-shift-g rebound from OpenGitPanel
             // to SelectSourceControlTab — same destination, new routing path.
+            KeyBinding::new("cmd-b", ToggleLeftSidebar, None),
             KeyBinding::new("cmd-l", ToggleRightSidebar, None),
             KeyBinding::new("cmd-shift-e", SelectExplorerTab, None),
             KeyBinding::new("cmd-shift-f", SelectSearchTab, None),
@@ -86,9 +89,18 @@ fn main() {
         let window_size = size(px(1400.0), px(900.0));
         let bounds = Bounds::centered(None, window_size, cx);
 
+        // Transparent unified titlebar: macOS draws traffic lights into the
+        // app chrome at point(12, 12); WorkspaceRoot's 40px top_bar sits
+        // beneath them with a 56px left gutter for the inset. On non-macOS,
+        // `traffic_light_position` is a no-op (system titlebar still drawn).
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(720.0), px(480.0))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("OxiMux".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(12.), px(12.))),
+            }),
             ..Default::default()
         };
 
