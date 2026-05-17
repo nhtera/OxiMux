@@ -34,5 +34,14 @@ actions!(
         PrevTab,
         /// Open the scrollback search overlay on the focused terminal pane.
         Search,
+        /// Toggle the git changed-files panel (Cmd+Shift+G in Phase 2 step 14).
+        OpenGitPanel,
+        /// Stage the file currently selected in the git panel.
+        StageFile,
+        /// Unstage the file currently selected in the git panel.
+        UnstageFile,
+        /// Revert (discard) worktree changes for the selected file. Step 8 is
+        /// a no-op stub; step 11 wires the type-to-confirm modal.
+        RevertFile,
     ]
 );

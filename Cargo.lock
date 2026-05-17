@@ -4278,9 +4278,12 @@ dependencies = [
  "gpui_macros",
  "gpui_platform",
  "oximux-core",
+ "oximux-git",
  "oximux-pty",
  "oximux-settings",
  "regex",
+ "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
