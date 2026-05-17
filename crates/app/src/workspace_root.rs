@@ -208,11 +208,13 @@ impl Render for WorkspaceRoot {
                 typography,
             ))
             .child(row)
+            // TODO(phase-07): replace 0 with AgentRuntime::active_count().
             .child(status_bar::view(
                 theme,
                 density,
                 typography,
                 pane_count,
+                0,
                 git_state.as_ref(),
             ))
     }

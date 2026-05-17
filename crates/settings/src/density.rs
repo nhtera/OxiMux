@@ -34,7 +34,8 @@ impl Density {
             // 40 (not 36): leaves room below the 12px macOS traffic lights
             // inset at point(12, 12) — see main.rs TitlebarOptions block.
             h_top_bar: 40.0,
-            h_status_bar: 22.0,
+            // 24 (not 22): room for the metric strip without descender clipping.
+            h_status_bar: 24.0,
             h_tab: 28.0,
             h_row: 24.0,
             r_card: 8.0,
