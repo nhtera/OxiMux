@@ -33,19 +33,33 @@ src/
 │                           registers keybindings; opens GPUI window
 ├── lib.rs                  re-exports for integration tests
 ├── actions.rs              all GPUI Action structs (SplitHorizontal, Search, etc.)
+├── assets.rs              CompositeAssets — local SVGs (git-branch) + gpui-component bundle
 ├── workspace_root.rs       WorkspaceRoot entity — top-level layout host
 │                           right_sidebar: Option<Entity<RightSidebar>>
+│                           left_rail: Entity<LeftRail>; left_rail_open: bool (Cmd+B)
+│                           palette: Entity<PaletteModal> (Cmd+P / Cmd+Shift+P)
 │                           poll_state mirrored from RightSidebar for status bar
 └── shell/
     ├── mod.rs
-    ├── top_bar.rs          brand + nav strip
-    ├── sidebar.rs          left rail placeholder
+    ├── top_bar.rs          40px chrome: 56px traffic-light gutter + L/R panel toggles + wordmark
+    ├── left_rail/          250px workspace + nav rail (replaces old sidebar stub)
+    │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state
+    │   ├── nav_section.rs  NavItem (Tasks/Automations/Agents/Search) + pure bg/fg helpers
+    │   ├── workspace_list_render.rs  build_workspace_row_plan (pure) + render
+    │   └── toolbar.rs      Add Project + settings (stubs)
+    ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay
+    │   ├── mod.rs          PaletteModal entity (open/close/mode/query state)
+    │   ├── entry.rs        PALETTE_COMMANDS (11 actions, fn-ptr factories) + QUICK_OPEN_STUBS
+    │   ├── match_engine.rs pure scorer: prefix > consecutive > subsequence (no external crate)
+    │   └── palette_modal.rs pure render: card + header chip + result list
+    ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)
     ├── main_pane.rs        pane binary-tree; split/close/focus actions
     ├── pane_tree.rs        pure PaneTree data structure (weight-aware)
     ├── pane_layout.rs      layout helpers
     ├── tabbed_pane.rs      TabbedPane entity: tab strip + active terminal
-    ├── main_area.rs        placeholder when no pane open
-    ├── status_bar.rs       left | center git zone | right; git_zone_label() helper
+    ├── main_area.rs        thin dispatcher → welcome_view::view
+    ├── status_bar.rs       left | center git zone | right metric strip (N TTY | N agents | N panes)
+    │                       pure helpers: tty_label / agent_label / pane_label / metric_color
     ├── terminal_view.rs    TerminalView GPUI entity; poll task; blink; focus
     ├── terminal_row.rs     build_row / group_runs / effective_colors
     ├── terminal_palette.rs CellColor → Hsla resolver (charcoal + xterm-256)
@@ -56,8 +70,8 @@ src/
     ├── cell_metrics.rs     character cell size constants
     ├── right_sidebar/
     │   ├── mod.rs          RightSidebar entity; tab switching; hosts GitPanel+DiffView or placeholders
-    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl
-    │   ├── activity_bar.rs 40px strip; single-letter glyph buttons; routes tab-select actions
+    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl; icon_path() per tab
+    │   ├── activity_bar.rs top tab bar (SVG icons) + persistent collapsed rail + PanelRight toggle
     │   └── layout.rs       layout constants
     ├── git_panel/
     │   ├── mod.rs          GitPanel entity; file-list render
