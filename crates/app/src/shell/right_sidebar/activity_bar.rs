@@ -1,9 +1,9 @@
-//! Activity bar — the 40px vertical icon strip on the far right edge.
+//! Top tab bar — horizontal strip across the top of the right sidebar.
 //!
-//! Renders one button per visible tab. The active tab gets a 2px right-edge
-//! accent line. Click handlers call the RightSidebar entity directly via a
-//! captured entity handle so tab switches work regardless of which element
-//! currently holds focus (no action-dispatch routing dependency).
+//! the reference UX-style: tabs flow left-to-right, active tab marked with a 2px bottom
+//! border accent, toggle button pinned to the right edge. Click handlers
+//! mutate the RightSidebar entity directly so they fire regardless of which
+//! element currently holds focus (no action-dispatch routing dependency).
 
 use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -12,14 +12,13 @@ use gpui::{
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::right_sidebar::RightSidebar;
-use crate::shell::right_sidebar::layout::{ACTIVE_INDICATOR_WIDTH, ACTIVITY_BAR_WIDTH};
+use crate::shell::right_sidebar::layout::{
+    ACTIVE_INDICATOR_THICKNESS, ACTIVITY_BAR_HEIGHT, TAB_BUTTON_WIDTH,
+};
 use crate::shell::right_sidebar::tab::RightTab;
 
-/// Render the vertical activity bar for the given set of `tabs`.
-///
-/// Click handlers mutate `sidebar` directly — bypassing GPUI action dispatch
-/// so tab switches fire regardless of which element currently holds focus.
-pub fn render_activity_bar(
+/// Render the horizontal top tab bar for the given set of `tabs`.
+pub fn render_top_tab_bar(
     active: RightTab,
     tabs: &[RightTab],
     sidebar: &Entity<RightSidebar>,
@@ -27,18 +26,21 @@ pub fn render_activity_bar(
     _density: Density,
     _typography: &Typography,
 ) -> impl IntoElement {
-    let buttons: Vec<_> = tabs
+    let tab_buttons: Vec<_> = tabs
         .iter()
         .map(|&tab| render_tab_button(tab, tab == active, sidebar.clone(), theme))
         .collect();
 
     div()
-        .w(ACTIVITY_BAR_WIDTH)
-        .h_full()
+        .h(ACTIVITY_BAR_HEIGHT)
+        .w_full()
         .flex()
-        .flex_col()
+        .flex_row()
+        .items_stretch()
         .bg(theme.bg_panel)
-        .children(buttons)
+        .child(div().flex().flex_row().children(tab_buttons))
+        .child(div().flex_1())
+        .child(render_toggle_button(sidebar.clone(), theme))
 }
 
 fn render_tab_button(
@@ -48,7 +50,6 @@ fn render_tab_button(
     theme: Theme,
 ) -> impl IntoElement {
     let label = tab.label();
-    // Use focus_ring as the active accent color (closest semantic match in Theme).
     let fg = if is_active {
         theme.focus_ring
     } else {
@@ -60,9 +61,6 @@ fn render_tab_button(
         theme.bg_panel
     };
 
-    // Right-edge 2px indicator for the active tab; bg_panel color for inactive.
-    let indicator = div().w(ACTIVE_INDICATOR_WIDTH).h_full().bg(indicator_color);
-
     let inner = div()
         .flex()
         .flex_1()
@@ -73,22 +71,44 @@ fn render_tab_button(
         .font_weight(gpui::FontWeight::BOLD)
         .child(label);
 
-    div()
+    // 2px bottom-border indicator for the active tab; bg_panel (invisible) otherwise.
+    let indicator = div()
         .w_full()
-        .h(px(40.))
+        .h(ACTIVE_INDICATOR_THICKNESS)
+        .bg(indicator_color);
+
+    div()
+        .w(TAB_BUTTON_WIDTH)
+        .h_full()
         .flex()
-        .flex_row()
-        .items_center()
+        .flex_col()
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
             move |_: &MouseDownEvent, _window: &mut Window, cx: &mut App| {
-                // Mutate the sidebar entity directly — avoids routing through
-                // GPUI action dispatch (which would target the focused element,
-                // not the sidebar).
                 sidebar.update(cx, |s, cx| s.select_tab(tab, cx));
             },
         )
         .child(inner)
         .child(indicator)
+}
+
+fn render_toggle_button(sidebar: Entity<RightSidebar>, theme: Theme) -> impl IntoElement {
+    div()
+        .w(TAB_BUTTON_WIDTH)
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(theme.fg_muted)
+        .text_size(px(16.))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_: &MouseDownEvent, _window: &mut Window, cx: &mut App| {
+                sidebar.update(cx, |s, cx| s.toggle(cx));
+            },
+        )
+        // Right-chevron glyph: signals "collapse this sidebar off to the right".
+        .child("›")
 }
