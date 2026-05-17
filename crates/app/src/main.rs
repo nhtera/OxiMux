@@ -2,17 +2,44 @@
 //!
 //! Boots GPUI + gpui-component, registers workspace key bindings, opens the
 //! main window, and mounts `WorkspaceRoot`.
+//!
+//! Tokio runtime: built once and entered for the lifetime of `app.run`. The
+//! `_rt_guard` keeps `Handle::try_current()` returning Ok in every GPUI
+//! callback (panel ops, diff fetch, status poller) without each one having
+//! to thread a Handle through. The drop-on-exit ordering — guard first,
+//! then runtime — is intentional: GPUI returns from `app.run`, the guard
+//! exits the runtime, then the runtime itself shuts down gracefully.
 
 use gpui::{AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
 use oximux_app::actions::{
-    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, PrevTab, Search, SplitHorizontal,
-    SplitVertical,
+    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, OpenCommitDialog, OpenGitPanel,
+    PrevTab, Search, SplitHorizontal, SplitVertical,
 };
 use oximux_app::workspace_root::WorkspaceRoot;
+use oximux_git::Repository;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
     init_tracing();
+
+    // Boot the tokio runtime that every git op + status poller relies on.
+    // Held across `app.run` so `Handle::try_current` succeeds in callbacks.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let _rt_guard = rt.enter();
+
+    // Best-effort: open the repo at cwd. If we're not in a git tree, render
+    // without the git column — the rest of the shell still works.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let repo = match rt.block_on(Repository::open(&cwd)) {
+        Ok(r) => Some(r),
+        Err(err) => {
+            tracing::info!(?err, "no git repository at cwd; git column hidden");
+            None
+        }
+    };
 
     // `with_assets` registers gpui-component's bundled SVG icons (chevrons,
     // close, etc.) so `IconName::*` paths resolve at runtime. Without this,
@@ -44,6 +71,11 @@ fn main() {
             // on the focused TerminalView's root div — when no pane is
             // focused (no editor exists yet in v1), the action no-ops.
             KeyBinding::new("cmd-f", Search, None),
+            // Phase 2 step 14 git keybinds. Handlers land at the shell mount
+            // in Phase 6 (toggle git column visibility, open commit dialog
+            // overlay). Bindings ship now so the action surface is stable.
+            KeyBinding::new("cmd-shift-g", OpenGitPanel, None),
+            KeyBinding::new("cmd-k", OpenCommitDialog, None),
         ]);
         cx.activate(true);
 
@@ -56,8 +88,9 @@ fn main() {
             ..Default::default()
         };
 
-        let _ = cx.open_window(options, |window, cx| {
-            cx.new(|cx| WorkspaceRoot::new(window, cx))
+        let repo_for_window = repo.clone();
+        let _ = cx.open_window(options, move |window, cx| {
+            cx.new(|cx| WorkspaceRoot::new(repo_for_window, window, cx))
         });
     });
 }
