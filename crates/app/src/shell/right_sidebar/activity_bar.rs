@@ -42,6 +42,8 @@ pub fn render_top_tab_bar(
         .flex_row()
         .items_stretch()
         .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border_inactive)
         .child(div().flex().flex_row().children(tab_buttons))
         .child(div().flex_1())
         .child(render_toggle_button(sidebar.clone(), theme, true))

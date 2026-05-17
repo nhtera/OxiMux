@@ -221,9 +221,19 @@ impl Render for RightSidebar {
         let entity = cx.entity().clone();
 
         // Closed: render a thin rail with just the expand toggle so users can
-        // re-open without remembering Cmd+L (the reference UX pattern).
+        // re-open without remembering Cmd+L (the reference UX pattern). Bordered + opaque
+        // so it sits cleanly next to the main pane.
         if !self.open {
-            return render_collapsed_rail(&entity, theme).into_any_element();
+            return div()
+                .id("right-sidebar-closed")
+                .flex()
+                .flex_col()
+                .h_full()
+                .bg(theme.bg_panel)
+                .border_l_1()
+                .border_color(theme.border_inactive)
+                .child(render_collapsed_rail(&entity, theme))
+                .into_any_element();
         }
 
         let top_bar = render_top_tab_bar(active, &tabs, &entity, theme, density, &typography);
@@ -264,12 +274,18 @@ impl Render for RightSidebar {
 
         // Vertical stack: top tab bar above the panel body. Total column width fixed
         // so it doesn't compete with MainPane's flex_1 in the parent row.
+        //
+        // bg_panel + border_l isolate the column visually so the terminal pane
+        // to the left can't visually bleed into the empty body area.
         div()
             .id("right-sidebar")
             .flex()
             .flex_col()
             .h_full()
             .w(DEFAULT_PANEL_WIDTH)
+            .bg(theme.bg_panel)
+            .border_l_1()
+            .border_color(theme.border_inactive)
             .child(top_bar)
             .child(body)
             .into_any_element()

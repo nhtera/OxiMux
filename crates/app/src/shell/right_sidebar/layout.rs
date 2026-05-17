@@ -4,8 +4,9 @@ use gpui::Pixels;
 use gpui::px;
 
 /// Height of the horizontal tab bar across the top of the right sidebar.
-/// top bar (was a 40px vertical right-edge strip pre-refactor).
-pub const ACTIVITY_BAR_HEIGHT: Pixels = px(36.);
+/// 40 to align with the global top_bar height — the two strips read as
+/// one continuous chrome row across the window.
+pub const ACTIVITY_BAR_HEIGHT: Pixels = px(40.);
 
 /// Total width of the right sidebar column (tabs + body share this).
 pub const DEFAULT_PANEL_WIDTH: Pixels = px(360.);

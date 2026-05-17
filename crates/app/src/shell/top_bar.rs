@@ -14,8 +14,9 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::actions::{ToggleLeftSidebar, ToggleRightSidebar};
 
 /// Width reserved on the left for macOS traffic lights (12px inset +
-/// 3 buttons × 12px + 8px breathing room).
-const TRAFFIC_LIGHT_GUTTER: f32 = 56.0;
+/// 3 × ~14px buttons with ~6px gaps + comfortable breathing room before
+/// the left-sidebar toggle button starts).
+const TRAFFIC_LIGHT_GUTTER: f32 = 76.0;
 
 /// Each toggle icon's hit target.
 const TOGGLE_BUTTON_WIDTH: f32 = 36.0;
