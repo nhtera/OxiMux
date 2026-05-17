@@ -1,27 +1,15 @@
-//! Main area — fills remaining horizontal space.
+//! Main area — center pane shown when no `MainPane` entity is mounted.
 //!
-//! Phase 0 ships an empty placeholder with a quiet hint string. Phase 1
-//! replaces this with the gpui-component dock that multiplexes terminal,
-//! editor, git, and agent panes.
+//! Delegates to `welcome_view::view` so the empty state is a proper card
+//! (logo, brand, action stubs, keyboard hints) instead of a placeholder
+//! string. Phase 04 will extend the predicate to gate on workspace
+//! selection state.
 
-use gpui::{IntoElement, ParentElement, Styled, div, px};
+use gpui::IntoElement;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::shell::welcome_view;
+
 pub fn view(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_1()
-        .h_full()
-        .items_center()
-        .justify_center()
-        .bg(theme.bg_base)
-        .child(
-            div()
-                .text_size(px(typography.t_body_md))
-                .text_color(theme.fg_subtle)
-                .child(format!(
-                    "OxiMux shell — dock empty (phase 0 · {}px gutters)",
-                    density.pad_panel as i32
-                )),
-        )
+    welcome_view::view(theme, density, typography)
 }

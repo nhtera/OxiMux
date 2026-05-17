@@ -25,4 +25,5 @@ pub mod terminal_search_overlay;
 pub mod terminal_search_state;
 pub mod terminal_view;
 pub mod top_bar;
+pub mod welcome_view;
 pub mod worktree_panel;
