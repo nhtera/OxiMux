@@ -14,6 +14,7 @@ pub mod main_pane;
 pub mod pane_layout;
 pub mod pane_tree;
 pub mod sidebar;
+pub mod stash_panel;
 pub mod status_bar;
 pub mod tabbed_pane;
 pub mod terminal_palette;
