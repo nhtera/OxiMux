@@ -18,7 +18,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::GitPanel;
-use crate::shell::right_sidebar::activity_bar::render_top_tab_bar;
+use crate::shell::right_sidebar::activity_bar::{render_collapsed_rail, render_top_tab_bar};
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 
@@ -217,13 +217,15 @@ impl Render for RightSidebar {
         // RightSidebar is a sibling of MainPane in the row layout — not an ancestor
         // of TerminalView — so on_action here would never fire when the terminal is focused.
 
-        // Closed: collapse the whole right column (the reference UX pattern — tabs hide with the sidebar).
-        if !self.open {
-            return div().id("right-sidebar");
-        }
-
         // Pass the entity handle so click handlers mutate the sidebar directly.
         let entity = cx.entity().clone();
+
+        // Closed: render a thin rail with just the expand toggle so users can
+        // re-open without remembering Cmd+L (the reference UX pattern).
+        if !self.open {
+            return render_collapsed_rail(&entity, theme).into_any_element();
+        }
+
         let top_bar = render_top_tab_bar(active, &tabs, &entity, theme, density, &typography);
 
         // Inline each tab body — avoids Box<dyn IntoElement> (trait not dyn-compatible).
@@ -249,13 +251,14 @@ impl Render for RightSidebar {
                 .child("Search — Phase 03")
                 .into_any_element(),
             RightTab::SourceControl => div()
-                // Both children flex_1 so they share the panel width 50/50 (M2 fix).
+                // Stack vertically: file list above, diff view below. Phase 04 will
+                // restructure with inline commit area between them.
                 .flex_1()
                 .w_full()
                 .flex()
-                .flex_row()
-                .child(div().flex_1().h_full().child(self.git_panel.clone()))
-                .child(div().flex_1().h_full().child(self.diff_view.clone()))
+                .flex_col()
+                .child(div().flex_1().w_full().child(self.git_panel.clone()))
+                .child(div().flex_1().w_full().child(self.diff_view.clone()))
                 .into_any_element(),
         };
 
@@ -269,5 +272,6 @@ impl Render for RightSidebar {
             .w(DEFAULT_PANEL_WIDTH)
             .child(top_bar)
             .child(body)
+            .into_any_element()
     }
 }

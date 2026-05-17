@@ -40,7 +40,20 @@ pub fn render_top_tab_bar(
         .bg(theme.bg_panel)
         .child(div().flex().flex_row().children(tab_buttons))
         .child(div().flex_1())
-        .child(render_toggle_button(sidebar.clone(), theme))
+        .child(render_toggle_button(sidebar.clone(), theme, true))
+}
+
+/// Render a minimal collapsed-state rail — just the expand toggle. Matches
+/// the reference UX's pattern where the sidebar can always be re-opened without keyboard.
+pub fn render_collapsed_rail(sidebar: &Entity<RightSidebar>, theme: Theme) -> impl IntoElement {
+    div()
+        .id("right-sidebar-collapsed")
+        .w(TAB_BUTTON_WIDTH)
+        .h_full()
+        .flex()
+        .flex_col()
+        .bg(theme.bg_panel)
+        .child(render_toggle_button(sidebar.clone(), theme, false))
 }
 
 fn render_tab_button(
@@ -93,10 +106,17 @@ fn render_tab_button(
         .child(indicator)
 }
 
-fn render_toggle_button(sidebar: Entity<RightSidebar>, theme: Theme) -> impl IntoElement {
+fn render_toggle_button(
+    sidebar: Entity<RightSidebar>,
+    theme: Theme,
+    is_open: bool,
+) -> impl IntoElement {
+    // Right-chevron when open (signals collapse-right); left-chevron when
+    // collapsed (signals expand). Matches the reference UX's persistent-toggle affordance.
+    let glyph = if is_open { "›" } else { "‹" };
     div()
         .w(TAB_BUTTON_WIDTH)
-        .h_full()
+        .h(ACTIVITY_BAR_HEIGHT)
         .flex()
         .items_center()
         .justify_center()
@@ -109,6 +129,5 @@ fn render_toggle_button(sidebar: Entity<RightSidebar>, theme: Theme) -> impl Int
                 sidebar.update(cx, |s, cx| s.toggle(cx));
             },
         )
-        // Right-chevron glyph: signals "collapse this sidebar off to the right".
-        .child("›")
+        .child(glyph)
 }
