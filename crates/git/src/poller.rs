@@ -8,6 +8,7 @@
 //!
 //! Drop aborts the task; no zombie polling and no orphaned producer/consumer.
 
+use crate::error::GitError;
 use crate::repository::Repository;
 use oximux_core::GitState;
 use std::time::Duration;
@@ -18,28 +19,43 @@ use tokio::task::AbortHandle;
 /// via `spawn_with_interval` for tests.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(500);
 
-/// After this many consecutive `repo.status()` failures, the poller emits a
-/// `None` on the watch channel so the UI can distinguish "git is broken /
-/// repo deleted" from "still loading first sample".
+/// After this many consecutive `repo.status()` failures, the poller emits
+/// `PollState::Failed(last_error)` on the watch channel so the UI can
+/// distinguish "git is broken / repo deleted" from "still loading first sample".
 const FAILURE_THRESHOLD: u32 = 3;
 
+/// Tri-state poller output. `Loading` is the initial channel value before
+/// the first poll completes; `Ready` carries the last successful sample;
+/// `Failed` carries the last error after `FAILURE_THRESHOLD` consecutive
+/// failures (transient single-poll failures are logged but not surfaced).
+#[derive(Debug, Clone)]
+pub enum PollState {
+    /// Initial value; no poll has completed yet.
+    Loading,
+    /// Most recent poll succeeded.
+    Ready(GitState),
+    /// `FAILURE_THRESHOLD` consecutive failures; last error attached.
+    Failed(GitError),
+}
+
 pub struct StatusPoller {
-    state_rx: watch::Receiver<Option<GitState>>,
+    state_rx: watch::Receiver<PollState>,
     focus_tx: watch::Sender<bool>,
     abort: AbortHandle,
 }
 
 impl StatusPoller {
     /// Spawn a poller at the default 500 ms cadence. Focus defaults to `true`
-    /// (ticking). The first successful poll publishes a `Some(GitState)`; until
-    /// then the receiver yields `None`. After `FAILURE_THRESHOLD` consecutive
-    /// failures the channel is reset to `None`.
+    /// (ticking). Initial channel value is `PollState::Loading`; the first
+    /// successful poll publishes `PollState::Ready(state)`. After
+    /// `FAILURE_THRESHOLD` consecutive failures the channel transitions to
+    /// `PollState::Failed(error)` and stays there until a poll succeeds.
     pub fn spawn(repo: Repository) -> Self {
         Self::spawn_with_interval(repo, DEFAULT_TICK)
     }
 
     pub fn spawn_with_interval(repo: Repository, tick: Duration) -> Self {
-        let (state_tx, state_rx) = watch::channel::<Option<GitState>>(None);
+        let (state_tx, state_rx) = watch::channel::<PollState>(PollState::Loading);
         let (focus_tx, focus_rx) = watch::channel::<bool>(true);
         let task = tokio::spawn(poll_loop(repo, tick, state_tx, focus_rx));
         Self {
@@ -50,12 +66,12 @@ impl StatusPoller {
     }
 
     /// Subscribe to status updates. Receivers see the latest value on attach.
-    pub fn subscribe(&self) -> watch::Receiver<Option<GitState>> {
+    pub fn subscribe(&self) -> watch::Receiver<PollState> {
         self.state_rx.clone()
     }
 
     /// Most recently observed state (without awaiting a change).
-    pub fn current(&self) -> Option<GitState> {
+    pub fn current(&self) -> PollState {
         self.state_rx.borrow().clone()
     }
 
@@ -75,7 +91,7 @@ impl Drop for StatusPoller {
 async fn poll_loop(
     repo: Repository,
     tick: Duration,
-    state_tx: watch::Sender<Option<GitState>>,
+    state_tx: watch::Sender<PollState>,
     mut focus_rx: watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(tick);
@@ -113,12 +129,17 @@ async fn poll_loop(
                         // identical rows between ticks.
                         next.files.sort_by(|a, b| a.path.cmp(&b.path));
                         let _ = state_tx.send_if_modified(|cur| {
-                            if cur.as_ref() == Some(&next) {
-                                false
-                            } else {
-                                *cur = Some(next);
-                                true
+                            // Only suppress when the previous value was an
+                            // identical `Ready` — recovering from Failed or
+                            // Loading must always emit, even if the state
+                            // happens to deep-equal the cached payload.
+                            if let PollState::Ready(prev) = cur
+                                && prev == &next
+                            {
+                                return false;
                             }
+                            *cur = PollState::Ready(next);
+                            true
                         });
                     }
                     Err(e) => {
@@ -126,14 +147,14 @@ async fn poll_loop(
                         if consecutive_failures < FAILURE_THRESHOLD {
                             tracing::warn!(error = %e, attempt = consecutive_failures, "git status poll failed");
                         } else if consecutive_failures == FAILURE_THRESHOLD {
-                            tracing::error!(error = %e, "git status poller giving up — emitting None");
+                            tracing::error!(error = %e, "git status poller giving up — emitting Failed");
+                            let err_for_channel = e.clone();
                             let _ = state_tx.send_if_modified(|cur| {
-                                if cur.is_some() {
-                                    *cur = None;
-                                    true
-                                } else {
-                                    false
-                                }
+                                // Always transition to Failed at the threshold,
+                                // even if the current value is already Failed
+                                // (different error → still surface).
+                                *cur = PollState::Failed(err_for_channel);
+                                true
                             });
                         }
                         // Past the threshold, stay silent until a success

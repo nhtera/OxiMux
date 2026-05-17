@@ -8,7 +8,7 @@
 //!
 //! Set RUST_LOG=oximux_git=debug to see the failure-counter warns from H2.
 
-use oximux_git::{Repository, StatusPoller};
+use oximux_git::{PollState, Repository, StatusPoller};
 use std::env;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -43,8 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let snap = rx_print.borrow_and_update().clone();
             match snap {
-                None => println!("[stream] None  (broken / not yet sampled)"),
-                Some(s) => println!(
+                PollState::Loading => println!("[stream] Loading  (first poll not yet completed)"),
+                PollState::Failed(e) => println!("[stream] Failed  ({e})"),
+                PollState::Ready(s) => println!(
                     "[stream] branch={:?}  ahead={}  behind={}  files={}  head={}",
                     s.branch.as_deref(),
                     s.ahead,

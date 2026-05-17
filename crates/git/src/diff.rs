@@ -311,11 +311,24 @@ fn accumulate_header(p: &mut Pending, line: &str) {
 }
 
 fn strip_a_prefix(s: &str) -> String {
-    s.strip_prefix("a/").unwrap_or(s).to_string()
+    let no_tab = trim_legacy_timestamp(s);
+    no_tab.strip_prefix("a/").unwrap_or(no_tab).to_string()
 }
 
 fn strip_b_prefix(s: &str) -> String {
-    s.strip_prefix("b/").unwrap_or(s).to_string()
+    let no_tab = trim_legacy_timestamp(s);
+    no_tab.strip_prefix("b/").unwrap_or(no_tab).to_string()
+}
+
+/// Strip the historical tab-separated timestamp suffix that `git diff` emits
+/// on `---`/`+++` lines when the path contains spaces (legacy unified-diff
+/// convention from `diff(1)`). Without this, a path like `"my file.txt"`
+/// round-trips as `"my file.txt\t<timestamp>"`.
+fn trim_legacy_timestamp(s: &str) -> &str {
+    match s.find('\t') {
+        Some(i) => &s[..i],
+        None => s,
+    }
 }
 
 fn parse_hunk_body_line(line: &str) -> Option<DiffLine> {

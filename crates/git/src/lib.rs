@@ -12,11 +12,12 @@ pub mod error;
 pub mod poller;
 pub mod process;
 pub mod repository;
+pub mod stage;
 pub mod status;
 
 pub use diff::{DiffParseError, parse_unified_diff};
 pub use error::{GitError, Result};
-pub use poller::{DEFAULT_TICK, StatusPoller};
+pub use poller::{DEFAULT_TICK, PollState, StatusPoller};
 pub use process::{GitCmd, Output, RawOutput};
 pub use repository::Repository;
 pub use status::parse_porcelain_v2;

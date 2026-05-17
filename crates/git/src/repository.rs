@@ -44,7 +44,10 @@ impl Repository {
             .await
         {
             Ok(r) => r,
-            Err(GitError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(GitError::Spawn {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) => {
                 // Spawn returned NotFound — could be a missing `git` binary OR
                 // a missing current_dir. If the path exists at this point, the
                 // cwd is fine, so git itself is missing. (Pure error-path

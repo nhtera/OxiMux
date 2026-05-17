@@ -11,7 +11,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,6 +22,9 @@ pub struct GitCmd {
     cwd: PathBuf,
     args: Vec<OsString>,
     timeout: Duration,
+    /// If `Some`, bytes piped to the child's stdin (and stdin handle closed
+    /// after, so the child sees EOF). If `None`, stdin is `/dev/null`.
+    stdin_bytes: Option<Vec<u8>>,
 }
 
 /// Successful git output (exit code zero). Stderr is dropped on success.
@@ -45,6 +48,7 @@ impl GitCmd {
             cwd: cwd.as_ref().to_path_buf(),
             args: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
+            stdin_bytes: None,
         }
     }
 
@@ -68,6 +72,15 @@ impl GitCmd {
         self
     }
 
+    /// Pipe `data` to the child's stdin, then close it. The handle is dropped
+    /// **before** stdout/stderr drain begins to prevent deadlock against
+    /// commands that read all stdin before producing any output (`git apply`,
+    /// `git hash-object --stdin`, …).
+    pub fn stdin(mut self, data: Vec<u8>) -> Self {
+        self.stdin_bytes = Some(data);
+        self
+    }
+
     /// Run to completion, requiring exit code zero.
     pub async fn run(self) -> Result<Output> {
         let raw = self.run_raw().await?;
@@ -83,6 +96,12 @@ impl GitCmd {
     /// Run to completion, returning the raw exit + stderr unconditionally.
     pub async fn run_raw(self) -> Result<RawOutput> {
         let secs = self.timeout.as_secs();
+        let stdin_bytes = self.stdin_bytes;
+        let stdin_mode = if stdin_bytes.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        };
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.cwd)
             .args(&self.args)
@@ -97,7 +116,7 @@ impl GitCmd {
             // Sandbox: ignore /etc/gitconfig (which can set `core.hooksPath` to
             // an arbitrary script and run it on every status poll).
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .stdin(std::process::Stdio::null())
+            .stdin(stdin_mode)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -107,7 +126,21 @@ impl GitCmd {
         // disambiguate from the io::Error alone. Surface the io error and let
         // higher layers (e.g. `Repository::open`) classify after checking
         // whether the cwd exists.
-        let mut child = cmd.spawn().map_err(GitError::Spawn)?;
+        let mut child = cmd.spawn().map_err(GitError::spawn)?;
+
+        // Write stdin (if any) and drop the handle BEFORE draining stdout —
+        // commands like `git apply -` consume all stdin before producing
+        // output, so the order matters or we'd deadlock.
+        if let Some(bytes) = stdin_bytes {
+            let mut stdin_pipe = child.stdin.take().expect("stdin was piped above");
+            if let Err(e) = stdin_pipe.write_all(&bytes).await {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(GitError::spawn(e));
+            }
+            drop(stdin_pipe);
+        }
+
         // Drive child manually rather than `wait_with_output()` so we retain
         // `&mut child` for explicit kill+reap on the timeout path. Letting the
         // tokio runtime's SIGCHLD reaper pick up an abandoned zombie was the
@@ -145,8 +178,8 @@ impl GitCmd {
                 Err(GitError::Timeout { secs })
             }
             drained = &mut drain => {
-                let (stdout_buf, stderr_buf) = drained.map_err(GitError::Spawn)?;
-                let status = child.wait().await.map_err(GitError::Spawn)?;
+                let (stdout_buf, stderr_buf) = drained.map_err(GitError::spawn)?;
+                let status = child.wait().await.map_err(GitError::spawn)?;
                 Ok(RawOutput {
                     stdout: stdout_buf,
                     stderr: stderr_buf,
@@ -201,5 +234,24 @@ mod tests {
             }
             other => panic!("expected NonZero, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stdin_pipes_into_hash_object() {
+        // `git hash-object --stdin` reads stdin and prints the blob SHA-1.
+        // For "hello\n" the SHA is the well-known `ce0136…`. Exercises both
+        // the stdin builder and the drop-before-drain ordering.
+        let out = GitCmd::new(std::env::current_dir().unwrap())
+            .args(["hash-object", "--stdin"])
+            .stdin(b"hello\n".to_vec())
+            .run()
+            .await
+            .expect("hash-object --stdin should work");
+        let sha = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            sha.trim(),
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+            "unexpected blob sha"
+        );
     }
 }

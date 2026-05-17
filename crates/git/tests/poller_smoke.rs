@@ -1,11 +1,20 @@
 //! Integration tests for `StatusPoller`. Uses real git CLI in tempdirs and
 //! short tick intervals to keep wall-clock cost low.
 
-use oximux_git::{GitCmd, Repository, StatusPoller};
+use oximux_git::{GitCmd, PollState, Repository, StatusPoller};
 use std::fs;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::timeout;
+
+/// Test helper — extract the `GitState` out of a `Ready` channel value or
+/// panic. Keeps the assertion sites readable.
+fn ready(state: &PollState) -> &oximux_core::GitState {
+    match state {
+        PollState::Ready(s) => s,
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
 
 const FAST_TICK: Duration = Duration::from_millis(40);
 // Generous wait so CI scheduling jitter doesn't flake; small enough that the
@@ -38,12 +47,10 @@ async fn emits_initial_status_on_startup() {
         .await
         .expect("first poll within budget")
         .expect("sender alive");
-    let snap = rx
-        .borrow_and_update()
-        .clone()
-        .expect("Some after first poll");
-    assert_eq!(snap.branch.as_deref(), Some("main"));
-    assert!(snap.files.is_empty());
+    let snap = rx.borrow_and_update().clone();
+    let s = ready(&snap);
+    assert_eq!(s.branch.as_deref(), Some("main"));
+    assert!(s.files.is_empty());
 }
 
 #[tokio::test]
@@ -65,9 +72,10 @@ async fn detects_filesystem_change() {
         .await
         .expect("change detected within budget")
         .unwrap();
-    let snap = rx.borrow_and_update().clone().expect("Some");
-    assert_eq!(snap.files.len(), 1);
-    assert_eq!(snap.files[0].path.to_str(), Some("hello.txt"));
+    let snap = rx.borrow_and_update().clone();
+    let s = ready(&snap);
+    assert_eq!(s.files.len(), 1);
+    assert_eq!(s.files[0].path.to_str(), Some("hello.txt"));
 }
 
 #[tokio::test]
@@ -102,8 +110,9 @@ async fn pauses_when_unfocused_and_resumes_on_focus() {
         .await
         .expect("resumed emit within budget")
         .unwrap();
-    let snap = rx.borrow_and_update().clone().expect("Some");
-    assert_eq!(snap.files.len(), 1);
+    let snap = rx.borrow_and_update().clone();
+    let s = ready(&snap);
+    assert_eq!(s.files.len(), 1);
 }
 
 #[tokio::test]
@@ -123,6 +132,41 @@ async fn deduplicates_identical_status() {
         result.is_err(),
         "expected no duplicate emit, got: {result:?}"
     );
+}
+
+#[tokio::test]
+async fn emits_failed_after_threshold_of_consecutive_errors() {
+    // Open a real repo, wait for the first Ready sample, then delete `.git`
+    // out from under the poller. After FAILURE_THRESHOLD=3 ticks, the channel
+    // must transition to `PollState::Failed` (the M4 contract — UI should see
+    // "git is broken" instead of silently sticking on the last good sample).
+    let (tmp, repo) = make_repo().await;
+    let poller = StatusPoller::spawn_with_interval(repo, FAST_TICK);
+    let mut rx = poller.subscribe();
+
+    timeout(RECV_BUDGET, rx.changed())
+        .await
+        .expect("initial poll")
+        .unwrap();
+    rx.borrow_and_update();
+
+    fs::remove_dir_all(tmp.path().join(".git")).expect("rm .git");
+
+    // 3 failures × FAST_TICK + scheduling slack. Cap the wait at ~750 ms.
+    let deadline = std::time::Instant::now() + RECV_BUDGET;
+    loop {
+        if matches!(*rx.borrow_and_update(), PollState::Failed(_)) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "expected PollState::Failed within budget, last={:?}",
+                rx.borrow().clone()
+            );
+        }
+        let remaining = deadline - std::time::Instant::now();
+        let _ = timeout(remaining, rx.changed()).await;
+    }
 }
 
 #[tokio::test]
