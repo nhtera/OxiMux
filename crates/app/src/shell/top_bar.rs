@@ -1,13 +1,18 @@
 //! Top bar — 40px horizontal strip across the window head.
 //!
 //! chrome: 56px gutter (traffic-light inset on macOS), left-rail
-//! toggle, centered wordmark, right-sidebar toggle. Click handlers dispatch
-//! `ToggleLeftSidebar` / `ToggleRightSidebar` actions via `window.dispatch_action`
-//! since this is a pure render function with no owning entity handle.
+//! toggle, centered wordmark, right-sidebar activity tabs, right-sidebar
+//! toggle. Click handlers dispatch `ToggleLeftSidebar` / `ToggleRightSidebar`
+//! actions via `window.dispatch_action` since this is a pure render function
+//! with no owning entity handle.
+//!
+//! The right-sidebar tab strip (Explorer / Search / Source Control icons) is
+//! rendered by `right_sidebar::activity_bar` and embedded here when the panel
+//! is open, so the chrome reads as one continuous row across the window.
 
 use gpui::{
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled, Window,
-    div, px, svg,
+    AnyElement, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    Styled, Window, div, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -27,6 +32,7 @@ const ICON_SIZE: f32 = 16.0;
 pub fn view(
     left_open: bool,
     right_open: bool,
+    right_tabs: Option<AnyElement>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -40,18 +46,29 @@ pub fn view(
         .bg(theme.bg_panel)
         .border_b_1()
         .border_color(theme.border_inactive)
-        .child(left_zone(left_open, theme))
-        .child(center_zone(theme, typography))
-        .child(right_zone(right_open, theme))
+        .child(left_zone(left_open, theme, typography))
+        .child(spacer_zone())
+        .child(right_zone(right_open, right_tabs, theme))
 }
 
-fn left_zone(left_open: bool, theme: Theme) -> impl IntoElement {
+fn left_zone(left_open: bool, theme: Theme, typography: &Typography) -> impl IntoElement {
+    // the reference UX order: traffic gutter → wordmark → left-rail toggle. Keeping the
+    // wordmark anchored left mirrors macOS native chrome and frees the center
+    // for the flexible spacer that pushes the right zone to the edge.
+    let wordmark = div()
+        .px(px(8.0))
+        .text_size(px(typography.t_brand))
+        .font_weight(typography.w_semibold)
+        .text_color(theme.fg_base)
+        .child("OxiMux");
+
     div()
         .flex()
         .flex_row()
         .items_center()
         .h_full()
         .child(div().w(px(TRAFFIC_LIGHT_GUTTER)))
+        .child(wordmark)
         .child(toggle_button(
             left_toggle_icon(left_open),
             theme,
@@ -59,29 +76,24 @@ fn left_zone(left_open: bool, theme: Theme) -> impl IntoElement {
         ))
 }
 
-fn center_zone(theme: Theme, typography: &Typography) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .text_size(px(typography.t_brand))
-        .font_weight(typography.w_semibold)
-        .text_color(theme.fg_base)
-        .child("OxiMux")
+fn spacer_zone() -> impl IntoElement {
+    div().flex().flex_1().h_full()
 }
 
-fn right_zone(right_open: bool, theme: Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .h_full()
-        .child(toggle_button(
-            right_toggle_icon(right_open),
-            theme,
-            ToggleSide::Right,
-        ))
+fn right_zone(
+    right_open: bool,
+    right_tabs: Option<AnyElement>,
+    theme: Theme,
+) -> impl IntoElement {
+    let mut zone = div().flex().flex_row().items_center().h_full();
+    if let Some(tabs) = right_tabs {
+        zone = zone.child(tabs);
+    }
+    zone.child(toggle_button(
+        right_toggle_icon(right_open),
+        theme,
+        ToggleSide::Right,
+    ))
 }
 
 #[derive(Clone, Copy)]

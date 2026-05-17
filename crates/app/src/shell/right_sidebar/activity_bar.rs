@@ -1,55 +1,42 @@
-//! Top tab bar — horizontal strip across the top of the right sidebar.
+//! Activity-bar tab buttons — icon strip hosted by the global top bar.
 //!
-//! the reference UX-style: SVG icon tabs flow left-to-right, active tab marked with a
-//! 2px bottom border accent. The right-side collapse toggle lives in the
-//! global top_bar (workspace_root.rs) — NOT here — so there is exactly one
-//! show/hide affordance regardless of sidebar state. Click handlers mutate
-//! the RightSidebar entity directly so they fire regardless of which
-//! element currently holds focus (no action-dispatch routing dependency).
+//! Each tab is a 36px-wide button with a centered SVG icon plus a 2px bottom
+//! accent on the active tab. Click handlers mutate the `RightSidebar` entity
+//! directly so they fire regardless of focus.
+//!
+//! Layout note: these buttons used to live inside a dedicated 40px strip at the
+//! top of `RightSidebar`. Now they're embedded into `top_bar`'s right zone so
+//! the chrome reads as one continuous row (matches the reference UX). The right sidebar
+//! column below contains only the panel body.
 
 use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     Styled, Window, div, px, svg,
 };
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::Theme;
 
 use crate::shell::right_sidebar::RightSidebar;
-use crate::shell::right_sidebar::layout::{
-    ACTIVE_INDICATOR_THICKNESS, ACTIVITY_BAR_HEIGHT, TAB_BUTTON_WIDTH,
-};
+use crate::shell::right_sidebar::layout::{ACTIVE_INDICATOR_THICKNESS, TAB_BUTTON_WIDTH};
 use crate::shell::right_sidebar::tab::RightTab;
 
 /// Tab icon size — matches lucide-react's default 16px in the reference UX.
 const ICON_SIZE: f32 = 16.;
 
-/// Render the horizontal top tab bar for the given set of `tabs`. Tabs
-/// cluster at the left; the trailing `flex_1` spacer eats remaining width
-/// so the top_bar's panel-right toggle (rendered separately above) stays
-/// the only collapse affordance.
-pub fn render_top_tab_bar(
+/// Render the horizontal row of activity-bar tab buttons for the given
+/// `tabs`. Returns just the buttons; the caller is responsible for the
+/// surrounding container (height, background, borders).
+pub fn render_tab_buttons(
     active: RightTab,
     tabs: &[RightTab],
     sidebar: &Entity<RightSidebar>,
     theme: Theme,
-    _density: Density,
-    _typography: &Typography,
 ) -> impl IntoElement {
-    let tab_buttons: Vec<_> = tabs
+    let buttons: Vec<_> = tabs
         .iter()
         .map(|&tab| render_tab_button(tab, tab == active, sidebar.clone(), theme))
         .collect();
 
-    div()
-        .h(ACTIVITY_BAR_HEIGHT)
-        .w_full()
-        .flex()
-        .flex_row()
-        .items_stretch()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border_inactive)
-        .child(div().flex().flex_row().children(tab_buttons))
-        .child(div().flex_1())
+    div().flex().flex_row().h_full().children(buttons)
 }
 
 fn render_tab_button(
@@ -66,7 +53,7 @@ fn render_tab_button(
     let indicator_color = if is_active {
         theme.focus_ring
     } else {
-        theme.bg_panel
+        gpui::transparent_black()
     };
 
     let icon = svg()
@@ -81,7 +68,7 @@ fn render_tab_button(
         .justify_center()
         .child(icon);
 
-    // 2px bottom-border indicator for the active tab; bg_panel (invisible) otherwise.
+    // 2px bottom-border indicator for the active tab; transparent otherwise.
     let indicator = div()
         .w_full()
         .h(ACTIVE_INDICATOR_THICKNESS)

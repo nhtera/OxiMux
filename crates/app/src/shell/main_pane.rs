@@ -34,10 +34,9 @@ use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
 use crate::shell::tabbed_pane::{TAB_STRIP_HEIGHT_PX, TabbedPane};
 use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView};
 
-/// Chrome subtracted from viewport when computing the terminal area. Mirrors
-/// `WorkspaceRoot` composition + density tokens.
-const CHROME_W_PX: f32 = 240.0; // sidebar
-const CHROME_H_PX: f32 = 36.0 + 22.0; // top bar + status bar
+/// Vertical chrome subtracted from viewport when computing terminal area
+/// (top bar + status bar). Density tokens are 40 + 24 = 64.
+const CHROME_H_PX: f32 = 40.0 + 24.0;
 
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
@@ -54,6 +53,12 @@ pub struct MainPane {
     density: Density,
     typography: Typography,
     focus_handle: FocusHandle,
+    /// Horizontal chrome reserved by surrounding panels (left rail + right
+    /// sidebar). Live value; updated by `WorkspaceRoot` on every render so
+    /// the PTY grid shrinks when the right sidebar opens. Defaults to the
+    /// left rail width so initial mount before the first sync still produces
+    /// a sane terminal grid.
+    chrome_w_px: f32,
     /// One observer per TabbedPane. When a pane notifies (click, keystroke,
     /// PTY output via its tab's bubbled notify, tab swap) we re-notify
     /// MainPane so render runs and `sync_focused_from_window` repaints the
@@ -86,6 +91,7 @@ impl MainPane {
         let mut pane_observers = HashMap::new();
         pane_observers.insert(id, sub);
         let focus_handle = cx.focus_handle();
+        let chrome_w_px = density.w_left_rail;
         Self {
             tree: PaneTree::Leaf(id),
             panes,
@@ -95,9 +101,22 @@ impl MainPane {
             density,
             typography,
             focus_handle,
+            chrome_w_px,
             _pane_observers: pane_observers,
             active_drag: None,
         }
+    }
+
+    /// Update the surrounding chrome width so PTY grids match the actual
+    /// MainPane rect. Called by `WorkspaceRoot::render` whenever the left
+    /// rail or right sidebar toggles. No-op if `new_chrome` matches; a
+    /// `cx.notify()` would otherwise loop forever (render → update → render).
+    pub fn set_chrome_width(&mut self, new_chrome: f32, cx: &mut Context<Self>) {
+        if (self.chrome_w_px - new_chrome).abs() < f32::EPSILON {
+            return;
+        }
+        self.chrome_w_px = new_chrome;
+        cx.notify();
     }
 
     pub fn leaf_count(&self) -> usize {
@@ -277,7 +296,7 @@ impl MainPane {
 
     fn dispatch_grids(&self, window: &Window, cx: &mut Context<Self>) {
         let metrics = CellMetrics::measure(&self.typography, window);
-        let (w, h) = available_area(window, self.density.pad_panel, &metrics);
+        let (w, h) = available_area(window, self.chrome_w_px, self.density.pad_panel, &metrics);
         // Defer PTY resize during an active divider drag (the reference terminal / iTerm
         // pattern). At 60 fps a drag would otherwise fire 60+ SIGWINCH/sec
         // per affected pane, which makes shells with expensive prompts
@@ -365,9 +384,14 @@ fn focus_pane(
     }
 }
 
-fn available_area(window: &Window, pad_panel: f32, metrics: &CellMetrics) -> (f32, f32) {
+fn available_area(
+    window: &Window,
+    chrome_w_px: f32,
+    pad_panel: f32,
+    metrics: &CellMetrics,
+) -> (f32, f32) {
     let v = window.viewport_size();
-    let w = (f32::from(v.width) - CHROME_W_PX - pad_panel * 2.0).max(metrics.cell_width);
+    let w = (f32::from(v.width) - chrome_w_px - pad_panel * 2.0).max(metrics.cell_width);
     let h = (f32::from(v.height) - CHROME_H_PX - pad_panel * 2.0).max(metrics.line_height);
     (w, h)
 }
@@ -487,7 +511,7 @@ impl Render for MainPane {
         self.dispatch_grids(window, cx);
         let focus_handle = self.focus_handle.clone();
         let metrics = CellMetrics::measure(&self.typography, window);
-        let (w, h) = available_area(window, self.density.pad_panel, &metrics);
+        let (w, h) = available_area(window, self.chrome_w_px, self.density.pad_panel, &metrics);
 
         // `window.on_mouse_event` only works from the paint phase, and
         // `Render::render` runs during layout — so instead we hang a plain

@@ -18,7 +18,6 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::GitPanel;
-use crate::shell::right_sidebar::activity_bar::render_top_tab_bar;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 
@@ -41,8 +40,6 @@ pub struct RightSidebar {
     _poll_observer: Task<()>,
 
     theme: Theme,
-    density: Density,
-    typography: Typography,
 }
 
 impl RightSidebar {
@@ -84,8 +81,6 @@ impl RightSidebar {
             _poller: Some(poller),
             _poll_observer: poll_observer,
             theme,
-            density,
-            typography,
         }
     }
 
@@ -145,14 +140,20 @@ impl RightSidebar {
             _poller: poller,
             _poll_observer: poll_observer,
             theme,
-            density,
-            typography,
         }
     }
 
     /// Expose the latest poll state so `WorkspaceRoot` can pass it to the status bar.
     pub fn latest_poll_state(&self) -> &PollState {
         &self.latest_poll_state
+    }
+
+    /// Tabs the activity bar should expose given current repo presence. Used by
+    /// `WorkspaceRoot` to render the tab strip inside the global top bar.
+    pub fn visible_tabs(&self) -> Vec<RightTab> {
+        visible_tabs(TabVisibility {
+            has_repo: self._poller.is_some(),
+        })
     }
 
     /// Switch the active tab and notify GPUI to re-render.
@@ -202,35 +203,25 @@ impl RightSidebar {
 }
 
 impl Render for RightSidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Derive has_repo from poller presence — None means no live repo.
-        let tabs = visible_tabs(TabVisibility {
-            has_repo: self._poller.is_some(),
-        });
-        let active = self.active_tab;
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
 
         // NOTE: on_action handlers for sidebar keybindings are registered on
         // WorkspaceRoot's outer div (workspace_root.rs::render), not here.
         // RightSidebar is a sibling of MainPane in the row layout — not an ancestor
         // of TerminalView — so on_action here would never fire when the terminal is focused.
-
-        // Pass the entity handle so click handlers mutate the sidebar directly.
-        let entity = cx.entity().clone();
+        //
+        // Activity-bar tabs are rendered inside the global top_bar (see
+        // workspace_root.rs) so the chrome reads as one continuous row.
+        // This view renders ONLY the panel body now.
 
         // Closed: render nothing — the right-sidebar toggle lives in the
         // global top_bar (workspace_root.rs), which stays visible and can
         // re-open the panel. Matches the reference UX: closed state = fully gone, no
-        // mini-rail. `_entity` shadow-binds to silence the unused warning
-        // when this branch fires.
-        let _ = &entity;
+        // mini-rail.
         if !self.open {
             return div().into_any_element();
         }
-
-        let top_bar = render_top_tab_bar(active, &tabs, &entity, theme, density, &typography);
 
         // Inline each tab body — avoids Box<dyn IntoElement> (trait not dyn-compatible).
         let body = match self.active_tab {
@@ -266,11 +257,9 @@ impl Render for RightSidebar {
                 .into_any_element(),
         };
 
-        // Vertical stack: top tab bar above the panel body. Total column width fixed
-        // so it doesn't compete with MainPane's flex_1 in the parent row.
-        //
-        // bg_panel + border_l isolate the column visually so the terminal pane
-        // to the left can't visually bleed into the empty body area.
+        // Fixed-width column so it doesn't compete with MainPane's flex_1 in the
+        // parent row. bg_panel + border_l isolate the column visually so the
+        // terminal pane to the left can't visually bleed into the body area.
         div()
             .id("right-sidebar")
             .flex()
@@ -280,7 +269,6 @@ impl Render for RightSidebar {
             .bg(theme.bg_panel)
             .border_l_1()
             .border_color(theme.border_inactive)
-            .child(top_bar)
             .child(body)
             .into_any_element()
     }

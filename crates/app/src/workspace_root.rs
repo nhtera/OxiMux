@@ -38,7 +38,10 @@ use crate::shell::{
     left_rail::LeftRail,
     main_area,
     main_pane::MainPane,
-    right_sidebar::{RightSidebar, tab::RightTab},
+    right_sidebar::{
+        RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH,
+        tab::RightTab,
+    },
     status_bar,
     tabbed_pane::TabbedPane,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView},
@@ -165,6 +168,48 @@ impl Render for WorkspaceRoot {
             .as_ref()
             .map(|s| s.read(cx).latest_poll_state().clone());
 
+        // Activity-bar tabs live in the global top_bar (the reference UX pattern). Compose
+        // them here so top_bar stays decoupled from RightSidebar internals.
+        // Tabs hide when the panel is closed — clicking the panel-right toggle
+        // re-opens the panel via ToggleRightSidebar.
+        let (right_open, right_tabs) = match self.right_sidebar.as_ref() {
+            Some(sidebar_entity) => {
+                let sidebar_ref = sidebar_entity.read(cx);
+                let open = sidebar_ref.open;
+                let tabs_element = if open {
+                    let tabs = sidebar_ref.visible_tabs();
+                    let active = sidebar_ref.active_tab;
+                    Some(
+                        render_tab_buttons(active, &tabs, sidebar_entity, theme).into_any_element(),
+                    )
+                } else {
+                    None
+                };
+                (open, tabs_element)
+            }
+            None => (false, None),
+        };
+
+        // Push current chrome width into MainPane so the PTY grid matches the
+        // actual visible area. Without this, opening the right sidebar would
+        // leave the terminal sized to the old (wider) MainPane and content
+        // would render past the sidebar boundary.
+        let left_chrome = if self.left_rail_open {
+            density.w_left_rail
+        } else {
+            0.0
+        };
+        let right_chrome = if right_open {
+            f32::from(DEFAULT_PANEL_WIDTH)
+        } else {
+            0.0
+        };
+        if let Some(mp) = self.main_pane.as_ref() {
+            mp.update(cx, |pane, cx| {
+                pane.set_chrome_width(left_chrome + right_chrome, cx);
+            });
+        }
+
         // Sidebar action handlers live on the outermost div — the common ancestor
         // of every focused element (TerminalView → MainPane → row → here).
         // Placing them on RightSidebar's div would break dispatch when the terminal
@@ -211,10 +256,8 @@ impl Render for WorkspaceRoot {
             )
             .child(top_bar::view(
                 self.left_rail_open,
-                self.right_sidebar
-                    .as_ref()
-                    .map(|s| s.read(cx).open)
-                    .unwrap_or(false),
+                right_open,
+                right_tabs,
                 theme,
                 density,
                 typography,
