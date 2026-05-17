@@ -8,6 +8,7 @@
 //! Domain shapes (`GitState`, `FileStatus`, …) live in `oximux-core`.
 
 pub mod branch;
+pub mod commit;
 pub mod diff;
 pub mod error;
 pub mod merge;

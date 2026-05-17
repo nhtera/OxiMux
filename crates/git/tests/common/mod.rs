@@ -23,11 +23,17 @@ pub fn run_git(cwd: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed in {cwd:?}");
 }
 
-/// `git init -b main` + disable commit signing so the tests work on
-/// developer boxes that have `commit.gpgsign=true` globally.
+/// `git init -b main` + disable commit signing + pin a local identity so
+/// tests work on developer boxes that have `commit.gpgsign=true` globally
+/// AND on fresh CI runners with no `~/.gitconfig`. `GIT_CONFIG_NOSYSTEM=1`
+/// (set in `GitCmd`) suppresses `/etc/gitconfig`, so without these locals,
+/// `git commit` would fail with "Author identity unknown" under
+/// `Repository::commit()` on CI.
 pub fn init_repo(cwd: &Path) {
     run_git(cwd, &["init", "-b", "main"]);
     run_git(cwd, &["config", "commit.gpgsign", "false"]);
+    run_git(cwd, &["config", "user.name", "Test"]);
+    run_git(cwd, &["config", "user.email", "test@example.com"]);
 }
 
 /// Convenience wrapper — same as `std::fs::write` but panics with a
