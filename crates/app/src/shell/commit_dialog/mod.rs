@@ -286,12 +286,7 @@ impl CommitDialog {
     }
 }
 
-fn label_row(
-    title: &str,
-    sub: &str,
-    theme: Theme,
-    typography: &Typography,
-) -> impl IntoElement {
+fn label_row(title: &str, sub: &str, theme: Theme, typography: &Typography) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -309,4 +304,3 @@ fn label_row(
                 .child(sub.to_string()),
         )
 }
-

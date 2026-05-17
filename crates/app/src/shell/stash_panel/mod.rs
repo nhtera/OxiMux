@@ -199,13 +199,10 @@ impl Render for StashPanel {
                 &self.typography,
             )
             .into_any_element(),
-            StashListState::Ready(entries) if entries.is_empty() => placeholder(
-                "No stashes",
-                self.theme,
-                self.density,
-                &self.typography,
-            )
-            .into_any_element(),
+            StashListState::Ready(entries) if entries.is_empty() => {
+                placeholder("No stashes", self.theme, self.density, &self.typography)
+                    .into_any_element()
+            }
             StashListState::Ready(entries) => {
                 let mut col = div().flex().flex_col().h_full().w_full();
                 for entry in entries.iter().cloned() {

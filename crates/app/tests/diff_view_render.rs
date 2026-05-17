@@ -60,7 +60,10 @@ fn hunked_modified_file_renders_lines_in_order() {
             line(DiffLineKind::Added, "let z = 4;"),
         ],
     );
-    let plan = build_render_plan(&[file("src/main.rs", DiffStatus::Modified, vec![h], false)], false);
+    let plan = build_render_plan(
+        &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
+        false,
+    );
     assert_eq!(plan.len(), 1);
     match &plan[0] {
         FilePlan::Hunked {

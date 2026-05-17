@@ -167,8 +167,7 @@ impl WorktreePanel {
                 });
             }
             Err(_) => {
-                self.create_state =
-                    CreateState::Failed("no tokio runtime (step 14)".to_string());
+                self.create_state = CreateState::Failed("no tokio runtime (step 14)".to_string());
                 return;
             }
         }
@@ -319,12 +318,7 @@ impl WorktreePanel {
         }
     }
 
-    fn render_row(
-        &self,
-        idx: usize,
-        w: WorktreeInfo,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_row(&self, idx: usize, w: WorktreeInfo, cx: &mut Context<Self>) -> impl IntoElement {
         let label = row_label(&w);
         let theme = self.theme;
         let density = self.density;

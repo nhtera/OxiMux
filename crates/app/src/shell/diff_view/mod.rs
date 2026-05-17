@@ -186,12 +186,9 @@ impl Render for DiffView {
             DiffViewState::Loading { path, .. } => {
                 loading_state(&path.display().to_string(), &rctx).into_any_element()
             }
-            DiffViewState::Failed { path, error, .. } => failed_state(
-                &path.display().to_string(),
-                error,
-                &rctx,
-            )
-            .into_any_element(),
+            DiffViewState::Failed { path, error, .. } => {
+                failed_state(&path.display().to_string(), error, &rctx).into_any_element()
+            }
             DiffViewState::Ready {
                 diffs, expanded, ..
             } => {

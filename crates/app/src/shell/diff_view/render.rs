@@ -79,10 +79,7 @@ pub struct LinePlan {
 
 /// Build the pure render plan.
 pub fn build_render_plan(diffs: &[FileDiff], expanded: bool) -> Vec<FilePlan> {
-    diffs
-        .iter()
-        .map(|d| build_file_plan(d, expanded))
-        .collect()
+    diffs.iter().map(|d| build_file_plan(d, expanded)).collect()
 }
 
 fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
@@ -151,11 +148,9 @@ fn format_status_label(s: &DiffStatus) -> String {
         DiffStatus::Added => "Added".to_string(),
         DiffStatus::Modified => "Modified".to_string(),
         DiffStatus::Deleted => "Deleted".to_string(),
-        DiffStatus::Renamed { from, similarity } => format!(
-            "Renamed from {} ({}% similar)",
-            from.display(),
-            similarity
-        ),
+        DiffStatus::Renamed { from, similarity } => {
+            format!("Renamed from {} ({}% similar)", from.display(), similarity)
+        }
         DiffStatus::Copied { from, similarity } => {
             format!("Copied from {} ({}% similar)", from.display(), similarity)
         }
@@ -201,7 +196,10 @@ fn render_file_plan(
             hunks,
         } => {
             let mut col = block
-                .child(file_header_strip(format!("{path}  ·  {}", header.label), rctx))
+                .child(file_header_strip(
+                    format!("{path}  ·  {}", header.label),
+                    rctx,
+                ))
                 .child(hunks_body(hunks, rctx));
             col = col.font(rctx.typography.mono_font());
             col
@@ -212,15 +210,20 @@ fn render_file_plan(
             total_lines,
             hunk_count,
         } => {
-            let label = format!(
-                "Large diff: {hunk_count} hunks, {total_lines} lines — click to expand"
-            );
+            let label =
+                format!("Large diff: {hunk_count} hunks, {total_lines} lines — click to expand");
             block
-                .child(file_header_strip(format!("{path}  ·  {}", header.label), rctx))
+                .child(file_header_strip(
+                    format!("{path}  ·  {}", header.label),
+                    rctx,
+                ))
                 .child(expand_row(label, rctx, cx))
         }
         FilePlan::Binary { path, header } => block
-            .child(file_header_strip(format!("{path}  ·  {}", header.label), rctx))
+            .child(file_header_strip(
+                format!("{path}  ·  {}", header.label),
+                rctx,
+            ))
             .child(body_placeholder(
                 "Binary file (body suppressed)".to_string(),
                 rctx,
@@ -233,7 +236,10 @@ fn render_file_plan(
         } => {
             let msg = format!("Mode change only: {old_mode:o} → {new_mode:o}");
             block
-                .child(file_header_strip(format!("{path}  ·  {}", header.label), rctx))
+                .child(file_header_strip(
+                    format!("{path}  ·  {}", header.label),
+                    rctx,
+                ))
                 .child(body_placeholder(msg, rctx))
         }
     }
@@ -293,11 +299,7 @@ fn line_row(line: &LinePlan, rctx: &RenderCtx<'_>) -> impl IntoElement {
         .child(text)
 }
 
-fn expand_row(
-    label: String,
-    rctx: &RenderCtx<'_>,
-    cx: &mut Context<DiffView>,
-) -> impl IntoElement {
+fn expand_row(label: String, rctx: &RenderCtx<'_>, cx: &mut Context<DiffView>) -> impl IntoElement {
     div()
         .flex()
         .items_center()
