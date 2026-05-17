@@ -18,7 +18,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::GitPanel;
-use crate::shell::right_sidebar::activity_bar::{render_collapsed_rail, render_top_tab_bar};
+use crate::shell::right_sidebar::activity_bar::render_top_tab_bar;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 
@@ -220,20 +220,14 @@ impl Render for RightSidebar {
         // Pass the entity handle so click handlers mutate the sidebar directly.
         let entity = cx.entity().clone();
 
-        // Closed: render a thin rail with just the expand toggle so users can
-        // re-open without remembering Cmd+L (the reference UX pattern). Bordered + opaque
-        // so it sits cleanly next to the main pane.
+        // Closed: render nothing — the right-sidebar toggle lives in the
+        // global top_bar (workspace_root.rs), which stays visible and can
+        // re-open the panel. Matches the reference UX: closed state = fully gone, no
+        // mini-rail. `_entity` shadow-binds to silence the unused warning
+        // when this branch fires.
+        let _ = &entity;
         if !self.open {
-            return div()
-                .id("right-sidebar-closed")
-                .flex()
-                .flex_col()
-                .h_full()
-                .bg(theme.bg_panel)
-                .border_l_1()
-                .border_color(theme.border_inactive)
-                .child(render_collapsed_rail(&entity, theme))
-                .into_any_element();
+            return div().into_any_element();
         }
 
         let top_bar = render_top_tab_bar(active, &tabs, &entity, theme, density, &typography);
