@@ -40,6 +40,23 @@ pub struct Theme {
     pub status_error: Hsla,
     pub status_info: Hsla,
     pub status_muted: Hsla,
+
+    /// Git status decoration palette — used by the workspace card status
+    /// dot in the left rail and (later) the file explorer status badges.
+    pub git: GitDecorations,
+}
+
+/// Per-status colors for git-decorated UI (workspace card dot,
+/// file-explorer badges, diff markers).
+#[derive(Debug, Clone, Copy)]
+pub struct GitDecorations {
+    pub modified: Hsla,
+    pub added: Hsla,
+    pub deleted: Hsla,
+    pub renamed: Hsla,
+    pub untracked: Hsla,
+    pub copied: Hsla,
+    pub ignored: Hsla,
 }
 
 impl Theme {
@@ -69,6 +86,16 @@ impl Theme {
             status_error: rgb(0xD26464).into(),
             status_info: rgb(0x5B97C9).into(),
             status_muted: rgb(0x6B7177).into(),
+
+            git: GitDecorations {
+                modified: rgb(0xD9A441).into(),
+                added: rgb(0x6FA86A).into(),
+                deleted: rgb(0xD26464).into(),
+                renamed: rgb(0x5B97C9).into(),
+                untracked: rgb(0x9CC79A).into(),
+                copied: rgb(0x4DA8A8).into(),
+                ignored: rgb(0x6B7177).into(),
+            },
         }
     }
 }
@@ -76,5 +103,28 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::charcoal()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_decorations_modified_matches_status_warn() {
+        let t = Theme::charcoal();
+        assert_eq!(t.git.modified, t.status_warn);
+    }
+
+    #[test]
+    fn git_decorations_added_matches_status_ok() {
+        let t = Theme::charcoal();
+        assert_eq!(t.git.added, t.status_ok);
+    }
+
+    #[test]
+    fn git_decorations_ignored_matches_fg_subtle() {
+        let t = Theme::charcoal();
+        assert_eq!(t.git.ignored, t.fg_subtle);
     }
 }

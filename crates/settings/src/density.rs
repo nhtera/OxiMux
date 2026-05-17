@@ -20,8 +20,11 @@ pub struct Density {
     pub pad_row: f32,
     pub gap_inline: f32,
 
-    // Sidebar default width
+    // Sidebar default width (legacy — superseded by w_left_rail; kept for
+    // backward compat with existing tests / phase-0 stub).
     pub w_sidebar: f32,
+    /// Left rail width (workspaces + nav). the reference UX uses ~250px; min 220, max 500.
+    pub w_left_rail: f32,
 }
 
 impl Density {
@@ -40,6 +43,7 @@ impl Density {
             pad_row: 6.0,
             gap_inline: 6.0,
             w_sidebar: 240.0,
+            w_left_rail: 250.0,
         }
     }
 }

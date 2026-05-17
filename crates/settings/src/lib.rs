@@ -10,5 +10,5 @@ pub mod theme;
 pub mod typography;
 
 pub use density::Density;
-pub use theme::Theme;
+pub use theme::{GitDecorations, Theme};
 pub use typography::Typography;

@@ -34,10 +34,11 @@ use crate::actions::{
     ToggleRightSidebar,
 };
 use crate::shell::{
+    left_rail::LeftRail,
     main_area,
     main_pane::MainPane,
     right_sidebar::{RightSidebar, tab::RightTab},
-    sidebar, status_bar,
+    status_bar,
     tabbed_pane::TabbedPane,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView},
     top_bar,
@@ -49,8 +50,8 @@ pub struct WorkspaceRoot {
     typography: Typography,
     main_pane: Option<Entity<MainPane>>,
     right_sidebar: Option<Entity<RightSidebar>>,
+    left_rail: Entity<LeftRail>,
     /// Whether the left rail (workspaces + nav) is visible. Toggled via Cmd+B.
-    /// Phase 02 mounts the rich left rail in place of the current `sidebar` stub.
     left_rail_open: bool,
 }
 
@@ -61,8 +62,11 @@ impl WorkspaceRoot {
         let typography = Typography::cockpit();
 
         let main_pane = spawn_initial_pane(theme, density, typography.clone(), window, cx);
-        let right_sidebar =
-            repo.map(|r| cx.new(|cx| RightSidebar::new(r, theme, density, typography.clone(), cx)));
+        let right_sidebar = repo
+            .clone()
+            .map(|r| cx.new(|cx| RightSidebar::new(r, theme, density, typography.clone(), cx)));
+        let left_rail =
+            cx.new(|cx| LeftRail::new(repo, theme, density, typography.clone(), window, cx));
 
         Self {
             theme,
@@ -70,6 +74,7 @@ impl WorkspaceRoot {
             typography,
             main_pane,
             right_sidebar,
+            left_rail,
             left_rail_open: true,
         }
     }
@@ -139,7 +144,7 @@ impl Render for WorkspaceRoot {
         // matches the reference UX's pattern — no permanent mini-strip.
         let row = div().flex().flex_row().flex_1().min_h(px(0.));
         let row = if self.left_rail_open {
-            row.child(sidebar::view(theme, density, typography))
+            row.child(self.left_rail.clone())
         } else {
             row
         };
