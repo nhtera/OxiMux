@@ -5,6 +5,7 @@
 
 pub mod cell_metrics;
 pub mod commit_dialog;
+pub mod confirm_dialog;
 pub mod diff_view;
 pub mod git_panel;
 pub mod key_input;
