@@ -4,6 +4,7 @@
 //! + Typography` and return an `impl IntoElement` (RenderOnce). No state.
 
 pub mod cell_metrics;
+pub mod command_palette;
 pub mod commit_dialog;
 pub mod confirm_dialog;
 pub mod diff_view;

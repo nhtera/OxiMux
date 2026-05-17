@@ -64,5 +64,10 @@ actions!(
         SelectSearchTab,
         /// Switch to the Source Control tab in the right sidebar (Cmd+Shift+G).
         SelectSourceControlTab,
+        /// Open the file/worktree Quick Open palette (Cmd+P). Phase 05 shell;
+        /// backend file index lands in a later plan.
+        OpenQuickOpen,
+        /// Open the action Command Palette (Cmd+Shift+P). Phase 05.
+        OpenCommandPalette,
     ]
 );

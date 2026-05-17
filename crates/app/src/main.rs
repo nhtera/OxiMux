@@ -14,9 +14,9 @@ use gpui::{
     AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
 use oximux_app::actions::{
-    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, OpenCommitDialog, PrevTab, Search,
-    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical,
-    ToggleLeftSidebar, ToggleRightSidebar,
+    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, OpenCommandPalette, OpenCommitDialog,
+    OpenQuickOpen, PrevTab, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
+    SplitHorizontal, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use oximux_app::assets::CompositeAssets;
 use oximux_app::workspace_root::WorkspaceRoot;
@@ -83,6 +83,10 @@ fn main() {
             KeyBinding::new("cmd-shift-g", SelectSourceControlTab, None),
             // cmd-k opens the commit dialog (Phase 04 attaches the handler).
             KeyBinding::new("cmd-k", OpenCommitDialog, None),
+            // Command palette (Phase 05 shell). cmd-k stays bound to the
+            // commit dialog, so the palette uses cmd-shift-p instead.
+            KeyBinding::new("cmd-p", OpenQuickOpen, None),
+            KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         ]);
         cx.activate(true);
 

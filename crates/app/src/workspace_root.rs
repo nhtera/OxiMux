@@ -30,10 +30,11 @@ use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    OpenCommandPalette, OpenQuickOpen, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
+    ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::{
+    command_palette::{PaletteModal, entry::PaletteMode},
     left_rail::LeftRail,
     main_area,
     main_pane::MainPane,
@@ -51,6 +52,7 @@ pub struct WorkspaceRoot {
     main_pane: Option<Entity<MainPane>>,
     right_sidebar: Option<Entity<RightSidebar>>,
     left_rail: Entity<LeftRail>,
+    palette: Entity<PaletteModal>,
     /// Whether the left rail (workspaces + nav) is visible. Toggled via Cmd+B.
     left_rail_open: bool,
 }
@@ -67,6 +69,7 @@ impl WorkspaceRoot {
             .map(|r| cx.new(|cx| RightSidebar::new(r, theme, density, typography.clone(), cx)));
         let left_rail =
             cx.new(|cx| LeftRail::new(repo, theme, density, typography.clone(), window, cx));
+        let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
 
         Self {
             theme,
@@ -75,6 +78,7 @@ impl WorkspaceRoot {
             main_pane,
             right_sidebar,
             left_rail,
+            palette,
             left_rail_open: true,
         }
     }
@@ -175,6 +179,14 @@ impl Render for WorkspaceRoot {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
+                this.palette
+                    .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
+                this.palette
+                    .update(cx, |p, cx| p.open(PaletteMode::Commands, cx));
+            }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |s, cx| s.toggle(cx));
@@ -217,5 +229,9 @@ impl Render for WorkspaceRoot {
                 0,
                 git_state.as_ref(),
             ))
+            // Palette modal — appended last so it paints above all other
+            // children (last child = topmost z-layer in GPUI, same pattern
+            // as `terminal_search_overlay`).
+            .child(self.palette.clone())
     }
 }
