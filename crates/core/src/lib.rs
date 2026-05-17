@@ -7,11 +7,13 @@
 //! Phase 0: skeleton only. Real types land in Phase 1+ as call sites need them.
 
 pub mod git_diff;
+pub mod git_ops;
 pub mod git_state;
 
 pub use git_diff::{
     DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, LARGE_DIFF_LINE_THRESHOLD,
 };
+pub use git_ops::{BranchInfo, MergeOutcome, StashEntry, StashRef, WorktreeInfo};
 pub use git_state::{FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus};
 
 use serde::{Deserialize, Serialize};
