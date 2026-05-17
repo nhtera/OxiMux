@@ -52,7 +52,7 @@ fn render_tab_button(
     let fg = if is_active {
         theme.focus_ring
     } else {
-        theme.fg_muted
+        theme.fg_base
     };
     let indicator_color = if is_active {
         theme.focus_ring

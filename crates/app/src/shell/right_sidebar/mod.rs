@@ -19,6 +19,7 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::GitPanel;
 use crate::shell::right_sidebar::activity_bar::render_activity_bar;
+use crate::shell::right_sidebar::layout::{ACTIVITY_BAR_WIDTH, DEFAULT_PANEL_WIDTH};
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 
 /// Tab-switchable right panel that replaces the old fixed `GitMount` column.
@@ -216,7 +217,15 @@ impl Render for RightSidebar {
         // RightSidebar is a sibling of MainPane in the row layout — not an ancestor
         // of TerminalView — so on_action here would never fire when the terminal is focused.
 
-        let root = div().id("right-sidebar").flex().flex_row().h_full();
+        // Fixed total width: panel body (320) + activity strip (40) = 360px.
+        // Without this, the body's flex_1 competes with MainPane's flex_1 and
+        // splits the window 50/50 — the reference UX uses ~360px, we match.
+        let root = div()
+            .id("right-sidebar")
+            .flex()
+            .flex_row()
+            .h_full()
+            .w(DEFAULT_PANEL_WIDTH + ACTIVITY_BAR_WIDTH);
 
         // Keep a minimal div when closed so the entity stays alive.
         if !self.open {
