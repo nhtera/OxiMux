@@ -159,6 +159,7 @@ fn row(
         RowKind::Untracked => "?",
     };
     let click_path = f.path.clone();
+    let click_staged = matches!(kind, RowKind::Staged);
     let label = f.path.display().to_string();
     div()
         .flex()
@@ -171,7 +172,7 @@ fn row(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |panel, _: &MouseDownEvent, _window, cx| {
-                panel.set_selected(Some(click_path.clone()));
+                panel.set_selected(Some((click_path.clone(), click_staged)), cx);
                 cx.notify();
             }),
         )

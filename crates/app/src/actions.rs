@@ -43,5 +43,13 @@ actions!(
         /// Revert (discard) worktree changes for the selected file. Step 8 is
         /// a no-op stub; step 11 wires the type-to-confirm modal.
         RevertFile,
+        /// Trigger the diff view to load the currently selected file in the
+        /// git panel. Dispatched up the element tree from GitPanel row
+        /// clicks; intercepted at the shell mount (step 14) or directly by
+        /// DiffView when wired as a sibling.
+        OpenDiff,
+        /// Expand a collapsed (large) diff in the DiffView. Wired to the
+        /// click on the "expand" affordance row.
+        ExpandDiff,
     ]
 );

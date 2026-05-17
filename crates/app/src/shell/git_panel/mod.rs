@@ -15,10 +15,11 @@
 pub mod changed_files;
 
 use crate::actions::{RevertFile, StageFile, UnstageFile};
+use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::changed_files::{RenderCtx, partition_files, render_sections};
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    Styled, Task, Window, div, px,
+    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Render, Styled, Task, Window, div, px,
 };
 use oximux_core::GitState;
 use oximux_git::{PollState, Repository};
@@ -33,7 +34,15 @@ pub struct GitPanel {
     /// can distinguish "no data yet" from "no changes".
     git_state: Option<GitState>,
     poll_state: PollState,
-    selected: Option<PathBuf>,
+    /// Currently-highlighted row. Stores both the path and the section it
+    /// came from (`staged` for the Staged section, `false` for Unstaged /
+    /// Untracked) so we know which side of the diff to fetch when routing
+    /// to `DiffView::load`.
+    selected: Option<(PathBuf, bool)>,
+    /// Optional sibling diff view. `None` keeps the panel buildable before
+    /// step 14 wires the shell. When `Some`, row clicks call
+    /// `diff_view.load(path, staged)`.
+    diff_view: Option<Entity<DiffView>>,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -50,6 +59,7 @@ impl GitPanel {
     pub fn new(
         repo: Repository,
         state_rx: watch::Receiver<PollState>,
+        diff_view: Option<Entity<DiffView>>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -67,6 +77,7 @@ impl GitPanel {
             git_state,
             poll_state: initial,
             selected: None,
+            diff_view,
             focus_handle,
             theme,
             density,
@@ -75,11 +86,18 @@ impl GitPanel {
         }
     }
 
-    /// Update the highlighted row. Called by `changed_files::row` click
-    /// handlers; pub-crate so the sibling module reaches it without exposing
-    /// the field directly.
-    pub(crate) fn set_selected(&mut self, path: Option<PathBuf>) {
-        self.selected = path;
+    /// Update the highlighted row and route to the sibling `DiffView` when
+    /// present. Called by `changed_files::row` click handlers; pub-crate so
+    /// the sibling module reaches it without exposing the field directly.
+    pub(crate) fn set_selected(
+        &mut self,
+        selection: Option<(PathBuf, bool)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = selection.clone();
+        if let (Some((path, staged)), Some(view)) = (selection, self.diff_view.as_ref()) {
+            view.update(cx, |v, cx| v.load(path, staged, cx));
+        }
     }
 
     fn start_watch_task(mut rx: watch::Receiver<PollState>, cx: &mut Context<Self>) -> Task<()> {
@@ -108,7 +126,7 @@ impl GitPanel {
     }
 
     fn on_stage_file(&mut self, _: &StageFile, _window: &mut Window, _cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
+        let Some((path, _)) = self.selected.clone() else {
             return;
         };
         spawn_repo_op(
@@ -119,7 +137,7 @@ impl GitPanel {
     }
 
     fn on_unstage_file(&mut self, _: &UnstageFile, _window: &mut Window, _cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
+        let Some((path, _)) = self.selected.clone() else {
             return;
         };
         spawn_repo_op(
@@ -132,7 +150,7 @@ impl GitPanel {
     fn on_revert_file(&mut self, _: &RevertFile, _window: &mut Window, _cx: &mut Context<Self>) {
         // Step 8 stub. Step 11 wires the type-to-confirm modal before any
         // worktree mutation. Logging here so the wiring is visible end-to-end.
-        if let Some(path) = self.selected.as_ref() {
+        if let Some((path, _)) = self.selected.as_ref() {
             tracing::info!(
                 ?path,
                 "RevertFile dispatched — confirm modal lands in step 11"
@@ -167,7 +185,7 @@ impl Render for GitPanel {
                     theme: self.theme,
                     density: self.density,
                     typography: &self.typography,
-                    selected: self.selected.as_deref(),
+                    selected: self.selected.as_ref().map(|(p, _)| p.as_path()),
                 };
                 render_sections(&sections, &rctx, cx).into_any_element()
             }

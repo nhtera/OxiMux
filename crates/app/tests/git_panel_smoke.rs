@@ -43,6 +43,7 @@ async fn git_panel_constructs_and_renders_without_panic(cx: &mut TestAppContext)
         GitPanel::new(
             repo,
             rx,
+            None,
             Theme::default(),
             Density::default(),
             Typography::default(),
