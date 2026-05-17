@@ -4,54 +4,49 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐  ← TopBar (36px)
-//! ├──────────┬──────────────────────────┬─────────┬─────────┤
-//! │ Sidebar  │        MainPane          │ GitPnl  │ DiffVw  │  ← HSplit
-//! │ (240px)  │     (Phase 1 grid)       │ (260px) │ (260px) │
-//! ├──────────┴──────────────────────────┴─────────┴─────────┤  ← StatusBar (22px)
+//! ├──────────┬──────────────────────────┬───────────────────┤
+//! │ Sidebar  │        MainPane          │   RightSidebar    │  ← HSplit
+//! │ (240px)  │     (Phase 1 grid)       │ panel(320) + bar  │
+//! ├──────────┴──────────────────────────┴───────────────────┤  ← StatusBar (22px)
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Git column (`GitPnl` + `DiffVw`) renders only when a repository was
-//! opened at startup. Without one, the layout collapses to the Phase 1
-//! `Sidebar | MainPane | StatusBar` form.
+//! The right column renders only when a repository was opened at startup.
+//! Without one, layout collapses to `Sidebar | MainPane | StatusBar`.
+//!
+//! Action routing note: sidebar tab-select keybindings (cmd-l, cmd-shift-e/f/g)
+//! are registered here on the outermost div — not on RightSidebar's div.
+//! RightSidebar is a sibling of MainPane, so its div is never in the ancestor
+//! chain when TerminalView holds focus. The outer WorkspaceRoot div IS the
+//! common ancestor of every focused element.
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Task, Window, div, px,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Window, div, px,
 };
-use oximux_git::{PollState, Repository, StatusPoller};
+use oximux_git::Repository;
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::actions::{
+    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, ToggleRightSidebar,
+};
 use crate::shell::{
-    diff_view::DiffView,
-    git_panel::GitPanel,
     main_area,
     main_pane::MainPane,
+    right_sidebar::{RightSidebar, tab::RightTab},
     sidebar, status_bar,
     tabbed_pane::TabbedPane,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView},
     top_bar,
 };
 
-/// Git surface mounted into the workspace. Owns the StatusPoller so it
-/// outlives the GitPanel and DiffView, and mirrors the latest poll state
-/// into `latest_poll_state` so the status bar can read it without
-/// borrowing the poller through the entity tree.
-pub struct GitMount {
-    /// Held to keep the poller alive (drop aborts the background task).
-    _poller: StatusPoller,
-    git_panel: Entity<GitPanel>,
-    diff_view: Entity<DiffView>,
-    latest_poll_state: PollState,
-    _poll_observer: Task<()>,
-}
-
 pub struct WorkspaceRoot {
     theme: Theme,
     density: Density,
     typography: Typography,
     main_pane: Option<Entity<MainPane>>,
-    git: Option<GitMount>,
+    right_sidebar: Option<Entity<RightSidebar>>,
 }
 
 impl WorkspaceRoot {
@@ -61,77 +56,17 @@ impl WorkspaceRoot {
         let typography = Typography::cockpit();
 
         let main_pane = spawn_initial_pane(theme, density, typography.clone(), window, cx);
-        let git = repo.map(|r| build_git_mount(r, theme, density, typography.clone(), cx));
+        let right_sidebar =
+            repo.map(|r| cx.new(|cx| RightSidebar::new(r, theme, density, typography.clone(), cx)));
 
         Self {
             theme,
             density,
             typography,
             main_pane,
-            git,
+            right_sidebar,
         }
     }
-}
-
-fn build_git_mount(
-    repo: Repository,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
-    cx: &mut Context<WorkspaceRoot>,
-) -> GitMount {
-    let poller = StatusPoller::spawn(repo.clone());
-    let panel_rx = poller.subscribe();
-    let bar_rx = poller.subscribe();
-    let initial = poller.current();
-    let diff_view = cx.new(|cx| {
-        DiffView::new(repo.clone(), theme, density, typography.clone(), cx)
-    });
-    let diff_view_for_panel = diff_view.clone();
-    let git_panel = cx.new(|cx| {
-        GitPanel::new(
-            repo,
-            panel_rx,
-            Some(diff_view_for_panel),
-            theme,
-            density,
-            typography,
-            cx,
-        )
-    });
-    let poll_observer = start_poll_observer(bar_rx, cx);
-    GitMount {
-        _poller: poller,
-        git_panel,
-        diff_view,
-        latest_poll_state: initial,
-        _poll_observer: poll_observer,
-    }
-}
-
-fn start_poll_observer(
-    mut rx: tokio::sync::watch::Receiver<PollState>,
-    cx: &mut Context<WorkspaceRoot>,
-) -> Task<()> {
-    cx.spawn(async move |this, cx| {
-        loop {
-            if rx.changed().await.is_err() {
-                return;
-            }
-            let state = rx.borrow_and_update().clone();
-            if this
-                .update(cx, |root, cx| {
-                    if let Some(g) = root.git.as_mut() {
-                        g.latest_poll_state = state;
-                        cx.notify();
-                    }
-                })
-                .is_err()
-            {
-                return;
-            }
-        }
-    })
 }
 
 fn spawn_initial_pane(
@@ -188,20 +123,6 @@ impl Render for WorkspaceRoot {
             .map(|mp| mp.read(cx).leaf_count())
             .unwrap_or(0);
 
-        let git_column = self.git.as_ref().map(|g| {
-            div()
-                .flex()
-                .flex_row()
-                .h_full()
-                .child(
-                    div()
-                        .w(px(260.0))
-                        .h_full()
-                        .child(g.git_panel.clone()),
-                )
-                .child(div().w(px(260.0)).h_full().child(g.diff_view.clone()))
-        });
-
         let row = div()
             .flex()
             .flex_row()
@@ -209,23 +130,58 @@ impl Render for WorkspaceRoot {
             .min_h(px(0.))
             .child(sidebar::view(theme, density, typography))
             .child(main);
-        let row = match git_column {
-            Some(col) => row.child(col),
+
+        let row = match self.right_sidebar.clone() {
+            Some(sidebar) => row.child(sidebar),
             None => row,
         };
 
-        let git_state = self.git.as_ref().map(|g| &g.latest_poll_state);
+        // Route poll state to the status bar via the RightSidebar getter.
+        let git_state = self
+            .right_sidebar
+            .as_ref()
+            .map(|s| s.read(cx).latest_poll_state().clone());
 
+        // Sidebar action handlers live on the outermost div — the common ancestor
+        // of every focused element (TerminalView → MainPane → row → here).
+        // Placing them on RightSidebar's div would break dispatch when the terminal
+        // holds focus (RightSidebar is a sibling, not an ancestor, of TerminalView).
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
+            .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
+                if let Some(rs) = &this.right_sidebar {
+                    rs.update(cx, |s, cx| s.toggle(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectExplorerTab, _window, cx| {
+                if let Some(rs) = &this.right_sidebar {
+                    rs.update(cx, |s, cx| s.select_tab(RightTab::Explorer, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectSearchTab, _window, cx| {
+                if let Some(rs) = &this.right_sidebar {
+                    rs.update(cx, |s, cx| s.select_tab(RightTab::Search, cx));
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectSourceControlTab, _window, cx| {
+                    if let Some(rs) = &this.right_sidebar {
+                        rs.update(cx, |s, cx| s.select_tab(RightTab::SourceControl, cx));
+                    }
+                }),
+            )
             .child(top_bar::view(theme, density, typography))
             .child(row)
             .child(status_bar::view(
-                theme, density, typography, pane_count, git_state,
+                theme,
+                density,
+                typography,
+                pane_count,
+                git_state.as_ref(),
             ))
     }
 }

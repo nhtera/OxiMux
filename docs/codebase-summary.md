@@ -34,8 +34,8 @@ src/
 ├── lib.rs                  re-exports for integration tests
 ├── actions.rs              all GPUI Action structs (SplitHorizontal, Search, etc.)
 ├── workspace_root.rs       WorkspaceRoot entity — top-level layout host
-│                           GitMount substruct: StatusPoller + GitPanel + DiffView
-│                           + mirrored PollState for status bar
+│                           right_sidebar: Option<Entity<RightSidebar>>
+│                           poll_state mirrored from RightSidebar for status bar
 └── shell/
     ├── mod.rs
     ├── top_bar.rs          brand + nav strip
@@ -54,6 +54,11 @@ src/
     ├── terminal_search_overlay.rs overlay render
     ├── key_input.rs        Keystroke → PTY bytes (xterm escapes, C0, Alt-prefix)
     ├── cell_metrics.rs     character cell size constants
+    ├── right_sidebar/
+    │   ├── mod.rs          RightSidebar entity; tab switching; hosts GitPanel+DiffView or placeholders
+    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl
+    │   ├── activity_bar.rs 40px strip; single-letter glyph buttons; routes tab-select actions
+    │   └── layout.rs       layout constants
     ├── git_panel/
     │   ├── mod.rs          GitPanel entity; file-list render
     │   └── changed_files.rs partition helper (staged / unstaged / untracked)
@@ -127,10 +132,10 @@ src/
 ## Key runtime flows
 
 ### Startup
-`main.rs` boots tokio → `Repository::open(cwd)` (best-effort) → `cx.open_window` → `WorkspaceRoot::new`. If no git repo at cwd, `git` field is `None`; git column hidden.
+`main.rs` boots tokio → `Repository::open(cwd)` (best-effort) → `cx.open_window` → `WorkspaceRoot::new`. If no git repo at cwd, `right_sidebar` is `None`; RightSidebar hidden.
 
 ### Git polling
-`WorkspaceRoot` owns a `GitMount { _poller, git_panel, diff_view, poll_state }`. `StatusPoller` ticks every 500ms (pauses on window blur), calls `send_if_modified` — only emits when state actually changes. On change: `entity.update(cx, …)` → `cx.notify()` → status bar center zone re-renders.
+`WorkspaceRoot` owns `right_sidebar: Option<Entity<RightSidebar>>`. `RightSidebar` holds the `StatusPoller` + `GitPanel` + `DiffView` (SourceControl tab). `StatusPoller` ticks every 500ms (pauses on window blur), calls `send_if_modified` — only emits when state actually changes. On change: `entity.update(cx, …)` → `cx.notify()` → status bar center zone re-renders via `RightSidebar::latest_poll_state()`.
 
 ### Terminal data flow
 PTY process → watcher thread → `state.advance(&buf)` → `TerminalEvent::Output` → 16ms poll task drains channel → `cx.notify()` → `terminal_view` re-renders visible rows only.

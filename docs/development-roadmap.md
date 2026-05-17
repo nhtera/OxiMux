@@ -46,6 +46,8 @@ All 14 implementation steps shipped. Step 15 is the dogfood usage gate.
 
 **Tests**: 285 passed, 0 failed
 
+- 2026-05-17: Right-sidebar Phase 01 shipped — RightSidebar entity replaces GitMount; 3-tab activity bar (Explorer/Search/SourceControl); 6 tests added.
+
 ---
 
 ## Phase 3 preview — CLI agent integration

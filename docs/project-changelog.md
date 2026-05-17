@@ -4,6 +4,15 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-17 — Right-Sidebar Phase 01
+
+- feat(app): replace fixed git column with tab-switchable RightSidebar entity (Explorer/Search/SourceControl)
+- shell migration: GitMount → RightSidebar (workspace_root.rs 231→187 LOC)
+- keybindings: cmd-l toggle, cmd-shift-e/f/g tab select
+- tests: +6 (3 visible_tabs/derive + 3 smoke incl. no-repo fallback)
+
+---
+
 ## 2026-05-17 — Phase 2 code-complete (steps 9-14)
 
 **Commits**: `ff05dbb`, `0b39ee6`, `0c5cb93`, `a69481c`, `8022258`, `5e1cc77`  

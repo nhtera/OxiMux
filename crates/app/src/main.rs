@@ -12,8 +12,9 @@
 
 use gpui::{AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
 use oximux_app::actions::{
-    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, OpenCommitDialog, OpenGitPanel,
-    PrevTab, Search, SplitHorizontal, SplitVertical,
+    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, OpenCommitDialog, PrevTab, Search,
+    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical,
+    ToggleRightSidebar,
 };
 use oximux_app::workspace_root::WorkspaceRoot;
 use oximux_git::Repository;
@@ -71,10 +72,13 @@ fn main() {
             // on the focused TerminalView's root div — when no pane is
             // focused (no editor exists yet in v1), the action no-ops.
             KeyBinding::new("cmd-f", Search, None),
-            // Phase 2 step 14 git keybinds. Handlers land at the shell mount
-            // in Phase 6 (toggle git column visibility, open commit dialog
-            // overlay). Bindings ship now so the action surface is stable.
-            KeyBinding::new("cmd-shift-g", OpenGitPanel, None),
+            // Right sidebar keybinds. cmd-shift-g rebound from OpenGitPanel
+            // to SelectSourceControlTab — same destination, new routing path.
+            KeyBinding::new("cmd-l", ToggleRightSidebar, None),
+            KeyBinding::new("cmd-shift-e", SelectExplorerTab, None),
+            KeyBinding::new("cmd-shift-f", SelectSearchTab, None),
+            KeyBinding::new("cmd-shift-g", SelectSourceControlTab, None),
+            // cmd-k opens the commit dialog (Phase 04 attaches the handler).
             KeyBinding::new("cmd-k", OpenCommitDialog, None),
         ]);
         cx.activate(true);

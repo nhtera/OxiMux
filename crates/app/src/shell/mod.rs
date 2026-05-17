@@ -13,6 +13,7 @@ pub mod main_area;
 pub mod main_pane;
 pub mod pane_layout;
 pub mod pane_tree;
+pub mod right_sidebar;
 pub mod sidebar;
 pub mod stash_panel;
 pub mod status_bar;

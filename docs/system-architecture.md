@@ -11,7 +11,8 @@
 ┌─────────────────────────────────────────────────────┐
 │  GPUI UI layer  (crates/app)                        │
 │  WorkspaceRoot → MainPane/TabbedPane/TerminalView   │
-│                → GitMount (GitPanel + DiffView)     │
+│                → RightSidebar (tab-switched panel)  │
+│                   SourceControl tab: GitPanel+DiffView│
 │                → StatusBar (git zone)               │
 ├─────────────────────────────────────────────────────┤
 │  Domain / backend layer                             │
@@ -26,23 +27,24 @@
 
 ---
 
-## WorkspaceRoot + GitMount wiring
+## WorkspaceRoot + RightSidebar wiring
 
 ```
 WorkspaceRoot (GPUI entity)
 ├── fields
 │   ├── main_pane: Entity<MainPane>
-│   ├── git: Option<GitMount>
-│   └── poll_state: Option<PollState>   ← mirrored for status bar
+│   └── right_sidebar: Option<Entity<RightSidebar>>   ← None when no git repo
 │
-└── GitMount (substruct, present only when cwd is a git repo)
+└── RightSidebar (GPUI entity, present only when cwd is a git repo)
+    ├── active_tab: RightTab  (Explorer | Search | SourceControl)
+    ├── activity_bar: 40px strip; single-letter glyph buttons
     ├── _repo: Arc<Repository>
     ├── _poller: StatusPoller           ← AbortHandle; drops → task stops
-    ├── git_panel: Entity<GitPanel>
-    └── diff_view: Entity<DiffView>
+    ├── git_panel: Entity<GitPanel>     ← shown on SourceControl tab
+    └── diff_view: Entity<DiffView>     ← shown on SourceControl tab
 ```
 
-`WorkspaceRoot::new` calls `make_git_mount(repo, cx)` when `Repository::open` succeeds. `StatusPoller::spawn` wires the 500ms tick. On each non-duplicate status delta, the poller calls back into `WorkspaceRoot` via `entity.update` to mirror `poll_state`, then `cx.notify()` propagates to all subscribers including the status bar center zone.
+`WorkspaceRoot::new` creates `RightSidebar::new(repo, …)` when `Repository::open` succeeds. `StatusPoller::spawn` wires the 500ms tick inside `RightSidebar`. Status bar reads `right_sidebar.read(cx).latest_poll_state()`. On each non-duplicate status delta, `cx.notify()` propagates to all subscribers including the status bar center zone.
 
 ---
 

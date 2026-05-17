@@ -5,9 +5,7 @@
 //! on the owning entity's root `div` via `.on_action(cx.listener(...))`.
 //! GPUI dispatches actions up the element tree from the focused leaf, so
 //! the focused `TerminalView` keystrokes still reach the shell while
-//! `Cmd-*` combos bubble up to `MainPane`.
-//!
-//! See `crates/app/src/shell/main_pane.rs` for handlers.
+//! `Cmd-*` combos bubble up to `WorkspaceRoot`.
 
 use gpui::actions;
 
@@ -34,7 +32,7 @@ actions!(
         PrevTab,
         /// Open the scrollback search overlay on the focused terminal pane.
         Search,
-        /// Toggle the git changed-files panel (Cmd+Shift+G in Phase 2 step 14).
+        /// Toggle the git changed-files panel (binding moved to SelectSourceControlTab).
         OpenGitPanel,
         /// Stage the file currently selected in the git panel.
         StageFile,
@@ -56,5 +54,13 @@ actions!(
         /// Submit the active commit dialog. Routed via dialog button click;
         /// declared here so step 14 can also bind Cmd+Enter to it.
         CommitStaged,
+        /// Toggle the right sidebar visibility (Cmd+L).
+        ToggleRightSidebar,
+        /// Switch to the Explorer tab in the right sidebar (Cmd+Shift+E).
+        SelectExplorerTab,
+        /// Switch to the Search tab in the right sidebar (Cmd+Shift+F).
+        SelectSearchTab,
+        /// Switch to the Source Control tab in the right sidebar (Cmd+Shift+G).
+        SelectSourceControlTab,
     ]
 );
