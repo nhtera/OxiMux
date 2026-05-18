@@ -1,4 +1,4 @@
-//! WorkspaceTabs — workspace-level tab strip.
+//! WorkspaceTabs — flat workspace-level tab strip.
 //!
 //! Each entry owns an `Entity<MainPane>` (its own split tree of terminals).
 //! The strip is rendered into the top_bar's center zone via
@@ -116,8 +116,8 @@ impl WorkspaceTabs {
         self.tabs.remove(idx);
         if self.tabs.is_empty() {
             // Closing the last tab drops the workspace into the empty welcome
-            // state (the reference UX pattern). `active` is irrelevant when there are no
-            // tabs; reset to 0 so the next open_tab lands on a sane index.
+            // state. `active` is irrelevant when there are no tabs; reset to
+            // 0 so the next open_tab lands on a sane index.
             // Move focus to the WorkspaceTabs root so subsequent action
             // dispatches (e.g. ToggleRightSidebar from a top-bar button)
             // still propagate up to WorkspaceRoot's on_action handlers —
@@ -190,12 +190,12 @@ impl WorkspaceTabs {
 
 /// Build the tab-strip element for embedding in `top_bar`'s center zone.
 ///
-/// flat strip: each tab fills the chrome row edge-to-edge
+/// Flat strip: each tab fills the chrome row edge-to-edge
 /// separated by 1px right borders. The active tab is identified ONLY by a
 /// 2px top accent line (focus_ring color) — no background recolor. Inactive
 /// tabs render with muted text; hovering brightens them. Close affordance
 /// stays hidden on inactive tabs (revealed via `group_hover`) and is
-/// permanently visible (muted) on the active tab — mirrors the reference UX.
+/// permanently visible (muted) on the active tab.
 ///
 /// `entity` is captured by per-tab click handlers, the per-tab × button,
 /// and trailing controls so they can mutate state from element closures.
@@ -423,7 +423,7 @@ fn close_button(
         .path("icons/close.svg")
         .size(px(9.0))
         .text_color(theme.fg_muted);
-    // Active tab: close X always visible (muted) — the reference UX pattern.
+    // Active tab: close X always visible (muted).
     // Inactive tab: hidden until the parent tab (same `group_name`) is
     // hovered, then `group_hover` flips opacity to 1.0.
     let initial_opacity = if is_active { 1.0 } else { 0.0 };

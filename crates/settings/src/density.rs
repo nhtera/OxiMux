@@ -23,7 +23,7 @@ pub struct Density {
     // Sidebar default width (legacy — superseded by w_left_rail; kept for
     // backward compat with existing tests / phase-0 stub).
     pub w_sidebar: f32,
-    /// Left rail width (workspaces + nav). the reference UX uses ~250px; min 220, max 500.
+    /// Left rail width (workspaces + nav). Default 250px; min 220, max 500.
     pub w_left_rail: f32,
 }
 

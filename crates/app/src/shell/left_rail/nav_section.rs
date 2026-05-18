@@ -11,8 +11,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::LeftRail;
 
-/// Top-level nav items rendered above the WORKSPACES section. Order matches
-/// the reference UX's `SidebarNav.tsx`.
+/// Top-level nav items rendered above the WORKSPACES section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavItem {
     Tasks,

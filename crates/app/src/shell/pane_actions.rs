@@ -27,7 +27,7 @@ const CARD_PADDING: f32 = 6.0;
 const ITEM_HEIGHT: f32 = 30.0;
 /// Icon size inside each menu item.
 const ICON_SIZE: f32 = 14.0;
-/// Horizontal padding inside each row (matches the reference UX rhythm).
+/// Horizontal padding inside each row.
 const ROW_PADDING_X: f32 = 10.0;
 /// Gap between icon and label.
 const ROW_GAP: f32 = 10.0;

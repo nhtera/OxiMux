@@ -1,9 +1,9 @@
 //! Welcome screen — empty-state center pane shown when no MainPane is mounted.
 //!
-//! the reference UX-style: borderless, centered directly on the workspace background.
-//! Logo tile, wordmark, tagline, and a flat list of keyboard shortcuts —
-//! no card surround. `should_show_welcome` is the pure predicate used in
-//! tests; Phase 04 will extend it to also gate on workspace selection.
+//! Borderless, centered directly on the workspace background. Logo tile,
+//! wordmark, tagline, and a flat list of keyboard shortcuts — no card
+//! surround. `should_show_welcome` is the pure predicate used in tests;
+//! Phase 04 will extend it to also gate on workspace selection.
 
 use gpui::{IntoElement, ParentElement, Styled, div, px, svg};
 use oximux_settings::{Density, Theme, Typography};
@@ -15,10 +15,9 @@ const SECTION_GAP: f32 = 20.0;
 const TAGLINE_GAP: f32 = 8.0;
 
 /// Static list of shortcut hint rows shown in the welcome screen. Each
-/// shortcut is an ordered slice of key glyphs (the reference UX pattern) — rendered as
-/// one chip per token with a small gap between, instead of a single
-/// "cmd-shift-p" pill. Items marked "(Phase 05)" land when the command
-/// palette ships.
+/// shortcut is an ordered slice of key glyphs — rendered as one chip per
+/// token with a small gap between, instead of a single "cmd-shift-p"
+/// pill. Items marked "(Phase 05)" land when the command palette ships.
 pub const SHORTCUT_HINTS: &[(&[&str], &str)] = &[
     (&["\u{2318}", "T"], "New terminal"),
     (&["\u{2318}", "D"], "Split pane horizontally"),
@@ -57,8 +56,8 @@ fn content(theme: Theme, density: Density, typography: &Typography) -> impl Into
         .child(hints(theme, density, typography))
 }
 
-/// rounded logo tile — solid dark square with the brand glyph
-/// centered inside. Sits ~96px tall, ~24px rounded corners.
+/// Rounded logo tile — solid dark square with the brand glyph centered
+/// inside. Sits ~96px tall, ~24px rounded corners.
 fn logo_tile(theme: Theme, density: Density) -> impl IntoElement {
     div()
         .w(px(LOGO_TILE_SIZE))
@@ -108,9 +107,9 @@ fn hint_row(
     density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
-    // Compose one chip per key glyph with a small gap — the reference UX pattern. The
-    // row uses justify_between so the description hugs the left and the
-    // chip cluster hugs the right within a fixed 320px frame.
+    // Compose one chip per key glyph with a small gap. The row uses
+    // justify_between so the description hugs the left and the chip
+    // cluster hugs the right within a fixed 320px frame.
     let mut chips = div().flex().flex_row().items_center().gap(px(4.));
     for key in keys.iter() {
         chips = chips.child(key_chip(*key, theme, density, typography));

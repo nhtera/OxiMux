@@ -11,8 +11,8 @@
 //! actions up the element tree from the focused leaf, so ordinary keystrokes
 //! still reach the focused `TerminalView` while `Cmd-*` combos bubble up here.
 //!
-//! Per-leaf tabs were removed when the workspace switched to the single-terminal-per-pane model:
-//! each leaf is a single terminal, and the workspace-level
+//! Per-leaf tabs were removed when the workspace switched to a single-tab-
+//! per-leaf model: each leaf is a single terminal, and the workspace-level
 //! [`crate::shell::workspace_tabs::WorkspaceTabs`] handles tab creation /
 //! switching above this struct.
 

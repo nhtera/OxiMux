@@ -18,13 +18,13 @@ actions!(
         /// Split the focused pane vertically — new pane on the bottom.
         /// Alias of `SplitDown` (kept for the existing Cmd+Shift+D binding).
         SplitVertical,
-        /// four-direction split: new pane on the right of focus.
+        /// Four-direction split: new pane on the right of focus.
         SplitRight,
-        /// four-direction split: new pane below focus.
+        /// Four-direction split: new pane below focus.
         SplitDown,
-        /// four-direction split: new pane on the left of focus.
+        /// Four-direction split: new pane on the left of focus.
         SplitLeft,
-        /// four-direction split: new pane above focus.
+        /// Four-direction split: new pane above focus.
         SplitUp,
         /// Open the Pane Actions dropdown (split direction picker).
         OpenPaneActions,

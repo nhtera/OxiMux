@@ -217,8 +217,7 @@ impl Render for RightSidebar {
 
         // Closed: render nothing — the right-sidebar toggle lives in the
         // global top_bar (workspace_root.rs), which stays visible and can
-        // re-open the panel. Matches the reference UX: closed state = fully gone, no
-        // mini-rail.
+        // re-open the panel. Closed state = fully gone, no mini-rail.
         if !self.open {
             return div().into_any_element();
         }

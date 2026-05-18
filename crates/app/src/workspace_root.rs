@@ -1,9 +1,9 @@
 //! WorkspaceRoot — the top-level view mounted into the GPUI window.
 //!
-//! Composition (the reference UX workspace pattern): three columns side-by-side, each
-//! topped by its own 40px header strip. There is NO full-width chrome row —
-//! the workspace tab strip is confined to the center column's width so it
-//! never extends across the side panels.
+//! Composition (per-column workspace pattern): three columns side-by-side,
+//! each topped by its own 40px header strip. There is NO full-width chrome
+//! row — the workspace tab strip is confined to the center column's width
+//! so it never extends across the side panels.
 //!
 //! ```text
 //! ┌──────────────┬─────────────────────────────┬──────────────────┐
@@ -21,7 +21,8 @@
 //!
 //! When a side panel is collapsed, its column disappears entirely and the
 //! chrome bits (wordmark/toggles) move into the center header so they stay
-//! reachable — mirrors the reference UX's `titlebar-left` floating behavior.
+//! reachable — mirrors the `titlebar-left` floating behavior found in
+//! similar workspace shells.
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
@@ -317,7 +318,7 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|this, _: &OpenPaneActions, _window, cx| {
                 // Anchor the dropdown's RIGHT edge at the "..." button's
-                // right edge so it feels visually attached (the reference UX pattern).
+                // right edge so it feels visually attached.
                 // When right sidebar is OPEN: center column ends where the
                 // right column begins, so "..." button right edge sits at
                 // `DEFAULT_PANEL_WIDTH` from window right.

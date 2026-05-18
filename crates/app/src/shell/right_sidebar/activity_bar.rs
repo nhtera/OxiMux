@@ -6,8 +6,8 @@
 //!
 //! Layout note: these buttons used to live inside a dedicated 40px strip at the
 //! top of `RightSidebar`. Now they're embedded into `top_bar`'s right zone so
-//! the chrome reads as one continuous row (matches the reference UX). The right sidebar
-//! column below contains only the panel body.
+//! the chrome reads as one continuous row. The right sidebar column below
+//! contains only the panel body.
 
 use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -19,7 +19,7 @@ use crate::shell::right_sidebar::RightSidebar;
 use crate::shell::right_sidebar::layout::{ACTIVE_INDICATOR_THICKNESS, TAB_BUTTON_WIDTH};
 use crate::shell::right_sidebar::tab::RightTab;
 
-/// Tab icon size — matches lucide-react's default 16px in the reference UX.
+/// Tab icon size — matches lucide-react's default 16px.
 const ICON_SIZE: f32 = 16.;
 
 /// Render the horizontal row of activity-bar tab buttons for the given

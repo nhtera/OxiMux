@@ -1,6 +1,6 @@
 //! Per-column top headers — 40px strip aligned with each body column.
 //!
-//! the reference UX pattern (workspace view): instead of one full-width chrome row across
+//! Per-column header pattern: instead of one full-width chrome row across
 //! the entire window, each of the three body columns (left rail / center /
 //! right sidebar) renders its OWN 40px header strip. The tab strip stays
 //! confined to the center column's width; collapsing a side panel naturally
@@ -93,7 +93,7 @@ fn left_chrome_cluster(
     theme: Theme,
     typography: &Typography,
 ) -> impl IntoElement {
-    // the reference UX order: traffic gutter → wordmark → left-rail toggle. Keeping the
+    // Order: traffic gutter → wordmark → left-rail toggle. Keeping the
     // wordmark anchored left mirrors macOS native chrome.
     let wordmark = div()
         .px(px(8.0))

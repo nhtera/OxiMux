@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-05-18 — the reference UX Shell Polish (5 phases, plan completed)
+### 2026-05-18 — Shell Polish (5 phases, plan completed)
 
 **Commits**: `9729baf` (P01), `745a3ba` (P02), `c951ab1` (P03), `8f9248d` (P04), `2237a94` (P05)
 **Status**: complete; total 344 tests passing across workspace
