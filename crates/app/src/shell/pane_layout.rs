@@ -16,7 +16,7 @@ use oximux_settings::Theme;
 
 use crate::shell::main_pane::MainPane;
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
-use crate::shell::tabbed_pane::TabbedPane;
+use crate::shell::terminal_view::TerminalView;
 
 /// Width of the resize handle hit zone between adjacent panes. The outer
 /// wrapper is transparent; only the 1 px center stripe (`DIVIDER_LINE_PX`)
@@ -58,7 +58,7 @@ pub struct ActiveDrag {
 /// crush the divider to 0 px. `(w, h)` is the pixel rect this node owns.
 pub fn build_node(
     node: &PaneTree,
-    panes: &HashMap<PaneId, Entity<TabbedPane>>,
+    panes: &HashMap<PaneId, Entity<TerminalView>>,
     theme: &Theme,
     path: &[usize],
     w: f32,
@@ -73,8 +73,8 @@ pub fn build_node(
             // cells will overflow the leaf's slot and bleed into the next
             // pane + its separator.
             let mut leaf = div().w(px(w)).h(px(h)).flex_shrink_0().overflow_hidden();
-            if let Some(pane) = panes.get(id) {
-                leaf = leaf.child(pane.clone());
+            if let Some(view) = panes.get(id) {
+                leaf = leaf.child(view.clone());
             }
             leaf
         }

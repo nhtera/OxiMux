@@ -19,6 +19,15 @@ pub enum Axis {
     Vertical,
 }
 
+/// Where the new pane goes relative to the target along the new split axis.
+/// `After` is the legacy semantics (Right / Down); `Before` powers the
+/// Left / Up split actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitInsert {
+    Before,
+    After,
+}
+
 /// Weights are stored as f32 alongside `children`, parallel-indexed. Only the
 /// *ratio* between siblings matters at render — `dispatch_grids` and
 /// `build_node` both treat `weights[i] / weights.iter().sum()` as the
@@ -99,9 +108,23 @@ impl PaneTree {
 
     /// Wrap the leaf matching `target` in a `Split { axis, [old, new] }` —
     /// each Cmd-D halves the focused pane's slice between old and new.
-    /// Matches the reference terminal / iTerm binary-split semantics. Returns true on
-    /// success.
+    /// Matches the reference terminal / iTerm binary-split semantics. The new pane goes
+    /// AFTER the old (right for horizontal, below for vertical). Returns
+    /// true on success.
     pub fn split_leaf(&mut self, target: PaneId, axis: Axis, new_id: PaneId) -> bool {
+        self.split_leaf_at(target, axis, new_id, SplitInsert::After)
+    }
+
+    /// Like [`split_leaf`] but lets the caller pick whether the new pane
+    /// goes before or after the focused leaf along the new axis. Drives the
+    /// four-direction menu: Right/Down = After, Left/Up = Before.
+    pub fn split_leaf_at(
+        &mut self,
+        target: PaneId,
+        axis: Axis,
+        new_id: PaneId,
+        insert: SplitInsert,
+    ) -> bool {
         let Some(path) = self.path_to(target) else {
             return false;
         };
@@ -113,9 +136,13 @@ impl PaneTree {
             weights: Vec::new(),
         };
         let old = std::mem::replace(node, placeholder);
+        let children = match insert {
+            SplitInsert::After => vec![old, PaneTree::Leaf(new_id)],
+            SplitInsert::Before => vec![PaneTree::Leaf(new_id), old],
+        };
         *node = PaneTree::Split {
             axis,
-            children: vec![old, PaneTree::Leaf(new_id)],
+            children,
             // 50/50 — divider drag mutates this in place.
             weights: vec![1.0, 1.0],
         };
@@ -290,6 +317,24 @@ mod tests {
             }
             _ => panic!("expected split root"),
         }
+    }
+
+    #[test]
+    fn split_leaf_at_before_places_new_pane_first() {
+        // Left/Up splits use SplitInsert::Before so the new pane lands on
+        // the leading side of the focused leaf along the new axis.
+        let mut t = PaneTree::Leaf(id(0));
+        assert!(t.split_leaf_at(id(0), Axis::Horizontal, id(1), SplitInsert::Before));
+        // in_order_leaves walks children left-to-right, so the new pane (1)
+        // must come BEFORE the original (0).
+        assert_eq!(t.in_order_leaves(), vec![id(1), id(0)]);
+    }
+
+    #[test]
+    fn split_leaf_at_after_matches_legacy_semantics() {
+        let mut t = PaneTree::Leaf(id(0));
+        assert!(t.split_leaf_at(id(0), Axis::Vertical, id(1), SplitInsert::After));
+        assert_eq!(t.in_order_leaves(), vec![id(0), id(1)]);
     }
 
     #[test]

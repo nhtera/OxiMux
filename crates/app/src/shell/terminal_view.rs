@@ -76,8 +76,8 @@ pub struct TerminalView {
     /// `cx.notify`) and delegates everything else.
     search: SearchState,
     /// Latest OSC 2 title from the PTY (`TerminalEvent::TitleChange`). `None`
-    /// until the shell emits one. `TabbedPane` reads this through `title()`
-    /// and uses it as the tab label, falling back to `"Tab N"` when None.
+    /// until the shell emits one. Reserved for future use by the workspace
+    /// tab strip — current labels are static `"Terminal N"` slugs.
     title: Option<String>,
     _poll_task: Task<()>,
     _blink_task: Task<()>,
@@ -368,8 +368,8 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Latest OSC 2 title the shell emitted, if any. Used by `TabbedPane` to
-    /// label the tab strip.
+    /// Latest OSC 2 title the shell emitted, if any. Exposed for future use
+    /// by the workspace tab strip.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }

@@ -13,9 +13,21 @@ actions!(
     oximux,
     [
         /// Split the focused pane horizontally — new pane on the right.
+        /// Alias of `SplitRight` (kept for the existing Cmd+D binding).
         SplitHorizontal,
         /// Split the focused pane vertically — new pane on the bottom.
+        /// Alias of `SplitDown` (kept for the existing Cmd+Shift+D binding).
         SplitVertical,
+        /// four-direction split: new pane on the right of focus.
+        SplitRight,
+        /// four-direction split: new pane below focus.
+        SplitDown,
+        /// four-direction split: new pane on the left of focus.
+        SplitLeft,
+        /// four-direction split: new pane above focus.
+        SplitUp,
+        /// Open the Pane Actions dropdown (split direction picker).
+        OpenPaneActions,
         /// Cycle focus to the next pane in in-order traversal.
         FocusNextPane,
         /// Cycle focus to the previous pane in in-order traversal.

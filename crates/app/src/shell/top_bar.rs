@@ -1,17 +1,19 @@
-//! Top bar — 40px horizontal strip across the window head.
+//! Per-column top headers — 40px strip aligned with each body column.
 //!
-//! chrome: 56px gutter (traffic-light inset on macOS), left-rail
-//! toggle, centered wordmark, right-sidebar activity tabs, right-sidebar
-//! toggle. Click handlers dispatch `ToggleLeftSidebar` / `ToggleRightSidebar`
-//! actions via `window.dispatch_action` since this is a pure render function
-//! with no owning entity handle.
+//! the reference UX pattern (workspace view): instead of one full-width chrome row across
+//! the entire window, each of the three body columns (left rail / center /
+//! right sidebar) renders its OWN 40px header strip. The tab strip stays
+//! confined to the center column's width; collapsing a side panel naturally
+//! yanks its header along.
 //!
-//! The right-sidebar tab strip (Explorer / Search / Source Control icons) is
-//! rendered by `right_sidebar::activity_bar` and embedded here when the panel
-//! is open, so the chrome reads as one continuous row across the window.
+//! When the left rail is collapsed, its chrome (traffic-light gutter,
+//! wordmark, left toggle button) moves to the start of the center header so
+//! the toggle stays reachable. Same idea on the right: when the panel is
+//! closed, the activity-bar tabs + right toggle move to the end of the
+//! center header.
 
 use gpui::{
-    AnyElement, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    AnyElement, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     Styled, Window, div, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
@@ -23,20 +25,58 @@ use crate::actions::{ToggleLeftSidebar, ToggleRightSidebar};
 /// the left-sidebar toggle button starts).
 const TRAFFIC_LIGHT_GUTTER: f32 = 76.0;
 
-/// Each toggle icon's hit target.
-const TOGGLE_BUTTON_WIDTH: f32 = 36.0;
+/// Each toggle icon's hit target. Public so positioning code (e.g. the
+/// Pane Actions dropdown anchor) can compute distances from the window
+/// right edge without hardcoding the magic 36 in multiple places.
+pub const TOGGLE_BUTTON_WIDTH: f32 = 36.0;
 
 /// Toggle icon glyph size.
 const ICON_SIZE: f32 = 16.0;
 
-pub fn view(
+/// Header strip for the left-rail column (when open). Hosts traffic-light
+/// gutter, wordmark, and the left-rail close toggle.
+pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
+    chrome_strip(theme, density).child(left_chrome_cluster(true, theme, typography))
+}
+
+/// Header strip for the center column. Hosts the workspace tab strip plus
+/// any chrome bits whose owning column is currently collapsed (so toggles
+/// stay reachable).
+pub fn center_header(
     left_open: bool,
     right_open: bool,
+    workspace_tabs: Option<AnyElement>,
     right_tabs: Option<AnyElement>,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
+    let mut row = chrome_strip(theme, density);
+    if !left_open {
+        // Left rail is collapsed — host the chrome cluster (toggle now uses
+        // the "open" icon since clicking it expands the rail).
+        row = row.child(left_chrome_cluster(false, theme, typography));
+    }
+    let center: AnyElement =
+        workspace_tabs.unwrap_or_else(|| spacer_zone().into_any_element());
+    row = row.child(center);
+    if !right_open {
+        row = row.child(right_chrome_cluster(false, right_tabs, theme));
+    }
+    row
+}
+
+/// Header strip for the right-sidebar column (when open). Hosts the
+/// activity-bar tab buttons and the right-sidebar close toggle.
+pub fn right_header(
+    right_tabs: Option<AnyElement>,
+    theme: Theme,
+    density: Density,
+) -> impl IntoElement {
+    chrome_strip(theme, density).child(right_chrome_cluster(true, right_tabs, theme))
+}
+
+fn chrome_strip(theme: Theme, density: Density) -> Div {
     div()
         .flex()
         .flex_row()
@@ -46,15 +86,15 @@ pub fn view(
         .bg(theme.bg_panel)
         .border_b_1()
         .border_color(theme.border_inactive)
-        .child(left_zone(left_open, theme, typography))
-        .child(spacer_zone())
-        .child(right_zone(right_open, right_tabs, theme))
 }
 
-fn left_zone(left_open: bool, theme: Theme, typography: &Typography) -> impl IntoElement {
+fn left_chrome_cluster(
+    left_open: bool,
+    theme: Theme,
+    typography: &Typography,
+) -> impl IntoElement {
     // the reference UX order: traffic gutter → wordmark → left-rail toggle. Keeping the
-    // wordmark anchored left mirrors macOS native chrome and frees the center
-    // for the flexible spacer that pushes the right zone to the edge.
+    // wordmark anchored left mirrors macOS native chrome.
     let wordmark = div()
         .px(px(8.0))
         .text_size(px(typography.t_brand))
@@ -67,6 +107,7 @@ fn left_zone(left_open: bool, theme: Theme, typography: &Typography) -> impl Int
         .flex_row()
         .items_center()
         .h_full()
+        .flex_shrink_0()
         .child(div().w(px(TRAFFIC_LIGHT_GUTTER)))
         .child(wordmark)
         .child(toggle_button(
@@ -76,16 +117,17 @@ fn left_zone(left_open: bool, theme: Theme, typography: &Typography) -> impl Int
         ))
 }
 
-fn spacer_zone() -> impl IntoElement {
-    div().flex().flex_1().h_full()
-}
-
-fn right_zone(
+fn right_chrome_cluster(
     right_open: bool,
     right_tabs: Option<AnyElement>,
     theme: Theme,
 ) -> impl IntoElement {
-    let mut zone = div().flex().flex_row().items_center().h_full();
+    let mut zone = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h_full()
+        .flex_shrink_0();
     if let Some(tabs) = right_tabs {
         zone = zone.child(tabs);
     }
@@ -94,6 +136,10 @@ fn right_zone(
         theme,
         ToggleSide::Right,
     ))
+}
+
+fn spacer_zone() -> impl IntoElement {
+    div().flex().flex_1().h_full().min_w(px(0.0))
 }
 
 #[derive(Clone, Copy)]

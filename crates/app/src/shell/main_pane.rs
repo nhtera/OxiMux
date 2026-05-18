@@ -1,17 +1,20 @@
-//! MainPane — workspace grid of terminal panes (Phase 1 step 5 + step 7).
+//! MainPane — workspace grid of terminal panes (Phase 1 step 5).
 //!
-//! Owns a `panes: HashMap<PaneId, Entity<TabbedPane>>` entity store paired
+//! Owns a `panes: HashMap<PaneId, Entity<TerminalView>>` entity store paired
 //! with a pure-data [`crate::shell::pane_tree::PaneTree`] describing the split
-//! layout. Render walks the tree top-down, looks up each leaf's TabbedPane in
-//! the HashMap, divides the available rect along each Split axis, and stages
-//! per-leaf `(cols, rows)` via `TabbedPane::set_target_grid` (which fans the
-//! grid to every tab inside).
+//! layout. Render walks the tree top-down, looks up each leaf's TerminalView
+//! in the HashMap, divides the available rect along each Split axis, and
+//! stages per-leaf `(cols, rows)` via `TerminalView::set_target_grid`.
 //!
-//! Action handlers (`SplitHorizontal`, `SplitVertical`, `ClosePane`,
-//! `FocusNextPane`, `NewTab`, `CloseTab`, `NextTab`, `PrevTab`) are wired on
-//! the root render `div`. GPUI dispatches actions up the element tree from
-//! the focused leaf, so ordinary keystrokes still reach the focused
-//! `TerminalView` while `Cmd-*` combos bubble up here.
+//! Action handlers (`SplitHorizontal`, `SplitVertical`, `FocusNextPane`,
+//! `FocusPrevPane`) are wired on the root render `div`. GPUI dispatches
+//! actions up the element tree from the focused leaf, so ordinary keystrokes
+//! still reach the focused `TerminalView` while `Cmd-*` combos bubble up here.
+//!
+//! Per-leaf tabs were removed when the workspace switched to the single-terminal-per-pane model:
+//! each leaf is a single terminal, and the workspace-level
+//! [`crate::shell::workspace_tabs::WorkspaceTabs`] handles tab creation /
+//! switching above this struct.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,17 +24,15 @@ use gpui::{
     MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Render, Styled, Subscription, Window,
     div,
 };
-use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, PrevTab, SplitHorizontal,
+    FocusNextPane, FocusPrevPane, SplitDown, SplitHorizontal, SplitLeft, SplitRight, SplitUp,
     SplitVertical,
 };
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_layout::{ActiveDrag, DIVIDER_HIT_PX, build_node};
-use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
-use crate::shell::tabbed_pane::{TAB_STRIP_HEIGHT_PX, TabbedPane};
+use crate::shell::pane_tree::{Axis, PaneId, PaneTree, SplitInsert};
 use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView};
 
 /// Vertical chrome subtracted from viewport when computing terminal area
@@ -41,12 +42,9 @@ const CHROME_H_PX: f32 = 40.0 + 24.0;
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 4;
 
-// Divider geometry (`DIVIDER_HIT_PX`, `DIVIDER_LINE_PX`) and the visual
-// builders (`build_node`, `build_divider`) live in `super::pane_layout`.
-
 pub struct MainPane {
     tree: PaneTree,
-    panes: HashMap<PaneId, Entity<TabbedPane>>,
+    panes: HashMap<PaneId, Entity<TerminalView>>,
     focused: PaneId,
     next_id: AtomicU64,
     theme: Theme,
@@ -54,30 +52,22 @@ pub struct MainPane {
     typography: Typography,
     focus_handle: FocusHandle,
     /// Horizontal chrome reserved by surrounding panels (left rail + right
-    /// sidebar). Live value; updated by `WorkspaceRoot` on every render so
-    /// the PTY grid shrinks when the right sidebar opens. Defaults to the
-    /// left rail width so initial mount before the first sync still produces
-    /// a sane terminal grid.
+    /// sidebar). Live value; updated by `WorkspaceTabs` on every render so the
+    /// PTY grid shrinks when the right sidebar opens. Defaults to the left
+    /// rail width so initial mount before the first sync still produces a
+    /// sane terminal grid.
     chrome_w_px: f32,
-    /// One observer per TabbedPane. When a pane notifies (click, keystroke,
-    /// PTY output via its tab's bubbled notify, tab swap) we re-notify
-    /// MainPane so render runs and `sync_focused_from_window` repaints the
-    /// active-pane ring + dim overlays. Stored to keep subscriptions alive.
+    /// One observer per leaf so the focus ring repaints on click / PTY output.
     _pane_observers: HashMap<PaneId, Subscription>,
     /// Set on divider `on_mouse_down`, read by the element-level
-    /// `on_mouse_move` listener on the MainPane root to translate cursor
-    /// position into weight updates. Cleared on `on_mouse_up` or when a
-    /// move event arrives with the left button no longer held (recovers
-    /// from the "released outside MainPane" case). `None` means no drag
-    /// in progress.
+    /// `on_mouse_move` listener on the MainPane root.
     active_drag: Option<ActiveDrag>,
 }
 
 impl MainPane {
-    /// Build a `MainPane` around a pre-spawned initial TabbedPane. PTY spawn
-    /// + TabbedPane wrap happen at the caller so this builder is infallible.
+    /// Build a `MainPane` around a pre-spawned initial TerminalView.
     pub fn new(
-        initial_pane: Entity<TabbedPane>,
+        initial_view: Entity<TerminalView>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -85,9 +75,9 @@ impl MainPane {
     ) -> Self {
         let id = PaneId(0);
         let next_id = AtomicU64::new(1);
-        let sub = cx.observe(&initial_pane, |_, _, cx| cx.notify());
+        let sub = cx.observe(&initial_view, |_, _, cx| cx.notify());
         let mut panes = HashMap::new();
-        panes.insert(id, initial_pane);
+        panes.insert(id, initial_view);
         let mut pane_observers = HashMap::new();
         pane_observers.insert(id, sub);
         let focus_handle = cx.focus_handle();
@@ -108,9 +98,8 @@ impl MainPane {
     }
 
     /// Update the surrounding chrome width so PTY grids match the actual
-    /// MainPane rect. Called by `WorkspaceRoot::render` whenever the left
-    /// rail or right sidebar toggles. No-op if `new_chrome` matches; a
-    /// `cx.notify()` would otherwise loop forever (render → update → render).
+    /// MainPane rect. No-op if the value matches to avoid a render → update →
+    /// render loop.
     pub fn set_chrome_width(&mut self, new_chrome: f32, cx: &mut Context<Self>) {
         if (self.chrome_w_px - new_chrome).abs() < f32::EPSILON {
             return;
@@ -123,30 +112,44 @@ impl MainPane {
         self.tree.leaf_count()
     }
 
+    /// Focus handle for the currently focused terminal leaf. Used by
+    /// `WorkspaceTabs::focus_active` so switching tabs re-homes focus inside
+    /// the destination tab's last-focused pane.
+    pub fn active_focus_handle(&self, cx: &App) -> FocusHandle {
+        match self.panes.get(&self.focused) {
+            Some(view) => view.read(cx).focus_handle(cx),
+            None => self.focus_handle.clone(),
+        }
+    }
+
     fn alloc_id(&self) -> PaneId {
         PaneId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Sync `self.focused` from the window's currently focused element.
-    /// Click-to-focus moves platform focus into a `TerminalView` (handled
-    /// inside that view), but `MainPane.focused` only changes when we
-    /// ourselves issue a focus call. Without this sync the user could click
-    /// pane A, press Cmd-D, and end up splitting pane B (whichever was last
-    /// action-focused). Called at the top of every action handler and at
-    /// the top of render so dim/ring repaint immediately on click.
+    /// Click-to-focus moves platform focus into a `TerminalView`, but
+    /// `MainPane.focused` only changes when we ourselves issue a focus call.
+    /// Without this sync the user could click pane A, press Cmd-D, and end up
+    /// splitting pane B (whichever was last action-focused).
     fn sync_focused_from_window(&mut self, window: &Window, cx: &App) {
         let Some(active) = window.focused(cx) else {
             return;
         };
-        for (id, pane) in &self.panes {
-            if pane.read(cx).contains_focus(&active, cx) {
+        for (id, view) in &self.panes {
+            if view.read(cx).focus_handle(cx) == active {
                 self.focused = *id;
                 return;
             }
         }
     }
 
-    fn split_focused(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
+    fn split_focused(
+        &mut self,
+        axis: Axis,
+        insert: SplitInsert,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(view) = spawn_terminal_view(
             self.theme,
             self.density,
@@ -156,15 +159,14 @@ impl MainPane {
         ) else {
             return;
         };
-        let new_pane = cx.new(|cx| TabbedPane::new(view, cx));
         let new_id = self.alloc_id();
-        if !self.tree.split_leaf(self.focused, axis, new_id) {
+        if !self.tree.split_leaf_at(self.focused, axis, new_id, insert) {
             tracing::warn!("split target not in tree; dropping new pane");
             return;
         }
-        let sub = cx.observe(&new_pane, |_, _, cx| cx.notify());
+        let sub = cx.observe(&view, |_, _, cx| cx.notify());
         self._pane_observers.insert(new_id, sub);
-        self.panes.insert(new_id, new_pane);
+        self.panes.insert(new_id, view);
         self.focused = new_id;
         focus_pane(&self.panes, new_id, window, cx);
         cx.notify();
@@ -177,7 +179,7 @@ impl MainPane {
         cx: &mut Context<Self>,
     ) {
         self.sync_focused_from_window(window, cx);
-        self.split_focused(Axis::Horizontal, window, cx);
+        self.split_focused(Axis::Horizontal, SplitInsert::After, window, cx);
     }
 
     fn on_split_vertical(
@@ -187,33 +189,27 @@ impl MainPane {
         cx: &mut Context<Self>,
     ) {
         self.sync_focused_from_window(window, cx);
-        self.split_focused(Axis::Vertical, window, cx);
+        self.split_focused(Axis::Vertical, SplitInsert::After, window, cx);
     }
 
-    /// Remove the currently focused pane and re-home focus on its in-order
-    /// neighbor. Reached via `CloseTab`'s last-tab cascade.
-    fn close_focused_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tree.leaf_count() <= 1 {
-            return;
-        }
-        let leaves_before = self.tree.in_order_leaves();
-        let Some(closing_pos) = leaves_before.iter().position(|id| *id == self.focused) else {
-            return;
-        };
-        let closing_id = self.focused;
-        if !self.tree.remove_leaf(closing_id) {
-            return;
-        }
-        self.panes.remove(&closing_id);
-        self._pane_observers.remove(&closing_id);
-        let leaves_after = self.tree.in_order_leaves();
-        if leaves_after.is_empty() {
-            return;
-        }
-        let neighbor = leaves_after[closing_pos.min(leaves_after.len() - 1)];
-        self.focused = neighbor;
-        focus_pane(&self.panes, neighbor, window, cx);
-        cx.notify();
+    fn on_split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        self.split_focused(Axis::Horizontal, SplitInsert::After, window, cx);
+    }
+
+    fn on_split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        self.split_focused(Axis::Vertical, SplitInsert::After, window, cx);
+    }
+
+    fn on_split_left(&mut self, _: &SplitLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        self.split_focused(Axis::Horizontal, SplitInsert::Before, window, cx);
+    }
+
+    fn on_split_up(&mut self, _: &SplitUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_from_window(window, cx);
+        self.split_focused(Axis::Vertical, SplitInsert::Before, window, cx);
     }
 
     fn on_focus_next_pane(
@@ -234,8 +230,6 @@ impl MainPane {
         self.cycle_focus(-1, window, cx);
     }
 
-    /// Shared cycling math for Cmd+] / Cmd+[. `step` is +1 for next, -1 for
-    /// prev; wraps modulo `leaves.len()`.
     fn cycle_focus(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_focused_from_window(window, cx);
         let leaves = self.tree.in_order_leaves();
@@ -253,75 +247,24 @@ impl MainPane {
         cx.notify();
     }
 
-    fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_focused_from_window(window, cx);
-        let Some(view) = spawn_terminal_view(
-            self.theme,
-            self.density,
-            self.typography.clone(),
-            window,
-            cx,
-        ) else {
-            return;
-        };
-        if let Some(pane) = self.panes.get(&self.focused).cloned() {
-            pane.update(cx, |tp, cx| tp.open_tab(view, window, cx));
-        }
-    }
-
-    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_focused_from_window(window, cx);
-        let Some(pane) = self.panes.get(&self.focused).cloned() else {
-            return;
-        };
-        let pane_should_close = pane.update(cx, |tp, cx| tp.close_active(window, cx));
-        if pane_should_close {
-            self.close_focused_pane(window, cx);
-        }
-    }
-
-    fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_focused_from_window(window, cx);
-        if let Some(pane) = self.panes.get(&self.focused).cloned() {
-            pane.update(cx, |tp, cx| tp.next_tab(window, cx));
-        }
-    }
-
-    fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_focused_from_window(window, cx);
-        if let Some(pane) = self.panes.get(&self.focused).cloned() {
-            pane.update(cx, |tp, cx| tp.prev_tab(window, cx));
-        }
-    }
-
     fn dispatch_grids(&self, window: &Window, cx: &mut Context<Self>) {
         let metrics = CellMetrics::measure(&self.typography, window);
         let (w, h) = available_area(window, self.chrome_w_px, self.density.pad_panel, &metrics);
         // Defer PTY resize during an active divider drag (the reference terminal / iTerm
-        // pattern). At 60 fps a drag would otherwise fire 60+ SIGWINCH/sec
-        // per affected pane, which makes shells with expensive prompts
-        // (oh-my-zsh, p10k) re-paint visibly every frame. The visible
-        // layout still updates (build_node uses weights directly); only
-        // the PTY backend resize is suppressed. On mouse-up the drag
-        // clears, the next render reaches this with `dragging=false`, and
-        // each affected pane gets a single resize reflecting the final
-        // weights.
+        // pattern). The visible layout still updates via build_node's pixel
+        // math; only the PTY backend resize is suppressed until mouse-up.
         let dragging = self.active_drag.is_some();
         dispatch_grids_inner(&self.tree, &self.panes, w, h, &metrics, cx, dragging);
     }
 
-    /// Called by `pane_layout::build_divider` on left mouse-down to stamp
-    /// the drag snapshot into `self.active_drag`. Kept as a method (rather
-    /// than letting layout poke the field directly) so the field can stay
-    /// private and so any future bookkeeping at drag start has one home.
+    /// Called by `pane_layout::build_divider` on left mouse-down to stamp the
+    /// drag snapshot into `self.active_drag`.
     pub(super) fn begin_divider_drag(&mut self, drag: ActiveDrag, cx: &mut Context<Self>) {
         self.active_drag = Some(drag);
         cx.notify();
     }
 
-    /// Called by `pane_layout::build_divider` on double-click — resets the
-    /// addressed split to equal weights (the reference terminal / Zed dock parity). No-op
-    /// if the path doesn't address a `Split`.
+    /// Reset the addressed split to equal weights (the reference terminal / Zed parity).
     pub(super) fn reset_split_weights(&mut self, path: &[usize], cx: &mut Context<Self>) {
         if let Some(current) = self.tree.split_weights(path) {
             let equal = vec![1.0; current.len()];
@@ -331,12 +274,6 @@ impl MainPane {
         }
     }
 
-    /// Compute new weights from a live cursor position and write them back
-    /// to the tree. `cursor` is in window coordinates; the math is
-    /// invariant to coordinate origin because we only consume the delta
-    /// against `start_position`. Skipping the update when either side
-    /// would fall below `MIN_FLEX` makes the drag stop at the boundary
-    /// instead of cascading.
     fn apply_drag(&mut self, cursor: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         let Some(drag) = self.active_drag.as_ref() else {
             return;
@@ -373,13 +310,13 @@ impl MainPane {
 }
 
 fn focus_pane(
-    panes: &HashMap<PaneId, Entity<TabbedPane>>,
+    panes: &HashMap<PaneId, Entity<TerminalView>>,
     id: PaneId,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if let Some(pane) = panes.get(&id) {
-        let handle = pane.read(cx).active_focus_handle(cx);
+    if let Some(view) = panes.get(&id) {
+        let handle = view.read(cx).focus_handle(cx);
         handle.focus(window, cx);
     }
 }
@@ -398,7 +335,7 @@ fn available_area(
 
 fn dispatch_grids_inner(
     node: &PaneTree,
-    panes: &HashMap<PaneId, Entity<TabbedPane>>,
+    panes: &HashMap<PaneId, Entity<TerminalView>>,
     w: f32,
     h: f32,
     metrics: &CellMetrics,
@@ -407,25 +344,16 @@ fn dispatch_grids_inner(
 ) {
     match node {
         PaneTree::Leaf(id) => {
-            // While a divider drag is in progress we deliberately do NOT
-            // call `set_target_grid` — see `MainPane::dispatch_grids` for
-            // the rationale (PTY resize coalescing). The visible layout
-            // still tracks the cursor via `build_node`'s pixel math.
+            // While a divider drag is in progress we deliberately do NOT call
+            // `set_target_grid` — see `MainPane::dispatch_grids` for the
+            // rationale (PTY resize coalescing).
             if dragging {
                 return;
             }
-            // Subtract the tab strip's height when this pane has multiple
-            // tabs so the terminal rect matches what render actually shows.
-            let strip_h = panes
-                .get(id)
-                .filter(|p| p.read(cx).tab_count() > 1)
-                .map(|_| TAB_STRIP_HEIGHT_PX)
-                .unwrap_or(0.0);
-            let usable_h = (h - strip_h).max(metrics.line_height);
             let cols = metrics.cols_in(w).max(MIN_COLS);
-            let rows = metrics.rows_in(usable_h).max(MIN_ROWS);
-            if let Some(pane) = panes.get(id) {
-                pane.update(cx, |tp, cx| tp.set_target_grid(cols, rows, cx));
+            let rows = metrics.rows_in(h).max(MIN_ROWS);
+            if let Some(view) = panes.get(id) {
+                view.update(cx, |v, _| v.set_target_grid(cols, rows));
             }
         }
         PaneTree::Split {
@@ -433,21 +361,11 @@ fn dispatch_grids_inner(
             children,
             weights,
         } if !children.is_empty() => {
-            // Invariant: `weights.len() == children.len()`. The zip below
-            // would silently truncate to the shorter side, dropping a pane
-            // from PTY dispatch (Codex flagged this in the pre-fix code).
-            // `remove_leaf` is the one mutation that could plausibly break
-            // it; we now panic in debug if any path got us here misaligned.
             debug_assert_eq!(
                 children.len(),
                 weights.len(),
                 "Split invariant violated in dispatch_grids_inner"
             );
-            // Reserve pixel space for the `(n-1)` dividers between siblings
-            // so the cols/rows we hand the PTY match the actual painted
-            // terminal rect. Without this the right-most pane reports +1 col
-            // to the shell and the cursor lands past the visible glyph
-            // column on resize.
             let gutter = DIVIDER_HIT_PX * (children.len().saturating_sub(1)) as f32;
             let usable = match axis {
                 Axis::Horizontal => (w - gutter).max(metrics.cell_width),
@@ -475,6 +393,7 @@ fn spawn_terminal_view(
     window: &mut Window,
     cx: &mut Context<MainPane>,
 ) -> Option<Entity<TerminalView>> {
+    use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
         cols: DEFAULT_COLS,
@@ -505,20 +424,12 @@ impl Render for MainPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Re-sync from window focus on every render so click-to-focus moves
         // the active-pane ring + dim overlay without waiting for the next
-        // action. Each TabbedPane notifies on click + tab swap; our
-        // `_pane_observers` forward those notifies back here.
+        // action.
         self.sync_focused_from_window(window, cx);
         self.dispatch_grids(window, cx);
         let focus_handle = self.focus_handle.clone();
         let metrics = CellMetrics::measure(&self.typography, window);
         let (w, h) = available_area(window, self.chrome_w_px, self.density.pad_panel, &metrics);
-
-        // `window.on_mouse_event` only works from the paint phase, and
-        // `Render::render` runs during layout — so instead we hang a plain
-        // `on_mouse_move` + `on_mouse_up` listener on the root div. Move
-        // events fire any time the cursor is anywhere over MainPane (the
-        // root spans the whole workspace area), which covers every
-        // realistic divider drag without needing window-level tracking.
 
         div()
             .id("oximux-main-pane")
@@ -526,23 +437,16 @@ impl Render for MainPane {
             .size_full()
             .on_action(cx.listener(Self::on_split_horizontal))
             .on_action(cx.listener(Self::on_split_vertical))
+            .on_action(cx.listener(Self::on_split_right))
+            .on_action(cx.listener(Self::on_split_down))
+            .on_action(cx.listener(Self::on_split_left))
+            .on_action(cx.listener(Self::on_split_up))
             .on_action(cx.listener(Self::on_focus_next_pane))
             .on_action(cx.listener(Self::on_focus_prev_pane))
-            .on_action(cx.listener(Self::on_new_tab))
-            .on_action(cx.listener(Self::on_close_tab))
-            .on_action(cx.listener(Self::on_next_tab))
-            .on_action(cx.listener(Self::on_prev_tab))
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _window, cx| {
                 if this.active_drag.is_none() {
                     return;
                 }
-                // If the left button is no longer held, the user
-                // released *outside* MainPane's hitbox (e.g. over the
-                // OS title bar or the sidebar) so `on_mouse_up` never
-                // fired. Without this check, the divider would keep
-                // following the cursor without any button held until
-                // the user clicked again. Clear the drag now that we
-                // can see the button state.
                 if e.pressed_button != Some(MouseButton::Left) {
                     this.active_drag = None;
                     cx.notify();
