@@ -1,12 +1,9 @@
 //! Smoke tests: construct `RightSidebar` with a static watch channel (no tokio
 //! thread-pool tasks), verify default state, tab switching, toggle, and
 //! the no-repo fallback that guards against SourceControl tab when hidden.
-//!
-//! Mirrors `git_panel_smoke.rs`: hands a watch::Receiver directly so no
-//! `StatusPoller` background thread runs during the GPUI test scheduler.
 
 use gpui::TestAppContext;
-use oximux_app::shell::right_sidebar::{RightSidebar, tab::RightTab};
+use oximux_app::shell::right_sidebar::{RightSidebar, SidebarTestConfig, tab::RightTab};
 use oximux_git::{PollState, Repository};
 use oximux_settings::{Density, Theme, Typography};
 use std::process::Command;
@@ -40,17 +37,19 @@ async fn right_sidebar_defaults_to_source_control_open(cx: &mut TestAppContext) 
     let (rt, repo) = setup_repo();
     let _guard = rt.enter();
 
-    // Static receiver — never ticks. Mirrors git_panel_smoke.rs pattern.
     let (_tx, rx) = watch::channel(PollState::Loading);
 
-    let window = cx.add_window(|_win, cx| {
+    let window = cx.add_window(|win, cx| {
         RightSidebar::new_for_test(
             repo,
-            rx,
-            true, // has_repo
-            Theme::default(),
-            Density::default(),
-            Typography::default(),
+            SidebarTestConfig {
+                state_rx: rx,
+                has_repo: true,
+                theme: Theme::default(),
+                density: Density::default(),
+                typography: Typography::default(),
+            },
+            win,
             cx,
         )
     });
@@ -70,14 +69,17 @@ async fn right_sidebar_select_tab_and_toggle(cx: &mut TestAppContext) {
 
     let (_tx, rx) = watch::channel(PollState::Loading);
 
-    let window = cx.add_window(|_win, cx| {
+    let window = cx.add_window(|win, cx| {
         RightSidebar::new_for_test(
             repo,
-            rx,
-            true, // has_repo
-            Theme::default(),
-            Density::default(),
-            Typography::default(),
+            SidebarTestConfig {
+                state_rx: rx,
+                has_repo: true,
+                theme: Theme::default(),
+                density: Density::default(),
+                typography: Typography::default(),
+            },
+            win,
             cx,
         )
     });
@@ -111,7 +113,7 @@ async fn right_sidebar_select_tab_and_toggle(cx: &mut TestAppContext) {
     });
 }
 
-/// M3 bonus: when `has_repo = false`, `_poller` is None so visible_tabs omits
+/// When `has_repo = false`, `_poller` is None so visible_tabs omits
 /// SourceControl. Attempting `select_tab(SourceControl)` must fall back to Explorer.
 #[gpui::test]
 async fn right_sidebar_no_repo_select_source_control_falls_back(cx: &mut TestAppContext) {
@@ -120,14 +122,17 @@ async fn right_sidebar_no_repo_select_source_control_falls_back(cx: &mut TestApp
 
     let (_tx, rx) = watch::channel(PollState::Loading);
 
-    let window = cx.add_window(|_win, cx| {
+    let window = cx.add_window(|win, cx| {
         RightSidebar::new_for_test(
             repo,
-            rx,
-            false, // has_repo = false → _poller = None
-            Theme::default(),
-            Density::default(),
-            Typography::default(),
+            SidebarTestConfig {
+                state_rx: rx,
+                has_repo: false, // _poller = None
+                theme: Theme::default(),
+                density: Density::default(),
+                typography: Typography::default(),
+            },
+            win,
             cx,
         )
     });

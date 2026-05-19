@@ -4,6 +4,48 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-19 — Right-Sidebar Phase 02 — File Explorer Panel
+
+**Status**: code complete; 439 workspace tests passing (0 failed)
+**Plan**: `plans/260517-1821-right-sidebar-panels/phase-02-file-explorer.md`
+**Code-review score**: 7.5 → all High/Medium items addressed before merge
+
+#### What shipped
+
+New `crates/app/src/shell/file_explorer/` module wired into the Explorer tab of `RightSidebar`.
+
+| File | Role |
+|---|---|
+| `mod.rs` | `FileExplorer` GPUI entity; state machine; action handlers; `cx.observe_window_activation` refresh |
+| `tree_state.rs` | flat-row build (`flatten`), expand toggle, `should_include` filter (skips `.git`/`node_modules`/`target`) |
+| `status_display.rs` | `BadgeStatus` enum, `STATUS_LABELS`/`STATUS_COLORS`, priority ladder, folder propagation (Deleted+Ignored excluded from folder badge) |
+| `row_render.rs` | `build_row_plan` pure helper → `RowPlan` consumed by `uniform_list` |
+| `fs_load.rs` | async `tokio::fs::read_dir` wrapper; 5s `tokio::time::timeout` per load; symlink skip; 12-deep recursion guard |
+
+#### Key behaviors
+- Virtualized via `gpui::uniform_list`; 24px row height, 16px/depth indent; targets 10k+ rows at 60 fps
+- Lazy directory load with `loaded`/`loading` flags; per-repo expanded-set persistence
+- Git status badges M/A/D/R/U/C right-aligned; folder propagation shows dominant child badge
+- Ignored entries rendered italic+dim; Deleted entries excluded from folder propagation
+- Focus-regain refresh via `cx.observe_window_activation` (reuses cached dirs, no full rescan)
+- Click file → `open <path>` (macOS default app); editor integration deferred to Phase 5
+
+#### Plan deviations (minor)
+- Symlink skip and 12-deep guard added (not in original spec) — prudent safety bounds
+- Deleted entries excluded from folder propagation (spec said only Ignored excluded) — UX improvement accepted in code review
+- Focus-refresh mechanism clarified to reuse cache rather than rescan
+
+#### Files modified outside `file_explorer/`
+- `shell/mod.rs` — added module export
+- `shell/right_sidebar/mod.rs` — Explorer tab wiring; `window: &mut Window` threaded through `new`
+- `workspace_root.rs` — passes window to `RightSidebar::new`
+- `crates/app/tests/right_sidebar_smoke.rs` + `file_explorer_*.rs` — 90+ new tests
+- `shell/welcome_view.rs` — one-line clippy fix
+
+**Test delta**: +90 tests (349 → 439 workspace total)
+
+---
+
 ### 2026-05-18 — Shell Polish (5 phases, plan completed)
 
 **Commits**: `9729baf` (P01), `745a3ba` (P02), `c951ab1` (P03), `8f9248d` (P04), `2237a94` (P05)

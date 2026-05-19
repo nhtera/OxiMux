@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-05-17  
-**Phase**: 2 code-complete
+**Updated**: 2026-05-19  
+**Phase**: 2 code-complete + right-sidebar Phase 02 (File Explorer) complete
 
 ---
 
@@ -12,6 +12,7 @@
 │  GPUI UI layer  (crates/app)                        │
 │  WorkspaceRoot → MainPane/TabbedPane/TerminalView   │
 │                → RightSidebar (tab-switched panel)  │
+│                   Explorer tab: FileExplorer (uniform_list, lazy, git badges)│
 │                   SourceControl tab: GitPanel+DiffView│
 │                → StatusBar (git zone)               │
 ├─────────────────────────────────────────────────────┤
@@ -39,9 +40,12 @@ WorkspaceRoot (GPUI entity)
     ├── active_tab: RightTab  (Explorer | Search | SourceControl)
     ├── activity_bar: 40px strip; single-letter glyph buttons
     ├── _repo: Arc<Repository>
-    ├── _poller: StatusPoller           ← AbortHandle; drops → task stops
-    ├── git_panel: Entity<GitPanel>     ← shown on SourceControl tab
-    └── diff_view: Entity<DiffView>     ← shown on SourceControl tab
+    ├── _poller: StatusPoller              ← AbortHandle; drops → task stops
+    ├── file_explorer: Entity<FileExplorer> ← shown on Explorer tab
+    │     uniform_list virtualized tree; lazy load; git status badges M/A/D/R/U/C
+    │     5s tokio timeout per dir load; focus-regain refresh via observe_window_activation
+    ├── git_panel: Entity<GitPanel>        ← shown on SourceControl tab
+    └── diff_view: Entity<DiffView>        ← shown on SourceControl tab
 ```
 
 `WorkspaceRoot::new` creates `RightSidebar::new(repo, …)` when `Repository::open` succeeds. `StatusPoller::spawn` wires the 500ms tick inside `RightSidebar`. Status bar reads `right_sidebar.read(cx).latest_poll_state()`. On each non-duplicate status delta, `cx.notify()` propagates to all subscribers including the status bar center zone.

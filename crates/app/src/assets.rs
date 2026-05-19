@@ -15,22 +15,60 @@ use gpui::{AssetSource, SharedString};
 /// file in `crates/app/assets/icons/` to register a new asset.
 struct AppAssets;
 
+/// SVGs shipped locally. Each entry is `(asset path, embedded bytes)`. To add
+/// a new icon, drop the file under `crates/app/assets/icons/` and append a
+/// tuple here — no other wiring needed.
+const APP_ICONS: &[(&str, &[u8])] = &[
+    (
+        "icons/git-branch.svg",
+        include_bytes!("../assets/icons/git-branch.svg"),
+    ),
+    (
+        "icons/list-collapse.svg",
+        include_bytes!("../assets/icons/list-collapse.svg"),
+    ),
+    (
+        "icons/refresh-cw.svg",
+        include_bytes!("../assets/icons/refresh-cw.svg"),
+    ),
+    (
+        "icons/circle-slash.svg",
+        include_bytes!("../assets/icons/circle-slash.svg"),
+    ),
+    (
+        "icons/file-text.svg",
+        include_bytes!("../assets/icons/file-text.svg"),
+    ),
+    (
+        "icons/file-box.svg",
+        include_bytes!("../assets/icons/file-box.svg"),
+    ),
+    (
+        "icons/file-cog.svg",
+        include_bytes!("../assets/icons/file-cog.svg"),
+    ),
+    (
+        "icons/file-code.svg",
+        include_bytes!("../assets/icons/file-code.svg"),
+    ),
+];
+
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        match path {
-            "icons/git-branch.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
-                "../assets/icons/git-branch.svg"
-            )))),
-            _ => Ok(None),
+        for (asset_path, bytes) in APP_ICONS {
+            if *asset_path == path {
+                return Ok(Some(Cow::Borrowed(*bytes)));
+            }
         }
+        Ok(None)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        if "icons/git-branch.svg".starts_with(path) {
-            Ok(vec!["icons/git-branch.svg".into()])
-        } else {
-            Ok(vec![])
-        }
+        Ok(APP_ICONS
+            .iter()
+            .filter(|(asset_path, _)| asset_path.starts_with(path))
+            .map(|(asset_path, _)| SharedString::from(*asset_path))
+            .collect())
     }
 }
 

@@ -43,8 +43,7 @@ use crate::shell::{
     main_pane::MainPane,
     pane_actions::PaneActionsMenu,
     right_sidebar::{
-        RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH,
-        tab::RightTab,
+        RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
     },
     status_bar,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView},
@@ -77,18 +76,18 @@ impl WorkspaceRoot {
         let density = Density::cockpit();
         let typography = Typography::cockpit();
 
-        let workspace_tabs = spawn_initial_workspace(theme, density, typography.clone(), window, cx);
+        let workspace_tabs =
+            spawn_initial_workspace(theme, density, typography.clone(), window, cx);
         let workspace_tabs_observer = workspace_tabs
             .as_ref()
             .map(|ws| cx.observe(ws, |_, _, cx| cx.notify()));
-        let right_sidebar = repo
-            .clone()
-            .map(|r| cx.new(|cx| RightSidebar::new(r, theme, density, typography.clone(), cx)));
+        let right_sidebar = repo.clone().map(|r| {
+            cx.new(|cx| RightSidebar::new(r, theme, density, typography.clone(), window, cx))
+        });
         let left_rail =
             cx.new(|cx| LeftRail::new(repo, theme, density, typography.clone(), window, cx));
         let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
-        let pane_actions =
-            cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
+        let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
 
         Self {
             theme,
@@ -143,7 +142,8 @@ fn spawn_initial_workspace(
             cx,
         )
     });
-    let initial_pane = cx.new(|cx| MainPane::new(initial_view, theme, density, typography.clone(), cx));
+    let initial_pane =
+        cx.new(|cx| MainPane::new(initial_view, theme, density, typography.clone(), cx));
     Some(cx.new(|cx| WorkspaceTabs::new(initial_pane, theme, density, typography, cx)))
 }
 
@@ -284,12 +284,7 @@ impl Render for WorkspaceRoot {
             _ => None,
         };
 
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h(px(0.))
-            .w_full();
+        let mut row = div().flex().flex_row().flex_1().min_h(px(0.)).w_full();
         if let Some(col) = left_column {
             row = row.child(col);
         }
@@ -325,10 +320,7 @@ impl Render for WorkspaceRoot {
                 // When CLOSED: "..." button is just left of the right
                 // toggle in the center header, so its right edge sits at
                 // `TOGGLE_BUTTON_WIDTH` from window right.
-                let r_open = this
-                    .right_sidebar
-                    .as_ref()
-                    .is_some_and(|s| s.read(cx).open);
+                let r_open = this.right_sidebar.as_ref().is_some_and(|s| s.read(cx).open);
                 let right_anchor = if r_open {
                     f32::from(DEFAULT_PANEL_WIDTH)
                 } else {

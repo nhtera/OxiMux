@@ -17,9 +17,21 @@ use oximux_git::{PollState, Repository, StatusPoller};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::diff_view::DiffView;
+use crate::shell::file_explorer::FileExplorer;
 use crate::shell::git_panel::GitPanel;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
+
+/// Configuration bundle for `RightSidebar::new_for_test`. Keeps the test
+/// constructor under the 7-argument clippy limit.
+#[doc(hidden)]
+pub struct SidebarTestConfig {
+    pub state_rx: tokio::sync::watch::Receiver<PollState>,
+    pub has_repo: bool,
+    pub theme: Theme,
+    pub density: Density,
+    pub typography: Typography,
+}
 
 /// Tab-switchable right panel that replaces the old fixed `GitMount` column.
 pub struct RightSidebar {
@@ -30,6 +42,9 @@ pub struct RightSidebar {
     // `pub(crate)`: tests in this package may read state; external callers should not.
     pub(crate) git_panel: Entity<GitPanel>,
     pub(crate) diff_view: Entity<DiffView>,
+
+    // Explorer panel.
+    pub(crate) file_explorer: Entity<FileExplorer>,
 
     // Poll state mirrored for the status bar (avoids borrowing through entity tree).
     pub latest_poll_state: PollState,
@@ -48,11 +63,13 @@ impl RightSidebar {
         theme: Theme,
         density: Density,
         typography: Typography,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let poller = Arc::new(StatusPoller::spawn(repo.clone()));
         let panel_rx = poller.subscribe();
         let bar_rx = poller.subscribe();
+        let explorer_rx = poller.subscribe();
         let initial = poller.current();
 
         let diff_view =
@@ -60,12 +77,25 @@ impl RightSidebar {
         let diff_view_for_panel = diff_view.clone();
         let git_panel = cx.new(|cx| {
             GitPanel::new(
-                repo,
+                repo.clone(),
                 panel_rx,
                 Some(diff_view_for_panel),
                 theme,
                 density,
                 typography.clone(),
+                cx,
+            )
+        });
+
+        let repo_root = repo.workdir().to_path_buf();
+        let file_explorer = cx.new(|cx| {
+            FileExplorer::new(
+                repo_root,
+                explorer_rx,
+                theme,
+                density,
+                typography.clone(),
+                window,
                 cx,
             )
         });
@@ -77,6 +107,7 @@ impl RightSidebar {
             active_tab: RightTab::SourceControl,
             git_panel,
             diff_view,
+            file_explorer,
             latest_poll_state: initial,
             _poller: Some(poller),
             _poll_observer: poll_observer,
@@ -91,15 +122,21 @@ impl RightSidebar {
     #[doc(hidden)]
     pub fn new_for_test(
         repo: Repository,
-        state_rx: tokio::sync::watch::Receiver<PollState>,
-        has_repo: bool,
-        theme: Theme,
-        density: Density,
-        typography: Typography,
+        cfg: SidebarTestConfig,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let SidebarTestConfig {
+            state_rx,
+            has_repo,
+            theme,
+            density,
+            typography,
+        } = cfg;
         // Dead bar_rx: sender dropped immediately so the observer exits on first Err.
         let (_bar_tx, bar_rx) = tokio::sync::watch::channel(PollState::Loading);
+        // Dead explorer_rx for tests — never ticks.
+        let (_explorer_tx, explorer_rx) = tokio::sync::watch::channel(PollState::Loading);
         let diff_view =
             cx.new(|cx| DiffView::new(repo.clone(), theme, density, typography.clone(), cx));
         let diff_view_for_panel = diff_view.clone();
@@ -111,6 +148,18 @@ impl RightSidebar {
                 theme,
                 density,
                 typography.clone(),
+                cx,
+            )
+        });
+        let repo_root = repo.workdir().to_path_buf();
+        let file_explorer = cx.new(|cx| {
+            FileExplorer::new(
+                repo_root,
+                explorer_rx,
+                theme,
+                density,
+                typography.clone(),
+                window,
                 cx,
             )
         });
@@ -136,6 +185,7 @@ impl RightSidebar {
             active_tab: initial_tab,
             git_panel,
             diff_view,
+            file_explorer,
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -228,11 +278,8 @@ impl Render for RightSidebar {
                 .flex_1()
                 .w_full()
                 .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.fg_muted)
-                .text_size(px(12.))
-                .child("File Explorer — Phase 02")
+                .flex_col()
+                .child(div().flex_1().w_full().child(self.file_explorer.clone()))
                 .into_any_element(),
             RightTab::Search => div()
                 .flex_1()

@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-05-17  
-**Phase**: 2 code-complete (steps 1-14 shipped; step 15 = dogfood gate)  
-**Tests**: 285 passed, 0 failed (workspace)
+**Updated**: 2026-05-19  
+**Phase**: 2 code-complete + right-sidebar Phase 02 (File Explorer) complete  
+**Tests**: 439 passed, 0 failed (workspace)
 
 ---
 
@@ -68,8 +68,14 @@ src/
     ├── terminal_search_overlay.rs overlay render
     ├── key_input.rs        Keystroke → PTY bytes (xterm escapes, C0, Alt-prefix)
     ├── cell_metrics.rs     character cell size constants
+    ├── file_explorer/      FileExplorer entity; virtualized git-aware file tree (uniform_list, lazy load, git status badges)
+    │   ├── mod.rs          FileExplorer entity; state machine; window-activation refresh trigger
+    │   ├── tree_state.rs   flat-row build, expand toggle, should_include filter
+    │   ├── status_display.rs BadgeStatus, STATUS_LABELS/COLORS, priority ladder, folder propagation
+    │   ├── row_render.rs   build_row_plan pure helper → RowPlan
+    │   └── fs_load.rs      async tokio read_dir; 5s timeout; symlink skip; 12-deep guard
     ├── right_sidebar/
-    │   ├── mod.rs          RightSidebar entity; tab switching; hosts GitPanel+DiffView or placeholders
+    │   ├── mod.rs          RightSidebar entity; tab switching; hosts FileExplorer (Explorer tab) + GitPanel+DiffView (SourceControl tab)
     │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl; icon_path() per tab
     │   ├── activity_bar.rs top tab bar (SVG icons) + persistent collapsed rail + PanelRight toggle
     │   └── layout.rs       layout constants

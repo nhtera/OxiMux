@@ -12,9 +12,7 @@
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
-    prelude::FluentBuilder,
-    svg,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, svg,
 };
 
 use crate::actions::{SplitDown, SplitLeft, SplitRight, SplitUp};
@@ -313,13 +311,10 @@ fn workspace_tab(
         .when(!is_active, |s| {
             s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
         })
-        .on_mouse_down(
-            MouseButton::Left,
-            move |_: &MouseDownEvent, window, cx| {
-                let entity = entity_for_click.clone();
-                entity.update(cx, |this, cx| this.set_active(ix, window, cx));
-            },
-        )
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            let entity = entity_for_click.clone();
+            entity.update(cx, |this, cx| this.set_active(ix, window, cx));
+        })
         .child(icon)
         .child(
             div()
@@ -359,12 +354,9 @@ fn pane_actions_button(theme: Theme) -> impl IntoElement {
         .flex_shrink_0()
         .cursor_pointer()
         .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(
-            MouseButton::Left,
-            move |_: &MouseDownEvent, window, cx| {
-                window.dispatch_action(Box::new(crate::actions::OpenPaneActions), cx);
-            },
-        )
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            window.dispatch_action(Box::new(crate::actions::OpenPaneActions), cx);
+        })
         .child(glyph)
 }
 
@@ -439,14 +431,11 @@ fn close_button(
         .opacity(initial_opacity)
         .group_hover(group_name, |s| s.opacity(1.0))
         .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(
-            MouseButton::Left,
-            move |_: &MouseDownEvent, window, cx| {
-                let entity = entity.clone();
-                entity.update(cx, |this, cx| this.close_tab(ix, window, cx));
-                cx.stop_propagation();
-            },
-        )
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            let entity = entity.clone();
+            entity.update(cx, |this, cx| this.close_tab(ix, window, cx));
+            cx.stop_propagation();
+        })
         .child(glyph)
 }
 
@@ -465,14 +454,11 @@ fn plus_button(theme: Theme, entity: Entity<WorkspaceTabs>) -> impl IntoElement 
         .flex_shrink_0()
         .cursor_pointer()
         .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(
-            MouseButton::Left,
-            move |_: &MouseDownEvent, window, cx| {
-                let entity = entity.clone();
-                entity.update(cx, |this, cx| this.open_tab(window, cx));
-                cx.stop_propagation();
-            },
-        )
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            let entity = entity.clone();
+            entity.update(cx, |this, cx| this.open_tab(window, cx));
+            cx.stop_propagation();
+        })
         .child(glyph)
 }
 

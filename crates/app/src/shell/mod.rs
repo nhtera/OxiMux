@@ -8,6 +8,7 @@ pub mod command_palette;
 pub mod commit_dialog;
 pub mod confirm_dialog;
 pub mod diff_view;
+pub mod file_explorer;
 pub mod git_panel;
 pub mod key_input;
 pub mod left_rail;

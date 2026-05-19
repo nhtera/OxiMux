@@ -57,8 +57,7 @@ pub fn center_header(
         // the "open" icon since clicking it expands the rail).
         row = row.child(left_chrome_cluster(false, theme, typography));
     }
-    let center: AnyElement =
-        workspace_tabs.unwrap_or_else(|| spacer_zone().into_any_element());
+    let center: AnyElement = workspace_tabs.unwrap_or_else(|| spacer_zone().into_any_element());
     row = row.child(center);
     if !right_open {
         row = row.child(right_chrome_cluster(false, right_tabs, theme));
@@ -88,11 +87,7 @@ fn chrome_strip(theme: Theme, density: Density) -> Div {
         .border_color(theme.border_inactive)
 }
 
-fn left_chrome_cluster(
-    left_open: bool,
-    theme: Theme,
-    typography: &Typography,
-) -> impl IntoElement {
+fn left_chrome_cluster(left_open: bool, theme: Theme, typography: &Typography) -> impl IntoElement {
     // Order: traffic gutter → wordmark → left-rail toggle. Keeping the
     // wordmark anchored left mirrors macOS native chrome.
     let wordmark = div()
@@ -122,14 +117,22 @@ fn right_chrome_cluster(
     right_tabs: Option<AnyElement>,
     theme: Theme,
 ) -> impl IntoElement {
-    let mut zone = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .h_full()
-        .flex_shrink_0();
+    // When the right sidebar is open this cluster sits inside its own
+    // `right_header` strip and should span the full strip width so the toggle
+    // can anchor at the far right. When the sidebar is closed the cluster is
+    // appended to `center_header`; the preceding `flex_1` spacer there
+    // already shoves it to the right edge, so `flex_shrink_0` keeps it intact.
+    let zone_base = div().flex().flex_row().items_center().h_full();
+    let mut zone = if right_open {
+        zone_base.w_full()
+    } else {
+        zone_base.flex_shrink_0()
+    };
     if let Some(tabs) = right_tabs {
         zone = zone.child(tabs);
+    }
+    if right_open {
+        zone = zone.child(div().flex_1().h_full());
     }
     zone.child(toggle_button(
         right_toggle_icon(right_open),

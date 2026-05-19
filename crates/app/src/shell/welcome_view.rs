@@ -112,7 +112,7 @@ fn hint_row(
     // cluster hugs the right within a fixed 320px frame.
     let mut chips = div().flex().flex_row().items_center().gap(px(4.));
     for key in keys.iter() {
-        chips = chips.child(key_chip(*key, theme, density, typography));
+        chips = chips.child(key_chip(key, theme, density, typography));
     }
     div()
         .flex()

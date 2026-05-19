@@ -11,7 +11,8 @@
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
 use gpui::{
-    AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
+    AnyView, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point,
+    px, size,
 };
 use oximux_app::actions::{
     CloseTab, FocusNextPane, FocusPrevPane, NewTab, NextTab, OpenCommandPalette, OpenCommitDialog,
@@ -110,7 +111,14 @@ fn main() {
 
         let repo_for_window = repo.clone();
         let _ = cx.open_window(options, move |window, cx| {
-            cx.new(|cx| WorkspaceRoot::new(repo_for_window, window, cx))
+            // Wrap the workspace in gpui-component's `Root`. `Root` hosts the
+            // tooltip / sheet / dialog / notification overlays, which is what
+            // makes `Button::tooltip(...)` (and any other component tooltip)
+            // actually paint. On macOS its `window_border` shadow size is 0,
+            // so it's a transparent pass-through — purely additive.
+            let workspace = cx.new(|cx| WorkspaceRoot::new(repo_for_window, window, cx));
+            let view: AnyView = workspace.into();
+            cx.new(|cx| gpui_component::Root::new(view, window, cx))
         });
     });
 }

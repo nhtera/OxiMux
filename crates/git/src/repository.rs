@@ -92,10 +92,22 @@ impl Repository {
         &self.workdir
     }
 
-    /// Run `git status --porcelain=v2 --branch -z` and parse into `GitState`.
+    /// Run `git status --porcelain=v2 --branch --ignored=matching -z` and
+    /// parse into `GitState`. `--ignored=matching` emits one `!` record per
+    /// path that directly matches a `.gitignore` rule, instead of the
+    /// traditional `--ignored` which recursively enumerates every file
+    /// inside ignored trees (catastrophically slow in repos with large
+    /// `target/`, `node_modules/`, etc.). The file explorer hides whole
+    /// ignored subtrees anyway — leaf-level enumeration is wasted work.
     pub async fn status(&self) -> Result<GitState> {
         let out = GitCmd::new(&self.workdir)
-            .args(["status", "--porcelain=v2", "--branch", "-z"])
+            .args([
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--ignored=matching",
+                "-z",
+            ])
             .run()
             .await?;
         status::parse_porcelain_v2(&out.stdout)

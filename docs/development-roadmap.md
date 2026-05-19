@@ -1,6 +1,6 @@
 # OxiMux — Development Roadmap
 
-**Updated**: 2026-05-17  
+**Updated**: 2026-05-19  
 **Gate rule**: each phase ships only after ≥7 consecutive daily-driver days with zero panics (ADR-003). Tests-passing alone is not sufficient.
 
 ---
@@ -47,6 +47,7 @@ All 14 implementation steps shipped. Step 15 is the dogfood usage gate.
 **Tests**: 285 passed, 0 failed
 
 - 2026-05-17: Right-sidebar Phase 01 shipped — RightSidebar entity replaces GitMount; 3-tab activity bar (Explorer/Search/SourceControl); 6 tests added.
+- 2026-05-19: Right-sidebar Phase 02 shipped — FileExplorer entity on Explorer tab; virtualized uniform_list tree; lazy dir load with 5s timeout; git status badges M/A/D/R/U/C with folder propagation; focus-regain refresh; 90+ tests added (439 workspace total).
 
 ---
 
