@@ -37,6 +37,8 @@ async fn right_sidebar_defaults_to_source_control_open(cx: &mut TestAppContext) 
     let (rt, repo) = setup_repo();
     let _guard = rt.enter();
 
+    cx.update(gpui_component::init);
+
     let (_tx, rx) = watch::channel(PollState::Loading);
 
     let window = cx.add_window(|win, cx| {
@@ -66,6 +68,10 @@ async fn right_sidebar_defaults_to_source_control_open(cx: &mut TestAppContext) 
 async fn right_sidebar_select_tab_and_toggle(cx: &mut TestAppContext) {
     let (rt, repo) = setup_repo();
     let _guard = rt.enter();
+
+    // SearchPanel inside RightSidebar uses gpui-component InputState, which
+    // reads the theme global initialised by `gpui_component::init`.
+    cx.update(gpui_component::init);
 
     let (_tx, rx) = watch::channel(PollState::Loading);
 
@@ -119,6 +125,8 @@ async fn right_sidebar_select_tab_and_toggle(cx: &mut TestAppContext) {
 async fn right_sidebar_no_repo_select_source_control_falls_back(cx: &mut TestAppContext) {
     let (rt, repo) = setup_repo();
     let _guard = rt.enter();
+
+    cx.update(gpui_component::init);
 
     let (_tx, rx) = watch::channel(PollState::Loading);
 

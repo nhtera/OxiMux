@@ -56,6 +56,18 @@ fn main() {
         // gpui-component defaults to ThemeMode::Light; flip to Dark so the
         // TabBar + future component chrome match OxiMux's dark terminal panes.
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        // Align the gpui-component Input border palette with OxiMux's
+        // charcoal theme. Default `input`/`ring` are tuned for a light
+        // shadcn-style page and read as "always focused" against our deep
+        // panel fill. `border_inactive` is the same color the rest of the
+        // shell uses for hairline edges, and `focus_ring` is the dedicated
+        // focus accent — same tokens, single source of truth.
+        {
+            let palette = oximux_settings::Theme::charcoal();
+            let component_theme = gpui_component::Theme::global_mut(cx);
+            component_theme.colors.input = palette.border_inactive;
+            component_theme.colors.ring = palette.focus_ring;
+        }
         cx.bind_keys([
             KeyBinding::new("cmd-d", SplitHorizontal, None),
             KeyBinding::new("cmd-shift-d", SplitVertical, None),

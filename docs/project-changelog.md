@@ -4,6 +4,48 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-20 — Right-Sidebar Phase 03 — Search Panel
+
+**Status**: code complete; 476 workspace tests passing (0 failed)
+**Plan**: `plans/260517-1821-right-sidebar-panels/phase-03-search-panel.md`
+
+#### What shipped
+
+New `crates/app/src/shell/search_panel/` module wired into the Search tab of `RightSidebar`.
+
+| File | Role |
+|---|---|
+| `mod.rs` | `SearchPanel` GPUI entity; 300ms debounce; monotonic search-id cancellation; InputState event subscriptions |
+| `search_state.rs` | pure `SearchOptions` (query, case/word/regex, include/exclude globs) |
+| `rg_runner.rs` | async `tokio::process::Command` spawn of `rg --json`; NDJSON stream-parse; per-file cap (100) and global cap (2000); 30s hard timeout; `kill_on_drop` |
+| `rows.rs` | pure `build_search_rows` interleaver: file headers + matches, collapse handling |
+| `match_render.rs` | pure VSCode-style `truncate_before` (26-byte pre-match cap); multi-byte char safe via `is_char_boundary` |
+| `header_render.rs` | query input + Aa/ab/.* toggle row + include/exclude glob fields + summary banner state |
+| `result_row.rs` | paint file header rows (chevron + name + match count) and match rows (line# + highlighted span) |
+
+#### Key behaviors
+- Backend: shell-out to `ripgrep --json`. Detect at startup; show install hint banner if missing.
+- 300ms debounce via `cx.background_executor().timer`; monotonic `latest_search_id` drops stale results.
+- Cancellation: `tokio::process::Child::start_kill()` + `kill_on_drop(true)` — no zombie processes on tab switch.
+- Virtualized via `gpui::uniform_list`; file rows 28px, match rows 20px.
+- Left-truncation keeps match span visible at narrow widths (BEFORE_MAX = 26 bytes).
+- Empty states: rg-missing / no query / no results.
+- Click file row toggles collapse; click match row opens file via `open` (editor jump deferred to Phase 5).
+
+#### Files modified outside `search_panel/`
+- `shell/mod.rs` — added module export
+- `shell/right_sidebar/mod.rs` — Search tab wiring; replaces "Phase 03" placeholder
+- `crates/app/Cargo.toml` — adds `serde`, `serde_json`, `thiserror` workspace deps
+- Tests: `tests/search_smoke.rs`, `tests/search_rg_runner.rs`, `tests/fixtures/search/` fixture dir.
+- Fixed pre-existing smoke test failures by initializing `gpui_component::init` in test setup (file_explorer_smoke, right_sidebar_smoke).
+
+#### New tests (+27 over baseline)
+- 20 lib unit tests across `search_panel/*` (pure modules)
+- 6 integration tests in `tests/search_rg_runner.rs` (real ripgrep against fixtures)
+- 1 gpui smoke test in `tests/search_smoke.rs`
+
+---
+
 ### 2026-05-19 — Right-Sidebar Phase 02 — File Explorer Panel
 
 **Status**: code complete; 439 workspace tests passing (0 failed)

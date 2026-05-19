@@ -40,6 +40,10 @@ async fn file_explorer_constructs_without_panic(cx: &mut TestAppContext) {
     let (rt, tmp, _repo) = setup();
     let _guard = rt.enter();
 
+    // header_render uses gpui-component `Button` widgets which read from the
+    // theme global initialized by `gpui_component::init`.
+    cx.update(gpui_component::init);
+
     let (tx, rx) = watch::channel(PollState::Loading);
 
     let window = cx.add_window(|win, cx| {
@@ -93,6 +97,8 @@ async fn file_explorer_renders_without_panic_before_dir_load(cx: &mut TestAppCon
     // doesn't resolve synchronously, so rows stay empty — correct "Loading…" state).
     let (rt, tmp, _repo) = setup();
     let _guard = rt.enter();
+
+    cx.update(gpui_component::init);
 
     let (_tx, rx) = watch::channel(PollState::Loading);
 

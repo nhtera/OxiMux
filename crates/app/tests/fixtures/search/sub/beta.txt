@@ -1,0 +1,2 @@
+struct Foo { name: String }
+FileStatus appears once in this dir too.

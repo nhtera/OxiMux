@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Task, Window, div, px,
+    Task, Window, div,
 };
 use oximux_git::{PollState, Repository, StatusPoller};
 use oximux_settings::{Density, Theme, Typography};
@@ -21,6 +21,7 @@ use crate::shell::file_explorer::FileExplorer;
 use crate::shell::git_panel::GitPanel;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
+use crate::shell::search_panel::SearchPanel;
 
 /// Configuration bundle for `RightSidebar::new_for_test`. Keeps the test
 /// constructor under the 7-argument clippy limit.
@@ -45,6 +46,9 @@ pub struct RightSidebar {
 
     // Explorer panel.
     pub(crate) file_explorer: Entity<FileExplorer>,
+
+    // Search panel (ripgrep-backed).
+    pub(crate) search_panel: Entity<SearchPanel>,
 
     // Poll state mirrored for the status bar (avoids borrowing through entity tree).
     pub latest_poll_state: PollState,
@@ -90,7 +94,7 @@ impl RightSidebar {
         let repo_root = repo.workdir().to_path_buf();
         let file_explorer = cx.new(|cx| {
             FileExplorer::new(
-                repo_root,
+                repo_root.clone(),
                 explorer_rx,
                 theme,
                 density,
@@ -99,6 +103,8 @@ impl RightSidebar {
                 cx,
             )
         });
+        let search_panel = cx
+            .new(|cx| SearchPanel::new(repo_root, theme, density, typography.clone(), window, cx));
 
         let poll_observer = Self::start_poll_observer(bar_rx, cx);
 
@@ -108,6 +114,7 @@ impl RightSidebar {
             git_panel,
             diff_view,
             file_explorer,
+            search_panel,
             latest_poll_state: initial,
             _poller: Some(poller),
             _poll_observer: poll_observer,
@@ -154,7 +161,7 @@ impl RightSidebar {
         let repo_root = repo.workdir().to_path_buf();
         let file_explorer = cx.new(|cx| {
             FileExplorer::new(
-                repo_root,
+                repo_root.clone(),
                 explorer_rx,
                 theme,
                 density,
@@ -163,6 +170,8 @@ impl RightSidebar {
                 cx,
             )
         });
+        let search_panel = cx
+            .new(|cx| SearchPanel::new(repo_root, theme, density, typography.clone(), window, cx));
         let poll_observer = Self::start_poll_observer(bar_rx, cx);
 
         // Simulate repo presence via a live poller when has_repo=true, None otherwise.
@@ -186,6 +195,7 @@ impl RightSidebar {
             git_panel,
             diff_view,
             file_explorer,
+            search_panel,
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -285,11 +295,8 @@ impl Render for RightSidebar {
                 .flex_1()
                 .w_full()
                 .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.fg_muted)
-                .text_size(px(12.))
-                .child("Search — Phase 03")
+                .flex_col()
+                .child(div().flex_1().w_full().child(self.search_panel.clone()))
                 .into_any_element(),
             RightTab::SourceControl => div()
                 // Stack vertically: file list above, diff view below. Phase 04 will

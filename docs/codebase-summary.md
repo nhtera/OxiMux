@@ -75,10 +75,18 @@ src/
     │   ├── row_render.rs   build_row_plan pure helper → RowPlan
     │   └── fs_load.rs      async tokio read_dir; 5s timeout; symlink skip; 12-deep guard
     ├── right_sidebar/
-    │   ├── mod.rs          RightSidebar entity; tab switching; hosts FileExplorer (Explorer tab) + GitPanel+DiffView (SourceControl tab)
+    │   ├── mod.rs          RightSidebar entity; tab switching; hosts FileExplorer (Explorer) + SearchPanel (Search) + GitPanel+DiffView (SourceControl)
     │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl; icon_path() per tab
     │   ├── activity_bar.rs top tab bar (SVG icons) + persistent collapsed rail + PanelRight toggle
     │   └── layout.rs       layout constants
+    ├── search_panel/       SearchPanel entity; ripgrep --json shell-out; debounced + cancellation
+    │   ├── mod.rs          SearchPanel entity; debounce timer; monotonic search-id cancellation
+    │   ├── search_state.rs pure SearchOptions (query, case/word/regex, include/exclude globs)
+    │   ├── rg_runner.rs    async rg subprocess + NDJSON stream parse; per-file cap; rg-missing detection
+    │   ├── rows.rs         pure build_search_rows: interleave file headers + matches; collapse handling
+    │   ├── match_render.rs pure truncate_before (VSCode lcut port) — multi-byte safe
+    │   ├── header_render.rs query input + Aa/ab/.* toggles + include/exclude glob fields + summary banner
+    │   └── result_row.rs   paint file/match rows with highlight span
     ├── git_panel/
     │   ├── mod.rs          GitPanel entity; file-list render
     │   └── changed_files.rs partition helper (staged / unstaged / untracked)
