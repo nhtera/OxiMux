@@ -197,6 +197,14 @@ impl WorkspaceTabs {
 ///
 /// `entity` is captured by per-tab click handlers, the per-tab × button,
 /// and trailing controls so they can mutate state from element closures.
+///
+/// Plus-button placement: sits inline immediately after the last tab so the
+/// affordance reads as "add another tab here", not as a disconnected chrome
+/// control. A `flex_1` spacer between the plus button and pane-actions keeps
+/// "..." pinned at the right edge. When tabs grow past the available width,
+/// the strip's `flex_shrink: 1` + `min_w: 0` causes it to shrink (with
+/// horizontal scroll); the spacer collapses to zero so plus stays anchored
+/// at the right edge of the (shrunken) strip.
 pub fn render_tab_strip(entity: Entity<WorkspaceTabs>, cx: &mut App) -> AnyElement {
     let this = entity.read(cx);
     let theme = this.theme;
@@ -234,8 +242,9 @@ pub fn render_tab_strip(entity: Entity<WorkspaceTabs>, cx: &mut App) -> AnyEleme
         .h_full()
         .min_w(px(0.0))
         .flex_1()
-        .child(div().flex_1().min_w(px(0.0)).h_full().child(strip))
-        .child(plus_button(theme, entity.clone()));
+        .child(strip)
+        .child(plus_button(theme, entity.clone()))
+        .child(div().flex_1().min_w(px(0.0)).h_full());
     // Hide the pane-actions ("...") button when no tabs are open — there is
     // no MainPane to split. The "+" stays so users can open a new terminal.
     if tab_count > 0 {
