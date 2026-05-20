@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-05-19  
-**Phase**: 2 code-complete + right-sidebar Phase 02 (File Explorer) complete
+**Updated**: 2026-05-20  
+**Phase**: 3 — steps 1-4 + CliRuntime done; steps 5-14 pending
 
 ---
 
@@ -17,9 +17,11 @@
 │                → StatusBar (git zone)               │
 ├─────────────────────────────────────────────────────┤
 │  Domain / backend layer                             │
-│  crates/pty   — TerminalBackend + PortablePtyBackend│
-│  crates/git   — Repository, StatusPoller, git ops   │
-│  crates/core  — shared domain types (no deps)       │
+│  crates/pty    — TerminalBackend + PortablePtyBackend│
+│  crates/git    — Repository, StatusPoller, git ops  │
+│  crates/agents — AgentRuntime trait + CliRuntime    │
+│                  CliAgentAdapter + StatusMachine     │
+│  crates/core   — shared domain types (no deps)      │
 ├─────────────────────────────────────────────────────┤
 │  Async runtime                                      │
 │  tokio multi-thread (booted in main.rs before GPUI) │
@@ -123,6 +125,42 @@ WorktreePanel (GPUI entity)
   ← submit_create() → git worktree add + branch create
   ← pending_remove → confirm_dialog gate → git worktree remove
 ```
+
+---
+
+## Agent runtime flow (Phase 3)
+
+```
+CliRuntime (AgentRuntime impl)
+│
+├── Adapter registry: HashMap<AgentAdapter, Arc<dyn CliAgentAdapter>>
+│     registered manually until step-8 detection scan
+│
+├── start_session(id, config)
+│     spawn_blocking → openpty/fork via PortablePtyBackend
+│     optional stdin_seed write (warn if > MAX_SAFE_STDIN_SEED = 4096 bytes)
+│     tokio 50ms poll task
+│       drain TerminalEvent::Output → StatusMachine::feed / tick
+│       on TerminalEvent::Exit    → StatusMachine::note_exit
+│       exits when saw_exit || status_tx.is_closed()
+│     watch::channel<AgentStatus> — cloned to all subscribers (badge / sidebar / dashboard)
+│
+├── send_message(id, text)
+│     spawn_blocking → write bytes to PTY stdin
+│
+├── cancel(id)
+│     spawn_blocking(drain_events + close)
+│     select!{ await poll_handle / sleep(timeout) }
+│       on timeout → poll_handle.abort()
+│     removes session entry (double-cancel returns error)
+│
+└── subscribe_status(id) / current_status(id)
+      brief lock → clone / borrow watch::Receiver
+```
+
+`CustomCommandAdapter` is the escape-hatch `CliAgentAdapter`: reads `AgentSessionConfig::custom_command: Option<(String, Vec<String>)>`; empty `status_patterns()` delegates all state transitions to `StatusMachine` defaults. Useful for one-off CLIs without a dedicated adapter.
+
+Future ACP runtime (v1.1) will be a sibling `AgentRuntime` impl with identical `watch::Receiver<AgentStatus>` contract — UI code subscribes to the trait, not the impl.
 
 ---
 

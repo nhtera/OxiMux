@@ -4,6 +4,43 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-20 — Phase 3 Step 4 + CliRuntime — CustomCommandAdapter + first concrete AgentRuntime
+
+**Status**: step 4 + CliRuntime code complete; 16 new tests, all green (510 workspace total)  
+**Plan**: `plans/reports/cook-260520-1448-phase-03-step04-cli-runtime.md`  
+**Code-review score**: DONE_WITH_CONCERNS — all Critical/High items resolved in-slice
+
+#### What shipped
+
+| File | Role |
+|---|---|
+| `crates/agents/src/cli/custom.rs` | `CustomCommandAdapter` — escape-hatch `CliAgentAdapter`; reads `custom_command: Option<(String, Vec<String>)>` from config; empty `status_patterns()` (StatusMachine defaults handle output→Running / silence→Idle / exit→Done/Failed); always-detects |
+| `crates/agents/src/runtime_impl.rs` | `CliRuntime` — first concrete `AgentRuntime` impl; adapter registry (`HashMap<AgentAdapter, Arc<dyn CliAgentAdapter>>`); per-session `PortablePtyBackend` + 50ms tokio poll task + `watch::channel<AgentStatus>`; `cancel` does `drain_events+close` in `spawn_blocking` then awaits poll handle with timeout+abort |
+| `crates/core/src/lib.rs` | `AgentAdapter::Custom` variant; `#[derive(Hash)]` for registry keying |
+| `crates/agents/src/runtime.rs` | `AgentSessionConfig::custom_command` field; `cancel()` doc notes step-13 SIGTERM-grace deferral |
+
+#### Design notes
+- `CliRuntime` is the canonical `AgentRuntime`. Future ACP runtime (v1.1) will be a sibling impl; both expose identical `watch::Receiver<AgentStatus>` to UI.
+- `StatusPattern` uses `regex::bytes::Regex` — PTY output is not guaranteed UTF-8.
+- `MAX_SAFE_STDIN_SEED = 4096` — soft cap; `warn!` guard on larger seeds.
+- `custom_command` field on `AgentSessionConfig` is acknowledged debt (M1) — step 10 launch dialog refactors to a typed `AdapterConfig` enum.
+
+#### Resolved during review
+- C1: `drain_events()` before `close()` inside `spawn_blocking` — eliminates cancel deadlock
+- H1: `select!{handle / sleep}` + abort on timeout — poll task no longer leaks on cancel timeout
+- H2: `cancel()` doc now explicitly notes step-13 SIGTERM-grace deferral (impl is SIGKILL today)
+- H3: `MAX_SAFE_STDIN_SEED = 4096` warn guard — large seeds won't stall the `spawn_blocking` thread silently
+- M2: test `subscribe_then_cancel_publishes_terminal_status` — UI contract: badge sees final state across cancel
+- M3: test `double_cancel_second_call_errors` — session table is source of truth
+
+#### Known limitations / deferred
+- No natural-exit session-table cleanup — entry stays until `cancel()` called; step 9 (pane integration) owns reaping.
+- SIGTERM-grace dance deferred to step 13; current `cancel()` is SIGKILL (reap-before-resolve honored).
+- No detection registry yet — step 8; until then `register_adapter()` called manually.
+- `pub mod runtime_impl` may expose internals (M4) — tighten to `pub(crate)` if a 2nd internal helper goes pub.
+
+---
+
 ### 2026-05-20 — Phase 3 Foundation (steps 1-3) — Agent Runtime Traits
 
 **Status**: steps 1-3 code complete; 18 new tests, all green (494 workspace total)  

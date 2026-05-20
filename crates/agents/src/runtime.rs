@@ -37,6 +37,11 @@ pub struct AgentSessionConfig {
     /// CLI sees a sane `$COLUMNS`/`$LINES` at first render.
     pub cols: u16,
     pub rows: u16,
+    /// Custom-adapter input: `(program, args)`. Only the `Custom` adapter
+    /// reads this; other adapters hard-code their binary in `build_command`
+    /// and ignore the field. The launch dialog (step 10) populates it when
+    /// the user picks "Custom command".
+    pub custom_command: Option<(String, Vec<String>)>,
 }
 
 /// Multi-consumer status subscription.
@@ -73,6 +78,12 @@ pub trait AgentRuntime: Send + Sync + 'static {
     /// Request graceful shutdown: SIGTERM → 5s grace → SIGKILL. Implementor
     /// MUST guarantee the process tree is reaped (zombie-free) before the
     /// returned future resolves.
+    ///
+    /// Step 4 note: `CliRuntime` currently SIGKILLs directly via
+    /// `portable-pty`'s `killer.kill()`. The SIGTERM-grace dance lands in
+    /// step 13 (zombie prevention). The reap-before-resolve invariant is
+    /// already honored — `close()` joins the watcher thread which only
+    /// exits after `child.wait()`.
     async fn cancel(&self, id: AgentSessionId) -> Result<()>;
 
     /// Subscribe to status updates for one session. `watch` semantics:

@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
 **Updated**: 2026-05-20  
-**Phase**: 3 foundation slice complete (steps 1-3); right-sidebar Phase 03 (Search Panel) complete  
-**Tests**: 494 passed, 0 failed (workspace)
+**Phase**: 3 — steps 1-4 + CliRuntime done; steps 5-14 pending  
+**Tests**: 510 passed, 0 failed (workspace)
 
 ---
 
@@ -145,15 +145,27 @@ src/
 
 ---
 
-## crates/agents — agent runtime (Phase 3 foundation)
+## crates/agents — agent runtime (Phase 3)
 
 ```
 src/
 ├── lib.rs
 ├── runtime.rs          AgentRuntime: Send+Sync+'static async trait (async-trait)
-│                       AgentSessionConfig { adapter, worktree_path, prompt, model, effort, env, cols, rows }
+│                       AgentSessionConfig { adapter, worktree_path, prompt, model, effort, env,
+│                         cols, rows, custom_command: Option<(String, Vec<String>)> }
 │                       AgentStatusStream = watch::Receiver<AgentStatus>
 │                       Methods: start_session / send_message / cancel / subscribe_status / current_status
+│                       cancel() doc: SIGTERM-grace dance deferred to step 13; currently SIGKILL
+├── runtime_impl.rs     CliRuntime — first concrete AgentRuntime impl
+│                       Adapter registry: HashMap<AgentAdapter, Arc<dyn CliAgentAdapter>>
+│                       Per-session state: own PortablePtyBackend behind Arc<Mutex<Box<dyn TerminalBackend>>>
+│                         + tokio 50ms poll task draining PTY events into StatusMachine
+│                         + watch::channel<AgentStatus> (multi-subscriber fan-out to badge / sidebar / dashboard)
+│                       start_session: spawn_blocking(openpty/fork) + optional stdin_seed write
+│                       cancel: spawn_blocking(drain_events+close) → await poll handle;
+│                         select!{sleep/handle} — aborts handle on timeout
+│                       MAX_SAFE_STDIN_SEED = 4096 — soft cap; warn-level guard on larger seeds
+│                       Future ACP runtime (v1.1) will be a sibling impl with identical watch::Receiver surface
 ├── status_machine.rs   StatusMachine: Arc<[StatusPattern]> + 1 KiB ring buffer
 │                       feed(bytes, now) — first-match-wins; fallback Idle→Running on any output
 │                       tick(now) — 5s idle decay (Running→Idle only; blocking/terminal immune)
@@ -161,10 +173,17 @@ src/
 │                       force(status) — manual override; rejects terminal states
 └── cli/
     ├── mod.rs
-    └── adapter.rs      CliAgentAdapter: Send+Sync+'static async trait
-                        CommandSpec { program, args, env, stdin_seed }
-                        StatusPattern { regex::bytes::Regex, target_status } — bytes engine: raw PTY is not guaranteed UTF-8
+    ├── adapter.rs      CliAgentAdapter: Send+Sync+'static async trait
+    │                   CommandSpec { program, args, env, stdin_seed }
+    │                   StatusPattern { regex::bytes::Regex, target_status } — bytes engine: raw PTY not guaranteed UTF-8
+    └── custom.rs       CustomCommandAdapter — escape-hatch CliAgentAdapter impl
+                        Reads custom_command: Option<(String, Vec<String>)> from AgentSessionConfig
+                        status_patterns() intentionally empty — falls through to StatusMachine defaults
+                        (output→Running, 5s silence→Idle, exit→Done/Failed); always-detects
 ```
+
+`crates/core/src/lib.rs`:
+- `AgentAdapter` enum gains `Custom` variant; `#[derive(Hash)]` added for registry keying
 
 `crates/core/src/agent_session.rs` (domain types, zero tokio dep):
 - `AgentSessionId(u64)` — field private; constructed via `new()`, read via `get()`. Unforgeable outside runtime.

@@ -12,7 +12,7 @@
 | 00 | Foundation: workspace, GPUI shell, CI guards | scaffold complete; dogfood pending |
 | 01 | Terminal cockpit: multi-pane PTY, tabs, search, render perf | code complete; dogfood pending |
 | **02** | **Git core: status, diff, stage, commit, stash, worktree UI** | **code complete (steps 1-14); step 15 = dogfood gate** |
-| **03** | **CLI agent integration: Claude Code, Codex, Aider adapters** | **foundation in progress (steps 1-3 done; steps 4-14 pending)** |
+| **03** | **CLI agent integration: Claude Code, Codex, Aider adapters** | **in progress (steps 1-4 + CliRuntime done; steps 5-14 pending)** |
 | 04 | Workspace persistence: SQLite + session restore | pending |
 | 05 | Editor + LSP: gpui-component code editor, file tree, rust-analyzer | pending |
 | 06 | Git review polish: side-by-side diff, blame, conflict UI | pending |
@@ -53,18 +53,23 @@ All 14 implementation steps shipped. Step 15 is the dogfood usage gate.
 
 ## Phase 3 — CLI agent integration (in progress)
 
-Goal: run Claude Code / Codex / Aider inside an OxiMux pane, with status detection (waiting / needs-approval badge).
+Goal: run agent CLIs inside an OxiMux pane, with status detection (waiting / needs-approval badge).
 
-**Foundation (steps 1-3) shipped 2026-05-20:**
+**Steps 1-3 shipped 2026-05-20 (foundation):**
 - `AgentRuntime` async trait + `AgentSessionConfig` + `watch::Receiver` fan-out stream
 - `CliAgentAdapter` async trait + `CommandSpec` + `StatusPattern` (regex::bytes)
 - `StatusMachine`: ring-buffer pattern scan, 5s idle decay, exit/force transitions; 18 tests
 
-**Remaining steps (4-14):**
-- Steps 4-7: concrete adapters (`ClaudeCodeAdapter`, `CodexAdapter`, `AiderAdapter`, custom)
-- Step 8: adapter registry
-- Steps 9-12: GPUI integration (pane badge overlay, `CliRuntime` impl, session lifecycle)
-- Steps 13-14: process hygiene (SIGTERM-grace-SIGKILL), config wiring
+**Step 4 + CliRuntime shipped 2026-05-20:**
+- `CustomCommandAdapter` — escape-hatch adapter; reads `custom_command` from config; empty status patterns fall through to StatusMachine defaults
+- `CliRuntime` — first concrete `AgentRuntime`; per-session PTY + 50ms poll task + `watch::channel`; adapter registry keyed by `AgentAdapter` enum (now `Hash`-derived)
+- 16 new tests (7 custom adapter + 9 runtime_impl); 510 workspace total
+
+**Remaining steps (5-14):**
+- Steps 5-7: concrete adapters (`ClaudeCodeAdapter`, `CodexAdapter`, `AiderAdapter`)
+- Step 8: detection registry (`which $bin` scan at startup)
+- Steps 9-12: GPUI integration (pane badge overlay, session lifecycle, launch dialog)
+- Steps 13-14: process hygiene (SIGTERM-grace-SIGKILL), config wiring (`AdapterConfig` enum)
 
 Blocked on: Phase 2 dogfood gate clearing (runtime steps can proceed in parallel).
 

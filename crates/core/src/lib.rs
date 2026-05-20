@@ -70,11 +70,16 @@ pub struct AgentSession {
     pub adapter: AgentAdapter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentAdapter {
     ClaudeCode,
     Codex,
     Aider,
+    /// Arbitrary shell command launched in a PTY. The program + args travel
+    /// on `AgentSessionConfig::custom_command`; status detection falls back
+    /// to the StatusMachine's Idle/Running/exit-code defaults since there
+    /// is no canonical prompt pattern.
+    Custom,
 }
 
 #[derive(Debug, thiserror::Error)]
