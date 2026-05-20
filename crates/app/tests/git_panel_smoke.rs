@@ -39,6 +39,12 @@ async fn git_panel_constructs_and_renders_without_panic(cx: &mut TestAppContext)
     // and renders the placeholder; that's all the smoke test exercises.
     let (_tx, rx) = watch::channel(PollState::Loading);
 
+    // `gpui_component::vertical_scrollbar` (wired on the panel's inner
+    // scroll region) reads the `gpui_component::Theme` global to colour
+    // its track/thumb. Without this set, rendering panics with
+    // "no state of type gpui_component::theme::Theme exists".
+    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+
     let window = cx.add_window(|_win, cx| {
         GitPanel::new(
             repo,

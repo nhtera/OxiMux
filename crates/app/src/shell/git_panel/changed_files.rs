@@ -3,13 +3,20 @@
 //! Stage / unstage are dispatched via the workspace `StageFile` / `UnstageFile`
 //! actions (Phase 2 step 8 routes them through `GitPanel`'s action handlers).
 
+use crate::shell::file_explorer::file_icon::icon_for_name;
 use crate::shell::git_panel::GitPanel;
+use crate::shell::source_control::style as sc_style;
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled,
-    div, px,
+    ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Styled, div, prelude::FluentBuilder as _, px, svg,
+};
+use gpui_component::{
+    Disableable as _, Icon, IconName, Sizable as _,
+    button::{Button, ButtonVariants as _},
 };
 use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
 use oximux_settings::{Density, Theme, Typography};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Borrowed-slice sectioning of `GitState::files` into Staged / Unstaged /
@@ -77,6 +84,10 @@ pub struct RenderCtx<'a> {
     pub density: Density,
     pub typography: &'a Typography,
     pub selected: Option<&'a Path>,
+    /// Section titles currently collapsed. Borrowed from `GitPanel` for the
+    /// duration of a single render pass — re-reading the entity from `cx`
+    /// during render panics because GPUI already holds a mut borrow.
+    pub collapsed: &'a HashSet<&'static str>,
 }
 
 /// Top-level renderer. Builds the three sections in order; emits a single
@@ -89,26 +100,32 @@ pub fn render_sections(
     if sections.is_empty() {
         return empty_state(rctx).into_any_element();
     }
+    // Order: unstaged first (CHANGES), then staged, then untracked. Mirrors
+    // the common VSCode SCM convention so users edit-then-stage left-to-right.
+    //
+    // No `h_full()` here: the parent scroll container needs this column to
+    // grow to its natural (sum-of-rows) height so `overflow_y_scroll` sees
+    // overflow and actually scrolls. With `h_full()` the column would clamp
+    // to parent height, content clips silently, and the scrollbar never fires.
     div()
         .flex()
         .flex_col()
-        .h_full()
         .child(section(
-            "STAGED",
-            &sections.staged,
-            RowKind::Staged,
-            rctx,
-            cx,
-        ))
-        .child(section(
-            "UNSTAGED",
+            "CHANGES",
             &sections.unstaged,
             RowKind::Unstaged,
             rctx,
             cx,
         ))
         .child(section(
-            "UNTRACKED",
+            "STAGED CHANGES",
+            &sections.staged,
+            RowKind::Staged,
+            rctx,
+            cx,
+        ))
+        .child(section(
+            "UNTRACKED FILES",
             &sections.untracked,
             RowKind::Untracked,
             rctx,
@@ -124,21 +141,100 @@ fn section(
     rctx: &RenderCtx<'_>,
     cx: &mut Context<GitPanel>,
 ) -> impl IntoElement {
-    let mut col = div().flex().flex_col().child(
-        div()
-            .flex()
-            .items_center()
-            .h(px(rctx.density.h_tab))
-            .px(px(rctx.density.pad_panel))
-            .text_size(px(rctx.typography.t_label_caps))
-            .font_weight(rctx.typography.w_semibold)
-            .text_color(rctx.theme.fg_muted)
-            .child(format!("{title} ({})", rows.len())),
-    );
-    for f in rows {
-        col = col.child(row(f, kind, rctx, cx));
+    if rows.is_empty() {
+        return div().into_any_element();
     }
-    col
+    let is_collapsed = rctx.collapsed.contains(&title);
+    let chevron = if is_collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+    let count = rows.len();
+    let theme = rctx.theme;
+    // Stable id required for GPUI hover/click interactivity on raw divs.
+    let header_id = format!("git-section-{title}");
+    let view_all_id = format!("git-view-all-{title}");
+    let header = div()
+        .id(gpui::SharedString::from(header_id))
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .h(px(rctx.density.h_tab))
+        .px(px(sc_style::PAD_H))
+        .rounded(px(rctx.density.r_xs))
+        .text_size(px(sc_style::CAPS_TEXT))
+        .font_weight(rctx.typography.w_semibold)
+        .text_color(rctx.theme.fg_muted)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |panel, _: &MouseDownEvent, _window, cx| {
+                panel.toggle_section(title, cx);
+            }),
+        )
+        .child(Icon::new(chevron).size_3().text_color(rctx.theme.fg_subtle))
+        .child(title.to_string())
+        .child(
+            div()
+                .text_color(rctx.theme.fg_subtle)
+                .child(format!("{count}")),
+        )
+        // Right-aligned "View all" ghost link. Decorative until the multi-diff
+        // opener ships; the tooltip is honest about scope.
+        .child(
+            div().ml_auto().child(
+                Button::new(gpui::SharedString::from(view_all_id))
+                    .ghost()
+                    .xsmall()
+                    .label("View all")
+                    .tooltip("Open all diffs (coming soon)")
+                    .disabled(true)
+                    .on_click(|_: &ClickEvent, _, _| {}),
+            ),
+        );
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .pt(px(rctx.density.pad_panel))
+        .child(header);
+    if !is_collapsed {
+        for f in rows {
+            col = col.child(row(f, kind, rctx, cx));
+        }
+    }
+    col.into_any_element()
+}
+
+/// One status badge per row — `M`/`A`/`D`/`R`/`U`/`C`. The kind argument lets
+/// the staged-side dot fall back to "M" (modified) when the index is
+/// `Unmodified` but the worktree changed (a partial-stage row mirrored into
+/// the Staged section).
+fn status_badge_for(f: &FileStatus, kind: RowKind) -> (&'static str, fn(&Theme) -> gpui::Hsla) {
+    match kind {
+        RowKind::Staged => match f.index {
+            IndexStatus::Added => ("A", |t| t.git.added),
+            IndexStatus::Deleted => ("D", |t| t.git.deleted),
+            IndexStatus::Renamed => ("R", |t| t.git.renamed),
+            IndexStatus::Copied => ("C", |t| t.git.copied),
+            IndexStatus::Modified => ("M", |t| t.git.modified),
+            IndexStatus::Untracked => ("U", |t| t.git.untracked),
+            IndexStatus::Unmerged => ("!", |t| t.status_error),
+            IndexStatus::Ignored => ("I", |t| t.git.ignored),
+            IndexStatus::Unmodified => ("M", |t| t.git.modified),
+        },
+        RowKind::Unstaged => match f.worktree {
+            WorktreeStatus::Deleted => ("D", |t| t.git.deleted),
+            WorktreeStatus::Modified => ("M", |t| t.git.modified),
+            WorktreeStatus::Renamed => ("R", |t| t.git.renamed),
+            WorktreeStatus::Untracked => ("U", |t| t.git.untracked),
+            WorktreeStatus::Unmerged => ("!", |t| t.status_error),
+            WorktreeStatus::Ignored => ("I", |t| t.git.ignored),
+            WorktreeStatus::Unmodified => ("M", |t| t.git.modified),
+        },
+        RowKind::Untracked => ("U", |t| t.git.untracked),
+    }
 }
 
 fn row(
@@ -153,22 +249,75 @@ fn row(
     } else {
         rctx.theme.bg_panel
     };
-    let glyph = match kind {
-        RowKind::Staged => "●",
-        RowKind::Unstaged => "○",
-        RowKind::Untracked => "?",
-    };
+    let theme = rctx.theme;
     let click_path = f.path.clone();
     let click_staged = matches!(kind, RowKind::Staged);
-    let label = f.path.display().to_string();
+
+    let file_name = f
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| f.path.display().to_string());
+    let parent = f
+        .path
+        .parent()
+        .and_then(|p| {
+            let s = p.display().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_default();
+
+    let (badge_text, badge_color_fn) = status_badge_for(f, kind);
+    let badge_color = badge_color_fn(&rctx.theme);
+
+    let icon_el: gpui::AnyElement = match icon_for_name(&file_name) {
+        Some(path) => svg()
+            .path(path)
+            .size(px(14.0))
+            .text_color(badge_color)
+            .into_any_element(),
+        None => Icon::new(IconName::File)
+            .size_3()
+            .text_color(badge_color)
+            .into_any_element(),
+    };
+
+    // Stable id (path + kind) keeps GPUI's hover interactivity working when
+    // the same row exists in both Staged and Unstaged sections after a partial
+    // stage. Without the kind suffix, both rows would share an id and only one
+    // would react to hover.
+    let row_id = format!(
+        "git-row-{}-{}",
+        match kind {
+            RowKind::Staged => "s",
+            RowKind::Unstaged => "u",
+            RowKind::Untracked => "n",
+        },
+        f.path.display()
+    );
+
+    // Hover-only inverse-action icon (— to unstage, + to stage). On hover the
+    // status badge fades out and this icon fades in within the same column —
+    // matches the common SCM convention. The button is a placeholder until
+    // stage/unstage are wired through the panel handlers.
+    let (action_icon_path, action_tooltip) = match kind {
+        RowKind::Staged => ("icons/minus.svg", "Unstage file (coming soon)"),
+        RowKind::Unstaged | RowKind::Untracked => ("icons/plus.svg", "Stage file (coming soon)"),
+    };
+    let action_id = format!("git-row-action-{}", row_id);
+
     div()
+        .id(gpui::SharedString::from(row_id.clone()))
+        .group(gpui::SharedString::from(row_id.clone()))
         .flex()
         .items_center()
-        .h(px(rctx.density.h_row))
-        .px(px(rctx.density.pad_panel))
+        .gap(px(rctx.density.gap_inline))
+        .h(px(rctx.density.h_row + 2.0))
+        .px(px(sc_style::PAD_H))
         .bg(bg)
-        .text_size(px(rctx.typography.t_body_sm))
+        .text_size(px(sc_style::TEXT))
         .text_color(rctx.theme.fg_base)
+        .when(!is_selected, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |panel, _: &MouseDownEvent, _window, cx| {
@@ -176,13 +325,75 @@ fn row(
                 cx.notify();
             }),
         )
+        .child(icon_el)
         .child(
             div()
-                .w(px(14.0))
-                .text_color(rctx.theme.fg_muted)
-                .child(glyph),
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(6.0))
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rctx.theme.fg_base)
+                        .font_weight(rctx.typography.w_medium)
+                        .child(file_name),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .text_size(px(sc_style::META_TEXT))
+                        .text_color(rctx.theme.fg_subtle)
+                        .child(parent),
+                ),
         )
-        .child(div().flex_1().child(label))
+        .child(
+            // Right slot stacks badge + action; group_hover toggles which is
+            // visible. Both occupy the same w(14)×h(row) slot via absolute
+            // positioning so the swap is jitter-free.
+            div()
+                .relative()
+                .w(px(18.0))
+                .h(px(rctx.density.h_row))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(rctx.typography.t_label_caps))
+                        .font_weight(rctx.typography.w_semibold)
+                        .text_color(badge_color)
+                        .group_hover(row_id.clone(), |s| s.invisible())
+                        .child(badge_text),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .invisible()
+                        .group_hover(row_id, |s| s.visible())
+                        .child(
+                            Button::new(gpui::SharedString::from(action_id))
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::default().path(action_icon_path))
+                                .tooltip(action_tooltip)
+                                .disabled(true)
+                                .on_click(|_: &ClickEvent, _, _| {}),
+                        ),
+                ),
+        )
 }
 
 fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
@@ -191,8 +402,9 @@ fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
         .items_center()
         .justify_center()
         .h_full()
-        .p(px(rctx.density.pad_panel))
-        .text_size(px(rctx.typography.t_body_sm))
+        .px(px(sc_style::PAD_H))
+        .py(px(rctx.density.pad_panel))
+        .text_size(px(sc_style::TEXT))
         .text_color(rctx.theme.fg_subtle)
         .child("No changes")
 }

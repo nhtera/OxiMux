@@ -55,6 +55,30 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/whole-word.svg",
         include_bytes!("../assets/icons/whole-word.svg"),
     ),
+    (
+        "icons/sparkles.svg",
+        include_bytes!("../assets/icons/sparkles.svg"),
+    ),
+    (
+        "icons/settings-2.svg",
+        include_bytes!("../assets/icons/settings-2.svg"),
+    ),
+    (
+        "icons/list-tree.svg",
+        include_bytes!("../assets/icons/list-tree.svg"),
+    ),
+    (
+        "icons/circle-help.svg",
+        include_bytes!("../assets/icons/circle-help.svg"),
+    ),
+    (
+        "icons/x.svg",
+        include_bytes!("../assets/icons/x.svg"),
+    ),
+    (
+        "icons/chevron-down.svg",
+        include_bytes!("../assets/icons/chevron-down.svg"),
+    ),
 ];
 
 impl AssetSource for AppAssets {

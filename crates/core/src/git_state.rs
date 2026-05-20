@@ -88,3 +88,23 @@ impl FileStatus {
         !matches!(self.worktree, WorktreeStatus::Unmodified)
     }
 }
+
+/// One row in the commit graph (phase-05). Parsed from a NUL-terminated
+/// `git log -z --pretty=format:<US-joined fields>` record (see
+/// `oximux_git::log` for the exact format string).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    /// Full 40-char SHA.
+    pub oid: String,
+    /// 7-char short SHA.
+    pub short_oid: String,
+    pub subject: String,
+    pub author: String,
+    /// Short author date — e.g. "May 20". Format-locale-stable via
+    /// `GitCmd`'s `LANG=C` and explicit `--date=format-local:%b %d`.
+    pub short_date: String,
+    /// Full commit message body (everything after the subject + blank line).
+    /// Empty string when the commit has no body. Newlines preserved so the
+    /// UI can render paragraphs as written.
+    pub body: String,
+}

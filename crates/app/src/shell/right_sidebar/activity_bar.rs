@@ -45,13 +45,17 @@ fn render_tab_button(
     sidebar: Entity<RightSidebar>,
     theme: Theme,
 ) -> impl IntoElement {
+    // Active tab uses the base foreground rather than the accent ring: the
+    // reference layout treats activity-bar selection as "this is current
+    // chrome", not "this needs attention", so a high-contrast neutral reads
+    // better than a saturated accent.
     let icon_color = if is_active {
-        theme.focus_ring
+        theme.fg_base
     } else {
         theme.fg_muted
     };
     let indicator_color = if is_active {
-        theme.focus_ring
+        theme.fg_base
     } else {
         gpui::transparent_black()
     };
@@ -68,11 +72,14 @@ fn render_tab_button(
         .justify_center()
         .child(icon);
 
-    // 2px bottom-border indicator for the active tab; transparent otherwise.
+    // Active-tab indicator sits 3px above the chrome strip's own bottom
+    // border so the two lines don't visually merge into a doubled rule at
+    // the seam between the top bar and the panel below.
     let indicator = div()
         .w_full()
         .h(ACTIVE_INDICATOR_THICKNESS)
         .bg(indicator_color);
+    let indicator_row = div().w_full().pb(px(3.0)).child(indicator);
 
     div()
         .w(TAB_BUTTON_WIDTH)
@@ -87,5 +94,5 @@ fn render_tab_button(
             },
         )
         .child(inner)
-        .child(indicator)
+        .child(indicator_row)
 }

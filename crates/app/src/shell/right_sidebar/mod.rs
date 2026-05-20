@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Task, Window, div,
+    Task, Window, div, px,
 };
 use oximux_git::{PollState, Repository, StatusPoller};
 use oximux_settings::{Density, Theme, Typography};
@@ -22,6 +22,7 @@ use crate::shell::git_panel::GitPanel;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 use crate::shell::search_panel::SearchPanel;
+use crate::shell::source_control::{PanelConfig, SourceControlPanel};
 
 /// Configuration bundle for `RightSidebar::new_for_test`. Keeps the test
 /// constructor under the 7-argument clippy limit.
@@ -39,10 +40,9 @@ pub struct RightSidebar {
     pub open: bool,
     pub active_tab: RightTab,
 
-    // Source Control sub-panels (unchanged from old GitMount).
-    // `pub(crate)`: tests in this package may read state; external callers should not.
-    pub(crate) git_panel: Entity<GitPanel>,
-    pub(crate) diff_view: Entity<DiffView>,
+    // Source Control: phase-04 composes the file list, diff view, inline
+    // commit area, and (phase-05) commit graph inside one entity.
+    pub(crate) source_control: Entity<SourceControlPanel>,
 
     // Explorer panel.
     pub(crate) file_explorer: Entity<FileExplorer>,
@@ -73,6 +73,7 @@ impl RightSidebar {
         let poller = Arc::new(StatusPoller::spawn(repo.clone()));
         let panel_rx = poller.subscribe();
         let bar_rx = poller.subscribe();
+        let sc_rx = poller.subscribe();
         let explorer_rx = poller.subscribe();
         let initial = poller.current();
 
@@ -87,6 +88,22 @@ impl RightSidebar {
                 theme,
                 density,
                 typography.clone(),
+                cx,
+            )
+        });
+
+        let source_control = cx.new(|cx| {
+            SourceControlPanel::new(
+                PanelConfig {
+                    repo: repo.clone(),
+                    theme,
+                    density,
+                    typography: typography.clone(),
+                },
+                sc_rx,
+                diff_view.clone(),
+                git_panel.clone(),
+                window,
                 cx,
             )
         });
@@ -111,14 +128,34 @@ impl RightSidebar {
         Self {
             open: true,
             active_tab: RightTab::SourceControl,
-            git_panel,
-            diff_view,
+            source_control,
             file_explorer,
             search_panel,
             latest_poll_state: initial,
             _poller: Some(poller),
             _poll_observer: poll_observer,
             theme,
+        }
+    }
+
+    /// Reach into the source-control panel to focus the commit subject input.
+    /// Called from `WorkspaceRoot` when Cmd+K fires.
+    pub fn focus_commit_subject(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = self.source_control.clone();
+        panel.update(cx, |p, cx| p.focus_commit_subject(window, cx));
+    }
+
+    /// Update the status poller's focus gate. `WorkspaceRoot` calls this on
+    /// window activation changes so polling pauses when the user is
+    /// elsewhere and resumes on focus regain.
+    pub fn set_polling_focused(&self, focused: bool) {
+        if let Some(poller) = &self._poller {
+            poller.set_focused(focused);
+            if focused {
+                // Force an immediate poll so the user doesn't stare at stale
+                // status while the 500 ms tick winds down.
+                poller.kick();
+            }
         }
     }
 
@@ -144,6 +181,8 @@ impl RightSidebar {
         let (_bar_tx, bar_rx) = tokio::sync::watch::channel(PollState::Loading);
         // Dead explorer_rx for tests — never ticks.
         let (_explorer_tx, explorer_rx) = tokio::sync::watch::channel(PollState::Loading);
+        // Dead source-control channel — same lifetime as bar.
+        let (_sc_tx, sc_rx) = tokio::sync::watch::channel(PollState::Loading);
         let diff_view =
             cx.new(|cx| DiffView::new(repo.clone(), theme, density, typography.clone(), cx));
         let diff_view_for_panel = diff_view.clone();
@@ -155,6 +194,21 @@ impl RightSidebar {
                 theme,
                 density,
                 typography.clone(),
+                cx,
+            )
+        });
+        let source_control = cx.new(|cx| {
+            SourceControlPanel::new(
+                PanelConfig {
+                    repo: repo.clone(),
+                    theme,
+                    density,
+                    typography: typography.clone(),
+                },
+                sc_rx,
+                diff_view.clone(),
+                git_panel.clone(),
+                window,
                 cx,
             )
         });
@@ -192,8 +246,7 @@ impl RightSidebar {
         Self {
             open: true,
             active_tab: initial_tab,
-            git_panel,
-            diff_view,
+            source_control,
             file_explorer,
             search_panel,
             latest_poll_state: PollState::Loading,
@@ -283,30 +336,62 @@ impl Render for RightSidebar {
         }
 
         // Inline each tab body — avoids Box<dyn IntoElement> (trait not dyn-compatible).
+        //
+        // `min_h(0) + overflow_hidden` on the flex_1 wrappers is load-bearing:
+        // a tab body whose inner content has a large intrinsic height (e.g.
+        // Source Control with an expanded STAGED CHANGES section listing
+        // dozens of rows) would otherwise push past its flex share and bulge
+        // the entire sidebar, hiding the chrome above. Clip here so each
+        // panel's own scroll region (uniform_list, overflow_y_scroll) owns
+        // overflow handling.
         let body = match self.active_tab {
             RightTab::Explorer => div()
                 .flex_1()
+                .min_h(px(0.0))
                 .w_full()
                 .flex()
                 .flex_col()
-                .child(div().flex_1().w_full().child(self.file_explorer.clone()))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .overflow_hidden()
+                        .child(self.file_explorer.clone()),
+                )
                 .into_any_element(),
             RightTab::Search => div()
                 .flex_1()
+                .min_h(px(0.0))
                 .w_full()
                 .flex()
                 .flex_col()
-                .child(div().flex_1().w_full().child(self.search_panel.clone()))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .overflow_hidden()
+                        .child(self.search_panel.clone()),
+                )
                 .into_any_element(),
             RightTab::SourceControl => div()
-                // Stack vertically: file list above, diff view below. Phase 04 will
-                // restructure with inline commit area between them.
                 .flex_1()
+                .min_h(px(0.0))
                 .w_full()
                 .flex()
                 .flex_col()
-                .child(div().flex_1().w_full().child(self.git_panel.clone()))
-                .child(div().flex_1().w_full().child(self.diff_view.clone()))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .overflow_hidden()
+                        .child(self.source_control.clone()),
+                )
                 .into_any_element(),
         };
 

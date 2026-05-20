@@ -41,6 +41,10 @@ pub enum PollState {
 pub struct StatusPoller {
     state_rx: watch::Receiver<PollState>,
     focus_tx: watch::Sender<bool>,
+    /// Bumped by `kick()` to force the poll loop out of `interval.tick()`
+    /// early — used by the focus-regain path so the user sees a fresh
+    /// status without waiting for the next 500 ms tick.
+    kick_tx: watch::Sender<u64>,
     abort: AbortHandle,
 }
 
@@ -57,10 +61,12 @@ impl StatusPoller {
     pub fn spawn_with_interval(repo: Repository, tick: Duration) -> Self {
         let (state_tx, state_rx) = watch::channel::<PollState>(PollState::Loading);
         let (focus_tx, focus_rx) = watch::channel::<bool>(true);
-        let task = tokio::spawn(poll_loop(repo, tick, state_tx, focus_rx));
+        let (kick_tx, kick_rx) = watch::channel::<u64>(0);
+        let task = tokio::spawn(poll_loop(repo, tick, state_tx, focus_rx, kick_rx));
         Self {
             state_rx,
             focus_tx,
+            kick_tx,
             abort: task.abort_handle(),
         }
     }
@@ -80,6 +86,14 @@ impl StatusPoller {
         // send_replace returns the prior value; we don't care about it.
         let _ = self.focus_tx.send_replace(focused);
     }
+
+    /// Force the next status fetch to happen immediately, skipping the
+    /// remaining interval. Used on window focus regain so the user doesn't
+    /// stare at a stale `GitState` while the timer winds down.
+    pub fn kick(&self) {
+        let next = self.kick_tx.borrow().wrapping_add(1);
+        let _ = self.kick_tx.send_replace(next);
+    }
 }
 
 impl Drop for StatusPoller {
@@ -93,6 +107,7 @@ async fn poll_loop(
     tick: Duration,
     state_tx: watch::Sender<PollState>,
     mut focus_rx: watch::Receiver<bool>,
+    mut kick_rx: watch::Receiver<u64>,
 ) {
     let mut interval = tokio::time::interval(tick);
     // Tick semantics: first `.tick()` fires immediately so callers see fresh
@@ -111,57 +126,64 @@ async fn poll_loop(
             }
         }
 
+        // Block until something fires: focus drop, kick, or tick.
         tokio::select! {
             biased;
-            // If focus drops mid-wait, loop back to the gate immediately.
             res = focus_rx.changed() => {
                 if res.is_err() {
                     return;
                 }
                 continue;
             }
-            _ = interval.tick() => {
-                match repo.status().await {
-                    Ok(mut next) => {
-                        consecutive_failures = 0;
-                        // Stable order so `send_if_modified` doesn't emit
-                        // spurious wakeups if git reorders semantically
-                        // identical rows between ticks.
-                        next.files.sort_by(|a, b| a.path.cmp(&b.path));
-                        let _ = state_tx.send_if_modified(|cur| {
-                            // Only suppress when the previous value was an
-                            // identical `Ready` — recovering from Failed or
-                            // Loading must always emit, even if the state
-                            // happens to deep-equal the cached payload.
-                            if let PollState::Ready(prev) = cur
-                                && prev == &next
-                            {
-                                return false;
-                            }
-                            *cur = PollState::Ready(next);
-                            true
-                        });
-                    }
-                    Err(e) => {
-                        consecutive_failures = consecutive_failures.saturating_add(1);
-                        if consecutive_failures < FAILURE_THRESHOLD {
-                            tracing::warn!(error = %e, attempt = consecutive_failures, "git status poll failed");
-                        } else if consecutive_failures == FAILURE_THRESHOLD {
-                            tracing::error!(error = %e, "git status poller giving up — emitting Failed");
-                            let err_for_channel = e.clone();
-                            let _ = state_tx.send_if_modified(|cur| {
-                                // Always transition to Failed at the threshold,
-                                // even if the current value is already Failed
-                                // (different error → still surface).
-                                *cur = PollState::Failed(err_for_channel);
-                                true
-                            });
-                        }
-                        // Past the threshold, stay silent until a success
-                        // resets the counter — avoids log spam.
-                    }
-                }
+            res = kick_rx.changed() => {
+                // kick sender drop is non-fatal — we just stop reacting to kicks.
+                let _ = res;
+                interval.reset();
             }
+            _ = interval.tick() => {}
+        }
+        run_poll_once(&repo, &state_tx, &mut consecutive_failures).await;
+    }
+}
+
+/// Run one `repo.status()` round and publish the result via `state_tx`.
+/// Extracted out of the select loop so kick + tick share the same body.
+async fn run_poll_once(
+    repo: &Repository,
+    state_tx: &watch::Sender<PollState>,
+    consecutive_failures: &mut u32,
+) {
+    match repo.status().await {
+        Ok(mut next) => {
+            *consecutive_failures = 0;
+            // Stable order so `send_if_modified` doesn't emit spurious
+            // wakeups if git reorders semantically identical rows between
+            // ticks.
+            next.files.sort_by(|a, b| a.path.cmp(&b.path));
+            let _ = state_tx.send_if_modified(|cur| {
+                if let PollState::Ready(prev) = cur
+                    && prev == &next
+                {
+                    return false;
+                }
+                *cur = PollState::Ready(next);
+                true
+            });
+        }
+        Err(e) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            if *consecutive_failures < FAILURE_THRESHOLD {
+                tracing::warn!(error = %e, attempt = *consecutive_failures, "git status poll failed");
+            } else if *consecutive_failures == FAILURE_THRESHOLD {
+                tracing::error!(error = %e, "git status poller giving up — emitting Failed");
+                let err_for_channel = e.clone();
+                let _ = state_tx.send_if_modified(|cur| {
+                    *cur = PollState::Failed(err_for_channel);
+                    true
+                });
+            }
+            // Past the threshold, stay silent until a success resets the
+            // counter — avoids log spam.
         }
     }
 }

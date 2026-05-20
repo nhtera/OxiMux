@@ -176,13 +176,24 @@ impl Focusable for DiffView {
 
 impl Render for DiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // When no file is selected, collapse to a zero-height placeholder so
+        // the source-control panel flows directly from the staged-files list
+        // into the commit graph. Earlier builds rendered a full-width
+        // "Select a file to view diff" stripe that wasted vertical space.
+        if matches!(self.state, DiffViewState::Empty) {
+            return div()
+                .track_focus(&self.focus_handle)
+                .on_action(cx.listener(Self::on_expand_diff))
+                .into_any_element();
+        }
+
         let rctx = RenderCtx {
             theme: self.theme,
             density: self.density,
             typography: &self.typography,
         };
         let body = match &self.state {
-            DiffViewState::Empty => empty_state(&rctx).into_any_element(),
+            DiffViewState::Empty => unreachable!("handled above"),
             DiffViewState::Loading { path, .. } => {
                 loading_state(&path.display().to_string(), &rctx).into_any_element()
             }
@@ -207,11 +218,8 @@ impl Render for DiffView {
             .border_l_1()
             .border_color(self.theme.border_inactive)
             .child(body)
+            .into_any_element()
     }
-}
-
-fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
-    centered("Select a file to view diff".to_string(), rctx)
 }
 
 fn loading_state(path: &str, rctx: &RenderCtx<'_>) -> impl IntoElement {

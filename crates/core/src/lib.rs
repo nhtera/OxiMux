@@ -14,7 +14,9 @@ pub use git_diff::{
     DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, LARGE_DIFF_LINE_THRESHOLD,
 };
 pub use git_ops::{BranchInfo, MergeOutcome, StashEntry, StashRef, WorktreeInfo};
-pub use git_state::{FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus};
+pub use git_state::{
+    CommitInfo, FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus,
+};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

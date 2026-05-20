@@ -33,8 +33,8 @@ use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    OpenCommandPalette, OpenPaneActions, OpenQuickOpen, SelectExplorerTab, SelectSearchTab,
-    SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
+    OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenQuickOpen, SelectExplorerTab,
+    SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::{
     command_palette::{PaletteModal, entry::PaletteMode},
@@ -68,6 +68,10 @@ pub struct WorkspaceRoot {
     /// inside WorkspaceTabs — would stay stale until something else notified
     /// us.
     _workspace_tabs_observer: Option<Subscription>,
+    /// Pauses + kicks the StatusPoller when the window loses / regains focus
+    /// (mirrors the standard `document.hasFocus()` gate). Held to keep the
+    /// subscription alive for the lifetime of the workspace.
+    _window_activation_observer: Subscription,
 }
 
 impl WorkspaceRoot {
@@ -89,6 +93,16 @@ impl WorkspaceRoot {
         let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
 
+        // Pause status polling when the window blurs; force an immediate
+        // refresh on focus regain via StatusPoller::kick().
+        let window_activation_observer =
+            cx.observe_window_activation(window, |this, window, cx| {
+                let active = window.is_window_active();
+                if let Some(rs) = &this.right_sidebar {
+                    rs.update(cx, |sidebar, _cx| sidebar.set_polling_focused(active));
+                }
+            });
+
         Self {
             theme,
             density,
@@ -100,6 +114,7 @@ impl WorkspaceRoot {
             pane_actions,
             left_rail_open: true,
             _workspace_tabs_observer: workspace_tabs_observer,
+            _window_activation_observer: window_activation_observer,
         }
     }
 
@@ -351,6 +366,20 @@ impl Render for WorkspaceRoot {
                     }
                 }),
             )
+            .on_action(cx.listener(|this, _: &OpenCommitDialog, window, cx| {
+                // Cmd+K: jump to Source Control tab and focus the inline
+                // commit subject input. Phase 04 replaces the legacy
+                // modal CommitDialog with this inline area.
+                if let Some(rs) = &this.right_sidebar {
+                    rs.update(cx, |s, cx| {
+                        s.select_tab(RightTab::SourceControl, cx);
+                        if !s.open {
+                            s.toggle(cx);
+                        }
+                        s.focus_commit_subject(window, cx);
+                    });
+                }
+            }))
             .child(row)
             // TODO(phase-07): replace 0 with AgentRuntime::active_count().
             .child(status_bar::view(

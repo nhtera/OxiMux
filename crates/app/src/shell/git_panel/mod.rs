@@ -17,13 +17,17 @@ pub mod changed_files;
 use crate::actions::{RevertFile, StageFile, UnstageFile};
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::changed_files::{RenderCtx, partition_files, render_sections};
+use crate::shell::source_control::filter::filter_files;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Task, Window, div, px,
+    Render, ScrollHandle, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
+use gpui_component::scroll::ScrollableElement as _;
+use crate::shell::source_control::style as sc_style;
 use oximux_core::GitState;
 use oximux_git::{PollState, Repository};
 use oximux_settings::{Density, Theme, Typography};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::sync::watch;
 
@@ -47,6 +51,17 @@ pub struct GitPanel {
     theme: Theme,
     density: Density,
     typography: Typography,
+    /// Case-insensitive substring filter applied to `git_state.files` before
+    /// partitioning. Empty string disables filtering. Owner: `SourceControlPanel`
+    /// updates this via `set_filter` as the user types in the filter input.
+    filter_query: String,
+    /// Section names (e.g. "STAGED CHANGES") whose body is currently hidden.
+    /// Toggled by clicking the section header. Default: all expanded.
+    collapsed_sections: HashSet<&'static str>,
+    /// Scroll position for the static sections list. Wired through `track_scroll`
+    /// on the inner overflow region and consumed by `vertical_scrollbar` so the
+    /// thumb actually moves as the user scrolls.
+    scroll_handle: ScrollHandle,
     /// Drop cancels the receiver-watching task (mirrors `_poll_task` /
     /// `_blink_task` lifetime semantics in `TerminalView`).
     _watch_task: Task<()>,
@@ -82,8 +97,30 @@ impl GitPanel {
             theme,
             density,
             typography,
+            filter_query: String::new(),
+            collapsed_sections: HashSet::new(),
+            scroll_handle: ScrollHandle::new(),
             _watch_task: watch_task,
         }
+    }
+
+    /// Update the changed-files filter. Pass the raw input value; empty /
+    /// whitespace-only disables filtering. Caller `cx.notify`-ing is the
+    /// usual path because GitPanel itself isn't tracked by the input.
+    pub fn set_filter(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.filter_query != query {
+            self.filter_query = query;
+            cx.notify();
+        }
+    }
+
+    /// Toggle a section's collapsed state. `name` matches the section title
+    /// passed to `render_sections` (e.g. "STAGED CHANGES").
+    pub(crate) fn toggle_section(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        if !self.collapsed_sections.remove(name) {
+            self.collapsed_sections.insert(name);
+        }
+        cx.notify();
     }
 
     /// Update the highlighted row and route to the sibling `DiffView` when
@@ -180,18 +217,48 @@ impl Render for GitPanel {
                     .into_any_element()
             }
             (_, Some(state)) => {
-                let sections = partition_files(&state.files);
+                // Filter first, then partition. `filter_files` returns
+                // borrowed slices; we clone to an owned Vec so partition's
+                // `&[FileStatus]` signature stays unchanged. Cost is trivial
+                // at the row counts a working tree produces.
+                let filtered: Vec<oximux_core::FileStatus> =
+                    filter_files(&state.files, &self.filter_query)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                let sections = partition_files(&filtered);
                 let rctx = RenderCtx {
                     theme: self.theme,
                     density: self.density,
                     typography: &self.typography,
                     selected: self.selected.as_ref().map(|(p, _)| p.as_path()),
+                    collapsed: &self.collapsed_sections,
                 };
                 render_sections(&sections, &rctx, cx).into_any_element()
             }
             (_, None) => placeholder_state("Loading…", self.theme, self.density, &self.typography)
                 .into_any_element(),
         };
+
+        // Inner scroll region: stateful (id required for `overflow_y_scroll`)
+        // with `flex_1 + min_h(0)` so the sections column can shrink below its
+        // intrinsic height. Without these, an expanded STAGED CHANGES section
+        // (dozens of rows) overflows the flex chain and pushes the rest of the
+        // Source Control panel — and the chrome above it — off-screen.
+        //
+        // `relative()` anchors the gpui-component vertical scrollbar overlay;
+        // `track_scroll` + `vertical_scrollbar` share `scroll_handle` so the
+        // thumb mirrors the user's wheel/drag position.
+        let scroll_body = div()
+            .id("git-panel-scroll")
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
+            .child(body)
+            .vertical_scrollbar(&self.scroll_handle);
 
         div()
             .track_focus(&self.focus_handle)
@@ -202,10 +269,12 @@ impl Render for GitPanel {
             .flex_col()
             .h_full()
             .w_full()
+            .min_h(px(0.0))
+            .overflow_hidden()
             .bg(self.theme.bg_panel)
             .border_l_1()
             .border_color(self.theme.border_inactive)
-            .child(body)
+            .child(scroll_body)
     }
 }
 
@@ -215,7 +284,7 @@ fn placeholder_state(
     msg: &str,
     theme: Theme,
     density: Density,
-    typography: &Typography,
+    _typography: &Typography,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -223,7 +292,7 @@ fn placeholder_state(
         .justify_center()
         .h_full()
         .p(px(density.pad_panel))
-        .text_size(px(typography.t_body_sm))
+        .text_size(px(sc_style::TEXT))
         .text_color(theme.fg_subtle)
         .child(msg.to_string())
 }

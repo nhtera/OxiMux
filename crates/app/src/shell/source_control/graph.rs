@@ -1,0 +1,630 @@
+//! Commit-graph panel (flat recent commits list, no DAG drawing for v1).
+//!
+//! Loads `Repository::log_recent(20)` on mount; "Load more" extends in
+//! 20-row chunks. State machine: `Loading → Ready | Failed`.
+
+use gpui::{
+    ClickEvent, Context, ElementId, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Task,
+    UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
+};
+use gpui_component::{
+    Disableable as _, Icon, IconName, Sizable as _,
+    button::{Button, ButtonVariants},
+    tooltip::Tooltip,
+};
+use oximux_core::CommitInfo;
+use oximux_git::{GitError, Repository};
+use oximux_settings::{Density, Theme, Typography};
+use tokio::sync::oneshot;
+
+use crate::shell::source_control::style as sc_style;
+
+const PAGE_SIZE: u32 = 20;
+
+#[derive(Debug, Clone)]
+enum GraphState {
+    Loading,
+    Ready {
+        commits: Vec<CommitInfo>,
+        can_load_more: bool,
+        loading_more: bool,
+        /// Stale-while-revalidate flag: a page-0 fetch is in-flight but the
+        /// previously loaded `commits` are still rendered. Lets the list,
+        /// count badge, and load-more link stay visible while the refresh
+        /// resolves, so the section never collapses to a placeholder and
+        /// then re-expands under the user.
+        refreshing: bool,
+    },
+    Failed(String),
+}
+
+pub struct CommitGraph {
+    repo: Repository,
+    state: GraphState,
+    collapsed: bool,
+    scroll: UniformListScrollHandle,
+    theme: Theme,
+    density: Density,
+    typography: Typography,
+    _load_task: Option<Task<()>>,
+}
+
+impl CommitGraph {
+    pub fn new(
+        repo: Repository,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut graph = Self {
+            repo,
+            state: GraphState::Loading,
+            collapsed: false,
+            scroll: UniformListScrollHandle::new(),
+            theme,
+            density,
+            typography,
+            _load_task: None,
+        };
+        graph.spawn_load_initial(cx);
+        graph
+    }
+
+    /// Refresh the graph (e.g. after a successful commit). When data is
+    /// already loaded, runs in stale-while-revalidate mode: the previous
+    /// commits stay painted and only the refresh button flips to its
+    /// loading spinner. When no data is loaded yet (initial mount, prior
+    /// failure), falls back to the full Loading placeholder.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        match &mut self.state {
+            GraphState::Ready { refreshing, .. } => {
+                if *refreshing {
+                    return;
+                }
+                *refreshing = true;
+            }
+            _ => {
+                self.state = GraphState::Loading;
+            }
+        }
+        self.spawn_load_initial(cx);
+        cx.notify();
+    }
+
+    /// Toggle the section open/closed. Called from the header chevron.
+    fn toggle_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.collapsed = !self.collapsed;
+        cx.notify();
+    }
+
+    fn spawn_load_initial(&mut self, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<Result<Vec<CommitInfo>, GitError>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let r = repo.log_recent(PAGE_SIZE).await;
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::source_control::graph",
+                    "no tokio runtime; commit graph stays in Loading state"
+                );
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            let _ = this.update(cx, |g, cx| {
+                g.state = match result {
+                    Ok(commits) => GraphState::Ready {
+                        can_load_more: commits.len() == PAGE_SIZE as usize,
+                        commits,
+                        loading_more: false,
+                        refreshing: false,
+                    },
+                    Err(e) => GraphState::Failed(e.to_string()),
+                };
+                cx.notify();
+            });
+        });
+        self._load_task = Some(task);
+    }
+
+    fn load_more(&mut self, cx: &mut Context<Self>) {
+        // Read the offset and flip `loading_more` in-place. The earlier
+        // implementation used `std::mem::take(commits)` which left an empty
+        // Vec inside the state for the duration of the async fetch — the
+        // intervening render then hit the `commits.is_empty()` arm and
+        // showed "No commits yet" + a "GRAPH 0 +" header before the new
+        // page resolved. Keeping the previous list intact eliminates that
+        // flash entirely.
+        let offset = match &mut self.state {
+            GraphState::Ready {
+                commits,
+                loading_more,
+                refreshing,
+                ..
+            } if !*loading_more && !*refreshing => {
+                *loading_more = true;
+                commits.len() as u32
+            }
+            _ => return,
+        };
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<Result<Vec<CommitInfo>, GitError>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let r = repo.log_page(offset, PAGE_SIZE).await;
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                if let GraphState::Ready { loading_more, .. } = &mut self.state {
+                    *loading_more = false;
+                }
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            let _ = this.update(cx, |g, cx| {
+                if let GraphState::Ready {
+                    commits,
+                    can_load_more,
+                    loading_more,
+                    ..
+                } = &mut g.state
+                {
+                    *loading_more = false;
+                    match result {
+                        Ok(mut more) => {
+                            *can_load_more = more.len() == PAGE_SIZE as usize;
+                            commits.append(&mut more);
+                        }
+                        Err(e) => {
+                            g.state = GraphState::Failed(e.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._load_task = Some(task);
+    }
+}
+
+impl Render for CommitGraph {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = &self.typography;
+
+        let (count_label, can_load_more_flag, is_refreshing) = match &self.state {
+            GraphState::Ready {
+                commits,
+                can_load_more,
+                refreshing,
+                ..
+            } => (
+                format!("{}", commits.len()),
+                *can_load_more,
+                *refreshing,
+            ),
+            // Initial load (no data yet) — keep the header count placeholder
+            // muted so the user sees the section is still resolving.
+            _ => ("…".to_string(), false, false),
+        };
+        let is_initial_loading = matches!(self.state, GraphState::Loading);
+
+        // Right-aligned cluster: a (?) help button (wires up when a refs-help
+        // popover ships) plus a refresh button that reloads the page-0 commit
+        // list immediately.
+        let header_actions = div()
+            .ml_auto()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .child(
+                Button::new("graph-help")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::default()
+                            .path("icons/circle-help.svg")
+                            .size(px(sc_style::ICON)),
+                    )
+                    .tooltip("What are graph refs? (coming soon)")
+                    .disabled(true),
+            )
+            .child(
+                Button::new("graph-refresh")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::default()
+                            .path("icons/refresh-cw.svg")
+                            .size(px(sc_style::ICON)),
+                    )
+                    // `.loading(true)` swaps the icon for the upstream
+                    // spinner and short-circuits clicks, so a second refresh
+                    // tap during an in-flight fetch is a no-op without us
+                    // wiring extra guards in `on_click`. Pair with the SWR
+                    // flag so the visual feedback only kicks in while a
+                    // fetch is actually outstanding.
+                    .loading(is_refreshing || is_initial_loading)
+                    .tooltip(if is_refreshing {
+                        "Refreshing…"
+                    } else {
+                        "Refresh graph"
+                    })
+                    .on_click(cx.listener(|graph, _: &ClickEvent, _window, cx| {
+                        graph.refresh(cx);
+                    })),
+            );
+
+        // Header sizing mirrors the reference: text-xs (12px) uppercase
+        // semibold with a 14px chevron, count rendered at 11px tabular nums
+        // so digits don't jitter as commit count grows. The label cluster
+        // (chevron + GRAPH + count) shares one click target that toggles the
+        // section open/closed; the right-side icon buttons stay as their own
+        // independent clickable controls.
+        let chevron_icon = if self.collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        let toggle_label = div()
+            .id("graph-header-toggle")
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .hover(|s| s.text_color(theme.fg_base))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|graph, _: &MouseDownEvent, _window, cx| {
+                    graph.toggle_collapsed(cx);
+                }),
+            )
+            .child(
+                Icon::new(chevron_icon)
+                    .size(px(sc_style::ICON))
+                    .text_color(theme.fg_subtle),
+            )
+            .child("GRAPH")
+            .child(
+                div()
+                    .text_size(px(sc_style::META_TEXT))
+                    .text_color(theme.fg_subtle)
+                    .child(count_label),
+            )
+            .child(if can_load_more_flag {
+                div()
+                    .text_size(px(sc_style::META_TEXT))
+                    .text_color(theme.fg_subtle)
+                    .child("+")
+            } else {
+                div()
+            });
+
+        let header = div()
+            .flex()
+            .items_center()
+            .h(px(density.h_tab))
+            .px(px(sc_style::PAD_H))
+            .text_size(px(sc_style::TEXT))
+            .font_weight(typography.w_semibold)
+            .text_color(theme.fg_muted)
+            .child(toggle_label)
+            .child(header_actions);
+
+        let body = match &self.state {
+            // Initial-load placeholder matches the eventual `uniform_list`
+            // height (240px) so the section doesn't pop taller when the
+            // first page resolves. Refresh never enters this arm — see
+            // `refresh()` for the stale-while-revalidate path that keeps
+            // the existing list painted.
+            GraphState::Loading => {
+                placeholder_sized("Loading commits…", 240.0, theme, density, typography)
+                    .into_any_element()
+            }
+            GraphState::Failed(e) => {
+                placeholder(&format!("git log failed: {e}"), theme, density, typography)
+                    .into_any_element()
+            }
+            GraphState::Ready { commits, .. } if commits.is_empty() => {
+                placeholder("No commits yet", theme, density, typography).into_any_element()
+            }
+            GraphState::Ready { commits, .. } => {
+                let commits = commits.clone();
+                let theme_cap = theme;
+                let typography_cap = self.typography.clone();
+                let density_cap = self.density;
+                uniform_list(
+                    "commit-graph-list",
+                    commits.len(),
+                    move |range, _window, _cx| {
+                        let mut rows = Vec::with_capacity(range.len());
+                        for ix in range {
+                            if let Some(c) = commits.get(ix) {
+                                rows.push(render_commit_row(
+                                    c,
+                                    theme_cap,
+                                    density_cap,
+                                    &typography_cap,
+                                ));
+                            }
+                        }
+                        rows
+                    },
+                )
+                .h(px(240.0))
+                .track_scroll(&self.scroll)
+                .into_any_element()
+            }
+        };
+
+        // Subtle text-link "Load more" rather than a chunky ghost button —
+        // the reference layout treats pagination as low-priority chrome that
+        // shouldn't compete with the commit rows above it.
+        let load_more = match &self.state {
+            GraphState::Ready {
+                can_load_more: true,
+                loading_more,
+                ..
+            } => {
+                let is_loading = *loading_more;
+                Some(
+                    div()
+                        .id("graph-load-more")
+                        .flex()
+                        .justify_center()
+                        .py(px(sc_style::PAD_V_TIGHT))
+                        .text_size(px(sc_style::META_TEXT))
+                        .text_color(theme.fg_subtle)
+                        .when(!is_loading, |s| {
+                            s.cursor_pointer()
+                                .hover(|s| s.text_color(theme.fg_base))
+                        })
+                        .when(!is_loading, |s| {
+                            s.on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|graph, _: &MouseDownEvent, _window, cx| {
+                                    graph.load_more(cx);
+                                    cx.notify();
+                                }),
+                            )
+                        })
+                        .child(if is_loading { "Loading…" } else { "Load more" }),
+                )
+            }
+            _ => None,
+        };
+
+        // `flex_shrink_0` keeps the graph at its natural height even when the
+        // file list above grows — the section stays pinned to the bottom of
+        // the panel rather than getting squeezed away by flex pressure.
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
+            .bg(theme.bg_panel)
+            .child(header);
+        if !self.collapsed {
+            col = col.child(body);
+            if let Some(lm) = load_more {
+                col = col.child(lm);
+            }
+        }
+        col
+    }
+}
+
+fn render_commit_row(
+    c: &CommitInfo,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> gpui::AnyElement {
+    // Single-line row: dot + subject (truncates) + author + date + short sha.
+    // Reference layout collapses the v1 two-line "subject / author • date"
+    // into one tight row so 20+ commits stay scannable inside the sidebar.
+    //
+    // The timeline column stacks a connector line above the dot and another
+    // below it, so consecutive rows draw an unbroken vertical line through
+    // the dot centers (the canonical commit-graph spine).
+    let timeline = div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .w(px(14.0))
+        .h_full()
+        .child(div().w(px(1.0)).flex_1().bg(theme.border_inactive))
+        .child(
+            div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_full()
+                .bg(theme.focus_ring),
+        )
+        .child(div().w(px(1.0)).flex_1().bg(theme.border_inactive));
+
+    // Subject flex-grows but truncates. `w_full` on the outer row gives the
+    // `flex_1` child a definite width to shrink against; without it taffy
+    // hands the row its intrinsic (content) width and truncation never
+    // engages — the long subject paints past the panel's right edge.
+    let subject = div()
+        .flex_1()
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(px(sc_style::TEXT))
+        .text_color(theme.fg_base)
+        .child(c.subject.clone());
+
+    // Author capped to ~88px so a long display name can't crowd out the
+    // subject column. Date and SHA stay shrink-0 because they're naturally
+    // short and always need to be readable.
+    let author = div()
+        .flex_shrink()
+        .min_w(px(0.0))
+        .max_w(px(88.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(px(sc_style::META_TEXT))
+        .text_color(theme.fg_subtle)
+        .child(c.author.clone());
+
+    let date = div()
+        .flex_shrink_0()
+        .text_size(px(sc_style::META_TEXT))
+        .text_color(theme.fg_subtle)
+        .child(c.short_date.clone());
+
+    // Short OID rendered in the typography mono face at 10px to match the
+    // reference — the smaller monospaced rendering keeps the hash readable
+    // without competing visually with the subject/author meta.
+    let sha = div()
+        .flex_shrink_0()
+        .text_size(px(10.0))
+        .font_family(typography.family_mono.clone())
+        .text_color(theme.fg_subtle)
+        .child(c.short_oid.clone());
+
+    // Row has an explicit height so the timeline's flex_1 connector lines
+    // have a definite parent height to distribute into. Without `h(…)` the
+    // row collapses to text line-height and the connector lines shrink to a
+    // near-invisible 2-3 px each.
+    //
+    // The hover tooltip surfaces the full subject (no truncation) and the
+    // commit body, so a contributor can read the whole message without
+    // checking out the commit. Captures are cheap `SharedString` clones.
+    let tip_subject: SharedString = c.subject.clone().into();
+    let tip_body: SharedString = c.body.clone().into();
+    let tip_theme = theme;
+    let tip_typography = typography.clone();
+
+    // Row carries an `.id(...)` so the tooltip can attach: `.tooltip(...)`
+    // lives on `StatefulInteractiveElement`, which div only implements
+    // after an id is set. The short OID is unique per commit, so a
+    // per-row id is both stable across renders and collision-free.
+    let row_id = ElementId::Name(format!("graph-commit-{}", c.short_oid).into());
+
+    div()
+        .id(row_id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .px(px(sc_style::PAD_H))
+        .h(px(sc_style::COMMIT_ROW_H))
+        .w_full()
+        .overflow_hidden()
+        .child(timeline.self_stretch())
+        .child(subject)
+        .child(author)
+        .child(date)
+        .child(sha)
+        .tooltip(move |window, cx| {
+            let subject = tip_subject.clone();
+            let body = tip_body.clone();
+            let theme = tip_theme;
+            let typography = tip_typography.clone();
+            Tooltip::element(move |_window, _cx| {
+                render_commit_tooltip(
+                    subject.clone(),
+                    body.clone(),
+                    theme,
+                    typography.clone(),
+                )
+            })
+            .build(window, cx)
+        })
+        .into_any_element()
+}
+
+/// Build the multi-line tooltip body shown on commit-row hover. Subject sits
+/// on its own as the title; the commit body — when present — renders below
+/// it with the original line breaks preserved. Width is capped so long
+/// subjects wrap instead of stretching the popover across the workspace.
+fn render_commit_tooltip(
+    subject: SharedString,
+    body: SharedString,
+    theme: Theme,
+    typography: Typography,
+) -> impl IntoElement {
+    // Width cap chosen so a typical 60-column body wraps once or twice
+    // rather than producing a single very wide line.
+    let max_width = px(440.0);
+
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .max_w(max_width)
+        .text_size(px(sc_style::TEXT))
+        .text_color(theme.fg_base)
+        .child(
+            div()
+                .font_weight(typography.w_semibold)
+                .child(subject),
+        );
+
+    if !body.is_empty() {
+        // GPUI's text element doesn't split on `\n` itself, so we emit one
+        // child per body line and substitute a small spacer for blank lines.
+        // This preserves the original paragraph structure of the commit
+        // message (bullet lists, code-block-style indents, footer trailers).
+        let mut body_col = div()
+            .flex()
+            .flex_col()
+            .pt(px(sc_style::PAD_V_TIGHT))
+            .text_color(theme.fg_muted);
+        for line in body.lines() {
+            if line.is_empty() {
+                body_col = body_col.child(div().h(px(6.0)));
+            } else {
+                body_col = body_col.child(div().child(line.to_string()));
+            }
+        }
+        col = col.child(body_col);
+    }
+    col
+}
+
+fn placeholder(
+    msg: &str,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    placeholder_sized(msg, 80.0, theme, density, typography)
+}
+
+/// Variant of `placeholder` with a caller-controlled height. Used by the
+/// initial-load arm so the placeholder matches the eventual list height and
+/// the section doesn't visibly resize when commits arrive.
+fn placeholder_sized(
+    msg: &str,
+    height_px: f32,
+    theme: Theme,
+    density: Density,
+    _typography: &Typography,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(density.pad_panel))
+        .h(px(height_px))
+        .text_size(px(sc_style::TEXT))
+        .text_color(theme.fg_subtle)
+        .child(msg.to_string())
+}
