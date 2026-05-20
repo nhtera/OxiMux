@@ -4,6 +4,34 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-20 — Phase 3 Foundation (steps 1-3) — Agent Runtime Traits
+
+**Status**: steps 1-3 code complete; 18 new tests, all green (494 workspace total)  
+**Plan**: `plans/reports/cook-260520-1242-phase-03-foundation.md`  
+**Code-review score**: 7/10 — all High/Medium items resolved in-slice
+
+#### What shipped
+
+| File | Role |
+|---|---|
+| `crates/core/src/agent_session.rs` | `AgentSessionId(u64)` newtype (private field); `AgentStatus` enum (6 variants); `is_blocking()` / `is_terminal()` helpers |
+| `crates/agents/src/runtime.rs` | `AgentRuntime` async trait (`async-trait`); `AgentSessionConfig`; `AgentStatusStream = watch::Receiver<AgentStatus>` (multi-subscriber fan-out) |
+| `crates/agents/src/cli/adapter.rs` | `CliAgentAdapter` async trait; `CommandSpec`; `StatusPattern` (regex::bytes — raw PTY is not guaranteed UTF-8) |
+| `crates/agents/src/status_machine.rs` | `StatusMachine`: 1 KiB ring buffer; `feed` / `tick` (5s idle decay) / `note_exit` / `force`; 18 unit tests |
+
+#### Resolved during review
+- H1: replaced `mpsc::Receiver` with `watch::Receiver` — multi-subscriber fan-out for badge + sidebar + dashboard
+- H2: ring cleared on blocking-entry transition — stale bytes can't re-match after state clears
+- M2: `AgentSessionId` field made private; forgery prevented
+- L1: `force()` now rejects terminal states
+
+#### Known limitations / deferred
+- No concrete adapter yet — steps 4-7 downstream. Trait surface logic-tested only.
+- `current_status()` returns `anyhow::Result`; typed `AgentError` deferred to Phase 4.
+- Pre-existing `cargo fmt` drift in `crates/app` (not regressed here); needs a cleanup slice.
+
+---
+
 ### 2026-05-20 — Right-Sidebar Phase 03 — Search Panel
 
 **Status**: code complete; 476 workspace tests passing (0 failed)

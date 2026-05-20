@@ -6,10 +6,12 @@
 //!
 //! Phase 0: skeleton only. Real types land in Phase 1+ as call sites need them.
 
+pub mod agent_session;
 pub mod git_diff;
 pub mod git_ops;
 pub mod git_state;
 
+pub use agent_session::{AgentSessionId, AgentStatus};
 pub use git_diff::{
     DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, LARGE_DIFF_LINE_THRESHOLD,
 };

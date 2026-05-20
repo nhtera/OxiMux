@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-05-19  
-**Phase**: 2 code-complete + right-sidebar Phase 02 (File Explorer) complete  
-**Tests**: 439 passed, 0 failed (workspace)
+**Updated**: 2026-05-20  
+**Phase**: 3 foundation slice complete (steps 1-3); right-sidebar Phase 03 (Search Panel) complete  
+**Tests**: 494 passed, 0 failed (workspace)
 
 ---
 
@@ -17,7 +17,7 @@ oximux/
     ├── core/               domain types with zero tokio/GPUI deps
     ├── pty/                portable-pty + alacritty_terminal backend
     ├── git/                git CLI wrappers, poller, diff parser
-    ├── agents/             AgentRuntime trait skeleton (Phase 3)
+    ├── agents/             AgentRuntime async trait + CliAgentAdapter + StatusMachine (Phase 3 foundation)
     ├── editor/             gpui-component editor stub (Phase 5)
     ├── storage/            SQLite stub (Phase 4)
     └── settings/           TOML config, theme tokens, typography
@@ -142,6 +142,34 @@ src/
 │                   parse_unified_diff (sync pure fn)
 └── git_ops.rs      StageOp, MergeOutcome, MergeResult
 ```
+
+---
+
+## crates/agents — agent runtime (Phase 3 foundation)
+
+```
+src/
+├── lib.rs
+├── runtime.rs          AgentRuntime: Send+Sync+'static async trait (async-trait)
+│                       AgentSessionConfig { adapter, worktree_path, prompt, model, effort, env, cols, rows }
+│                       AgentStatusStream = watch::Receiver<AgentStatus>
+│                       Methods: start_session / send_message / cancel / subscribe_status / current_status
+├── status_machine.rs   StatusMachine: Arc<[StatusPattern]> + 1 KiB ring buffer
+│                       feed(bytes, now) — first-match-wins; fallback Idle→Running on any output
+│                       tick(now) — 5s idle decay (Running→Idle only; blocking/terminal immune)
+│                       note_exit(code) — idempotent terminal transition
+│                       force(status) — manual override; rejects terminal states
+└── cli/
+    ├── mod.rs
+    └── adapter.rs      CliAgentAdapter: Send+Sync+'static async trait
+                        CommandSpec { program, args, env, stdin_seed }
+                        StatusPattern { regex::bytes::Regex, target_status } — bytes engine: raw PTY is not guaranteed UTF-8
+```
+
+`crates/core/src/agent_session.rs` (domain types, zero tokio dep):
+- `AgentSessionId(u64)` — field private; constructed via `new()`, read via `get()`. Unforgeable outside runtime.
+- `AgentStatus` enum: `Idle | Running | WaitingForInput | NeedsApproval(String) | Done { code } | Failed(String)`
+- Helpers: `is_blocking()`, `is_terminal()`
 
 ---
 

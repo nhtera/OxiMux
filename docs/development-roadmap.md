@@ -1,6 +1,6 @@
 # OxiMux — Development Roadmap
 
-**Updated**: 2026-05-19  
+**Updated**: 2026-05-20  
 **Gate rule**: each phase ships only after ≥7 consecutive daily-driver days with zero panics (ADR-003). Tests-passing alone is not sufficient.
 
 ---
@@ -12,7 +12,7 @@
 | 00 | Foundation: workspace, GPUI shell, CI guards | scaffold complete; dogfood pending |
 | 01 | Terminal cockpit: multi-pane PTY, tabs, search, render perf | code complete; dogfood pending |
 | **02** | **Git core: status, diff, stage, commit, stash, worktree UI** | **code complete (steps 1-14); step 15 = dogfood gate** |
-| 03 | CLI agent integration: Claude Code, Codex, Aider adapters | pending |
+| **03** | **CLI agent integration: Claude Code, Codex, Aider adapters** | **foundation in progress (steps 1-3 done; steps 4-14 pending)** |
 | 04 | Workspace persistence: SQLite + session restore | pending |
 | 05 | Editor + LSP: gpui-component code editor, file tree, rust-analyzer | pending |
 | 06 | Git review polish: side-by-side diff, blame, conflict UI | pending |
@@ -51,17 +51,22 @@ All 14 implementation steps shipped. Step 15 is the dogfood usage gate.
 
 ---
 
-## Phase 3 preview — CLI agent integration
+## Phase 3 — CLI agent integration (in progress)
 
 Goal: run Claude Code / Codex / Aider inside an OxiMux pane, with status detection (waiting / needs-approval badge).
 
-Key work:
-- `crates/agents/` `AgentRuntime` trait implementation
-- Adapter per tool: `ClaudeCodeAdapter`, `CodexAdapter`, `AiderAdapter`
-- Agent status heuristics (PTY output pattern matching)
-- Pane badge overlay (waiting / needs-approval / running)
+**Foundation (steps 1-3) shipped 2026-05-20:**
+- `AgentRuntime` async trait + `AgentSessionConfig` + `watch::Receiver` fan-out stream
+- `CliAgentAdapter` async trait + `CommandSpec` + `StatusPattern` (regex::bytes)
+- `StatusMachine`: ring-buffer pattern scan, 5s idle decay, exit/force transitions; 18 tests
 
-Blocked on: Phase 2 dogfood gate clearing.
+**Remaining steps (4-14):**
+- Steps 4-7: concrete adapters (`ClaudeCodeAdapter`, `CodexAdapter`, `AiderAdapter`, custom)
+- Step 8: adapter registry
+- Steps 9-12: GPUI integration (pane badge overlay, `CliRuntime` impl, session lifecycle)
+- Steps 13-14: process hygiene (SIGTERM-grace-SIGKILL), config wiring
+
+Blocked on: Phase 2 dogfood gate clearing (runtime steps can proceed in parallel).
 
 ---
 
