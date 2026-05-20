@@ -109,12 +109,19 @@ impl AdapterPicker {
     /// Toggle-aware open: a second click on the `+` button closes the
     /// popover instead of being a no-op. Callers (WorkspaceRoot's
     /// `RequestOpenAdapterPicker` handler) hit this on every dispatch.
+    ///
+    /// `left_anchor_px` is the desired left edge in window coordinates.
+    /// Clamped to `[0, viewport_w - MENU_WIDTH]` so the popover never
+    /// overflows past the right edge when many tabs push the `+` button
+    /// near the window's right side.
     pub fn open(&mut self, left_anchor_px: f32, window: &mut Window, cx: &mut Context<Self>) {
         if self.open {
             self.close(cx);
             return;
         }
-        self.left_anchor_px = left_anchor_px;
+        let viewport_w = f32::from(window.viewport_size().width);
+        let max_left = (viewport_w - MENU_WIDTH).max(0.0);
+        self.left_anchor_px = left_anchor_px.clamp(0.0, max_left);
         self.open = true;
         cx.notify();
         self.refresh_if_needed(window, cx);
@@ -523,5 +530,46 @@ mod tests {
         let entries: Vec<RegistryEntry> = Vec::new();
         let visible = render_rows(&entries);
         assert!(visible.is_empty());
+    }
+
+    /// Helper mirroring the clamp expression inside `open()` so the
+    /// math can be exercised without a real `Window`. Keeps the constants
+    /// (`MENU_WIDTH`) the single source of truth.
+    fn clamp_anchor(anchor: f32, viewport_w: f32) -> f32 {
+        let max_left = (viewport_w - MENU_WIDTH).max(0.0);
+        anchor.clamp(0.0, max_left)
+    }
+
+    #[test]
+    fn anchor_clamped_to_window_right_edge() {
+        // Plus button sat near the right edge with many tabs — without
+        // clamping the popover would extend off-screen.
+        let viewport_w = 1000.0;
+        let anchor_off_screen = 900.0;
+        let clamped = clamp_anchor(anchor_off_screen, viewport_w);
+        // 1000 - 240 = 760 is the max left.
+        assert!((clamped - (viewport_w - MENU_WIDTH)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn anchor_passes_through_when_in_bounds() {
+        let viewport_w = 1400.0;
+        let anchor = 600.0; // Well within the viewport minus menu width.
+        assert!((clamp_anchor(anchor, viewport_w) - anchor).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn anchor_clamped_to_zero_when_negative() {
+        let clamped = clamp_anchor(-50.0, 1000.0);
+        assert!(clamped.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn anchor_handles_viewport_narrower_than_menu() {
+        // Pathological: window smaller than the menu. max_left clamps to 0
+        // so the popover at least starts at the left edge instead of going
+        // negative.
+        let clamped = clamp_anchor(500.0, MENU_WIDTH - 40.0);
+        assert!(clamped.abs() < f32::EPSILON);
     }
 }

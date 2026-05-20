@@ -9,6 +9,7 @@
 //! Cmd-{) that bubble up from the focused TerminalView through the active
 //! MainPane.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use gpui::{
@@ -79,6 +80,14 @@ pub struct WorkspaceTabs {
     /// `WorkspaceRoot::spawn_agent_tab` in step 10 — only the close
     /// path still needs the runtime here.
     cli_runtime: Arc<CliRuntime>,
+    /// Window-coordinate x of the most recent `+` button click. The plus
+    /// button is rendered inline after the last tab, so its position drifts
+    /// as tabs open/close — a static inset cannot track it. The click
+    /// handler writes here before dispatching `RequestOpenAdapterPicker`;
+    /// `WorkspaceRoot` reads it back to anchor the popover under the
+    /// button. `None` for the keyboard-only path (Cmd+Shift+A) where no
+    /// click position is available.
+    last_plus_click_x: Cell<Option<f32>>,
 }
 
 impl WorkspaceTabs {
@@ -108,7 +117,16 @@ impl WorkspaceTabs {
             typography,
             focus_handle: cx.focus_handle(),
             cli_runtime,
+            last_plus_click_x: Cell::new(None),
         }
+    }
+
+    /// Pop the most-recent `+` click x (window coords) if one was recorded
+    /// since the last read. `take` semantics so a keyboard-only follow-up
+    /// (Cmd+Shift+A after a mouse click) doesn't reuse a stale position
+    /// from a since-resized window.
+    pub fn take_plus_click_x(&self) -> Option<f32> {
+        self.last_plus_click_x.take()
     }
 
     /// Count of currently-open agent tabs. Consumed by the status bar's
@@ -623,14 +641,20 @@ fn close_button(
         .child(glyph)
 }
 
-fn plus_button(theme: Theme, _entity: Entity<WorkspaceTabs>) -> impl IntoElement {
+/// Plus-button width in CSS px. Subtracted from the click x so the popover's
+/// left edge sits roughly at the button's left edge (best-effort: the click
+/// can land anywhere inside the 28px hit area, so the popover may shift up
+/// to ~half a button width depending on where the user clicked).
+const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
+
+fn plus_button(theme: Theme, entity: Entity<WorkspaceTabs>) -> impl IntoElement {
     let glyph = svg()
         .path("icons/plus.svg")
         .size(px(14.0))
         .text_color(theme.fg_muted);
     div()
         .id("ws-tab-plus")
-        .w(px(28.0))
+        .w(px(PLUS_BUTTON_WIDTH_PX))
         .h_full()
         .flex()
         .items_center()
@@ -638,11 +662,18 @@ fn plus_button(theme: Theme, _entity: Entity<WorkspaceTabs>) -> impl IntoElement
         .flex_shrink_0()
         .cursor_pointer()
         .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
             // Step 10: opening a new tab is no longer a fast path here.
             // The adapter picker (mounted on `WorkspaceRoot`) shows
             // "+ New terminal" + every detected agent; selecting any row
             // performs the appropriate spawn.
+            //
+            // Approximate the button's left edge from the click position
+            // (centered around the glyph) so `WorkspaceRoot` can anchor
+            // the popover under the actual button instead of a static
+            // inset that ignored tab-strip width.
+            let anchor_x = (f32::from(e.position.x) - PLUS_BUTTON_WIDTH_PX / 2.0).max(0.0);
+            entity.read(cx).last_plus_click_x.set(Some(anchor_x));
             window.dispatch_action(Box::new(RequestOpenAdapterPicker), cx);
             cx.stop_propagation();
         })
@@ -741,5 +772,35 @@ mod tests {
         // `plus_button` and `on_new_agent`. If `actions!` macro output
         // ever changes, this fails before the dispatch sites do.
         let _: Box<RequestOpenAdapterPicker> = Box::new(RequestOpenAdapterPicker);
+    }
+
+    #[test]
+    fn click_anchor_cell_take_returns_then_clears() {
+        // Direct exercise of the Cell semantics that bridge `plus_button`
+        // → `WorkspaceRoot`. A `take()` should consume the stored value so
+        // a follow-up keyboard activation falls through to the inset
+        // fallback instead of reusing a stale x from a since-resized
+        // window or scrolled tab strip.
+        let cell: Cell<Option<f32>> = Cell::new(None);
+        assert!(cell.take().is_none());
+
+        cell.set(Some(450.0));
+        assert_eq!(cell.take(), Some(450.0));
+        assert!(cell.take().is_none(), "Cell must clear after first take");
+    }
+
+    #[test]
+    fn click_x_to_anchor_subtracts_half_button_width() {
+        // Mirror the math inside `plus_button`'s mouse_down closure.
+        // Documents the convention: anchor = click_x - 14 so the popover
+        // sits roughly under the button regardless of where inside the
+        // 28px hitbox the user actually clicked.
+        let click_x = 600.0;
+        let anchor = (click_x - PLUS_BUTTON_WIDTH_PX / 2.0).max(0.0);
+        assert!((anchor - 586.0).abs() < f32::EPSILON);
+
+        // Edge: click reported at x=10 (improbable but exercises clamp).
+        let anchor_edge = (10.0_f32 - PLUS_BUTTON_WIDTH_PX / 2.0).max(0.0);
+        assert!(anchor_edge.abs() < f32::EPSILON);
     }
 }

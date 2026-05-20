@@ -519,17 +519,23 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(
                 cx.listener(|this, _: &RequestOpenAdapterPicker, window, cx| {
-                    // Anchor the picker's LEFT edge just past the chrome where
-                    // the `+` button approximately sits. The strip itself can
-                    // scroll horizontally when tabs overflow, so this offset is
-                    // a stable approximation rather than a per-frame layout
-                    // query — refine when the picker visibly misaligns under
-                    // realistic tab counts.
-                    let left_anchor = if this.left_rail_open {
+                    // Anchor the picker's LEFT edge under the `+` button.
+                    // The button is rendered inline after the last tab, so
+                    // its window-x drifts with tab count + label widths +
+                    // scroll state. The click handler stashes the captured
+                    // event.position.x; we consume it here. Keyboard path
+                    // (Cmd+Shift+A) has no click position — fall back to a
+                    // static post-rail inset.
+                    let fallback_anchor = if this.left_rail_open {
                         this.density.w_left_rail + ADAPTER_PICKER_LEFT_INSET
                     } else {
                         ADAPTER_PICKER_LEFT_INSET
                     };
+                    let left_anchor = this
+                        .workspace_tabs
+                        .as_ref()
+                        .and_then(|ws| ws.read(cx).take_plus_click_x())
+                        .unwrap_or(fallback_anchor);
                     // M2 (review 260520-1830): both popovers register a
                     // full-window overlay; if both opened simultaneously
                     // the lower-z one would have no click-outside dismiss
