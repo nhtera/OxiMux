@@ -14,7 +14,8 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, svg,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
+    px, svg,
 };
 use oximux_agents::{AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend};
 use oximux_core::AgentSessionId;
@@ -25,6 +26,7 @@ use crate::actions::{
     CloseTab, NewAgent, NewTab, NextTab, PrevTab, RequestOpenAdapterPicker, SplitDown, SplitLeft,
     SplitRight, SplitUp,
 };
+use crate::shell::agent_status_badge::render_dot;
 use crate::shell::agent_tab_label;
 use crate::shell::main_pane::MainPane;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
@@ -55,6 +57,13 @@ struct WorkspaceTab {
     pane: Entity<MainPane>,
     kind: WorkspaceTabKind,
     _observer: Subscription,
+    /// Per-tab watcher that wakes the strip on every `AgentStatus` change so
+    /// the badge dot recolors without a polling timer. `None` for terminal
+    /// tabs — those have no status stream to observe. Dropping the field
+    /// cancels the spawned task; `close_tab` relies on this drop-on-remove
+    /// contract (same pattern as `_observer`) so no explicit cancel is
+    /// needed at tab teardown.
+    _status_task: Option<Task<()>>,
 }
 
 pub struct WorkspaceTabs {
@@ -88,6 +97,7 @@ impl WorkspaceTabs {
             pane: initial_pane,
             kind: WorkspaceTabKind::Terminal,
             _observer: observer,
+            _status_task: None,
         }];
         Self {
             tabs,
@@ -147,6 +157,7 @@ impl WorkspaceTabs {
             pane: new_pane,
             kind: WorkspaceTabKind::Terminal,
             _observer: observer,
+            _status_task: None,
         });
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
@@ -286,6 +297,26 @@ impl WorkspaceTabs {
         let observer = cx.observe(&pane, |_, _, cx| cx.notify());
         let current_labels: Vec<SharedString> = self.tabs.iter().map(|t| t.label.clone()).collect();
         let label = agent_tab_label::next_label_for(adapter_id, &current_labels);
+        // Wake the strip on every status transition so the badge dot recolors
+        // without a polling timer. The receiver clone is cheap (watch is
+        // Arc-backed). Bailing on `changed().is_err()` or a stale weak handle
+        // ends the task — the same exit pattern `terminal_view.rs` uses.
+        let mut status_rx_for_task = status_rx.clone();
+        let status_task = cx.spawn(async move |weak, cx| {
+            // Mark the initial value as seen so `changed()` waits for the
+            // first real transition. `watch::Sender::send` bumps the version
+            // counter unconditionally — without this, a future duplicate
+            // send would double-fire `cx.notify()`.
+            let _ = status_rx_for_task.borrow_and_update();
+            loop {
+                if status_rx_for_task.changed().await.is_err() {
+                    return;
+                }
+                if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        });
         self.tabs.push(WorkspaceTab {
             label,
             pane,
@@ -295,6 +326,7 @@ impl WorkspaceTabs {
                 status_rx,
             },
             _observer: observer,
+            _status_task: Some(status_task),
         });
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
@@ -358,6 +390,7 @@ pub fn render_tab_strip(entity: Entity<WorkspaceTabs>, cx: &mut App) -> AnyEleme
             tab.label.clone(),
             ix == active,
             ix < tab_count - 1,
+            &tab.kind,
             theme,
             entity.clone(),
         ));
@@ -382,12 +415,15 @@ pub fn render_tab_strip(entity: Entity<WorkspaceTabs>, cx: &mut App) -> AnyEleme
 }
 
 /// One flat tab: full chrome-row height, top accent on active,
-/// right-border separator from its neighbor.
+/// right-border separator from its neighbor. Agent tabs receive a 6 px
+/// colored dot prepended to the label — terminal tabs render without one.
+#[allow(clippy::too_many_arguments)]
 fn workspace_tab(
     ix: usize,
     label: SharedString,
     is_active: bool,
     has_neighbor_right: bool,
+    kind: &WorkspaceTabKind,
     theme: Theme,
     entity: Entity<WorkspaceTabs>,
 ) -> impl IntoElement {
@@ -423,6 +459,16 @@ fn workspace_tab(
     };
     let close_btn = close_button(theme, ix, is_active, entity.clone(), group_name.clone());
     let entity_for_click = entity.clone();
+    // Agent tabs prepend a colored status dot; terminal tabs leave the slot
+    // empty so layout stays identical to today. `borrow().clone()` releases
+    // the watch guard before the closure-heavy builder chain runs.
+    let agent_dot: Option<AnyElement> = if let WorkspaceTabKind::Agent { status_rx, .. } = kind {
+        let status = status_rx.borrow().clone();
+        let dot_id = SharedString::from(format!("agent-status-dot-{ix}"));
+        Some(render_dot(dot_id, &status, theme).into_any_element())
+    } else {
+        None
+    };
 
     // The top-accent line is the primary visual signal for "active". Right-
     // edge separator is rendered as an absolutely-positioned 1px child so
@@ -453,6 +499,7 @@ fn workspace_tab(
             entity.update(cx, |this, cx| this.set_active(ix, window, cx));
         })
         .child(icon)
+        .when_some(agent_dot, |this, dot| this.child(dot))
         .child(
             div()
                 .min_w(px(0.0))
