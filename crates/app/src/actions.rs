@@ -81,11 +81,16 @@ actions!(
         OpenQuickOpen,
         /// Open the action Command Palette (Cmd+Shift+P). Phase 05.
         OpenCommandPalette,
-        /// Spawn a new agent tab using the first available built-in adapter.
-        /// Bound to Cmd+Shift+A as a throwaway keyboard stopgap; step 10
-        /// replaces it with an inline-popover adapter picker on the `+`
-        /// button. Picks the first non-Custom adapter from the registry's
-        /// detection walk; bails with a tracing::warn if none are installed.
+        /// Open the inline adapter-picker popover anchored to the `+`
+        /// button. Cmd+Shift+A reroutes here so the keyboard and mouse
+        /// paths converge on the same surface. A second dispatch while the
+        /// popover is open closes it (toggle).
         NewAgent,
+        /// Workspace-internal request to open the adapter picker. Fired by
+        /// the `+` button's `on_mouse_down` and by the `NewAgent` action
+        /// handler; handled in `WorkspaceRoot`. Kept distinct from
+        /// `NewAgent` so the button-fired path doesn't fight a focus-chain
+        /// keystroke during state recovery.
+        RequestOpenAdapterPicker,
     ]
 );

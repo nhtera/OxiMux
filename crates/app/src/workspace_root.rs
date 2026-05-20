@@ -28,18 +28,20 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Subscription, Window, div, px,
+    Render, Styled, Subscription, WeakEntity, Window, div, px,
 };
-use oximux_agents::{AdapterRegistry, CliRuntime};
+use oximux_agents::{AdapterRegistry, AgentRuntime, AgentSessionConfig, CliRuntime};
 use oximux_core::AgentAdapter;
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenQuickOpen, SelectExplorerTab,
-    SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
+    OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenQuickOpen, RequestOpenAdapterPicker,
+    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar,
+    ToggleRightSidebar,
 };
 use crate::shell::{
+    adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
     command_palette::{PaletteModal, entry::PaletteMode},
     left_rail::LeftRail,
     main_area,
@@ -49,10 +51,16 @@ use crate::shell::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
     },
     status_bar,
-    terminal_view::{TerminalView, spawn_local_pty},
+    terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView, spawn_local_pty},
     top_bar,
     workspace_tabs::{self, WorkspaceTabs},
 };
+
+/// Approximate horizontal inset (CSS px) of the `+` button from its
+/// column's left edge. Used by the adapter picker's anchor calculation;
+/// the strip can scroll when overflowing so this is intentionally a
+/// stable approximation rather than a live layout query.
+const ADAPTER_PICKER_LEFT_INSET: f32 = 8.0;
 
 pub struct WorkspaceRoot {
     theme: Theme,
@@ -63,14 +71,18 @@ pub struct WorkspaceRoot {
     left_rail: Entity<LeftRail>,
     palette: Entity<PaletteModal>,
     pane_actions: Entity<PaneActionsMenu>,
+    /// Inline adapter-picker popover. Anchored to the `+` button via a
+    /// left-edge offset; opened by the `RequestOpenAdapterPicker` action
+    /// (button click or Cmd+Shift+A). Owns its own detection cache.
+    adapter_picker: Entity<AdapterPicker>,
     /// CLI agent runtime — owns every agent session's PTY backend and
     /// publishes `AgentStatusStream` per session. One per workspace, held
-    /// behind `Arc` so the `WorkspaceTabs` strip can clone a reference
-    /// into the NewAgent action handler.
+    /// behind `Arc` so `WorkspaceTabs::close_tab` can cancel and so
+    /// `spawn_agent_tab` can drive `start_session`.
     cli_runtime: Arc<CliRuntime>,
-    /// Cached registry of the four built-in adapters. Held alongside the
-    /// runtime so the launch surface (Cmd+Shift+A keyboard stopgap today,
-    /// popover UX in step 10) can call `detect_available()` lazily.
+    /// Cached registry of the four built-in adapters. Drives the picker's
+    /// detect-available list and resolves the chosen `AgentAdapter` to a
+    /// concrete adapter at spawn time.
     adapter_registry: Arc<AdapterRegistry>,
     /// Whether the left rail (workspaces + nav) is visible. Toggled via Cmd+B.
     left_rail_open: bool,
@@ -118,7 +130,6 @@ impl WorkspaceRoot {
             density,
             typography.clone(),
             cli_runtime.clone(),
-            adapter_registry.clone(),
             window,
             cx,
         );
@@ -132,6 +143,29 @@ impl WorkspaceRoot {
             cx.new(|cx| LeftRail::new(repo, theme, density, typography.clone(), window, cx));
         let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
+
+        // Adapter picker: weak self-reference in the on_select closure so
+        // the picker can route the user's choice back to `spawn_agent_tab`
+        // / `spawn_local_terminal_tab` without holding a strong cycle.
+        let weak_self: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let on_select: OnSelect = Box::new(move |selection, window, cx| {
+            let weak = weak_self.clone();
+            let _ = weak.update(cx, |this, cx| match selection {
+                AdapterSelection::NewTerminal => this.spawn_local_terminal_tab(window, cx),
+                AdapterSelection::Adapter { kind, id } => {
+                    this.spawn_agent_tab(kind, id, window, cx)
+                }
+            });
+        });
+        let adapter_picker = cx.new(|_| {
+            AdapterPicker::new(
+                theme,
+                density,
+                typography.clone(),
+                adapter_registry.clone(),
+                on_select,
+            )
+        });
 
         // Pause status polling when the window blurs; force an immediate
         // refresh on focus regain via StatusPoller::kick().
@@ -152,12 +186,106 @@ impl WorkspaceRoot {
             left_rail,
             palette,
             pane_actions,
+            adapter_picker,
             cli_runtime,
             adapter_registry,
             left_rail_open: true,
             _workspace_tabs_observer: workspace_tabs_observer,
             _window_activation_observer: window_activation_observer,
         }
+    }
+
+    /// Open a fresh local-PTY tab. Used by the picker's "+ New terminal"
+    /// row so the popover and the keyboard path stay in sync.
+    fn spawn_local_terminal_tab(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.workspace_tabs.clone() else {
+            return;
+        };
+        ws.update(cx, |tabs, cx| tabs.open_tab(window, cx));
+    }
+
+    /// Spawn the chosen agent in a new workspace tab. Runs the
+    /// start_session → backend_for → terminal_session_id → subscribe_status
+    /// chain, then hands the assembled handles to `WorkspaceTabs::push_agent_tab`.
+    ///
+    /// If `update_in` errors (window/workspace dropped mid-spawn), cancels
+    /// the half-mounted session so the PTY doesn't zombie (C2 fix
+    /// transferred from step 9b's `on_new_agent`).
+    fn spawn_agent_tab(
+        &self,
+        adapter: AgentAdapter,
+        adapter_id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.workspace_tabs.clone() else {
+            return;
+        };
+        let runtime = self.cli_runtime.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        cx.spawn_in(window, async move |_root, cx| {
+            // `adapter_id` arrives from the row the user clicked — the
+            // picker holds the `RegistryEntry` slug at click time, so we
+            // skip a redundant `detect_available` walk here (M1 fix from
+            // review 260520-1830).
+            let cfg = AgentSessionConfig {
+                adapter,
+                worktree_path: cwd,
+                prompt: None,
+                model: None,
+                effort: None,
+                env: Vec::new(),
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+                custom_command: None,
+            };
+            let session_id = match runtime.start_session(cfg).await {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(?err, adapter = adapter_id, "start_session failed");
+                    return;
+                }
+            };
+            let backend = match runtime.backend_for(session_id) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(?err, "backend_for after start_session");
+                    let _ = runtime.cancel(session_id).await;
+                    return;
+                }
+            };
+            let term_id = match runtime.terminal_session_id(session_id) {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(?err, "terminal_session_id after start_session");
+                    let _ = runtime.cancel(session_id).await;
+                    return;
+                }
+            };
+            let status_rx = match runtime.subscribe_status(session_id) {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(?err, "subscribe_status after start_session");
+                    let _ = runtime.cancel(session_id).await;
+                    return;
+                }
+            };
+
+            let mount_result = ws.update_in(cx, |tabs, window, cx| {
+                tabs.push_agent_tab(
+                    adapter_id, session_id, status_rx, backend, term_id, window, cx,
+                );
+            });
+            if mount_result.is_err() {
+                tracing::warn!(
+                    ?session_id,
+                    "spawn_agent_tab: workspace dropped mid-spawn; cancelling orphan"
+                );
+                let _ = runtime.cancel(session_id).await;
+            }
+        })
+        .detach();
     }
 
     /// Accessor for the workspace's CLI agent runtime. Used by the (future)
@@ -186,7 +314,6 @@ fn spawn_initial_workspace(
     density: Density,
     typography: Typography,
     cli_runtime: Arc<CliRuntime>,
-    adapter_registry: Arc<AdapterRegistry>,
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<Entity<WorkspaceTabs>> {
@@ -205,17 +332,7 @@ fn spawn_initial_workspace(
     });
     let initial_pane =
         cx.new(|cx| MainPane::new(initial_view, theme, density, typography.clone(), cx));
-    Some(cx.new(|cx| {
-        WorkspaceTabs::new(
-            initial_pane,
-            theme,
-            density,
-            typography,
-            cli_runtime,
-            adapter_registry,
-            cx,
-        )
-    }))
+    Some(cx.new(|cx| WorkspaceTabs::new(initial_pane, theme, density, typography, cli_runtime, cx)))
 }
 
 impl Render for WorkspaceRoot {
@@ -400,6 +517,28 @@ impl Render for WorkspaceRoot {
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, cx));
             }))
+            .on_action(
+                cx.listener(|this, _: &RequestOpenAdapterPicker, window, cx| {
+                    // Anchor the picker's LEFT edge just past the chrome where
+                    // the `+` button approximately sits. The strip itself can
+                    // scroll horizontally when tabs overflow, so this offset is
+                    // a stable approximation rather than a per-frame layout
+                    // query — refine when the picker visibly misaligns under
+                    // realistic tab counts.
+                    let left_anchor = if this.left_rail_open {
+                        this.density.w_left_rail + ADAPTER_PICKER_LEFT_INSET
+                    } else {
+                        ADAPTER_PICKER_LEFT_INSET
+                    };
+                    // M2 (review 260520-1830): both popovers register a
+                    // full-window overlay; if both opened simultaneously
+                    // the lower-z one would have no click-outside dismiss
+                    // path. Close pane-actions first to enforce mutex.
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker
+                        .update(cx, |p, cx| p.open(left_anchor, window, cx));
+                }),
+            )
             .on_action(cx.listener(|this, _: &OpenPaneActions, _window, cx| {
                 // Anchor the dropdown's RIGHT edge at the "..." button's
                 // right edge so it feels visually attached.
@@ -415,6 +554,8 @@ impl Render for WorkspaceRoot {
                 } else {
                     top_bar::TOGGLE_BUTTON_WIDTH
                 };
+                // M2 mutex (see RequestOpenAdapterPicker above).
+                this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.pane_actions
                     .update(cx, |p, cx| p.open(right_anchor, cx));
             }))
@@ -466,6 +607,9 @@ impl Render for WorkspaceRoot {
             // Pane Actions dropdown — appended before the palette so the
             // palette (more rare, larger) wins z-order when both are open.
             .child(self.pane_actions.clone())
+            // Adapter picker — same z-band as pane_actions; only one of
+            // them can be open at a time so order between them is moot.
+            .child(self.adapter_picker.clone())
             // Palette modal — appended last so it paints above all other
             // children (last child = topmost z-layer in GPUI).
             .child(self.palette.clone())
