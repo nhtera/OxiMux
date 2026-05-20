@@ -10,7 +10,9 @@ pub mod runtime;
 pub mod runtime_impl;
 pub mod status_machine;
 
-pub use cli::{CliAgentAdapter, CommandSpec, CustomCommandAdapter, StatusPattern};
+pub use cli::{
+    ClaudeCodeAdapter, CliAgentAdapter, CommandSpec, CustomCommandAdapter, StatusPattern,
+};
 pub use runtime::{AgentRuntime, AgentSessionConfig, AgentStatusStream};
 pub use runtime_impl::CliRuntime;
 pub use status_machine::{StatusMachine, StatusTransition};
