@@ -10,6 +10,7 @@
 //! (the actual grid/scrollback state machine) lands in step 3.
 
 pub mod backend;
+pub(crate) mod close_grace;
 pub mod events;
 pub mod portable_pty_backend;
 pub mod snapshot;

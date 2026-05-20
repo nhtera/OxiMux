@@ -13,3 +13,9 @@ anyhow = { workspace = true }
 portable-pty = { workspace = true }
 alacritty_terminal = { workspace = true }
 # tokio/tracing land when the UI consumer needs async fan-out or structured logs.
+
+[target.'cfg(unix)'.dependencies]
+# Pinned to 0.25 to share the existing transitive copy via portable-pty
+# instead of pulling a second major. Only `sys::signal::kill` + `Pid` are
+# used; both have been stable in nix for many releases.
+nix = { version = "0.25", features = ["signal"] }

@@ -21,8 +21,10 @@ use std::io::{Read, Write};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
+use crate::close_grace::{JoinHandleWatcher, close_with_grace, term_step};
 use crate::events::TerminalEvent;
 use crate::snapshot::{Cell, TerminalSnapshot};
 use crate::state::TerminalState;
@@ -30,6 +32,17 @@ use crate::state::TerminalState;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const READ_BUFFER_BYTES: usize = 4096;
 const SCROLLBACK_ROWS: usize = 5_000;
+
+/// Maximum time `close()` waits for the watcher thread to finish after
+/// sending SIGTERM before falling back to SIGKILL. The trait contract
+/// (`runtime.rs::AgentRuntime::cancel` doc) promises 5 s; agents that
+/// flush logs and exit cleanly will land well inside this window.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// Polling interval for `watcher.is_finished()` during the grace window.
+/// 50 ms × 100 iterations = 5 s ceiling; sleep imprecision on loaded
+/// hosts is acceptable since the grace is best-effort, not a hard SLA.
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 struct Session {
     master: Box<dyn MasterPty + Send>,
@@ -39,6 +52,13 @@ struct Session {
     watcher: Option<JoinHandle<()>>,
     cols: u16,
     rows: u16,
+    /// PID captured before the child is moved into the watcher thread.
+    /// Used as the signal target for the grace SIGTERM dance; portable-pty
+    /// calls `setsid()` in the child's pre-exec hook so the PID equals
+    /// the process-group id, and `kill(-pid, SIGTERM)` reaches every
+    /// descendant the agent CLI spawned. `None` is a safe fallback —
+    /// `close()` skips SIGTERM and goes straight to SIGKILL.
+    pid: Option<u32>,
 }
 
 pub struct PortablePtyBackend {
@@ -92,6 +112,9 @@ impl TerminalBackend for PortablePtyBackend {
         }
         let child = pair.slave.spawn_command(command).context("spawn shell")?;
         let killer = child.clone_killer();
+        // Capture PID before the watcher thread consumes `child`. Used by
+        // the grace SIGTERM path in `close()`; see the `pid` field doc.
+        let pid = child.process_id();
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().context("clone reader")?;
@@ -118,6 +141,7 @@ impl TerminalBackend for PortablePtyBackend {
                 watcher: Some(watcher),
                 cols: cfg.cols,
                 rows: cfg.rows,
+                pid,
             },
         );
         Ok(id)
@@ -206,17 +230,37 @@ impl TerminalBackend for PortablePtyBackend {
         let Some(mut session) = self.sessions.remove(&id) else {
             return Ok(());
         };
-        let _ = session.killer.kill();
-        // Dropping master + writer closes the fds; watcher hits EOF and exits.
+        // Drop writer immediately so write() callers get EBADF rather than
+        // racing with the pending kill.
         drop(session.writer);
+        // Build the SIGTERM step. On Unix, target the whole process group
+        // (negative pid) so children spawned by the agent CLI also receive
+        // the signal. The negative-pid contract works because portable-pty
+        // calls setsid() in the child's pre-exec hook, making pid == pgid.
+        let pid = session.pid;
+        let term_fn = move || term_step(pid);
+        // The SIGKILL fallback uses the existing portable-pty killer.
+        let mut killer = session.killer;
+        let kill_fn = move || {
+            let _ = killer.kill();
+        };
+        // Drop master BEFORE polling the watcher: closes the pty fd, which
+        // unblocks the watcher's read() and lets it observe EOF + reap the
+        // child. SIGTERM gives the agent a chance to exit cleanly first;
+        // master-drop ensures even a stubborn agent's read loop unblocks.
         drop(session.master);
         if let Some(handle) = session.watcher.take() {
-            let _ = handle.join();
+            close_with_grace(
+                JoinHandleWatcher(handle),
+                term_fn,
+                kill_fn,
+                CANCEL_GRACE,
+                KILL_POLL_INTERVAL,
+            );
         }
         Ok(())
     }
 }
-
 fn watch_session(
     id: TerminalSessionId,
     mut reader: Box<dyn Read + Send>,

@@ -7,8 +7,9 @@
 //!   plus a tokio poll task that drains PTY events at 50 ms and feeds them
 //!   into a per-session `StatusMachine`. Status transitions are published
 //!   on a `tokio::sync::watch` channel that the UI can subscribe to.
-//! - Cancel = SIGKILL (via `portable-pty`'s killer). SIGTERM-grace-SIGKILL
-//!   lands in step 13 (zombie prevention).
+//! - Cancel = SIGTERM (process group) → 5 s grace → SIGKILL fallback, all
+//!   inside `PortablePtyBackend::close()`. The runtime simply calls
+//!   `backend.close(term_id)` and trusts the backend to reap zombie-free.
 //!
 //! This file is the forcing function for the Phase 3 trait surface — the
 //! first slice that turns `AgentRuntime` + `CliAgentAdapter` from

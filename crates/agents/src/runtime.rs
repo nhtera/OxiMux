@@ -75,15 +75,11 @@ pub trait AgentRuntime: Send + Sync + 'static {
     /// line discipline).
     async fn send_message(&self, id: AgentSessionId, msg: &str) -> Result<()>;
 
-    /// Request graceful shutdown: SIGTERM → 5s grace → SIGKILL. Implementor
+    /// Request graceful shutdown: SIGTERM → 5 s grace → SIGKILL. Implementor
     /// MUST guarantee the process tree is reaped (zombie-free) before the
-    /// returned future resolves.
-    ///
-    /// Step 4 note: `CliRuntime` currently SIGKILLs directly via
-    /// `portable-pty`'s `killer.kill()`. The SIGTERM-grace dance lands in
-    /// step 13 (zombie prevention). The reap-before-resolve invariant is
-    /// already honored — `close()` joins the watcher thread which only
-    /// exits after `child.wait()`.
+    /// returned future resolves. `CliRuntime` honors this via
+    /// `PortablePtyBackend::close()`, which signals the child's process
+    /// group then joins the watcher thread that calls `child.wait()`.
     async fn cancel(&self, id: AgentSessionId) -> Result<()>;
 
     /// Subscribe to status updates for one session. `watch` semantics:
