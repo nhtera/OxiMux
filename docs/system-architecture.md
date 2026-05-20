@@ -164,6 +164,8 @@ CliRuntime (AgentRuntime impl)
 
 `CodexAdapter` is the second branded adapter: builds `codex [-m M] [<prompt>]`. `cfg.effort` ignored (no CLI analog), no `--ask-for-approval` / `--sandbox` overrides (user's `~/.codex/config.toml` owns approval cadence — the "no paternalistic defaults" v0.9 retro rule). `status_patterns()` intentionally empty; pattern calibration is deferred to dogfood week 18 (step 14) when real Codex TUI bytes get captured into fixtures — writing regex against an imagined haystack is the exact "tests-pass / runtime-broken" trap the step-5 journal documents.
 
+`AiderAdapter` is the third branded adapter: builds `aider [--model M]` and routes `cfg.prompt` through `CommandSpec::stdin_seed` rather than argv — Aider's REPL has no positional-prompt argument and `--message` is one-shot incompatible with the OxiMux interactive PTY model. Aider is the first real consumer of the `stdin_seed` path the trait reserved at Phase 3 step 1. Embedded `\n` in the prompt submits each line as a discrete REPL prompt — intentional, no collapse. No `--yes` / `--auto-commits` paternalism (user's `~/.aider.conf.yml` owns). Empty `status_patterns()` with the same step-14 calibration deferral.
+
 Future ACP runtime (v1.1) will be a sibling `AgentRuntime` impl with identical `watch::Receiver<AgentStatus>` contract — UI code subscribes to the trait, not the impl.
 
 ---

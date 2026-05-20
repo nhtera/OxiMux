@@ -28,6 +28,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::PathBuf;
 
+use crate::cli::adapter::EMPTY_PATTERNS;
 use crate::cli::detect::which_on_path;
 use crate::cli::{CliAgentAdapter, CommandSpec, StatusPattern};
 use crate::runtime::AgentSessionConfig;
@@ -35,10 +36,6 @@ use crate::runtime::AgentSessionConfig;
 /// Bare-name binary, resolved via PATH. Centralized so step 8 (registry)
 /// can later surface a settings override without grepping the body.
 const CODEX_BIN: &str = "codex";
-
-/// Empty pattern slice — see the file-level docstring for why patterns
-/// are intentionally deferred until step 14 fixture capture lands.
-const EMPTY_PATTERNS: &[StatusPattern] = &[];
 
 /// Stateless adapter — one instance lives in the runtime registry and is
 /// reused across all Codex sessions. Per-session config (model, prompt,

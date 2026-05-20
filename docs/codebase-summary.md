@@ -175,7 +175,9 @@ src/
     ├── mod.rs
     ├── adapter.rs      CliAgentAdapter: Send+Sync+'static async trait
     │                   CommandSpec { program, args, env, stdin_seed }
+    │                   stdin_seed: caller owns trailing `\n`; runtime never appends (matches send_message contract)
     │                   StatusPattern { regex::bytes::Regex, target_status } — bytes engine: raw PTY not guaranteed UTF-8
+    │                   pub(crate) const EMPTY_PATTERNS — shared by all zero-pattern adapters
     ├── detect.rs       pub(crate) async fn which_on_path(bin) -> bool
     │                   Shared helper: shells out to `which`, never panics, false on miss
     ├── claude_code.rs  ClaudeCodeAdapter — interactive PTY launch of `claude`
@@ -187,6 +189,13 @@ src/
     │                   cfg.effort silently ignored (no CLI analog); no --ask-for-approval / --sandbox
     │                   (user's ~/.codex/config.toml owns approval cadence per v0.9 retro)
     │                   status_patterns() intentionally empty — deferred to step-14 dogfood capture
+    ├── aider.rs        AiderAdapter — interactive PTY launch of `aider`
+    │                   build_command: optional --model <m> long flag
+    │                   cfg.prompt → stdin_seed (Aider's REPL has no positional-prompt arg;
+    │                     --message is one-shot incompatible with interactive PTY)
+    │                   embedded `\n` submits each line as a discrete REPL prompt
+    │                   no --yes / --auto-commits overrides (user's ~/.aider.conf.yml owns)
+    │                   status_patterns() intentionally empty — deferred to step-14 capture
     └── custom.rs       CustomCommandAdapter — escape-hatch CliAgentAdapter impl
                         Reads custom_command: Option<(String, Vec<String>)> from AgentSessionConfig
                         status_patterns() intentionally empty — falls through to StatusMachine defaults

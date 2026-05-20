@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
+use crate::cli::adapter::EMPTY_PATTERNS;
 use crate::cli::{CliAgentAdapter, CommandSpec, StatusPattern};
 use crate::runtime::AgentSessionConfig;
 
@@ -21,8 +22,6 @@ use crate::runtime::AgentSessionConfig;
 /// itself, so adapter instances stay shareable.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CustomCommandAdapter;
-
-const EMPTY_PATTERNS: &[StatusPattern] = &[];
 
 #[async_trait]
 impl CliAgentAdapter for CustomCommandAdapter {

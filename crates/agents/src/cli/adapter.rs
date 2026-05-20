@@ -27,6 +27,12 @@ pub struct CommandSpec {
     /// Initial bytes to write to stdin after spawn (some adapters take
     /// the prompt that way instead of `-p`). The runtime writes these
     /// once the PTY is ready.
+    ///
+    /// The caller owns the trailing `\n` (or any other submit
+    /// terminator the target REPL needs). The runtime writes the bytes
+    /// verbatim and never appends. By contrast `AgentRuntime::send_message`
+    /// also writes raw bytes with no implicit terminator — so both
+    /// inbound-byte paths have the same ownership rule.
     pub stdin_seed: Option<Vec<u8>>,
 }
 
@@ -55,6 +61,13 @@ impl StatusPattern {
         })
     }
 }
+
+/// Empty pattern slice shared by adapters that intentionally don't
+/// classify (`CustomCommandAdapter`, `CodexAdapter`, `AiderAdapter`).
+/// Returning the same `&'static []` from `status_patterns()` keeps the
+/// per-call allocation at zero and lets the `StatusMachine` skip the
+/// pattern loop on a known-empty slice.
+pub(crate) const EMPTY_PATTERNS: &[StatusPattern] = &[];
 
 /// One CLI agent adapter. Stateless — the runtime instantiates once and
 /// reuses across sessions. All session state lives in the runtime's
