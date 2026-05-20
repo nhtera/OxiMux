@@ -4382,6 +4382,8 @@ dependencies = [
  "anyhow",
  "oximux-core",
  "rusqlite",
+ "tempfile",
+ "thiserror 1.0.69",
  "tracing",
 ]
 

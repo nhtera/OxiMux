@@ -11,4 +11,8 @@ rust-version.workspace = true
 oximux-core = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

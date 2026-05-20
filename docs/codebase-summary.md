@@ -19,7 +19,7 @@ oximux/
     ├── git/                git CLI wrappers, poller, diff parser
     ├── agents/             AgentRuntime async trait + CliAgentAdapter + StatusMachine (Phase 3 foundation)
     ├── editor/             gpui-component editor stub (Phase 5)
-    ├── storage/            SQLite stub (Phase 4)
+    ├── storage/            SQLite via rusqlite — Db wrapper + migration runner (Phase 4 step 1; schemas land step 3)
     └── settings/           TOML config, theme tokens, typography
 ```
 
@@ -221,6 +221,22 @@ src/
 | `state.rs` | `TerminalState`: alacritty_terminal + vte processor; 5000-row scrollback |
 | `snapshot.rs` | `TerminalSnapshot`: cells grid + cursor position |
 | `events.rs` | `TerminalEvent` enum: Output/Exit/Resize/TitleChange |
+| `close_grace.rs` | `term_step` SIGTERM-to-process-group + `close_with_grace(WatcherHandle, term_fn, kill_fn, GRACE, POLL)` orchestrator (5 s SIGTERM grace → SIGKILL fallback) |
+
+---
+
+## crates/storage — SQLite persistence (Phase 4)
+
+| File | Role |
+|---|---|
+| `lib.rs` | Re-exports `Db`, `open`, `open_memory`, `StorageError`, `Migration`, `MIGRATIONS` |
+| `db.rs` | `Db(Arc<Mutex<Connection>>)` newtype; `open(path)` (file-backed, WAL) + `open_memory()` (test helper, `#[doc(hidden)]`); `with_conn(|c| …)` closure accessor; `set_pragmas` applies WAL/foreign_keys/busy_timeout=5000/synchronous=NORMAL/wal_autocheckpoint=1000 on every connection |
+| `migrations.rs` | `Migration { version, name, sql }`; `run_migrations(conn, &[Migration])` runs each unapplied migration in its own transaction; bookkeeping in `__oximux_migrations(version, name, applied_at)`; downgrade detection (db_max > code_max) + gap detection (recorded must be contiguous from 1); `migration_ladder_matches_files` CI guard counts `migrations/*.sql` vs `MIGRATIONS.len()` |
+| `error.rs` | `StorageError` (thiserror): `Open`, `Pragma`, `Migration{version,source}`, `SchemaMigrationDowngrade{db_version,code_version}`, `Query` |
+| `migrations/` | `.sql` files; empty in Phase 4 step 1, V001 lands step 3 |
+| `tests/migration_runner.rs` | File-backed integration tests: open + reopen + bookkeeping table contract |
+
+`r2d2` deliberately **not** adopted in v1 — single `Arc<Mutex<Connection>>` over WAL is sufficient for the single-writer model. Read-pool split (write conn + N readers) is the documented upgrade path if profiling shows contention.
 
 ---
 
