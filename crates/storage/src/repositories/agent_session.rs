@@ -1,0 +1,140 @@
+//! `AgentSessionRepo` — typed CRUD over the `agent_sessions` table. The
+//! three-column codec (`status`, `exit_code`, `status_detail`) is owned
+//! by `AgentStatus::{as_str, exit_code_for_storage, detail_for_storage,
+//! from_row}` in `oximux-core`; this repo only plumbs the values.
+
+use oximux_core::{AgentSession, AgentStatus};
+use rusqlite::{OptionalExtension, params};
+
+use super::{new_id, now};
+use crate::db::Db;
+use crate::error::StorageError;
+use crate::model::AgentSessionRow;
+
+#[derive(Clone)]
+pub struct AgentSessionRepo {
+    db: Db,
+}
+
+impl AgentSessionRepo {
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+
+    pub fn insert(
+        &self,
+        workspace_id: &str,
+        adapter_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<AgentSession, StorageError> {
+        let id = new_id();
+        let started_at = now();
+        let status = AgentStatus::Idle;
+        self.db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO agent_sessions (id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL)",
+                params![
+                    id,
+                    workspace_id,
+                    adapter_id,
+                    model,
+                    effort,
+                    status.as_str(),
+                    started_at,
+                ],
+            )
+            .map(|_| ())
+        })?;
+        Ok(AgentSession {
+            id,
+            workspace_id: workspace_id.to_string(),
+            adapter_id: adapter_id.to_string(),
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+            status,
+            started_at: Some(started_at),
+            ended_at: None,
+        })
+    }
+
+    pub fn get_by_id(&self, id: &str) -> Result<Option<AgentSession>, StorageError> {
+        let row = self.db.with_conn(|c| {
+            c.query_row(
+                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at \
+                 FROM agent_sessions WHERE id = ?1",
+                [id],
+                AgentSessionRow::from_row,
+            )
+            .optional()
+        })?;
+        Ok(row.map(Into::into))
+    }
+
+    pub fn list_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<AgentSession>, StorageError> {
+        let rows = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at \
+                 FROM agent_sessions WHERE workspace_id = ?1 \
+                 ORDER BY started_at DESC",
+            )?;
+            let iter = stmt.query_map([workspace_id], AgentSessionRow::from_row)?;
+            iter.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Encode an [`AgentStatus`] into the three columns and write it.
+    pub fn update_status(&self, id: &str, status: &AgentStatus) -> Result<(), StorageError> {
+        let slug = status.as_str();
+        let exit_code = status.exit_code_for_storage();
+        let detail = status.detail_for_storage();
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_sessions SET status = ?1, exit_code = ?2, status_detail = ?3 WHERE id = ?4",
+                params![slug, exit_code, detail, id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    pub fn update_ended_at(&self, id: &str) -> Result<(), StorageError> {
+        let ts = now();
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_sessions SET ended_at = ?1 WHERE id = ?2",
+                params![ts, id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    /// Sessions whose `status = 'running'` AND have no `ended_at` — i.e.
+    /// they were alive when the app went down. The Phase 4 step 9 startup
+    /// path calls `update_status(id, AgentStatus::Interrupted)` on each.
+    ///
+    /// The literal `'running'` MUST stay in lockstep with
+    /// `AgentStatus::Running.as_str()`; the codec test
+    /// `agent_status_running_slug_matches_query` (in
+    /// `crates/storage/tests/agent_status_codec.rs`) machine-checks the
+    /// link.
+    pub fn list_running_at_shutdown(&self) -> Result<Vec<AgentSession>, StorageError> {
+        let rows = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at \
+                 FROM agent_sessions \
+                 WHERE status = 'running' AND ended_at IS NULL \
+                 ORDER BY started_at ASC",
+            )?;
+            let iter = stmt.query_map([], AgentSessionRow::from_row)?;
+            iter.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}

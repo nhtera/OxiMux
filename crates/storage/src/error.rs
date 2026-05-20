@@ -30,4 +30,7 @@ pub enum StorageError {
 
     #[error("query failed: {0}")]
     Query(#[source] rusqlite::Error),
+
+    #[error("conflict on {table}: {constraint}")]
+    Conflict { table: String, constraint: String },
 }

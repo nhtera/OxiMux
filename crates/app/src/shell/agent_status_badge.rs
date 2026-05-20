@@ -46,6 +46,9 @@ pub fn status_color(status: &AgentStatus, theme: Theme) -> Hsla {
         AgentStatus::Done { code: Some(_) } => theme.status_error,
         AgentStatus::Done { code: None } => theme.status_muted,
         AgentStatus::Failed(_) => theme.status_error,
+        // Session was running at shutdown and could not be resumed; treat
+        // visually like a non-zero exit so the user notices on relaunch.
+        AgentStatus::Interrupted => theme.status_error,
     }
 }
 

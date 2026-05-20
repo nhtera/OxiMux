@@ -19,7 +19,7 @@ oximux/
     ├── git/                git CLI wrappers, poller, diff parser
     ├── agents/             AgentRuntime async trait + CliAgentAdapter + StatusMachine (Phase 3 foundation)
     ├── editor/             gpui-component editor stub (Phase 5)
-    ├── storage/            SQLite via rusqlite — Db wrapper + migration runner (Phase 4 step 1; schemas land step 3)
+    ├── storage/            SQLite via rusqlite — Db wrapper + migrations + V001 schema + 5 typed repos (Phase 4 step 3)
     └── settings/           TOML config, theme tokens, typography
 ```
 
@@ -229,12 +229,18 @@ src/
 
 | File | Role |
 |---|---|
-| `lib.rs` | Re-exports `Db`, `open`, `open_memory`, `StorageError`, `Migration`, `MIGRATIONS` |
+| `lib.rs` | Re-exports `Db`, `open`, `open_memory`, `StorageError`, `Migration`, `MIGRATIONS`, and 5 repository structs |
 | `db.rs` | `Db(Arc<Mutex<Connection>>)` newtype; `open(path)` (file-backed, WAL) + `open_memory()` (test helper, `#[doc(hidden)]`); `with_conn(|c| …)` closure accessor; `set_pragmas` applies WAL/foreign_keys/busy_timeout=5000/synchronous=NORMAL/wal_autocheckpoint=1000 on every connection |
-| `migrations.rs` | `Migration { version, name, sql }`; `run_migrations(conn, &[Migration])` runs each unapplied migration in its own transaction; bookkeeping in `__oximux_migrations(version, name, applied_at)`; downgrade detection (db_max > code_max) + gap detection (recorded must be contiguous from 1); `migration_ladder_matches_files` CI guard counts `migrations/*.sql` vs `MIGRATIONS.len()` |
-| `error.rs` | `StorageError` (thiserror): `Open`, `Pragma`, `Migration{version,source}`, `SchemaMigrationDowngrade{db_version,code_version}`, `Query` |
-| `migrations/` | `.sql` files; empty in Phase 4 step 1, V001 lands step 3 |
-| `tests/migration_runner.rs` | File-backed integration tests: open + reopen + bookkeeping table contract |
+| `migrations.rs` | `Migration { version, name, sql }`; `run_migrations(conn, &[Migration])` per-migration transactions; bookkeeping in `__oximux_migrations(version, name, applied_at)`; downgrade-by-max ordered before gap detection; `strip_sql_comments` helper so `contains_transaction_keyword` guard ignores prose; `migration_ladder_matches_files` CI guard |
+| `error.rs` | `StorageError` (thiserror): `Open`, `Pragma`, `Migration{version,source}`, `SchemaMigrationDowngrade{db_version,code_version}`, `Query`, `Conflict{table,constraint}` |
+| `model.rs` | Row types (`ProjectRow`, `WorkspaceRow`, `AgentSessionRow`, `PaneSessionRow`) with `from_row(&rusqlite::Row)` + `From<XxxRow> for Xxx` impls returning `oximux-core` domain types; unknown `AgentStatus` slug degrades to `Interrupted` |
+| `repositories/mod.rs` | Shared helpers: `now()` (RFC 3339), `new_id()` (UUIDv4), `classify_unique` (maps SQLite UNIQUE/PK extended codes 2067/1555 → `StorageError::Conflict`). Module doc locks the silent-ok-on-missing-row contract |
+| `repositories/project.rs` | `ProjectRepo`: insert / get_by_id / list_recent (LIFO by last_opened) / update_last_opened_at / delete (FK CASCADE) |
+| `repositories/workspace.rs` | `WorkspaceRepo`: insert (UNIQUE(project_id, slug) → `Conflict`) / get_by_id / list_for_project (excludes archived) / mark_archived / rename / delete (worktree-rollback contract) |
+| `repositories/agent_session.rs` | `AgentSessionRepo`: insert (starts `Idle`) / get_by_id / list_for_workspace / update_status (3-column codec) / update_ended_at / list_running_at_shutdown (machine-checked vs `AgentStatus::Running.as_str()`) |
+| `repositories/pane_session.rs` | `PaneSessionRepo`: insert / get_by_id / list_for_workspace (oldest-first restore) / update_grid_position / delete |
+| `repositories/settings.rs` | `SettingsRepo`: get / set (upsert) / delete; caller enforces ≤ 64 KiB |
+| `migrations/V001__init.sql` | 5 tables (projects, workspaces, agent_sessions [+ exit_code, status_detail for AgentStatus payloads], pane_sessions [ON DELETE SET NULL on agent FK], settings) + 3 FK-support indexes |
 
 `r2d2` deliberately **not** adopted in v1 — single `Arc<Mutex<Connection>>` over WAL is sufficient for the single-writer model. Read-pool split (write conn + N readers) is the documented upgrade path if profiling shows contention.
 

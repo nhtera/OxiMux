@@ -34,9 +34,14 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-/// Phase 0 ships an empty ladder. Phase 4 step 3 appends V001 (projects,
-/// workspaces, panes) and onward.
-pub const MIGRATIONS: &[Migration] = &[];
+/// V001 lands the five-table OxiMux schema (projects, workspaces,
+/// agent_sessions, pane_sessions, settings) plus three FK-support
+/// indexes. Future migrations append; never reorder, never rewrite.
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "init",
+    sql: include_str!("../migrations/V001__init.sql"),
+}];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
 /// The CI guard uses this to count `.sql` files.
@@ -213,29 +218,56 @@ fn current_timestamp() -> String {
     format!("{secs}")
 }
 
-/// Cheap upper-case scan for the three transaction directives. Treats the
-/// SQL as case-insensitive ASCII and looks for whole-word occurrences only
-/// (so a column named `committed_at` doesn't trip the check).
+/// Cheap upper-case scan for the four transaction directives after
+/// stripping SQL comments. Treats the SQL as case-insensitive ASCII and
+/// matches whole-word occurrences only (so a column named `committed_at`
+/// doesn't trip the check, and a comment mentioning `BEGIN` is ignored).
 fn contains_transaction_keyword(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
+    let stripped = strip_sql_comments(sql);
+    let upper = stripped.to_ascii_uppercase();
     for kw in ["BEGIN", "COMMIT", "SAVEPOINT", "ROLLBACK"] {
-        if let Some(pos) = upper.find(kw) {
-            let before = pos
-                .checked_sub(1)
-                .map(|i| upper.as_bytes()[i])
-                .unwrap_or(b' ');
-            let after = upper
-                .as_bytes()
-                .get(pos + kw.len())
-                .copied()
-                .unwrap_or(b' ');
-            let word_boundary = |b: u8| !b.is_ascii_alphanumeric() && b != b'_';
+        let bytes = upper.as_bytes();
+        let word_boundary = |b: u8| !b.is_ascii_alphanumeric() && b != b'_';
+        let mut search_from = 0;
+        while let Some(rel) = upper[search_from..].find(kw) {
+            let pos = search_from + rel;
+            let before = pos.checked_sub(1).map(|i| bytes[i]).unwrap_or(b' ');
+            let after = bytes.get(pos + kw.len()).copied().unwrap_or(b' ');
             if word_boundary(before) && word_boundary(after) {
                 return true;
             }
+            search_from = pos + kw.len();
         }
     }
     false
+}
+
+/// Strip `-- line comments` and `/* block comments */` from a SQL string.
+/// Comment-stripping is the simplest way to keep the keyword check from
+/// false-positiving on prose like "no embedded BEGIN/COMMIT directives"
+/// that legitimately documents the constraint.
+fn strip_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            // Skip to EOL.
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -481,6 +513,25 @@ mod tests {
         assert!(!contains_transaction_keyword(
             "CREATE TABLE x (id INTEGER PRIMARY KEY);"
         ));
+    }
+
+    #[test]
+    fn contains_transaction_keyword_ignores_comments() {
+        // V001's lead-in mentions BEGIN/COMMIT in a comment — must not trip.
+        let sql = "-- script in a single transaction, so no embedded BEGIN/COMMIT directives.\n\
+                   CREATE TABLE x (id INTEGER PRIMARY KEY);";
+        assert!(!contains_transaction_keyword(sql));
+
+        // Block comment with the keyword inside.
+        let sql_block = "/* BEGIN here is documentation, not DDL */\n\
+                         CREATE TABLE x (id INTEGER PRIMARY KEY);";
+        assert!(!contains_transaction_keyword(sql_block));
+
+        // After stripping the harmless `-- COMMIT` mention, the real BEGIN
+        // remains and is detected.
+        let sql_mixed = "-- harmless mention of COMMIT\n\
+                         BEGIN; CREATE TABLE x (id INT);";
+        assert!(contains_transaction_keyword(sql_mixed));
     }
 
     #[test]

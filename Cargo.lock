@@ -4380,11 +4380,13 @@ name = "oximux-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "oximux-core",
  "rusqlite",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

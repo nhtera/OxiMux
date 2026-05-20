@@ -21,7 +21,12 @@
 pub mod db;
 pub mod error;
 pub mod migrations;
+pub mod model;
+pub mod repositories;
 
 pub use db::{Db, open, open_memory};
 pub use error::StorageError;
 pub use migrations::{MIGRATIONS, Migration};
+pub use repositories::{
+    AgentSessionRepo, PaneSessionRepo, ProjectRepo, SettingsRepo, WorkspaceRepo,
+};
