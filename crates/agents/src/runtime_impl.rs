@@ -53,7 +53,13 @@ const MAX_SAFE_STDIN_SEED: usize = 4096;
 /// methods (`send_message`, `cancel`) and the per-session poll task can
 /// each touch the backend without ownership games. Locks are held only
 /// for the duration of a single non-blocking call.
-type SharedBackend = Arc<Mutex<Box<dyn TerminalBackend>>>;
+///
+/// Public so the app's terminal renderer can hold one and read PTY output
+/// from either a locally-spawned shell OR an agent session — same render
+/// path, no enum split. Callers MUST NOT block under the lock; the only
+/// safe ops are the non-blocking `TerminalBackend` methods
+/// (`drain_events`, `write`, `resize`).
+pub type SharedBackend = Arc<Mutex<Box<dyn TerminalBackend>>>;
 
 struct SessionEntry {
     backend: SharedBackend,
@@ -98,6 +104,35 @@ impl CliRuntime {
     pub fn register_adapter(&self, key: AgentAdapter, adapter: Arc<dyn CliAgentAdapter>) {
         let mut inner = self.inner.lock().expect("CliRuntime mutex poisoned");
         inner.adapters.insert(key, adapter);
+    }
+
+    /// Hand out a shared handle on the session's PTY backend so the app's
+    /// terminal renderer can drain output and write input without going
+    /// through `send_message`. The same `Arc` the poll task holds — both
+    /// callers compete on the same mutex, which is fine because the only
+    /// supported ops on the trait (`drain_events`, `write`, `resize`) are
+    /// non-blocking. Errors when the session is unknown (already cancelled
+    /// or never started).
+    pub fn backend_for(&self, id: AgentSessionId) -> Result<SharedBackend> {
+        let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        inner
+            .sessions
+            .get(&id)
+            .map(|entry| entry.backend.clone())
+            .ok_or_else(|| anyhow!("unknown session {:?}", id))
+    }
+
+    /// The `TerminalSessionId` the underlying PTY was assigned at spawn
+    /// time. The renderer needs this to filter `TerminalEvent`s coming out
+    /// of the shared backend (each backend can serve multiple sessions in
+    /// principle — `oximux-pty` does not enforce one-id-per-backend).
+    pub fn terminal_session_id(&self, id: AgentSessionId) -> Result<TerminalSessionId> {
+        let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        inner
+            .sessions
+            .get(&id)
+            .map(|entry| entry.term_id)
+            .ok_or_else(|| anyhow!("unknown session {:?}", id))
     }
 }
 
@@ -514,5 +549,73 @@ mod tests {
         rt.cancel(id).await.expect("first cancel");
         let err = rt.cancel(id).await.unwrap_err();
         assert!(err.to_string().contains("unknown session"));
+    }
+
+    // Phase 3 step 9 sub-1: the app renderer needs the same backend Arc the
+    // poll task holds so it can drain output and resize without going
+    // through `send_message`. `backend_for` hands out a clone; both
+    // callers compete on the same mutex.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_for_returns_live_handle_shared_with_poll_task() {
+        let rt = runtime_with_custom();
+        let id = rt
+            .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
+            .await
+            .expect("start_session");
+        let backend = rt.backend_for(id).expect("backend_for");
+        // Arc count: one in SessionEntry, one cloned into the poll task,
+        // one we just took. Asserting an exact count would tie the test
+        // to the poll-task internals; instead prove the Arc is shared by
+        // exercising the same mutex from both sides.
+        let term_id = rt.terminal_session_id(id).expect("terminal_session_id");
+        let resize_ok = tokio::task::spawn_blocking(move || {
+            let mut be = backend.lock().expect("backend mutex poisoned");
+            be.resize(term_id, 100, 30).is_ok()
+        })
+        .await
+        .expect("spawn_blocking");
+        assert!(resize_ok, "renderer-side resize must succeed");
+        // Session is still alive and reachable through the runtime.
+        let s = rt.current_status(id).expect("current_status");
+        assert!(!s.is_terminal(), "session must not be killed by resize");
+        let _ = rt.cancel(id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_for_unknown_session_errors() {
+        let rt = runtime_with_custom();
+        let bogus = AgentSessionId::new(999);
+        // `SharedBackend` wraps a trait object so `Result<SharedBackend>`
+        // doesn't impl `Debug`; pattern-match the Err arm instead of
+        // `unwrap_err()`.
+        match rt.backend_for(bogus) {
+            Ok(_) => panic!("expected unknown-session error"),
+            Err(e) => assert!(e.to_string().contains("unknown session")),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_session_id_unknown_session_errors() {
+        let rt = runtime_with_custom();
+        let bogus = AgentSessionId::new(999);
+        let err = rt.terminal_session_id(bogus).unwrap_err();
+        assert!(err.to_string().contains("unknown session"));
+    }
+
+    // After cancel removes the SessionEntry, backend_for must surface the
+    // typed error — proves the session table (not the OS-level handle) is
+    // the source of truth.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_for_after_cancel_returns_unknown_session() {
+        let rt = runtime_with_custom();
+        let id = rt
+            .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
+            .await
+            .expect("start_session");
+        rt.cancel(id).await.expect("cancel");
+        match rt.backend_for(id) {
+            Ok(_) => panic!("expected unknown-session error after cancel"),
+            Err(e) => assert!(e.to_string().contains("unknown session")),
+        }
     }
 }

@@ -33,7 +33,7 @@ use crate::actions::{
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_layout::{ActiveDrag, DIVIDER_HIT_PX, build_node};
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree, SplitInsert};
-use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView};
+use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
 /// Vertical chrome subtracted from viewport when computing terminal area
 /// (top bar + status bar). Density tokens are 40 + 24 = 64.
@@ -393,20 +393,7 @@ fn spawn_terminal_view(
     window: &mut Window,
     cx: &mut Context<MainPane>,
 ) -> Option<Entity<TerminalView>> {
-    use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
-    let mut backend = PortablePtyBackend::new();
-    let cfg = SpawnConfig {
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
-        ..SpawnConfig::default()
-    };
-    let session_id = match backend.spawn(cfg) {
-        Ok(id) => id,
-        Err(err) => {
-            tracing::warn!(?err, "pty spawn failed");
-            return None;
-        }
-    };
+    let (backend, session_id) = spawn_local_pty()?;
     Some(
         cx.new(|cx| {
             TerminalView::mount(backend, session_id, theme, density, typography, window, cx)

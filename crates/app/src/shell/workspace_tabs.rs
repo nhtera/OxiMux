@@ -16,12 +16,11 @@ use gpui::{
 };
 
 use crate::actions::{SplitDown, SplitLeft, SplitRight, SplitUp};
-use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{CloseTab, NewTab, NextTab, PrevTab};
 use crate::shell::main_pane::MainPane;
-use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView};
+use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
 struct WorkspaceTab {
     label: SharedString,
@@ -478,19 +477,7 @@ fn spawn_main_pane(
     window: &mut Window,
     cx: &mut Context<WorkspaceTabs>,
 ) -> Option<Entity<MainPane>> {
-    let mut backend = PortablePtyBackend::new();
-    let cfg = SpawnConfig {
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
-        ..SpawnConfig::default()
-    };
-    let session_id = match backend.spawn(cfg) {
-        Ok(id) => id,
-        Err(err) => {
-            tracing::warn!(?err, "pty spawn for new workspace tab failed");
-            return None;
-        }
-    };
+    let (backend, session_id) = spawn_local_pty()?;
     let typography_for_view = typography.clone();
     let initial_view = cx.new(|cx| {
         TerminalView::mount(

@@ -17,14 +17,17 @@
 //! it on the next `maybe_resize` tick. This lets one window host an
 //! arbitrary tree of splits without each leaf double-counting chrome.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, ParentElement, Render, Styled, Task, Window, div, px,
 };
+use oximux_agents::SharedBackend;
 use oximux_pty::{
-    PortablePtyBackend, TerminalBackend, TerminalEvent, TerminalSessionId, TerminalSnapshot,
+    PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId,
+    TerminalSnapshot,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -50,8 +53,37 @@ const BLINK_INTERVAL_MS: u64 = 530;
 pub const DEFAULT_COLS: u16 = 100;
 pub const DEFAULT_ROWS: u16 = 32;
 
+/// Spawn a local-shell PTY and wrap its backend in the shared-Arc form
+/// `TerminalView::mount` expects. Centralizes the three previously-
+/// duplicated spawn sites (workspace bootstrap, tab-strip new-tab,
+/// pane-grid split). Returns `None` on spawn failure (caller logs + falls
+/// back to a placeholder); the `tracing::warn` is emitted here so each
+/// caller doesn't repeat the same line.
+pub fn spawn_local_pty() -> Option<(SharedBackend, TerminalSessionId)> {
+    let mut backend = PortablePtyBackend::new();
+    let cfg = SpawnConfig {
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+        ..SpawnConfig::default()
+    };
+    let session_id = match backend.spawn(cfg) {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(?err, "pty spawn failed");
+            return None;
+        }
+    };
+    let boxed: Box<dyn TerminalBackend> = Box::new(backend);
+    Some((Arc::new(Mutex::new(boxed)), session_id))
+}
+
 pub struct TerminalView {
-    backend: PortablePtyBackend,
+    /// `Arc<Mutex<Box<dyn TerminalBackend>>>` — shared with whoever spawned
+    /// the session. For local terminals the renderer is the only holder;
+    /// for agent tabs `CliRuntime` holds the same Arc inside its
+    /// `SessionEntry` and the poll task races on this lock. Lock window is
+    /// the duration of a single non-blocking trait call.
+    backend: SharedBackend,
     session_id: TerminalSessionId,
     snapshot: TerminalSnapshot,
     theme: Theme,
@@ -89,7 +121,7 @@ impl TerminalView {
     /// infallible; this keeps spawn errors at the caller where they can be
     /// logged + fall back to a placeholder.
     pub fn mount(
-        backend: PortablePtyBackend,
+        backend: SharedBackend,
         session_id: TerminalSessionId,
         theme: Theme,
         density: Density,
@@ -98,6 +130,8 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot = backend
+            .lock()
+            .expect("pty backend mutex poisoned")
             .snapshot(session_id)
             .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS));
 
@@ -203,6 +237,14 @@ impl TerminalView {
         self.target_grid = (cols, rows);
     }
 
+    /// Lock the shared backend briefly and run `f` against the trait. The
+    /// lock is held for one non-blocking call only — never await across,
+    /// never sleep within. Returns whatever `f` returns.
+    fn with_backend<R>(&self, f: impl FnOnce(&mut dyn TerminalBackend) -> R) -> R {
+        let mut be = self.backend.lock().expect("pty backend mutex poisoned");
+        f(&mut **be)
+    }
+
     fn on_search(&mut self, _: &Search, _window: &mut Window, cx: &mut Context<Self>) {
         self.search.open();
         self.rerun_search();
@@ -210,7 +252,8 @@ impl TerminalView {
     }
 
     fn rerun_search(&mut self) {
-        let grid = self.backend.search_grid(self.session_id);
+        let session_id = self.session_id;
+        let grid = self.with_backend(|be| be.search_grid(session_id));
         let visible = self.snapshot.cells.len();
         self.search.rerun(&grid, visible);
     }
@@ -269,7 +312,8 @@ impl TerminalView {
         if bytes.is_empty() {
             return;
         }
-        if let Err(err) = self.backend.write(self.session_id, bytes) {
+        let session_id = self.session_id;
+        if let Err(err) = self.with_backend(|be| be.write(session_id, bytes)) {
             tracing::warn!(?err, "pty write failed");
             return;
         }
@@ -313,9 +357,9 @@ impl TerminalView {
         // chunk as a single insertion (no per-line execution, no autocomplete
         // expansion). Plain `cat` etc. leave it off — we'd just leak the
         // escape bytes as literal text, so passthrough is correct there.
+        let session_id = self.session_id;
         let wrap = self
-            .backend
-            .bracketed_paste(self.session_id)
+            .with_backend(|be| be.bracketed_paste(session_id))
             .unwrap_or(false);
         let mut out = Vec::with_capacity(sanitized.len() + if wrap { 12 } else { 0 });
         if wrap {
@@ -329,7 +373,7 @@ impl TerminalView {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
-        let events = self.backend.drain_events();
+        let events = self.with_backend(|be| be.drain_events());
         if events.is_empty() {
             return;
         }
@@ -356,7 +400,8 @@ impl TerminalView {
                 _ => {}
             }
         }
-        if needs_snapshot && let Ok(snapshot) = self.backend.snapshot(self.session_id) {
+        let session_id = self.session_id;
+        if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
             self.snapshot = snapshot;
         }
         if had_output {
@@ -378,10 +423,9 @@ impl TerminalView {
         if self.target_grid == self.last_resize {
             return;
         }
-        if let Err(err) =
-            self.backend
-                .resize(self.session_id, self.target_grid.0, self.target_grid.1)
-        {
+        let session_id = self.session_id;
+        let (cols, rows) = self.target_grid;
+        if let Err(err) = self.with_backend(|be| be.resize(session_id, cols, rows)) {
             tracing::warn!(?err, "pty resize failed");
             return;
         }
@@ -392,7 +436,7 @@ impl TerminalView {
         // `Term::resize` already performed isn't visible until the shell
         // next emits output. The render that triggered `maybe_resize`
         // proceeds with up-to-date cell data this same frame.
-        if let Ok(snapshot) = self.backend.snapshot(self.session_id) {
+        if let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
             self.snapshot = snapshot;
         }
     }

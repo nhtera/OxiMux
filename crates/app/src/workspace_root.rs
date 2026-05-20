@@ -29,7 +29,6 @@ use gpui::{
     Render, Styled, Subscription, Window, div, px,
 };
 use oximux_git::Repository;
-use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
@@ -46,7 +45,7 @@ use crate::shell::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
     },
     status_bar,
-    terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView},
+    terminal_view::{TerminalView, spawn_local_pty},
     top_bar,
     workspace_tabs::{self, WorkspaceTabs},
 };
@@ -132,19 +131,7 @@ fn spawn_initial_workspace(
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<Entity<WorkspaceTabs>> {
-    let mut backend = PortablePtyBackend::new();
-    let cfg = SpawnConfig {
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
-        ..SpawnConfig::default()
-    };
-    let session_id = match backend.spawn(cfg) {
-        Ok(id) => id,
-        Err(err) => {
-            tracing::warn!(?err, "pty spawn failed; rendering placeholder");
-            return None;
-        }
-    };
+    let (backend, session_id) = spawn_local_pty()?;
     let typography_for_view = typography.clone();
     let initial_view = cx.new(|cx| {
         TerminalView::mount(

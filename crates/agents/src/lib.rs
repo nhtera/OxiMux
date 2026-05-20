@@ -17,5 +17,5 @@ pub use cli::{
 };
 pub use registry::{AdapterRegistry, RegistryEntry};
 pub use runtime::{AgentRuntime, AgentSessionConfig, AgentStatusStream};
-pub use runtime_impl::CliRuntime;
+pub use runtime_impl::{CliRuntime, SharedBackend};
 pub use status_machine::{StatusMachine, StatusTransition};

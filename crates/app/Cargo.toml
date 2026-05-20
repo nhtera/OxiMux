@@ -12,6 +12,7 @@ name = "oximux"
 path = "src/main.rs"
 
 [dependencies]
+oximux-agents = { workspace = true }
 oximux-core = { workspace = true }
 oximux-git = { workspace = true }
 oximux-pty = { workspace = true }

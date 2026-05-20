@@ -4280,6 +4280,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_macros",
  "gpui_platform",
+ "oximux-agents",
  "oximux-core",
  "oximux-git",
  "oximux-pty",
