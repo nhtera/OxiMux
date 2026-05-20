@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use oximux_core::AgentStatus;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use tokio::process::Command;
 
+use crate::cli::detect::which_on_path;
 use crate::cli::{CliAgentAdapter, CommandSpec, StatusPattern};
 use crate::runtime::AgentSessionConfig;
 
@@ -70,20 +70,6 @@ fn patterns() -> &'static [StatusPattern] {
             ]
         })
         .as_slice()
-}
-
-/// Shared helper for the CLI adapters' `detect()` impls. Shells out to
-/// `which <bin>` and treats a 0 exit as "installed". Never returns `Err`
-/// so the registry never panics on a missing tool. Lives here until a
-/// second adapter (`codex.rs`, step 6) wants it — then promote to
-/// `cli/detect.rs`.
-async fn which_on_path(bin: &str) -> bool {
-    Command::new("which")
-        .arg(bin)
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 #[async_trait]

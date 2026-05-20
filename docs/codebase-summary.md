@@ -176,11 +176,17 @@ src/
     ├── adapter.rs      CliAgentAdapter: Send+Sync+'static async trait
     │                   CommandSpec { program, args, env, stdin_seed }
     │                   StatusPattern { regex::bytes::Regex, target_status } — bytes engine: raw PTY not guaranteed UTF-8
+    ├── detect.rs       pub(crate) async fn which_on_path(bin) -> bool
+    │                   Shared helper: shells out to `which`, never panics, false on miss
     ├── claude_code.rs  ClaudeCodeAdapter — interactive PTY launch of `claude`
     │                   build_command: optional --model/--effort then prompt as trailing positional
-    │                   detect: shells out to `which claude` (helper `which_on_path`, promotes to cli/detect.rs at step 6)
     │                   status_patterns: 2 NeedsApproval rules (workspace-trust / tool-approval)
     │                   patterns omit leading `\b` so ANSI-SGR-prefixed prompts still match
+    ├── codex.rs        CodexAdapter — interactive PTY launch of `codex`
+    │                   build_command: optional -m <model> then prompt as trailing positional
+    │                   cfg.effort silently ignored (no CLI analog); no --ask-for-approval / --sandbox
+    │                   (user's ~/.codex/config.toml owns approval cadence per v0.9 retro)
+    │                   status_patterns() intentionally empty — deferred to step-14 dogfood capture
     └── custom.rs       CustomCommandAdapter — escape-hatch CliAgentAdapter impl
                         Reads custom_command: Option<(String, Vec<String>)> from AgentSessionConfig
                         status_patterns() intentionally empty — falls through to StatusMachine defaults
