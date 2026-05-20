@@ -18,12 +18,12 @@ use crate::actions::{RevertFile, StageFile, UnstageFile};
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::changed_files::{RenderCtx, partition_files, render_sections};
 use crate::shell::source_control::filter::filter_files;
+use crate::shell::source_control::style as sc_style;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
     Render, ScrollHandle, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 use gpui_component::scroll::ScrollableElement as _;
-use crate::shell::source_control::style as sc_style;
 use oximux_core::GitState;
 use oximux_git::{PollState, Repository};
 use oximux_settings::{Density, Theme, Typography};

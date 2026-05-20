@@ -109,8 +109,7 @@ impl SourceControlPanel {
         };
         let observer = Self::start_state_observer(state_rx, cx);
 
-        let filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
+        let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
         // Push every keystroke into both this panel's `filter_query` (used by
         // the future "no matches" empty state) and into the embedded
         // `GitPanel`, which actually filters the rendered file list.
@@ -432,11 +431,7 @@ impl SourceControlPanel {
                 Button::new("sc-filter-clear")
                     .ghost()
                     .xsmall()
-                    .icon(
-                        Icon::default()
-                            .path("icons/x.svg")
-                            .size(px(sc_style::ICON)),
-                    )
+                    .icon(Icon::default().path("icons/x.svg").size(px(sc_style::ICON)))
                     .tooltip("Clear filter")
                     .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
                         panel.clear_filter(window, cx);

@@ -211,11 +211,7 @@ impl Render for CommitGraph {
                 can_load_more,
                 refreshing,
                 ..
-            } => (
-                format!("{}", commits.len()),
-                *can_load_more,
-                *refreshing,
-            ),
+            } => (format!("{}", commits.len()), *can_load_more, *refreshing),
             // Initial load (no data yet) — keep the header count placeholder
             // muted so the user sees the section is still resolving.
             _ => ("…".to_string(), false, false),
@@ -390,8 +386,7 @@ impl Render for CommitGraph {
                         .text_size(px(sc_style::META_TEXT))
                         .text_color(theme.fg_subtle)
                         .when(!is_loading, |s| {
-                            s.cursor_pointer()
-                                .hover(|s| s.text_color(theme.fg_base))
+                            s.cursor_pointer().hover(|s| s.text_color(theme.fg_base))
                         })
                         .when(!is_loading, |s| {
                             s.on_mouse_down(
@@ -402,7 +397,11 @@ impl Render for CommitGraph {
                                 }),
                             )
                         })
-                        .child(if is_loading { "Loading…" } else { "Load more" }),
+                        .child(if is_loading {
+                            "Loading…"
+                        } else {
+                            "Load more"
+                        }),
                 )
             }
             _ => None,
@@ -539,12 +538,7 @@ fn render_commit_row(
             let theme = tip_theme;
             let typography = tip_typography.clone();
             Tooltip::element(move |_window, _cx| {
-                render_commit_tooltip(
-                    subject.clone(),
-                    body.clone(),
-                    theme,
-                    typography.clone(),
-                )
+                render_commit_tooltip(subject.clone(), body.clone(), theme, typography.clone())
             })
             .build(window, cx)
         })
@@ -571,11 +565,7 @@ fn render_commit_tooltip(
         .max_w(max_width)
         .text_size(px(sc_style::TEXT))
         .text_color(theme.fg_base)
-        .child(
-            div()
-                .font_weight(typography.w_semibold)
-                .child(subject),
-        );
+        .child(div().font_weight(typography.w_semibold).child(subject));
 
     if !body.is_empty() {
         // GPUI's text element doesn't split on `\n` itself, so we emit one
