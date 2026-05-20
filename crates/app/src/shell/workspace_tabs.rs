@@ -27,7 +27,9 @@ use crate::actions::{
     CloseTab, NewAgent, NewTab, NextTab, PrevTab, RequestOpenAdapterPicker, SplitDown, SplitLeft,
     SplitRight, SplitUp,
 };
+use crate::notifier::{Notifier, TabId};
 use crate::shell::agent_status_badge::render_dot;
+use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
 use crate::shell::main_pane::MainPane;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
@@ -88,15 +90,30 @@ pub struct WorkspaceTabs {
     /// button. `None` for the keyboard-only path (Cmd+Shift+A) where no
     /// click position is available.
     last_plus_click_x: Cell<Option<f32>>,
+    /// macOS notification sink. `Arc<dyn Notifier>` so the per-tab status
+    /// task can clone cheaply and so non-mac builds can swap in
+    /// `NullNotifier` without conditional compilation at this layer.
+    notifier: Arc<dyn Notifier>,
+    /// Current GPUI window active state. Updated by the
+    /// `_window_activation_observer` subscription below; read by the per-tab
+    /// status task before deciding whether to dispatch a notification. The
+    /// badge alone is sufficient when the user is already looking at the app.
+    window_active: bool,
+    /// Holds the `observe_window_activation` subscription alive for the
+    /// lifetime of this entity. Drop ends the subscription.
+    _window_activation_observer: Subscription,
 }
 
 impl WorkspaceTabs {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_pane: Entity<MainPane>,
         theme: Theme,
         density: Density,
         typography: Typography,
         cli_runtime: Arc<CliRuntime>,
+        notifier: Arc<dyn Notifier>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let observer = cx.observe(&initial_pane, |_, _, cx| cx.notify());
@@ -108,6 +125,11 @@ impl WorkspaceTabs {
             _observer: observer,
             _status_task: None,
         }];
+        let window_active = window.is_window_active();
+        let window_activation_observer =
+            cx.observe_window_activation(window, |this, window, _cx| {
+                this.window_active = window.is_window_active();
+            });
         Self {
             tabs,
             active: 0,
@@ -118,6 +140,9 @@ impl WorkspaceTabs {
             focus_handle: cx.focus_handle(),
             cli_runtime,
             last_plus_click_x: Cell::new(None),
+            notifier,
+            window_active,
+            _window_activation_observer: window_activation_observer,
         }
     }
 
@@ -144,6 +169,13 @@ impl WorkspaceTabs {
 
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    /// True when the GPUI window is currently the active app window.
+    /// Consumed by per-agent status watchers to decide whether to bother
+    /// the user with a macOS notification on `NeedsApproval` transitions.
+    pub fn window_active(&self) -> bool {
+        self.window_active
     }
 
     /// Forward the chrome width to every tab's MainPane. Inactive tabs still
@@ -235,6 +267,31 @@ impl WorkspaceTabs {
         }
     }
 
+    /// Activate the tab whose agent session matches `tab_id`. Returns true
+    /// when a matching tab was found (and either was already active or has
+    /// been activated). Lookup is by `AgentSessionId` — stable across tab
+    /// reorder and label rename, unlike the strip index used by
+    /// `set_active`. Used by the notification click router: the user clicks
+    /// a "needs approval" banner, the router sends the originating session's
+    /// id over an mpsc, and this method resolves it back to the current
+    /// strip index. Missing id (tab closed before click) is a silent
+    /// no-op — the caller logs at debug if it cares.
+    pub fn set_active_by_tab_id(
+        &mut self,
+        tab_id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(idx) = self.tabs.iter().position(|t| match &t.kind {
+            WorkspaceTabKind::Agent { session_id, .. } => TabId::from(*session_id) == tab_id,
+            WorkspaceTabKind::Terminal => false,
+        }) else {
+            return false;
+        };
+        self.set_active(idx, window, cx);
+        true
+    }
+
     pub fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() < 2 {
             return;
@@ -315,26 +372,13 @@ impl WorkspaceTabs {
         let observer = cx.observe(&pane, |_, _, cx| cx.notify());
         let current_labels: Vec<SharedString> = self.tabs.iter().map(|t| t.label.clone()).collect();
         let label = agent_tab_label::next_label_for(adapter_id, &current_labels);
-        // Wake the strip on every status transition so the badge dot recolors
-        // without a polling timer. The receiver clone is cheap (watch is
-        // Arc-backed). Bailing on `changed().is_err()` or a stale weak handle
-        // ends the task — the same exit pattern `terminal_view.rs` uses.
-        let mut status_rx_for_task = status_rx.clone();
-        let status_task = cx.spawn(async move |weak, cx| {
-            // Mark the initial value as seen so `changed()` waits for the
-            // first real transition. `watch::Sender::send` bumps the version
-            // counter unconditionally — without this, a future duplicate
-            // send would double-fire `cx.notify()`.
-            let _ = status_rx_for_task.borrow_and_update();
-            loop {
-                if status_rx_for_task.changed().await.is_err() {
-                    return;
-                }
-                if weak.update(cx, |_, cx| cx.notify()).is_err() {
-                    return;
-                }
-            }
-        });
+        let status_task = spawn_status_task(
+            status_rx.clone(),
+            self.notifier.clone(),
+            TabId::from(session_id),
+            label.clone(),
+            cx,
+        );
         self.tabs.push(WorkspaceTab {
             label,
             pane,

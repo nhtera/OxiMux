@@ -5,6 +5,7 @@
 
 pub mod adapter_picker;
 pub mod agent_status_badge;
+pub mod agent_status_task;
 pub mod agent_tab_label;
 pub mod cell_metrics;
 pub mod command_palette;

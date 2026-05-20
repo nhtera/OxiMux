@@ -28,12 +28,14 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Subscription, WeakEntity, Window, div, px,
+    Render, Styled, Subscription, Task, WeakEntity, Window, div, px,
 };
 use oximux_agents::{AdapterRegistry, AgentRuntime, AgentSessionConfig, CliRuntime};
 use oximux_core::AgentAdapter;
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
+
+use crate::notifier::{Notifier, TabId};
 
 use crate::actions::{
     OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenQuickOpen, RequestOpenAdapterPicker,
@@ -96,6 +98,11 @@ pub struct WorkspaceRoot {
     /// (mirrors the standard `document.hasFocus()` gate). Held to keep the
     /// subscription alive for the lifetime of the workspace.
     _window_activation_observer: Subscription,
+    /// Drains tab-ids posted by the macOS notifier's click watcher and
+    /// activates the matching agent tab. Dropping the task cancels the
+    /// loop — bound to WorkspaceRoot's lifetime so a window close stops
+    /// trying to dispatch focus events into a torn-down view tree.
+    _click_router: Task<()>,
 }
 
 impl WorkspaceRoot {
@@ -125,11 +132,28 @@ impl WorkspaceRoot {
             }
         }
 
+        // macOS notification click bridge. The notifier (a Send + Sync
+        // `Notifier` impl) gets the sender; the router task below drains
+        // the receiver on the GPUI side. Non-mac builds plug in a no-op
+        // notifier and the channel pair is unused.
+        let (click_tx, mut click_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        #[cfg(target_os = "macos")]
+        let notifier: Arc<dyn Notifier> =
+            Arc::new(crate::notifier::mac::MacNotifier::new(click_tx));
+        #[cfg(not(target_os = "macos"))]
+        let notifier: Arc<dyn Notifier> = {
+            // Channel exists to keep type-shape consistent across cfg;
+            // sender is dropped, receiver yields None immediately.
+            drop(click_tx);
+            Arc::new(crate::notifier::null::NullNotifier)
+        };
+
         let workspace_tabs = spawn_initial_workspace(
             theme,
             density,
             typography.clone(),
             cli_runtime.clone(),
+            notifier.clone(),
             window,
             cx,
         );
@@ -177,6 +201,35 @@ impl WorkspaceRoot {
                 }
             });
 
+        // Click router: drains tab-ids posted by the macOS click watcher.
+        // For each id, raise the window and activate the matching tab.
+        // Closure ends when the mpsc receiver returns None (all senders
+        // dropped, e.g. at app shutdown) or when the entity is gone.
+        let click_router = cx.spawn_in(window, async move |weak, cx| {
+            while let Some(tab_id_raw) = click_rx.recv().await {
+                let tab_id = TabId(tab_id_raw);
+                // Raise the window only when the tab still exists. A
+                // notification for a since-closed agent (M1 review-260521):
+                // popping the window with no destination would be a
+                // disruptive UX on a stale click.
+                if weak
+                    .update_in(cx, |root, window, cx| {
+                        let activated = root.workspace_tabs.as_ref().is_some_and(|tabs_entity| {
+                            tabs_entity.update(cx, |tabs, cx| {
+                                tabs.set_active_by_tab_id(tab_id, window, cx)
+                            })
+                        });
+                        if activated {
+                            window.activate_window();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
         Self {
             theme,
             density,
@@ -192,6 +245,7 @@ impl WorkspaceRoot {
             left_rail_open: true,
             _workspace_tabs_observer: workspace_tabs_observer,
             _window_activation_observer: window_activation_observer,
+            _click_router: click_router,
         }
     }
 
@@ -314,6 +368,7 @@ fn spawn_initial_workspace(
     density: Density,
     typography: Typography,
     cli_runtime: Arc<CliRuntime>,
+    notifier: Arc<dyn Notifier>,
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<Entity<WorkspaceTabs>> {
@@ -332,7 +387,18 @@ fn spawn_initial_workspace(
     });
     let initial_pane =
         cx.new(|cx| MainPane::new(initial_view, theme, density, typography.clone(), cx));
-    Some(cx.new(|cx| WorkspaceTabs::new(initial_pane, theme, density, typography, cli_runtime, cx)))
+    Some(cx.new(|cx| {
+        WorkspaceTabs::new(
+            initial_pane,
+            theme,
+            density,
+            typography,
+            cli_runtime,
+            notifier,
+            window,
+            cx,
+        )
+    }))
 }
 
 impl Render for WorkspaceRoot {
