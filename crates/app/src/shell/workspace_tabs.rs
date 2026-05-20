@@ -9,22 +9,51 @@
 //! Cmd-{) that bubble up from the focused TerminalView through the active
 //! MainPane.
 
+use std::sync::Arc;
+
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, svg,
 };
+use oximux_agents::{
+    AdapterRegistry, AgentRuntime, AgentSessionConfig, AgentStatusStream, CliRuntime,
+};
+use oximux_core::{AgentAdapter, AgentSessionId};
 
 use crate::actions::{SplitDown, SplitLeft, SplitRight, SplitUp};
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{CloseTab, NewTab, NextTab, PrevTab};
+use crate::actions::{CloseTab, NewAgent, NewTab, NextTab, PrevTab};
+use crate::shell::agent_tab_label;
 use crate::shell::main_pane::MainPane;
-use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
+use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView, spawn_local_pty};
+
+/// Whether a workspace tab hosts a raw shell PTY (Terminal) or an agent
+/// session managed by `CliRuntime` (Agent). Phase 3 step 9 adds the
+/// distinction so the status bar `agent_count`, future status badge, and
+/// label prefix all read from one source of truth.
+pub enum WorkspaceTabKind {
+    /// Plain shell. The pane owns its own local `SharedBackend`; no
+    /// `CliRuntime` involvement.
+    Terminal,
+    /// Agent session. The `CliRuntime` owns the PTY backend; the renderer
+    /// holds a clone of the same Arc via `TerminalView`. `status_rx` is
+    /// the watch receiver the step-11 status badge reads from.
+    Agent {
+        /// Adapter id slug — `"claude-code"`, `"codex"`, `"aider"`, etc.
+        adapter_id: &'static str,
+        /// Runtime-assigned session id; used for cancel + status lookups.
+        session_id: AgentSessionId,
+        /// Live status receiver. Cloned cheaply (`watch::Receiver` is Arc-backed).
+        status_rx: AgentStatusStream,
+    },
+}
 
 struct WorkspaceTab {
     label: SharedString,
     pane: Entity<MainPane>,
+    kind: WorkspaceTabKind,
     _observer: Subscription,
 }
 
@@ -36,6 +65,18 @@ pub struct WorkspaceTabs {
     density: Density,
     typography: Typography,
     focus_handle: FocusHandle,
+    /// App-level singletons threaded down so the (future) NewAgent action
+    /// handler can resolve the first-available adapter and spawn a session
+    /// without reaching back up to `WorkspaceRoot`.
+    cli_runtime: Arc<CliRuntime>,
+    adapter_registry: Arc<AdapterRegistry>,
+    /// H1 (review 260520-1700): debounce guard for the Cmd+Shift+A
+    /// keyboard stopgap. macOS auto-repeat fires the action at ~30 Hz
+    /// while the key is held; without this guard a two-second hold would
+    /// launch dozens of `claude`/`codex`/`aider` processes in parallel.
+    /// Set to `true` on entry, cleared from the `update_in` closure (or
+    /// from the error path inside the async task).
+    spawning_agent: bool,
 }
 
 impl WorkspaceTabs {
@@ -44,6 +85,8 @@ impl WorkspaceTabs {
         theme: Theme,
         density: Density,
         typography: Typography,
+        cli_runtime: Arc<CliRuntime>,
+        adapter_registry: Arc<AdapterRegistry>,
         cx: &mut Context<Self>,
     ) -> Self {
         let observer = cx.observe(&initial_pane, |_, _, cx| cx.notify());
@@ -51,6 +94,7 @@ impl WorkspaceTabs {
         let tabs = vec![WorkspaceTab {
             label,
             pane: initial_pane,
+            kind: WorkspaceTabKind::Terminal,
             _observer: observer,
         }];
         Self {
@@ -61,7 +105,30 @@ impl WorkspaceTabs {
             density,
             typography,
             focus_handle: cx.focus_handle(),
+            cli_runtime,
+            adapter_registry,
+            spawning_agent: false,
         }
+    }
+
+    /// Count of currently-open agent tabs. Consumed by the status bar's
+    /// `agent_count` slot (sub-6).
+    pub fn agent_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|t| matches!(t.kind, WorkspaceTabKind::Agent { .. }))
+            .count()
+    }
+
+    /// Read-only access to the CLI runtime + adapter registry, used by
+    /// follow-up wiring (the NewAgent action handler in sub-5, settings
+    /// panel later). Returns `Arc` clones so callers can hold across
+    /// async boundaries.
+    pub fn cli_runtime(&self) -> Arc<CliRuntime> {
+        self.cli_runtime.clone()
+    }
+    pub fn adapter_registry(&self) -> Arc<AdapterRegistry> {
+        self.adapter_registry.clone()
     }
 
     pub fn active_pane(&self) -> Option<Entity<MainPane>> {
@@ -99,6 +166,7 @@ impl WorkspaceTabs {
         self.tabs.push(WorkspaceTab {
             label: SharedString::from(format!("Terminal {n}")),
             pane: new_pane,
+            kind: WorkspaceTabKind::Terminal,
             _observer: observer,
         });
         self.active = self.tabs.len() - 1;
@@ -110,7 +178,24 @@ impl WorkspaceTabs {
         if idx >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(idx);
+        let removed = self.tabs.remove(idx);
+        // C1 (review 260520-1700): an Agent tab's `WorkspaceTabKind::Agent`
+        // holds the runtime's `AgentSessionId`. Dropping the tab releases
+        // the `Receiver<AgentStatus>` clone but leaves the `SessionEntry`
+        // inside `CliRuntime` — the PTY process and poll task survive. Fire
+        // `cancel` async so the process tree is reaped (SIGKILL via
+        // `portable-pty` per the existing `cancel` path; SIGTERM grace
+        // lands in step 13). Detach the task: tab close should not block
+        // the UI on agent shutdown.
+        if let WorkspaceTabKind::Agent { session_id, .. } = removed.kind {
+            let runtime = self.cli_runtime.clone();
+            cx.spawn_in(window, async move |_this, _cx| {
+                if let Err(err) = runtime.cancel(session_id).await {
+                    tracing::warn!(?err, "close_tab: agent cancel failed");
+                }
+            })
+            .detach();
+        }
         if self.tabs.is_empty() {
             // Closing the last tab drops the workspace into the empty welcome
             // state. `active` is irrelevant when there are no tabs; reset to
@@ -182,6 +267,177 @@ impl WorkspaceTabs {
 
     fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
         self.prev_tab(window, cx);
+    }
+
+    /// Throwaway keyboard spawn — Cmd+Shift+A. Picks the first available
+    /// non-Custom adapter from `registry.detect_available()`, spawns a
+    /// session with `cwd = std::env::current_dir()` and no initial prompt,
+    /// then mounts a fresh tab with `WorkspaceTabKind::Agent`. Replaced by
+    /// the inline-popover adapter picker in step 10.
+    fn on_new_agent(&mut self, _: &NewAgent, window: &mut Window, cx: &mut Context<Self>) {
+        // H1: debounce key auto-repeat. macOS fires actions at ~30 Hz while
+        // the key is held; without this guard a 2-second hold would launch
+        // dozens of CLI agent processes in parallel before the first tab
+        // is even mounted. The flag clears inside `update_in` (success) or
+        // along every error path before this function returns.
+        if self.spawning_agent {
+            return;
+        }
+        self.spawning_agent = true;
+
+        let runtime = self.cli_runtime.clone();
+        let registry = self.adapter_registry.clone();
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        cx.spawn_in(window, async move |this, cx| {
+            // H2: hard cap on detection. `which` on an NFS PATH can stall
+            // indefinitely — 500 ms is generous for the local-binary case
+            // (~60 ms typical) while keeping the UI responsive when the
+            // user retries after a missed press.
+            let entries = match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                registry.detect_available(),
+            )
+            .await
+            {
+                Ok(es) => es,
+                Err(_) => {
+                    tracing::warn!(
+                        "NewAgent: adapter detection timed out after 500ms; PATH may be on a slow mount"
+                    );
+                    let _ = this
+                        .update(cx, |tabs, _| tabs.spawning_agent = false);
+                    return;
+                }
+            };
+            // Custom adapter is skipped: `CustomCommandAdapter::detect` always
+            // reports true, so without filtering it would always match first
+            // before any real agent. Custom also needs a user-supplied
+            // `(program, args)` pair this keyboard stopgap can't surface;
+            // step 10's popover prompts for it.
+            let Some(entry) = entries
+                .iter()
+                .find(|e| e.available && e.adapter_enum != AgentAdapter::Custom)
+            else {
+                tracing::warn!(
+                    "NewAgent: no built-in agent detected on PATH; install claude/codex/aider or use the launch popover (step 10)"
+                );
+                let _ = this
+                    .update(cx, |tabs, _| tabs.spawning_agent = false);
+                return;
+            };
+            let adapter_kind = entry.adapter_enum;
+            let adapter_id = entry.adapter_id;
+
+            let cfg = AgentSessionConfig {
+                adapter: adapter_kind,
+                worktree_path: cwd,
+                prompt: None,
+                model: None,
+                effort: None,
+                env: Vec::new(),
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+                custom_command: None,
+            };
+            let session_id = match runtime.start_session(cfg).await {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(?err, adapter = adapter_id, "NewAgent: start_session failed");
+                    let _ = this
+                        .update(cx, |tabs, _| tabs.spawning_agent = false);
+                    return;
+                }
+            };
+            // backend_for / terminal_session_id / subscribe_status are
+            // infallible right after a successful start_session — the
+            // session was inserted into the table under the same lock that
+            // these methods take. Surface as warns rather than panic to
+            // keep the UI alive; cancel the session so we don't leak.
+            let backend = match runtime.backend_for(session_id) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(?err, "NewAgent: backend_for after start_session");
+                    let _ = runtime.cancel(session_id).await;
+                    let _ = this
+                        .update(cx, |tabs, _| tabs.spawning_agent = false);
+                    return;
+                }
+            };
+            let term_id = match runtime.terminal_session_id(session_id) {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(?err, "NewAgent: terminal_session_id after start_session");
+                    let _ = runtime.cancel(session_id).await;
+                    let _ = this
+                        .update(cx, |tabs, _| tabs.spawning_agent = false);
+                    return;
+                }
+            };
+            let status_rx = match runtime.subscribe_status(session_id) {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(?err, "NewAgent: subscribe_status after start_session");
+                    let _ = runtime.cancel(session_id).await;
+                    let _ = this
+                        .update(cx, |tabs, _| tabs.spawning_agent = false);
+                    return;
+                }
+            };
+
+            let mount_result = this.update_in(cx, |tabs, window, cx| {
+                let typography_for_view = typography.clone();
+                let view = cx.new(|cx| {
+                    TerminalView::mount(
+                        backend,
+                        term_id,
+                        theme,
+                        density,
+                        typography_for_view,
+                        window,
+                        cx,
+                    )
+                });
+                let pane =
+                    cx.new(|cx| MainPane::new(view, theme, density, typography.clone(), cx));
+                let observer = cx.observe(&pane, |_, _, cx| cx.notify());
+                // M1: re-snapshot labels at mount time rather than at
+                // action-fire time so a terminal tab opened during the
+                // ~110 ms spawn window is included in the counter scan.
+                let current_labels: Vec<SharedString> =
+                    tabs.tabs.iter().map(|t| t.label.clone()).collect();
+                let label = agent_tab_label::next_label_for(adapter_id, &current_labels);
+                tabs.tabs.push(WorkspaceTab {
+                    label,
+                    pane,
+                    kind: WorkspaceTabKind::Agent {
+                        adapter_id,
+                        session_id,
+                        status_rx,
+                    },
+                    _observer: observer,
+                });
+                tabs.active = tabs.tabs.len() - 1;
+                tabs.focus_active(window, cx);
+                tabs.spawning_agent = false;
+                cx.notify();
+            });
+            // C2: window/workspace closed mid-spawn — the agent process is
+            // already started but no tab will ever own it. Cancel here so
+            // it doesn't zombie. The `spawning_agent` flag dies with the
+            // entity so no clear needed on this branch.
+            if mount_result.is_err() {
+                tracing::warn!(
+                    ?session_id,
+                    "NewAgent: WorkspaceTabs dropped mid-spawn; cancelling orphaned session"
+                );
+                let _ = runtime.cancel(session_id).await;
+            }
+        })
+        .detach();
     }
 }
 
@@ -515,7 +771,8 @@ impl Render for WorkspaceTabs {
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))
-            .on_action(cx.listener(Self::on_prev_tab));
+            .on_action(cx.listener(Self::on_prev_tab))
+            .on_action(cx.listener(Self::on_new_agent));
         if let Some(pane) = self.active_pane() {
             root = root.child(pane);
         } else {

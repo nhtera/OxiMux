@@ -81,5 +81,11 @@ actions!(
         OpenQuickOpen,
         /// Open the action Command Palette (Cmd+Shift+P). Phase 05.
         OpenCommandPalette,
+        /// Spawn a new agent tab using the first available built-in adapter.
+        /// Bound to Cmd+Shift+A as a throwaway keyboard stopgap; step 10
+        /// replaces it with an inline-popover adapter picker on the `+`
+        /// button. Picks the first non-Custom adapter from the registry's
+        /// detection walk; bails with a tracing::warn if none are installed.
+        NewAgent,
     ]
 );

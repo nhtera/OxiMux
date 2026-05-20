@@ -3,6 +3,7 @@
 //! Each child module is one zone of the cockpit. They take a `Theme + Density
 //! + Typography` and return an `impl IntoElement` (RenderOnce). No state.
 
+pub mod agent_tab_label;
 pub mod cell_metrics;
 pub mod command_palette;
 pub mod commit_dialog;

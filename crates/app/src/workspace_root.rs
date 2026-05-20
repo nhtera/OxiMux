@@ -24,10 +24,14 @@
 //! reachable — mirrors the `titlebar-left` floating behavior found in
 //! similar workspace shells.
 
+use std::sync::Arc;
+
 use gpui::{
     AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
     Render, Styled, Subscription, Window, div, px,
 };
+use oximux_agents::{AdapterRegistry, CliRuntime};
+use oximux_core::AgentAdapter;
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -59,6 +63,15 @@ pub struct WorkspaceRoot {
     left_rail: Entity<LeftRail>,
     palette: Entity<PaletteModal>,
     pane_actions: Entity<PaneActionsMenu>,
+    /// CLI agent runtime — owns every agent session's PTY backend and
+    /// publishes `AgentStatusStream` per session. One per workspace, held
+    /// behind `Arc` so the `WorkspaceTabs` strip can clone a reference
+    /// into the NewAgent action handler.
+    cli_runtime: Arc<CliRuntime>,
+    /// Cached registry of the four built-in adapters. Held alongside the
+    /// runtime so the launch surface (Cmd+Shift+A keyboard stopgap today,
+    /// popover UX in step 10) can call `detect_available()` lazily.
+    adapter_registry: Arc<AdapterRegistry>,
     /// Whether the left rail (workspaces + nav) is visible. Toggled via Cmd+B.
     left_rail_open: bool,
     /// Forwards WorkspaceTabs notifications (open/close/select tab) up to
@@ -79,8 +92,36 @@ impl WorkspaceRoot {
         let density = Density::cockpit();
         let typography = Typography::cockpit();
 
-        let workspace_tabs =
-            spawn_initial_workspace(theme, density, typography.clone(), window, cx);
+        // Construct the CLI agent runtime + adapter registry once per
+        // workspace. The registry is built with all four built-in adapters
+        // in dialog order; each adapter is also registered into the runtime
+        // so `start_session` can resolve them by `AgentAdapter` enum.
+        // Detection (`registry.detect_available()`) is intentionally lazy —
+        // the Cmd+Shift+A action handler calls it at spawn time. Step 10's
+        // popover will switch to fire-on-startup once the UX needs the
+        // installed-list rendered before user interaction.
+        let cli_runtime = Arc::new(CliRuntime::new());
+        let adapter_registry = Arc::new(AdapterRegistry::with_builtin_adapters());
+        for kind in [
+            AgentAdapter::ClaudeCode,
+            AgentAdapter::Codex,
+            AgentAdapter::Aider,
+            AgentAdapter::Custom,
+        ] {
+            if let Some(adapter) = adapter_registry.adapter_for(kind) {
+                cli_runtime.register_adapter(kind, adapter);
+            }
+        }
+
+        let workspace_tabs = spawn_initial_workspace(
+            theme,
+            density,
+            typography.clone(),
+            cli_runtime.clone(),
+            adapter_registry.clone(),
+            window,
+            cx,
+        );
         let workspace_tabs_observer = workspace_tabs
             .as_ref()
             .map(|ws| cx.observe(ws, |_, _, cx| cx.notify()));
@@ -111,10 +152,26 @@ impl WorkspaceRoot {
             left_rail,
             palette,
             pane_actions,
+            cli_runtime,
+            adapter_registry,
             left_rail_open: true,
             _workspace_tabs_observer: workspace_tabs_observer,
             _window_activation_observer: window_activation_observer,
         }
+    }
+
+    /// Accessor for the workspace's CLI agent runtime. Used by the (future)
+    /// settings panel + tests; the main consumer is the `WorkspaceTabs`
+    /// strip, which received its own `Arc` clone at construction time.
+    #[doc(hidden)]
+    pub fn cli_runtime(&self) -> Arc<CliRuntime> {
+        self.cli_runtime.clone()
+    }
+
+    /// Accessor for the adapter registry. Same rationale as `cli_runtime`.
+    #[doc(hidden)]
+    pub fn adapter_registry(&self) -> Arc<AdapterRegistry> {
+        self.adapter_registry.clone()
     }
 
     /// Test-only inspector for the left-rail visibility flag.
@@ -128,6 +185,8 @@ fn spawn_initial_workspace(
     theme: Theme,
     density: Density,
     typography: Typography,
+    cli_runtime: Arc<CliRuntime>,
+    adapter_registry: Arc<AdapterRegistry>,
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<Entity<WorkspaceTabs>> {
@@ -146,7 +205,17 @@ fn spawn_initial_workspace(
     });
     let initial_pane =
         cx.new(|cx| MainPane::new(initial_view, theme, density, typography.clone(), cx));
-    Some(cx.new(|cx| WorkspaceTabs::new(initial_pane, theme, density, typography, cx)))
+    Some(cx.new(|cx| {
+        WorkspaceTabs::new(
+            initial_pane,
+            theme,
+            density,
+            typography,
+            cli_runtime,
+            adapter_registry,
+            cx,
+        )
+    }))
 }
 
 impl Render for WorkspaceRoot {
@@ -162,6 +231,24 @@ impl Render for WorkspaceRoot {
             .as_ref()
             .and_then(|ws| ws.read(cx).active_pane())
             .map(|mp| mp.read(cx).leaf_count())
+            .unwrap_or(0);
+
+        // Open-agent-tab count for the status-bar readout. Phase 3 step 9:
+        // replaces the hardcoded 0 with a live count sourced from
+        // `WorkspaceTabKind::Agent` entries.
+        //
+        // NOTE (M5, review 260520-1700): semantic asymmetry — `pane_count`
+        // reads the active tab only (via `active_pane().leaf_count()`),
+        // whereas `agent_count` aggregates across every workspace tab. For
+        // v1 single-workspace the difference is academic; the choice is
+        // deliberate because users care about total agents in flight
+        // ("I have 3 agents running"), not how many are in the foreground.
+        // If a multi-window or per-workspace status bar lands later, this
+        // is the seam to revisit.
+        let agent_count = self
+            .workspace_tabs
+            .as_ref()
+            .map(|ws| ws.read(cx).agent_count())
             .unwrap_or(0);
 
         // Route poll state to the status bar via the RightSidebar getter.
@@ -368,13 +455,12 @@ impl Render for WorkspaceRoot {
                 }
             }))
             .child(row)
-            // TODO(phase-07): replace 0 with AgentRuntime::active_count().
             .child(status_bar::view(
                 theme,
                 density,
                 typography,
                 pane_count,
-                0,
+                agent_count,
                 git_state.as_ref(),
             ))
             // Pane Actions dropdown — appended before the palette so the
