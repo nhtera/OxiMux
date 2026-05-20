@@ -6,6 +6,7 @@
 //! and emits lifecycle events the UI badge + dashboard consume.
 
 pub mod cli;
+pub mod registry;
 pub mod runtime;
 pub mod runtime_impl;
 pub mod status_machine;
@@ -14,6 +15,7 @@ pub use cli::{
     AiderAdapter, ClaudeCodeAdapter, CliAgentAdapter, CodexAdapter, CommandSpec,
     CustomCommandAdapter, StatusPattern,
 };
+pub use registry::{AdapterRegistry, RegistryEntry};
 pub use runtime::{AgentRuntime, AgentSessionConfig, AgentStatusStream};
 pub use runtime_impl::CliRuntime;
 pub use status_machine::{StatusMachine, StatusTransition};
