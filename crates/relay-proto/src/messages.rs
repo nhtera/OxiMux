@@ -30,6 +30,17 @@ pub struct PtyDescriptor {
     pub rows: u16,
 }
 
+// Phase-07: per-PTY counters surfaced by `Request::Stats`. Currently
+// observational only — no UI consumer yet (planned for the relay pane
+// in the app's About dialog).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyStats {
+    pub pty_id: String,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub alive_secs: u64,
+}
+
 // Hello + HelloAck travel inside Request/Response frames (not as a
 // separate non-framed prelude) so the codec stays uniform — one read
 // loop on both sides, one parse path. The daemon enforces that the
@@ -63,6 +74,7 @@ pub enum Request {
         grace_ms: u32,
     },
     ListPtys,
+    Stats,
     Shutdown,
 }
 
@@ -74,6 +86,7 @@ pub enum Response {
     Ok,
     Pty(PtyDescriptor),
     PtyList(Vec<PtyDescriptor>),
+    StatsOk(Vec<PtyStats>),
     Err { code: ErrCode, message: String },
 }
 

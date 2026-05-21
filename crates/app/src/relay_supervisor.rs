@@ -18,9 +18,22 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use oximux_relay_client::RelayClient;
+use oximux_relay_client::{ClientError, RelayClient};
+use oximux_relay_proto::ErrCode;
+use thiserror::Error;
 use tokio::net::UnixStream;
 use uuid::Uuid;
+
+/// Typed boot outcome so the caller can branch on `VersionMismatch` —
+/// per phase-07 spec, that path must NOT auto-respawn (a running daemon
+/// from another build may belong to other windows).
+#[derive(Debug, Error)]
+pub enum SupervisorError {
+    #[error("relay version mismatch with running daemon")]
+    VersionMismatch,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 const SOCKET_FILENAME: &str = "relay-v1.sock";
 const TOKEN_FILENAME: &str = "relay-v1.token";
@@ -63,28 +76,77 @@ impl RelaySupervisor {
         self.log_dir.join("relay.log")
     }
 
-    pub async fn ensure_running(&self) -> Result<RelayClient> {
-        std::fs::create_dir_all(&self.runtime_dir).with_context(|| {
-            format!("create runtime dir {}", self.runtime_dir.display())
-        })?;
+    /// Read the daemon's PID from the on-disk pid file. Returns `None`
+    /// when the file is missing or unparseable — supervisor callers
+    /// treat that as "we can't watch, skip the heartbeat" rather than
+    /// fatal.
+    pub fn read_pid(&self) -> Option<u32> {
+        let raw = std::fs::read_to_string(self.pid_path()).ok()?;
+        raw.trim().parse().ok()
+    }
+
+    /// Spawn a per-second `kill(pid, 0)` heartbeat. The task exits as
+    /// soon as the PID is no longer alive, invoking `on_death` once.
+    /// Caller holds the returned join handle to abort the watch on
+    /// app shutdown.
+    pub fn watch_pid<F>(&self, pid: u32, on_death: F) -> tokio::task::JoinHandle<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !pid_alive(pid) {
+                    tracing::warn!(pid, "relay daemon PID no longer alive");
+                    on_death();
+                    return;
+                }
+            }
+        })
+    }
+
+    pub async fn ensure_running(&self) -> Result<RelayClient, SupervisorError> {
+        std::fs::create_dir_all(&self.runtime_dir)
+            .with_context(|| format!("create runtime dir {}", self.runtime_dir.display()))
+            .map_err(SupervisorError::Other)?;
         std::fs::create_dir_all(&self.log_dir)
-            .with_context(|| format!("create log dir {}", self.log_dir.display()))?;
+            .with_context(|| format!("create log dir {}", self.log_dir.display()))
+            .map_err(SupervisorError::Other)?;
 
         // Path 1: existing daemon answers quickly. Best case — no
-        // spawn, no probe delay. Fails fast if the socket is stale
-        // (connect returns ENOENT or ECONNREFUSED in ~ms).
-        if let Some(client) = self.try_connect_existing().await {
-            tracing::info!("relay already running, reusing");
-            return Ok(client);
+        // spawn, no probe delay. VersionMismatch propagates as a
+        // typed error so the caller can surface a banner without
+        // killing a daemon that other windows may still own.
+        match self.try_connect_existing().await {
+            ExistingConnect::Ok(client) => {
+                tracing::info!("relay already running, reusing");
+                return Ok(client);
+            }
+            ExistingConnect::VersionMismatch => {
+                tracing::warn!("running relay daemon speaks a different protocol version");
+                return Err(SupervisorError::VersionMismatch);
+            }
+            ExistingConnect::Absent => {}
         }
 
         // Path 2: spawn fresh. Generate a new token first so the
         // existing token file (if any) is invalidated atomically.
         let _ = std::fs::remove_file(self.socket_path());
+        let _ = std::fs::remove_file(self.pid_path());
         let token = generate_token();
-        write_token(&self.token_path(), &token)?;
-        let binary = resolve_binary_path()?;
-        spawn_detached(&binary, &self.socket_path(), &self.token_path(), &self.log_path())?;
+        write_token(&self.token_path(), &token).map_err(SupervisorError::Other)?;
+        let binary = resolve_binary_path().map_err(SupervisorError::Other)?;
+        spawn_detached(
+            &binary,
+            &self.socket_path(),
+            &self.token_path(),
+            &self.pid_path(),
+            &self.log_dir,
+            &self.log_path(),
+        )
+        .map_err(SupervisorError::Other)?;
         tracing::info!(
             binary = %binary.display(),
             socket = %self.socket_path().display(),
@@ -99,40 +161,99 @@ impl RelaySupervisor {
         loop {
             match RelayClient::connect(&self.socket_path(), &token).await {
                 Ok(client) => return Ok(client),
+                Err(e) if is_version_mismatch(&e) => {
+                    return Err(SupervisorError::VersionMismatch);
+                }
                 Err(_) if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(SPAWN_READY_POLL_INTERVAL).await;
                 }
-                Err(e) => bail!("relay never became reachable: {e}"),
+                Err(e) => {
+                    return Err(SupervisorError::Other(anyhow::anyhow!(
+                        "relay never became reachable: {e}"
+                    )));
+                }
             }
         }
     }
 
-    async fn try_connect_existing(&self) -> Option<RelayClient> {
+    async fn try_connect_existing(&self) -> ExistingConnect {
         // Token file presence is a proxy for "we believe a daemon
         // was started"; absence means a fresh boot or a clean
         // uninstall. Skip the connect attempt to keep the boot path
         // free of stray socket errors in the common case.
-        let token = std::fs::read_to_string(self.token_path()).ok()?;
+        let Ok(token) = std::fs::read_to_string(self.token_path()) else {
+            return ExistingConnect::Absent;
+        };
         let token = token.trim();
         if token.is_empty() {
-            return None;
+            return ExistingConnect::Absent;
         }
         // Quick TCP-level reachability before paying for Hello.
         // tokio::UnixStream::connect returns immediately if the
         // socket file is missing or refused.
-        tokio::time::timeout(HANDSHAKE_QUICK_TIMEOUT, UnixStream::connect(self.socket_path()))
-            .await
-            .ok()?
-            .ok()?;
+        let reachable = tokio::time::timeout(
+            HANDSHAKE_QUICK_TIMEOUT,
+            UnixStream::connect(self.socket_path()),
+        )
+        .await;
+        if !matches!(reachable, Ok(Ok(_))) {
+            return ExistingConnect::Absent;
+        }
         // Now the full handshake — verifies the daemon also speaks
         // our protocol version and accepts the token.
-        tokio::time::timeout(
+        match tokio::time::timeout(
             HANDSHAKE_QUICK_TIMEOUT,
             RelayClient::connect(&self.socket_path(), token),
         )
         .await
-        .ok()?
-        .ok()
+        {
+            Ok(Ok(c)) => ExistingConnect::Ok(c),
+            Ok(Err(e)) if is_version_mismatch(&e) => ExistingConnect::VersionMismatch,
+            _ => ExistingConnect::Absent,
+        }
+    }
+}
+
+enum ExistingConnect {
+    Ok(RelayClient),
+    VersionMismatch,
+    Absent,
+}
+
+fn is_version_mismatch(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Daemon {
+            code: ErrCode::VersionMismatch,
+            ..
+        }
+    )
+}
+
+// `kill(pid, 0)` semantics: returns 0 if the process is alive AND we
+// can signal it; ESRCH if it's gone; EPERM if we lack permission
+// (process exists but is owned by someone else — treat as alive).
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: kill(2) with sig=0 has no side effects; success
+        // means the process exists, failure means errno tells us
+        // why. We read errno through `std::io::Error::last_os_error`
+        // instead of the raw `__errno_location()` pointer so the
+        // probe stays portable + safe (and works on FreeBSD).
+        let r = unsafe { libc::kill(pid_i32, 0) };
+        if r == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -198,7 +319,14 @@ pub fn resolve_binary_path() -> Result<PathBuf> {
     Ok(candidate)
 }
 
-fn spawn_detached(binary: &Path, socket: &Path, token_file: &Path, log_file: &Path) -> Result<()> {
+fn spawn_detached(
+    binary: &Path,
+    socket: &Path,
+    token_file: &Path,
+    pid_file: &Path,
+    log_dir: &Path,
+    log_file: &Path,
+) -> Result<()> {
     let log_handle = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -210,6 +338,10 @@ fn spawn_detached(binary: &Path, socket: &Path, token_file: &Path, log_file: &Pa
         .arg(socket)
         .arg("--token")
         .arg(token_file)
+        .arg("--pid-file")
+        .arg(pid_file)
+        .arg("--log-dir")
+        .arg(log_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_handle.try_clone()?))
         .stderr(Stdio::from(log_handle));
@@ -299,5 +431,37 @@ mod tests {
         assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v1.token"));
         assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v1.pid"));
         assert_eq!(s.log_path(), PathBuf::from("/tmp/logs/relay.log"));
+    }
+
+    #[test]
+    fn read_pid_returns_none_for_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        assert_eq!(s.read_pid(), None);
+    }
+
+    #[test]
+    fn read_pid_parses_written_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        std::fs::write(s.pid_path(), "12345\n").unwrap();
+        assert_eq!(s.read_pid(), Some(12345));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_reports_true_for_own_pid() {
+        // Phase-07 crash-heartbeat: kill(0) on our own pid is the
+        // canonical "process exists" probe and must return true.
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_reports_false_for_almost_certainly_dead_pid() {
+        // PID 2^31 - 1 is reserved/never assigned on macOS+Linux. The
+        // probe must report dead (the alternative would silently make
+        // the crash heartbeat into a no-op).
+        assert!(!pid_alive(i32::MAX as u32));
     }
 }

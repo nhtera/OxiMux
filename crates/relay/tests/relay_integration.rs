@@ -28,10 +28,7 @@ async fn boot_relay() -> TestRelay {
     let token = "deadbeef-test-token".to_string();
     std::fs::write(&token_file, &token).expect("write token");
 
-    let cfg = ServerConfig {
-        socket_path: socket.clone(),
-        token_file,
-    };
+    let cfg = ServerConfig::idle_disabled(socket.clone(), token_file);
     let server_task = tokio::spawn(async move {
         let _ = run_server(cfg).await;
     });
@@ -278,6 +275,222 @@ async fn bad_token_rejected_with_auth_failed() {
         } => {}
         other => panic!("expected AuthFailed, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn version_mismatch_is_rejected() {
+    // Plan's phase-07 "Tests" item: connecting with a future
+    // protocol_version must produce ErrCode::VersionMismatch and the
+    // daemon must close the connection (we observe that by EOF on the
+    // next frame attempt).
+    let relay = boot_relay().await;
+    let mut stream = UnixStream::connect(&relay.socket).await.unwrap();
+    let hello = Frame::Request {
+        request_id: 1,
+        request: Request::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION + 999,
+            token: relay.token.clone(),
+            client_id: "x".into(),
+        }),
+    };
+    write_frame(&mut stream, &hello).await.unwrap();
+    let mut buf = Vec::new();
+    let f = read_frame(&mut stream, &mut buf).await.unwrap();
+    match f {
+        Frame::Response {
+            response: Response::Err {
+                code: oximux_relay_proto::ErrCode::VersionMismatch,
+                ..
+            },
+            ..
+        } => {}
+        other => panic!("expected VersionMismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn shutdown_request_breaks_accept_loop_when_no_ptys_alive() {
+    // With no PTYs alive, Request::Shutdown must drain run_server. We
+    // observe that by joining the spawned server task with a timeout
+    // — without the wired notify, the loop would block forever.
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("relay-v1.sock");
+    let token_file = dir.path().join("relay-v1.token");
+    let token = "deadbeef-test-token".to_string();
+    std::fs::write(&token_file, &token).unwrap();
+    let cfg = ServerConfig::idle_disabled(socket.clone(), token_file);
+    let handle = tokio::spawn(async move { run_server(cfg).await });
+
+    // Wait for readiness.
+    for _ in 0..100 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let relay = TestRelay {
+        socket,
+        token,
+        _dir: dir,
+        _server_task: tokio::spawn(async {}),
+    };
+    let (mut s, mut buf) = connect_and_hello(&relay).await;
+    let resp = req(&mut s, &mut buf, 2, Request::Shutdown).await;
+    assert!(matches!(resp, Response::Ok), "shutdown got {resp:?}");
+    drop(s);
+
+    let joined =
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("server did not exit after Shutdown");
+    assert!(joined.is_ok(), "server task panicked: {joined:?}");
+}
+
+#[tokio::test]
+async fn shutdown_refused_while_ptys_alive() {
+    let relay = boot_relay().await;
+    let (mut s, mut buf) = connect_and_hello(&relay).await;
+    let _ = match req(
+        &mut s,
+        &mut buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id } => pty_id,
+        other => panic!("{other:?}"),
+    };
+    let resp = req(&mut s, &mut buf, 3, Request::Shutdown).await;
+    match resp {
+        Response::Err {
+            code: oximux_relay_proto::ErrCode::Internal,
+            ..
+        } => {}
+        other => panic!("expected Internal err refusing shutdown, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stats_endpoint_returns_per_pty_counters() {
+    let relay = boot_relay().await;
+    let (mut s, mut buf) = connect_and_hello(&relay).await;
+    let pty_id = match req(
+        &mut s,
+        &mut buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id } => pty_id,
+        other => panic!("{other:?}"),
+    };
+    let written = b"echo STATS_PROBE\n";
+    let resp = req(
+        &mut s,
+        &mut buf,
+        3,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: written.to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok));
+    // Let the reader thread push the echoed bytes into bytes_out.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = req(&mut s, &mut buf, 4, Request::Stats).await;
+    let stats = match resp {
+        Response::StatsOk(s) => s,
+        other => panic!("expected StatsOk, got {other:?}"),
+    };
+    let mine = stats
+        .iter()
+        .find(|s| s.pty_id == pty_id)
+        .expect("stats missing the spawned pty");
+    assert_eq!(mine.bytes_in, written.len() as u64);
+    assert!(mine.bytes_out >= written.len() as u64, "bytes_out = {}", mine.bytes_out);
+}
+
+#[tokio::test]
+async fn idle_gc_shuts_down_when_no_clients_and_no_ptys() {
+    // 200ms timeout with 40ms tick: the moment both counters hit zero
+    // and stay there for 5 ticks the daemon must self-exit.
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("relay-v1.sock");
+    let token_file = dir.path().join("relay-v1.token");
+    let token = "deadbeef-test-token".to_string();
+    std::fs::write(&token_file, &token).unwrap();
+    let cfg = ServerConfig {
+        socket_path: socket.clone(),
+        token_file,
+        pid_path: None,
+        idle_timeout: Some(Duration::from_millis(200)),
+        idle_tick_interval: Some(Duration::from_millis(40)),
+    };
+    let handle = tokio::spawn(async move { run_server(cfg).await });
+
+    // No client ever connects. The idle GC should fire and break the
+    // accept loop within ~5 ticks.
+    let joined =
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("idle GC never triggered shutdown");
+    assert!(joined.is_ok());
+}
+
+#[tokio::test]
+async fn pid_file_is_written_and_removed_on_clean_exit() {
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("relay-v1.sock");
+    let token_file = dir.path().join("relay-v1.token");
+    let pid_path = dir.path().join("relay-v1.pid");
+    std::fs::write(&token_file, "deadbeef-test-token").unwrap();
+    let cfg = ServerConfig {
+        socket_path: socket.clone(),
+        token_file,
+        pid_path: Some(pid_path.clone()),
+        idle_timeout: Some(Duration::from_millis(80)),
+        idle_tick_interval: Some(Duration::from_millis(20)),
+    };
+    let handle = tokio::spawn(async move { run_server(cfg).await });
+
+    // Wait for the pid file to appear.
+    let mut saw_pid = false;
+    for _ in 0..50 {
+        if pid_path.exists() {
+            saw_pid = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(saw_pid, "pid file never appeared at {}", pid_path.display());
+
+    let raw = std::fs::read_to_string(&pid_path).unwrap();
+    let pid: u32 = raw.trim().parse().expect("pid must parse");
+    assert_eq!(pid, std::process::id(), "pid file should hold OUR pid");
+
+    // Let idle GC fire so we observe clean-exit cleanup.
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    assert!(
+        !pid_path.exists(),
+        "pid file should be removed on clean exit"
+    );
 }
 
 #[tokio::test]

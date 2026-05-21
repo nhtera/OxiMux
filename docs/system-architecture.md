@@ -170,6 +170,50 @@ Future ACP runtime (v1.1) will be a sibling `AgentRuntime` impl with identical `
 
 ---
 
+## Relay daemon lifecycle (Phase 5)
+
+```
+launchd / manual spawn
+  │
+  └── relay main.rs
+        ├── PidGuard  — writes pid file; unlinks on drop
+        ├── SocketGuard — creates Unix socket; unlinks on drop
+        ├── tracing subscriber stack
+        │     stderr text layer
+        │     + tracing-appender daily-rolled JSON  (relay.log.YYYY-MM-DD, 7-day purge at startup)
+        │     + macOS oslog layer
+        │
+        └── Server::run(config, shutdown_notify)
+              ├── accept loop → per-connection task
+              │     Request::Stats    → PtyRegistry::stats() → Response::StatsOk
+              │     Request::Shutdown → Notify::notify_waiters()
+              │
+              ├── spawn_idle_gc task
+              │     ticks at idle_tick_interval
+              │     reaps PtyRegistry entries idle > idle_timeout
+              │
+              └── SIGTERM / SIGINT handler → Notify::notify_waiters()
+                    Server awaits Notify; drops guards → socket + pid cleaned up
+```
+
+**App-side supervisor** (`crates/app/src/relay_supervisor.rs`):
+
+```
+boot_relay_supervisor(PaneRelayIdRepo)
+  ├── read_pid → Option<u32>
+  ├── if pid alive → ExistingConnect (attach path)
+  ├── else → spawn relay binary
+  └── spawn crash heartbeat task
+        watch_pid: 1Hz kill(pid,0) loop
+        on death → on_relay_died
+              spawn_blocking: sqlite delete orphaned pane rows
+                + AppKit banner if VersionMismatch (no auto-respawn)
+```
+
+**VersionMismatch** (`SupervisorError::VersionMismatch`): app reads relay's reported protocol version on connect; mismatch shows macOS notification banner and parks in degraded mode — never silently auto-respawns a mismatched binary.
+
+---
+
 ## Key architectural constraints
 
 | Constraint | Enforcement |

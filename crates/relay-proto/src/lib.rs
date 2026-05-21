@@ -8,5 +8,5 @@ pub mod messages;
 pub use error::{ErrCode, ProtoError};
 pub use frame::{decode_frame, encode_frame, Frame, FrameKind, MAX_FRAME_SIZE};
 pub use messages::{
-    Hello, HelloAck, Notification, PtyDescriptor, Request, Response, PROTOCOL_VERSION,
+    Hello, HelloAck, Notification, PROTOCOL_VERSION, PtyDescriptor, PtyStats, Request, Response,
 };

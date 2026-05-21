@@ -23,7 +23,7 @@ use oximux_app::actions::{
     ToggleLeftSidebar, ToggleRightSidebar,
 };
 use oximux_app::assets::CompositeAssets;
-use oximux_app::relay_supervisor::RelaySupervisor;
+use oximux_app::relay_supervisor::{RelaySupervisor, SupervisorError};
 use oximux_app::shell::terminal_view::install_shared_backend;
 use oximux_app::state;
 use oximux_app::workspace_root::WorkspaceRoot;
@@ -95,7 +95,7 @@ fn main() {
     // survives Cmd-Q. On failure, log and continue — the app falls
     // back to per-pane `PortablePtyBackend` (today's behavior, no
     // survival, but the shell still works).
-    boot_relay_supervisor(&rt);
+    boot_relay_supervisor(&rt, app_state.pane_relay_id_repo().clone());
 
     // `with_assets` registers our composite SVG source: local app icons
     // (e.g. `icons/git-branch.svg`) first, falling through to gpui-component's
@@ -249,7 +249,10 @@ fn open_db_or_exit() -> Db {
 // Best-effort: bring up the relay daemon and install the shared
 // backend. Any error here is downgraded to a warning — the app
 // degrades to in-process PTYs rather than refusing to start.
-fn boot_relay_supervisor(rt: &tokio::runtime::Runtime) {
+fn boot_relay_supervisor(
+    rt: &tokio::runtime::Runtime,
+    pane_relay_id_repo: oximux_storage::PaneRelayIdRepo,
+) {
     let Some(data_dir) = dirs::data_dir() else {
         tracing::warn!("no data_dir; skipping relay supervisor");
         return;
@@ -265,16 +268,69 @@ fn boot_relay_supervisor(rt: &tokio::runtime::Runtime) {
     let supervisor = RelaySupervisor::new(runtime_dir, log_dir);
     let client = match rt.block_on(supervisor.ensure_running()) {
         Ok(c) => c,
-        Err(err) => {
+        Err(SupervisorError::VersionMismatch) => {
+            tracing::warn!("relay version mismatch; falling back to in-process PTYs");
+            #[cfg(target_os = "macos")]
+            {
+                // Plain thread (not spawn_blocking) — we are NOT inside
+                // a tokio runtime context here; this branch is sync boot
+                // code reached via `block_on(ensure_running())`.
+                std::thread::spawn(|| {
+                    let _ = mac_notification_sys::Notification::new()
+                        .title("OxiMux relay version mismatch")
+                        .message("Restart OxiMux to pick up the new daemon.")
+                        .send();
+                });
+            }
+            return;
+        }
+        Err(SupervisorError::Other(err)) => {
             tracing::warn!(?err, "relay supervisor failed; using in-process PTYs");
             return;
         }
     };
-    let backend = RelayBackend::new(std::sync::Arc::new(client), rt.handle().clone());
+    let server_session_id = client.server_session_id().to_owned();
+    let client_arc = std::sync::Arc::new(client);
+
+    if let Some(pid) = supervisor.read_pid() {
+        let repo_for_death = pane_relay_id_repo;
+        let session_for_death = server_session_id.clone();
+        let _enter = rt.handle().enter();
+        // JoinHandle dropped intentionally: the heartbeat task exits
+        // by itself when the daemon dies, and we have no way to call
+        // back into the GPUI window from this boot frame anyway.
+        std::mem::drop(supervisor.watch_pid(pid, move || {
+            on_relay_died(repo_for_death, session_for_death);
+        }));
+    } else {
+        tracing::warn!("relay PID file missing; crash heartbeat disabled");
+    }
+
+    let backend = RelayBackend::new(client_arc, rt.handle().clone());
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
     install_shared_backend(shared);
     tracing::info!("relay supervisor up; PTYs will route through the daemon");
+}
+
+// Invoked once when the supervisor's heartbeat sees the relay PID go
+// ESRCH. Both the SQLite delete and the macOS AppKit notify call are
+// blocking, so off-load to `spawn_blocking`; the heartbeat caller is
+// a regular async tokio task and must not stall the runtime worker.
+fn on_relay_died(repo: oximux_storage::PaneRelayIdRepo, session_id: String) {
+    tracing::warn!(session_id, "relay daemon died mid-session");
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = repo.delete_for_session(&session_id) {
+            tracing::warn!(?err, "pruning pane_relay_ids for dead session failed");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = mac_notification_sys::Notification::new()
+                .title("OxiMux relay restarted")
+                .message("Your terminals were reset. Relaunch OxiMux to recover.")
+                .send();
+        }
+    });
 }
 
 fn init_tracing() {

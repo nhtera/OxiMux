@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -7,21 +8,57 @@ use oximux_relay_proto::{
     ErrCode, Frame, HelloAck, Notification, PROTOCOL_VERSION, Request, Response,
 };
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 use crate::codec::{CodecError, read_frame, write_frame};
 use crate::registry::{PtyRegistry, RegistryError, SUBSCRIBER_QUEUE, SpawnArgs};
 
+// Daemon self-exit if no clients attached and no PTYs alive for this
+// long. Plan's "Locked decisions": 24h. Configurable for tests via
+// `ServerConfig.idle_timeout`.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
+const DEFAULT_IDLE_TICK: Duration = Duration::from_secs(60);
+
 pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub token_file: PathBuf,
+    // None skips PID-file writing (useful for in-process tests).
+    pub pid_path: Option<PathBuf>,
+    // None disables idle GC. Tests override with short values to
+    // exercise the auto-exit path without sleeping for a day.
+    pub idle_timeout: Option<Duration>,
+    // None uses `DEFAULT_IDLE_TICK`. Tests can pick a sub-second tick
+    // so the idle timer reaches its threshold quickly.
+    pub idle_tick_interval: Option<Duration>,
+}
+
+impl ServerConfig {
+    pub fn idle_disabled(socket_path: PathBuf, token_file: PathBuf) -> Self {
+        Self {
+            socket_path,
+            token_file,
+            pid_path: None,
+            idle_timeout: None,
+            idle_tick_interval: None,
+        }
+    }
 }
 
 // Drop guard: removes the bound socket path on drop so a crashed
 // relay can be replaced by a fresh spawn without manual cleanup.
 struct SocketGuard(PathBuf);
 impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+// Mirror of SocketGuard for the PID file. Supervisor uses the PID file
+// for liveness probes; leaving a stale one after graceful exit would
+// confuse the next supervisor into trusting a dead PID.
+struct PidGuard(PathBuf);
+impl Drop for PidGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
@@ -41,29 +78,163 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
     let _ = std::fs::remove_file(&cfg.socket_path);
     let listener = UnixListener::bind(&cfg.socket_path)
         .with_context(|| format!("bind {}", cfg.socket_path.display()))?;
-    let _guard = SocketGuard(cfg.socket_path.clone());
+    let _socket_guard = SocketGuard(cfg.socket_path.clone());
+
+    let _pid_guard = if let Some(pid_path) = &cfg.pid_path {
+        write_pid_file(pid_path)?;
+        Some(PidGuard(pid_path.clone()))
+    } else {
+        None
+    };
 
     let registry = Arc::new(PtyRegistry::new());
     let session_id = Uuid::new_v4().to_string();
+    let shutdown = Arc::new(Notify::new());
+    let active_sessions = Arc::new(AtomicUsize::new(0));
+
+    install_signal_handler(Arc::clone(&shutdown));
+
+    if let Some(timeout) = cfg.idle_timeout {
+        spawn_idle_gc(
+            Arc::clone(&registry),
+            Arc::clone(&active_sessions),
+            Arc::clone(&shutdown),
+            timeout,
+            cfg.idle_tick_interval.unwrap_or(DEFAULT_IDLE_TICK),
+        );
+    }
+
     tracing::info!(session_id, "relay listening");
 
     loop {
-        let (stream, _addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(?e, "accept failed");
-                continue;
+        tokio::select! {
+            biased;
+            _ = shutdown.notified() => {
+                tracing::info!("shutdown signal received, leaving accept loop");
+                break;
             }
-        };
-        let registry = Arc::clone(&registry);
-        let token = token.clone();
-        let session_id = session_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = session_loop(stream, registry, token, session_id).await {
-                tracing::debug!(?e, "session ended");
+            accept_res = listener.accept() => {
+                let (stream, _addr) = match accept_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(?e, "accept failed");
+                        continue;
+                    }
+                };
+                let registry = Arc::clone(&registry);
+                let token = token.clone();
+                let session_id = session_id.clone();
+                let shutdown = Arc::clone(&shutdown);
+                let active_sessions = Arc::clone(&active_sessions);
+                tokio::spawn(async move {
+                    let _session_guard = SessionGuard::new(active_sessions);
+                    if let Err(e) =
+                        session_loop(stream, registry, token, session_id, shutdown).await
+                    {
+                        tracing::debug!(?e, "session ended");
+                    }
+                });
             }
-        });
+        }
     }
+
+    Ok(())
+}
+
+// Ref-counted "is anyone attached?" tracker for the idle GC. Increments
+// on session start, decrements on drop — covers panic-unwind exits too.
+struct SessionGuard(Arc<AtomicUsize>);
+impl SessionGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// Idle GC: tick every `tick`, and when both counters have been zero for
+// >= `timeout`, notify the accept loop to exit. Simple poll-based —
+// the alternative (event-driven on every attach/spawn/close) would
+// pull state-tracking into hot paths for no real benefit.
+fn spawn_idle_gc(
+    registry: Arc<PtyRegistry>,
+    active_sessions: Arc<AtomicUsize>,
+    shutdown: Arc<Notify>,
+    timeout: Duration,
+    tick: Duration,
+) {
+    tokio::spawn(async move {
+        let mut idle_for = Duration::ZERO;
+        loop {
+            tokio::time::sleep(tick).await;
+            let idle = registry.live_count() == 0
+                && active_sessions.load(Ordering::Relaxed) == 0;
+            if idle {
+                idle_for += tick;
+                if idle_for >= timeout {
+                    tracing::info!(
+                        ?idle_for,
+                        "idle threshold reached; shutting down"
+                    );
+                    shutdown.notify_waiters();
+                    return;
+                }
+            } else if idle_for > Duration::ZERO {
+                idle_for = Duration::ZERO;
+            }
+        }
+    });
+}
+
+fn write_pid_file(path: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open pid file {}", path.display()))?;
+    write!(&mut f, "{}", std::process::id()).context("write pid")?;
+    Ok(())
+}
+
+// Wire SIGTERM + SIGINT to the shared shutdown notify. tokio's signal
+// driver requires a multi-thread runtime to be active, which `main.rs`
+// guarantees. SIGINT is included for foreground dev runs (ctrl-c).
+fn install_signal_handler(shutdown: Arc<Notify>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(?e, "install SIGTERM failed");
+                    return;
+                }
+            };
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(?e, "install SIGINT failed");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+                _ = sigint.recv() => tracing::info!("SIGINT received"),
+            }
+            shutdown.notify_waiters();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = shutdown;
+        }
+    });
 }
 
 // Per-connection logic. Hello first; reject anything else until a
@@ -74,6 +245,7 @@ async fn session_loop(
     registry: Arc<PtyRegistry>,
     token: String,
     session_id: String,
+    shutdown: Arc<Notify>,
 ) -> Result<()> {
     let (mut read_half, mut write_half) = stream.into_split();
     let mut buf = Vec::with_capacity(8 * 1024);
@@ -153,6 +325,7 @@ async fn session_loop(
         &registry,
         &outbound_tx,
         &notif_tx,
+        &shutdown,
     )
     .await;
 
@@ -171,6 +344,7 @@ async fn dispatch_loop(
     registry: &Arc<PtyRegistry>,
     outbound_tx: &mpsc::Sender<Frame>,
     notif_tx: &mpsc::Sender<Notification>,
+    shutdown: &Arc<Notify>,
 ) -> Result<()> {
     loop {
         let frame = match read_frame(read_half, buf).await {
@@ -187,7 +361,7 @@ async fn dispatch_loop(
             continue;
         };
 
-        let response = handle_request(registry, notif_tx, request).await;
+        let response = handle_request(registry, notif_tx, shutdown, request).await;
         let frame = Frame::Response {
             request_id,
             response,
@@ -201,6 +375,7 @@ async fn dispatch_loop(
 async fn handle_request(
     registry: &Arc<PtyRegistry>,
     notif_tx: &mpsc::Sender<Notification>,
+    shutdown: &Arc<Notify>,
     request: Request,
 ) -> Response {
     match request {
@@ -254,16 +429,20 @@ async fn handle_request(
             }
         }
         Request::ListPtys => Response::PtyList(registry.list()),
+        Request::Stats => Response::StatsOk(registry.stats()),
         Request::Shutdown => {
-            // v1: cooperative-only — refuse if anything is alive,
-            // otherwise the daemon stays up. True shutdown wiring
-            // (oneshot to break the accept loop) is phase-04 polish.
+            // Cooperative shutdown: refuse if any PTYs are alive
+            // (forces the caller to close them first). Otherwise
+            // notify the accept loop to exit and return Ok before the
+            // process tears down.
             if registry.live_count() > 0 {
                 Response::Err {
                     code: ErrCode::Internal,
                     message: "live PTYs present; refusing shutdown".into(),
                 }
             } else {
+                tracing::info!("Shutdown request accepted; signalling accept loop");
+                shutdown.notify_waiters();
                 Response::Ok
             }
         }

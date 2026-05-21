@@ -1,12 +1,12 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use dashmap::DashMap;
-use oximux_relay_proto::{ErrCode, Notification, PtyDescriptor};
+use oximux_relay_proto::{ErrCode, Notification, PtyDescriptor, PtyStats};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -75,6 +75,10 @@ struct Entry {
     // Best-effort PID of the spawned child for the SIGTERM step. None
     // on non-Unix or when portable-pty returns None.
     pid: Option<u32>,
+    // Phase-07: per-PTY counters surfaced by `Request::Stats`.
+    bytes_in: AtomicU64,
+    bytes_out: Arc<AtomicU64>,
+    started_at: Instant,
 }
 
 pub struct PtyRegistry {
@@ -137,10 +141,12 @@ impl PtyRegistry {
         // The reader thread owns the cloned read fd and the Child
         // handle (so it can wait for the exit code). It pushes bytes
         // into the ring and fans them to every live subscriber.
+        let bytes_out = Arc::new(AtomicU64::new(0));
         let pty_id_for_reader = pty_id.clone();
         let ring_for_reader = Arc::clone(&ring);
         let subs_for_reader = Arc::clone(&subscribers);
         let exited_for_reader = Arc::clone(&child_exited);
+        let bytes_out_for_reader = Arc::clone(&bytes_out);
         std::thread::Builder::new()
             .name(format!("relay-pty-{pty_id}"))
             .spawn(move || {
@@ -151,6 +157,7 @@ impl PtyRegistry {
                     ring_for_reader,
                     subs_for_reader,
                     exited_for_reader,
+                    bytes_out_for_reader,
                 )
             })
             .context("spawn reader thread")?;
@@ -167,6 +174,9 @@ impl PtyRegistry {
             subscribers,
             child_exited,
             pid,
+            bytes_in: AtomicU64::new(0),
+            bytes_out,
+            started_at: Instant::now(),
         });
         self.entries.insert(pty_id.clone(), entry);
         Ok(pty_id)
@@ -204,6 +214,7 @@ impl PtyRegistry {
         let mut w = entry.writer.lock().expect("writer poisoned");
         w.write_all(bytes).context("pty write")?;
         w.flush().context("pty flush")?;
+        entry.bytes_in.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -269,6 +280,21 @@ impl PtyRegistry {
     pub fn live_count(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn stats(&self) -> Vec<PtyStats> {
+        self.entries
+            .iter()
+            .map(|kv| {
+                let e = kv.value();
+                PtyStats {
+                    pty_id: e.pty_id.clone(),
+                    bytes_in: e.bytes_in.load(Ordering::Relaxed),
+                    bytes_out: e.bytes_out.load(Ordering::Relaxed),
+                    alive_secs: e.started_at.elapsed().as_secs(),
+                }
+            })
+            .collect()
+    }
 }
 
 fn send_sigterm(pid: Option<u32>) {
@@ -302,6 +328,7 @@ fn reader_loop(
     ring: Arc<Mutex<RingBuffer>>,
     subscribers: Arc<Mutex<Vec<Sender<Notification>>>>,
     child_exited: Arc<AtomicBool>,
+    bytes_out: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; READ_CHUNK_BYTES];
     loop {
@@ -309,6 +336,7 @@ fn reader_loop(
             Ok(0) => break,
             Ok(n) => {
                 let bytes = &buf[..n];
+                bytes_out.fetch_add(n as u64, Ordering::Relaxed);
                 // Lock-order discipline: ring before subscribers, same
                 // order `attach` uses, to keep snapshot+push atomic.
                 let mut rb = ring.lock().expect("ring poisoned");

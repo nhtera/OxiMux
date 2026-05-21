@@ -61,6 +61,15 @@ pub struct AppState {
     pub(crate) interrupted_sessions: Vec<AgentSession>,
 }
 
+impl AppState {
+    /// Accessor for the binary crate's relay supervisor boot path, which
+    /// hands the repo to the crash-heartbeat death closure for stale-id
+    /// cleanup. Internal callers use the field directly.
+    pub fn pane_relay_id_repo(&self) -> &PaneRelayIdRepo {
+        &self.pane_relay_id_repo
+    }
+}
+
 /// Load recent projects + their workspaces, then mark every alive-at-
 /// shutdown agent session as [`AgentStatus::Interrupted`] and return them
 /// in `interrupted_sessions`. The Interrupted side effect is colocated

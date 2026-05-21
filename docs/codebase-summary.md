@@ -246,6 +246,42 @@ src/
 
 ---
 
+## crates/relay — relay daemon (Phase 5)
+
+```
+src/
+├── main.rs         CLI entry: --pid-file, --log-dir flags
+│                   Layered tracing: stderr text + daily-rolled JSON (tracing-appender, 7-day purge)
+│                     + macOS oslog mirror; OXIMUX_RELAY_TRACE=1 → trace level
+│                   Calls purge_old_logs at startup; boots tokio + Server
+├── server.rs       Server: UnixListener accept loop; Notify-based graceful shutdown
+│                   Handles Request::Shutdown via Notify signal; SIGTERM/SIGINT handler
+│                   ServerConfig { pid_path, idle_timeout, idle_tick_interval, … }
+│                   SessionGuard ref count + spawn_idle_gc task (reaps sessions idle > idle_timeout)
+│                   PidGuard (mirrors SocketGuard pattern — unlinks pid file on drop)
+└── registry.rs     PtyRegistry: per-Entry AtomicU64 counters (bytes_in / bytes_out) + started_at Instant
+                    PtyRegistry::stats() → Vec<PtyStats>
+```
+
+**relay-proto** (`crates/relay-proto/src/messages.rs`) additions:
+- `Request::Stats` — ask daemon for live PTY metrics
+- `Response::StatsOk(Vec<PtyStats>)` — reply carrying per-PTY counters
+- `PtyStats { pty_id, bytes_in, bytes_out, alive_secs }`
+
+**crates/app** additions (`relay_supervisor.rs`):
+- `SupervisorError` enum: `VersionMismatch` | `Other`
+- `read_pid` / `watch_pid` — 1Hz `kill(pid, 0)` heartbeat loop
+- `ExistingConnect` typed variant for attach-to-running-relay path
+- `pid_alive` via `std::io::Error::last_os_error()` (signal-safe)
+- `boot_relay_supervisor` takes `PaneRelayIdRepo`; spawns crash heartbeat;
+  branches on `VersionMismatch` → macOS banner, no auto-respawn
+
+**scripts** additions:
+- `scripts/oximux-launchd-install.sh` — opt-in launchd agent installer; `plutil`-lints plist; refuses if token file absent
+- `scripts/oximux-uninstall.sh` — full uninstall hygiene (socket, pid, log dir, launchd label)
+
+---
+
 ## Key runtime flows
 
 ### Startup

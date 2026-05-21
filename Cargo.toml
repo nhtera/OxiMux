@@ -66,7 +66,12 @@ bincode = { version = "2", features = ["serde"] }
 dashmap = "5"
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# Daily-rotated relay daemon log (phase-07 hardening). Stays detached from
+# tracing-subscriber's own rotation API to keep the dep surface minimal.
+tracing-appender = "0.2"
+# macOS unified-logging mirror for the relay (visible in Console.app).
+tracing-oslog = "0.3"
 
 # Phase 1-2 prep (declared centrally; pulled into crates as used)
 portable-pty = "0.8"

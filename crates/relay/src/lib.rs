@@ -8,4 +8,4 @@ pub mod ring_buffer;
 pub mod server;
 
 pub use ring_buffer::RingBuffer;
-pub use server::{ServerConfig, run_server};
+pub use server::{DEFAULT_IDLE_TIMEOUT, ServerConfig, run_server};

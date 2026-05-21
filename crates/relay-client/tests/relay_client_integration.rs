@@ -31,10 +31,10 @@ fn boot_fixture() -> Fixture {
     let socket_for_server = socket.clone();
     let token_file_for_server = token_file.clone();
     runtime.spawn(async move {
-        let _ = run_server(ServerConfig {
-            socket_path: socket_for_server,
-            token_file: token_file_for_server,
-        })
+        let _ = run_server(ServerConfig::idle_disabled(
+            socket_for_server,
+            token_file_for_server,
+        ))
         .await;
     });
 
