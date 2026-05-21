@@ -1,0 +1,13 @@
+[package]
+name = "oximux-relay-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bincode = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

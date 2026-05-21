@@ -9,6 +9,7 @@ members = [
     "crates/editor",
     "crates/storage",
     "crates/settings",
+    "crates/relay-proto",
     "xtask",
 ]
 
@@ -30,6 +31,7 @@ oximux-agents   = { path = "crates/agents" }
 oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }
 oximux-settings = { path = "crates/settings" }
+oximux-relay-proto = { path = "crates/relay-proto" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
 # upstream `longbridge/gpui-component` workspace pins `gpui` to the default
@@ -51,6 +53,10 @@ async-trait = "0.1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Phase 5 relay wire format. v2 has the cleaner config API but its
+# byte layout is not ABI-stable across point releases — the workspace
+# pin is the authoritative version both app + daemon agree on.
+bincode = { version = "2", features = ["serde"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
