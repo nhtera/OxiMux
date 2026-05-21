@@ -367,6 +367,22 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Walk every open project's tabs and persist each plain-terminal
+    /// leaf's relay PTY id (Phase 5 step 6). Called from the same
+    /// hooks as `capture_all_pane_buffers` so the two tables stay in
+    /// sync. No-op when there's no relay session (in-process backend).
+    pub fn capture_all_pane_relay_ids(&self, cx: &gpui::App) {
+        let snap = crate::shell::terminal_view::relay_state_snapshot();
+        let Some(session_id) = snap.session_id else {
+            return;
+        };
+        let repo = self.app_state.pane_relay_id_repo.clone();
+        for (project_id, tabs) in &self.workspace_tabs_by_project {
+            tabs.read(cx)
+                .capture_pane_relay_ids(&repo, project_id, &session_id, cx);
+        }
+    }
+
     /// Spawn the chosen agent in a new workspace tab. Runs the
     /// start_session → backend_for → terminal_session_id → subscribe_status
     /// chain, then hands the assembled handles to `WorkspaceTabs::push_agent_tab`.

@@ -23,7 +23,9 @@ use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt
 use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
-use crate::workspace_tabs_factory::{build_workspace_tabs, load_persisted_tabs, save_persisted_tabs};
+use crate::workspace_tabs_factory::{
+    build_workspace_tabs, compute_attach_hints, load_persisted_tabs, save_persisted_tabs,
+};
 
 /// Build the Add-Project dialog entity. Wires the `on_pick` callback to
 /// route the chosen project through `WorkspaceRoot::set_active_project`.
@@ -206,6 +208,16 @@ impl WorkspaceRoot {
                 crate::workspace_tabs_factory::PANE_BUFFER_MAX_BYTES,
                 cx,
             );
+            // Same capture cadence for relay PTY ids — phase-06
+            // reconciliation needs the (project, ordinal) → pty_id
+            // map up-to-date across project switches, not just at
+            // app quit.
+            let snap = crate::shell::terminal_view::relay_state_snapshot();
+            if let Some(session_id) = snap.session_id {
+                let relay_repo = self.app_state.pane_relay_id_repo.clone();
+                tabs.read(cx)
+                    .capture_pane_relay_ids(&relay_repo, &outgoing, &session_id, cx);
+            }
         }
         self.active_project = Some(project.clone());
         let project_root = PathBuf::from(&project.root_path);
@@ -225,10 +237,31 @@ impl WorkspaceRoot {
                 &self.app_state.pane_buffer_repo,
                 &project.id,
             );
+            // Phase-06: build attach hints from the persisted
+            // (ordinal, relay_pty_id, session) rows + the live id
+            // set returned by the daemon's ListPtys. Any row whose
+            // id isn't live OR whose session doesn't match the
+            // current daemon falls out — those panes spawn fresh
+            // and lean on pane_buffers for visual continuity.
+            let pane_relay_ids = self
+                .app_state
+                .pane_relay_id_repo
+                .get_all_for_project(&project.id)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(?err, project_id = %project.id, "load pane_relay_ids failed");
+                    Vec::new()
+                });
+            let relay_snap = crate::shell::terminal_view::relay_state_snapshot();
+            let attach_hints = compute_attach_hints(
+                pane_relay_ids,
+                &relay_snap.live_external_ids,
+                relay_snap.session_id.as_deref(),
+            );
             if let Some(tabs) = build_workspace_tabs(
                 project_root.clone(),
                 snapshot,
                 pane_buffers,
+                attach_hints,
                 theme,
                 density,
                 typography,

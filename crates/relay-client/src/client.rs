@@ -44,6 +44,10 @@ pub struct RelayClient {
     pending: Arc<DashMap<u64, oneshot::Sender<Response>>>,
     pty_subscribers: PtySubscribers,
     next_request_id: AtomicU64,
+    // Daemon's `HelloAck.session_id`. Persisted alongside every PTY id
+    // so phase-06 reconciliation can detect "daemon restarted" with a
+    // single string comparison instead of N PtyNotFound round trips.
+    server_session_id: String,
     _reader_task: JoinHandle<()>,
     _writer_task: JoinHandle<()>,
 }
@@ -68,11 +72,11 @@ impl RelayClient {
 
         let mut buf = Vec::with_capacity(4 * 1024);
         let ack = read_frame(&mut read_half, &mut buf).await?;
-        match ack {
+        let server_session_id = match ack {
             Frame::Response {
                 request_id: 0,
-                response: Response::HelloAck(_),
-            } => {}
+                response: Response::HelloAck(ack),
+            } => ack.session_id,
             Frame::Response {
                 response: Response::Err { code, message },
                 ..
@@ -84,7 +88,7 @@ impl RelayClient {
                     "expected HelloAck, got {other:?}"
                 )));
             }
-        }
+        };
 
         // --- Long-lived I/O tasks -----------------------------------
         let pending: Arc<DashMap<u64, oneshot::Sender<Response>>> = Arc::new(DashMap::new());
@@ -110,9 +114,14 @@ impl RelayClient {
             pending,
             pty_subscribers,
             next_request_id: AtomicU64::new(1),
+            server_session_id,
             _reader_task: reader_task,
             _writer_task: writer_task,
         })
+    }
+
+    pub fn server_session_id(&self) -> &str {
+        &self.server_session_id
     }
 
     pub async fn request(&self, request: Request) -> Result<Response, ClientError> {

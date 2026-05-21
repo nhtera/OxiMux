@@ -189,7 +189,7 @@ fn attach_existing_replays_into_local_state() {
     // happens against a new local session id regardless.
     let attached_id = fx
         .backend
-        .attach_existing(&relay_pty_id)
+        .attach_relay_pty(&relay_pty_id)
         .expect("attach existing");
     assert_ne!(attached_id, original_id);
 

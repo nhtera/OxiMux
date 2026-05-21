@@ -9,7 +9,7 @@
 //!   against `SettingsRepo` under the `terminal_tabs:<project_id>` key.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{AppContext, Context, Entity, WeakEntity, Window};
@@ -24,9 +24,13 @@ use crate::persisted_terminals::{
 };
 use crate::shell::main_pane::MainPane;
 use crate::shell::pane_tree::PaneId;
-use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
+use crate::shell::terminal_view::{TerminalView, attach_pty_existing, spawn_local_pty};
 use crate::shell::workspace_tabs::WorkspaceTabs;
 use crate::workspace_root::WorkspaceRoot;
+
+use oximux_pty::TerminalSessionId;
+use oximux_agents::SharedBackend;
+use std::collections::HashSet;
 
 const DEFAULT_AGENT_COLS: u16 = 120;
 const DEFAULT_AGENT_ROWS: u16 = 32;
@@ -36,11 +40,36 @@ const DEFAULT_AGENT_ROWS: u16 = 32;
 /// with SGR runs. Stored as raw BLOB so JSON encoding overhead is nil.
 pub const PANE_BUFFER_MAX_BYTES: usize = 512 * 1024;
 
+/// Per-ordinal hint produced by phase-06 reconciliation: "this leaf
+/// should attach to this surviving daemon PTY id instead of spawning
+/// fresh." Built by [`compute_attach_hints`] which already filtered
+/// against the live id set + session match.
+pub type AttachHints = std::collections::HashMap<u32, String>;
+
+/// Phase-06: pre-filter persisted (ordinal, relay_pty_id, relay_session)
+/// rows down to the ordinals that should re-attach. Mismatched
+/// sessions and unknown ids drop out — those panes fall through to
+/// the spawn + visual-prefill path on next launch.
+pub fn compute_attach_hints(
+    pane_relay_ids: Vec<(u32, String, String)>,
+    live_external_ids: &HashSet<String>,
+    current_external_session: Option<&str>,
+) -> AttachHints {
+    pane_relay_ids
+        .into_iter()
+        .filter_map(|(ord, pty_id, session)| {
+            let session_ok = current_external_session.map(|s| s == session).unwrap_or(false);
+            (session_ok && live_external_ids.contains(&pty_id)).then_some((ord, pty_id))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_workspace_tabs(
     cwd: PathBuf,
     snapshot: Option<PersistedTabs>,
     pane_buffers: Vec<Vec<u8>>,
+    attach_hints: AttachHints,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -73,8 +102,10 @@ pub(crate) fn build_workspace_tabs(
     // agents kick off an async `start_session` + push when ready.
     // `pane_buffers_iter` cursors through the captured scrollback bytes in
     // the same DFS leaf order produced by capture so each restored leaf gets
-    // its own buffer (when one exists).
+    // its own buffer (when one exists). `global_ordinal` tracks the same
+    // counter that capture used so the attach-hint lookup stays aligned.
     let mut pane_buffers_iter = pane_buffers.into_iter();
+    let mut global_ordinal: u32 = 0;
     for tab in &snap.tabs {
         if let Some(agent) = &tab.agent {
             restore_agent_tab(
@@ -88,18 +119,28 @@ pub(crate) fn build_workspace_tabs(
         } else if let Some(pane) = build_pane_for_tree(
             &tab.tree,
             cwd.clone(),
+            &attach_hints,
+            global_ordinal,
             theme,
             density,
             typography.clone(),
             window,
             cx,
         ) {
-            // Pre-paint scrollback into each leaf BEFORE the live PTY's
-            // poll task ticks for the first time so restored output lands
-            // above the fresh shell prompt.
             let leaf_count = pane.read(cx).leaf_count();
+            // Pull the per-leaf buffers in DFS order. Skip prefill for
+            // any leaf whose ordinal got a live attach — the daemon's
+            // replay already populated the grid and pushing local
+            // bytes on top would duplicate output.
             let chunk: Vec<Vec<u8>> = (0..leaf_count)
-                .map(|_| pane_buffers_iter.next().unwrap_or_default())
+                .map(|i| {
+                    let bytes = pane_buffers_iter.next().unwrap_or_default();
+                    if attach_hints.contains_key(&(global_ordinal + i as u32)) {
+                        Vec::new()
+                    } else {
+                        bytes
+                    }
+                })
                 .collect();
             pane.update(cx, |main, cx| {
                 main.prefill_leaves(&chunk, cx);
@@ -107,6 +148,7 @@ pub(crate) fn build_workspace_tabs(
             tabs_entity.update(cx, |tabs, cx| {
                 tabs.push_restored_terminal_tab(tab.label.clone(), pane, cx);
             });
+            global_ordinal += leaf_count as u32;
         }
     }
     tabs_entity.update(cx, |tabs, cx| {
@@ -212,11 +254,18 @@ fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
     }
 }
 
-/// Spawn one MainPane whose pane tree mirrors `tree_snapshot`. Each leaf
-/// gets a fresh PTY at `cwd`; axes + weights are preserved.
+/// Spawn one MainPane whose pane tree mirrors `tree_snapshot`. Each
+/// leaf either attaches to a daemon-side surviving PTY (when an
+/// `attach_hints[ordinal]` is present) or spawns a fresh one. Axes +
+/// weights are preserved. `base_ordinal` is the global ordinal of
+/// this tab's first leaf (so the same counter that capture used
+/// drives the lookup).
+#[allow(clippy::too_many_arguments)]
 fn build_pane_for_tree(
     tree_snapshot: &PersistedTree,
     cwd: PathBuf,
+    attach_hints: &AttachHints,
+    base_ordinal: u32,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -237,8 +286,10 @@ fn build_pane_for_tree(
     };
     let tree = restore_tree(tree_snapshot, &mut alloc);
     let mut panes: HashMap<PaneId, Entity<TerminalView>> = HashMap::with_capacity(leaf_count);
-    for leaf_id in tree.in_order_leaves() {
-        let (backend, session_id) = spawn_local_pty(cwd.clone())?;
+    for (idx, leaf_id) in tree.in_order_leaves().iter().enumerate() {
+        let ordinal = base_ordinal + idx as u32;
+        let (backend, session_id) = attach_or_spawn_pane(&cwd, attach_hints, ordinal)?;
+        let leaf_id = *leaf_id;
         let typography_for_view = typography.clone();
         let view = cx.new(|cx| {
             TerminalView::mount(
@@ -268,6 +319,92 @@ fn build_pane_for_tree(
             cx,
         )
     }))
+}
+
+/// Phase-06 per-leaf fork: attach to a surviving daemon PTY when the
+/// pre-computed hint says so, otherwise spawn a fresh PTY. The attach
+/// path can still fail (race: id was alive when we ran ListPtys but
+/// the child exited before the Attach hit the daemon); that case
+/// falls through to spawn so the tree still builds.
+fn attach_or_spawn_pane(
+    cwd: &Path,
+    attach_hints: &AttachHints,
+    ordinal: u32,
+) -> Option<(SharedBackend, TerminalSessionId)> {
+    if let Some(relay_pty_id) = attach_hints.get(&ordinal)
+        && let Some(result) = attach_pty_existing(relay_pty_id)
+    {
+        return Some(result);
+    }
+    spawn_local_pty(cwd.to_path_buf())
+}
+
+#[cfg(test)]
+mod attach_hint_tests {
+    use super::*;
+
+    fn live(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn match_when_id_live_and_session_matches() {
+        let hints = compute_attach_hints(
+            vec![(0, "pty-1".into(), "sess-A".into())],
+            &live(&["pty-1"]),
+            Some("sess-A"),
+        );
+        assert_eq!(hints.get(&0), Some(&"pty-1".to_string()));
+    }
+
+    #[test]
+    fn drop_when_id_not_live() {
+        let hints = compute_attach_hints(
+            vec![(0, "pty-1".into(), "sess-A".into())],
+            &live(&["pty-other"]),
+            Some("sess-A"),
+        );
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn drop_when_session_mismatches() {
+        // Daemon restarted between launches — every persisted row
+        // ties to the old session, attach_hints must come back empty
+        // so all panes fall through to spawn + visual prefill.
+        let hints = compute_attach_hints(
+            vec![(0, "pty-1".into(), "sess-OLD".into())],
+            &live(&["pty-1"]),
+            Some("sess-NEW"),
+        );
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn drop_when_no_session_at_all() {
+        // No relay backend installed → no current session →
+        // everything spawns fresh.
+        let hints = compute_attach_hints(
+            vec![(0, "pty-1".into(), "sess-A".into())],
+            &live(&["pty-1"]),
+            None,
+        );
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn mixed_results_preserve_only_matches() {
+        let rows = vec![
+            (0, "pty-live".into(), "sess".into()),       // ok
+            (1, "pty-dead".into(), "sess".into()),       // not in live set
+            (2, "pty-other".into(), "sess-old".into()),  // session mismatch
+            (3, "pty-live2".into(), "sess".into()),      // ok
+        ];
+        let hints = compute_attach_hints(rows, &live(&["pty-live", "pty-live2", "pty-other"]), Some("sess"));
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints.get(&0), Some(&"pty-live".to_string()));
+        assert_eq!(hints.get(&3), Some(&"pty-live2".to_string()));
+    }
 }
 
 /// Read the persisted-tabs JSON blob for a project. Missing key or invalid

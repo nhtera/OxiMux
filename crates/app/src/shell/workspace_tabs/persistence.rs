@@ -7,7 +7,7 @@ use oximux_agents::{AgentStatusStream, SharedBackend};
 use oximux_core::AgentSessionId;
 use oximux_pty::TerminalSessionId;
 
-use oximux_storage::PaneBufferRepo;
+use oximux_storage::{PaneBufferRepo, PaneRelayIdRepo};
 
 use crate::notifier::TabId;
 use crate::persisted_terminals::{
@@ -225,6 +225,45 @@ impl WorkspaceTabs {
                 }
                 if let Err(err) = repo.set(project_id, ordinal, &bytes) {
                     tracing::warn!(?err, project_id, ordinal, "pane_buffers: set failed");
+                }
+                ordinal += 1;
+            }
+        }
+    }
+
+    /// Walk every plain-terminal leaf in DFS order and persist each
+    /// leaf's relay-side PTY id (if any) keyed by
+    /// `(project_id, ordinal)`. Agent tabs are skipped because their
+    /// restore path goes through `CliRuntime::start_session`, not the
+    /// pane factory's attach-or-spawn fork. Same ordinal-counting
+    /// rules as `capture_pane_buffers` so the two tables stay
+    /// aligned by index.
+    ///
+    /// `relay_session_id` is the daemon's `HelloAck.session_id` at
+    /// capture time; phase-06 reconciliation uses it to detect
+    /// "daemon restarted, all persisted ids stale."
+    pub fn capture_pane_relay_ids(
+        &self,
+        repo: &PaneRelayIdRepo,
+        project_id: &str,
+        relay_session_id: &str,
+        cx: &gpui::App,
+    ) {
+        if let Err(err) = repo.delete_for_project(project_id) {
+            tracing::warn!(?err, project_id, "pane_relay_ids: delete_for_project failed");
+            return;
+        }
+        let mut ordinal: u32 = 0;
+        for tab in &self.tabs {
+            if !matches!(tab.kind, WorkspaceTabKind::Terminal) {
+                continue;
+            }
+            let ids = tab.pane.read(cx).collect_pane_external_ids(cx);
+            for id in ids {
+                if let Some(pty_id) = id
+                    && let Err(err) = repo.set(project_id, ordinal, &pty_id, relay_session_id)
+                {
+                    tracing::warn!(?err, project_id, ordinal, "pane_relay_ids: set failed");
                 }
                 ordinal += 1;
             }

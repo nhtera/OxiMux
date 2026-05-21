@@ -47,6 +47,43 @@ pub trait TerminalBackend: Send + 'static {
     /// Spawn a new session. Returns a fresh `TerminalSessionId`.
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId>;
 
+    /// Attach to a session that already exists in this backend's
+    /// underlying source (e.g., a daemon-owned PTY that outlived the
+    /// previous app launch). The default implementation returns an
+    /// error — only relay-backed backends meaningfully implement it.
+    /// Phase 06 reconciliation calls this before falling back to a
+    /// fresh `spawn` + visual prefill.
+    fn attach_existing(&mut self, _external_id: &str) -> Result<TerminalSessionId> {
+        Err(anyhow::anyhow!(
+            "this backend does not support attach_existing"
+        ))
+    }
+
+    /// Local-side identifier this backend would use to persist the
+    /// given session for cross-restart re-attach (e.g., the relay
+    /// daemon's PTY id). Default returns `None` — backends without
+    /// cross-restart semantics opt out by leaving the default.
+    fn external_id_of(&self, _id: TerminalSessionId) -> Option<String> {
+        None
+    }
+
+    /// Every external id this backend currently knows about on its
+    /// remote source (e.g., live relay PTYs). Phase 06 reconciliation
+    /// calls this once per project switch to learn which persisted
+    /// ids are still attachable. Default returns empty — in-process
+    /// backends have no external namespace.
+    fn list_external_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Opaque session-identity string for the backend's remote source
+    /// (e.g., the relay daemon's `HelloAck.session_id`). Used by phase
+    /// 06 to detect "remote restarted, persisted ids are stale." None
+    /// for backends without a remote source.
+    fn external_session_id(&self) -> Option<String> {
+        None
+    }
+
     /// Write user input (keypresses, paste, programmatic input) to the session.
     fn write(&mut self, id: TerminalSessionId, bytes: &[u8]) -> Result<()>;
 

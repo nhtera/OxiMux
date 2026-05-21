@@ -74,6 +74,55 @@ pub fn install_shared_backend(backend: SharedBackend) {
     }
 }
 
+/// Snapshot of the relay daemon's currently-live state. Returned by
+/// [`relay_state_snapshot`] so the factory can do all the relay queries
+/// once per project switch instead of per leaf.
+pub struct RelayStateSnapshot {
+    pub live_external_ids: std::collections::HashSet<String>,
+    pub session_id: Option<String>,
+}
+
+pub fn relay_state_snapshot() -> RelayStateSnapshot {
+    let Some(shared) = SHARED_BACKEND.get() else {
+        return RelayStateSnapshot {
+            live_external_ids: Default::default(),
+            session_id: None,
+        };
+    };
+    let guard = shared.lock().expect("shared backend poisoned");
+    RelayStateSnapshot {
+        live_external_ids: guard.list_external_ids().into_iter().collect(),
+        session_id: guard.external_session_id(),
+    }
+}
+
+/// Try to attach to a daemon-side PTY that's still alive. Returns
+/// `None` when no shared backend is installed or the attach failed
+/// (caller falls back to spawn + visual prefill).
+pub fn attach_pty_existing(external_id: &str) -> Option<(SharedBackend, TerminalSessionId)> {
+    let shared = SHARED_BACKEND.get()?;
+    let mut guard = shared.lock().expect("shared backend poisoned");
+    match guard.attach_existing(external_id) {
+        Ok(session_id) => {
+            drop(guard);
+            Some((Arc::clone(shared), session_id))
+        }
+        Err(err) => {
+            tracing::debug!(?err, external_id, "attach_existing failed");
+            None
+        }
+    }
+}
+
+/// Look up the daemon-side identifier for a local session so the
+/// caller can persist it for next-launch reconciliation. `None` when
+/// no shared backend is installed or the backend has no external id
+/// for this session.
+pub fn external_id_for_session(id: TerminalSessionId) -> Option<String> {
+    let shared = SHARED_BACKEND.get()?;
+    shared.lock().ok()?.external_id_of(id)
+}
+
 pub fn spawn_local_pty(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessionId)> {
     // Relay-backed path: one shared backend across the whole app.
     if let Some(shared) = SHARED_BACKEND.get() {
@@ -293,6 +342,14 @@ impl TerminalView {
     pub fn serialize_buffer(&self, max_bytes: usize) -> Vec<u8> {
         let id = self.session_id;
         self.with_backend(|be| be.serialize_buffer(id, max_bytes))
+    }
+
+    /// Backend's external identifier for this pane's session (e.g.,
+    /// the relay daemon's PTY id), if any. Used by the phase-06
+    /// reconciliation capture path. `None` for in-process backends.
+    pub fn external_id(&self) -> Option<String> {
+        let id = self.session_id;
+        self.with_backend(|be| be.external_id_of(id))
     }
 
     /// Replay captured bytes into this pane's grid BEFORE the live PTY

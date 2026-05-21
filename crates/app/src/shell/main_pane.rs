@@ -189,6 +189,22 @@ impl MainPane {
         out
     }
 
+    /// Walk the tree in DFS leaf order and return one external id per
+    /// leaf (relay PTY id for relay-backed backends, `None` for
+    /// in-process). Same ordering as `collect_pane_buffers` so the
+    /// two captures stay aligned in the persisted `pane_relay_ids`
+    /// table.
+    pub fn collect_pane_external_ids(&self, cx: &gpui::App) -> Vec<Option<String>> {
+        let mut out = Vec::with_capacity(self.panes.len());
+        for leaf_id in self.tree.in_order_leaves() {
+            let Some(view) = self.panes.get(&leaf_id) else {
+                continue;
+            };
+            out.push(view.read(cx).external_id());
+        }
+        out
+    }
+
     /// Inverse of `collect_pane_buffers`: feed previously-captured bytes
     /// into each leaf's grid BEFORE the live PTY produces any output.
     /// Buffers are paired with leaves in DFS order; an empty buffer means

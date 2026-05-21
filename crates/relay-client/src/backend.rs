@@ -62,6 +62,17 @@ impl RelayBackend {
         &self.client
     }
 
+    // Daemon-side relay PTY id behind a local `TerminalSessionId`.
+    // Phase 06 calls this at capture time (on app quit / project
+    // switch) to persist `(project, ordinal) → relay_pty_id`.
+    pub fn relay_pty_id_of_session(&self, id: TerminalSessionId) -> Option<String> {
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .get(&id)
+            .map(|s| s.relay_pty_id.clone())
+    }
+
     fn mint_id(&self) -> TerminalSessionId {
         TerminalSessionId(self.next_session_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -83,11 +94,12 @@ impl RelayBackend {
             .ok_or_else(|| anyhow!("unknown session {id:?}"))
     }
 
-    // Attach to a relay-side PTY that's still alive (phase 06
-    // reconciliation entry point). Replays the daemon's buffered
-    // bytes into the local TerminalState BEFORE the pump starts so
-    // the first frame the renderer sees is the full prior screen.
-    pub fn attach_existing(&self, relay_pty_id: &str) -> Result<TerminalSessionId> {
+    // Attach implementation. Public so callers holding a concrete
+    // `RelayBackend` can skip the trait-method indirection; the trait
+    // method forwards to this. Replays the daemon's buffered bytes
+    // into the local TerminalState BEFORE the pump starts so the
+    // first frame the renderer sees is the full prior screen.
+    pub fn attach_relay_pty(&self, relay_pty_id: &str) -> Result<TerminalSessionId> {
         let resp = self.request(Request::Attach {
             pty_id: relay_pty_id.to_owned(),
         })?;
@@ -154,6 +166,32 @@ impl RelayBackend {
 }
 
 impl TerminalBackend for RelayBackend {
+    fn attach_existing(&mut self, external_id: &str) -> Result<TerminalSessionId> {
+        self.attach_relay_pty(external_id)
+    }
+
+    fn external_id_of(&self, id: TerminalSessionId) -> Option<String> {
+        self.relay_pty_id_of_session(id)
+    }
+
+    fn list_external_ids(&self) -> Vec<String> {
+        match self.block_on(self.client.request(Request::ListPtys)) {
+            Ok(Response::PtyList(items)) => items.into_iter().map(|d| d.pty_id).collect(),
+            Ok(other) => {
+                tracing::warn!(?other, "list_external_ids unexpected response");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(?e, "list_external_ids failed");
+                Vec::new()
+            }
+        }
+    }
+
+    fn external_session_id(&self) -> Option<String> {
+        Some(self.client.server_session_id().to_owned())
+    }
+
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId> {
         let resp = self.request(Request::Spawn {
             cwd: cfg.cwd.to_string_lossy().into_owned(),

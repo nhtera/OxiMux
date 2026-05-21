@@ -200,7 +200,9 @@ fn main() {
             // same rows in `set_active_project` (Phase 4 step 16).
             let workspace_for_quit = workspace.clone();
             cx.on_app_quit(move |cx| {
-                workspace_for_quit.read(cx).capture_all_pane_buffers(cx);
+                let root = workspace_for_quit.read(cx);
+                root.capture_all_pane_buffers(cx);
+                root.capture_all_pane_relay_ids(cx);
                 async {}
             })
             .detach();
