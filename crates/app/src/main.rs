@@ -179,6 +179,9 @@ fn main() {
             // so it's a transparent pass-through — purely additive.
             let workspace =
                 cx.new(|cx| WorkspaceRoot::new(repo_for_window, app_state_for_window, window, cx));
+            // Restore last-active project so the sidebar isn't empty after
+            // relaunch. Helper reads recents (ORDER BY last_opened_at DESC).
+            workspace.update(cx, |root, cx| root.bootstrap_active_project(window, cx));
             let view: AnyView = workspace.into();
             cx.new(|cx| gpui_component::Root::new(view, window, cx))
         });

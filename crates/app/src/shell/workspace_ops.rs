@@ -153,6 +153,17 @@ fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
 }
 
 impl WorkspaceRoot {
+    /// Boot-time helper: if the recents snapshot is non-empty, activate
+    /// the most-recently-opened project so the sidebar isn't a blank
+    /// "Open a project" state after relaunch. No-op when there are no
+    /// recents. Public so the bin's `main.rs` can call it after
+    /// constructing `WorkspaceRoot`.
+    pub fn bootstrap_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(boot) = self.app_state.recent_projects.first().cloned() {
+            self.set_active_project(boot, window, cx);
+        }
+    }
+
     /// Set the currently active project. Stores it on `self`, triggers
     /// a re-render so the left rail picks up the new workspaces, and
     /// asynchronously rebuilds the right sidebar (Explorer / Source
