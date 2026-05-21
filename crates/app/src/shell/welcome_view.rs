@@ -19,6 +19,7 @@ const TAGLINE_GAP: f32 = 8.0;
 /// token with a small gap between, instead of a single "cmd-shift-p"
 /// pill. Items marked "(Phase 05)" land when the command palette ships.
 pub const SHORTCUT_HINTS: &[(&[&str], &str)] = &[
+    (&["\u{2318}", "O"], "Open a project"),
     (&["\u{2318}", "T"], "New terminal"),
     (&["\u{2318}", "D"], "Split pane horizontally"),
     (&["\u{2318}", "L"], "Toggle right sidebar"),
@@ -170,8 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_hints_count_is_five() {
-        assert_eq!(SHORTCUT_HINTS.len(), 5);
+    fn shortcut_hints_count_is_six() {
+        assert_eq!(SHORTCUT_HINTS.len(), 6);
     }
 
     #[test]

@@ -92,5 +92,8 @@ actions!(
         /// `NewAgent` so the button-fired path doesn't fight a focus-chain
         /// keystroke during state recovery.
         RequestOpenAdapterPicker,
+        /// Open the project picker modal (Cmd+O). Shows recent projects +
+        /// "Open Folder…" affordance backed by a native NSOpenPanel.
+        OpenProjectPicker,
     ]
 );

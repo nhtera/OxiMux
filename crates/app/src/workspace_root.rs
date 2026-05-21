@@ -31,7 +31,7 @@ use gpui::{
     Render, Styled, Subscription, Task, WeakEntity, Window, div, px,
 };
 use oximux_agents::{AdapterRegistry, AgentRuntime, AgentSessionConfig, CliRuntime};
-use oximux_core::AgentAdapter;
+use oximux_core::{AgentAdapter, Project};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -39,9 +39,9 @@ use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenQuickOpen, RequestOpenAdapterPicker,
-    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenProjectPicker, OpenQuickOpen,
+    RequestOpenAdapterPicker, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
+    ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::{
     adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
@@ -50,6 +50,7 @@ use crate::shell::{
     main_area,
     main_pane::MainPane,
     pane_actions::PaneActionsMenu,
+    project_picker::{OnPick, ProjectPickerModal},
     right_sidebar::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
     },
@@ -106,11 +107,19 @@ pub struct WorkspaceRoot {
     _click_router: Task<()>,
     /// Boot-time snapshot of persisted state (`recent_projects`, workspaces
     /// per project, interrupted sessions) + repo handles for on-demand
-    /// reads/writes. Hydrated once by `main.rs` before the window opens;
-    /// step 5+ consume it via `pub(crate)` access. Marked `dead_code`-
-    /// allowed until step 5's project picker lands — step 4 is plumbing.
-    #[allow(dead_code)]
+    /// reads/writes. Hydrated once by `main.rs` before the window opens.
+    /// Read by `project_picker` (step 5) and step 7+ sidebar wiring.
     pub(crate) app_state: AppState,
+    /// Project picker modal (Cmd+O). Holds its own snapshot of recent
+    /// projects taken at open() time; emits the chosen Project back here
+    /// via the `OnPick` callback wired in `new()`.
+    project_picker: Entity<ProjectPickerModal>,
+    /// Currently active project — set when the picker resolves a
+    /// selection. Consumed by step 7's sidebar render. `None` until the
+    /// user opens a project. Held on `WorkspaceRoot` (not `AppState`)
+    /// because this is ephemeral UI selection, not persisted state.
+    #[allow(dead_code)]
+    pub(crate) active_project: Option<Project>,
 }
 
 impl WorkspaceRoot {
@@ -204,6 +213,26 @@ impl WorkspaceRoot {
             )
         });
 
+        // Project picker: weak self-reference in the on_pick closure so
+        // the picker can route the user's choice back to
+        // `set_active_project` without holding a strong cycle.
+        let weak_for_picker: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let on_pick: OnPick = Box::new(move |project, _window, cx| {
+            let weak = weak_for_picker.clone();
+            let _ = weak.update(cx, |this, cx| this.set_active_project(project, cx));
+        });
+        let project_repo = app_state.project_repo.clone();
+        let project_picker = cx.new(|cx| {
+            ProjectPickerModal::new(
+                theme,
+                density,
+                typography.clone(),
+                project_repo,
+                on_pick,
+                cx,
+            )
+        });
+
         // Pause status polling when the window blurs; force an immediate
         // refresh on focus regain via StatusPoller::kick().
         let window_activation_observer =
@@ -260,7 +289,24 @@ impl WorkspaceRoot {
             _window_activation_observer: window_activation_observer,
             _click_router: click_router,
             app_state,
+            project_picker,
+            active_project: None,
         }
+    }
+
+    /// Set the currently active project (called by the project picker's
+    /// `on_pick` callback). Step 7's sidebar reads this for its workspace
+    /// list; v1 dogfood just exercises the path. `cx.notify` triggers a
+    /// re-render so the status bar / future sidebar reflect the new
+    /// selection.
+    pub(crate) fn set_active_project(&mut self, project: Project, cx: &mut Context<Self>) {
+        tracing::info!(
+            project_id = %project.id,
+            name = %project.name,
+            "active project set"
+        );
+        self.active_project = Some(project);
+        cx.notify();
     }
 
     /// Open a fresh local-PTY tab. Used by the picker's "+ New terminal"
@@ -590,12 +636,38 @@ impl Render for WorkspaceRoot {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
+                // Close the project picker first so two full-window
+                // overlays don't fight for the click-outside region
+                // (H4 — code-review 260521-1102).
+                this.project_picker.update(cx, |p, cx| p.close(cx));
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
+                this.project_picker.update(cx, |p, cx| p.close(cx));
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenProjectPicker, window, cx| {
+                // Toggle: a second Cmd+O closes the picker (H1 —
+                // code-review 260521-1102). Also blocks the
+                // double-NSOpenPanel race where a second Cmd+O while
+                // NSOpenPanel is open would clear `pending_folder_pick`
+                // and let "Open Folder…" launch a second panel.
+                if this.project_picker.read(cx).is_open() {
+                    this.project_picker.update(cx, |p, cx| p.close(cx));
+                    return;
+                }
+                // Snapshot recent projects so the picker's list stays
+                // stable while it is open. Close conflicting overlays
+                // (palette / adapter picker / pane actions) so only one
+                // click-outside dismiss region is registered at a time.
+                let projects = this.app_state.recent_projects.clone();
+                this.palette.update(cx, |p, cx| p.close(cx));
+                this.pane_actions.update(cx, |p, cx| p.close(cx));
+                this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.project_picker
+                    .update(cx, |p, cx| p.open(projects, window, cx));
             }))
             .on_action(
                 cx.listener(|this, _: &RequestOpenAdapterPicker, window, cx| {
@@ -696,6 +768,10 @@ impl Render for WorkspaceRoot {
             // Adapter picker — same z-band as pane_actions; only one of
             // them can be open at a time so order between them is moot.
             .child(self.adapter_picker.clone())
+            // Project picker (Cmd+O). Below the palette so an
+            // accidentally-opened palette during picker use wins z-order;
+            // the action handlers also close conflicting overlays.
+            .child(self.project_picker.clone())
             // Palette modal — appended last so it paints above all other
             // children (last child = topmost z-layer in GPUI).
             .child(self.palette.clone())

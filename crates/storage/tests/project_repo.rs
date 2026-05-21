@@ -79,6 +79,30 @@ fn project_delete_cascades_to_workspaces() {
 }
 
 #[test]
+fn project_get_by_root_path_returns_inserted() {
+    let (projects, _) = repo();
+    let p = projects
+        .insert("Acme", "/home/acme", "main")
+        .expect("insert");
+    let fetched = projects
+        .get_by_root_path("/home/acme")
+        .expect("lookup")
+        .expect("present");
+    assert_eq!(fetched, p);
+}
+
+#[test]
+fn project_get_by_root_path_returns_none_for_missing() {
+    let (projects, _) = repo();
+    assert!(
+        projects
+            .get_by_root_path("/does/not/exist")
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+#[test]
 fn project_root_path_unique_conflict() {
     let (projects, _) = repo();
     projects.insert("A", "/same", "main").expect("first");

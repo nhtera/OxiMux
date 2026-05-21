@@ -71,6 +71,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # default-features off: we only need `data_dir()` on macOS; the default
 # features pull in Windows/X11 helpers we never call.
 dirs = { version = "5", default-features = false }
+# Native folder picker — wraps NSOpenPanel on macOS via objc2. We use
+# `AsyncFileDialog` from the GPUI `cx.spawn` task so the OxiMux window
+# stays responsive while the panel is open. default-features off:
+# we don't need the GTK/XDG portal stacks the default features pull in
+# (Linux is not a v1 target).
+rfd = { version = "0.14", default-features = false }
 
 [profile.dev]
 opt-level = 0

@@ -58,6 +58,56 @@ impl ProjectRepo {
         Ok(row.map(Into::into))
     }
 
+    /// Lookup by absolute path. Used by the project picker's
+    /// conflict-then-touch flow when a user re-opens a project older
+    /// than the `list_recent(20)` horizon (so the in-memory scan misses).
+    pub fn get_by_root_path(&self, root_path: &str) -> Result<Option<Project>, StorageError> {
+        let row = self.db.with_conn(|c| {
+            c.query_row(
+                "SELECT id, name, root_path, default_branch, created_at, last_opened_at \
+                 FROM projects WHERE root_path = ?1",
+                [root_path],
+                ProjectRow::from_row,
+            )
+            .optional()
+        })?;
+        Ok(row.map(Into::into))
+    }
+
+    /// Insert a new project, or — on duplicate `root_path` — silently
+    /// touch the existing row's `last_opened_at` and return it.
+    ///
+    /// Used by the project picker (step 5) so the "Open Folder…" flow
+    /// re-promotes already-known paths to the top of the recent list
+    /// without surfacing a Conflict to the user. Two SQL writes in the
+    /// duplicate case: a failed INSERT (caught as Conflict) then an
+    /// UPDATE — acceptable for an interactive-only path.
+    pub fn insert_or_touch(
+        &self,
+        name: &str,
+        root_path: &str,
+        default_branch: &str,
+    ) -> Result<Project, StorageError> {
+        match self.insert(name, root_path, default_branch) {
+            Ok(project) => Ok(project),
+            Err(StorageError::Conflict {
+                table, constraint, ..
+            }) if table == "projects" && constraint == "root_path" => {
+                // Re-fetch existing row; this is the canonical home for
+                // the conflict→touch flow so consumers never see SQL.
+                let existing = self
+                    .get_by_root_path(root_path)?
+                    .ok_or(StorageError::Conflict {
+                        table: "projects".into(),
+                        constraint: "root_path".into(),
+                    })?;
+                self.update_last_opened_at(&existing.id)?;
+                Ok(existing)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     pub fn list_recent(&self, limit: usize) -> Result<Vec<Project>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(

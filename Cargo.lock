@@ -4339,6 +4339,7 @@ dependencies = [
  "oximux-settings",
  "oximux-storage",
  "regex",
+ "rfd",
  "serde",
  "serde_json",
  "tempfile",
@@ -5265,6 +5266,26 @@ dependencies = [
  "tiny-skia",
  "usvg",
  "zune-jpeg 0.4.21",
+]
+
+[[package]]
+name = "rfd"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25a73a7337fc24366edfca76ec521f51877b114e42dab584008209cca6719251"
+dependencies = [
+ "block",
+ "dispatch",
+ "js-sys",
+ "log",
+ "objc",
+ "objc-foundation",
+ "objc_id",
+ "raw-window-handle",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

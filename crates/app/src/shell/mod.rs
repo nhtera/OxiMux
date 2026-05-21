@@ -21,6 +21,7 @@ pub mod main_pane;
 pub mod pane_actions;
 pub mod pane_layout;
 pub mod pane_tree;
+pub mod project_picker;
 pub mod right_sidebar;
 pub mod search_panel;
 pub mod source_control;
