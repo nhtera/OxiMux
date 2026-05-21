@@ -8,4 +8,5 @@ pub mod actions;
 pub mod assets;
 pub mod notifier;
 pub mod shell;
+pub mod state;
 pub mod workspace_root;

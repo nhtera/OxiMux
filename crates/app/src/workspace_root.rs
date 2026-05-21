@@ -36,6 +36,7 @@ use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::notifier::{Notifier, TabId};
+use crate::state::AppState;
 
 use crate::actions::{
     OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenQuickOpen, RequestOpenAdapterPicker,
@@ -103,10 +104,22 @@ pub struct WorkspaceRoot {
     /// loop — bound to WorkspaceRoot's lifetime so a window close stops
     /// trying to dispatch focus events into a torn-down view tree.
     _click_router: Task<()>,
+    /// Boot-time snapshot of persisted state (`recent_projects`, workspaces
+    /// per project, interrupted sessions) + repo handles for on-demand
+    /// reads/writes. Hydrated once by `main.rs` before the window opens;
+    /// step 5+ consume it via `pub(crate)` access. Marked `dead_code`-
+    /// allowed until step 5's project picker lands — step 4 is plumbing.
+    #[allow(dead_code)]
+    pub(crate) app_state: AppState,
 }
 
 impl WorkspaceRoot {
-    pub fn new(repo: Option<Repository>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        repo: Option<Repository>,
+        app_state: AppState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let theme = Theme::charcoal();
         let density = Density::cockpit();
         let typography = Typography::cockpit();
@@ -246,6 +259,7 @@ impl WorkspaceRoot {
             _workspace_tabs_observer: workspace_tabs_observer,
             _window_activation_observer: window_activation_observer,
             _click_router: click_router,
+            app_state,
         }
     }
 

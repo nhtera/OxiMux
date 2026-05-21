@@ -67,6 +67,10 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# macOS Application Support directory resolution (see crates/app/src/main.rs).
+# default-features off: we only need `data_dir()` on macOS; the default
+# features pull in Windows/X11 helpers we never call.
+dirs = { version = "5", default-features = false }
 
 [profile.dev]
 opt-level = 0

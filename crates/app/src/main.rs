@@ -10,6 +10,8 @@
 //! then runtime — is intentional: GPUI returns from `app.run`, the guard
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
+use std::path::PathBuf;
+
 use gpui::{
     AnyView, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point,
     px, size,
@@ -20,9 +22,17 @@ use oximux_app::actions::{
     SelectSourceControlTab, SplitHorizontal, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use oximux_app::assets::CompositeAssets;
+use oximux_app::state;
 use oximux_app::workspace_root::WorkspaceRoot;
 use oximux_git::Repository;
+use oximux_storage::Db;
 use tracing_subscriber::EnvFilter;
+
+/// macOS bundle identifier — anchors the on-disk data directory under
+/// `~/Library/Application Support`. Must stay in lockstep with
+/// `CFBundleIdentifier` in `assets/Info.plist`.
+const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
+const DB_FILE_NAME: &str = "oximux.db";
 
 fn main() {
     init_tracing();
@@ -37,12 +47,41 @@ fn main() {
 
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
     // without the git column — the rest of the shell still works.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repo = match rt.block_on(Repository::open(&cwd)) {
         Ok(r) => Some(r),
         Err(err) => {
             tracing::info!(?err, "no git repository at cwd; git column hidden");
             None
+        }
+    };
+
+    // Open SQLite + hydrate boot state. A failure here means every later
+    // write would fail too, so we surface the error loudly via eprintln +
+    // exit(1) rather than degrade silently. `spawn_blocking` keeps the
+    // rusqlite calls off the runtime worker pool — even though we
+    // immediately `block_on` it, the seam matches every other repo call
+    // site in the codebase (per `crates/storage/src/repositories/mod.rs`).
+    //
+    // The original `db` is moved into the closure; the surviving handle
+    // lives inside `AppState.db`. If `state::hydrate` panics, the
+    // closure's `Db` mutex is poisoned — but the `exit(1)` in the
+    // `JoinError` arm makes that path unreachable, so retry callers
+    // would need to reopen `Db` from scratch.
+    let db = open_db_or_exit();
+    let app_state = rt.block_on(async {
+        tokio::task::spawn_blocking(move || state::hydrate(db))
+            .await
+            .unwrap_or_else(|join_err| {
+                eprintln!("oximux: hydration task panicked: {join_err}");
+                std::process::exit(1);
+            })
+    });
+    let app_state = match app_state {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("oximux: failed to hydrate AppState: {err}");
+            std::process::exit(1);
         }
     };
 
@@ -126,17 +165,53 @@ fn main() {
         };
 
         let repo_for_window = repo.clone();
+        let app_state_for_window = app_state.clone();
         let _ = cx.open_window(options, move |window, cx| {
             // Wrap the workspace in gpui-component's `Root`. `Root` hosts the
             // tooltip / sheet / dialog / notification overlays, which is what
             // makes `Button::tooltip(...)` (and any other component tooltip)
             // actually paint. On macOS its `window_border` shadow size is 0,
             // so it's a transparent pass-through — purely additive.
-            let workspace = cx.new(|cx| WorkspaceRoot::new(repo_for_window, window, cx));
+            let workspace =
+                cx.new(|cx| WorkspaceRoot::new(repo_for_window, app_state_for_window, window, cx));
             let view: AnyView = workspace.into();
             cx.new(|cx| gpui_component::Root::new(view, window, cx))
         });
     });
+}
+
+/// Resolve `~/Library/Application Support/dev.nhtera.oximux/oximux.db`,
+/// mkdir-p the parent, and open the SQLite database. Any failure on this
+/// path is fatal — `eprintln` + `exit(1)` rather than panic so the user
+/// sees a one-line message instead of a Rust backtrace.
+fn open_db_or_exit() -> Db {
+    let Some(data_dir) = dirs::data_dir() else {
+        eprintln!(
+            "oximux: cannot resolve Application Support directory; \
+             try setting $HOME or running outside a restrictive sandbox"
+        );
+        std::process::exit(1);
+    };
+    let db_dir = data_dir.join(APP_DATA_SUBDIR);
+    if let Err(err) = std::fs::create_dir_all(&db_dir) {
+        eprintln!(
+            "oximux: cannot create data directory {}: {err}",
+            db_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let db_path = db_dir.join(DB_FILE_NAME);
+    match oximux_storage::open(&db_path) {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!(
+                "oximux: cannot open database {} (is another OxiMux instance \
+                 running? if the file is corrupt, delete it to reset): {err}",
+                db_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 fn init_tracing() {

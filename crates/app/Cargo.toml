@@ -17,6 +17,7 @@ oximux-core = { workspace = true }
 oximux-git = { workspace = true }
 oximux-pty = { workspace = true }
 oximux-settings = { workspace = true }
+oximux-storage = { workspace = true }
 
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
@@ -24,6 +25,7 @@ gpui-component = { workspace = true }
 gpui-component-assets = { workspace = true }
 
 anyhow = { workspace = true }
+dirs = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
