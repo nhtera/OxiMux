@@ -37,8 +37,10 @@ pub struct Migration {
 /// V001 lands the five-table OxiMux schema (projects, workspaces,
 /// agent_sessions, pane_sessions, settings) plus three FK-support
 /// indexes. V002 adds `pane_buffers` (per-pane scrollback snapshots for
-/// terminal-tab restore, Phase 4 step 16). Future migrations append;
-/// never reorder, never rewrite.
+/// terminal-tab restore, Phase 4 step 16). V003 adds `pane_relay_ids`
+/// (per-pane mapping to relay-side PTY ids for cross-restart attach,
+/// Phase 5 step 5). Future migrations append; never reorder, never
+/// rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -49,6 +51,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "pane_buffers",
         sql: include_str!("../migrations/V002__pane_buffers.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "pane_relay_ids",
+        sql: include_str!("../migrations/V003__pane_relay_ids.sql"),
     },
 ];
 

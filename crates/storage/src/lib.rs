@@ -28,5 +28,6 @@ pub use db::{Db, open, open_memory};
 pub use error::StorageError;
 pub use migrations::{MIGRATIONS, Migration};
 pub use repositories::{
-    AgentSessionRepo, PaneBufferRepo, PaneSessionRepo, ProjectRepo, SettingsRepo, WorkspaceRepo,
+    AgentSessionRepo, PaneBufferRepo, PaneRelayIdRepo, PaneSessionRepo, ProjectRepo, SettingsRepo,
+    WorkspaceRepo,
 };
