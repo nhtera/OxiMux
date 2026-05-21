@@ -74,6 +74,24 @@ pub trait TerminalBackend: Send + 'static {
         Vec::new()
     }
 
+    /// Snapshot the session's grid + scrollback as ANSI bytes suitable for
+    /// replaying into a fresh PTY's grid (Phase 4 step 16). `max_bytes`
+    /// caps output size; backends binary-search the largest scrollback
+    /// that fits. Default impl returns empty so fixture / replay backends
+    /// without a live grid can opt out.
+    fn serialize_buffer(&self, _id: TerminalSessionId, _max_bytes: usize) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Feed bytes directly into the session's grid without writing them to
+    /// the PTY. Used at restore time to repopulate the visible grid +
+    /// scrollback from a previous session's `serialize_buffer` capture
+    /// BEFORE the live shell starts producing output. Default impl is a
+    /// no-op for backends without a live grid.
+    fn prefill_grid(&mut self, _id: TerminalSessionId, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
     /// Drain accumulated events without blocking. Returns empty when idle.
     fn drain_events(&mut self) -> Vec<TerminalEvent>;
 

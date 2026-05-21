@@ -14,7 +14,8 @@ use std::collections::HashMap;
 
 use oximux_core::{AgentSession, AgentStatus, Project, Workspace};
 use oximux_storage::{
-    AgentSessionRepo, Db, PaneSessionRepo, ProjectRepo, SettingsRepo, StorageError, WorkspaceRepo,
+    AgentSessionRepo, Db, PaneBufferRepo, PaneSessionRepo, ProjectRepo, SettingsRepo, StorageError,
+    WorkspaceRepo,
 };
 
 /// Recent-projects fetch limit. The project picker (step 5) paginates if a
@@ -43,6 +44,7 @@ pub struct AppState {
     pub(crate) workspace_repo: WorkspaceRepo,
     pub(crate) agent_session_repo: AgentSessionRepo,
     pub(crate) pane_session_repo: PaneSessionRepo,
+    pub(crate) pane_buffer_repo: PaneBufferRepo,
     pub(crate) settings_repo: SettingsRepo,
     /// Most recently opened projects (newest `last_opened_at` first), capped
     /// at [`RECENT_PROJECTS_LIMIT`]. Empty on first launch — that is the
@@ -74,6 +76,7 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
     let workspace_repo = WorkspaceRepo::new(db.clone());
     let agent_session_repo = AgentSessionRepo::new(db.clone());
     let pane_session_repo = PaneSessionRepo::new(db.clone());
+    let pane_buffer_repo = PaneBufferRepo::new(db.clone());
     let settings_repo = SettingsRepo::new(db.clone());
 
     let recent_projects = project_repo.list_recent(RECENT_PROJECTS_LIMIT)?;
@@ -120,6 +123,7 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
         workspace_repo,
         agent_session_repo,
         pane_session_repo,
+        pane_buffer_repo,
         settings_repo,
         recent_projects,
         workspaces,

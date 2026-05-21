@@ -7,6 +7,8 @@ use oximux_agents::{AgentStatusStream, SharedBackend};
 use oximux_core::AgentSessionId;
 use oximux_pty::TerminalSessionId;
 
+use oximux_storage::PaneBufferRepo;
+
 use crate::notifier::TabId;
 use crate::persisted_terminals::{
     PersistedAgentTab, PersistedTab, PersistedTabs, snapshot_tree,
@@ -187,6 +189,46 @@ impl WorkspaceTabs {
             _status_task: Some(status_task),
         });
         cx.notify();
+    }
+
+    /// Capture every plain-terminal leaf's scrollback to `pane_buffers`
+    /// keyed by `(project_id, ordinal)`. Ordinal counts plain-terminal
+    /// leaves in DFS tab+leaf order, skipping agent tabs (agent restore
+    /// goes through `CliRuntime::start_session` and the CLI reloads its
+    /// own history).
+    ///
+    /// Best-effort: failures are logged but do not abort. Called at
+    /// project-switch and app-quit checkpoints — never on the per-frame
+    /// `cx.observe` path (full grid serialization is too expensive for
+    /// that cadence).
+    pub fn capture_pane_buffers(
+        &self,
+        repo: &PaneBufferRepo,
+        project_id: &str,
+        max_bytes_per_pane: usize,
+        cx: &gpui::App,
+    ) {
+        if let Err(err) = repo.delete_for_project(project_id) {
+            tracing::warn!(?err, project_id, "pane_buffers: delete_for_project failed");
+            return;
+        }
+        let mut ordinal: u32 = 0;
+        for tab in &self.tabs {
+            if !matches!(tab.kind, WorkspaceTabKind::Terminal) {
+                continue;
+            }
+            let buffers = tab.pane.read(cx).collect_pane_buffers(max_bytes_per_pane, cx);
+            for bytes in buffers {
+                if bytes.is_empty() {
+                    ordinal += 1;
+                    continue;
+                }
+                if let Err(err) = repo.set(project_id, ordinal, &bytes) {
+                    tracing::warn!(?err, project_id, ordinal, "pane_buffers: set failed");
+                }
+                ordinal += 1;
+            }
+        }
     }
 
     /// Finalize the restore: set active tab + label counter, focus the

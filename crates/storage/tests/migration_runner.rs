@@ -3,7 +3,7 @@
 //! Unit tests in `db.rs` cover the in-memory path; these exercise the
 //! create-file + re-open paths and the bookkeeping table contract.
 
-use oximux_storage::{open, open_memory};
+use oximux_storage::{MIGRATIONS, open, open_memory};
 
 #[test]
 fn open_creates_db_file() {
@@ -39,7 +39,8 @@ fn open_twice_is_noop() {
     }
     let second = open(&path).expect("second open");
 
-    // V001 recorded exactly once; second open is a no-op.
+    // Every registered migration recorded exactly once; second open is a
+    // no-op regardless of how many migrations the ladder grows to.
     let row_count: i64 = second
         .with_conn(|c| {
             c.query_row("SELECT COUNT(*) FROM __oximux_migrations", [], |row| {
@@ -47,7 +48,7 @@ fn open_twice_is_noop() {
             })
         })
         .expect("count");
-    assert_eq!(row_count, 1);
+    assert_eq!(row_count, MIGRATIONS.len() as i64);
 }
 
 #[test]

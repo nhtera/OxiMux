@@ -28,12 +28,14 @@ use uuid::Uuid;
 use crate::error::StorageError;
 
 mod agent_session;
+mod pane_buffer;
 mod pane_session;
 mod project;
 mod settings;
 mod workspace;
 
 pub use agent_session::AgentSessionRepo;
+pub use pane_buffer::PaneBufferRepo;
 pub use pane_session::PaneSessionRepo;
 pub use project::ProjectRepo;
 pub use settings::SettingsRepo;

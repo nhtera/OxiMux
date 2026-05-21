@@ -36,12 +36,21 @@ pub struct Migration {
 
 /// V001 lands the five-table OxiMux schema (projects, workspaces,
 /// agent_sessions, pane_sessions, settings) plus three FK-support
-/// indexes. Future migrations append; never reorder, never rewrite.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "init",
-    sql: include_str!("../migrations/V001__init.sql"),
-}];
+/// indexes. V002 adds `pane_buffers` (per-pane scrollback snapshots for
+/// terminal-tab restore, Phase 4 step 16). Future migrations append;
+/// never reorder, never rewrite.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "init",
+        sql: include_str!("../migrations/V001__init.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "pane_buffers",
+        sql: include_str!("../migrations/V002__pane_buffers.sql"),
+    },
+];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
 /// The CI guard uses this to count `.sql` files.

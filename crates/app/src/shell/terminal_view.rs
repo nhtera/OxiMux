@@ -247,6 +247,26 @@ impl TerminalView {
         f(&mut **be)
     }
 
+    /// Serialize this pane's grid + scrollback to ANSI bytes for the
+    /// persistence path (Phase 4 step 16). Caps output at `max_bytes` via
+    /// the backend's binary-search wrapper. Empty Vec when the backend
+    /// can't serialize (fixture / replay backends).
+    pub fn serialize_buffer(&self, max_bytes: usize) -> Vec<u8> {
+        let id = self.session_id;
+        self.with_backend(|be| be.serialize_buffer(id, max_bytes))
+    }
+
+    /// Replay captured bytes into this pane's grid BEFORE the live PTY
+    /// produces output, so prior scrollback is visible on restart.
+    pub fn prefill_grid(&self, bytes: &[u8]) {
+        let id = self.session_id;
+        self.with_backend(|be| {
+            if let Err(err) = be.prefill_grid(id, bytes) {
+                tracing::warn!(?err, "prefill_grid failed");
+            }
+        });
+    }
+
     fn on_search(&mut self, _: &Search, _window: &mut Window, cx: &mut Context<Self>) {
         self.search.open();
         self.rerun_search();

@@ -182,6 +182,17 @@ fn main() {
             // Restore last-active project so the sidebar isn't empty after
             // relaunch. Helper reads recents (ORDER BY last_opened_at DESC).
             workspace.update(cx, |root, cx| root.bootstrap_active_project(window, cx));
+            // Capture every open project's pane scrollback to `pane_buffers`
+            // on app quit. The on_app_quit closure runs synchronously inside
+            // GPUI's grace window (default 100 ms); BLOB writes for ~10
+            // panes fit comfortably. Restore on next launch reads these
+            // same rows in `set_active_project` (Phase 4 step 16).
+            let workspace_for_quit = workspace.clone();
+            cx.on_app_quit(move |cx| {
+                workspace_for_quit.read(cx).capture_all_pane_buffers(cx);
+                async {}
+            })
+            .detach();
             let view: AnyView = workspace.into();
             cx.new(|cx| gpui_component::Root::new(view, window, cx))
         });

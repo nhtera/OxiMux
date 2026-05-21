@@ -16,7 +16,7 @@ use gpui::{AppContext, Context, Entity, WeakEntity, Window};
 use oximux_agents::{AgentRuntime, AgentSessionConfig, CliRuntime};
 use oximux_core::AgentAdapter;
 use oximux_settings::{Density, Theme, Typography};
-use oximux_storage::SettingsRepo;
+use oximux_storage::{PaneBufferRepo, SettingsRepo};
 
 use crate::notifier::Notifier;
 use crate::persisted_terminals::{
@@ -31,10 +31,16 @@ use crate::workspace_root::WorkspaceRoot;
 const DEFAULT_AGENT_COLS: u16 = 120;
 const DEFAULT_AGENT_ROWS: u16 = 32;
 
+/// Per-pane cap on captured scrollback bytes. 512 KiB matches the
+/// reference cockpit; covers ~5k rows × 80 cols of typical output even
+/// with SGR runs. Stored as raw BLOB so JSON encoding overhead is nil.
+pub const PANE_BUFFER_MAX_BYTES: usize = 512 * 1024;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_workspace_tabs(
     cwd: PathBuf,
     snapshot: Option<PersistedTabs>,
+    pane_buffers: Vec<Vec<u8>>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -65,6 +71,10 @@ pub(crate) fn build_workspace_tabs(
 
     // Snapshot path. Walk tabs in saved order; terminals build synchronously,
     // agents kick off an async `start_session` + push when ready.
+    // `pane_buffers_iter` cursors through the captured scrollback bytes in
+    // the same DFS leaf order produced by capture so each restored leaf gets
+    // its own buffer (when one exists).
+    let mut pane_buffers_iter = pane_buffers.into_iter();
     for tab in &snap.tabs {
         if let Some(agent) = &tab.agent {
             restore_agent_tab(
@@ -84,6 +94,16 @@ pub(crate) fn build_workspace_tabs(
             window,
             cx,
         ) {
+            // Pre-paint scrollback into each leaf BEFORE the live PTY's
+            // poll task ticks for the first time so restored output lands
+            // above the fresh shell prompt.
+            let leaf_count = pane.read(cx).leaf_count();
+            let chunk: Vec<Vec<u8>> = (0..leaf_count)
+                .map(|_| pane_buffers_iter.next().unwrap_or_default())
+                .collect();
+            pane.update(cx, |main, cx| {
+                main.prefill_leaves(&chunk, cx);
+            });
             tabs_entity.update(cx, |tabs, cx| {
                 tabs.push_restored_terminal_tab(tab.label.clone(), pane, cx);
             });
@@ -266,6 +286,33 @@ pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Opti
         Err(err) => {
             tracing::warn!(?err, project_id, "load_persisted_tabs: parse failed; ignoring");
             None
+        }
+    }
+}
+
+/// Fetch every captured pane buffer for a project, in ordinal-ascending
+/// order, returning just the bytes (caller pairs them with leaves in DFS
+/// order via the same indexing the capture path used). Missing project
+/// or fetch failure yields an empty Vec.
+pub(crate) fn load_pane_buffers(repo: &PaneBufferRepo, project_id: &str) -> Vec<Vec<u8>> {
+    match repo.get_all_for_project(project_id) {
+        Ok(rows) => {
+            // Rows arrive sorted by ordinal; the highest ordinal sets the
+            // Vec length so a missing middle ordinal becomes an empty
+            // buffer rather than a misaligned pairing.
+            let cap = rows.last().map(|(o, _)| *o as usize + 1).unwrap_or(0);
+            let mut out: Vec<Vec<u8>> = vec![Vec::new(); cap];
+            for (ord, bytes) in rows {
+                let idx = ord as usize;
+                if idx < out.len() {
+                    out[idx] = bytes;
+                }
+            }
+            out
+        }
+        Err(err) => {
+            tracing::warn!(?err, project_id, "load_pane_buffers: get failed");
+            Vec::new()
         }
     }
 }

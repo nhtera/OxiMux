@@ -172,6 +172,39 @@ impl MainPane {
         self.tree.leaf_count()
     }
 
+    /// Walk the tree in DFS leaf order and return one byte buffer per
+    /// leaf via `TerminalBackend::serialize_buffer`. Used by the scrollback
+    /// persistence path (Phase 4 step 16); ordinal index in the returned
+    /// Vec lines up with the restore-time leaf order produced by
+    /// `restore_tree` so capture and restore agree without an explicit map.
+    pub fn collect_pane_buffers(&self, max_bytes: usize, cx: &gpui::App) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.panes.len());
+        for leaf_id in self.tree.in_order_leaves() {
+            let Some(view) = self.panes.get(&leaf_id) else {
+                continue;
+            };
+            let bytes = view.read(cx).serialize_buffer(max_bytes);
+            out.push(bytes);
+        }
+        out
+    }
+
+    /// Inverse of `collect_pane_buffers`: feed previously-captured bytes
+    /// into each leaf's grid BEFORE the live PTY produces any output.
+    /// Buffers are paired with leaves in DFS order; an empty buffer means
+    /// "no capture for this leaf" and is skipped.
+    pub fn prefill_leaves(&self, buffers: &[Vec<u8>], cx: &gpui::App) {
+        for (leaf_id, bytes) in self.tree.in_order_leaves().iter().zip(buffers.iter()) {
+            if bytes.is_empty() {
+                continue;
+            }
+            let Some(view) = self.panes.get(leaf_id) else {
+                continue;
+            };
+            view.read(cx).prefill_grid(bytes);
+        }
+    }
+
     /// Focus handle for the currently focused terminal leaf. Used by
     /// `WorkspaceTabs::focus_active` so switching tabs re-homes focus inside
     /// the destination tab's last-focused pane.

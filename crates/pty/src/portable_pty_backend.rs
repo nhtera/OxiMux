@@ -207,6 +207,28 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(on)
     }
 
+    fn serialize_buffer(&self, id: TerminalSessionId, max_bytes: usize) -> Vec<u8> {
+        let Some(session) = self.sessions.get(&id) else {
+            return Vec::new();
+        };
+        session
+            .state
+            .lock()
+            .map(|s| crate::grid_serializer::serialize_term_capped(s.term_for_test(), max_bytes))
+            .unwrap_or_default()
+    }
+
+    fn prefill_grid(&mut self, id: TerminalSessionId, bytes: &[u8]) -> Result<()> {
+        let session = self
+            .sessions
+            .get(&id)
+            .with_context(|| format!("unknown session {id:?}"))?;
+        if let Ok(mut state) = session.state.lock() {
+            state.advance(bytes);
+        }
+        Ok(())
+    }
+
     fn search_grid(&self, id: TerminalSessionId) -> Vec<Vec<Cell>> {
         let Some(session) = self.sessions.get(&id) else {
             return Vec::new();

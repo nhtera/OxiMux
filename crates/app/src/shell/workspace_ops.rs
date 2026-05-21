@@ -192,6 +192,21 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         tracing::info!(project_id = %project.id, name = %project.name, "active project set");
+        // Capture the outgoing project's pane scrollback before swapping so
+        // a project-switch-then-quit-other-window flow doesn't lose data.
+        // No-op when no project was previously active.
+        if let Some(outgoing) = self.active_project.as_ref().map(|p| p.id.clone())
+            && outgoing != project.id
+            && let Some(tabs) = self.workspace_tabs_by_project.get(&outgoing).cloned()
+        {
+            let repo = self.app_state.pane_buffer_repo.clone();
+            tabs.read(cx).capture_pane_buffers(
+                &repo,
+                &outgoing,
+                crate::workspace_tabs_factory::PANE_BUFFER_MAX_BYTES,
+                cx,
+            );
+        }
         self.active_project = Some(project.clone());
         let project_root = PathBuf::from(&project.root_path);
         // Lazy-build the tabs entity on first activation of this project so
@@ -206,9 +221,14 @@ impl WorkspaceRoot {
             let notifier = self.notifier.clone();
             // Try to restore from settings; missing/malformed = fresh start.
             let snapshot = load_persisted_tabs(&self.app_state.settings_repo, &project.id);
+            let pane_buffers = crate::workspace_tabs_factory::load_pane_buffers(
+                &self.app_state.pane_buffer_repo,
+                &project.id,
+            );
             if let Some(tabs) = build_workspace_tabs(
                 project_root.clone(),
                 snapshot,
+                pane_buffers,
                 theme,
                 density,
                 typography,

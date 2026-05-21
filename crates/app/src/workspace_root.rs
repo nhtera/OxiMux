@@ -352,6 +352,21 @@ impl WorkspaceRoot {
         self.workspace_tabs_by_project.get(id).cloned()
     }
 
+    /// Walk every open project's tabs and serialize plain-terminal
+    /// scrollback to `pane_buffers`. Called from the app-quit hook so
+    /// state restored on next launch reflects the user's final view.
+    pub fn capture_all_pane_buffers(&self, cx: &gpui::App) {
+        let repo = self.app_state.pane_buffer_repo.clone();
+        for (project_id, tabs) in &self.workspace_tabs_by_project {
+            tabs.read(cx).capture_pane_buffers(
+                &repo,
+                project_id,
+                crate::workspace_tabs_factory::PANE_BUFFER_MAX_BYTES,
+                cx,
+            );
+        }
+    }
+
     /// Spawn the chosen agent in a new workspace tab. Runs the
     /// start_session → backend_for → terminal_session_id → subscribe_status
     /// chain, then hands the assembled handles to `WorkspaceTabs::push_agent_tab`.
