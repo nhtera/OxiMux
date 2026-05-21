@@ -28,10 +28,14 @@ pub mod workspace_row;
 
 use std::collections::HashMap;
 
-use gpui::{Context, IntoElement, ParentElement, Render, Styled, WeakEntity, Window, div, px, svg};
+use gpui::{
+    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
+    Styled, WeakEntity, Window, div, px, svg,
+};
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::actions::OpenProjectPicker;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
 use crate::shell::left_rail::toolbar::render_toolbar;
@@ -151,7 +155,7 @@ fn render_workspace_list(
     typography: &Typography,
 ) -> gpui::AnyElement {
     let Some(active_project) = active_project else {
-        return placeholder("Open a project (⌘O)", theme, density, typography).into_any_element();
+        return open_project_cta(theme, density, typography).into_any_element();
     };
 
     let plan = build_project_group_plan(&active_project, &workspaces, true);
@@ -183,21 +187,24 @@ fn render_workspace_list(
     .into_any_element()
 }
 
-fn placeholder(
-    msg: &str,
-    theme: Theme,
-    density: Density,
-    typography: &Typography,
-) -> impl IntoElement {
+/// Empty-state row: clickable "Open a project (⌘O)" that dispatches the
+/// project-picker action.
+fn open_project_cta(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
     div()
+        .id("left-rail-open-project-cta")
         .flex()
         .items_center()
         .justify_center()
         .h(px(60.))
         .px(px(density.pad_panel))
+        .cursor_pointer()
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_subtle)
-        .child(msg.to_string())
+        .hover(|s| s.text_color(theme.fg_base))
+        .child("Open a project (⌘O)")
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+            window.dispatch_action(Box::new(OpenProjectPicker), cx);
+        })
 }
 
 fn divider(theme: Theme) -> impl IntoElement {

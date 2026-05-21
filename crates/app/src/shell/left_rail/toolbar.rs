@@ -1,10 +1,14 @@
 //! Bottom toolbar of the left rail — "Add Project" button + settings icon.
 //!
-//! All actions are TODO stubs in Phase 02. Phase 04 (settings) wires the
-//! settings cog; new-workspace flow lands in a future phase.
+//! Settings cog is still a TODO stub (lands with settings round-trip).
 
-use gpui::{IntoElement, ParentElement, Styled, div, px, svg};
+use gpui::{
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled, div, px,
+    svg,
+};
 use oximux_settings::{Density, Theme, Typography};
+
+use crate::actions::OpenProjectPicker;
 
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const ICON_SIZE: f32 = 14.0;
@@ -21,15 +25,14 @@ pub fn render_toolbar(theme: Theme, density: Density, typography: &Typography) -
         .border_t_1()
         .border_color(theme.border_inactive)
         .bg(theme.bg_panel)
-        // TODO(phase-04): open the new-workspace modal on click.
         .child(add_project_button(theme, density, typography))
-        // TODO(phase-04): open the settings panel on click.
         .child(div().flex_1())
         .child(settings_icon(theme))
 }
 
 fn add_project_button(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
     div()
+        .id("left-rail-add-project")
         .flex()
         .flex_row()
         .items_center()
@@ -37,6 +40,7 @@ fn add_project_button(theme: Theme, density: Density, typography: &Typography) -
         .cursor_pointer()
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_muted)
+        .hover(|s| s.text_color(theme.fg_base))
         .child(
             svg()
                 .path("icons/plus.svg")
@@ -44,6 +48,9 @@ fn add_project_button(theme: Theme, density: Density, typography: &Typography) -
                 .text_color(theme.fg_muted),
         )
         .child("Add Project")
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+            window.dispatch_action(Box::new(OpenProjectPicker), cx);
+        })
 }
 
 fn settings_icon(theme: Theme) -> impl IntoElement {
