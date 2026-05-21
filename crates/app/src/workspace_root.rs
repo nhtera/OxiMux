@@ -234,9 +234,9 @@ impl WorkspaceRoot {
         // the picker can route the user's choice back to
         // `set_active_project` without holding a strong cycle.
         let weak_for_picker: WeakEntity<WorkspaceRoot> = cx.weak_entity();
-        let on_pick: OnPick = Box::new(move |project, _window, cx| {
+        let on_pick: OnPick = Box::new(move |project, window, cx| {
             let weak = weak_for_picker.clone();
-            let _ = weak.update_in(cx, |this, w, cx| this.set_active_project(project, w, cx));
+            let _ = weak.update(cx, |this, cx| this.set_active_project(project, window, cx));
         });
         let project_repo = app_state.project_repo.clone();
         let project_picker = cx.new(|cx| {

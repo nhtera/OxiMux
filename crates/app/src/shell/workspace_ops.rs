@@ -36,9 +36,13 @@ pub(crate) fn build_add_project_dialog(
     cx: &mut Context<WorkspaceRoot>,
 ) -> Entity<AddProjectDialog> {
     let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
-    let on_pick: OnAddProjectPick = Box::new(move |project, _window, cx| {
+    let on_pick: OnAddProjectPick = Box::new(move |project, window, cx| {
         tracing::info!(project_id = %project.id, "AddProjectDialog on_pick callback fired");
-        let _ = weak.update_in(cx, |this, window, cx| {
+        // Use `update` + the outer window directly — `update_in` does a
+        // with_window lookup that returns "entity has no current window"
+        // when fired from a deeply-nested async callback (e.g. rfd's
+        // NSOpenPanel resolution).
+        let _ = weak.update(cx, |this, cx| {
             this.set_active_project(project, window, cx);
         });
     });
