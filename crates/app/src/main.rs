@@ -23,8 +23,12 @@ use oximux_app::actions::{
     ToggleLeftSidebar, ToggleRightSidebar,
 };
 use oximux_app::assets::CompositeAssets;
+use oximux_app::relay_supervisor::RelaySupervisor;
+use oximux_app::shell::terminal_view::install_shared_backend;
 use oximux_app::state;
 use oximux_app::workspace_root::WorkspaceRoot;
+use oximux_pty::TerminalBackend;
+use oximux_relay_client::RelayBackend;
 use oximux_git::Repository;
 use oximux_storage::Db;
 use tracing_subscriber::EnvFilter;
@@ -85,6 +89,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Try to bring up the relay daemon. On success, install a shared
+    // `RelayBackend` so every PTY spawn goes through the daemon and
+    // survives Cmd-Q. On failure, log and continue — the app falls
+    // back to per-pane `PortablePtyBackend` (today's behavior, no
+    // survival, but the shell still works).
+    boot_relay_supervisor(&rt);
 
     // `with_assets` registers our composite SVG source: local app icons
     // (e.g. `icons/git-branch.svg`) first, falling through to gpui-component's
@@ -231,6 +242,37 @@ fn open_db_or_exit() -> Db {
             std::process::exit(1);
         }
     }
+}
+
+// Best-effort: bring up the relay daemon and install the shared
+// backend. Any error here is downgraded to a warning — the app
+// degrades to in-process PTYs rather than refusing to start.
+fn boot_relay_supervisor(rt: &tokio::runtime::Runtime) {
+    let Some(data_dir) = dirs::data_dir() else {
+        tracing::warn!("no data_dir; skipping relay supervisor");
+        return;
+    };
+    let runtime_dir = data_dir.join(APP_DATA_SUBDIR);
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("no home_dir; skipping relay supervisor");
+        return;
+    };
+    // macOS convention: per-app logs live under ~/Library/Logs.
+    let log_dir = home.join("Library/Logs").join(APP_DATA_SUBDIR);
+
+    let supervisor = RelaySupervisor::new(runtime_dir, log_dir);
+    let client = match rt.block_on(supervisor.ensure_running()) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(?err, "relay supervisor failed; using in-process PTYs");
+            return;
+        }
+    };
+    let backend = RelayBackend::new(std::sync::Arc::new(client), rt.handle().clone());
+    let boxed: Box<dyn TerminalBackend> = Box::new(backend);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
+    install_shared_backend(shared);
+    tracing::info!("relay supervisor up; PTYs will route through the daemon");
 }
 
 fn init_tracing() {

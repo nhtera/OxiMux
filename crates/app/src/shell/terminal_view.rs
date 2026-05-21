@@ -18,7 +18,7 @@
 //! arbitrary tree of splits without each leaf double-counting chrome.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use gpui::{
@@ -60,7 +60,46 @@ pub const DEFAULT_ROWS: u16 = 32;
 /// pane-grid split). Returns `None` on spawn failure (caller logs + falls
 /// back to a placeholder); the `tracing::warn` is emitted here so each
 /// caller doesn't repeat the same line.
+// Process-wide shared backend, installed once at app boot when the
+// relay supervisor brings up a `RelayBackend`. Every pane mints a
+// fresh `TerminalSessionId` on this single backend (the relay
+// multiplexes the underlying socket). Unset = the relay couldn't
+// start; fall back to per-pane `PortablePtyBackend` (today's
+// behavior — no survival, but the app still works).
+static SHARED_BACKEND: OnceLock<SharedBackend> = OnceLock::new();
+
+pub fn install_shared_backend(backend: SharedBackend) {
+    if SHARED_BACKEND.set(backend).is_err() {
+        tracing::warn!("shared backend already installed; ignoring");
+    }
+}
+
 pub fn spawn_local_pty(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessionId)> {
+    // Relay-backed path: one shared backend across the whole app.
+    if let Some(shared) = SHARED_BACKEND.get() {
+        let cfg = SpawnConfig {
+            cwd: cwd.clone(),
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            ..SpawnConfig::default()
+        };
+        let mut guard = shared.lock().expect("shared backend poisoned");
+        match guard.spawn(cfg) {
+            Ok(session_id) => {
+                drop(guard);
+                return Some((Arc::clone(shared), session_id));
+            }
+            Err(err) => {
+                drop(guard);
+                tracing::warn!(?err, "relay-backed pty spawn failed; falling back");
+                // fall through to the in-process backend
+            }
+        }
+    }
+    spawn_fallback_portable(cwd)
+}
+
+fn spawn_fallback_portable(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
         cwd,
