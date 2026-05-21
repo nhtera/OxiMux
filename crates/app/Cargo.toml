@@ -16,6 +16,8 @@ oximux-agents = { workspace = true }
 oximux-core = { workspace = true }
 oximux-git = { workspace = true }
 oximux-pty = { workspace = true }
+oximux-relay-client = { workspace = true }
+oximux-relay-proto = { workspace = true }
 oximux-settings = { workspace = true }
 oximux-storage = { workspace = true }
 
@@ -34,6 +36,14 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+# Relay supervisor's `pre_exec` calls libc::umask so the bundled
+# socket/token files come out 0600. libc is already in the transitive
+# graph via nix/tokio but pulling it explicitly is cheaper than the
+# `libc::` qualifier dance through nix's re-exports.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"

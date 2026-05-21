@@ -8,6 +8,7 @@ pub mod actions;
 pub mod assets;
 pub mod notifier;
 pub mod persisted_terminals;
+pub mod relay_supervisor;
 pub mod shell;
 pub mod state;
 pub mod workspace_root;

@@ -4364,11 +4364,14 @@ dependencies = [
  "gpui-component-assets",
  "gpui_macros",
  "gpui_platform",
+ "libc",
  "mac-notification-sys",
  "oximux-agents",
  "oximux-core",
  "oximux-git",
  "oximux-pty",
+ "oximux-relay-client",
+ "oximux-relay-proto",
  "oximux-settings",
  "oximux-storage",
  "regex",
@@ -4380,6 +4383,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
