@@ -176,8 +176,8 @@ fn build_header(
         )
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             cx.stop_propagation();
-            let _ = weak_for_plus.update(cx, |root, cx| {
-                root.set_active_project(project.clone(), cx);
+            let _ = weak_for_plus.update_in(cx, |root, window, cx| {
+                root.set_active_project(project.clone(), window, cx);
             });
             window.dispatch_action(Box::new(OpenWorkspaceCreate), cx);
         });

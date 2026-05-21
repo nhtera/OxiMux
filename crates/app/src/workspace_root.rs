@@ -81,7 +81,7 @@ pub struct WorkspaceRoot {
     pub(crate) density: Density,
     pub(crate) typography: Typography,
     pub(crate) workspace_tabs: Option<Entity<WorkspaceTabs>>,
-    right_sidebar: Option<Entity<RightSidebar>>,
+    pub(crate) right_sidebar: Option<Entity<RightSidebar>>,
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
     pub(crate) pane_actions: Entity<PaneActionsMenu>,
@@ -236,7 +236,7 @@ impl WorkspaceRoot {
         let weak_for_picker: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let on_pick: OnPick = Box::new(move |project, _window, cx| {
             let weak = weak_for_picker.clone();
-            let _ = weak.update(cx, |this, cx| this.set_active_project(project, cx));
+            let _ = weak.update_in(cx, |this, w, cx| this.set_active_project(project, w, cx));
         });
         let project_repo = app_state.project_repo.clone();
         let project_picker = cx.new(|cx| {

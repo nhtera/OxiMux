@@ -37,7 +37,9 @@ pub(crate) fn build_add_project_dialog(
 ) -> Entity<AddProjectDialog> {
     let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
     let on_pick: OnAddProjectPick = Box::new(move |project, _window, cx| {
-        let _ = weak.update(cx, |this, cx| this.set_active_project(project, cx));
+        let _ = weak.update_in(cx, |this, window, cx| {
+            this.set_active_project(project, window, cx);
+        });
     });
     cx.new(|cx| AddProjectDialog::new(theme, density, typography, project_repo, on_pick, cx))
 }
@@ -147,14 +149,43 @@ fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
 }
 
 impl WorkspaceRoot {
-    /// Set the currently active project (called by the project picker's
-    /// `on_pick` callback). Step 7's sidebar reads this for its
-    /// workspace list. `cx.notify` triggers a re-render so the status
-    /// bar / future sidebar reflect the new selection.
-    pub(crate) fn set_active_project(&mut self, project: Project, cx: &mut Context<Self>) {
+    /// Set the currently active project. Stores it on `self`, triggers
+    /// a re-render so the left rail picks up the new workspaces, and
+    /// asynchronously rebuilds the right sidebar (Explorer / Source
+    /// Control / Search) against the new project's root. Repository
+    /// open is async so the rebuild is spawned; on success, the old
+    /// `right_sidebar` entity is replaced and drops.
+    pub(crate) fn set_active_project(
+        &mut self,
+        project: Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         tracing::info!(project_id = %project.id, name = %project.name, "active project set");
-        self.active_project = Some(project);
+        self.active_project = Some(project.clone());
         cx.notify();
+        let project_root = PathBuf::from(&project.root_path);
+        cx.spawn_in(window, async move |weak, cx| {
+            let repo = match oximux_git::Repository::open(&project_root).await {
+                Ok(r) => r,
+                Err(err) => {
+                    tracing::warn!(?err, path = %project_root.display(), "Repository::open failed");
+                    return;
+                }
+            };
+            let _ = weak.update_in(cx, |this, window, cx| {
+                let theme = this.theme;
+                let density = this.density;
+                let typography = this.typography.clone();
+                this.right_sidebar = Some(cx.new(|cx| {
+                    crate::shell::right_sidebar::RightSidebar::new(
+                        repo, theme, density, typography, window, cx,
+                    )
+                }));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Close every full-window modal overlay. Callers invoke this before
@@ -247,7 +278,7 @@ impl WorkspaceRoot {
                     .map(|p| p.id == project.id)
                     .unwrap_or(false);
                 if !same_active {
-                    self.set_active_project(project.clone(), cx);
+                    self.set_active_project(project.clone(), window, cx);
                 }
                 self.create_workspace_async(project, submit.name, submit.agent, window, cx);
             }
