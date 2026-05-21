@@ -105,6 +105,7 @@ impl AddProjectDialog {
     }
 
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!("AddProjectDialog: open()");
         self.open = true;
         self.pending_folder_pick = false;
         window.focus(&self.focus_handle, cx);
@@ -118,14 +119,18 @@ impl AddProjectDialog {
     }
 
     fn trigger_browse(&mut self, cx: &mut Context<Self>) {
+        tracing::info!("AddProjectDialog: Browse folder clicked");
         if self.pending_folder_pick {
+            tracing::info!("AddProjectDialog: pending_folder_pick already set; ignoring");
             return;
         }
         self.pending_folder_pick = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
+            tracing::info!("AddProjectDialog: opening NSOpenPanel");
             let folder = rfd::AsyncFileDialog::new().pick_folder().await;
             let path = folder.map(|h| h.path().to_path_buf());
+            tracing::info!(?path, "AddProjectDialog: NSOpenPanel resolved");
             let _ = this.update_in(cx, |this, window, cx| match path {
                 Some(p) => this.handle_folder_pick(p, window, cx),
                 None => {
@@ -138,8 +143,10 @@ impl AddProjectDialog {
     }
 
     fn handle_folder_pick(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!(path = %path.display(), "AddProjectDialog: handle_folder_pick");
         // NSOpenPanel races against close(); discard stale results.
         if !self.open {
+            tracing::warn!("AddProjectDialog: handle_folder_pick on a closed dialog; dropping");
             return;
         }
         self.pending_folder_pick = false;
@@ -150,6 +157,7 @@ impl AddProjectDialog {
             .insert_or_touch(&name, &path_str, DEFAULT_BRANCH_PLACEHOLDER)
         {
             Ok(project) => {
+                tracing::info!(project_id = %project.id, "AddProjectDialog: invoking on_pick");
                 // Close before invoking the callback so any modal the
                 // callback opens isn't wiped by a trailing close.
                 self.close(cx);

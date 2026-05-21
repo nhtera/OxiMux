@@ -690,6 +690,7 @@ impl Render for WorkspaceRoot {
                     .update(cx, |d, cx| d.open_create(projects, active, window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenAddProjectDialog, window, cx| {
+                tracing::info!("WorkspaceRoot: OpenAddProjectDialog action received");
                 this.close_modal_overlays(cx);
                 this.add_project_dialog
                     .update(cx, |d, cx| d.open(window, cx));
