@@ -289,6 +289,15 @@ impl RightSidebar {
         &self.latest_poll_state
     }
 
+    /// Whether this sidebar is backed by a live git repo. Non-git projects
+    /// instantiate the sidebar in explorer-only mode (no poller), so the
+    /// `latest_poll_state` stays at `Loading` forever — callers wanting to
+    /// render a git status indicator should gate on this before reading
+    /// the poll state.
+    pub fn has_repo(&self) -> bool {
+        self._poller.is_some()
+    }
+
     /// Tabs the activity bar should expose given current repo presence. Used by
     /// `WorkspaceRoot` to render the tab strip inside the global top bar.
     pub fn visible_tabs(&self) -> Vec<RightTab> {

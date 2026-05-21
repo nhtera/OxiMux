@@ -540,10 +540,17 @@ impl Render for WorkspaceRoot {
             .unwrap_or(0);
 
         // Route poll state to the status bar via the RightSidebar getter.
-        let git_state = self
-            .right_sidebar
-            .as_ref()
-            .map(|s| s.read(cx).latest_poll_state().clone());
+        // Non-git projects keep their PollState pinned at Loading forever
+        // (no poller exists), so gate on `has_repo` to keep the status
+        // bar from showing a perpetual "loading git…" placeholder.
+        let git_state = self.right_sidebar.as_ref().and_then(|s| {
+            let sidebar = s.read(cx);
+            if sidebar.has_repo() {
+                Some(sidebar.latest_poll_state().clone())
+            } else {
+                None
+            }
+        });
 
         // Activity-bar tabs are composed here so top_bar / right_sidebar stay
         // decoupled. Tabs only render when the sidebar is open.
