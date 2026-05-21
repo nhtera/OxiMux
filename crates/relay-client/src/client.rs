@@ -93,7 +93,11 @@ impl RelayClient {
         // --- Long-lived I/O tasks -----------------------------------
         let pending: Arc<DashMap<u64, oneshot::Sender<Response>>> = Arc::new(DashMap::new());
         let pty_subscribers: PtySubscribers = Arc::new(DashMap::new());
-        let (write_tx, mut write_rx) = mpsc::channel::<Frame>(256);
+        // Larger queue: keystroke writes use the sync `try_send_oneway`
+        // path so we want enough headroom to absorb a long paste while
+        // the writer task flushes to UDS. 4096 frames at ~64B/frame is
+        // ~256 KiB of worst-case buffering — negligible.
+        let (write_tx, mut write_rx) = mpsc::channel::<Frame>(4096);
 
         let writer_task = tokio::spawn(async move {
             while let Some(frame) = write_rx.recv().await {
@@ -143,6 +147,30 @@ impl RelayClient {
         }
     }
 
+    // Fire-and-forget send, synchronous. Skips both the pending oneshot
+    // AND the tokio Handle::block_on bridge — keystroke writes called
+    // from the GPUI render/input thread must not pay async runtime
+    // overhead per character. `try_send` is lock-free; on Full we log
+    // and drop (queue is 4096 frames, only reachable if UDS is hung,
+    // in which case the daemon is already toast). The daemon emits a
+    // Response::Ok we never pair with a pending entry; the reader_loop
+    // drops it at trace level.
+    pub fn try_send_oneway(&self, request: Request) -> Result<(), ClientError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let frame = Frame::Request {
+            request_id,
+            request,
+        };
+        match self.write_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("relay write queue full; dropping frame");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ClientError::Disconnected),
+        }
+    }
+
     // Register a per-PTY notification stream. Returned Receiver gets
     // every Output / Exit frame for `pty_id` until the matching
     // `unsubscribe_pty` call or until the daemon disconnects.
@@ -183,7 +211,11 @@ async fn reader_loop(
                 if let Some((_, tx)) = pending.remove(&request_id) {
                     let _ = tx.send(response);
                 } else {
-                    tracing::debug!(request_id, "response for unknown request_id");
+                    // Expected for fire-and-forget writes (every
+                    // keystroke). Keep at trace level so a debug-level
+                    // session doesn't pay format-string + I/O cost
+                    // for what is now normal traffic.
+                    tracing::trace!(request_id, "response for unknown request_id");
                 }
             }
             Frame::Notification(n) => fan_to_subscriber(&subscribers, n),

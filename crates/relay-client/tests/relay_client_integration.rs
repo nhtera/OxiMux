@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use oximux_pty::{SpawnConfig, TerminalBackend, TerminalEvent};
+use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent};
 use oximux_relay::server::{ServerConfig, run_server};
 use oximux_relay_client::{RelayBackend, RelayClient};
 use tempfile::TempDir;
@@ -151,6 +151,141 @@ fn snapshot_mirrors_remote_state() {
     let _ = drain_until(&mut fx.backend, Duration::from_secs(2), |e| {
         matches!(e, TerminalEvent::Exit { .. })
     });
+}
+
+// End-to-end keystroke latency probe. Measures write→echo round-trip
+// for N single-byte writes against a real /bin/sh through the live
+// daemon. Run with:
+//   cargo test --release -p oximux-relay-client \
+//       --test relay_client_integration -- --ignored --nocapture \
+//       keystroke_echo_latency
+// Ignored by default so the normal `cargo test` cycle stays under 1s.
+#[test]
+#[ignore]
+fn keystroke_echo_latency() {
+    use std::time::Instant;
+
+    let mut fx = boot_fixture();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        cwd: PathBuf::from("/tmp"),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    let id = fx.backend.spawn(cfg).expect("spawn");
+    // Wait for the prompt so the shell is in "ready to echo" mode.
+    let _ = drain_until(&mut fx.backend, Duration::from_secs(2), |_| false);
+
+    // Disable line-editor echo confusion: tell the shell to echo a
+    // unique marker on each input by reading one char in a loop. Use
+    // `cat` so every byte we write comes back verbatim, no buffering.
+    fx.backend
+        .write(id, b"cat\n")
+        .expect("start cat");
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = fx.backend.drain_events();
+
+    const N: usize = 50;
+    let mut samples_us: Vec<u128> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = Instant::now();
+        fx.backend.write(id, b"x").expect("write");
+        // Spin-drain until we see at least one Output containing 'x'.
+        loop {
+            let events = fx.backend.drain_events();
+            if events.iter().any(|e| {
+                matches!(e, TerminalEvent::Output { bytes, .. } if bytes.contains(&b'x'))
+            }) {
+                samples_us.push(t0.elapsed().as_micros());
+                break;
+            }
+            if t0.elapsed() > Duration::from_millis(500) {
+                panic!("no echo within 500ms — daemon hung?");
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    samples_us.sort_unstable();
+    let min = samples_us[0];
+    let p50 = samples_us[N / 2];
+    let p95 = samples_us[(N * 95) / 100];
+    let max = *samples_us.last().unwrap();
+    eprintln!(
+        "keystroke_echo_latency over {N} samples (microseconds): \
+         min={min} p50={p50} p95={p95} max={max}"
+    );
+
+    // Hard upper bound: if p50 > 30ms the daemon path is the bottleneck;
+    // < 30ms means render-side investigation needed.
+    assert!(
+        p50 < 30_000,
+        "p50={p50}µs exceeds 30ms budget — see relay path"
+    );
+
+    fx.backend.write(id, b"\x03").ok(); // SIGINT to cat
+    fx.backend.write(id, b"exit\n").ok();
+    let _ = drain_until(&mut fx.backend, Duration::from_secs(2), |e| {
+        matches!(e, TerminalEvent::Exit { .. })
+    });
+}
+
+// A/B counterpart: same latency probe against the in-process backend,
+// so the relay numbers can be compared against the "no daemon" baseline.
+// Same invocation pattern (--ignored --nocapture).
+#[test]
+#[ignore]
+fn keystroke_echo_latency_in_process() {
+    use std::time::Instant;
+
+    let mut backend = PortablePtyBackend::new();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        cwd: PathBuf::from("/tmp"),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    let id = backend.spawn(cfg).expect("spawn");
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = backend.drain_events();
+    backend.write(id, b"cat\n").expect("start cat");
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = backend.drain_events();
+
+    const N: usize = 50;
+    let mut samples_us: Vec<u128> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = Instant::now();
+        backend.write(id, b"x").expect("write");
+        loop {
+            let events = backend.drain_events();
+            if events.iter().any(|e| {
+                matches!(e, TerminalEvent::Output { bytes, .. } if bytes.contains(&b'x'))
+            }) {
+                samples_us.push(t0.elapsed().as_micros());
+                break;
+            }
+            if t0.elapsed() > Duration::from_millis(500) {
+                panic!("no echo within 500ms — pty hung?");
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    samples_us.sort_unstable();
+    eprintln!(
+        "keystroke_echo_latency_in_process over {N} samples (microseconds): \
+         min={} p50={} p95={} max={}",
+        samples_us[0],
+        samples_us[N / 2],
+        samples_us[(N * 95) / 100],
+        samples_us.last().unwrap()
+    );
+
+    backend.write(id, b"\x03").ok();
+    backend.write(id, b"exit\n").ok();
 }
 
 #[test]

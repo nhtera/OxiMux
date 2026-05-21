@@ -35,6 +35,20 @@ pub enum TerminalEvent {
     },
 }
 
+impl TerminalEvent {
+    /// Session this event is addressed to. Used by backends that
+    /// multiplex many panes onto one event source (e.g., the relay
+    /// backend) to route a drained event back to the owning view.
+    pub fn session_id(&self) -> TerminalSessionId {
+        match self {
+            TerminalEvent::Output { id, .. }
+            | TerminalEvent::Exit { id, .. }
+            | TerminalEvent::Resize { id, .. }
+            | TerminalEvent::TitleChange { id, .. } => *id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

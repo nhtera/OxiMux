@@ -132,6 +132,19 @@ pub trait TerminalBackend: Send + 'static {
     /// Drain accumulated events without blocking. Returns empty when idle.
     fn drain_events(&mut self) -> Vec<TerminalEvent>;
 
+    /// Drain events for a single session. Critical when one backend
+    /// instance is shared across multiple panes (e.g., the relay
+    /// backend): without this, every pane's tick races on the same
+    /// global channel and steals other panes' events. Default impl
+    /// filters `drain_events` by id — correct when the backend has only
+    /// one session, wasteful but still correct otherwise.
+    fn drain_events_for(&mut self, id: TerminalSessionId) -> Vec<TerminalEvent> {
+        self.drain_events()
+            .into_iter()
+            .filter(|e| e.session_id() == id)
+            .collect()
+    }
+
     /// Tear down a session. Idempotent — safe to call on an already-closed id.
     fn close(&mut self, id: TerminalSessionId) -> Result<()>;
 }

@@ -491,7 +491,12 @@ impl TerminalView {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
-        let events = self.with_backend(|be| be.drain_events());
+        // Use the per-session drain so panes can't steal each other's
+        // events from a shared backend (e.g., the relay). The global
+        // `drain_events` is reserved for tests + cleanup paths.
+        let session_id_for_drain = self.session_id;
+        let events =
+            self.with_backend(|be| be.drain_events_for(session_id_for_drain));
         if events.is_empty() {
             return;
         }

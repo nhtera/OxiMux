@@ -1,6 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
@@ -20,6 +19,14 @@ use crate::client::RelayClient;
 // backends mid-session (e.g., relay went down + supervisor restarted).
 const SCROLLBACK_ROWS: usize = 5000;
 
+// Per-session event buffer. Each TerminalView consumes only its own
+// queue via `drain_events_for`, so panes can't steal each other's
+// Output notifications. A shared global channel (as the old design
+// used) made tick-time draining a race: whichever pane ticked first
+// emptied the queue, leaving the actually-active pane with nothing to
+// render.
+type SessionEventQueues = Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>;
+
 struct Session {
     relay_pty_id: String,
     state: Arc<Mutex<TerminalState>>,
@@ -33,8 +40,7 @@ pub struct RelayBackend {
     handle: Handle,
     sessions: Mutex<HashMap<TerminalSessionId, Session>>,
     next_session_id: AtomicU64,
-    event_tx: Sender<TerminalEvent>,
-    event_rx: Receiver<TerminalEvent>,
+    event_queues: SessionEventQueues,
 }
 
 impl RelayBackend {
@@ -44,14 +50,12 @@ impl RelayBackend {
     // client and only calling sync methods from the GPUI render
     // thread (which is not a tokio worker).
     pub fn new(client: Arc<RelayClient>, handle: Handle) -> Self {
-        let (event_tx, event_rx) = channel();
         Self {
             client,
             handle,
             sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
-            event_tx,
-            event_rx,
+            event_queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -137,29 +141,22 @@ impl RelayBackend {
         state: Arc<Mutex<TerminalState>>,
         mut notif_rx: UnboundedReceiver<Notification>,
     ) -> JoinHandle<()> {
-        let event_tx = self.event_tx.clone();
+        let queues = Arc::clone(&self.event_queues);
         self.handle.spawn(async move {
             while let Some(n) = notif_rx.recv().await {
-                match n {
+                let event = match n {
                     Notification::Output { bytes, .. } => {
                         if let Ok(mut s) = state.lock() {
                             s.advance(&bytes);
                         }
-                        if event_tx
-                            .send(TerminalEvent::Output {
-                                id,
-                                bytes: bytes.clone(),
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
+                        TerminalEvent::Output { id, bytes }
                     }
                     Notification::Exit { code, .. } => {
-                        let _ = event_tx.send(TerminalEvent::Exit { id, code });
+                        push_event(&queues, id, TerminalEvent::Exit { id, code });
                         return;
                     }
-                }
+                };
+                push_event(&queues, id, event);
             }
         })
     }
@@ -229,14 +226,19 @@ impl TerminalBackend for RelayBackend {
 
     fn write(&mut self, id: TerminalSessionId, bytes: &[u8]) -> Result<()> {
         let pty_id = self.relay_pty_id_of(id)?;
-        let resp = self.request(Request::Write {
-            pty_id,
-            bytes: bytes.to_vec(),
-        })?;
-        match resp {
-            Response::Ok => Ok(()),
-            other => Err(anyhow!("write: {other:?}")),
-        }
+        // Hot path: called once per keystroke from the GPUI render/input
+        // thread. `try_send_oneway` is fully synchronous — no tokio
+        // Handle::block_on bridge, no future polling, no thread parking.
+        // Send order is preserved by the writer task's single-consumer
+        // mpsc; daemon-side write failures surface via the per-PTY
+        // Output/Exit notification stream rather than a per-byte ack.
+        self.client
+            .try_send_oneway(Request::Write {
+                pty_id,
+                bytes: bytes.to_vec(),
+            })
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
     }
 
     fn resize(&mut self, id: TerminalSessionId, cols: u16, rows: u16) -> Result<()> {
@@ -256,9 +258,11 @@ impl TerminalBackend for RelayBackend {
                         state.resize(cols, rows);
                     }
                 }
-                let _ = self
-                    .event_tx
-                    .send(TerminalEvent::Resize { id, cols, rows });
+                push_event(
+                    &self.event_queues,
+                    id,
+                    TerminalEvent::Resize { id, cols, rows },
+                );
                 Ok(())
             }
             other => Err(anyhow!("resize: {other:?}")),
@@ -325,11 +329,23 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn drain_events(&mut self) -> Vec<TerminalEvent> {
+        // Drains every session's queue. Used by tests + cleanup paths;
+        // the per-frame render path uses `drain_events_for` instead so
+        // each pane only sees its own events.
+        let mut map = self.event_queues.lock().expect("event queues poisoned");
         let mut out = Vec::new();
-        while let Ok(event) = self.event_rx.try_recv() {
-            out.push(event);
+        for q in map.values_mut() {
+            out.extend(q.drain(..));
         }
         out
+    }
+
+    fn drain_events_for(&mut self, id: TerminalSessionId) -> Vec<TerminalEvent> {
+        let mut map = self.event_queues.lock().expect("event queues poisoned");
+        match map.get_mut(&id) {
+            Some(q) => q.drain(..).collect(),
+            None => Vec::new(),
+        }
     }
 
     fn close(&mut self, id: TerminalSessionId) -> Result<()> {
@@ -337,6 +353,10 @@ impl TerminalBackend for RelayBackend {
             Some(s) => s,
             None => return Ok(()),
         };
+        self.event_queues
+            .lock()
+            .expect("event queues poisoned")
+            .remove(&id);
         self.client.unsubscribe_pty(&session.relay_pty_id);
         let resp = self
             .request(Request::Close {
@@ -354,6 +374,12 @@ impl TerminalBackend for RelayBackend {
             } => Ok(()),
             other => Err(anyhow!("close: {other:?}")),
         }
+    }
+}
+
+fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {
+    if let Ok(mut map) = queues.lock() {
+        map.entry(id).or_default().push_back(event);
     }
 }
 
