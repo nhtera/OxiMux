@@ -28,24 +28,31 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Subscription, Task, WeakEntity, Window, div, px,
+    Render, Styled, Subscription, Task, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use oximux_agents::{AdapterRegistry, AgentRuntime, AgentSessionConfig, CliRuntime};
 use oximux_core::{AgentAdapter, Project};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
+/// macOS Application Support sub-directory anchor. Must mirror the same
+/// constant in `crates/app/src/main.rs` — kept duplicated rather than
+/// re-exported because `main.rs` is a binary and `workspace_root.rs` is
+/// the library, and the two share no module today.
+pub(crate) const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
+
 use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
     OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenProjectPicker, OpenQuickOpen,
-    RequestOpenAdapterPicker, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
-    ToggleLeftSidebar, ToggleRightSidebar,
+    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectSearchTab,
+    SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::{
     adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
     command_palette::{PaletteModal, entry::PaletteMode},
+    confirm_dialog::ConfirmDialog,
     left_rail::LeftRail,
     main_area,
     main_pane::MainPane,
@@ -57,6 +64,7 @@ use crate::shell::{
     status_bar,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView, spawn_local_pty},
     top_bar,
+    workspace_dialog::{OnSubmit as OnWorkspaceSubmit, WorkspaceDialog},
     workspace_tabs::{self, WorkspaceTabs},
 };
 
@@ -67,9 +75,9 @@ use crate::shell::{
 const ADAPTER_PICKER_LEFT_INSET: f32 = 8.0;
 
 pub struct WorkspaceRoot {
-    theme: Theme,
-    density: Density,
-    typography: Typography,
+    pub(crate) theme: Theme,
+    pub(crate) density: Density,
+    pub(crate) typography: Typography,
     workspace_tabs: Option<Entity<WorkspaceTabs>>,
     right_sidebar: Option<Entity<RightSidebar>>,
     left_rail: Entity<LeftRail>,
@@ -114,6 +122,15 @@ pub struct WorkspaceRoot {
     /// projects taken at open() time; emits the chosen Project back here
     /// via the `OnPick` callback wired in `new()`.
     project_picker: Entity<ProjectPickerModal>,
+    /// Workspace create / rename dialog (Cmd+Shift+N opens in Create
+    /// mode; rename mode is driven programmatically from the step 7
+    /// sidebar context menu via `request_rename_workspace`).
+    pub(crate) workspace_dialog: Entity<WorkspaceDialog>,
+    /// Active type-to-confirm dialog. `None` when idle; replaced on each
+    /// `request_delete_workspace` call. `ConfirmDialog` is constructed
+    /// per-request (not persistent open/close like the picker) because
+    /// its prompt + callback are bound at construction time.
+    pub(crate) confirm_dialog: Option<Entity<ConfirmDialog>>,
     /// Currently active project — set when the picker resolves a
     /// selection. Consumed by step 7's sidebar render. `None` until the
     /// user opens a project. Held on `WorkspaceRoot` (not `AppState`)
@@ -233,6 +250,28 @@ impl WorkspaceRoot {
             )
         });
 
+        // Workspace dialog: same weak-ref pattern. Submit payload carries
+        // the mode (Create vs Rename) — `WorkspaceRoot` dispatches to
+        // `create_workspace_async` or `rename_workspace_now`.
+        let weak_for_workspace: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let on_workspace_submit: OnWorkspaceSubmit = Box::new(move |submit, window, cx| {
+            let weak = weak_for_workspace.clone();
+            let _ = weak.update_in(cx, |this, window, cx| {
+                this.dispatch_workspace_submit(submit, window, cx);
+            });
+            let _ = window; // referenced only inside the update_in callback
+        });
+        let workspace_dialog = cx.new(|cx| {
+            WorkspaceDialog::new(
+                theme,
+                density,
+                typography.clone(),
+                on_workspace_submit,
+                window,
+                cx,
+            )
+        });
+
         // Pause status polling when the window blurs; force an immediate
         // refresh on focus regain via StatusPoller::kick().
         let window_activation_observer =
@@ -290,23 +329,10 @@ impl WorkspaceRoot {
             _click_router: click_router,
             app_state,
             project_picker,
+            workspace_dialog,
+            confirm_dialog: None,
             active_project: None,
         }
-    }
-
-    /// Set the currently active project (called by the project picker's
-    /// `on_pick` callback). Step 7's sidebar reads this for its workspace
-    /// list; v1 dogfood just exercises the path. `cx.notify` triggers a
-    /// re-render so the status bar / future sidebar reflect the new
-    /// selection.
-    pub(crate) fn set_active_project(&mut self, project: Project, cx: &mut Context<Self>) {
-        tracing::info!(
-            project_id = %project.id,
-            name = %project.name,
-            "active project set"
-        );
-        self.active_project = Some(project);
-        cx.notify();
     }
 
     /// Open a fresh local-PTY tab. Used by the picker's "+ New terminal"
@@ -636,17 +662,32 @@ impl Render for WorkspaceRoot {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
-                // Close the project picker first so two full-window
-                // overlays don't fight for the click-outside region
-                // (H4 — code-review 260521-1102).
+                // Close other full-window overlays first so two
+                // inset-0 dismiss regions don't fight (H4 step-5
+                // review + C2 step-6 review).
                 this.project_picker.update(cx, |p, cx| p.close(cx));
+                this.workspace_dialog.update(cx, |d, cx| d.close(cx));
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
                 this.project_picker.update(cx, |p, cx| p.close(cx));
+                this.workspace_dialog.update(cx, |d, cx| d.close(cx));
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
+                if this.active_project.is_none() {
+                    tracing::info!("OpenWorkspaceCreate: no active project; press Cmd+O first");
+                    return;
+                }
+                // Mutex with other overlays — only one modal stack visible.
+                this.palette.update(cx, |p, cx| p.close(cx));
+                this.pane_actions.update(cx, |p, cx| p.close(cx));
+                this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.project_picker.update(cx, |p, cx| p.close(cx));
+                this.workspace_dialog
+                    .update(cx, |d, cx| d.open_create(window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenProjectPicker, window, cx| {
                 // Toggle: a second Cmd+O closes the picker (H1 —
@@ -660,12 +701,14 @@ impl Render for WorkspaceRoot {
                 }
                 // Snapshot recent projects so the picker's list stays
                 // stable while it is open. Close conflicting overlays
-                // (palette / adapter picker / pane actions) so only one
-                // click-outside dismiss region is registered at a time.
+                // (palette / adapter picker / pane actions / workspace
+                // dialog) so only one click-outside dismiss region is
+                // registered at a time (C2 — code-review 260521-1306).
                 let projects = this.app_state.recent_projects.clone();
                 this.palette.update(cx, |p, cx| p.close(cx));
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.workspace_dialog.update(cx, |d, cx| d.close(cx));
                 this.project_picker
                     .update(cx, |p, cx| p.open(projects, window, cx));
             }))
@@ -772,6 +815,23 @@ impl Render for WorkspaceRoot {
             // accidentally-opened palette during picker use wins z-order;
             // the action handlers also close conflicting overlays.
             .child(self.project_picker.clone())
+            // Workspace dialog (Cmd+Shift+N create + sidebar rename).
+            .child(self.workspace_dialog.clone())
+            // Type-to-confirm dialog for destructive workspace ops. Built
+            // per-request; `None` when idle. Wrapped in a full-window
+            // overlay here so the inner `ConfirmDialog` card stays pure.
+            .when_some(self.confirm_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
             // Palette modal — appended last so it paints above all other
             // children (last child = topmost z-layer in GPUI).
             .child(self.palette.clone())

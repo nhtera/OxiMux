@@ -18,9 +18,9 @@ use gpui::{
 };
 use oximux_app::actions::{
     CloseTab, FocusNextPane, FocusPrevPane, NewAgent, NewTab, NextTab, OpenCommandPalette,
-    OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, PrevTab, Search, SelectExplorerTab,
-    SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, Search,
+    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical,
+    ToggleLeftSidebar, ToggleRightSidebar,
 };
 use oximux_app::assets::CompositeAssets;
 use oximux_app::state;
@@ -142,6 +142,8 @@ fn main() {
             KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
             // cmd-o opens the project picker (Phase 04 step 5).
             KeyBinding::new("cmd-o", OpenProjectPicker, None),
+            // cmd-shift-n opens the workspace create dialog (Phase 04 step 6).
+            KeyBinding::new("cmd-shift-n", OpenWorkspaceCreate, None),
             // Cmd-shift-a spawns a new agent tab using the first available
             // built-in adapter. Throwaway stopgap until step 10 ships the
             // inline-popover adapter picker on the `+` button.

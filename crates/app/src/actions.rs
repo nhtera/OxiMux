@@ -95,5 +95,9 @@ actions!(
         /// Open the project picker modal (Cmd+O). Shows recent projects +
         /// "Open Folder…" affordance backed by a native NSOpenPanel.
         OpenProjectPicker,
+        /// Open the workspace create dialog (Cmd+Shift+N). No-ops when no
+        /// active project is set — welcome screen prompts the user to
+        /// Cmd+O first.
+        OpenWorkspaceCreate,
     ]
 );

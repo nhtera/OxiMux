@@ -160,6 +160,64 @@ async fn switch_branch_dirty_errors() {
 }
 
 #[tokio::test]
+async fn delete_branch_removes_merged_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    // A fresh branch off main is merged-by-definition (same SHA); `-d` succeeds.
+    run_git(p, &["branch", "to-delete"]);
+
+    let repo = Repository::open(p).await.unwrap();
+    repo.delete_branch("to-delete", false).await.unwrap();
+    let bs = repo.list_branches().await.unwrap();
+    let names: Vec<&str> = bs.iter().map(|b| b.name.as_str()).collect();
+    assert!(!names.contains(&"to-delete"), "got: {names:?}");
+}
+
+#[tokio::test]
+async fn delete_branch_refuses_unmerged_without_force() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    // Create + check out + commit on `feat` so its tip diverges from main.
+    run_git(p, &["checkout", "-b", "feat"]);
+    write(&p.join("b.txt"), "x\n");
+    run_git(p, &["add", "b.txt"]);
+    run_git(p, &["commit", "-m", "diverge"]);
+    run_git(p, &["checkout", "main"]);
+
+    let repo = Repository::open(p).await.unwrap();
+    // `-d` refuses an unmerged branch — must surface as NonZero.
+    let err = repo.delete_branch("feat", false).await.unwrap_err();
+    assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
+    // `-D` force-deletes regardless.
+    repo.delete_branch("feat", true).await.unwrap();
+    let bs = repo.list_branches().await.unwrap();
+    let names: Vec<&str> = bs.iter().map(|b| b.name.as_str()).collect();
+    assert!(!names.contains(&"feat"), "got: {names:?}");
+}
+
+#[tokio::test]
+async fn delete_branch_rejects_empty_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    let repo = Repository::open(p).await.unwrap();
+    let err = repo.delete_branch("", false).await.unwrap_err();
+    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
+}
+
+#[tokio::test]
 async fn list_branches_detached_head_hides_pseudo_entry() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();

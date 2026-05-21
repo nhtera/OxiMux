@@ -60,6 +60,23 @@ impl Repository {
             .await?;
         Ok(())
     }
+
+    /// Delete a local branch. `force=false` uses `git branch -d` (refuses
+    /// unmerged); `force=true` uses `-D` (destructive — discards work).
+    /// The workspace delete flow always passes `force=false` so the user
+    /// sees the "has unmerged changes" error rather than silently losing
+    /// commits; a future force-delete affordance can flip the flag.
+    pub async fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
+        if name.is_empty() {
+            return Err(GitError::invalid_input("branch name is empty"));
+        }
+        let flag = if force { "-D" } else { "-d" };
+        GitCmd::new(self.workdir())
+            .args(["branch", flag, "--", name])
+            .run()
+            .await?;
+        Ok(())
+    }
 }
 
 /// Parse the output of our `git branch --list --format=...` invocation.

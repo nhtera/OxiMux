@@ -28,3 +28,4 @@ pub use poller::{DEFAULT_TICK, PollState, StatusPoller};
 pub use process::{GitCmd, Output, RawOutput};
 pub use repository::Repository;
 pub use status::parse_porcelain_v2;
+pub use worktree::{derive_slug, validate_slug};

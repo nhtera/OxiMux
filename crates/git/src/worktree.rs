@@ -91,7 +91,7 @@ impl Repository {
 /// - No leading `-` (would be parsed as a flag by `git worktree add -b`)
 /// - No leading or trailing `.` (rejected by `git check-ref-format`)
 /// - No trailing `.lock` (collides with git lockfile naming)
-pub(crate) fn validate_slug(slug: &str) -> Result<()> {
+pub fn validate_slug(slug: &str) -> Result<()> {
     if slug.is_empty() {
         return Err(GitError::invalid_input("slug is empty"));
     }
@@ -121,6 +121,41 @@ pub(crate) fn validate_slug(slug: &str) -> Result<()> {
         return Err(GitError::invalid_input("slug contains whitespace"));
     }
     Ok(())
+}
+
+/// Derive a slug from a human-readable workspace name.
+///
+/// Rules: lowercase ASCII, replace each non-`[a-z0-9]` byte with `-`,
+/// collapse consecutive `-` runs to a single `-`, trim leading and
+/// trailing `-`, and fall back to `"workspace"` if the result is empty.
+///
+/// The derived slug still must be validated with [`validate_slug`]
+/// before use as a branch component — `derive_slug` only normalises
+/// shape; it does not guarantee the result passes every git
+/// `check-ref-format` rule (for example, a slug like `"workspace.lock"`
+/// could in theory be reached if a future caller built the name from a
+/// trusted string).
+pub fn derive_slug(name: &str) -> String {
+    const FALLBACK: &str = "workspace";
+    let mut out = String::with_capacity(name.len());
+    let mut last_was_dash = false;
+    for byte in name.as_bytes() {
+        let lower = byte.to_ascii_lowercase();
+        let ok = lower.is_ascii_lowercase() || lower.is_ascii_digit();
+        if ok {
+            out.push(lower as char);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        FALLBACK.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Parse `git worktree list --porcelain` output. Blocks are delimited by
@@ -256,6 +291,38 @@ mod tests {
     #[test]
     fn slug_rejects_leading_dash() {
         assert!(validate_slug("-evil").is_err());
+    }
+
+    #[test]
+    fn derive_slug_basic() {
+        assert_eq!(derive_slug("My Feature"), "my-feature");
+    }
+
+    #[test]
+    fn derive_slug_whitespace_collapse() {
+        assert_eq!(derive_slug("  hello   world  "), "hello-world");
+    }
+
+    #[test]
+    fn derive_slug_punctuation() {
+        assert_eq!(derive_slug("feat!@#$end"), "feat-end");
+    }
+
+    #[test]
+    fn derive_slug_non_ascii_replaced() {
+        // Each non-ASCII byte becomes a `-`; multi-byte UTF-8 sequences
+        // collapse to a single dash via the run-collapse rule.
+        assert_eq!(derive_slug("héllo"), "h-llo");
+    }
+
+    #[test]
+    fn derive_slug_all_rejected_fallback() {
+        assert_eq!(derive_slug("!!!"), "workspace");
+    }
+
+    #[test]
+    fn derive_slug_run_collapse() {
+        assert_eq!(derive_slug("foo---bar"), "foo-bar");
     }
 
     #[test]
