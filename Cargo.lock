@@ -4441,6 +4441,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-relay-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dashmap",
+ "oximux-pty",
+ "oximux-relay",
+ "oximux-relay-proto",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "oximux-relay-proto"
 version = "0.1.0"
 dependencies = [
