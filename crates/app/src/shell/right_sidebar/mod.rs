@@ -7,6 +7,7 @@ pub mod activity_bar;
 pub mod layout;
 pub mod tab;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
@@ -40,9 +41,9 @@ pub struct RightSidebar {
     pub open: bool,
     pub active_tab: RightTab,
 
-    // Source Control: phase-04 composes the file list, diff view, inline
-    // commit area, and (phase-05) commit graph inside one entity.
-    pub(crate) source_control: Entity<SourceControlPanel>,
+    // Source Control panel; `None` when the active project isn't a git repo.
+    // Composes the file list, diff view, inline commit area, and commit graph.
+    pub(crate) source_control: Option<Entity<SourceControlPanel>>,
 
     // Explorer panel.
     pub(crate) file_explorer: Entity<FileExplorer>,
@@ -62,56 +63,76 @@ pub struct RightSidebar {
 }
 
 impl RightSidebar {
+    /// Build the sidebar for an active project. When `repo` is `Some` the
+    /// full git-aware UI is wired (Source Control tab + status poller).
+    /// When `None`, only Explorer + Search tabs exist — they read directly
+    /// from `root_path`. Source Control tab is hidden via `visible_tabs`.
     pub fn new(
-        repo: Repository,
+        repo: Option<Repository>,
+        root_path: PathBuf,
         theme: Theme,
         density: Density,
         typography: Typography,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let poller = Arc::new(StatusPoller::spawn(repo.clone()));
-        let panel_rx = poller.subscribe();
-        let bar_rx = poller.subscribe();
-        let sc_rx = poller.subscribe();
-        let explorer_rx = poller.subscribe();
-        let initial = poller.current();
+        // Channel wiring varies by repo presence. Dead channels in non-git
+        // mode mean the explorer / source-control receivers wait forever on
+        // `rx.changed()`, which is fine for an idle file explorer.
+        let (poller, bar_rx, explorer_rx, sc_rx, panel_rx, initial) = match &repo {
+            Some(repo) => {
+                let p = Arc::new(StatusPoller::spawn(repo.clone()));
+                let bar = p.subscribe();
+                let ex = p.subscribe();
+                let sc = p.subscribe();
+                let panel = p.subscribe();
+                let init = p.current();
+                (Some(p), bar, ex, sc, panel, init)
+            }
+            None => {
+                let (_bar_tx, bar) = tokio::sync::watch::channel(PollState::Loading);
+                let (_ex_tx, ex) = tokio::sync::watch::channel(PollState::Loading);
+                let (_sc_tx, sc) = tokio::sync::watch::channel(PollState::Loading);
+                let (_panel_tx, panel) = tokio::sync::watch::channel(PollState::Loading);
+                (None, bar, ex, sc, panel, PollState::Loading)
+            }
+        };
 
-        let diff_view =
-            cx.new(|cx| DiffView::new(repo.clone(), theme, density, typography.clone(), cx));
-        let diff_view_for_panel = diff_view.clone();
-        let git_panel = cx.new(|cx| {
-            GitPanel::new(
-                repo.clone(),
-                panel_rx,
-                Some(diff_view_for_panel),
-                theme,
-                density,
-                typography.clone(),
-                cx,
-            )
-        });
-
-        let source_control = cx.new(|cx| {
-            SourceControlPanel::new(
-                PanelConfig {
-                    repo: repo.clone(),
+        let source_control = repo.as_ref().map(|repo| {
+            let diff_view = cx.new(|cx| {
+                DiffView::new(repo.clone(), theme, density, typography.clone(), cx)
+            });
+            let git_panel = cx.new(|cx| {
+                GitPanel::new(
+                    repo.clone(),
+                    panel_rx,
+                    Some(diff_view.clone()),
                     theme,
                     density,
-                    typography: typography.clone(),
-                },
-                sc_rx,
-                diff_view.clone(),
-                git_panel.clone(),
-                window,
-                cx,
-            )
+                    typography.clone(),
+                    cx,
+                )
+            });
+            cx.new(|cx| {
+                SourceControlPanel::new(
+                    PanelConfig {
+                        repo: repo.clone(),
+                        theme,
+                        density,
+                        typography: typography.clone(),
+                    },
+                    sc_rx,
+                    diff_view.clone(),
+                    git_panel.clone(),
+                    window,
+                    cx,
+                )
+            })
         });
 
-        let repo_root = repo.workdir().to_path_buf();
         let file_explorer = cx.new(|cx| {
             FileExplorer::new(
-                repo_root.clone(),
+                root_path.clone(),
                 explorer_rx,
                 theme,
                 density,
@@ -121,28 +142,35 @@ impl RightSidebar {
             )
         });
         let search_panel = cx
-            .new(|cx| SearchPanel::new(repo_root, theme, density, typography.clone(), window, cx));
+            .new(|cx| SearchPanel::new(root_path, theme, density, typography.clone(), window, cx));
 
         let poll_observer = Self::start_poll_observer(bar_rx, cx);
 
+        let active_tab = if source_control.is_some() {
+            RightTab::SourceControl
+        } else {
+            RightTab::Explorer
+        };
+
         Self {
             open: true,
-            active_tab: RightTab::SourceControl,
+            active_tab,
             source_control,
             file_explorer,
             search_panel,
             latest_poll_state: initial,
-            _poller: Some(poller),
+            _poller: poller,
             _poll_observer: poll_observer,
             theme,
         }
     }
 
     /// Reach into the source-control panel to focus the commit subject input.
-    /// Called from `WorkspaceRoot` when Cmd+K fires.
+    /// Called from `WorkspaceRoot` when Cmd+K fires. No-op for non-git projects.
     pub fn focus_commit_subject(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let panel = self.source_control.clone();
-        panel.update(cx, |p, cx| p.focus_commit_subject(window, cx));
+        if let Some(panel) = self.source_control.clone() {
+            panel.update(cx, |p, cx| p.focus_commit_subject(window, cx));
+        }
     }
 
     /// Update the status poller's focus gate. `WorkspaceRoot` calls this on
@@ -197,7 +225,7 @@ impl RightSidebar {
                 cx,
             )
         });
-        let source_control = cx.new(|cx| {
+        let source_control = Some(cx.new(|cx| {
             SourceControlPanel::new(
                 PanelConfig {
                     repo: repo.clone(),
@@ -211,7 +239,7 @@ impl RightSidebar {
                 window,
                 cx,
             )
-        });
+        }));
         let repo_root = repo.workdir().to_path_buf();
         let file_explorer = cx.new(|cx| {
             FileExplorer::new(
@@ -377,22 +405,32 @@ impl Render for RightSidebar {
                         .child(self.search_panel.clone()),
                 )
                 .into_any_element(),
-            RightTab::SourceControl => div()
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .w_full()
-                        .overflow_hidden()
-                        .child(self.source_control.clone()),
-                )
-                .into_any_element(),
+            RightTab::SourceControl => {
+                // Source Control tab is filtered out of `visible_tabs` for
+                // non-git projects, so `active_tab` should never land here
+                // without `source_control`. Guard anyway — render an empty
+                // panel rather than panic if a stale tab pointer survives.
+                let body_div = div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden();
+                match self.source_control.clone() {
+                    Some(panel) => body_div
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .child(panel),
+                        )
+                        .into_any_element(),
+                    None => body_div.into_any_element(),
+                }
+            }
         };
 
         // Fixed-width column so it doesn't compete with MainPane's flex_1 in the

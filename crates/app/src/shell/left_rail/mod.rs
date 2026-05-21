@@ -57,8 +57,9 @@ pub struct LeftRail {
     /// these before each render; `Render` reads them. Never reach out to
     /// `weak_root` from inside `Render` — re-entrant read of a being-
     /// updated entity panics.
-    active_project: Option<Project>,
-    workspaces: Vec<Workspace>,
+    projects: Vec<Project>,
+    active_project_id: Option<String>,
+    workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
 }
 
@@ -72,8 +73,9 @@ impl LeftRail {
             theme: Theme::charcoal(),
             density: Density::cockpit(),
             typography: Typography::cockpit(),
-            active_project: None,
-            workspaces: Vec::new(),
+            projects: Vec::new(),
+            active_project_id: None,
+            workspaces_by_project: HashMap::new(),
             latest_status: HashMap::new(),
         }
     }
@@ -82,13 +84,15 @@ impl LeftRail {
     /// `WorkspaceRoot::refresh_left_rail` at the top of each render.
     pub(crate) fn set_sidebar_data(
         &mut self,
-        active_project: Option<Project>,
-        workspaces: Vec<Workspace>,
+        projects: Vec<Project>,
+        active_project_id: Option<String>,
+        workspaces_by_project: HashMap<String, Vec<Workspace>>,
         latest_status: LatestStatusMap,
         cx: &mut Context<Self>,
     ) {
-        self.active_project = active_project;
-        self.workspaces = workspaces;
+        self.projects = projects;
+        self.active_project_id = active_project_id;
+        self.workspaces_by_project = workspaces_by_project;
         self.latest_status = latest_status;
         cx.notify();
     }
@@ -113,8 +117,9 @@ impl Render for LeftRail {
         let entity = cx.entity().clone();
 
         let workspace_list = render_workspace_list(
-            self.active_project.clone(),
-            self.workspaces.clone(),
+            self.projects.clone(),
+            self.active_project_id.clone(),
+            self.workspaces_by_project.clone(),
             self.latest_status.clone(),
             self.weak_root.clone(),
             theme,
@@ -146,45 +151,56 @@ impl Render for LeftRail {
 
 #[allow(clippy::too_many_arguments)]
 fn render_workspace_list(
-    active_project: Option<Project>,
-    workspaces: Vec<Workspace>,
+    projects: Vec<Project>,
+    active_project_id: Option<String>,
+    workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> gpui::AnyElement {
-    let Some(active_project) = active_project else {
+    if projects.is_empty() {
         return open_project_cta(theme, density, typography).into_any_element();
-    };
+    }
 
-    let plan = build_project_group_plan(&active_project, &workspaces, true);
+    let mut col = div().flex().flex_col().w_full();
+    for project in projects {
+        let workspaces = workspaces_by_project
+            .get(&project.id)
+            .cloned()
+            .unwrap_or_default();
+        let is_active = active_project_id.as_deref() == Some(project.id.as_str());
+        let plan = build_project_group_plan(&project, &workspaces, is_active);
 
-    let latest_status_for =
-        move |workspace_id: &str| latest_status.get(workspace_id).cloned().flatten();
+        let status_for_group = latest_status.clone();
+        let latest_status_for =
+            move |workspace_id: &str| status_for_group.get(workspace_id).cloned().flatten();
 
-    let weak_root_for_menu = weak_root.clone();
-    let on_row_menu = move |workspace: Workspace,
-                            x: f32,
-                            y: f32,
-                            _window: &mut gpui::Window,
-                            cx: &mut gpui::App| {
-        let _ = weak_root_for_menu.update(cx, |root, cx| root.open_row_menu(workspace, x, y, cx));
-    };
+        let weak_root_for_menu = weak_root.clone();
+        let on_row_menu = move |workspace: Workspace,
+                                x: f32,
+                                y: f32,
+                                _window: &mut gpui::Window,
+                                cx: &mut gpui::App| {
+            let _ =
+                weak_root_for_menu.update(cx, |root, cx| root.open_row_menu(workspace, x, y, cx));
+        };
 
-    render_project_group(
-        plan,
-        active_project,
-        workspaces,
-        latest_status_for,
-        None,
-        weak_root,
-        on_row_menu,
-        theme,
-        density,
-        typography,
-    )
-    .into_any_element()
+        col = col.child(render_project_group(
+            plan,
+            project,
+            workspaces,
+            latest_status_for,
+            None,
+            weak_root.clone(),
+            on_row_menu,
+            theme,
+            density,
+            typography,
+        ));
+    }
+    col.into_any_element()
 }
 
 /// Empty-state row: clickable "Open a project (⌘O)" that dispatches the

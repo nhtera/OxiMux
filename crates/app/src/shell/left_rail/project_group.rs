@@ -157,6 +157,7 @@ fn build_header(
 
     let plus_id: SharedString = format!("project-plus-{}", project.id).into();
     let weak_for_plus = weak_root.clone();
+    let project_for_plus = project.clone();
     let plus_btn = div()
         .id(plus_id)
         .flex()
@@ -176,13 +177,23 @@ fn build_header(
         )
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             cx.stop_propagation();
-            let _ = weak_for_plus.update_in(cx, |root, window, cx| {
-                root.set_active_project(project.clone(), window, cx);
+            let project = project_for_plus.clone();
+            // `update` + outer `window` — `update_in` does a with_window
+            // lookup that returns Err from a mouse callback context.
+            let _ = weak_for_plus.update(cx, |root, cx| {
+                root.set_active_project(project, window, cx);
             });
             window.dispatch_action(Box::new(OpenWorkspaceCreate), cx);
         });
 
+    // Click anywhere on the header (folder / title / count chip / gap) to
+    // activate this project. The "+" button stop-propagates so it stays
+    // a workspace-create shortcut, not an activate-and-open one.
+    let header_id: SharedString = format!("project-header-{}", project.id).into();
+    let weak_for_header = weak_root.clone();
+    let project_for_header = project.clone();
     div()
+        .id(header_id)
         .group(group_name)
         .flex()
         .flex_row()
@@ -191,6 +202,19 @@ fn build_header(
         .h(px(HEADER_HEIGHT))
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.bg_panel_alt))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_: &MouseDownEvent, window, cx| {
+                // `update` + outer `window` — `update_in` does a with_window
+                // lookup that returns Err from a mouse callback context.
+                let project = project_for_header.clone();
+                let _ = weak_for_header.update(cx, |root, cx| {
+                    root.set_active_project(project, window, cx);
+                });
+            },
+        )
         .child(folder_icon)
         .child(title)
         .child(count_chip)

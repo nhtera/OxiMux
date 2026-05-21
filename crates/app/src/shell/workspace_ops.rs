@@ -42,6 +42,9 @@ pub(crate) fn build_add_project_dialog(
         // when fired from a deeply-nested async callback (e.g. rfd's
         // NSOpenPanel resolution).
         let _ = weak.update(cx, |this, cx| {
+            // Re-pull recents from DB so the just-added project shows up
+            // in the sidebar list and in the next Cmd+O picker open.
+            this.refresh_recent_projects();
             this.set_active_project(project, window, cx);
         });
     });
@@ -164,6 +167,17 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Re-pull `app_state.recent_projects` from the DB. Called after a new
+    /// project is inserted (add-project dialog) or an existing one is
+    /// touched (picker) so the in-memory snapshot stays in sync with the
+    /// persisted order.
+    pub(crate) fn refresh_recent_projects(&mut self) {
+        match self.app_state.project_repo.list_recent(20) {
+            Ok(list) => self.app_state.recent_projects = list,
+            Err(err) => tracing::warn!(?err, "refresh_recent_projects: list_recent failed"),
+        }
+    }
+
     /// Set the currently active project. Stores it on `self`, triggers
     /// a re-render so the left rail picks up the new workspaces, and
     /// asynchronously rebuilds the right sidebar (Explorer / Source
@@ -181,11 +195,21 @@ impl WorkspaceRoot {
         cx.notify();
         let project_root = PathBuf::from(&project.root_path);
         cx.spawn_in(window, async move |weak, cx| {
-            let repo = match oximux_git::Repository::open(&project_root).await {
-                Ok(r) => r,
+            // Repo presence is optional now — Repository::open may fail for
+            // non-git folders. Build the sidebar in either mode: with git
+            // (Source Control + Explorer + Search) or without (Explorer +
+            // Search only). The Explorer + Search tabs always work from
+            // `root_path` regardless of git status.
+            let opened = oximux_git::Repository::open(&project_root).await;
+            let repo = match opened {
+                Ok(r) => Some(r),
                 Err(err) => {
-                    tracing::warn!(?err, path = %project_root.display(), "Repository::open failed; keeping old right sidebar");
-                    return;
+                    tracing::info!(
+                        ?err,
+                        path = %project_root.display(),
+                        "non-git project; building file-explorer-only sidebar"
+                    );
+                    None
                 }
             };
             let _ = weak.update_in(cx, |this, window, cx| {
@@ -194,7 +218,13 @@ impl WorkspaceRoot {
                 let typography = this.typography.clone();
                 this.right_sidebar = Some(cx.new(|cx| {
                     crate::shell::right_sidebar::RightSidebar::new(
-                        repo, theme, density, typography, window, cx,
+                        repo,
+                        project_root.clone(),
+                        theme,
+                        density,
+                        typography,
+                        window,
+                        cx,
                     )
                 }));
                 cx.notify();
@@ -229,42 +259,49 @@ impl WorkspaceRoot {
             .update(cx, |m, cx| m.open(workspace, x, y, cx));
     }
 
-    /// Snapshot the sidebar data (active project, its workspaces, and
-    /// the latest agent-session status per workspace) and push it into
+    /// Snapshot the sidebar data (all recent projects, their workspaces,
+    /// and the latest agent-session status per workspace) and push it into
     /// `LeftRail`. Called at the top of `WorkspaceRoot::render` — LeftRail
     /// never reads `WorkspaceRoot` directly because doing so re-enters
     /// the entity slot during rendering and panics.
     pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
-        let active_project = self.active_project.clone();
-        let (workspaces, latest_status) = match &active_project {
-            Some(project) => match self.app_state.workspace_repo.list_for_project(&project.id) {
-                Ok(list) => {
-                    let mut status_map: LatestStatusMap = HashMap::with_capacity(list.len());
-                    for workspace in &list {
-                        let latest = match self
-                            .app_state
-                            .agent_session_repo
-                            .list_for_workspace(&workspace.id)
-                        {
-                            Ok(mut sessions) => sessions.drain(..).next().map(|s| s.status),
-                            Err(err) => {
-                                tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
-                                None
-                            }
-                        };
-                        status_map.insert(workspace.id.clone(), latest);
-                    }
-                    (list, status_map)
-                }
+        let projects = self.app_state.recent_projects.clone();
+        let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
+        let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
+            HashMap::with_capacity(projects.len());
+        let mut latest_status: LatestStatusMap = HashMap::new();
+        for project in &projects {
+            let list = match self.app_state.workspace_repo.list_for_project(&project.id) {
+                Ok(list) => list,
                 Err(err) => {
                     tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
-                    (Vec::new(), HashMap::new())
+                    Vec::new()
                 }
-            },
-            None => (Vec::new(), HashMap::new()),
-        };
+            };
+            for workspace in &list {
+                let latest = match self
+                    .app_state
+                    .agent_session_repo
+                    .list_for_workspace(&workspace.id)
+                {
+                    Ok(mut sessions) => sessions.drain(..).next().map(|s| s.status),
+                    Err(err) => {
+                        tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
+                        None
+                    }
+                };
+                latest_status.insert(workspace.id.clone(), latest);
+            }
+            workspaces_by_project.insert(project.id.clone(), list);
+        }
         self.left_rail.update(cx, |rail, cx| {
-            rail.set_sidebar_data(active_project, workspaces, latest_status, cx);
+            rail.set_sidebar_data(
+                projects,
+                active_project_id,
+                workspaces_by_project,
+                latest_status,
+                cx,
+            );
         });
     }
 

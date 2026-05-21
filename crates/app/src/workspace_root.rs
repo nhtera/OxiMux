@@ -85,58 +85,32 @@ pub struct WorkspaceRoot {
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
     pub(crate) pane_actions: Entity<PaneActionsMenu>,
-    /// Inline adapter-picker popover. Anchored to the `+` button via a
-    /// left-edge offset; opened by the `RequestOpenAdapterPicker` action
-    /// (button click or Cmd+Shift+A). Owns its own detection cache.
+    /// Inline adapter-picker popover anchored to the workspace-tabs `+` button.
     pub(crate) adapter_picker: Entity<AdapterPicker>,
-    /// CLI agent runtime — owns every agent session's PTY backend and
-    /// publishes `AgentStatusStream` per session. One per workspace, held
-    /// behind `Arc` so `WorkspaceTabs::close_tab` can cancel and so
-    /// `spawn_agent_tab` can drive `start_session`.
+    /// PTY backend + status streams for every agent session. Held behind Arc
+    /// so tab close and spawn paths share a single runtime.
     pub(crate) cli_runtime: Arc<CliRuntime>,
-    /// Cached registry of the four built-in adapters. Drives the picker's
-    /// detect-available list and resolves the chosen `AgentAdapter` to a
-    /// concrete adapter at spawn time.
+    /// Cached registry of built-in adapters; resolves `AgentAdapter` at spawn.
     pub(crate) adapter_registry: Arc<AdapterRegistry>,
-    /// Whether the left rail (workspaces + nav) is visible. Toggled via Cmd+B.
+    /// Left rail visibility flag (Cmd+B).
     left_rail_open: bool,
-    /// Forwards WorkspaceTabs notifications (open/close/select tab) up to
-    /// WorkspaceRoot so the top_bar tab strip rebuilds on the next render.
-    /// Without this, the strip — which lives in WorkspaceRoot::render, not
-    /// inside WorkspaceTabs — would stay stale until something else notified
-    /// us.
+    /// Bubbles WorkspaceTabs change notifications up so the tab strip rerenders.
     _workspace_tabs_observer: Option<Subscription>,
-    /// Pauses + kicks the StatusPoller when the window loses / regains focus
-    /// (mirrors the standard `document.hasFocus()` gate). Held to keep the
-    /// subscription alive for the lifetime of the workspace.
+    /// Pauses + kicks StatusPoller on window blur/focus.
     _window_activation_observer: Subscription,
-    /// Drains tab-ids posted by the macOS notifier's click watcher and
-    /// activates the matching agent tab. Dropping the task cancels the
-    /// loop — bound to WorkspaceRoot's lifetime so a window close stops
-    /// trying to dispatch focus events into a torn-down view tree.
+    /// macOS notification click watcher → activates the matching tab.
     _click_router: Task<()>,
-    /// Boot-time snapshot of persisted state (`recent_projects`, workspaces
-    /// per project, interrupted sessions) + repo handles for on-demand
-    /// reads/writes. Hydrated once by `main.rs` before the window opens.
-    /// Read by `project_picker` (step 5) and step 7+ sidebar wiring.
+    /// Persisted-state snapshot + repo handles. Hydrated once at boot.
     pub(crate) app_state: AppState,
-    /// Project picker modal (Cmd+O). Holds its own snapshot of recent
-    /// projects taken at open() time; emits the chosen Project back here
-    /// via the `OnPick` callback wired in `new()`.
+    /// Project picker modal (Cmd+O).
     pub(crate) project_picker: Entity<ProjectPickerModal>,
-    /// Workspace create / rename dialog (Cmd+Shift+N opens in Create
-    /// mode; rename mode is driven programmatically from the step 7
-    /// sidebar context menu via `request_rename_workspace`).
+    /// Workspace create / rename dialog (Cmd+Shift+N + sidebar rename).
     pub(crate) workspace_dialog: Entity<WorkspaceDialog>,
-    /// Active type-to-confirm dialog. `None` when idle; replaced on each
-    /// `request_delete_workspace` call. `ConfirmDialog` is constructed
-    /// per-request (not persistent open/close like the picker) because
-    /// its prompt + callback are bound at construction time.
+    /// Active type-to-confirm dialog (per-request; `None` when idle).
     pub(crate) confirm_dialog: Option<Entity<ConfirmDialog>>,
     /// Currently active project — `None` until the user opens one.
     pub(crate) active_project: Option<Project>,
-    /// Per-row action popover (Rename / Archive / Delete). Mounted at
-    /// root scope so its click-outside backdrop covers the full window.
+    /// Sidebar Rename/Archive/Delete popover (mounted at root for full-window backdrop).
     pub(crate) row_menu: Entity<WorkspaceRowMenu>,
     pub(crate) add_project_dialog: Entity<AddProjectDialog>,
 }
@@ -202,7 +176,18 @@ impl WorkspaceRoot {
             .as_ref()
             .map(|ws| cx.observe(ws, |_, _, cx| cx.notify()));
         let right_sidebar = repo.clone().map(|r| {
-            cx.new(|cx| RightSidebar::new(r, theme, density, typography.clone(), window, cx))
+            let root_path = r.workdir().to_path_buf();
+            cx.new(|cx| {
+                RightSidebar::new(
+                    Some(r),
+                    root_path,
+                    theme,
+                    density,
+                    typography.clone(),
+                    window,
+                    cx,
+                )
+            })
         });
         // Shared weak self-handle: LeftRail + picker callbacks route through it.
         let weak_self: WeakEntity<WorkspaceRoot> = cx.weak_entity();
@@ -236,7 +221,10 @@ impl WorkspaceRoot {
         let weak_for_picker: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let on_pick: OnPick = Box::new(move |project, window, cx| {
             let weak = weak_for_picker.clone();
-            let _ = weak.update(cx, |this, cx| this.set_active_project(project, window, cx));
+            let _ = weak.update(cx, |this, cx| {
+                this.refresh_recent_projects();
+                this.set_active_project(project, window, cx);
+            });
         });
         let project_repo = app_state.project_repo.clone();
         let project_picker = cx.new(|cx| {
@@ -695,9 +683,6 @@ impl Render for WorkspaceRoot {
                     .update(cx, |d, cx| d.open(window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenProjectPicker, window, cx| {
-                // Toggle: a second Cmd+O closes the picker. Also blocks the
-                // double-NSOpenPanel race (clearing pending_folder_pick
-                // and letting "Open Folder…" launch a second panel).
                 if this.project_picker.read(cx).is_open() {
                     this.project_picker.update(cx, |p, cx| p.close(cx));
                     return;
@@ -709,13 +694,8 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(
                 cx.listener(|this, _: &RequestOpenAdapterPicker, window, cx| {
-                    // Anchor the picker's LEFT edge under the `+` button.
-                    // The button is rendered inline after the last tab, so
-                    // its window-x drifts with tab count + label widths +
-                    // scroll state. The click handler stashes the captured
-                    // event.position.x; we consume it here. Keyboard path
-                    // (Cmd+Shift+A) has no click position — fall back to a
-                    // static post-rail inset.
+                    // Anchor under the `+` button; the click handler stashes
+                    // event.position.x. Keyboard path falls back to a post-rail inset.
                     let fallback_anchor = if this.left_rail_open {
                         this.density.w_left_rail + ADAPTER_PICKER_LEFT_INSET
                     } else {
@@ -726,31 +706,21 @@ impl Render for WorkspaceRoot {
                         .as_ref()
                         .and_then(|ws| ws.read(cx).take_plus_click_x())
                         .unwrap_or(fallback_anchor);
-                    // M2 (review 260520-1830): both popovers register a
-                    // full-window overlay; if both opened simultaneously
-                    // the lower-z one would have no click-outside dismiss
-                    // path. Close pane-actions first to enforce mutex.
+                    // Mutex: only one full-window popover can hold the click-outside path.
                     this.pane_actions.update(cx, |p, cx| p.close(cx));
                     this.adapter_picker
                         .update(cx, |p, cx| p.open(left_anchor, window, cx));
                 }),
             )
             .on_action(cx.listener(|this, _: &OpenPaneActions, _window, cx| {
-                // Anchor the dropdown's RIGHT edge at the "..." button's
-                // right edge so it feels visually attached.
-                // When right sidebar is OPEN: center column ends where the
-                // right column begins, so "..." button right edge sits at
-                // `DEFAULT_PANEL_WIDTH` from window right.
-                // When CLOSED: "..." button is just left of the right
-                // toggle in the center header, so its right edge sits at
-                // `TOGGLE_BUTTON_WIDTH` from window right.
+                // Right-edge anchor: matches the "..." button position relative to
+                // the right column when sidebar is open / center toggle when closed.
                 let r_open = this.right_sidebar.as_ref().is_some_and(|s| s.read(cx).open);
                 let right_anchor = if r_open {
                     f32::from(DEFAULT_PANEL_WIDTH)
                 } else {
                     top_bar::TOGGLE_BUTTON_WIDTH
                 };
-                // M2 mutex (see RequestOpenAdapterPicker above).
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.pane_actions
                     .update(cx, |p, cx| p.open(right_anchor, cx));
@@ -778,9 +748,7 @@ impl Render for WorkspaceRoot {
                 }),
             )
             .on_action(cx.listener(|this, _: &OpenCommitDialog, window, cx| {
-                // Cmd+K: jump to Source Control tab and focus the inline
-                // commit subject input. Phase 04 replaces the legacy
-                // modal CommitDialog with this inline area.
+                // Cmd+K: jump to Source Control tab and focus the commit input.
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |s, cx| {
                         s.select_tab(RightTab::SourceControl, cx);
