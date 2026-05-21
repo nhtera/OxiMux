@@ -1,62 +1,69 @@
-//! LeftRail — full workspace + nav rail (replaces the 30-line `sidebar.rs` stub).
+//! LeftRail — full workspace + nav rail.
 //!
 //! Composition (top → bottom):
 //!
 //! 1. Nav section: Tasks / Automations / Agents / Search rows (shells)
 //! 2. WORKSPACES section header with filter / sort / + controls
-//! 3. Workspace list (reuses `WorktreePanel` state; renders our own rows)
+//! 3. Workspace list — per-project groups rendering OxiMux `Workspace`
+//!    rows with status dots derived from the latest agent session.
 //! 4. Spacer
 //! 5. Bottom toolbar: "Add Project" + settings cog
 //!
 //! Width is `density.w_left_rail` (250px in cockpit density). Full-collapse
 //! toggling is handled at `WorkspaceRoot` via the `left_rail_open` flag.
+//!
+//! Data source: a `WeakEntity<WorkspaceRoot>` is the single channel to
+//! reach `AppState` (recent projects + workspace_repo + agent_session_repo)
+//! and `active_project`. Re-fetched on every render at v1 scale — fine
+//! for <50 workspaces; switch to subscribe-and-cache if dogfood shows
+//! frame-time issues.
 
 pub mod nav_section;
+pub mod project_group;
+pub mod row_menu;
 pub mod toolbar;
 pub mod workspace_list_render;
+pub mod workspace_row;
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div, px, svg,
+    Context, IntoElement, ParentElement, Render, Styled, WeakEntity, Window, div, px, svg,
 };
-use oximux_git::Repository;
+use oximux_core::Workspace;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
+use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
 use crate::shell::left_rail::toolbar::render_toolbar;
-use crate::shell::left_rail::workspace_list_render::{
-    build_workspace_row_plan, render_workspace_row,
-};
-use crate::shell::worktree_panel::{WorktreeListState, WorktreePanel};
+use crate::workspace_root::WorkspaceRoot;
 
 const HEADER_ICON_SIZE: f32 = 14.0;
 
 pub struct LeftRail {
     active_nav: NavItem,
-    /// Owned for state ownership / async fetch lifetime. Its own Render impl
-    /// is not invoked — we render rows from `state()` ourselves.
-    worktree_panel: Option<Entity<WorktreePanel>>,
+    weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: Typography,
 }
 
 impl LeftRail {
-    pub fn new(
-        repo: Option<Repository>,
-        theme: Theme,
-        density: Density,
-        typography: Typography,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let worktree_panel = repo.map(|r| {
-            let typography_clone = typography.clone();
-            cx.new(|cx| WorktreePanel::new(r, theme, density, typography_clone, window, cx))
-        });
-
+    /// Sources `theme`/`density`/`typography` from the `WorkspaceRoot` so
+    /// the call site stays a one-liner. `weak_root.upgrade()` will be
+    /// `None` at the precise moment `WorkspaceRoot::new` is wiring up
+    /// (entity slot not yet populated), so the fallback defaults are the
+    /// hot path during init — and they match `WorkspaceRoot::new`'s own
+    /// defaults verbatim.
+    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, cx: &mut Context<Self>) -> Self {
+        let (theme, density, typography) = weak_root
+            .upgrade()
+            .map(|r| {
+                let root = r.read(cx);
+                (root.theme, root.density, root.typography.clone())
+            })
+            .unwrap_or_else(|| (Theme::charcoal(), Density::cockpit(), Typography::cockpit()));
         Self {
             active_nav: NavItem::Tasks,
-            worktree_panel,
+            weak_root,
             theme,
             density,
             typography,
@@ -82,10 +89,8 @@ impl Render for LeftRail {
         let typography = self.typography.clone();
         let entity = cx.entity().clone();
 
-        let workspace_list = match self.worktree_panel.as_ref() {
-            Some(panel) => render_workspace_list(panel, theme, density, &typography, cx),
-            None => empty_state(theme, density, &typography),
-        };
+        let workspace_list =
+            render_workspace_list(&self.weak_root, theme, density, &typography, cx);
 
         div()
             .flex()
@@ -110,33 +115,72 @@ impl Render for LeftRail {
 }
 
 fn render_workspace_list(
-    panel: &Entity<WorktreePanel>,
+    weak_root: &WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
     cx: &mut Context<LeftRail>,
 ) -> gpui::AnyElement {
-    let state = panel.read(cx).state();
-    match state {
-        WorktreeListState::Ready(list) => {
-            let mut col = div().flex().flex_col().w_full();
-            for w in list.iter() {
-                let plan = build_workspace_row_plan(w, false, theme);
-                col = col.child(render_workspace_row(plan, theme, density, typography));
-            }
-            col.into_any_element()
-        }
-        WorktreeListState::Loading | WorktreeListState::Idle => {
-            placeholder("Loading worktrees…", theme, density, typography).into_any_element()
-        }
-        WorktreeListState::Failed(err) => {
-            placeholder(&format!("Failed: {err}"), theme, density, typography).into_any_element()
-        }
-    }
-}
+    let Some(root_entity) = weak_root.upgrade() else {
+        return placeholder("No workspace root", theme, density, typography).into_any_element();
+    };
+    let root = root_entity.read(cx);
+    let Some(active_project) = root.active_project.clone() else {
+        return placeholder("Open a project (⌘O)", theme, density, typography).into_any_element();
+    };
 
-fn empty_state(theme: Theme, density: Density, typography: &Typography) -> gpui::AnyElement {
-    placeholder("No repository open", theme, density, typography).into_any_element()
+    // Re-fetch from DB so the rail reflects creates/renames/archives/deletes
+    // emitted after boot. v1 scale: single SQLite call, sub-millisecond.
+    let workspaces = match root
+        .app_state
+        .workspace_repo
+        .list_for_project(&active_project.id)
+    {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!(?err, project_id = %active_project.id, "list_for_project failed");
+            return placeholder("Failed to load workspaces", theme, density, typography)
+                .into_any_element();
+        }
+    };
+
+    // `list_for_project` already filters `archived_at IS NULL` at the SQL
+    // layer, so no extra in-memory filter is needed.
+    let plan = build_project_group_plan(&active_project, &workspaces, true);
+
+    let agent_repo = root.app_state.agent_session_repo.clone();
+    let latest_status_for =
+        move |workspace_id: &str| match agent_repo.list_for_workspace(workspace_id) {
+            Ok(mut sessions) => sessions.drain(..).next(),
+            Err(err) => {
+                tracing::warn!(?err, %workspace_id, "list_for_workspace failed");
+                None
+            }
+        };
+
+    let weak_root_for_menu = weak_root.clone();
+    let on_row_menu = move |workspace: Workspace,
+                            x: f32,
+                            y: f32,
+                            _window: &mut gpui::Window,
+                            cx: &mut gpui::App| {
+        let _ = weak_root_for_menu.update(cx, |root, cx| root.open_row_menu(workspace, x, y, cx));
+    };
+
+    let weak_for_render = weak_root.clone();
+    render_project_group(
+        plan,
+        active_project,
+        workspaces,
+        latest_status_for,
+        None,
+        weak_for_render,
+        on_row_menu,
+        theme,
+        density,
+        typography,
+    )
+    .into_any_element()
 }
 
 fn placeholder(
@@ -177,9 +221,7 @@ fn workspace_header(theme: Theme, density: Density, typography: &Typography) -> 
                 .text_color(theme.fg_muted)
                 .child("WORKSPACES"),
         )
-        // TODO(phase-04): filter, sort, and `+` add controls become interactive.
-        .child(header_icon(theme, "icons/sort-descending.svg"))
-        .child(header_icon(theme, "icons/plus.svg"))
+        .child(header_icon(theme, "icons/list-collapse.svg"))
 }
 
 fn header_icon(theme: Theme, path: &'static str) -> impl IntoElement {

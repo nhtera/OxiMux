@@ -123,6 +123,31 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
+    /// Close every full-window modal overlay. Callers invoke this before
+    /// opening a new overlay so two inset-0 dismiss regions never compete.
+    pub(crate) fn close_modal_overlays(&mut self, cx: &mut Context<Self>) {
+        self.palette.update(cx, |p, cx| p.close(cx));
+        self.pane_actions.update(cx, |p, cx| p.close(cx));
+        self.adapter_picker.update(cx, |p, cx| p.close(cx));
+        self.project_picker.update(cx, |p, cx| p.close(cx));
+        self.workspace_dialog.update(cx, |d, cx| d.close(cx));
+        self.row_menu.update(cx, |m, cx| m.close(cx));
+    }
+
+    /// Open the per-row action popover at the given screen coordinates.
+    /// Closes any other overlays first so backdrops don't compete.
+    pub(crate) fn open_row_menu(
+        &mut self,
+        workspace: oximux_core::Workspace,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_modal_overlays(cx);
+        self.row_menu
+            .update(cx, |m, cx| m.open(workspace, x, y, cx));
+    }
+
     /// Route a workspace-dialog submission to the right backend flow.
     /// Mode dispatch lives here (not in the dialog) so the dialog stays
     /// UI-only and the create-with-rollback orchestration stays close
