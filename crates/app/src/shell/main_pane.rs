@@ -17,6 +17,7 @@
 //! switching above this struct.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
@@ -57,6 +58,14 @@ pub struct MainPane {
     /// rail width so initial mount before the first sync still produces a
     /// sane terminal grid.
     chrome_w_px: f32,
+    /// Spawn cwd for new panes created by split actions. Inherited from the
+    /// owning `WorkspaceTabs` (= active project's `root_path`).
+    cwd: PathBuf,
+    /// Bumped on every topology change (split, weight set, leaf removal).
+    /// `WorkspaceTabs` reads this in its `cx.observe(&pane)` callback to
+    /// debounce persistence — PTY-output `cx.notify()` calls would
+    /// otherwise trigger a settings.set per 16ms tick.
+    topology_version: u64,
     /// One observer per leaf so the focus ring repaints on click / PTY output.
     _pane_observers: HashMap<PaneId, Subscription>,
     /// Set on divider `on_mouse_down`, read by the element-level
@@ -68,6 +77,7 @@ impl MainPane {
     /// Build a `MainPane` around a pre-spawned initial TerminalView.
     pub fn new(
         initial_view: Entity<TerminalView>,
+        cwd: PathBuf,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -92,9 +102,59 @@ impl MainPane {
             typography,
             focus_handle,
             chrome_w_px,
+            cwd,
+            topology_version: 0,
             _pane_observers: pane_observers,
             active_drag: None,
         }
+    }
+
+    /// Construct a MainPane around a pre-built pane tree + view map. Used
+    /// by the persistence restore path: `build_workspace_tabs` spawns N
+    /// `TerminalView`s in DFS-leaf order, assembles them into a `PaneTree`
+    /// via `persisted_terminals::restore_tree`, then hands the pair here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tree(
+        tree: PaneTree,
+        panes: HashMap<PaneId, Entity<TerminalView>>,
+        focused: PaneId,
+        next_id_seed: u64,
+        cwd: PathBuf,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut pane_observers = HashMap::with_capacity(panes.len());
+        for (id, view) in &panes {
+            pane_observers.insert(*id, cx.observe(view, |_, _, cx| cx.notify()));
+        }
+        Self {
+            tree,
+            panes,
+            focused,
+            next_id: AtomicU64::new(next_id_seed),
+            theme,
+            density,
+            typography,
+            focus_handle: cx.focus_handle(),
+            chrome_w_px: density.w_left_rail,
+            cwd,
+            topology_version: 0,
+            _pane_observers: pane_observers,
+            active_drag: None,
+        }
+    }
+
+    /// Read accessor for the topology-version dedup counter.
+    pub fn topology_version(&self) -> u64 {
+        self.topology_version
+    }
+
+    /// Read accessor for the pane tree — `WorkspaceTabs` snapshots this for
+    /// persistence via `persisted_terminals::snapshot_tree`.
+    pub fn tree(&self) -> &PaneTree {
+        &self.tree
     }
 
     /// Update the surrounding chrome width so PTY grids match the actual
@@ -151,6 +211,7 @@ impl MainPane {
         cx: &mut Context<Self>,
     ) {
         let Some(view) = spawn_terminal_view(
+            self.cwd.clone(),
             self.theme,
             self.density,
             self.typography.clone(),
@@ -169,6 +230,7 @@ impl MainPane {
         self.panes.insert(new_id, view);
         self.focused = new_id;
         focus_pane(&self.panes, new_id, window, cx);
+        self.topology_version += 1;
         cx.notify();
     }
 
@@ -269,6 +331,7 @@ impl MainPane {
         if let Some(current) = self.tree.split_weights(path) {
             let equal = vec![1.0; current.len()];
             if self.tree.set_split_weights(path, equal) {
+                self.topology_version += 1;
                 cx.notify();
             }
         }
@@ -304,6 +367,7 @@ impl MainPane {
         new_weights[drag.gap_idx + 1] = new_right;
         let path = drag.split_path.clone();
         if self.tree.set_split_weights(&path, new_weights) {
+            self.topology_version += 1;
             cx.notify();
         }
     }
@@ -387,13 +451,14 @@ fn dispatch_grids_inner(
 }
 
 fn spawn_terminal_view(
+    cwd: PathBuf,
     theme: Theme,
     density: Density,
     typography: Typography,
     window: &mut Window,
     cx: &mut Context<MainPane>,
 ) -> Option<Entity<TerminalView>> {
-    let (backend, session_id) = spawn_local_pty()?;
+    let (backend, session_id) = spawn_local_pty(cwd)?;
     Some(
         cx.new(|cx| {
             TerminalView::mount(backend, session_id, theme, density, typography, window, cx)

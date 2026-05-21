@@ -23,6 +23,7 @@ use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt
 use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
+use crate::workspace_tabs_factory::{build_workspace_tabs, load_persisted_tabs, save_persisted_tabs};
 
 /// Build the Add-Project dialog entity. Wires the `on_pick` callback to
 /// route the chosen project through `WorkspaceRoot::set_active_project`.
@@ -192,8 +193,52 @@ impl WorkspaceRoot {
     ) {
         tracing::info!(project_id = %project.id, name = %project.name, "active project set");
         self.active_project = Some(project.clone());
-        cx.notify();
         let project_root = PathBuf::from(&project.root_path);
+        // Lazy-build the tabs entity on first activation of this project so
+        // its terminals spawn with the correct cwd. Subsequent switches just
+        // resolve the existing entity via `active_workspace_tabs()` — tab
+        // state (open terminals + agent sessions) survives the switch.
+        if !self.workspace_tabs_by_project.contains_key(&project.id) {
+            let theme = self.theme;
+            let density = self.density;
+            let typography = self.typography.clone();
+            let cli_runtime = self.cli_runtime.clone();
+            let notifier = self.notifier.clone();
+            // Try to restore from settings; missing/malformed = fresh start.
+            let snapshot = load_persisted_tabs(&self.app_state.settings_repo, &project.id);
+            if let Some(tabs) = build_workspace_tabs(
+                project_root.clone(),
+                snapshot,
+                theme,
+                density,
+                typography,
+                cli_runtime,
+                notifier,
+                window,
+                cx,
+            ) {
+                // Install the save sink keyed to this project. Cloning the
+                // repo is cheap (it wraps `Arc<Db>`).
+                let settings_repo = self.app_state.settings_repo.clone();
+                let project_id = project.id.clone();
+                let save_cb: crate::shell::workspace_tabs::SaveCallback =
+                    std::sync::Arc::new(move |snap| {
+                        save_persisted_tabs(&settings_repo, &project_id, &snap);
+                    });
+                tabs.update(cx, |t, _| t.set_save_callback(save_cb));
+                // Re-register the observer on the newly-active entity so its
+                // notifications bubble up. Drops the previous subscription.
+                self._workspace_tabs_observer = Some(cx.observe(&tabs, |_, _, cx| cx.notify()));
+                self.workspace_tabs_by_project.insert(project.id.clone(), tabs);
+            } else {
+                tracing::warn!(project_id = %project.id, "build_workspace_tabs failed");
+            }
+        } else if let Some(tabs) = self.workspace_tabs_by_project.get(&project.id) {
+            // Project's tabs already exist — re-point the observer at this
+            // entity so the active tab strip notifies the right one.
+            self._workspace_tabs_observer = Some(cx.observe(tabs, |_, _, cx| cx.notify()));
+        }
+        cx.notify();
         cx.spawn_in(window, async move |weak, cx| {
             // Repo presence is optional now — Repository::open may fail for
             // non-git folders. Build the sidebar in either mode: with git

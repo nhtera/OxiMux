@@ -10,6 +10,7 @@
 //! MainPane.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
@@ -27,30 +28,29 @@ use crate::actions::{
     CloseTab, NewAgent, NewTab, NextTab, PrevTab, RequestOpenAdapterPicker, SplitDown, SplitLeft,
     SplitRight, SplitUp,
 };
+mod persistence;
+
 use crate::notifier::{Notifier, TabId};
+use crate::persisted_terminals::PersistedTabs;
 use crate::shell::agent_status_badge::render_dot;
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
 use crate::shell::main_pane::MainPane;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
-/// Whether a workspace tab hosts a raw shell PTY (Terminal) or an agent
-/// session managed by `CliRuntime` (Agent). Phase 3 step 9 adds the
-/// distinction so the status bar `agent_count`, future status badge, and
-/// label prefix all read from one source of truth.
+/// Save sink invoked after every tab/topology change. Captures
+/// `SettingsRepo` + `project_id`; serializes the snapshot to JSON +
+/// writes one row in `settings`. `Arc<dyn Fn>` so the closure can sit
+/// behind a long-lived entity.
+pub type SaveCallback = Arc<dyn Fn(PersistedTabs) + Send + Sync>;
+
+/// Tab kind: raw shell PTY vs `CliRuntime`-managed agent session. The
+/// distinction drives `agent_count`, the status badge, and the label prefix.
 pub enum WorkspaceTabKind {
-    /// Plain shell. The pane owns its own local `SharedBackend`; no
-    /// `CliRuntime` involvement.
     Terminal,
-    /// Agent session. The `CliRuntime` owns the PTY backend; the renderer
-    /// holds a clone of the same Arc via `TerminalView`. `status_rx` is
-    /// the watch receiver the step-11 status badge reads from.
     Agent {
-        /// Adapter id slug — `"claude-code"`, `"codex"`, `"aider"`, etc.
         adapter_id: &'static str,
-        /// Runtime-assigned session id; used for cancel + status lookups.
         session_id: AgentSessionId,
-        /// Live status receiver. Cloned cheaply (`watch::Receiver` is Arc-backed).
         status_rx: AgentStatusStream,
     },
 }
@@ -60,12 +60,8 @@ struct WorkspaceTab {
     pane: Entity<MainPane>,
     kind: WorkspaceTabKind,
     _observer: Subscription,
-    /// Per-tab watcher that wakes the strip on every `AgentStatus` change so
-    /// the badge dot recolors without a polling timer. `None` for terminal
-    /// tabs — those have no status stream to observe. Dropping the field
-    /// cancels the spawned task; `close_tab` relies on this drop-on-remove
-    /// contract (same pattern as `_observer`) so no explicit cancel is
-    /// needed at tab teardown.
+    /// Per-tab `AgentStatus` watcher. `None` for terminal tabs. Drop on tab
+    /// removal cancels the task (same pattern as `_observer`).
     _status_task: Option<Task<()>>,
 }
 
@@ -73,41 +69,42 @@ pub struct WorkspaceTabs {
     tabs: Vec<WorkspaceTab>,
     active: usize,
     next_label_n: u64,
+    /// Spawn cwd for new tabs + splits. Set to the owning project's
+    /// `root_path`; `WorkspaceRoot` keeps one entity per project so cwd is
+    /// always the right one.
+    cwd: PathBuf,
     theme: Theme,
     density: Density,
     typography: Typography,
     focus_handle: FocusHandle,
-    /// Runtime handle, retained so `close_tab` can cancel any agent
-    /// session whose tab is being removed. The launch path moved to
-    /// `WorkspaceRoot::spawn_agent_tab` in step 10 — only the close
-    /// path still needs the runtime here.
+    /// Retained so `close_tab` can cancel agent sessions. Launch path is in
+    /// `WorkspaceRoot::spawn_agent_tab`.
     cli_runtime: Arc<CliRuntime>,
-    /// Window-coordinate x of the most recent `+` button click. The plus
-    /// button is rendered inline after the last tab, so its position drifts
-    /// as tabs open/close — a static inset cannot track it. The click
-    /// handler writes here before dispatching `RequestOpenAdapterPicker`;
-    /// `WorkspaceRoot` reads it back to anchor the popover under the
-    /// button. `None` for the keyboard-only path (Cmd+Shift+A) where no
-    /// click position is available.
+    /// Window-x of the most-recent `+` click. The button drifts as tabs
+    /// open/close, so a static inset can't anchor the popover under it.
+    /// `None` for the keyboard path (Cmd+Shift+A).
     last_plus_click_x: Cell<Option<f32>>,
-    /// macOS notification sink. `Arc<dyn Notifier>` so the per-tab status
-    /// task can clone cheaply and so non-mac builds can swap in
-    /// `NullNotifier` without conditional compilation at this layer.
+    /// macOS notification sink (or `NullNotifier` on non-mac). Cloned by
+    /// each per-tab status task.
     notifier: Arc<dyn Notifier>,
-    /// Current GPUI window active state. Updated by the
-    /// `_window_activation_observer` subscription below; read by the per-tab
-    /// status task before deciding whether to dispatch a notification. The
-    /// badge alone is sufficient when the user is already looking at the app.
+    /// Current GPUI window active state. Per-tab status tasks check this
+    /// before firing a notification — the badge is enough when focused.
     window_active: bool,
-    /// Holds the `observe_window_activation` subscription alive for the
-    /// lifetime of this entity. Drop ends the subscription.
     _window_activation_observer: Subscription,
+    /// Persistence sink, set by `build_workspace_tabs` after construction.
+    /// `None` in tests and during construction.
+    save_callback: Option<SaveCallback>,
+    /// Sum of every tab's `MainPane::topology_version`. Re-computed on each
+    /// pane observe; a delta triggers a save. Filters out PTY-output ticks
+    /// (which only bump frame counters, not topology).
+    last_topology_signature: u64,
 }
 
 impl WorkspaceTabs {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_pane: Entity<MainPane>,
+        cwd: PathBuf,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -116,7 +113,10 @@ impl WorkspaceTabs {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observer = cx.observe(&initial_pane, |_, _, cx| cx.notify());
+        let observer = cx.observe(&initial_pane, |this, _pane, cx| {
+            cx.notify();
+            this.maybe_save_on_topology_change(cx);
+        });
         let label = SharedString::from("Terminal 1");
         let tabs = vec![WorkspaceTab {
             label,
@@ -134,6 +134,7 @@ impl WorkspaceTabs {
             tabs,
             active: 0,
             next_label_n: 2,
+            cwd,
             theme,
             density,
             typography,
@@ -143,6 +144,8 @@ impl WorkspaceTabs {
             notifier,
             window_active,
             _window_activation_observer: window_activation_observer,
+            save_callback: None,
+            last_topology_signature: 0,
         }
     }
 
@@ -191,6 +194,7 @@ impl WorkspaceTabs {
 
     pub fn open_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(new_pane) = spawn_main_pane(
+            self.cwd.clone(),
             self.theme,
             self.density,
             self.typography.clone(),
@@ -201,7 +205,10 @@ impl WorkspaceTabs {
         };
         let n = self.next_label_n;
         self.next_label_n += 1;
-        let observer = cx.observe(&new_pane, |_, _, cx| cx.notify());
+        let observer = cx.observe(&new_pane, |this, _pane, cx| {
+            cx.notify();
+            this.maybe_save_on_topology_change(cx);
+        });
         self.tabs.push(WorkspaceTab {
             label: SharedString::from(format!("Terminal {n}")),
             pane: new_pane,
@@ -211,6 +218,7 @@ impl WorkspaceTabs {
         });
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
+        self.save_now(cx);
         cx.notify();
     }
 
@@ -237,16 +245,13 @@ impl WorkspaceTabs {
             .detach();
         }
         if self.tabs.is_empty() {
-            // Closing the last tab drops the workspace into the empty welcome
-            // state. `active` is irrelevant when there are no tabs; reset to
-            // 0 so the next open_tab lands on a sane index.
-            // Move focus to the WorkspaceTabs root so subsequent action
-            // dispatches (e.g. ToggleRightSidebar from a top-bar button)
-            // still propagate up to WorkspaceRoot's on_action handlers —
-            // without a focused descendant, button-fired `dispatch_action`
-            // calls have no element chain to bubble through.
+            // Last-tab close: drop to welcome state. Move focus to the
+            // tabs root so top-bar button dispatches still bubble up to
+            // WorkspaceRoot's on_action handlers (button-fired
+            // `dispatch_action` needs a focused descendant).
             self.active = 0;
             self.focus_handle.focus(window, cx);
+            self.save_now(cx);
             cx.notify();
             return;
         }
@@ -256,6 +261,7 @@ impl WorkspaceTabs {
             self.active -= 1;
         }
         self.focus_active(window, cx);
+        self.save_now(cx);
         cx.notify();
     }
 
@@ -263,19 +269,15 @@ impl WorkspaceTabs {
         if idx < self.tabs.len() && idx != self.active {
             self.active = idx;
             self.focus_active(window, cx);
+            self.save_now(cx);
             cx.notify();
         }
     }
 
-    /// Activate the tab whose agent session matches `tab_id`. Returns true
-    /// when a matching tab was found (and either was already active or has
-    /// been activated). Lookup is by `AgentSessionId` — stable across tab
-    /// reorder and label rename, unlike the strip index used by
-    /// `set_active`. Used by the notification click router: the user clicks
-    /// a "needs approval" banner, the router sends the originating session's
-    /// id over an mpsc, and this method resolves it back to the current
-    /// strip index. Missing id (tab closed before click) is a silent
-    /// no-op — the caller logs at debug if it cares.
+    /// Activate the tab whose agent session matches `tab_id`. Returns
+    /// true on hit. Lookup is by `AgentSessionId` (stable across reorder
+    /// and rename, unlike the strip index). Used by the macOS
+    /// notification click router; missing id is a silent no-op.
     pub fn set_active_by_tab_id(
         &mut self,
         tab_id: TabId,
@@ -334,14 +336,9 @@ impl WorkspaceTabs {
         self.prev_tab(window, cx);
     }
 
-    /// Mount a freshly-spawned agent session as a new tab. Called by
-    /// `WorkspaceRoot::spawn_agent_tab` after `CliRuntime::start_session`
-    /// returns and the three accessors (`backend_for`,
-    /// `terminal_session_id`, `subscribe_status`) succeed.
-    ///
-    /// Owns the `TerminalView` + `MainPane` construction and the label-
-    /// counter scan so the label snapshot reflects any tabs added during
-    /// the async spawn window (M1 fix, review 260520-1700).
+    /// Mount a freshly-spawned agent session as a new tab. Builds the
+    /// `TerminalView` + `MainPane` here so the label-counter scan reflects
+    /// any tabs added during the async spawn window.
     #[allow(clippy::too_many_arguments)]
     pub fn push_agent_tab(
         &mut self,
@@ -368,8 +365,12 @@ impl WorkspaceTabs {
                 cx,
             )
         });
-        let pane = cx.new(|cx| MainPane::new(view, theme, density, typography.clone(), cx));
-        let observer = cx.observe(&pane, |_, _, cx| cx.notify());
+        let pane =
+            cx.new(|cx| MainPane::new(view, self.cwd.clone(), theme, density, typography.clone(), cx));
+        let observer = cx.observe(&pane, |this, _pane, cx| {
+            cx.notify();
+            this.maybe_save_on_topology_change(cx);
+        });
         let current_labels: Vec<SharedString> = self.tabs.iter().map(|t| t.label.clone()).collect();
         let label = agent_tab_label::next_label_for(adapter_id, &current_labels);
         let status_task = spawn_status_task(
@@ -725,13 +726,14 @@ fn plus_button(theme: Theme, entity: Entity<WorkspaceTabs>) -> impl IntoElement 
 }
 
 fn spawn_main_pane(
+    cwd: PathBuf,
     theme: Theme,
     density: Density,
     typography: Typography,
     window: &mut Window,
     cx: &mut Context<WorkspaceTabs>,
 ) -> Option<Entity<MainPane>> {
-    let (backend, session_id) = spawn_local_pty()?;
+    let (backend, session_id) = spawn_local_pty(cwd.clone())?;
     let typography_for_view = typography.clone();
     let initial_view = cx.new(|cx| {
         TerminalView::mount(
@@ -744,7 +746,7 @@ fn spawn_main_pane(
             cx,
         )
     });
-    Some(cx.new(|cx| MainPane::new(initial_view, theme, density, typography, cx)))
+    Some(cx.new(|cx| MainPane::new(initial_view, cwd, theme, density, typography, cx)))
 }
 
 impl Focusable for WorkspaceTabs {

@@ -17,6 +17,7 @@
 //! it on the next `maybe_resize` tick. This lets one window host an
 //! arbitrary tree of splits without each leaf double-counting chrome.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,15 +54,16 @@ const BLINK_INTERVAL_MS: u64 = 530;
 pub const DEFAULT_COLS: u16 = 100;
 pub const DEFAULT_ROWS: u16 = 32;
 
-/// Spawn a local-shell PTY and wrap its backend in the shared-Arc form
-/// `TerminalView::mount` expects. Centralizes the three previously-
+/// Spawn a local-shell PTY at `cwd` and wrap its backend in the shared-Arc
+/// form `TerminalView::mount` expects. Centralizes the three previously-
 /// duplicated spawn sites (workspace bootstrap, tab-strip new-tab,
 /// pane-grid split). Returns `None` on spawn failure (caller logs + falls
 /// back to a placeholder); the `tracing::warn` is emitted here so each
 /// caller doesn't repeat the same line.
-pub fn spawn_local_pty() -> Option<(SharedBackend, TerminalSessionId)> {
+pub fn spawn_local_pty(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
+        cwd,
         cols: DEFAULT_COLS,
         rows: DEFAULT_ROWS,
         ..SpawnConfig::default()
