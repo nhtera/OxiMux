@@ -37,7 +37,6 @@ pub(crate) fn build_add_project_dialog(
 ) -> Entity<AddProjectDialog> {
     let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
     let on_pick: OnAddProjectPick = Box::new(move |project, window, cx| {
-        tracing::info!(project_id = %project.id, "AddProjectDialog on_pick callback fired");
         // Use `update` + the outer window directly — `update_in` does a
         // with_window lookup that returns "entity has no current window"
         // when fired from a deeply-nested async callback (e.g. rfd's
@@ -171,12 +170,8 @@ impl WorkspaceRoot {
         cx.notify();
         let project_root = PathBuf::from(&project.root_path);
         cx.spawn_in(window, async move |weak, cx| {
-            tracing::info!(path = %project_root.display(), "set_active_project: opening repo");
             let repo = match oximux_git::Repository::open(&project_root).await {
-                Ok(r) => {
-                    tracing::info!("set_active_project: Repository::open OK; rebuilding RightSidebar");
-                    r
-                }
+                Ok(r) => r,
                 Err(err) => {
                     tracing::warn!(?err, path = %project_root.display(), "Repository::open failed; keeping old right sidebar");
                     return;

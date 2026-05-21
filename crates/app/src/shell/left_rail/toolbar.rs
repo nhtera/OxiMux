@@ -49,7 +49,6 @@ fn add_project_button(theme: Theme, density: Density, typography: &Typography) -
         )
         .child("Add Project")
         .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
-            tracing::info!("LeftRail toolbar: Add Project clicked");
             window.dispatch_action(Box::new(OpenAddProjectDialog), cx);
         })
 }
