@@ -10,6 +10,7 @@ members = [
     "crates/storage",
     "crates/settings",
     "crates/relay-proto",
+    "crates/relay",
     "xtask",
 ]
 
@@ -32,6 +33,7 @@ oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }
 oximux-settings = { path = "crates/settings" }
 oximux-relay-proto = { path = "crates/relay-proto" }
+oximux-relay    = { path = "crates/relay" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
 # upstream `longbridge/gpui-component` workspace pins `gpui` to the default
@@ -57,6 +59,9 @@ serde_json = "1"
 # byte layout is not ABI-stable across point releases — the workspace
 # pin is the authoritative version both app + daemon agree on.
 bincode = { version = "2", features = ["serde"] }
+# Phase 5 relay daemon: lock-free concurrent map for PtyRegistry. Used
+# only by the relay binary; declared centrally for future reuse.
+dashmap = "5"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
