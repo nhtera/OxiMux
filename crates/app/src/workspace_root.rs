@@ -28,8 +28,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Subscription, Task, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    AnyElement, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window, div,
+    prelude::FluentBuilder, px,
 };
 use oximux_agents::{AdapterRegistry, AgentRuntime, AgentSessionConfig, CliRuntime};
 use oximux_core::{AgentAdapter, Project};
@@ -121,6 +122,9 @@ pub struct WorkspaceRoot {
     /// Sidebar Rename/Archive/Delete popover (mounted at root for full-window backdrop).
     pub(crate) row_menu: Entity<WorkspaceRowMenu>,
     pub(crate) add_project_dialog: Entity<AddProjectDialog>,
+    /// Render root tracks this so action dispatch reaches the workspace
+    /// even when no pane is focused (sidebar toggle, command palette).
+    pub(crate) focus_handle: FocusHandle,
 }
 
 impl WorkspaceRoot {
@@ -182,6 +186,7 @@ impl WorkspaceRoot {
                 RightSidebar::new(
                     Some(r),
                     root_path,
+                    false, // default-collapsed on app boot
                     theme,
                     density,
                     typography.clone(),
@@ -331,6 +336,7 @@ impl WorkspaceRoot {
             active_project: None,
             row_menu,
             add_project_dialog,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -504,6 +510,8 @@ impl WorkspaceRoot {
 
 // `build_workspace_tabs` + restore helpers live in
 // `crate::workspace_tabs_factory` so this file stays under the 800-LOC cap.
+// `impl Focusable for WorkspaceRoot` lives in `shell::workspace_ops` for
+// the same reason.
 
 impl Render for WorkspaceRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -678,6 +686,7 @@ impl Render for WorkspaceRoot {
         }
 
         div()
+            .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
             .size_full()

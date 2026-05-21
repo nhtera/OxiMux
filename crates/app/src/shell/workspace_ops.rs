@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use gpui::{AppContext, Context, Entity, WeakEntity, Window};
+use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
 use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, Theme, Typography};
@@ -143,6 +143,22 @@ fn agent_adapter_id(kind: AgentAdapter) -> &'static str {
     }
 }
 
+/// Defer `focus_active` until after GPUI commits the new render tree.
+/// Calling focus inline during `set_active_project` lands on whichever
+/// surface the project-switch event just relinquished focus from (the
+/// left-rail row, the dialog button, etc.), not the freshly-mounted
+/// pane. The same two-step race is documented in upstream desktop UIs
+/// that use a double-`requestAnimationFrame` pattern for the same fix.
+fn defer_focus_active(
+    window: &mut Window,
+    cx: &mut Context<crate::workspace_root::WorkspaceRoot>,
+    tabs: Entity<crate::shell::workspace_tabs::WorkspaceTabs>,
+) {
+    window.defer(cx, move |window, app| {
+        tabs.update(app, |t, cx| t.focus_active(window, cx));
+    });
+}
+
 /// Compose the worktree dir path:
 /// `<app_data>/dev.nhtera.oximux/projects/<project_id>/worktrees/<slug>`.
 /// Returns `None` when `dirs::data_dir()` is unavailable (sandbox or
@@ -156,6 +172,12 @@ fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
             .join("worktrees")
             .join(slug),
     )
+}
+
+impl Focusable for WorkspaceRoot {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl WorkspaceRoot {
@@ -282,14 +304,16 @@ impl WorkspaceRoot {
                 // Re-register the observer on the newly-active entity so its
                 // notifications bubble up. Drops the previous subscription.
                 self._workspace_tabs_observer = Some(cx.observe(&tabs, |_, _, cx| cx.notify()));
-                self.workspace_tabs_by_project.insert(project.id.clone(), tabs);
+                self.workspace_tabs_by_project.insert(project.id.clone(), tabs.clone());
+                defer_focus_active(window, cx, tabs);
             } else {
                 tracing::warn!(project_id = %project.id, "build_workspace_tabs failed");
             }
-        } else if let Some(tabs) = self.workspace_tabs_by_project.get(&project.id) {
+        } else if let Some(tabs) = self.workspace_tabs_by_project.get(&project.id).cloned() {
             // Project's tabs already exist — re-point the observer at this
             // entity so the active tab strip notifies the right one.
-            self._workspace_tabs_observer = Some(cx.observe(tabs, |_, _, cx| cx.notify()));
+            self._workspace_tabs_observer = Some(cx.observe(&tabs, |_, _, cx| cx.notify()));
+            defer_focus_active(window, cx, tabs);
         }
         cx.notify();
         cx.spawn_in(window, async move |weak, cx| {
@@ -314,10 +338,19 @@ impl WorkspaceRoot {
                 let theme = this.theme;
                 let density = this.density;
                 let typography = this.typography.clone();
+                // Carry the previous sidebar's open/collapsed state across
+                // the rebuild — the right column must stay where the user
+                // left it, not snap back open on every project switch.
+                let prior_open = this
+                    .right_sidebar
+                    .as_ref()
+                    .map(|s| s.read(cx).open)
+                    .unwrap_or(true);
                 this.right_sidebar = Some(cx.new(|cx| {
                     crate::shell::right_sidebar::RightSidebar::new(
                         repo,
                         project_root.clone(),
+                        prior_open,
                         theme,
                         density,
                         typography,

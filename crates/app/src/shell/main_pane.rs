@@ -85,7 +85,7 @@ impl MainPane {
     ) -> Self {
         let id = PaneId(0);
         let next_id = AtomicU64::new(1);
-        let sub = cx.observe(&initial_view, |_, _, cx| cx.notify());
+        let sub = observe_pane_focus(&initial_view, id, cx);
         let mut panes = HashMap::new();
         panes.insert(id, initial_view);
         let mut pane_observers = HashMap::new();
@@ -127,7 +127,7 @@ impl MainPane {
     ) -> Self {
         let mut pane_observers = HashMap::with_capacity(panes.len());
         for (id, view) in &panes {
-            pane_observers.insert(*id, cx.observe(view, |_, _, cx| cx.notify()));
+            pane_observers.insert(*id, observe_pane_focus(view, *id, cx));
         }
         Self {
             tree,
@@ -274,7 +274,7 @@ impl MainPane {
             tracing::warn!("split target not in tree; dropping new pane");
             return;
         }
-        let sub = cx.observe(&view, |_, _, cx| cx.notify());
+        let sub = observe_pane_focus(&view, new_id, cx);
         self._pane_observers.insert(new_id, sub);
         self.panes.insert(new_id, view);
         self.focused = new_id;
@@ -432,6 +432,25 @@ fn focus_pane(
         let handle = view.read(cx).focus_handle(cx);
         handle.focus(window, cx);
     }
+}
+
+/// Observe `view` and mirror its focus state into `MainPane.focused`.
+/// Click-to-focus moves platform focus into a `TerminalView` directly;
+/// without this observer, `MainPane.focused` would lag until the next
+/// action handler ran `sync_focused_from_window`. That lag broke
+/// "restore last-interacted pane on project switch" because the field
+/// was stale by capture time.
+fn observe_pane_focus(
+    view: &Entity<TerminalView>,
+    pane_id: PaneId,
+    cx: &mut Context<MainPane>,
+) -> Subscription {
+    cx.observe(view, move |this, view, cx| {
+        if view.read(cx).focused() && this.focused != pane_id {
+            this.focused = pane_id;
+        }
+        cx.notify();
+    })
 }
 
 fn available_area(

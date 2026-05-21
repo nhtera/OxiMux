@@ -67,9 +67,11 @@ impl RightSidebar {
     /// full git-aware UI is wired (Source Control tab + status poller).
     /// When `None`, only Explorer + Search tabs exist — they read directly
     /// from `root_path`. Source Control tab is hidden via `visible_tabs`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Option<Repository>,
         root_path: PathBuf,
+        initial_open: bool,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -153,7 +155,7 @@ impl RightSidebar {
         };
 
         Self {
-            open: true,
+            open: initial_open,
             active_tab,
             source_control,
             file_explorer,

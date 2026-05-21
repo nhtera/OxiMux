@@ -336,7 +336,14 @@ impl WorkspaceTabs {
         self.set_active(prev, window, cx);
     }
 
-    fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Focus the active tab's pane. Called by tab open/switch from
+    /// inside this entity, AND by `WorkspaceRoot::set_active_project`
+    /// when activating a project's tabs entity — without that outer
+    /// call, switching projects leaves focus on the previous project's
+    /// (now-orphaned) pane and every action dispatched from there
+    /// (sidebar toggle, keystrokes, command palette) walks up a dead
+    /// focus chain that no longer reaches the workspace-root handlers.
+    pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };

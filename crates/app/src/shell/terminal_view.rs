@@ -226,16 +226,14 @@ impl TerminalView {
             .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS));
 
         let focus_handle = cx.focus_handle();
-        // Grab focus on mount so the user can type into the shell immediately
-        // without first clicking. Without this the window opens with no focus
-        // owner and keystrokes are dropped until the first click.
-        focus_handle.focus(window, cx);
-
-        // Mirror focus state into `view.focused` for the blink task. Detach so
-        // the listener survives until the entity drops; the listener's
-        // WeakEntity will self-clean via update-returning-Err at that point.
-        // `on_focus` also resets `cursor_visible` so a pane gaining focus
-        // never waits a full 530 ms for the cursor to reappear.
+        // Register on_focus / on_blur BEFORE calling focus() so the initial
+        // focus transition fires the callback. Without this ordering the
+        // struct had to init `focused: true` as a workaround, which left
+        // every pane reporting "I'm focused" — when two panes were created
+        // during workspace restore, MainPane's observer saw both as focused
+        // and ping-ponged `self.focused` between them at the cursor-blink
+        // cadence. `on_focus` also resets `cursor_visible` so a pane gaining
+        // focus never waits a full 530 ms for the cursor to reappear.
         cx.on_focus(&focus_handle, window, |view, _, cx| {
             view.focused = true;
             view.cursor_visible = true;
@@ -247,6 +245,10 @@ impl TerminalView {
             cx.notify();
         })
         .detach();
+        // Grab focus on mount so the user can type into the shell immediately
+        // without first clicking. Without this the window opens with no focus
+        // owner and keystrokes are dropped until the first click.
+        focus_handle.focus(window, cx);
 
         let poll_task = Self::start_poll_task(cx);
         let blink_task = Self::start_blink_task(cx);
@@ -262,7 +264,11 @@ impl TerminalView {
             target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
-            focused: true,
+            // Init to false; the on_focus callback fires for the focus() above
+            // and flips this true for whichever pane actually wins focus.
+            // Multiple panes constructed in the same effect run will each see
+            // their focus() call land, last one wins, on_blur clears the rest.
+            focused: false,
             search: SearchState::new(),
             title: None,
             _poll_task: poll_task,
@@ -342,6 +348,14 @@ impl TerminalView {
     pub fn serialize_buffer(&self, max_bytes: usize) -> Vec<u8> {
         let id = self.session_id;
         self.with_backend(|be| be.serialize_buffer(id, max_bytes))
+    }
+
+    /// Whether this view's focus handle currently holds platform focus.
+    /// Public so `MainPane`'s observer can mirror per-pane focus state
+    /// into `self.focused` without a `&Window` (the field is kept up to
+    /// date by the `cx.on_focus` / `cx.on_blur` observers in `mount`).
+    pub fn focused(&self) -> bool {
+        self.focused
     }
 
     /// Backend's external identifier for this pane's session (e.g.,
