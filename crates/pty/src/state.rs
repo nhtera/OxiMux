@@ -83,6 +83,14 @@ impl TerminalState {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Crate-internal accessor used by `grid_serializer` to walk the live
+    /// grid for persistence. Exposed (rather than wrapping every
+    /// `serialize_*` call as a method) so the serializer module stays a
+    /// pure function over `Term` and is unit-testable on its own.
+    pub fn term_for_test(&self) -> &Term<VoidListener> {
+        &self.term
+    }
+
     /// Resize the grid. Called whenever the pane's render area changes.
     ///
     /// Delegates to alacritty's `Term::resize` so the active grid, inactive

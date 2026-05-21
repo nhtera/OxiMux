@@ -12,12 +12,14 @@
 pub mod backend;
 pub(crate) mod close_grace;
 pub mod events;
+pub mod grid_serializer;
 pub mod portable_pty_backend;
 pub mod snapshot;
 pub mod state;
 
 pub use backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 pub use events::TerminalEvent;
+pub use grid_serializer::{SerializeOptions, serialize_term, serialize_term_capped};
 pub use portable_pty_backend::PortablePtyBackend;
 pub use snapshot::{Cell, CellColor, NamedColor16, TerminalSnapshot};
 pub use state::TerminalState;
