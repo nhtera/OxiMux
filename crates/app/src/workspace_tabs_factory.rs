@@ -12,20 +12,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AppContext, Context, Entity, Window};
-use oximux_agents::CliRuntime;
+use gpui::{AppContext, Context, Entity, WeakEntity, Window};
+use oximux_agents::{AgentRuntime, AgentSessionConfig, CliRuntime};
+use oximux_core::AgentAdapter;
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
 
 use crate::notifier::Notifier;
 use crate::persisted_terminals::{
-    PersistedTabs, PersistedTree, count_leaves, restore_tree, settings_key,
+    PersistedAgentTab, PersistedTabs, PersistedTree, count_leaves, restore_tree, settings_key,
 };
 use crate::shell::main_pane::MainPane;
 use crate::shell::pane_tree::PaneId;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 use crate::shell::workspace_tabs::WorkspaceTabs;
 use crate::workspace_root::WorkspaceRoot;
+
+const DEFAULT_AGENT_COLS: u16 = 120;
+const DEFAULT_AGENT_ROWS: u16 = 32;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_workspace_tabs(
@@ -39,95 +43,153 @@ pub(crate) fn build_workspace_tabs(
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<Entity<WorkspaceTabs>> {
-    // Empty-tabs snapshot is treated as no-snapshot so the user never lands
-    // on a blank welcome.
     let restore: Option<PersistedTabs> = snapshot.filter(|s| !s.tabs.is_empty());
-
-    let (first_pane, rest) = match restore.as_ref() {
-        Some(s) => {
-            let initial = build_pane_for_tree(
-                &s.tabs[0].tree,
-                cwd.clone(),
-                theme,
-                density,
-                typography.clone(),
-                window,
-                cx,
-            )?;
-            (initial, &s.tabs[1..])
-        }
-        None => (
-            build_default_pane(cwd.clone(), theme, density, typography.clone(), window, cx)?,
-            &[][..],
-        ),
-    };
 
     let tabs_entity = cx.new(|cx| {
         WorkspaceTabs::new(
-            first_pane,
             cwd.clone(),
             theme,
             density,
             typography.clone(),
-            cli_runtime,
-            notifier,
+            cli_runtime.clone(),
+            notifier.clone(),
             window,
             cx,
         )
     });
 
-    if !rest.is_empty() {
-        let extra_tabs: Vec<_> = rest
-            .iter()
-            .filter_map(|t| {
-                build_pane_for_tree(
-                    &t.tree,
-                    cwd.clone(),
-                    theme,
-                    density,
-                    typography.clone(),
-                    window,
-                    cx,
-                )
-                .map(|pane| (t.label.clone(), pane))
-            })
-            .collect();
-        tabs_entity.update(cx, |tabs, cx| {
-            for (label, pane) in extra_tabs {
-                tabs.push_restored_terminal_tab(label, pane, cx);
-            }
-        });
+    let Some(snap) = restore else {
+        tabs_entity.update(cx, |tabs, cx| tabs.seed_default_terminal(window, cx));
+        return Some(tabs_entity);
+    };
+
+    // Snapshot path. Walk tabs in saved order; terminals build synchronously,
+    // agents kick off an async `start_session` + push when ready.
+    for tab in &snap.tabs {
+        if let Some(agent) = &tab.agent {
+            restore_agent_tab(
+                agent,
+                tab.label.clone(),
+                cli_runtime.clone(),
+                tabs_entity.downgrade(),
+                window,
+                cx,
+            );
+        } else if let Some(pane) = build_pane_for_tree(
+            &tab.tree,
+            cwd.clone(),
+            theme,
+            density,
+            typography.clone(),
+            window,
+            cx,
+        ) {
+            tabs_entity.update(cx, |tabs, cx| {
+                tabs.push_restored_terminal_tab(tab.label.clone(), pane, cx);
+            });
+        }
     }
-    if let Some(snap) = restore.as_ref() {
-        tabs_entity.update(cx, |tabs, cx| {
-            tabs.apply_restored_state(snap.active, snap.next_label_n, window, cx);
-        });
-    }
+    tabs_entity.update(cx, |tabs, cx| {
+        tabs.apply_restored_state(snap.active, snap.next_label_n, window, cx);
+    });
     Some(tabs_entity)
 }
 
-fn build_default_pane(
-    cwd: PathBuf,
-    theme: Theme,
-    density: Density,
-    typography: Typography,
+/// Async agent respawn. Mirrors `WorkspaceRoot::spawn_agent_tab` but
+/// hands the persisted label through `push_restored_agent_tab` so the
+/// strip keeps the user's pre-quit label and skips the save-on-mount
+/// (the snapshot is already on disk).
+fn restore_agent_tab(
+    persisted: &PersistedAgentTab,
+    label: String,
+    cli_runtime: Arc<CliRuntime>,
+    ws: WeakEntity<WorkspaceTabs>,
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
-) -> Option<Entity<MainPane>> {
-    let (backend, session_id) = spawn_local_pty(cwd.clone())?;
-    let typography_for_view = typography.clone();
-    let view = cx.new(|cx| {
-        TerminalView::mount(
-            backend,
-            session_id,
-            theme,
-            density,
-            typography_for_view,
-            window,
-            cx,
-        )
-    });
-    Some(cx.new(|cx| MainPane::new(view, cwd, theme, density, typography, cx)))
+) {
+    if matches!(persisted.adapter, AgentAdapter::Custom) {
+        tracing::info!("agent restore: skipping Custom adapter (non-deterministic argv)");
+        return;
+    }
+    let cfg = AgentSessionConfig {
+        adapter: persisted.adapter,
+        worktree_path: PathBuf::from(&persisted.worktree_path),
+        prompt: None,
+        model: persisted.model.clone(),
+        effort: persisted.effort.clone(),
+        env: Vec::new(),
+        cols: DEFAULT_AGENT_COLS,
+        rows: DEFAULT_AGENT_ROWS,
+        custom_command: None,
+    };
+    let adapter_id: &'static str = static_adapter_id(persisted.adapter);
+    let persisted_clone = persisted.clone();
+    cx.spawn_in(window, async move |_root, cx| {
+        let session_id = match cli_runtime.start_session(cfg).await {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(?err, adapter = adapter_id, "agent restore: start_session failed");
+                return;
+            }
+        };
+        let backend = match cli_runtime.backend_for(session_id) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(?err, "agent restore: backend_for failed");
+                let _ = cli_runtime.cancel(session_id).await;
+                return;
+            }
+        };
+        let term_id = match cli_runtime.terminal_session_id(session_id) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(?err, "agent restore: terminal_session_id failed");
+                let _ = cli_runtime.cancel(session_id).await;
+                return;
+            }
+        };
+        let status_rx = match cli_runtime.subscribe_status(session_id) {
+            Ok(rx) => rx,
+            Err(err) => {
+                tracing::warn!(?err, "agent restore: subscribe_status failed");
+                let _ = cli_runtime.cancel(session_id).await;
+                return;
+            }
+        };
+        let mount = ws.update_in(cx, |tabs, window, cx| {
+            tabs.push_restored_agent_tab(
+                &persisted_clone,
+                adapter_id,
+                label,
+                session_id,
+                status_rx,
+                backend,
+                term_id,
+                window,
+                cx,
+            );
+        });
+        if mount.is_err() {
+            tracing::warn!(
+                ?session_id,
+                "agent restore: workspace dropped mid-spawn; cancelling orphan"
+            );
+            let _ = cli_runtime.cancel(session_id).await;
+        }
+    })
+    .detach();
+}
+
+/// Map an `AgentAdapter` to the `'static` slug `push_restored_agent_tab`
+/// expects. Mirrors `workspace_ops::agent_adapter_id` (not re-exported to
+/// keep crate-internal visibility tight).
+fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
+    match adapter {
+        AgentAdapter::ClaudeCode => "claude-code",
+        AgentAdapter::Codex => "codex",
+        AgentAdapter::Aider => "aider",
+        AgentAdapter::Custom => "custom",
+    }
 }
 
 /// Spawn one MainPane whose pane tree mirrors `tree_snapshot`. Each leaf

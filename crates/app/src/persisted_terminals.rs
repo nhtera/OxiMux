@@ -8,12 +8,16 @@
 //! panes restore at the owning project's `root_path`.
 //!
 //! What is **not** persisted:
-//! - Agent tabs (the `CliRuntime` session is per-process; can't be revived).
-//!   Save path filters them out.
 //! - PTY scrollback / running command output (the shell process is dead).
+//!   Restored shells start with a fresh prompt.
 //! - Per-pane focus inside a tab (active leaf restores to the first leaf).
+//! - Live agent process — the `CliRuntime` session dies with the app. On
+//!   restore the adapter respawns with the same `{adapter, worktree, model,
+//!   effort}` it had before and reloads its own conversation from disk.
 
 use serde::{Deserialize, Serialize};
+
+use oximux_core::AgentAdapter;
 
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
 
@@ -34,6 +38,23 @@ pub struct PersistedTabs {
 pub struct PersistedTab {
     pub label: String,
     pub tree: PersistedTree,
+    /// Present iff the tab was an agent tab. `None` keeps the existing
+    /// plain-terminal restore path. `#[serde(default)]` lets older snapshots
+    /// (no `agent` field) parse cleanly.
+    #[serde(default)]
+    pub agent: Option<PersistedAgentTab>,
+}
+
+/// Per-tab agent metadata sufficient to respawn the same CLI session on
+/// restore. The agent CLI itself reloads its conversation from disk; this
+/// blob only carries what `start_session` needs to reach the same shell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedAgentTab {
+    pub adapter: AgentAdapter,
+    pub adapter_id: String,
+    pub worktree_path: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Mirrors `PaneTree` but without GPUI-side `PaneId`s (regenerated on
@@ -170,6 +191,7 @@ mod tests {
             tabs: vec![PersistedTab {
                 label: "Terminal 1".into(),
                 tree: snap,
+                agent: None,
             }],
             active: 0,
             next_label_n: 2,
@@ -178,5 +200,44 @@ mod tests {
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
         assert_eq!(back.tabs.len(), 1);
         assert_eq!(back.next_label_n, 2);
+        assert!(back.tabs[0].agent.is_none());
+    }
+
+    #[test]
+    fn legacy_blob_without_agent_field_still_parses() {
+        // Snapshots from pre-step-15 builds had no `agent` field. Verify
+        // serde-default keeps them readable so the user's first relaunch
+        // after upgrade doesn't drop their tab layout.
+        let legacy = r#"{"tabs":[{"label":"Terminal 1","tree":"Leaf"}],"active":0,"next_label_n":2}"#;
+        let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.tabs.len(), 1);
+        assert!(parsed.tabs[0].agent.is_none());
+    }
+
+    #[test]
+    fn round_trip_agent_tab_preserves_metadata() {
+        let blob = PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "Claude Code 1".into(),
+                tree: PersistedTree::Leaf,
+                agent: Some(PersistedAgentTab {
+                    adapter: AgentAdapter::ClaudeCode,
+                    adapter_id: "claude-code".into(),
+                    worktree_path: "/tmp/proj".into(),
+                    model: Some("claude-opus-4-7".into()),
+                    effort: Some("high".into()),
+                }),
+            }],
+            active: 0,
+            next_label_n: 2,
+        };
+        let s = serde_json::to_string(&blob).unwrap();
+        let back: PersistedTabs = serde_json::from_str(&s).unwrap();
+        let agent = back.tabs[0].agent.as_ref().unwrap();
+        assert_eq!(agent.adapter, AgentAdapter::ClaudeCode);
+        assert_eq!(agent.adapter_id, "claude-code");
+        assert_eq!(agent.worktree_path, "/tmp/proj");
+        assert_eq!(agent.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(agent.effort.as_deref(), Some("high"));
     }
 }

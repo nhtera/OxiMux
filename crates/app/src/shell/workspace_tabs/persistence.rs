@@ -2,10 +2,18 @@
 //! `mod.rs` to keep the parent file under the 800-LOC hard cap. Fields
 //! touched here are crate-private on the struct definition in `mod.rs`.
 
-use gpui::{Context, Entity, SharedString, Window};
+use gpui::{AppContext, Context, Entity, SharedString, Task, Window};
+use oximux_agents::{AgentStatusStream, SharedBackend};
+use oximux_core::AgentSessionId;
+use oximux_pty::TerminalSessionId;
 
-use crate::persisted_terminals::{PersistedTab, PersistedTabs, snapshot_tree};
+use crate::notifier::TabId;
+use crate::persisted_terminals::{
+    PersistedAgentTab, PersistedTab, PersistedTabs, snapshot_tree,
+};
+use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::main_pane::MainPane;
+use crate::shell::terminal_view::TerminalView;
 
 use super::{SaveCallback, WorkspaceTab, WorkspaceTabKind, WorkspaceTabs};
 
@@ -16,21 +24,43 @@ impl WorkspaceTabs {
         self.save_callback = Some(cb);
     }
 
-    /// Build a snapshot of every Terminal tab. Agent tabs are skipped —
-    /// the `CliRuntime` session is per-process and can't be revived.
+    /// Build a snapshot of every tab. Plain terminals capture topology only;
+    /// agent tabs additionally carry the spawn-config metadata so restore
+    /// can hand `CliRuntime::start_session` the same shape (step 15).
+    /// `Custom` adapters are excluded — their argv is non-deterministic.
     pub fn snapshot(&self, cx: &gpui::App) -> PersistedTabs {
         let mut tabs = Vec::with_capacity(self.tabs.len());
         let mut active_offset: Option<usize> = None;
         for (idx, tab) in self.tabs.iter().enumerate() {
-            if !matches!(tab.kind, WorkspaceTabKind::Terminal) {
-                continue;
-            }
+            let agent = match &tab.kind {
+                WorkspaceTabKind::Terminal => None,
+                WorkspaceTabKind::Agent {
+                    adapter,
+                    adapter_id,
+                    worktree_path,
+                    model,
+                    effort,
+                    ..
+                } => {
+                    if matches!(adapter, oximux_core::AgentAdapter::Custom) {
+                        continue;
+                    }
+                    Some(PersistedAgentTab {
+                        adapter: *adapter,
+                        adapter_id: (*adapter_id).to_string(),
+                        worktree_path: worktree_path.display().to_string(),
+                        model: model.clone(),
+                        effort: effort.clone(),
+                    })
+                }
+            };
             if idx == self.active {
                 active_offset = Some(tabs.len());
             }
             tabs.push(PersistedTab {
                 label: tab.label.to_string(),
                 tree: snapshot_tree(tab.pane.read(cx).tree()),
+                agent,
             });
         }
         PersistedTabs {
@@ -85,6 +115,78 @@ impl WorkspaceTabs {
             _observer: observer,
             _status_task: None,
         });
+    }
+
+    /// Append an Agent tab restored from persistence. Caller has already
+    /// driven `start_session` + assembled the handles; this mirrors
+    /// `push_restored_terminal_tab` (no label-counter bump, no save —
+    /// caller restores active + counter via `apply_restored_state`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_restored_agent_tab(
+        &mut self,
+        persisted: &PersistedAgentTab,
+        adapter_id: &'static str,
+        label: String,
+        session_id: AgentSessionId,
+        status_rx: AgentStatusStream,
+        backend: SharedBackend,
+        term_id: TerminalSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let typography_for_view = typography.clone();
+        let view = cx.new(|cx| {
+            TerminalView::mount(
+                backend,
+                term_id,
+                theme,
+                density,
+                typography_for_view,
+                window,
+                cx,
+            )
+        });
+        let pane = cx.new(|cx| {
+            MainPane::new(
+                view,
+                std::path::PathBuf::from(&persisted.worktree_path),
+                theme,
+                density,
+                typography.clone(),
+                cx,
+            )
+        });
+        let observer = cx.observe(&pane, |this, _pane, cx| {
+            cx.notify();
+            this.maybe_save_on_topology_change(cx);
+        });
+        let label_shared = SharedString::from(label.clone());
+        let status_task: Task<()> = spawn_status_task(
+            status_rx.clone(),
+            self.notifier.clone(),
+            TabId::from(session_id),
+            label_shared.clone(),
+            cx,
+        );
+        self.tabs.push(WorkspaceTab {
+            label: label_shared,
+            pane,
+            kind: WorkspaceTabKind::Agent {
+                adapter: persisted.adapter,
+                adapter_id,
+                worktree_path: std::path::PathBuf::from(&persisted.worktree_path),
+                model: persisted.model.clone(),
+                effort: persisted.effort.clone(),
+                session_id,
+                status_rx,
+            },
+            _observer: observer,
+            _status_task: Some(status_task),
+        });
+        cx.notify();
     }
 
     /// Finalize the restore: set active tab + label counter, focus the

@@ -371,6 +371,9 @@ impl WorkspaceRoot {
             return;
         };
         let runtime = self.cli_runtime.clone();
+        let cwd_for_tab = cwd.clone();
+        let model: Option<String> = None;
+        let effort: Option<String> = None;
 
         cx.spawn_in(window, async move |_root, cx| {
             // `adapter_id` arrives from the row the user clicked — the
@@ -381,8 +384,8 @@ impl WorkspaceRoot {
                 adapter,
                 worktree_path: cwd,
                 prompt: None,
-                model: None,
-                effort: None,
+                model: model.clone(),
+                effort: effort.clone(),
                 env: Vec::new(),
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
@@ -422,7 +425,18 @@ impl WorkspaceRoot {
 
             let mount_result = ws.update_in(cx, |tabs, window, cx| {
                 tabs.push_agent_tab(
-                    adapter_id, session_id, status_rx, backend, term_id, window, cx,
+                    adapter,
+                    adapter_id,
+                    cwd_for_tab,
+                    model,
+                    effort,
+                    session_id,
+                    status_rx,
+                    backend,
+                    term_id,
+                    None,
+                    window,
+                    cx,
                 );
             });
             if mount_result.is_err() {

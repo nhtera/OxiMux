@@ -14,25 +14,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
-    px, svg,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div,
 };
 use oximux_agents::{AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend};
-use oximux_core::AgentSessionId;
+use oximux_core::{AgentAdapter, AgentSessionId};
 use oximux_pty::TerminalSessionId;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{
-    CloseTab, NewAgent, NewTab, NextTab, PrevTab, RequestOpenAdapterPicker, SplitDown, SplitLeft,
-    SplitRight, SplitUp,
-};
+use crate::actions::{CloseTab, NewAgent, NewTab, NextTab, PrevTab, RequestOpenAdapterPicker};
 mod persistence;
+mod render;
+
+pub use render::{SplitDirection, render_tab_strip, split_icon};
 
 use crate::notifier::{Notifier, TabId};
 use crate::persisted_terminals::PersistedTabs;
-use crate::shell::agent_status_badge::render_dot;
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
 use crate::shell::main_pane::MainPane;
@@ -46,10 +43,16 @@ pub type SaveCallback = Arc<dyn Fn(PersistedTabs) + Send + Sync>;
 
 /// Tab kind: raw shell PTY vs `CliRuntime`-managed agent session. The
 /// distinction drives `agent_count`, the status badge, and the label prefix.
+/// Agent variant carries the spawn-config metadata so persistence can
+/// respawn the same session shape on restart (step 15).
 pub enum WorkspaceTabKind {
     Terminal,
     Agent {
+        adapter: AgentAdapter,
         adapter_id: &'static str,
+        worktree_path: PathBuf,
+        model: Option<String>,
+        effort: Option<String>,
         session_id: AgentSessionId,
         status_rx: AgentStatusStream,
     },
@@ -101,9 +104,12 @@ pub struct WorkspaceTabs {
 }
 
 impl WorkspaceTabs {
+    /// Construct an empty tabs strip. Callers seed it via either
+    /// `seed_default_terminal` (no-snapshot path) or the per-tab restore
+    /// helpers in `persistence.rs` (snapshot path). Empty state is valid:
+    /// `render` falls through to the welcome view.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        initial_pane: Entity<MainPane>,
         cwd: PathBuf,
         theme: Theme,
         density: Density,
@@ -113,27 +119,15 @@ impl WorkspaceTabs {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observer = cx.observe(&initial_pane, |this, _pane, cx| {
-            cx.notify();
-            this.maybe_save_on_topology_change(cx);
-        });
-        let label = SharedString::from("Terminal 1");
-        let tabs = vec![WorkspaceTab {
-            label,
-            pane: initial_pane,
-            kind: WorkspaceTabKind::Terminal,
-            _observer: observer,
-            _status_task: None,
-        }];
         let window_active = window.is_window_active();
         let window_activation_observer =
             cx.observe_window_activation(window, |this, window, _cx| {
                 this.window_active = window.is_window_active();
             });
         Self {
-            tabs,
+            tabs: Vec::new(),
             active: 0,
-            next_label_n: 2,
+            next_label_n: 1,
             cwd,
             theme,
             density,
@@ -147,6 +141,37 @@ impl WorkspaceTabs {
             save_callback: None,
             last_topology_signature: 0,
         }
+    }
+
+    /// Push a freshly-spawned default Terminal as "Terminal 1". Used by
+    /// the no-snapshot boot path so the user opens onto a working shell
+    /// rather than the welcome view.
+    pub fn seed_default_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = spawn_main_pane(
+            self.cwd.clone(),
+            self.theme,
+            self.density,
+            self.typography.clone(),
+            window,
+            cx,
+        ) else {
+            return;
+        };
+        let observer = cx.observe(&pane, |this, _pane, cx| {
+            cx.notify();
+            this.maybe_save_on_topology_change(cx);
+        });
+        self.tabs.push(WorkspaceTab {
+            label: SharedString::from("Terminal 1"),
+            pane,
+            kind: WorkspaceTabKind::Terminal,
+            _observer: observer,
+            _status_task: None,
+        });
+        self.active = 0;
+        self.next_label_n = 2;
+        self.focus_active(window, cx);
+        cx.notify();
     }
 
     /// Pop the most-recent `+` click x (window coords) if one was recorded
@@ -339,14 +364,22 @@ impl WorkspaceTabs {
     /// Mount a freshly-spawned agent session as a new tab. Builds the
     /// `TerminalView` + `MainPane` here so the label-counter scan reflects
     /// any tabs added during the async spawn window.
+    ///
+    /// `label_override` lets the restore path keep the user's pre-quit label
+    /// verbatim. `None` triggers the normal auto-incrementing label.
     #[allow(clippy::too_many_arguments)]
     pub fn push_agent_tab(
         &mut self,
+        adapter: AgentAdapter,
         adapter_id: &'static str,
+        worktree_path: PathBuf,
+        model: Option<String>,
+        effort: Option<String>,
         session_id: AgentSessionId,
         status_rx: AgentStatusStream,
         backend: SharedBackend,
         term_id: TerminalSessionId,
+        label_override: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -371,8 +404,14 @@ impl WorkspaceTabs {
             cx.notify();
             this.maybe_save_on_topology_change(cx);
         });
-        let current_labels: Vec<SharedString> = self.tabs.iter().map(|t| t.label.clone()).collect();
-        let label = agent_tab_label::next_label_for(adapter_id, &current_labels);
+        let label = match label_override {
+            Some(s) => SharedString::from(s),
+            None => {
+                let current_labels: Vec<SharedString> =
+                    self.tabs.iter().map(|t| t.label.clone()).collect();
+                agent_tab_label::next_label_for(adapter_id, &current_labels)
+            }
+        };
         let status_task = spawn_status_task(
             status_rx.clone(),
             self.notifier.clone(),
@@ -384,7 +423,11 @@ impl WorkspaceTabs {
             label,
             pane,
             kind: WorkspaceTabKind::Agent {
+                adapter,
                 adapter_id,
+                worktree_path,
+                model,
+                effort,
                 session_id,
                 status_rx,
             },
@@ -393,6 +436,7 @@ impl WorkspaceTabs {
         });
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
+        self.save_now(cx);
         cx.notify();
     }
 
@@ -407,322 +451,6 @@ impl WorkspaceTabs {
     fn on_new_agent(&mut self, _: &NewAgent, window: &mut Window, cx: &mut Context<Self>) {
         window.dispatch_action(Box::new(RequestOpenAdapterPicker), cx);
     }
-}
-
-/// Build the tab-strip element for embedding in `top_bar`'s center zone.
-///
-/// Flat strip: each tab fills the chrome row edge-to-edge
-/// separated by 1px right borders. The active tab is identified ONLY by a
-/// 2px top accent line (focus_ring color) — no background recolor. Inactive
-/// tabs render with muted text; hovering brightens them. Close affordance
-/// stays hidden on inactive tabs (revealed via `group_hover`) and is
-/// permanently visible (muted) on the active tab.
-///
-/// `entity` is captured by per-tab click handlers, the per-tab × button,
-/// and trailing controls so they can mutate state from element closures.
-///
-/// Plus-button placement: sits inline immediately after the last tab so the
-/// affordance reads as "add another tab here", not as a disconnected chrome
-/// control. A `flex_1` spacer between the plus button and pane-actions keeps
-/// "..." pinned at the right edge. When tabs grow past the available width,
-/// the strip's `flex_shrink: 1` + `min_w: 0` causes it to shrink (with
-/// horizontal scroll); the spacer collapses to zero so plus stays anchored
-/// at the right edge of the (shrunken) strip.
-pub fn render_tab_strip(entity: Entity<WorkspaceTabs>, cx: &mut App) -> AnyElement {
-    let this = entity.read(cx);
-    let theme = this.theme;
-    let active = this.active;
-    let tab_count = this.tabs.len();
-
-    let mut strip = div()
-        .id(SharedString::from(format!(
-            "oximux-workspace-tab-strip-{}",
-            entity.entity_id()
-        )))
-        .flex()
-        .flex_row()
-        .items_stretch()
-        .h_full()
-        .min_w(px(0.0))
-        .overflow_x_scroll()
-        .overflow_y_hidden();
-
-    for (ix, tab) in this.tabs.iter().enumerate() {
-        strip = strip.child(workspace_tab(
-            ix,
-            tab.label.clone(),
-            ix == active,
-            ix < tab_count - 1,
-            &tab.kind,
-            theme,
-            entity.clone(),
-        ));
-    }
-
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .items_stretch()
-        .h_full()
-        .min_w(px(0.0))
-        .flex_1()
-        .child(strip)
-        .child(plus_button(theme, entity.clone()))
-        .child(div().flex_1().min_w(px(0.0)).h_full());
-    // Hide the pane-actions ("...") button when no tabs are open — there is
-    // no MainPane to split. The "+" stays so users can open a new terminal.
-    if tab_count > 0 {
-        row = row.child(pane_actions_button(theme));
-    }
-    row.into_any_element()
-}
-
-/// One flat tab: full chrome-row height, top accent on active,
-/// right-border separator from its neighbor. Agent tabs receive a 6 px
-/// colored dot prepended to the label — terminal tabs render without one.
-#[allow(clippy::too_many_arguments)]
-fn workspace_tab(
-    ix: usize,
-    label: SharedString,
-    is_active: bool,
-    has_neighbor_right: bool,
-    kind: &WorkspaceTabKind,
-    theme: Theme,
-    entity: Entity<WorkspaceTabs>,
-) -> impl IntoElement {
-    // Unique group per tab so the close X's hover-reveal only triggers on
-    // ITS OWN tab's hover (Tailwind group/group-hover idiom). Without the
-    // per-ix name, hovering any tab would reveal every close button.
-    let group_name = SharedString::from(format!("ws-tab-{ix}"));
-    let icon = svg()
-        .path("icons/square-terminal.svg")
-        .size(px(11.0))
-        .text_color(if is_active {
-            theme.fg_muted
-        } else {
-            theme.fg_subtle
-        });
-    let text_color = if is_active {
-        theme.fg_base
-    } else {
-        theme.fg_muted
-    };
-    // Always reserve 2px on top so the active accent line doesn't shift
-    // tab content vertically when selection changes. Inactive tabs paint
-    // that border transparent; active uses the focus-ring color.
-    let top_accent = if is_active {
-        theme.focus_ring
-    } else {
-        gpui::transparent_black()
-    };
-    let separator = if has_neighbor_right {
-        theme.border_inactive
-    } else {
-        gpui::transparent_black()
-    };
-    let close_btn = close_button(theme, ix, is_active, entity.clone(), group_name.clone());
-    let entity_for_click = entity.clone();
-    // Agent tabs prepend a colored status dot; terminal tabs leave the slot
-    // empty so layout stays identical to today. `borrow().clone()` releases
-    // the watch guard before the closure-heavy builder chain runs.
-    let agent_dot: Option<AnyElement> = if let WorkspaceTabKind::Agent { status_rx, .. } = kind {
-        let status = status_rx.borrow().clone();
-        let dot_id = SharedString::from(format!("agent-status-dot-{ix}"));
-        Some(render_dot(dot_id, &status, theme).into_any_element())
-    } else {
-        None
-    };
-
-    // The top-accent line is the primary visual signal for "active". Right-
-    // edge separator is rendered as an absolutely-positioned 1px child so
-    // gpui's single `border_color` doesn't have to serve both the top
-    // accent (focus_ring or transparent) and the side separator
-    // (border_inactive or transparent).
-    div()
-        .id(SharedString::from(format!("ws-tab-{ix}")))
-        .group(group_name)
-        .relative()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(5.0))
-        .h_full()
-        .px(px(8.0))
-        .border_t_2()
-        .border_color(top_accent)
-        .text_size(px(11.0))
-        .text_color(text_color)
-        .flex_shrink_0()
-        .cursor_pointer()
-        .when(!is_active, |s| {
-            s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
-        })
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
-            let entity = entity_for_click.clone();
-            entity.update(cx, |this, cx| this.set_active(ix, window, cx));
-        })
-        .child(icon)
-        .when_some(agent_dot, |this, dot| this.child(dot))
-        .child(
-            div()
-                .min_w(px(0.0))
-                .max_w(px(110.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(label),
-        )
-        .child(close_btn)
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .w(px(1.0))
-                .bg(separator),
-        )
-}
-
-/// "..." button that opens the Pane Actions menu (split
-/// directions). Dispatches `SplitRight`/`SplitDown`/`SplitLeft`/`SplitUp`
-/// from the menu items; this button itself just opens the menu.
-fn pane_actions_button(theme: Theme) -> impl IntoElement {
-    let glyph = svg()
-        .path("icons/ellipsis.svg")
-        .size(px(14.0))
-        .text_color(theme.fg_muted);
-    div()
-        .id("ws-tab-pane-actions")
-        .w(px(28.0))
-        .h_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .flex_shrink_0()
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
-            window.dispatch_action(Box::new(crate::actions::OpenPaneActions), cx);
-        })
-        .child(glyph)
-}
-
-/// Static helper exposing per-direction split icons so the dropdown menu
-/// (and any future surface) can reuse the same glyphs.
-pub fn split_icon(action: SplitDirection) -> &'static str {
-    match action {
-        SplitDirection::Right => "icons/arrow-right.svg",
-        SplitDirection::Down => "icons/arrow-down.svg",
-        SplitDirection::Left => "icons/arrow-left.svg",
-        SplitDirection::Up => "icons/arrow-up.svg",
-    }
-}
-
-/// Enum mirror of the four split actions for menu rendering. Kept here
-/// (not actions.rs) because it's UI-presentation metadata, not a dispatched
-/// action — each variant maps to a real `Split*` action when activated.
-#[derive(Clone, Copy)]
-pub enum SplitDirection {
-    Right,
-    Down,
-    Left,
-    Up,
-}
-
-impl SplitDirection {
-    pub fn label(self) -> &'static str {
-        match self {
-            SplitDirection::Right => "Split Right",
-            SplitDirection::Down => "Split Down",
-            SplitDirection::Left => "Split Left",
-            SplitDirection::Up => "Split Up",
-        }
-    }
-
-    /// Dispatch the corresponding workspace action up the focus chain so the
-    /// focused MainPane intercepts it.
-    pub fn dispatch(self, window: &mut Window, cx: &mut App) {
-        match self {
-            SplitDirection::Right => window.dispatch_action(Box::new(SplitRight), cx),
-            SplitDirection::Down => window.dispatch_action(Box::new(SplitDown), cx),
-            SplitDirection::Left => window.dispatch_action(Box::new(SplitLeft), cx),
-            SplitDirection::Up => window.dispatch_action(Box::new(SplitUp), cx),
-        }
-    }
-}
-
-fn close_button(
-    theme: Theme,
-    ix: usize,
-    is_active: bool,
-    entity: Entity<WorkspaceTabs>,
-    group_name: SharedString,
-) -> impl IntoElement {
-    let glyph = svg()
-        .path("icons/close.svg")
-        .size(px(9.0))
-        .text_color(theme.fg_muted);
-    // Active tab: close X always visible (muted).
-    // Inactive tab: hidden until the parent tab (same `group_name`) is
-    // hovered, then `group_hover` flips opacity to 1.0.
-    let initial_opacity = if is_active { 1.0 } else { 0.0 };
-    div()
-        .id(SharedString::from(format!("ws-tab-close-{ix}")))
-        .w(px(14.0))
-        .h(px(14.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_sm()
-        .cursor_pointer()
-        .opacity(initial_opacity)
-        .group_hover(group_name, |s| s.opacity(1.0))
-        .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
-            let entity = entity.clone();
-            entity.update(cx, |this, cx| this.close_tab(ix, window, cx));
-            cx.stop_propagation();
-        })
-        .child(glyph)
-}
-
-/// Plus-button width in CSS px. Subtracted from the click x so the popover's
-/// left edge sits roughly at the button's left edge (best-effort: the click
-/// can land anywhere inside the 28px hit area, so the popover may shift up
-/// to ~half a button width depending on where the user clicked).
-const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
-
-fn plus_button(theme: Theme, entity: Entity<WorkspaceTabs>) -> impl IntoElement {
-    let glyph = svg()
-        .path("icons/plus.svg")
-        .size(px(14.0))
-        .text_color(theme.fg_muted);
-    div()
-        .id("ws-tab-plus")
-        .w(px(PLUS_BUTTON_WIDTH_PX))
-        .h_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .flex_shrink_0()
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
-            // Step 10: opening a new tab is no longer a fast path here.
-            // The adapter picker (mounted on `WorkspaceRoot`) shows
-            // "+ New terminal" + every detected agent; selecting any row
-            // performs the appropriate spawn.
-            //
-            // Approximate the button's left edge from the click position
-            // (centered around the glyph) so `WorkspaceRoot` can anchor
-            // the popover under the actual button instead of a static
-            // inset that ignored tab-strip width.
-            let anchor_x = (f32::from(e.position.x) - PLUS_BUTTON_WIDTH_PX / 2.0).max(0.0);
-            entity.read(cx).last_plus_click_x.set(Some(anchor_x));
-            window.dispatch_action(Box::new(RequestOpenAdapterPicker), cx);
-            cx.stop_propagation();
-        })
-        .child(glyph)
 }
 
 fn spawn_main_pane(
@@ -841,12 +569,13 @@ mod tests {
         // Documents the convention: anchor = click_x - 14 so the popover
         // sits roughly under the button regardless of where inside the
         // 28px hitbox the user actually clicked.
+        let plus_w = super::render::PLUS_BUTTON_WIDTH_PX;
         let click_x = 600.0;
-        let anchor = (click_x - PLUS_BUTTON_WIDTH_PX / 2.0).max(0.0);
+        let anchor = (click_x - plus_w / 2.0).max(0.0);
         assert!((anchor - 586.0).abs() < f32::EPSILON);
 
         // Edge: click reported at x=10 (improbable but exercises clamp).
-        let anchor_edge = (10.0_f32 - PLUS_BUTTON_WIDTH_PX / 2.0).max(0.0);
+        let anchor_edge = (10.0_f32 - plus_w / 2.0).max(0.0);
         assert!(anchor_edge.abs() < f32::EPSILON);
     }
 }
