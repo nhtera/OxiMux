@@ -9,6 +9,7 @@
 //! root file under the 800-LOC fail cap; they are the only consumers
 //! of the helper.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, Context, WeakEntity, Window};
@@ -17,6 +18,7 @@ use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_storage::{StorageError, WorkspaceRepo};
 
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
+use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
 
@@ -146,6 +148,45 @@ impl WorkspaceRoot {
         self.close_modal_overlays(cx);
         self.row_menu
             .update(cx, |m, cx| m.open(workspace, x, y, cx));
+    }
+
+    /// Snapshot the sidebar data (active project, its workspaces, and
+    /// the latest agent-session status per workspace) and push it into
+    /// `LeftRail`. Called at the top of `WorkspaceRoot::render` — LeftRail
+    /// never reads `WorkspaceRoot` directly because doing so re-enters
+    /// the entity slot during rendering and panics.
+    pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
+        let active_project = self.active_project.clone();
+        let (workspaces, latest_status) = match &active_project {
+            Some(project) => match self.app_state.workspace_repo.list_for_project(&project.id) {
+                Ok(list) => {
+                    let mut status_map: LatestStatusMap = HashMap::with_capacity(list.len());
+                    for workspace in &list {
+                        let latest = match self
+                            .app_state
+                            .agent_session_repo
+                            .list_for_workspace(&workspace.id)
+                        {
+                            Ok(mut sessions) => sessions.drain(..).next().map(|s| s.status),
+                            Err(err) => {
+                                tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
+                                None
+                            }
+                        };
+                        status_map.insert(workspace.id.clone(), latest);
+                    }
+                    (list, status_map)
+                }
+                Err(err) => {
+                    tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
+                    (Vec::new(), HashMap::new())
+                }
+            },
+            None => (Vec::new(), HashMap::new()),
+        };
+        self.left_rail.update(cx, |rail, cx| {
+            rail.set_sidebar_data(active_project, workspaces, latest_status, cx);
+        });
     }
 
     /// Route a workspace-dialog submission to the right backend flow.

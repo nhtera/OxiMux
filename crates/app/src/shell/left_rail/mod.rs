@@ -12,11 +12,12 @@
 //! Width is `density.w_left_rail` (250px in cockpit density). Full-collapse
 //! toggling is handled at `WorkspaceRoot` via the `left_rail_open` flag.
 //!
-//! Data source: a `WeakEntity<WorkspaceRoot>` is the single channel to
-//! reach `AppState` (recent projects + workspace_repo + agent_session_repo)
-//! and `active_project`. Re-fetched on every render at v1 scale — fine
-//! for <50 workspaces; switch to subscribe-and-cache if dogfood shows
-//! frame-time issues.
+//! Data flow: data is pushed DOWN by `WorkspaceRoot::refresh_left_rail`
+//! before each render. LeftRail itself never reads `WorkspaceRoot` —
+//! that would re-enter the entity slot during rendering and panic
+//! ("cannot read while it is already being updated"). The only thing
+//! kept on `weak_root` is dispatch upward via callbacks (e.g.
+//! `open_row_menu`), which fire on user events after render completes.
 
 pub mod nav_section;
 pub mod project_group;
@@ -25,10 +26,10 @@ pub mod toolbar;
 pub mod workspace_list_render;
 pub mod workspace_row;
 
-use gpui::{
-    Context, IntoElement, ParentElement, Render, Styled, WeakEntity, Window, div, px, svg,
-};
-use oximux_core::Workspace;
+use std::collections::HashMap;
+
+use gpui::{Context, IntoElement, ParentElement, Render, Styled, WeakEntity, Window, div, px, svg};
+use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
@@ -38,36 +39,54 @@ use crate::workspace_root::WorkspaceRoot;
 
 const HEADER_ICON_SIZE: f32 = 14.0;
 
+/// Snapshot of the latest agent-session status for a single workspace.
+/// `None` means no sessions have ever been started for that workspace.
+pub type LatestStatusMap = HashMap<String, Option<AgentStatus>>;
+
 pub struct LeftRail {
     active_nav: NavItem,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: Typography,
+    /// Sidebar data snapshot. `WorkspaceRoot::refresh_left_rail` writes
+    /// these before each render; `Render` reads them. Never reach out to
+    /// `weak_root` from inside `Render` — re-entrant read of a being-
+    /// updated entity panics.
+    active_project: Option<Project>,
+    workspaces: Vec<Workspace>,
+    latest_status: LatestStatusMap,
 }
 
 impl LeftRail {
-    /// Sources `theme`/`density`/`typography` from the `WorkspaceRoot` so
-    /// the call site stays a one-liner. `weak_root.upgrade()` will be
-    /// `None` at the precise moment `WorkspaceRoot::new` is wiring up
-    /// (entity slot not yet populated), so the fallback defaults are the
-    /// hot path during init — and they match `WorkspaceRoot::new`'s own
-    /// defaults verbatim.
-    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, cx: &mut Context<Self>) -> Self {
-        let (theme, density, typography) = weak_root
-            .upgrade()
-            .map(|r| {
-                let root = r.read(cx);
-                (root.theme, root.density, root.typography.clone())
-            })
-            .unwrap_or_else(|| (Theme::charcoal(), Density::cockpit(), Typography::cockpit()));
+    /// Default-construct theme/density/typography. WorkspaceRoot uses the
+    /// same constants in its own `new`, so the rail and root always agree.
+    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, _cx: &mut Context<Self>) -> Self {
         Self {
             active_nav: NavItem::Tasks,
             weak_root,
-            theme,
-            density,
-            typography,
+            theme: Theme::charcoal(),
+            density: Density::cockpit(),
+            typography: Typography::cockpit(),
+            active_project: None,
+            workspaces: Vec::new(),
+            latest_status: HashMap::new(),
         }
+    }
+
+    /// Push the latest sidebar snapshot. Called by
+    /// `WorkspaceRoot::refresh_left_rail` at the top of each render.
+    pub(crate) fn set_sidebar_data(
+        &mut self,
+        active_project: Option<Project>,
+        workspaces: Vec<Workspace>,
+        latest_status: LatestStatusMap,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_project = active_project;
+        self.workspaces = workspaces;
+        self.latest_status = latest_status;
+        cx.notify();
     }
 
     /// Test-only inspector for the currently-active nav item.
@@ -89,8 +108,15 @@ impl Render for LeftRail {
         let typography = self.typography.clone();
         let entity = cx.entity().clone();
 
-        let workspace_list =
-            render_workspace_list(&self.weak_root, theme, density, &typography, cx);
+        let workspace_list = render_workspace_list(
+            self.active_project.clone(),
+            self.workspaces.clone(),
+            self.latest_status.clone(),
+            self.weak_root.clone(),
+            theme,
+            density,
+            &typography,
+        );
 
         div()
             .flex()
@@ -114,49 +140,24 @@ impl Render for LeftRail {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_workspace_list(
-    weak_root: &WeakEntity<WorkspaceRoot>,
+    active_project: Option<Project>,
+    workspaces: Vec<Workspace>,
+    latest_status: LatestStatusMap,
+    weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
-    cx: &mut Context<LeftRail>,
 ) -> gpui::AnyElement {
-    let Some(root_entity) = weak_root.upgrade() else {
-        return placeholder("No workspace root", theme, density, typography).into_any_element();
-    };
-    let root = root_entity.read(cx);
-    let Some(active_project) = root.active_project.clone() else {
+    let Some(active_project) = active_project else {
         return placeholder("Open a project (⌘O)", theme, density, typography).into_any_element();
     };
 
-    // Re-fetch from DB so the rail reflects creates/renames/archives/deletes
-    // emitted after boot. v1 scale: single SQLite call, sub-millisecond.
-    let workspaces = match root
-        .app_state
-        .workspace_repo
-        .list_for_project(&active_project.id)
-    {
-        Ok(list) => list,
-        Err(err) => {
-            tracing::warn!(?err, project_id = %active_project.id, "list_for_project failed");
-            return placeholder("Failed to load workspaces", theme, density, typography)
-                .into_any_element();
-        }
-    };
-
-    // `list_for_project` already filters `archived_at IS NULL` at the SQL
-    // layer, so no extra in-memory filter is needed.
     let plan = build_project_group_plan(&active_project, &workspaces, true);
 
-    let agent_repo = root.app_state.agent_session_repo.clone();
     let latest_status_for =
-        move |workspace_id: &str| match agent_repo.list_for_workspace(workspace_id) {
-            Ok(mut sessions) => sessions.drain(..).next(),
-            Err(err) => {
-                tracing::warn!(?err, %workspace_id, "list_for_workspace failed");
-                None
-            }
-        };
+        move |workspace_id: &str| latest_status.get(workspace_id).cloned().flatten();
 
     let weak_root_for_menu = weak_root.clone();
     let on_row_menu = move |workspace: Workspace,
@@ -167,14 +168,13 @@ fn render_workspace_list(
         let _ = weak_root_for_menu.update(cx, |root, cx| root.open_row_menu(workspace, x, y, cx));
     };
 
-    let weak_for_render = weak_root.clone();
     render_project_group(
         plan,
         active_project,
         workspaces,
         latest_status_for,
         None,
-        weak_for_render,
+        weak_root,
         on_row_menu,
         theme,
         density,

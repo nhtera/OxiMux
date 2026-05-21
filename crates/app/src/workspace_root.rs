@@ -80,7 +80,7 @@ pub struct WorkspaceRoot {
     pub(crate) typography: Typography,
     workspace_tabs: Option<Entity<WorkspaceTabs>>,
     right_sidebar: Option<Entity<RightSidebar>>,
-    left_rail: Entity<LeftRail>,
+    pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
     pub(crate) pane_actions: Entity<PaneActionsMenu>,
     /// Inline adapter-picker popover. Anchored to the `+` button via a
@@ -489,6 +489,8 @@ fn spawn_initial_workspace(
 
 impl Render for WorkspaceRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Push sidebar data down before LeftRail::render runs in the tree.
+        self.refresh_left_rail(cx);
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;

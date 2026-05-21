@@ -9,7 +9,7 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
     Styled, WeakEntity, div, px, svg,
 };
-use oximux_core::{AgentSession, Project, Workspace};
+use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::OpenWorkspaceCreate;
@@ -56,7 +56,7 @@ pub fn render_project_group(
     plan: ProjectGroupPlan,
     project: Project,
     workspaces: Vec<Workspace>,
-    latest_status_for: impl Fn(&str) -> Option<AgentSession>,
+    latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
     active_workspace_id: Option<&str>,
     weak_root: WeakEntity<WorkspaceRoot>,
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
@@ -82,12 +82,7 @@ pub fn render_project_group(
         let row_group: SharedString = format!("ws-row-{}", workspace.id).into();
         let is_active = active_workspace_id == Some(workspace.id.as_str());
         let latest = latest_status_for(&workspace.id);
-        let row_plan = build_workspace_row_plan(
-            &workspace,
-            is_active,
-            latest.as_ref().map(|s| &s.status),
-            theme,
-        );
+        let row_plan = build_workspace_row_plan(&workspace, is_active, latest.as_ref(), theme);
         let row_id: SharedString = format!("ws-row-{}", workspace.id).into();
 
         let on_menu = on_row_menu.clone();
