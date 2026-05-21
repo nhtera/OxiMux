@@ -349,8 +349,13 @@ fn open_folder_row(
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| {
-                this.trigger_open_folder(cx);
+            cx.listener(|this, _event, window, cx| {
+                // Defer to the 3-card Add-Project dialog. The dialog
+                // owns its own NSOpenPanel trigger; the picker's own
+                // `trigger_open_folder` stays as a fallback for the
+                // Enter-on-row-0 keyboard path.
+                this.close(cx);
+                window.dispatch_action(Box::new(crate::actions::OpenAddProjectDialog), cx);
             }),
         )
         .child(label)

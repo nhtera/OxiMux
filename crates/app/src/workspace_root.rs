@@ -45,12 +45,13 @@ use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenProjectPicker, OpenQuickOpen,
-    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectSearchTab,
-    SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
+    OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenProjectPicker,
+    OpenQuickOpen, OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab,
+    SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::{
     adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
+    add_project_dialog::AddProjectDialog,
     command_palette::{PaletteModal, entry::PaletteMode},
     confirm_dialog::ConfirmDialog,
     left_rail::{LeftRail, row_menu::WorkspaceRowMenu},
@@ -65,6 +66,7 @@ use crate::shell::{
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS, TerminalView, spawn_local_pty},
     top_bar,
     workspace_dialog::{OnSubmit as OnWorkspaceSubmit, WorkspaceDialog},
+    workspace_ops::build_add_project_dialog,
     workspace_tabs::{self, WorkspaceTabs},
 };
 
@@ -78,7 +80,7 @@ pub struct WorkspaceRoot {
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,
-    workspace_tabs: Option<Entity<WorkspaceTabs>>,
+    pub(crate) workspace_tabs: Option<Entity<WorkspaceTabs>>,
     right_sidebar: Option<Entity<RightSidebar>>,
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
@@ -91,11 +93,11 @@ pub struct WorkspaceRoot {
     /// publishes `AgentStatusStream` per session. One per workspace, held
     /// behind `Arc` so `WorkspaceTabs::close_tab` can cancel and so
     /// `spawn_agent_tab` can drive `start_session`.
-    cli_runtime: Arc<CliRuntime>,
+    pub(crate) cli_runtime: Arc<CliRuntime>,
     /// Cached registry of the four built-in adapters. Drives the picker's
     /// detect-available list and resolves the chosen `AgentAdapter` to a
     /// concrete adapter at spawn time.
-    adapter_registry: Arc<AdapterRegistry>,
+    pub(crate) adapter_registry: Arc<AdapterRegistry>,
     /// Whether the left rail (workspaces + nav) is visible. Toggled via Cmd+B.
     left_rail_open: bool,
     /// Forwards WorkspaceTabs notifications (open/close/select tab) up to
@@ -132,11 +134,11 @@ pub struct WorkspaceRoot {
     /// its prompt + callback are bound at construction time.
     pub(crate) confirm_dialog: Option<Entity<ConfirmDialog>>,
     /// Currently active project — `None` until the user opens one.
-    #[allow(dead_code)]
     pub(crate) active_project: Option<Project>,
     /// Per-row action popover (Rename / Archive / Delete). Mounted at
     /// root scope so its click-outside backdrop covers the full window.
     pub(crate) row_menu: Entity<WorkspaceRowMenu>,
+    pub(crate) add_project_dialog: Entity<AddProjectDialog>,
 }
 
 impl WorkspaceRoot {
@@ -212,7 +214,9 @@ impl WorkspaceRoot {
             let _ = weak.update(cx, |this, cx| match selection {
                 AdapterSelection::NewTerminal => this.spawn_local_terminal_tab(window, cx),
                 AdapterSelection::Adapter { kind, id } => {
-                    this.spawn_agent_tab(kind, id, window, cx)
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    this.spawn_agent_tab(kind, id, cwd, window, cx)
                 }
             });
         });
@@ -270,6 +274,9 @@ impl WorkspaceRoot {
         let weak_for_menu: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let row_menu =
             cx.new(|_| WorkspaceRowMenu::new(theme, density, typography.clone(), weak_for_menu));
+        let pr = app_state.project_repo.clone();
+        let add_project_dialog =
+            build_add_project_dialog(theme, density, typography.clone(), pr, cx);
 
         // Pause status polling when the window blurs; force an immediate
         // refresh on focus regain via StatusPoller::kick().
@@ -332,6 +339,7 @@ impl WorkspaceRoot {
             confirm_dialog: None,
             active_project: None,
             row_menu,
+            add_project_dialog,
         }
     }
 
@@ -351,10 +359,11 @@ impl WorkspaceRoot {
     /// If `update_in` errors (window/workspace dropped mid-spawn), cancels
     /// the half-mounted session so the PTY doesn't zombie (C2 fix
     /// transferred from step 9b's `on_new_agent`).
-    fn spawn_agent_tab(
+    pub(crate) fn spawn_agent_tab(
         &self,
         adapter: AgentAdapter,
         adapter_id: &'static str,
+        cwd: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -362,7 +371,6 @@ impl WorkspaceRoot {
             return;
         };
         let runtime = self.cli_runtime.clone();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
         cx.spawn_in(window, async move |_root, cx| {
             // `adapter_id` arrives from the row the user clicked — the
@@ -675,13 +683,16 @@ impl Render for WorkspaceRoot {
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
-                if this.active_project.is_none() {
-                    tracing::info!("OpenWorkspaceCreate: no active project; press Cmd+O first");
-                    return;
-                }
+                let projects = this.app_state.recent_projects.clone();
+                let active = this.active_project.clone();
                 this.close_modal_overlays(cx);
                 this.workspace_dialog
-                    .update(cx, |d, cx| d.open_create(window, cx));
+                    .update(cx, |d, cx| d.open_create(projects, active, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenAddProjectDialog, window, cx| {
+                this.close_modal_overlays(cx);
+                this.add_project_dialog
+                    .update(cx, |d, cx| d.open(window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenProjectPicker, window, cx| {
                 // Toggle: a second Cmd+O closes the picker. Also blocks the
@@ -803,6 +814,7 @@ impl Render for WorkspaceRoot {
             .child(self.workspace_dialog.clone())
             // Per-row action popover (sidebar Rename / Archive / Delete).
             .child(self.row_menu.clone())
+            .child(self.add_project_dialog.clone())
             // Type-to-confirm dialog for destructive workspace ops. Built
             // per-request; `None` when idle. Wrapped in a full-window
             // overlay here so the inner `ConfirmDialog` card stays pure.

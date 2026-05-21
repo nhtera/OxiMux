@@ -8,7 +8,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::OpenProjectPicker;
+use crate::actions::OpenAddProjectDialog;
 
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const ICON_SIZE: f32 = 14.0;
@@ -49,7 +49,7 @@ fn add_project_button(theme: Theme, density: Density, typography: &Typography) -
         )
         .child("Add Project")
         .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
-            window.dispatch_action(Box::new(OpenProjectPicker), cx);
+            window.dispatch_action(Box::new(OpenAddProjectDialog), cx);
         })
 }
 

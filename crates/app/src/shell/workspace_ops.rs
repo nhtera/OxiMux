@@ -12,15 +12,35 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use gpui::{AppContext, Context, WeakEntity, Window};
-use oximux_core::{Project, Workspace};
+use gpui::{AppContext, Context, Entity, WeakEntity, Window};
+use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::{Repository, derive_slug, validate_slug};
-use oximux_storage::{StorageError, WorkspaceRepo};
+use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::{ProjectRepo, StorageError, WorkspaceRepo};
 
+use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
+
+/// Build the Add-Project dialog entity. Wires the `on_pick` callback to
+/// route the chosen project through `WorkspaceRoot::set_active_project`.
+/// Lives here (not in `workspace_root.rs`) to keep that file under the
+/// 800-LOC fail cap.
+pub(crate) fn build_add_project_dialog(
+    theme: Theme,
+    density: Density,
+    typography: Typography,
+    project_repo: ProjectRepo,
+    cx: &mut Context<WorkspaceRoot>,
+) -> Entity<AddProjectDialog> {
+    let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+    let on_pick: OnAddProjectPick = Box::new(move |project, _window, cx| {
+        let _ = weak.update(cx, |this, cx| this.set_active_project(project, cx));
+    });
+    cx.new(|cx| AddProjectDialog::new(theme, density, typography, project_repo, on_pick, cx))
+}
 
 /// Outcome of a create flow. Distinguishes user-visible failures (which
 /// require explicit handling at the call site) from the silent success
@@ -99,6 +119,18 @@ pub async fn create_workspace_with_rollback(
     }
 }
 
+/// Resolve the static adapter slug used by `start_session` for each
+/// built-in agent variant. Inline 4-arm match — KISS over adding a
+/// method to `oximux-core`.
+fn agent_adapter_id(kind: AgentAdapter) -> &'static str {
+    match kind {
+        AgentAdapter::ClaudeCode => "claude-code",
+        AgentAdapter::Codex => "codex",
+        AgentAdapter::Aider => "aider",
+        AgentAdapter::Custom => "custom",
+    }
+}
+
 /// Compose the worktree dir path:
 /// `<app_data>/dev.nhtera.oximux/projects/<project_id>/worktrees/<slug>`.
 /// Returns `None` when `dirs::data_dir()` is unavailable (sandbox or
@@ -134,6 +166,7 @@ impl WorkspaceRoot {
         self.project_picker.update(cx, |p, cx| p.close(cx));
         self.workspace_dialog.update(cx, |d, cx| d.close(cx));
         self.row_menu.update(cx, |m, cx| m.close(cx));
+        self.add_project_dialog.update(cx, |d, cx| d.close(cx));
     }
 
     /// Open the per-row action popover at the given screen coordinates.
@@ -201,11 +234,22 @@ impl WorkspaceRoot {
     ) {
         match submit.mode {
             WorkspaceDialogMode::Create => {
-                let Some(project) = self.active_project.clone() else {
-                    tracing::info!("workspace create: no active project, ignoring");
+                let Some(project) = submit.project.or_else(|| self.active_project.clone()) else {
+                    tracing::info!("workspace create: no project selected, ignoring");
                     return;
                 };
-                self.create_workspace_async(project, submit.name, window, cx);
+                // Keep sidebar in sync if the user picked a different
+                // project from the dialog dropdown than the currently
+                // active one.
+                let same_active = self
+                    .active_project
+                    .as_ref()
+                    .map(|p| p.id == project.id)
+                    .unwrap_or(false);
+                if !same_active {
+                    self.set_active_project(project.clone(), cx);
+                }
+                self.create_workspace_async(project, submit.name, submit.agent, window, cx);
             }
             WorkspaceDialogMode::Rename(workspace) => {
                 self.rename_workspace_now(*workspace, submit.name, cx);
@@ -220,6 +264,7 @@ impl WorkspaceRoot {
         &mut self,
         project: Project,
         name: String,
+        agent: Option<AgentAdapter>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -273,10 +318,13 @@ impl WorkspaceRoot {
                         slug = %slug,
                         "workspace created"
                     );
-                    // Notify WorkspaceRoot so step 7's sidebar picks up
-                    // the new row without waiting for an unrelated
-                    // re-render (M3 — code-review 260521-1306).
-                    let _ = weak.update(cx, |_this, cx| cx.notify());
+                    let cwd = PathBuf::from(&workspace.worktree_path);
+                    let _ = weak.update_in(cx, |this, window, cx| {
+                        cx.notify();
+                        if let Some(kind) = agent {
+                            this.spawn_agent_tab(kind, agent_adapter_id(kind), cwd, window, cx);
+                        }
+                    });
                 }
                 CreateOutcome::GitFailed(msg) => {
                     tracing::warn!(slug = %slug, error = %msg, "workspace create: git step failed");

@@ -99,5 +99,9 @@ actions!(
         /// active project is set — welcome screen prompts the user to
         /// Cmd+O first.
         OpenWorkspaceCreate,
+        /// Open the 3-card "Add a project" modal (Browse folder / Clone
+        /// from URL / Remote project). Browse is wired; the other two
+        /// are disabled "Coming soon" stubs for v1.
+        OpenAddProjectDialog,
     ]
 );
