@@ -19,7 +19,8 @@ use gpui::{
 use oximux_app::actions::{
     CloseTab, FocusNextPane, FocusPrevPane, NewAgent, NewTab, NextTab, OpenCommandPalette,
     OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, Search,
-    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical,
+    SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal,
+    SplitVertical,
     ToggleLeftSidebar, ToggleRightSidebar,
 };
 // SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
@@ -170,6 +171,7 @@ fn main() {
             KeyBinding::new("cmd-shift-e", SelectExplorerTab, None),
             KeyBinding::new("cmd-shift-f", SelectSearchTab, None),
             KeyBinding::new("cmd-shift-g", SelectSourceControlTab, None),
+            KeyBinding::new("cmd-shift-t", SelectFilesTab, None),
             // cmd-k opens the commit dialog (Phase 04 attaches the handler).
             KeyBinding::new("cmd-k", OpenCommitDialog, None),
             // Command palette (Phase 05 shell). cmd-k stays bound to the
@@ -370,7 +372,7 @@ fn run_file_tree_spike() {
                     path.display()
                 );
             });
-            let view = cx.new(|cx| FileTreeView::new(tree, on_open, window, cx));
+            let view = cx.new(|cx| FileTreeView::new(tree, on_open, None, window, cx));
             let any: AnyView = view.into();
             cx.new(|cx| gpui_component::Root::new(any, window, cx))
         });

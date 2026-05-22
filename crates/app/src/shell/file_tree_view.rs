@@ -24,6 +24,13 @@ use std::sync::Arc;
 /// executor or tokio paths capture this Arc.
 pub type OnOpenFile = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + 'static>;
 
+/// Active-file query callback. Invoked once per render to find the file
+/// currently open in the focused pane; the matching tree row is then
+/// rendered with the active-file highlight in addition to (or instead of)
+/// the click-selected row. `None` means no editor leaf is focused, or
+/// the focused editor's file lives outside the tree's root.
+pub type OnQueryActivePath = Arc<dyn Fn(&App) -> Option<PathBuf> + 'static>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowKind {
     Dir {
@@ -66,6 +73,11 @@ pub struct FileTreeView {
     selected: Option<TreeNodeId>,
     scroll: UniformListScrollHandle,
     on_open: OnOpenFile,
+    /// Optional pulse from the host on every render: "what file is the
+    /// focused editor showing right now?" Used to highlight the matching
+    /// row separately from the click-selection. `None` until the host
+    /// provides a query.
+    on_query_active_path: Option<OnQueryActivePath>,
     _sub: Subscription,
 }
 
@@ -73,6 +85,7 @@ impl FileTreeView {
     pub fn new(
         tree: Entity<FileTree>,
         on_open: OnOpenFile,
+        on_query_active_path: Option<OnQueryActivePath>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -101,6 +114,7 @@ impl FileTreeView {
             selected: None,
             scroll: UniformListScrollHandle::new(),
             on_open,
+            on_query_active_path,
             _sub: sub,
         }
     }
@@ -259,25 +273,39 @@ const FG_DEFAULT: u32 = 0xCBD0D8;
 const FG_DIM: u32 = 0x6A707A;
 const HOVER_BG: u32 = 0x22262C;
 const SELECT_BG: u32 = 0x2E343D;
+/// Active-file highlight: distinct from click-selection so the user can
+/// see both signals at once (e.g. the active file is `main.rs` but they
+/// just clicked `lib.rs` to preview). Darker accent + brighter foreground.
+const ACTIVE_BG: u32 = 0x1F3340;
+const ACTIVE_FG: u32 = 0xE2E8F0;
 
 impl Render for FileTreeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.rows.len();
+        // Resolve the focused-editor file path once per render. Cached
+        // into the uniform_list closure so every row's match check is a
+        // cheap `==` instead of an Arc call per row.
+        let active_path = self.on_query_active_path.as_ref().and_then(|q| q(cx));
         let list = uniform_list(
             "file-tree-view",
             count,
-            cx.processor(
-                |me: &mut Self,
-                 range: std::ops::Range<usize>,
-                 _window: &mut Window,
-                 cx: &mut Context<Self>| {
+            cx.processor({
+                let active_path = active_path.clone();
+                move |me: &mut Self,
+                      range: std::ops::Range<usize>,
+                      _window: &mut Window,
+                      cx: &mut Context<Self>| {
                     let rows = me.rows.clone();
                     let selected = me.selected;
+                    let active_path = active_path.clone();
                     range
-                        .map(|i| render_row(rows[i].clone(), selected, cx).into_any_element())
+                        .map(|i| {
+                            render_row(rows[i].clone(), selected, active_path.as_deref(), cx)
+                                .into_any_element()
+                        })
                         .collect::<Vec<AnyElement>>()
-                },
-            ),
+                }
+            }),
         )
         .track_scroll(&self.scroll)
         .h_full()
@@ -302,6 +330,7 @@ impl Render for FileTreeView {
 fn render_row(
     row: DisplayRow,
     selected: Option<TreeNodeId>,
+    active_path: Option<&std::path::Path>,
     cx: &mut Context<FileTreeView>,
 ) -> impl IntoElement {
     let indent = px(row.depth as f32 * INDENT_PX);
@@ -323,6 +352,12 @@ fn render_row(
         RowKind::Dir { id, .. } | RowKind::File { id } => Some(*id) == selected,
         _ => false,
     };
+    // Highlight the row corresponding to the currently-active editor
+    // (separate from click-selection). For directories the comparison
+    // is meaningless (active files are files), so this only fires on
+    // File rows.
+    let is_active = matches!(&row.kind, RowKind::File { .. })
+        && active_path.map(|p| p == row.path.as_path()).unwrap_or(false);
     let is_sentinel = matches!(
         &row.kind,
         RowKind::Placeholder { .. } | RowKind::EmptyDir { .. }
@@ -367,7 +402,8 @@ fn render_row(
         .pl(indent)
         .pr(px(6.0))
         .rounded(px(4.0))
-        .when(is_selected, |s| s.bg(rgb(SELECT_BG)))
+        .when(is_active, |s| s.bg(rgb(ACTIVE_BG)).text_color(rgb(ACTIVE_FG)))
+        .when(is_selected && !is_active, |s| s.bg(rgb(SELECT_BG)))
         .when(!is_sentinel, |s| s.hover(|h| h.bg(rgb(HOVER_BG))))
         .child(chevron_el)
         .child(icon_el)

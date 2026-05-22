@@ -49,7 +49,7 @@ use crate::state::AppState;
 use crate::actions::{
     OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenProjectPicker,
     OpenQuickOpen, OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab,
-    SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
+    SelectFilesTab, SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::{
     adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
@@ -58,6 +58,7 @@ use crate::shell::{
     confirm_dialog::ConfirmDialog,
     left_rail::{LeftRail, row_menu::WorkspaceRowMenu},
     main_area,
+    openable_text_file::is_openable_text_file,
     pane_actions::PaneActionsMenu,
     project_picker::{OnPick, ProjectPickerModal},
     right_sidebar::{
@@ -180,13 +181,21 @@ impl WorkspaceRoot {
         // until the project-restore path (or user open) supplies one.
         let workspace_tabs_by_project: HashMap<String, Entity<WorkspaceTabs>> = HashMap::new();
         let workspace_tabs_observer: Option<Subscription> = None;
+        // Shared weak self-handle: LeftRail + picker callbacks route through it.
+        // Built before the right-sidebar so the Files-tab `OnOpenFile` callback
+        // can capture it and route clicks back to `open_file_in_active_pane`.
+        let weak_self: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let right_sidebar = repo.clone().map(|r| {
             let root_path = r.workdir().to_path_buf();
+            let on_open = Self::build_on_open_file_callback(weak_self.clone());
+            let on_query = Self::build_on_query_active_path_callback(weak_self.clone());
             cx.new(|cx| {
                 RightSidebar::new(
                     Some(r),
                     root_path,
                     false, // default-collapsed on app boot
+                    Some(on_open),
+                    Some(on_query),
                     theme,
                     density,
                     typography.clone(),
@@ -195,8 +204,6 @@ impl WorkspaceRoot {
                 )
             })
         });
-        // Shared weak self-handle: LeftRail + picker callbacks route through it.
-        let weak_self: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let left_rail = cx.new(|cx| LeftRail::new(weak_self.clone(), cx));
         let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
@@ -355,6 +362,67 @@ impl WorkspaceRoot {
     pub(crate) fn active_workspace_tabs(&self) -> Option<Entity<WorkspaceTabs>> {
         let id = self.active_project.as_ref().map(|p| p.id.as_str())?;
         self.workspace_tabs_by_project.get(id).cloned()
+    }
+
+    /// Open `path` as a new editor tab in the active project's workspace
+    /// tab strip. If the file is already open in another tab, activate
+    /// that tab instead of opening a duplicate. The tab strip mixes
+    /// terminal and editor tabs in a single horizontal row (industry-
+    /// standard editor convention).
+    ///
+    /// Pre-filters binary / system files (`.DS_Store`, images, archives,
+    /// etc.) so the editor never opens an empty buffer on a UTF-8 decode
+    /// failure. No-op when there's no active project / workspace tabs.
+    pub fn open_file_in_active_pane(
+        &self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !is_openable_text_file(&path) {
+            tracing::info!(
+                file = %path.display(),
+                "open-file: refusing non-text file (binary, system metadata, or unreadable)"
+            );
+            return;
+        }
+        let Some(ws) = self.active_workspace_tabs() else {
+            return;
+        };
+        ws.update(cx, |tabs, cx| {
+            tabs.open_or_activate_editor_tab(path, window, cx);
+        });
+    }
+
+    /// Build the on-click callback handed to the Files-tab `FileTreeView`.
+    /// The closure captures a weak self-handle so the callback survives
+    /// project switches that rebuild `RightSidebar`. A dropped weak handle
+    /// (window closed) silently no-ops the click.
+    pub(crate) fn build_on_open_file_callback(
+        weak: WeakEntity<Self>,
+    ) -> crate::shell::file_tree_view::OnOpenFile {
+        Arc::new(move |path, window, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                this.open_file_in_active_pane(path, window, cx);
+            });
+        })
+    }
+
+    /// Build the active-file query handed to the Files-tab `FileTreeView`.
+    /// Resolves the focused leaf of the active project's active tab and
+    /// returns the file path of its currently-active editor tab (`None`
+    /// when the focused leaf is a terminal or when no project is active).
+    /// Fires once per FileTreeView render; cheap enough to walk on every
+    /// frame since the tab + pane lookups are HashMap reads.
+    pub(crate) fn build_on_query_active_path_callback(
+        weak: WeakEntity<Self>,
+    ) -> crate::shell::file_tree_view::OnQueryActivePath {
+        Arc::new(move |cx| {
+            let root = weak.upgrade()?;
+            let ws = root.read(cx).active_workspace_tabs()?;
+            let pane = ws.read(cx).active_pane()?;
+            pane.read(cx).active_editor_path(cx)
+        })
     }
 
     /// Walk every open project's tabs and serialize plain-terminal
@@ -763,6 +831,11 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |s, cx| s.toggle(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectFilesTab, _window, cx| {
+                if let Some(rs) = &this.right_sidebar {
+                    rs.update(cx, |s, cx| s.select_tab(RightTab::Files, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectExplorerTab, _window, cx| {

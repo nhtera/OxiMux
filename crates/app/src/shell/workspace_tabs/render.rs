@@ -74,14 +74,15 @@ fn workspace_tab(
     entity: Entity<WorkspaceTabs>,
 ) -> impl IntoElement {
     let group_name = SharedString::from(format!("ws-tab-{ix}"));
-    let icon = svg()
-        .path("icons/square-terminal.svg")
-        .size(px(11.0))
-        .text_color(if is_active {
-            theme.fg_muted
-        } else {
-            theme.fg_subtle
-        });
+    let icon_path = match kind {
+        WorkspaceTabKind::Editor { .. } => "icons/file.svg",
+        WorkspaceTabKind::Terminal | WorkspaceTabKind::Agent { .. } => "icons/square-terminal.svg",
+    };
+    let icon = svg().path(icon_path).size(px(11.0)).text_color(if is_active {
+        theme.fg_muted
+    } else {
+        theme.fg_subtle
+    });
     let text_color = if is_active {
         theme.fg_base
     } else {

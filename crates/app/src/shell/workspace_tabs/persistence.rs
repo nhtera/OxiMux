@@ -34,6 +34,9 @@ impl WorkspaceTabs {
         for (idx, tab) in self.tabs.iter().enumerate() {
             let agent = match &tab.kind {
                 WorkspaceTabKind::Terminal => None,
+                // Editor tabs are NOT persisted in v1 — they vanish on
+                // restart. Restoring open editors is a future slice.
+                WorkspaceTabKind::Editor { .. } => continue,
                 WorkspaceTabKind::Agent {
                     adapter,
                     adapter_id,

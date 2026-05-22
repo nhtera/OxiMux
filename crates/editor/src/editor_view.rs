@@ -117,6 +117,13 @@ pub struct EditorView {
     /// Keeps the `cx.observe` subscription alive for the lifetime of this
     /// view. Dropping it unregisters the callback from `InputState`.
     _observe_sub: Subscription,
+    /// Mirrors platform focus state into a local field so the host's
+    /// per-leaf observer can drive its active-pane bookkeeping without
+    /// requiring a `&Window`. Kept in sync by the `cx.on_focus` /
+    /// `cx.on_blur` subscriptions installed in `new`.
+    focused: bool,
+    _focus_sub: Subscription,
+    _blur_sub: Subscription,
 }
 
 impl EditorView {
@@ -126,6 +133,21 @@ impl EditorView {
     /// `tracing::warn` — the editor still renders so the user can see the
     /// file path was wrong instead of staring at a frozen UI.
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        // Mirror window-focus events into `self.focused` so the host's
+        // per-leaf observer can drive its bookkeeping with a plain
+        // `&App` read. Register BEFORE any explicit focus() call would
+        // run; the editor view does not seize focus on mount, but the
+        // host may focus it immediately after construction.
+        let _focus_sub = cx.on_focus(&focus_handle, window, |view, _, cx| {
+            view.focused = true;
+            cx.notify();
+        });
+        let _blur_sub = cx.on_blur(&focus_handle, window, |view, _, cx| {
+            view.focused = false;
+            cx.notify();
+        });
+
         let content = std::fs::read_to_string(&path).unwrap_or_else(|err| {
             tracing::warn!(?err, file = %path.display(), "editor: failed to read file; starting empty");
             String::new()
@@ -180,14 +202,25 @@ impl EditorView {
         Self {
             uri,
             state,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             lsp_client: None,
             dirty: false,
             doc_version: 1, // version 1 is consumed by didOpen
             last_sent_text: content,
             _observe_sub,
             file_path: path,
+            focused: false,
+            _focus_sub,
+            _blur_sub,
         }
+    }
+
+    /// Whether this view's focus handle currently holds platform focus.
+    /// Kept in sync by the `cx.on_focus` / `cx.on_blur` subscriptions
+    /// installed in `new`. Used by the host's per-leaf observer to mirror
+    /// focus into its active-pane bookkeeping without a `&Window`.
+    pub fn focused(&self) -> bool {
+        self.focused
     }
 
     /// Called by `lsp_bridge` once the LSP handshake completes. Sets the
@@ -303,26 +336,32 @@ impl Focusable for EditorView {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        // Dirty indicator: use Window::set_window_title to append " •" when
-        // the buffer has unsaved changes. This is the macOS convention for
-        // document-edited state (the platform also supports set_window_edited
-        // for the traffic-light dot, but the title suffix is more portable).
-        // Called from render() which runs on every cx.notify() — low cost
-        // since GPUI coalesces repaints and set_window_title is a platform
-        // string set (not a visual repaint trigger).
-        let file_name = self
-            .file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("untitled");
-        if self.dirty {
-            window.set_window_title(&format!("OxiMux — {file_name} •"));
-        } else {
-            window.set_window_title(&format!("OxiMux — {file_name}"));
-        }
+        // Dirty state is surfaced by the host (pane chrome / tab label), not
+        // by mutating the window title — multiple editor leaves can be open
+        // at once and a single title cannot represent all of them.
+
+        // Path breadcrumb row above the editor content. Shows the full path
+        // so the user can confirm which file is open in the focused leaf
+        // (matches the industry-standard editor convention). Dirty
+        // indicator suffix (`•`) makes unsaved state visible without the
+        // window-title hack.
+        let path_str = self.file_path.display().to_string();
+        let dirty_suffix = if self.dirty { " •" } else { "" };
+        let breadcrumb = gpui::div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(gpui::px(28.0))
+            .px(gpui::px(12.0))
+            .bg(theme.background)
+            .border_b_1()
+            .border_color(theme.border)
+            .text_size(gpui::px(11.0))
+            .text_color(theme.muted_foreground)
+            .child(format!("{path_str}{dirty_suffix}"));
 
         // Outer wrapper fixes GPUI flex collapse: a bare `Input` child
         // without an explicit `flex_1`/`size_full` renders at height 0.
@@ -333,6 +372,7 @@ impl Render for EditorView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::on_save))
+            .child(breadcrumb)
             .child(
                 Input::new(&self.state)
                     .font_family(theme.mono_font_family.clone())

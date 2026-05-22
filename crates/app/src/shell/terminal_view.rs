@@ -578,6 +578,47 @@ impl TerminalView {
     }
 }
 
+impl Drop for TerminalView {
+    /// Tear down the PTY session when the entity is dropped (tab close,
+    /// project switch, or content replace in `MainPane::open_editor_*`).
+    ///
+    /// Without this, every dropped view leaks the backend session: the
+    /// portable-pty path retains a watcher thread + master fd until the
+    /// backend Arc count hits zero, and the relay path retains the daemon-
+    /// side PTY indefinitely. `TerminalBackend::close` is idempotent, so
+    /// a co-owner (e.g., `CliRuntime::cancel`) racing this Drop is safe.
+    ///
+    /// The close path can stall up to `CANCEL_GRACE` (5 s) while it joins
+    /// the watcher thread, so we run it on a detached OS thread instead
+    /// of blocking the GPUI main thread (which is where Drop fires). The
+    /// `SharedBackend` Arc is cloned into the thread, keeping the backend
+    /// alive until close completes. `drain_events` runs first so the
+    /// watcher thread isn't blocked on a full event-channel send during
+    /// the join (mirrors the deadlock fix in agent runtime cancel).
+    ///
+    /// Mutex poisoning is treated as best-effort: log + skip rather than
+    /// panic inside Drop (a panic in Drop aborts the process).
+    fn drop(&mut self) {
+        let id = self.session_id;
+        let backend = self.backend.clone();
+        std::thread::spawn(move || match backend.lock() {
+            Ok(mut be) => {
+                let _ = be.drain_events();
+                if let Err(err) = be.close(id) {
+                    tracing::warn!(
+                        ?err,
+                        ?id,
+                        "terminal-view: backend.close failed in drop helper"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!(?id, "terminal-view: backend mutex poisoned at drop");
+            }
+        });
+    }
+}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()

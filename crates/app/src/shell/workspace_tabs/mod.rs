@@ -56,6 +56,10 @@ pub enum WorkspaceTabKind {
         session_id: AgentSessionId,
         status_rx: AgentStatusStream,
     },
+    /// File editor opened from the file tree. The path doubles as the
+    /// dedup key for "is this file already open?" — the lookup is a
+    /// linear scan, fine for the small tab counts users keep open.
+    Editor { path: PathBuf },
 }
 
 struct WorkspaceTab {
@@ -217,6 +221,57 @@ impl WorkspaceTabs {
         }
     }
 
+    /// Open `path` as an editor tab. If a tab already shows that file,
+    /// activate it (no duplicate tab). Otherwise spawn a new `MainPane`
+    /// whose single leaf hosts an `EditorView`, push it as a new
+    /// workspace tab with the file's basename as the label, and activate
+    /// it. Returns the index of the activated tab; `None` if file
+    /// construction failed (caller logs).
+    ///
+    /// Persistence: editor tabs are NOT persisted in v1 — the saved
+    /// snapshot only walks Terminal + Agent tabs. Editor tabs gracefully
+    /// disappear on restart; restoring open editors is a separate slice.
+    pub fn open_or_activate_editor_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        if let Some(idx) = self.tabs.iter().position(|t| matches!(&t.kind, WorkspaceTabKind::Editor { path: p } if p == &path)) {
+            self.set_active(idx, window, cx);
+            return Some(idx);
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cwd = self.cwd.clone();
+        let path_for_pane = path.clone();
+        let pane = cx.new(|cx| {
+            let editor = cx.new(|cx| oximux_editor::EditorView::new(path_for_pane, window, cx));
+            MainPane::new_with_editor(editor, cwd, theme, density, typography, cx)
+        });
+        let label_str = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("untitled")
+            .to_string();
+        let observer = cx.observe(&pane, |this, _pane, cx| {
+            cx.notify();
+            this.maybe_save_on_topology_change(cx);
+        });
+        self.tabs.push(WorkspaceTab {
+            label: SharedString::from(label_str),
+            pane,
+            kind: WorkspaceTabKind::Editor { path },
+            _observer: observer,
+            _status_task: None,
+        });
+        self.active = self.tabs.len() - 1;
+        self.focus_active(window, cx);
+        cx.notify();
+        Some(self.active)
+    }
+
     pub fn open_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(new_pane) = spawn_main_pane(
             self.cwd.clone(),
@@ -311,7 +366,7 @@ impl WorkspaceTabs {
     ) -> bool {
         let Some(idx) = self.tabs.iter().position(|t| match &t.kind {
             WorkspaceTabKind::Agent { session_id, .. } => TabId::from(*session_id) == tab_id,
-            WorkspaceTabKind::Terminal => false,
+            WorkspaceTabKind::Terminal | WorkspaceTabKind::Editor { .. } => false,
         }) else {
             return false;
         };

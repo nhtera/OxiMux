@@ -70,6 +70,10 @@ actions!(
         ToggleLeftSidebar,
         /// Toggle the right sidebar visibility (Cmd+L).
         ToggleRightSidebar,
+        /// Switch to the Files tab in the right sidebar (Cmd+Shift+T).
+        /// Bound after Cmd+Shift+E/F/G — `T` for the file tree to avoid
+        /// the Cmd+B (left sidebar) and Cmd+Shift+F (search) collisions.
+        SelectFilesTab,
         /// Switch to the Explorer tab in the right sidebar (Cmd+Shift+E).
         SelectExplorerTab,
         /// Switch to the Search tab in the right sidebar (Cmd+Shift+F).

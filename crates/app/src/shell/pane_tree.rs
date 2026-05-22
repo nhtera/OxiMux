@@ -8,10 +8,27 @@
 //! a separate concern (an explicit "balance" action could flatten + equalize
 //! a same-axis cascade if/when the UX demands it).
 
-/// Stable identifier for a pane leaf in the workspace tree. Issued
-/// monotonically by `MainPane`; never reused after a pane closes.
+/// Stable identifier for a pane leaf in the content tree. Issued
+/// monotonically by the host (today `MainPane`); never reused after a
+/// pane closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u64);
+
+/// Stable identifier for a pane GROUP in the workspace layout tree.
+/// Each group owns its own tab strip; the workspace owns a
+/// `PaneTree<PaneGroupId>` of these. Issued monotonically by the host
+/// (`PaneGroupManager`); never reused after a group closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PaneGroupId(pub u64);
+
+/// Convenience alias: the per-group content tree (terminal/editor leaves
+/// inside one tab strip). Reserved for callers that still need the
+/// internal split; v1 workspace splits use [`GroupTree`] instead.
+pub type ContentTree = PaneTree<PaneId>;
+
+/// Convenience alias: the workspace-level split tree of pane groups.
+/// Splitting the workspace creates a new sibling leaf in this tree.
+pub type GroupTree = PaneTree<PaneGroupId>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
@@ -36,11 +53,11 @@ pub enum SplitInsert {
 /// only `PartialEq` is meaningful for weights (NaN). Tests compare
 /// structurally via dedicated helpers, not `==` on the whole tree.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PaneTree {
-    Leaf(PaneId),
+pub enum PaneTree<L = PaneId> {
+    Leaf(L),
     Split {
         axis: Axis,
-        children: Vec<PaneTree>,
+        children: Vec<PaneTree<L>>,
         /// Parallel to `children`; one weight per child. New splits start at
         /// 1.0 each (so a binary split is 50/50). Drag-resize mutates these.
         /// Always kept positive — `MIN_FLEX` is the floor, enforced by
@@ -54,7 +71,7 @@ pub enum PaneTree {
 /// for a usable terminal grid at typical viewport sizes.
 pub const MIN_FLEX: f32 = 0.1;
 
-impl PaneTree {
+impl<L: Copy + PartialEq> PaneTree<L> {
     pub fn leaf_count(&self) -> usize {
         match self {
             PaneTree::Leaf(_) => 1,
@@ -62,13 +79,13 @@ impl PaneTree {
         }
     }
 
-    pub fn in_order_leaves(&self) -> Vec<PaneId> {
+    pub fn in_order_leaves(&self) -> Vec<L> {
         let mut out = Vec::new();
         self.collect_leaves(&mut out);
         out
     }
 
-    fn collect_leaves(&self, out: &mut Vec<PaneId>) {
+    fn collect_leaves(&self, out: &mut Vec<L>) {
         match self {
             PaneTree::Leaf(id) => out.push(*id),
             PaneTree::Split { children, .. } => {
@@ -81,7 +98,7 @@ impl PaneTree {
 
     /// Path of child indices from root to the named leaf, or `None` if the
     /// id isn't in the tree. Empty `Vec` means root is the leaf.
-    fn path_to(&self, target: PaneId) -> Option<Vec<usize>> {
+    fn path_to(&self, target: L) -> Option<Vec<usize>> {
         let mut path = Vec::new();
         if self.path_to_inner(target, &mut path) {
             Some(path)
@@ -90,7 +107,7 @@ impl PaneTree {
         }
     }
 
-    fn path_to_inner(&self, target: PaneId, path: &mut Vec<usize>) -> bool {
+    fn path_to_inner(&self, target: L, path: &mut Vec<usize>) -> bool {
         match self {
             PaneTree::Leaf(id) => *id == target,
             PaneTree::Split { children, .. } => {
@@ -107,22 +124,21 @@ impl PaneTree {
     }
 
     /// Wrap the leaf matching `target` in a `Split { axis, [old, new] }` —
-    /// each Cmd-D halves the focused pane's slice between old and new.
-    /// Matches the reference terminal / iTerm binary-split semantics. The new pane goes
-    /// AFTER the old (right for horizontal, below for vertical). Returns
-    /// true on success.
-    pub fn split_leaf(&mut self, target: PaneId, axis: Axis, new_id: PaneId) -> bool {
+    /// each split halves the focused leaf's slice between old and new.
+    /// Binary-split semantics. The new leaf goes AFTER the old (right for
+    /// horizontal, below for vertical). Returns true on success.
+    pub fn split_leaf(&mut self, target: L, axis: Axis, new_id: L) -> bool {
         self.split_leaf_at(target, axis, new_id, SplitInsert::After)
     }
 
-    /// Like [`split_leaf`] but lets the caller pick whether the new pane
+    /// Like [`split_leaf`] but lets the caller pick whether the new leaf
     /// goes before or after the focused leaf along the new axis. Drives the
     /// four-direction menu: Right/Down = After, Left/Up = Before.
     pub fn split_leaf_at(
         &mut self,
-        target: PaneId,
+        target: L,
         axis: Axis,
-        new_id: PaneId,
+        new_id: L,
         insert: SplitInsert,
     ) -> bool {
         let Some(path) = self.path_to(target) else {
@@ -152,8 +168,7 @@ impl PaneTree {
     /// Replace the weights at the Split node addressed by `path`. Returns
     /// `true` when the path lands on a `Split` whose `children.len()` matches
     /// `new_weights.len()`. Weights are clamped per-entry to `MIN_FLEX` so a
-    /// drag can't shrink a pane to zero. Called from the divider drag
-    /// handler in `main_pane`.
+    /// drag can't shrink a leaf to zero.
     pub fn set_split_weights(&mut self, path: &[usize], new_weights: Vec<f32>) -> bool {
         let node = descend_mut(self, path);
         match node {
@@ -170,8 +185,8 @@ impl PaneTree {
     }
 
     /// Read-only view of weights at the Split addressed by `path`. Used by
-    /// the divider drag handler at `on_drag` to capture initial weights as
-    /// part of the drag payload.
+    /// the divider drag handler to capture initial weights as part of the
+    /// drag payload.
     pub fn split_weights(&self, path: &[usize]) -> Option<Vec<f32>> {
         let node = descend(self, path)?;
         match node {
@@ -182,8 +197,8 @@ impl PaneTree {
 
     /// Remove the leaf matching `target` and collapse any single-child
     /// Splits. Returns false when the target is the root leaf (caller must
-    /// guard "only one pane remains") or not in the tree.
-    pub fn remove_leaf(&mut self, target: PaneId) -> bool {
+    /// guard "only one leaf remains") or not in the tree.
+    pub fn remove_leaf(&mut self, target: L) -> bool {
         let Some(path) = self.path_to(target) else {
             return false;
         };
@@ -199,12 +214,11 @@ impl PaneTree {
                 // Strict invariant: `weights.len() == children.len()` at all
                 // times. An earlier guarded `if last < weights.len()` here
                 // was unsafe — a missing weight would silently desync the
-                // arrays, and `build_node` / `dispatch_grids_inner` both
-                // iterate with `zip`, which would drop the trailing child
-                // from render AND PTY dispatch (Codex flagged this). The
+                // arrays, and downstream zip-iteration would drop the
+                // trailing child from render AND PTY dispatch. The
                 // unconditional remove preserves the invariant; if the
                 // invariant ever breaks elsewhere, this will panic loudly
-                // rather than silently lose a pane.
+                // rather than silently lose a leaf.
                 children.remove(last);
                 weights.remove(last);
             }
@@ -216,11 +230,7 @@ impl PaneTree {
 
     /// Walk the tree recursively and panic if any `Split` node has
     /// `children.len() != weights.len()`. Cheap O(tree size) check, gated
-    /// on `debug_assertions` so release builds skip it. Used to assert the
-    /// invariant after every mutation in tests; also called at the top of
-    /// `build_node` / `dispatch_grids_inner` to catch any future code that
-    /// violates the invariant before render/PTY dispatch silently drops a
-    /// pane.
+    /// on `debug_assertions` so release builds skip it.
     #[cfg(debug_assertions)]
     pub fn debug_assert_invariants(&self) {
         match self {
@@ -263,7 +273,7 @@ impl PaneTree {
 }
 
 /// Immutable counterpart of `descend_mut` for `split_weights`.
-fn descend<'a>(root: &'a PaneTree, path: &[usize]) -> Option<&'a PaneTree> {
+fn descend<'a, L>(root: &'a PaneTree<L>, path: &[usize]) -> Option<&'a PaneTree<L>> {
     let mut node = root;
     for &i in path {
         node = match node {
@@ -274,7 +284,7 @@ fn descend<'a>(root: &'a PaneTree, path: &[usize]) -> Option<&'a PaneTree> {
     Some(node)
 }
 
-fn descend_mut<'a>(root: &'a mut PaneTree, path: &[usize]) -> &'a mut PaneTree {
+fn descend_mut<'a, L>(root: &'a mut PaneTree<L>, path: &[usize]) -> &'a mut PaneTree<L> {
     let mut node = root;
     for &i in path {
         node = match node {
@@ -463,6 +473,24 @@ mod tests {
     /// children.len()` strictly across every mutation and (b)
     /// `debug_assert!` the invariant before render. This test asserts (a)
     /// across the full mutation surface.
+    /// Genericity smoke: the same `PaneTree` API has to work for both
+    /// content leaves (`PaneTree<PaneId>`) and the workspace's group
+    /// layout (`PaneTree<PaneGroupId>`). This test pins the latter so a
+    /// future change to the trait bounds can't silently break the
+    /// workspace-level split tree.
+    #[test]
+    fn split_works_for_pane_group_id_leaf_type() {
+        let mut t: PaneTree<PaneGroupId> = PaneTree::Leaf(PaneGroupId(0));
+        assert!(t.split_leaf(PaneGroupId(0), Axis::Horizontal, PaneGroupId(1)));
+        assert_eq!(t.leaf_count(), 2);
+        assert_eq!(
+            t.in_order_leaves(),
+            vec![PaneGroupId(0), PaneGroupId(1)]
+        );
+        assert!(t.remove_leaf(PaneGroupId(1)));
+        assert_eq!(t, PaneTree::Leaf(PaneGroupId(0)));
+    }
+
     #[test]
     fn split_invariant_holds_across_mutations() {
         let mut t = PaneTree::Leaf(id(0));

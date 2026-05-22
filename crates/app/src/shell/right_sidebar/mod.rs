@@ -19,11 +19,13 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::file_explorer::FileExplorer;
+use crate::shell::file_tree_view::{FileTreeView, OnOpenFile, OnQueryActivePath};
 use crate::shell::git_panel::GitPanel;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 use crate::shell::search_panel::SearchPanel;
 use crate::shell::source_control::{PanelConfig, SourceControlPanel};
+use oximux_editor::FileTree;
 
 /// Configuration bundle for `RightSidebar::new_for_test`. Keeps the test
 /// constructor under the 7-argument clippy limit.
@@ -51,6 +53,13 @@ pub struct RightSidebar {
     // Search panel (ripgrep-backed).
     pub(crate) search_panel: Entity<SearchPanel>,
 
+    // Files tab — workspace file tree. `FileTreeView` holds an
+    // `Entity<FileTree>` internally, which keeps the model + watcher alive
+    // via reference counting, so storing a separate handle here would be
+    // dead weight. `None` when the host hasn't supplied an `on_open`
+    // callback yet (tests).
+    pub(crate) file_tree_view: Option<Entity<FileTreeView>>,
+
     // Poll state mirrored for the status bar (avoids borrowing through entity tree).
     pub latest_poll_state: PollState,
 
@@ -72,6 +81,8 @@ impl RightSidebar {
         repo: Option<Repository>,
         root_path: PathBuf,
         initial_open: bool,
+        on_open_file: Option<OnOpenFile>,
+        on_query_active_path: Option<OnQueryActivePath>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -142,15 +153,34 @@ impl RightSidebar {
                 cx,
             )
         });
-        let search_panel = cx
-            .new(|cx| SearchPanel::new(root_path, theme, density, typography.clone(), window, cx));
+        let search_panel = cx.new(|cx| {
+            SearchPanel::new(
+                root_path.clone(),
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
+
+        // Files tab: construct the FileTree + FileTreeView only when the host
+        // supplied an `on_open` callback. Tests skip the callback (no live
+        // host to wire) and the tab body falls back to an empty placeholder.
+        // The `FileTree` entity is moved into `FileTreeView::new`, which
+        // owns it for the rest of its lifetime — no separate handle is
+        // retained here.
+        let file_tree_view = on_open_file.map(|on_open| {
+            let tree = cx.new(|cx| FileTree::new(root_path, cx));
+            cx.new(|cx| FileTreeView::new(tree, on_open, on_query_active_path, window, cx))
+        });
 
         let poll_observer = Self::start_poll_observer(bar_rx, cx);
 
         let active_tab = if source_control.is_some() {
             RightTab::SourceControl
         } else {
-            RightTab::Explorer
+            RightTab::Files
         };
 
         Self {
@@ -159,6 +189,7 @@ impl RightSidebar {
             source_control,
             file_explorer,
             search_panel,
+            file_tree_view,
             latest_poll_state: initial,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -278,6 +309,7 @@ impl RightSidebar {
             source_control,
             file_explorer,
             search_panel,
+            file_tree_view: None,
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -383,6 +415,30 @@ impl Render for RightSidebar {
         // panel's own scroll region (uniform_list, overflow_y_scroll) owns
         // overflow handling.
         let body = match self.active_tab {
+            RightTab::Files => {
+                let body_div = div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden();
+                match self.file_tree_view.clone() {
+                    Some(view) => body_div
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .child(view),
+                        )
+                        .into_any_element(),
+                    // No callback wired — `new_for_test` or pre-host mount;
+                    // render an empty body rather than panic.
+                    None => body_div.into_any_element(),
+                }
+            }
             RightTab::Explorer => div()
                 .flex_1()
                 .min_h(px(0.0))

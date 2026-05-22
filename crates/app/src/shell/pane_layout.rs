@@ -14,9 +14,8 @@ use gpui::{
 };
 use oximux_settings::Theme;
 
-use crate::shell::main_pane::MainPane;
+use crate::shell::main_pane::{MainPane, PaneContent};
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
-use crate::shell::terminal_view::TerminalView;
 
 /// Width of the resize handle hit zone between adjacent panes. The outer
 /// wrapper is transparent; only the 1 px center stripe (`DIVIDER_LINE_PX`)
@@ -58,7 +57,7 @@ pub struct ActiveDrag {
 /// crush the divider to 0 px. `(w, h)` is the pixel rect this node owns.
 pub fn build_node(
     node: &PaneTree,
-    panes: &HashMap<PaneId, Entity<TerminalView>>,
+    panes: &HashMap<PaneId, PaneContent>,
     theme: &Theme,
     path: &[usize],
     w: f32,
@@ -73,8 +72,11 @@ pub fn build_node(
             // cells will overflow the leaf's slot and bleed into the next
             // pane + its separator.
             let mut leaf = div().w(px(w)).h(px(h)).flex_shrink_0().overflow_hidden();
-            if let Some(view) = panes.get(id) {
-                leaf = leaf.child(view.clone());
+            if let Some(content) = panes.get(id) {
+                match content {
+                    PaneContent::Terminal(view) => leaf = leaf.child(view.clone()),
+                    PaneContent::Editor(view) => leaf = leaf.child(view.clone()),
+                }
             }
             leaf
         }

@@ -1,6 +1,6 @@
 # OxiMux — Development Roadmap
 
-**Updated**: 2026-05-20  
+**Updated**: 2026-05-23  
 **Gate rule**: each phase ships only after ≥7 consecutive daily-driver days with zero panics (ADR-003). Tests-passing alone is not sufficient.
 
 ---
@@ -14,7 +14,7 @@
 | **02** | **Git core: status, diff, stage, commit, stash, worktree UI** | **code complete (steps 1-14); step 15 = dogfood gate** |
 | **03** | **CLI agent integration: Claude Code, Codex, Aider adapters** | **in progress (steps 1-4 + CliRuntime done; steps 5-14 pending)** |
 | 04 | Workspace persistence: SQLite + session restore | pending |
-| 05 | Editor + LSP: gpui-component code editor, file tree, rust-analyzer | in progress — steps 1-4 done (spike + save round-trip + file tree backend + file tree UI); step 5 next (workspace wiring) |
+| 05 | Editor + LSP: gpui-component code editor, file tree, rust-analyzer | in progress — steps 1-5 done (spike + save round-trip + file tree backend + file tree UI + pane-as-editor-host); step 6+ next |
 | 06 | Git review polish: side-by-side diff, blame, conflict UI | pending |
 | 07 | Multi-agent cockpit: dashboard, approval detection, presets | pending |
 | 08 | Ship v1: docs, packaging, beta, v1.0 tag | pending |

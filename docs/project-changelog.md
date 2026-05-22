@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-23 — Phase 5 / Step 05 — Pane as editor host (workspace wiring)
+
+**Status**: complete  
+**Touches**: `crates/app/src/shell/main_pane.rs`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/right_sidebar/`, `crates/editor/src/editor_view.rs`
+
+#### feat(app,editor): phase-05 step 5 — pane-as-editor-host
+
+- **`PaneContent` enum** (`Terminal | Editor`) — each leaf in the `MainPane` grid now holds either a terminal or an editor; grid is no longer terminal-only
+- **`MainPane::open_editor_in_focused_pane(path, window, cx)`** — replaces focused leaf content with `EditorView`; same-path short-circuit prevents redundant reloads
+- **`RightTab::Files`** — new tab in `RightSidebar`; always visible (no git-repo gate); hosts `FileTreeView`; `SelectFilesTab` action bound to `Cmd+Shift+T`
+- **File open flow**: click file row in Files tab → `OnOpenFile` callback → `WorkspaceRoot::open_file_in_active_pane` → `MainPane::open_editor_in_focused_pane`
+- **`EditorView` focus parity**: `focused: bool` field mirrored by `cx.on_focus`/`cx.on_blur`; `set_window_title` removed from `render` (multi-leaf editors cannot share one title)
+- **Session behavior**: editor leaves persist for the running session; silently dropped on app quit or project switch (no restore in v1)
+
+---
+
 ### 2026-05-23 — Phase 5 / Step 04 — File tree UI (FileTreeView + --file-tree-spike)
 
 **Status**: 8 pure unit tests green; cargo check/clippy clean; file-size-lint pass  

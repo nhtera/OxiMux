@@ -347,11 +347,18 @@ impl WorkspaceRoot {
                     .as_ref()
                     .map(|s| s.read(cx).open)
                     .unwrap_or(true);
+                let weak = cx.weak_entity();
+                let on_open =
+                    crate::workspace_root::WorkspaceRoot::build_on_open_file_callback(weak.clone());
+                let on_query =
+                    crate::workspace_root::WorkspaceRoot::build_on_query_active_path_callback(weak);
                 this.right_sidebar = Some(cx.new(|cx| {
                     crate::shell::right_sidebar::RightSidebar::new(
                         repo,
                         project_root.clone(),
                         prior_open,
+                        Some(on_open),
+                        Some(on_query),
                         theme,
                         density,
                         typography,

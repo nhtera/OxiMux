@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
 **Updated**: 2026-05-23  
-**Phase**: 5 — relay hardening done; editor+LSP steps 1-4 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI)
+**Phase**: 5 — relay hardening done; editor+LSP steps 1-5 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI + pane-as-editor-host)
 
 ---
 
@@ -10,9 +10,13 @@
 ```
 ┌─────────────────────────────────────────────────────┐
 │  GPUI UI layer  (crates/app)                        │
-│  WorkspaceRoot → MainPane/TabbedPane/TerminalView   │
+│  WorkspaceRoot → MainPane (grid of pane leaves)     │
+│                   each leaf: PaneContent::Terminal  │
+│                            | PaneContent::Editor    │
 │                → RightSidebar (tab-switched panel)  │
 │                   Explorer tab: FileExplorer (uniform_list, lazy, git badges)│
+│                   Files tab:    FileTreeView (always visible; no repo gate)  │
+│                   Search tab:   SearchPanel                                  │
 │                   SourceControl tab: GitPanel+DiffView│
 │                → StatusBar (git zone)               │
 ├─────────────────────────────────────────────────────┤
@@ -35,17 +39,22 @@
 ```
 WorkspaceRoot (GPUI entity)
 ├── fields
-│   ├── main_pane: Entity<MainPane>
+│   ├── main_pane: Entity<MainPane>        ← grid of pane leaves (Terminal | Editor)
 │   └── right_sidebar: Option<Entity<RightSidebar>>   ← None when no git repo
+│       open_file_in_active_pane(path, window, cx)
+│         → MainPane::open_editor_in_focused_pane(path, window, cx)
 │
 └── RightSidebar (GPUI entity, present only when cwd is a git repo)
-    ├── active_tab: RightTab  (Explorer | Search | SourceControl)
+    ├── active_tab: RightTab  (Explorer | Search | SourceControl | Files)
     ├── activity_bar: 40px strip; single-letter glyph buttons
     ├── _repo: Arc<Repository>
     ├── _poller: StatusPoller              ← AbortHandle; drops → task stops
     ├── file_explorer: Entity<FileExplorer> ← shown on Explorer tab
     │     uniform_list virtualized tree; lazy load; git status badges M/A/D/R/U/C
     │     5s tokio timeout per dir load; focus-regain refresh via observe_window_activation
+    ├── file_tree_view: Entity<FileTreeView> ← shown on Files tab (always visible; no repo gate)
+    │     on_open callback → WorkspaceRoot::open_file_in_active_pane
+    │     SelectFilesTab action bound to Cmd+Shift+T
     ├── git_panel: Entity<GitPanel>        ← shown on SourceControl tab
     └── diff_view: Entity<DiffView>        ← shown on SourceControl tab
 ```
@@ -350,7 +359,36 @@ dir click → tree.expand(id)           oximux-editor entity
 - `expanded_ids` (view) is separate from `FileTreeNode.loaded` (model) — chevron direction reads `expanded`, not `loaded`
 - Raw `uniform_list` used, not `gpui-component::Tree` — matches `FileExplorer` precedent; avoids auto-expand-on-click conflict with lazy walker model
 - `build_display_rows` is a pure fn extracted for unit testing (8 tests in `app/tests/file_tree_view_unit.rs`)
-- `--file-tree-spike` CLI flag mounts standalone window against CWD; `on_open` stubs to `tracing::info!` until step 5
+
+---
+
+### Step 5 — pane as editor host (workspace wiring)
+
+`MainPane` workspace grid is no longer terminal-only. Each leaf now holds a `PaneContent` enum.
+
+```
+PaneContent::Terminal(Entity<TerminalView>)
+PaneContent::Editor(Entity<EditorView>)
+
+MainPane::open_editor_in_focused_pane(path, window, cx)
+  same-path short-circuit → no-op if focused leaf already shows that file
+  else → replace focused leaf content with EditorView::new(path, cx)
+
+RightSidebar (Files tab — always visible, no repo gate)
+  FileTreeView on_open callback
+    → OnOpenFile event
+    → WorkspaceRoot::open_file_in_active_pane(path, window, cx)
+    → MainPane::open_editor_in_focused_pane(path, window, cx)
+```
+
+**EditorView focus parity (step 5 addition):**
+- `focused: bool` field mirrored by `cx.on_focus` / `cx.on_blur` — matches `TerminalView` observer pattern
+- `set_window_title` removed from `EditorView::render`: multi-leaf editors cannot share a single window title
+
+**Key invariants:**
+- Files tab (`RightTab::Files`): always present regardless of whether cwd is a git repo
+- `SelectFilesTab` action bound to `Cmd+Shift+T`
+- Editor leaves persist for the running session; silently dropped on app quit or project switch (no editor restore in v1)
 
 ---
 
@@ -375,7 +413,7 @@ dir click → tree.expand(id)           oximux-editor entity
 | ACP agent protocol | v1.1 (ADR-004) |
 | Side-by-side diff | Phase 6 |
 | Blame, file history, commit graph | Phase 6 |
-| Editor + LSP full integration | Phase 5 step 5+ (steps 1-4 shipped; step 5 = workspace wiring) |
+| Editor + LSP full integration | Phase 5 step 6+ (steps 1-5 shipped; step 6+ = keybindings, multi-file, LSP completions) |
 | SQLite persistence / session restore | Phase 4 |
 | Multi-agent dashboard | Phase 7 |
 | embeddable terminal library terminal backend | v2 (ADR in brief.md) |

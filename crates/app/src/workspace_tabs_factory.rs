@@ -22,7 +22,7 @@ use crate::notifier::Notifier;
 use crate::persisted_terminals::{
     PersistedAgentTab, PersistedTabs, PersistedTree, count_leaves, restore_tree, settings_key,
 };
-use crate::shell::main_pane::MainPane;
+use crate::shell::main_pane::{MainPane, PaneContent};
 use crate::shell::pane_tree::PaneId;
 use crate::shell::terminal_view::{TerminalView, attach_pty_existing, spawn_local_pty};
 use crate::shell::workspace_tabs::WorkspaceTabs;
@@ -291,7 +291,7 @@ fn build_pane_for_tree(
         id
     };
     let tree = restore_tree(tree_snapshot, &mut alloc);
-    let mut panes: HashMap<PaneId, Entity<TerminalView>> = HashMap::with_capacity(leaf_count);
+    let mut panes: HashMap<PaneId, PaneContent> = HashMap::with_capacity(leaf_count);
     for (idx, leaf_id) in tree.in_order_leaves().iter().enumerate() {
         let ordinal = base_ordinal + idx as u32;
         let (backend, session_id) = attach_or_spawn_pane(&cwd, attach_hints, ordinal)?;
@@ -308,7 +308,7 @@ fn build_pane_for_tree(
                 cx,
             )
         });
-        panes.insert(leaf_id, view);
+        panes.insert(leaf_id, PaneContent::Terminal(view));
     }
     let focused = tree.in_order_leaves().first().copied()?;
     let next_id_seed = next_id;

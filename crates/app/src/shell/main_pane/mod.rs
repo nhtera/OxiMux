@@ -1,20 +1,27 @@
-//! MainPane — workspace grid of terminal panes (Phase 1 step 5).
+//! MainPane — workspace grid of pane leaves (terminal or editor).
 //!
-//! Owns a `panes: HashMap<PaneId, Entity<TerminalView>>` entity store paired
-//! with a pure-data [`crate::shell::pane_tree::PaneTree`] describing the split
-//! layout. Render walks the tree top-down, looks up each leaf's TerminalView
-//! in the HashMap, divides the available rect along each Split axis, and
-//! stages per-leaf `(cols, rows)` via `TerminalView::set_target_grid`.
+//! Owns a `panes: HashMap<PaneId, PaneContent>` entity store paired with a
+//! pure-data [`crate::shell::pane_tree::PaneTree`] describing the split
+//! layout. Render walks the tree top-down, looks up each leaf's content in
+//! the HashMap, divides the available rect along each Split axis, and for
+//! terminal leaves stages per-leaf `(cols, rows)` via
+//! `TerminalView::set_target_grid`. Editor leaves participate in the layout
+//! but ignore grid dispatch — they size to their assigned rect via GPUI
+//! flex.
 //!
 //! Action handlers (`SplitHorizontal`, `SplitVertical`, `FocusNextPane`,
 //! `FocusPrevPane`) are wired on the root render `div`. GPUI dispatches
 //! actions up the element tree from the focused leaf, so ordinary keystrokes
-//! still reach the focused `TerminalView` while `Cmd-*` combos bubble up here.
+//! still reach the focused view while `Cmd-*` combos bubble up here.
 //!
 //! Per-leaf tabs were removed when the workspace switched to a single-tab-
-//! per-leaf model: each leaf is a single terminal, and the workspace-level
-//! [`crate::shell::workspace_tabs::WorkspaceTabs`] handles tab creation /
-//! switching above this struct.
+//! per-leaf model: each leaf hosts a single content entity, and the
+//! workspace-level [`crate::shell::workspace_tabs::WorkspaceTabs`] handles
+//! tab creation / switching above this struct.
+
+pub mod pane_content;
+
+pub use pane_content::PaneContent;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +42,7 @@ use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_layout::{ActiveDrag, DIVIDER_HIT_PX, build_node};
 use crate::shell::pane_tree::{Axis, PaneId, PaneTree, SplitInsert};
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
+use oximux_editor::EditorView;
 
 /// Vertical chrome subtracted from viewport when computing terminal area
 /// (top bar + status bar). Density tokens are 40 + 24 = 64.
@@ -45,7 +53,7 @@ const MIN_ROWS: u16 = 4;
 
 pub struct MainPane {
     tree: PaneTree,
-    panes: HashMap<PaneId, Entity<TerminalView>>,
+    panes: HashMap<PaneId, PaneContent>,
     focused: PaneId,
     next_id: AtomicU64,
     theme: Theme,
@@ -85,9 +93,10 @@ impl MainPane {
     ) -> Self {
         let id = PaneId(0);
         let next_id = AtomicU64::new(1);
-        let sub = observe_pane_focus(&initial_view, id, cx);
+        let content = PaneContent::Terminal(initial_view);
+        let sub = observe_pane_focus(&content, id, cx);
         let mut panes = HashMap::new();
-        panes.insert(id, initial_view);
+        panes.insert(id, content);
         let mut pane_observers = HashMap::new();
         pane_observers.insert(id, sub);
         let focus_handle = cx.focus_handle();
@@ -109,14 +118,55 @@ impl MainPane {
         }
     }
 
-    /// Construct a MainPane around a pre-built pane tree + view map. Used
+    /// Build a `MainPane` whose single leaf hosts an editor on `path`.
+    /// Used by the workspace tab strip when opening a file as a new tab
+    /// — the resulting `MainPane` has no terminal leaf, so no PTY is
+    /// spawned. Splitting (Cmd+D/etc.) inside this pane will create
+    /// fresh terminal siblings as usual; only the seed leaf is an editor.
+    pub fn new_with_editor(
+        initial_editor: Entity<EditorView>,
+        cwd: PathBuf,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let id = PaneId(0);
+        let next_id = AtomicU64::new(1);
+        let content = PaneContent::Editor(initial_editor);
+        let sub = observe_pane_focus(&content, id, cx);
+        let mut panes = HashMap::new();
+        panes.insert(id, content);
+        let mut pane_observers = HashMap::new();
+        pane_observers.insert(id, sub);
+        let focus_handle = cx.focus_handle();
+        let chrome_w_px = density.w_left_rail;
+        Self {
+            tree: PaneTree::Leaf(id),
+            panes,
+            focused: id,
+            next_id,
+            theme,
+            density,
+            typography,
+            focus_handle,
+            chrome_w_px,
+            cwd,
+            topology_version: 0,
+            _pane_observers: pane_observers,
+            active_drag: None,
+        }
+    }
+
+    /// Construct a MainPane around a pre-built pane tree + content map. Used
     /// by the persistence restore path: `build_workspace_tabs` spawns N
-    /// `TerminalView`s in DFS-leaf order, assembles them into a `PaneTree`
-    /// via `persisted_terminals::restore_tree`, then hands the pair here.
+    /// `TerminalView`s in DFS-leaf order, wraps each in `PaneContent::Terminal`,
+    /// assembles them into a `PaneTree` via `persisted_terminals::restore_tree`,
+    /// then hands the pair here.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_tree(
         tree: PaneTree,
-        panes: HashMap<PaneId, Entity<TerminalView>>,
+        panes: HashMap<PaneId, PaneContent>,
         focused: PaneId,
         next_id_seed: u64,
         cwd: PathBuf,
@@ -126,8 +176,8 @@ impl MainPane {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut pane_observers = HashMap::with_capacity(panes.len());
-        for (id, view) in &panes {
-            pane_observers.insert(*id, observe_pane_focus(view, *id, cx));
+        for (id, content) in &panes {
+            pane_observers.insert(*id, observe_pane_focus(content, *id, cx));
         }
         Self {
             tree,
@@ -173,14 +223,16 @@ impl MainPane {
     }
 
     /// Walk the tree in DFS leaf order and return one byte buffer per
-    /// leaf via `TerminalBackend::serialize_buffer`. Used by the scrollback
-    /// persistence path (Phase 4 step 16); ordinal index in the returned
-    /// Vec lines up with the restore-time leaf order produced by
-    /// `restore_tree` so capture and restore agree without an explicit map.
+    /// TERMINAL leaf via `TerminalBackend::serialize_buffer`. Editor leaves
+    /// are silently skipped — their content lives on disk, not in a
+    /// scrollback. Used by the scrollback persistence path (Phase 4 step 16);
+    /// ordinal index in the returned Vec lines up with the restore-time
+    /// terminal-leaf order produced by `restore_tree` so capture and restore
+    /// agree without an explicit map.
     pub fn collect_pane_buffers(&self, max_bytes: usize, cx: &gpui::App) -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(self.panes.len());
         for leaf_id in self.tree.in_order_leaves() {
-            let Some(view) = self.panes.get(&leaf_id) else {
+            let Some(PaneContent::Terminal(view)) = self.panes.get(&leaf_id) else {
                 continue;
             };
             let bytes = view.read(cx).serialize_buffer(max_bytes);
@@ -190,14 +242,14 @@ impl MainPane {
     }
 
     /// Walk the tree in DFS leaf order and return one external id per
-    /// leaf (relay PTY id for relay-backed backends, `None` for
-    /// in-process). Same ordering as `collect_pane_buffers` so the
-    /// two captures stay aligned in the persisted `pane_relay_ids`
-    /// table.
+    /// TERMINAL leaf (relay PTY id for relay-backed backends, `None` for
+    /// in-process). Editor leaves are silently skipped. Same ordering as
+    /// `collect_pane_buffers` so the two captures stay aligned in the
+    /// persisted `pane_relay_ids` table.
     pub fn collect_pane_external_ids(&self, cx: &gpui::App) -> Vec<Option<String>> {
         let mut out = Vec::with_capacity(self.panes.len());
         for leaf_id in self.tree.in_order_leaves() {
-            let Some(view) = self.panes.get(&leaf_id) else {
+            let Some(PaneContent::Terminal(view)) = self.panes.get(&leaf_id) else {
                 continue;
             };
             out.push(view.read(cx).external_id());
@@ -206,37 +258,53 @@ impl MainPane {
     }
 
     /// Inverse of `collect_pane_buffers`: feed previously-captured bytes
-    /// into each leaf's grid BEFORE the live PTY produces any output.
-    /// Buffers are paired with leaves in DFS order; an empty buffer means
-    /// "no capture for this leaf" and is skipped.
+    /// into each TERMINAL leaf's grid BEFORE the live PTY produces any
+    /// output. Buffers are paired with terminal leaves in DFS order; an
+    /// empty buffer means "no capture for this leaf" and is skipped.
+    /// Editor leaves are silently skipped.
     pub fn prefill_leaves(&self, buffers: &[Vec<u8>], cx: &gpui::App) {
-        for (leaf_id, bytes) in self.tree.in_order_leaves().iter().zip(buffers.iter()) {
+        let mut buf_iter = buffers.iter();
+        for leaf_id in self.tree.in_order_leaves() {
+            let Some(PaneContent::Terminal(view)) = self.panes.get(&leaf_id) else {
+                continue;
+            };
+            let Some(bytes) = buf_iter.next() else {
+                break;
+            };
             if bytes.is_empty() {
                 continue;
             }
-            let Some(view) = self.panes.get(leaf_id) else {
-                continue;
-            };
             view.read(cx).prefill_grid(bytes);
         }
     }
 
-    /// Focus handle for the currently focused terminal leaf. Used by
+    /// Focus handle for the currently focused leaf. Used by
     /// `WorkspaceTabs::focus_active` so switching tabs re-homes focus inside
     /// the destination tab's last-focused pane.
     pub fn active_focus_handle(&self, cx: &App) -> FocusHandle {
         match self.panes.get(&self.focused) {
-            Some(view) => view.read(cx).focus_handle(cx),
+            Some(content) => content.focus_handle(cx),
             None => self.focus_handle.clone(),
         }
+    }
+
+    /// File path of the editor currently shown in the focused leaf
+    /// (`None` if the focused leaf is a terminal). Drives the Files-tab
+    /// active-row highlight when a workspace tab is rendering this pane.
+    pub fn active_editor_path(&self, cx: &App) -> Option<PathBuf> {
+        self.panes
+            .get(&self.focused)?
+            .editor_path(cx)
+            .map(|p| p.to_path_buf())
     }
 
     fn alloc_id(&self) -> PaneId {
         PaneId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
+
     /// Sync `self.focused` from the window's currently focused element.
-    /// Click-to-focus moves platform focus into a `TerminalView`, but
+    /// Click-to-focus moves platform focus into a leaf view directly, but
     /// `MainPane.focused` only changes when we ourselves issue a focus call.
     /// Without this sync the user could click pane A, press Cmd-D, and end up
     /// splitting pane B (whichever was last action-focused).
@@ -244,8 +312,8 @@ impl MainPane {
         let Some(active) = window.focused(cx) else {
             return;
         };
-        for (id, view) in &self.panes {
-            if view.read(cx).focus_handle(cx) == active {
+        for (id, content) in &self.panes {
+            if content.focus_handle(cx) == active {
                 self.focused = *id;
                 return;
             }
@@ -274,9 +342,10 @@ impl MainPane {
             tracing::warn!("split target not in tree; dropping new pane");
             return;
         }
-        let sub = observe_pane_focus(&view, new_id, cx);
+        let content = PaneContent::Terminal(view);
+        let sub = observe_pane_focus(&content, new_id, cx);
         self._pane_observers.insert(new_id, sub);
-        self.panes.insert(new_id, view);
+        self.panes.insert(new_id, content);
         self.focused = new_id;
         focus_pane(&self.panes, new_id, window, cx);
         self.topology_version += 1;
@@ -423,34 +492,46 @@ impl MainPane {
 }
 
 fn focus_pane(
-    panes: &HashMap<PaneId, Entity<TerminalView>>,
+    panes: &HashMap<PaneId, PaneContent>,
     id: PaneId,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if let Some(view) = panes.get(&id) {
-        let handle = view.read(cx).focus_handle(cx);
+    if let Some(content) = panes.get(&id) {
+        let handle = content.focus_handle(cx);
         handle.focus(window, cx);
     }
 }
 
-/// Observe `view` and mirror its focus state into `MainPane.focused`.
-/// Click-to-focus moves platform focus into a `TerminalView` directly;
-/// without this observer, `MainPane.focused` would lag until the next
-/// action handler ran `sync_focused_from_window`. That lag broke
-/// "restore last-interacted pane on project switch" because the field
-/// was stale by capture time.
+/// Observe a pane's content entity and mirror its focus state into
+/// `MainPane.focused`. Click-to-focus moves platform focus into the leaf
+/// view directly; without this observer, `MainPane.focused` would lag
+/// until the next action handler ran `sync_focused_from_window`. That lag
+/// broke "restore last-interacted pane on project switch" because the
+/// field was stale by capture time.
+///
+/// Each PaneContent variant gets its own typed observer because GPUI's
+/// `cx.observe` is generic over the watched entity type — there is no
+/// way to subscribe to "either Terminal or Editor" with one call.
 fn observe_pane_focus(
-    view: &Entity<TerminalView>,
+    content: &PaneContent,
     pane_id: PaneId,
     cx: &mut Context<MainPane>,
 ) -> Subscription {
-    cx.observe(view, move |this, view, cx| {
-        if view.read(cx).focused() && this.focused != pane_id {
-            this.focused = pane_id;
-        }
-        cx.notify();
-    })
+    match content {
+        PaneContent::Terminal(view) => cx.observe(view, move |this, view, cx| {
+            if view.read(cx).focused() && this.focused != pane_id {
+                this.focused = pane_id;
+            }
+            cx.notify();
+        }),
+        PaneContent::Editor(view) => cx.observe(view, move |this, view, cx| {
+            if view.read(cx).focused() && this.focused != pane_id {
+                this.focused = pane_id;
+            }
+            cx.notify();
+        }),
+    }
 }
 
 fn available_area(
@@ -467,7 +548,7 @@ fn available_area(
 
 fn dispatch_grids_inner(
     node: &PaneTree,
-    panes: &HashMap<PaneId, Entity<TerminalView>>,
+    panes: &HashMap<PaneId, PaneContent>,
     w: f32,
     h: f32,
     metrics: &CellMetrics,
@@ -484,7 +565,10 @@ fn dispatch_grids_inner(
             }
             let cols = metrics.cols_in(w).max(MIN_COLS);
             let rows = metrics.rows_in(h).max(MIN_ROWS);
-            if let Some(view) = panes.get(id) {
+            // Editor leaves participate in the layout but do not own a PTY
+            // grid — skip them. Terminal leaves stage the resize on the
+            // backend.
+            if let Some(PaneContent::Terminal(view)) = panes.get(id) {
                 view.update(cx, |v, _| v.set_target_grid(cols, rows));
             }
         }

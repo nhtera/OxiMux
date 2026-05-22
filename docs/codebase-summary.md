@@ -1,7 +1,7 @@
 # OxiMux — Codebase Summary
 
 **Updated**: 2026-05-23  
-**Phase**: 5 — relay hardening done; editor steps 1-4 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI)  
+**Phase**: 5 — relay hardening done; editor steps 1-5 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI + pane-as-editor-host)  
 **Tests**: 510+ passed (editor crate: 28 tests — 21 prior + 7 file_tree integration; app crate: +8 file_tree_view unit tests)
 
 ---
@@ -53,7 +53,9 @@ src/
     │   ├── match_engine.rs pure scorer: prefix > consecutive > subsequence (no external crate)
     │   └── palette_modal.rs pure render: card + header chip + result list
     ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)
-    ├── main_pane.rs        pane binary-tree; split/close/focus actions
+    ├── main_pane.rs        pane binary-tree; split/close/focus actions; each leaf holds
+    │                       PaneContent enum (Terminal | Editor); open_editor_in_focused_pane
+    │                       replaces focused leaf content; same-path short-circuit
     ├── pane_tree.rs        pure PaneTree data structure (weight-aware)
     ├── pane_layout.rs      layout helpers
     ├── tabbed_pane.rs      TabbedPane entity: tab strip + active terminal
@@ -70,7 +72,7 @@ src/
     ├── cell_metrics.rs     character cell size constants
     ├── file_tree_view.rs   FileTreeView GPUI entity (step 4); subscribes to Entity<FileTree> from oximux-editor;
     │                       lazy expand via placeholder child (RowKind::Placeholder sentinel → real rows on Loaded event);
-    │                       on_open: Arc<dyn Fn(PathBuf,…)> fires on file click; --file-tree-spike standalone binary
+    │                       on_open: Arc<dyn Fn(PathBuf,…)> fires on file click; wired to WorkspaceRoot::open_file_in_active_pane (step 5)
     ├── file_explorer/      FileExplorer entity; virtualized git-aware file tree (uniform_list, lazy load, git status badges)
     │   ├── mod.rs          FileExplorer entity; state machine; window-activation refresh trigger
     │   ├── tree_state.rs   flat-row build, expand toggle, should_include filter
@@ -78,8 +80,9 @@ src/
     │   ├── row_render.rs   build_row_plan pure helper → RowPlan
     │   └── fs_load.rs      async tokio read_dir; 5s timeout; symlink skip; 12-deep guard
     ├── right_sidebar/
-    │   ├── mod.rs          RightSidebar entity; tab switching; hosts FileExplorer (Explorer) + SearchPanel (Search) + GitPanel+DiffView (SourceControl)
-    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl; icon_path() per tab
+    │   ├── mod.rs          RightSidebar entity; tab switching; hosts FileExplorer (Explorer) + SearchPanel (Search) + GitPanel+DiffView (SourceControl) + FileTreeView (Files)
+    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl | Files; icon_path() per tab
+    │   │                   Files tab: always visible (no repo gate); hosts FileTreeView; SelectFilesTab action bound to Cmd+Shift+T
     │   ├── activity_bar.rs top tab bar (SVG icons) + persistent collapsed rail + PanelRight toggle
     │   └── layout.rs       layout constants
     ├── search_panel/       SearchPanel entity; ripgrep --json shell-out; debounced + cancellation
