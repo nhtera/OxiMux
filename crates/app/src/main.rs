@@ -22,6 +22,9 @@ use oximux_app::actions::{
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal, SplitVertical,
     ToggleLeftSidebar, ToggleRightSidebar,
 };
+// SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
+// crate dependency: oximux-app → oximux-editor → oximux-app would be a cycle.
+use oximux_editor::SaveFile;
 use oximux_app::assets::CompositeAssets;
 use oximux_app::relay_supervisor::{RelaySupervisor, SupervisorError};
 use oximux_app::shell::terminal_view::install_shared_backend;
@@ -171,6 +174,9 @@ fn main() {
             // built-in adapter. Throwaway stopgap until step 10 ships the
             // inline-popover adapter picker on the `+` button.
             KeyBinding::new("cmd-shift-a", NewAgent, None),
+            // cmd-s saves the active editor buffer. Handled by EditorView's
+            // root div via `.on_action`; no-op when no editor is focused.
+            KeyBinding::new("cmd-s", SaveFile, None),
         ]);
         cx.activate(true);
 

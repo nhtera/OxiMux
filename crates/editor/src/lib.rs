@@ -5,11 +5,12 @@
 //! client (`mod lsp`) that drives rust-analyzer over stdio and feeds the
 //! editor's `HoverProvider` + `DiagnosticSet` surfaces.
 //!
-//! Phase 5 step 1 (spike): only the editor surface ships in this slice.
-//! LSP modules land in step 1 days 2-3.
+//! Step 2 adds: dirty flag, Cmd+S save, LSP didChange/didSave/didClose.
+//! `lsp_bridge` is extracted from `editor_view` to keep each file ≤300 LOC.
 
 pub mod editor_view;
 pub mod lsp;
+pub mod lsp_bridge;
 
-pub use editor_view::{EditorView, language_for_path};
+pub use editor_view::{EditorView, SaveFile, language_for_path};
 pub use lsp::{LspClient, LspHoverProvider, path_to_file_uri};

@@ -9,11 +9,8 @@
 //!       - responses by id -> oneshot reply
 //!       - `textDocument/publishDiagnostics` -> tokio broadcast channel
 //!       - everything else -> trace log + drop
-//!   - Expose typed helpers: `did_open`, `hover`.
-//!
-//! Scope is the Phase 5 step-1 spike: exactly enough to drive a hover +
-//! diagnostics decision gate against real rust-analyzer. `didChange`,
-//! `definition`, cancellation, completion, code actions are out of scope.
+//!   - Expose typed helpers: `did_open`, `did_change`, `did_save`,
+//!     `did_close`, `hover`.
 
 use std::{
     collections::HashMap,
@@ -28,10 +25,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use lsp_types::{
-    ClientCapabilities, DidOpenTextDocumentParams, Hover, HoverParams, InitializeParams,
+    ClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, Hover, HoverParams, InitializeParams,
     InitializeResult, InitializedParams, Position, PublishDiagnosticsParams,
-    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, WorkDoneProgressParams, notification::Notification as _,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, notification::Notification as _,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -46,7 +45,7 @@ use tokio::{
 
 use super::transport::{buffered, encode_frame, read_frame};
 
-/// 5-second cap on every awaited LSP request. Helix and early Zed both
+/// 5-second cap on every awaited LSP request. Helix and early editors
 /// skipped `$/cancelRequest` and relied on the timeout instead — see
 /// `phase-05-step-01-editor-lsp-spike-plan.md` OQ3.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -171,9 +170,9 @@ impl LspClient {
         Ok(result)
     }
 
-    /// Issue a `textDocument/didOpen` notification. The spike opens one
-    /// file at startup; richer document sync (didChange, didSave) lands
-    /// in Phase 5 step 2.
+    /// Issue a `textDocument/didOpen` notification. Carries the initial
+    /// buffer text at `version` 1; each subsequent change increments the
+    /// version via `did_change`.
     pub fn did_open(&self, uri: Uri, language_id: &str, version: i32, text: String) -> Result<()> {
         self.notify::<lsp_types::notification::DidOpenTextDocument>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
@@ -183,6 +182,54 @@ impl LspClient {
                 text,
             },
         })
+    }
+
+    /// Issue a `textDocument/didChange` notification using full-document
+    /// sync (Language Server Protocol §3.17.2: `range: None` = full
+    /// replacement). `version` must be strictly monotonic per open document.
+    /// Sync is full-document; incremental sync is deferred to a later step.
+    ///
+    /// Accepts a pre-parsed `&Uri` (cached on `EditorView`) so the caller
+    /// avoids re-encoding the path on every keystroke (H1 fix).
+    pub fn did_change(&self, uri: &Uri, version: i32, text: String) -> Result<()> {
+        self.notify::<lsp_types::notification::DidChangeTextDocument>(
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(uri.clone(), version),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text,
+                }],
+            },
+        )
+    }
+
+    /// Issue a `textDocument/didSave` notification. Sends no text payload —
+    /// the server uses the last-received `didChange` text. Call only after
+    /// the file has been written to disk successfully.
+    ///
+    /// Accepts a pre-parsed `&Uri` (cached on `EditorView`) to avoid
+    /// redundant parse/allocation (H1 fix — consistent with `did_change`).
+    pub fn did_save(&self, uri: &Uri) -> Result<()> {
+        self.notify::<lsp_types::notification::DidSaveTextDocument>(
+            DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                text: None,
+            },
+        )
+    }
+
+    /// Issue a `textDocument/didClose` notification. After this the server
+    /// stops tracking the document. Call when the buffer is torn down.
+    ///
+    /// Accepts a pre-parsed `&Uri` (cached on `EditorView`) to avoid
+    /// redundant parse/allocation (H1 fix — consistent with `did_change`).
+    pub fn did_close(&self, uri: &Uri) -> Result<()> {
+        self.notify::<lsp_types::notification::DidCloseTextDocument>(
+            DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            },
+        )
     }
 
     /// Request hover info at `position` for the file at `uri`. The
@@ -458,7 +505,7 @@ mod tests {
     #[test]
     fn path_to_file_uri_percent_encodes_spaces() {
         // macOS `~/Library/Application Support/...` has a space — without
-        // percent-encoding the URI doesn't round-trip against rust-analyzer's
+        // percent-encoding the URI doesn't round-trip against the server's
         // response URI and `params.uri != uri` silently drops diagnostics
         // (H2 / H3, code-review 260522-0240).
         let uri = path_to_file_uri(Path::new("/tmp/has space/foo.rs")).unwrap();
@@ -469,4 +516,8 @@ mod tests {
         );
         assert!(!s.contains(' '), "raw space leaked into URI: {s:?}");
     }
+
 }
+// LSP notification serialization tests live in
+// `crates/editor/tests/lsp_notification_serialization.rs` to keep this
+// file under 500 LOC (xtask file-size-lint warn threshold).
