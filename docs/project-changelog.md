@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-23 — Phase 5 / Step 03 — File tree backend (ignore + notify-debouncer-full)
+
+**Status**: 7 integration tests green; cargo check/clippy clean; file-size-lint pass  
+**Touches**: `crates/editor/src/file_tree/` (NEW), `crates/editor/tests/file_tree_tests.rs` (NEW), `crates/editor/src/lib.rs`, `crates/editor/Cargo.toml`, root `Cargo.toml`
+
+#### feat(editor): phase-05 step 3 — file tree backend
+
+- **`FileTree` GPUI entity** (`file_tree/mod.rs`): headless; emits `FileTreeEvent::{Loaded, Refresh, WatchError}`; `cx.spawn` drives the debounced watcher event loop; `cx.background_executor().spawn` runs the walker
+- **Lazy single-level walker** (`file_tree/walker.rs`): `ignore`-crate `WalkBuilder::max_depth(1)` + `filter_entry(SKIP_NAMES)`; `sort_entries` dirs-first ASCII-lowercase alpha; gitignore-aware (requires `.git` marker in root)
+- **FSEvents watcher** (`file_tree/watcher.rs`): `notify_debouncer_full::new_debouncer` 200ms debounce; closure forwards into tokio mpsc; `is_ignored` + `find_node_to_invalidate` are pure free fns
+- **`SKIP_NAMES` const** shared by walker + watcher — single source of truth for filter list
+- **`remove_subtree`** recursive eviction on re-expand prevents grandchild node leaks and phantom `Refresh` events
+- No UI wired yet — step 4 owns the `uniform_list` render and UI diffing
+
+---
+
 ### 2026-05-22 — Phase 5 / Step 02 — Editor save round-trip + LSP textDocument lifecycle
 
 **Status**: all automated gates pass (cargo check, clippy -D warnings, 21 editor tests, file-size-lint); smoke green  

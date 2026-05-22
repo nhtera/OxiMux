@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-05-22  
-**Phase**: 5 — relay hardening done; editor save round-trip + LSP didChange/didSave/didClose shipped (step 2 smoke green)  
-**Tests**: 510+ passed (editor crate: 21 tests — 17 unit + 4 integration)
+**Updated**: 2026-05-23  
+**Phase**: 5 — relay hardening done; editor save round-trip + LSP lifecycle (step 2) + file tree backend (step 3) shipped  
+**Tests**: 510+ passed (editor crate: 28 tests — 21 prior + 7 file_tree integration)
 
 ---
 
@@ -286,10 +286,32 @@ src/
 
 ```
 tests/
-└── lsp_notification_serialization.rs   4 integration tests (step 2): did_change
-                                        full-sync JSON shape, did_save, did_close,
-                                        version monotonic; no GPUI runtime needed
+├── lsp_notification_serialization.rs   4 integration tests (step 2): did_change
+│                                       full-sync JSON shape, did_save, did_close,
+│                                       version monotonic; no GPUI runtime needed
+└── file_tree_tests.rs                  7 integration tests (step 3): load, expand,
+                                        collapse, refresh, skip-names, watcher round-trip;
+                                        tempfile::TempDir with .git marker (required for
+                                        WalkBuilder gitignore engagement)
 ```
+
+### file_tree/ — headless file-tree backend (Phase 5 step 3)
+
+```
+src/file_tree/
+├── mod.rs      FileTree GPUI entity; TreeNodeId / FileTreeNode / FileTreeEvent
+│               SKIP_NAMES const (shared filter list — prevents walker/watcher divergence)
+│               remove_subtree: recursive eviction from nodes + open_dirs on re-expand
+│               cx.spawn drives the watcher event loop
+├── walker.rs   ignore-crate WalkBuilder::max_depth(1) + filter_entry(SKIP_NAMES)
+│               returns (PathBuf, bool) direct children; sort_entries: dirs-first alpha
+└── watcher.rs  spawn_watcher wraps notify_debouncer_full::new_debouncer (200ms)
+                closure forwards DebounceEventResult into tokio mpsc
+                is_ignored + find_node_to_invalidate are pure free fns
+```
+
+`FileTreeEvent` variants: `Loaded(TreeNodeId)`, `Refresh(TreeNodeId)`, `WatchError(String)`.  
+Step 4 owns UI diffing; step 3 emits coarse `Refresh(id)` only.
 
 Workspace deps: `lsp-types = "0.97"`, `url = "2"` (percent-encoding for file URIs).  
 New action: `SaveFile` (in `oximux-editor`; bound in `app/src/main.rs` via `use oximux_editor::SaveFile`).

@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-05-22  
-**Phase**: 5 — relay hardening done; editor+LSP steps 1-2 shipped (save round-trip + LSP lifecycle go)
+**Updated**: 2026-05-23  
+**Phase**: 5 — relay hardening done; editor+LSP steps 1-3 shipped (save round-trip + LSP lifecycle + file tree backend)
 
 ---
 
@@ -298,6 +298,38 @@ gpui-component's undo/redo calls `replace_text_in_range_silent` which bypasses `
 
 ---
 
+### Step 3 — file tree backend (headless entity)
+
+```
+FileTree (GPUI entity)
+  ├── load(root_path, cx)
+  │     cx.background_executor().spawn → walker::walk_dir(root, SKIP_NAMES)
+  │       WalkBuilder::max_depth(1) + filter_entry → Vec<(PathBuf, bool)>
+  │       sort_entries: dirs first, then ASCII-lowercase alpha
+  │     → inserts children into nodes map; emits FileTreeEvent::Loaded(id)
+  │
+  ├── expand(node_id, cx)
+  │     remove_subtree(id) — recursive evict from nodes + open_dirs (prevents phantom Refresh)
+  │     then re-runs walker for that dir → Loaded(id)
+  │
+  ├── collapse(node_id) — marks closed; children stay in map (lazy re-walk on next expand)
+  │
+  └── cx.spawn → watcher event loop
+        spawn_watcher(root, tx) wraps notify_debouncer_full::new_debouncer(200ms)
+          closure: DebounceEventResult → tx.send(paths)
+        loop: rx.recv() → is_ignored(path, SKIP_NAMES)
+                        → find_node_to_invalidate(path, nodes)
+                        → emits FileTreeEvent::Refresh(ancestor_id)
+```
+
+**Key invariants:**
+- Single FSEvents watch from root; userspace `is_ignored` filter in debounce callback (not kernel-level).
+- `SKIP_NAMES` const shared by walker + watcher — one place to add `node_modules` etc.
+- `notify` accessed via `notify_debouncer_full::notify` re-export; avoids two-versions-of-notify compile failure (debouncer 0.4 pins notify 7).
+- `Refresh(id)` is coarse — step 4 diffs against UI state; step 3 does not diff.
+
+---
+
 ## Key architectural constraints
 
 | Constraint | Enforcement |
@@ -319,7 +351,7 @@ gpui-component's undo/redo calls `replace_text_in_range_silent` which bypasses `
 | ACP agent protocol | v1.1 (ADR-004) |
 | Side-by-side diff | Phase 6 |
 | Blame, file history, commit graph | Phase 6 |
-| Editor + LSP full integration | Phase 5 step 3+ (steps 1-2 shipped; step 3 = file-tree backend) |
+| Editor + LSP full integration | Phase 5 step 4+ (steps 1-3 shipped; step 4 = file-tree UI render) |
 | SQLite persistence / session restore | Phase 4 |
 | Multi-agent dashboard | Phase 7 |
 | embeddable terminal library terminal backend | v2 (ADR in brief.md) |
