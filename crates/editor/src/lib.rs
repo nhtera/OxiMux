@@ -7,10 +7,15 @@
 //!
 //! Step 2 adds: dirty flag, Cmd+S save, LSP didChange/didSave/didClose.
 //! `lsp_bridge` is extracted from `editor_view` to keep each file ≤300 LOC.
+//!
+//! Step 3 adds the `file_tree` backend: headless GPUI entity emitting
+//! `FileTreeEvent` from an `ignore`-crate walker + `notify` watcher pair.
 
 pub mod editor_view;
+pub mod file_tree;
 pub mod lsp;
 pub mod lsp_bridge;
 
 pub use editor_view::{EditorView, SaveFile, language_for_path};
+pub use file_tree::{FileTree, FileTreeEvent, FileTreeNode, TreeNodeId};
 pub use lsp::{LspClient, LspHoverProvider, path_to_file_uri};

@@ -109,6 +109,23 @@ dirs = { version = "5", default-features = false }
 # (Linux is not a v1 target).
 rfd = { version = "0.14", default-features = false }
 
+# Phase 5 step 3 — file tree backend. `ignore` is the gitignore-aware
+# walker ripgrep uses; `WalkBuilder::max_depth(Some(1))` gives lazy
+# single-level enumeration. `notify-debouncer-full` drives FSEvents on
+# macOS with a 200ms debounce.
+ignore = "0.4"
+# Re-exports its bundled `notify` at `notify_debouncer_full::notify::*`
+# — depend on the debouncer and use the re-export to avoid two copies
+# of `notify` in the graph (a single direct `notify = "8"` next to
+# debouncer-full's pinned notify-7 silently produced trait-mismatch
+# compile errors). `DebounceEventHandler` has a blanket impl for any
+# `FnMut(DebounceEventResult) + Send + 'static`, so the watcher passes
+# a sync closure that forwards into a tokio mpsc (see watcher.rs) — no
+# special debouncer feature flag needed.
+notify-debouncer-full = "0.4"
+# Temp dirs for file-tree backend unit tests (dev-dep on the editor crate).
+tempfile = "3"
+
 [profile.dev]
 opt-level = 0
 debug = 1

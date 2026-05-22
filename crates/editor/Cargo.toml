@@ -35,3 +35,11 @@ serde_json = { workspace = true }
 
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+# Phase 5 step 3 — file tree backend. `notify` is re-exported through
+# `notify_debouncer_full::notify` so we don't list it twice in the graph.
+ignore                = { workspace = true }
+notify-debouncer-full = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
