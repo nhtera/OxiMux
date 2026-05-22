@@ -27,9 +27,9 @@ use oximux_app::relay_supervisor::{RelaySupervisor, SupervisorError};
 use oximux_app::shell::terminal_view::install_shared_backend;
 use oximux_app::state;
 use oximux_app::workspace_root::WorkspaceRoot;
+use oximux_git::Repository;
 use oximux_pty::TerminalBackend;
 use oximux_relay_client::RelayBackend;
-use oximux_git::Repository;
 use oximux_storage::Db;
 use tracing_subscriber::EnvFilter;
 
@@ -49,6 +49,18 @@ fn main() {
         .build()
         .expect("tokio runtime");
     let _rt_guard = rt.enter();
+
+    // Phase 5 step 1 spike: `--editor-spike` short-circuits the normal
+    // workspace boot and opens a single editor window on this file
+    // (`crates/app/src/main.rs`). The spike validates that
+    // gpui-component's `code_editor()` + tree-sitter highlight works
+    // before days 2-3 wire rust-analyzer into the LSP provider traits.
+    // The flag is intentionally undocumented in `--help` — it ships
+    // alongside the spike and disappears with it.
+    if std::env::args().any(|a| a == "--editor-spike") {
+        run_editor_spike();
+        return;
+    }
 
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
     // without the git column — the rest of the shell still works.
@@ -207,6 +219,79 @@ fn main() {
             })
             .detach();
             let view: AnyView = workspace.into();
+            cx.new(|cx| gpui_component::Root::new(view, window, cx))
+        });
+    });
+}
+
+/// Phase 5 step 1 spike entry point. Opens a single window mounting
+/// `EditorView` on `crates/app/src/main.rs`. The DB / repo / relay /
+/// workspace shell are all skipped so the spike isolates the editor +
+/// (days 2-3) LSP surface.
+///
+/// Step-1 day-1 deliverable: window opens, file content visible, Rust
+/// tree-sitter highlights render. No LSP wiring yet — that's day 2.
+fn run_editor_spike() {
+    use oximux_editor::EditorView;
+
+    // Day-1 verification (success criteria checkbox in the sub-plan):
+    // confirm the rt.enter guard above is in scope for callbacks. If
+    // this returns Err, the spike is a NO-GO before any window opens —
+    // every later LSP request via `cx.background_executor().spawn`
+    // would explode on `Handle::current()`.
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tracing::info!("editor-spike: tokio runtime context confirmed"),
+        Err(err) => {
+            eprintln!(
+                "editor-spike: NO-GO precondition failed — tokio handle not \
+                 in scope inside main(): {err}. The Phase 5 design assumes \
+                 rt.enter() guards `app.run`; spike cannot proceed."
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let file_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("crates/app/src/main.rs");
+    tracing::info!(file = %file_path.display(), "editor-spike: opening file");
+
+    let app = gpui_platform::application().with_assets(CompositeAssets);
+    app.run(move |cx| {
+        gpui_component::init(cx);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        {
+            let palette = oximux_settings::Theme::charcoal();
+            let component_theme = gpui_component::Theme::global_mut(cx);
+            component_theme.colors.input = palette.border_inactive;
+            component_theme.colors.ring = palette.focus_ring;
+        }
+        cx.activate(true);
+
+        let window_size = size(px(1100.0), px(800.0));
+        let bounds = Bounds::centered(None, window_size, cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(480.0), px(320.0))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("OxiMux — Editor Spike".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(12.), px(12.))),
+            }),
+            ..Default::default()
+        };
+
+        // Workspace root is the cwd — for OxiMux's own dogfood path that
+        // resolves to the repo root, which is what rust-analyzer wants.
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let file_for_window = file_path.clone();
+        let _ = cx.open_window(options, move |window, cx| {
+            let editor = cx.new(|cx| {
+                let mut v = EditorView::new(file_for_window.clone(), window, cx);
+                v.attach_lsp("rust-analyzer", "rust", workspace_root.clone(), cx);
+                v
+            });
+            let view: AnyView = editor.into();
             cx.new(|cx| gpui_component::Root::new(view, window, cx))
         });
     });

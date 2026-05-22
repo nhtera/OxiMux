@@ -4377,6 +4377,7 @@ dependencies = [
  "mac-notification-sys",
  "oximux-agents",
  "oximux-core",
+ "oximux-editor",
  "oximux-git",
  "oximux-pty",
  "oximux-relay-client",
@@ -4408,8 +4409,15 @@ name = "oximux-editor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gpui",
+ "gpui-component",
+ "lsp-types",
  "oximux-core",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

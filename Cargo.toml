@@ -85,6 +85,19 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Phase 5 editor + LSP. Pinned to match gpui-component's transitive
+# `lsp-types = "0.97"` so the `HoverProvider` trait surface (Hover,
+# Diagnostic, Position) is a single concrete type across the dep graph.
+# Two copies of `lsp_types` would force a conversion shim at every
+# provider boundary — see docs/gpui-pins.md for the same family of
+# trap the gpui crates are pinned against.
+lsp-types = { version = "0.97", features = ["proposed"] }
+# `url::Url::from_file_path` is the percent-encoding gate between
+# `Path` and the `file://` URI rust-analyzer expects. Used by the
+# editor crate's `path_to_file_uri`; paths with spaces / unicode /
+# reserved chars round-trip cleanly only with proper encoding.
+url = "2"
 # macOS Application Support directory resolution (see crates/app/src/main.rs).
 # default-features off: we only need `data_dir()` on macOS; the default
 # features pull in Windows/X11 helpers we never call.

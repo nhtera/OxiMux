@@ -1,12 +1,15 @@
 //! oximux-editor
 //!
-//! Wraps the gpui-component built-in code editor + file tree + LSP glue.
-//! v1 target: rust-analyzer working out of the box. The maturity spike for
-//! this crate is in Phase 5.
+//! Thin wrapper around `gpui-component`'s `Input` widget configured as a
+//! code editor (tree-sitter highlight built in), plus a hand-rolled LSP
+//! client (`mod lsp`) that drives rust-analyzer over stdio and feeds the
+//! editor's `HoverProvider` + `DiagnosticSet` surfaces.
 //!
-//! Phase 0 = empty placeholder so workspace `cargo check` is green.
+//! Phase 5 step 1 (spike): only the editor surface ships in this slice.
+//! LSP modules land in step 1 days 2-3.
 
-/// Placeholder. Phase 5 introduces `EditorView`, `FileTreeView`, `LspClient`.
-pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
+pub mod editor_view;
+pub mod lsp;
+
+pub use editor_view::{EditorView, language_for_path};
+pub use lsp::{LspClient, LspHoverProvider, path_to_file_uri};

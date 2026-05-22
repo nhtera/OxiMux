@@ -9,6 +9,29 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
+
+# GPUI shell + editor primitive. gpui-component already wraps tree-sitter
+# (rust/ts/js/go/json/markdown/...) and exposes the `Input` widget plus
+# the `HoverProvider` / `CompletionProvider` / `DefinitionProvider` traits
+# Phase 5 needs. We're a thin layer: file -> InputState -> Input render +
+# LspClient wiring the provider traits.
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+
+# LSP wire types. Pin matched to gpui-component's transitive `0.97` so the
+# provider trait signatures (gpui::Task<Result<Option<lsp_types::Hover>>>)
+# resolve to the same concrete type as ours — no conversion shim.
+lsp-types = { workspace = true }
+# url::Url::from_file_path percent-encodes paths into file:// URIs that
+# round-trip against rust-analyzer's response URIs — the naive
+# `format!("file://{}", path.display())` breaks for paths with spaces.
+url = { workspace = true }
+
+# Async runtime for the LSP child + stdio framing. Tokio is already alive
+# inside gpui callbacks (see crates/app/src/main.rs:47-51 rt.enter guard).
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 anyhow = { workspace = true }
 tracing = { workspace = true }
-# gpui-component editor wrapping lands in Phase 5; LSP glue too.
