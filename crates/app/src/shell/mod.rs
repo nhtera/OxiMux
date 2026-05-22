@@ -14,6 +14,7 @@ pub mod commit_dialog;
 pub mod confirm_dialog;
 pub mod diff_view;
 pub mod file_explorer;
+pub mod file_tree_view;
 pub mod git_panel;
 pub mod key_input;
 pub mod left_rail;

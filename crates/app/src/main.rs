@@ -65,6 +65,16 @@ fn main() {
         return;
     }
 
+    // Phase 5 step 4 spike: `--file-tree-spike` opens a standalone window
+    // mounting `FileTreeView` against the current working directory. Used
+    // to validate the lazy expand / placeholder / on_open click flow
+    // before step 5 wires the tree into the real workspace shell. The
+    // flag is intentionally undocumented in `--help`.
+    if std::env::args().any(|a| a == "--file-tree-spike") {
+        run_file_tree_spike();
+        return;
+    }
+
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
     // without the git column — the rest of the shell still works.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -299,6 +309,70 @@ fn run_editor_spike() {
             });
             let view: AnyView = editor.into();
             cx.new(|cx| gpui_component::Root::new(view, window, cx))
+        });
+    });
+}
+
+/// Phase 5 step 4 spike entry point. Opens a standalone window with
+/// `FileTreeView` mounted against the cwd. No DB / relay / workspace
+/// boot — just the file-tree pane in isolation, mirroring the
+/// editor-spike pattern at line 240. The `on_open` callback is a
+/// no-op `tracing::info!` until step 5 lands the real pane-split
+/// handler.
+fn run_file_tree_spike() {
+    use oximux_app::shell::file_tree_view::{FileTreeView, OnOpenFile};
+    use oximux_editor::FileTree;
+    use std::sync::Arc;
+
+    // Same tokio precondition the editor spike checks — `cx.spawn` inside
+    // `FileTree::new` calls `tokio::sync::mpsc` constructors which require
+    // a live runtime context.
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tracing::info!("file-tree-spike: tokio runtime context confirmed"),
+        Err(err) => {
+            eprintln!(
+                "file-tree-spike: NO-GO precondition failed — tokio handle \
+                 not in scope inside main(): {err}"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    tracing::info!(root = %cwd.display(), "file-tree-spike: opening tree");
+
+    let app = gpui_platform::application().with_assets(CompositeAssets);
+    app.run(move |cx| {
+        gpui_component::init(cx);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        cx.activate(true);
+
+        let window_size = size(px(400.0), px(800.0));
+        let bounds = Bounds::centered(None, window_size, cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(240.0), px(320.0))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("OxiMux — File Tree Spike".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(12.), px(12.))),
+            }),
+            ..Default::default()
+        };
+
+        let cwd_for_window = cwd.clone();
+        let _ = cx.open_window(options, move |window, cx| {
+            let tree = cx.new(|cx| FileTree::new(cwd_for_window.clone(), cx));
+            let on_open: OnOpenFile = Arc::new(|path, _window, _cx| {
+                tracing::info!(
+                    target: "file_tree_spike",
+                    "would open: {}",
+                    path.display()
+                );
+            });
+            let view = cx.new(|cx| FileTreeView::new(tree, on_open, window, cx));
+            let any: AnyView = view.into();
+            cx.new(|cx| gpui_component::Root::new(any, window, cx))
         });
     });
 }
