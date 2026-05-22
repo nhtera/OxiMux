@@ -101,9 +101,8 @@ impl RightSidebar {
         };
 
         let source_control = repo.as_ref().map(|repo| {
-            let diff_view = cx.new(|cx| {
-                DiffView::new(repo.clone(), theme, density, typography.clone(), cx)
-            });
+            let diff_view =
+                cx.new(|cx| DiffView::new(repo.clone(), theme, density, typography.clone(), cx));
             let git_panel = cx.new(|cx| {
                 GitPanel::new(
                     repo.clone(),

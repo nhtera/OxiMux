@@ -170,10 +170,9 @@ mod tests {
         });
         // PaneIds differ but the structural shape + weights match.
         match (&original, &restored) {
-            (
-                PaneTree::Split { weights: w1, .. },
-                PaneTree::Split { weights: w2, .. },
-            ) => assert_eq!(w1, w2),
+            (PaneTree::Split { weights: w1, .. }, PaneTree::Split { weights: w2, .. }) => {
+                assert_eq!(w1, w2)
+            }
             _ => panic!("structure mismatch"),
         }
         assert_eq!(count_leaves(&snap), 3);
@@ -208,7 +207,8 @@ mod tests {
         // Snapshots from pre-step-15 builds had no `agent` field. Verify
         // serde-default keeps them readable so the user's first relaunch
         // after upgrade doesn't drop their tab layout.
-        let legacy = r#"{"tabs":[{"label":"Terminal 1","tree":"Leaf"}],"active":0,"next_label_n":2}"#;
+        let legacy =
+            r#"{"tabs":[{"label":"Terminal 1","tree":"Leaf"}],"active":0,"next_label_n":2}"#;
         let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.tabs.len(), 1);
         assert!(parsed.tabs[0].agent.is_none());

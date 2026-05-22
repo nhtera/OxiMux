@@ -24,12 +24,7 @@ impl PaneBufferRepo {
     }
 
     /// Upsert one pane's bytes at the given ordinal.
-    pub fn set(
-        &self,
-        project_id: &str,
-        ordinal: u32,
-        bytes: &[u8],
-    ) -> Result<(), StorageError> {
+    pub fn set(&self, project_id: &str, ordinal: u32, bytes: &[u8]) -> Result<(), StorageError> {
         let ts = now();
         self.db.with_conn(|c| {
             c.execute(

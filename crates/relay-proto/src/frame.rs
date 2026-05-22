@@ -1,5 +1,5 @@
 use bincode::config::Configuration;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::ProtoError;
 use crate::messages::{Notification, Request, Response};
@@ -127,8 +127,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, ProtoError> {
         return Ok(None);
     }
     let kind = FrameKind::from_byte(buf[0])?;
-    let payload_len =
-        u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    let payload_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
 
     if payload_len > MAX_FRAME_SIZE {
         return Err(ProtoError::FrameTooLarge(payload_len as u64));
@@ -284,7 +283,11 @@ mod tests {
 
     #[test]
     fn frame_kind_byte_round_trip() {
-        for kind in [FrameKind::Request, FrameKind::Response, FrameKind::Notification] {
+        for kind in [
+            FrameKind::Request,
+            FrameKind::Response,
+            FrameKind::Notification,
+        ] {
             assert_eq!(FrameKind::from_byte(kind.as_byte()).unwrap(), kind);
         }
     }
@@ -330,7 +333,9 @@ mod tests {
         // error paths cover the variants we touch.
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         for _ in 0..256 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let len = (state as usize) % 64;
             let bytes: Vec<u8> = (0..len)
                 .map(|i| ((state >> (i % 8 * 8)) & 0xFF) as u8)

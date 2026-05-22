@@ -28,8 +28,8 @@ use crate::shell::terminal_view::{TerminalView, attach_pty_existing, spawn_local
 use crate::shell::workspace_tabs::WorkspaceTabs;
 use crate::workspace_root::WorkspaceRoot;
 
-use oximux_pty::TerminalSessionId;
 use oximux_agents::SharedBackend;
+use oximux_pty::TerminalSessionId;
 use std::collections::HashSet;
 
 const DEFAULT_AGENT_COLS: u16 = 120;
@@ -58,7 +58,9 @@ pub fn compute_attach_hints(
     pane_relay_ids
         .into_iter()
         .filter_map(|(ord, pty_id, session)| {
-            let session_ok = current_external_session.map(|s| s == session).unwrap_or(false);
+            let session_ok = current_external_session
+                .map(|s| s == session)
+                .unwrap_or(false);
             (session_ok && live_external_ids.contains(&pty_id)).then_some((ord, pty_id))
         })
         .collect()
@@ -190,7 +192,11 @@ fn restore_agent_tab(
         let session_id = match cli_runtime.start_session(cfg).await {
             Ok(id) => id,
             Err(err) => {
-                tracing::warn!(?err, adapter = adapter_id, "agent restore: start_session failed");
+                tracing::warn!(
+                    ?err,
+                    adapter = adapter_id,
+                    "agent restore: start_session failed"
+                );
                 return;
             }
         };
@@ -395,12 +401,16 @@ mod attach_hint_tests {
     #[test]
     fn mixed_results_preserve_only_matches() {
         let rows = vec![
-            (0, "pty-live".into(), "sess".into()),       // ok
-            (1, "pty-dead".into(), "sess".into()),       // not in live set
-            (2, "pty-other".into(), "sess-old".into()),  // session mismatch
-            (3, "pty-live2".into(), "sess".into()),      // ok
+            (0, "pty-live".into(), "sess".into()),      // ok
+            (1, "pty-dead".into(), "sess".into()),      // not in live set
+            (2, "pty-other".into(), "sess-old".into()), // session mismatch
+            (3, "pty-live2".into(), "sess".into()),     // ok
         ];
-        let hints = compute_attach_hints(rows, &live(&["pty-live", "pty-live2", "pty-other"]), Some("sess"));
+        let hints = compute_attach_hints(
+            rows,
+            &live(&["pty-live", "pty-live2", "pty-other"]),
+            Some("sess"),
+        );
         assert_eq!(hints.len(), 2);
         assert_eq!(hints.get(&0), Some(&"pty-live".to_string()));
         assert_eq!(hints.get(&3), Some(&"pty-live2".to_string()));
@@ -421,7 +431,11 @@ pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Opti
     match serde_json::from_str::<PersistedTabs>(&raw) {
         Ok(snap) => Some(snap),
         Err(err) => {
-            tracing::warn!(?err, project_id, "load_persisted_tabs: parse failed; ignoring");
+            tracing::warn!(
+                ?err,
+                project_id,
+                "load_persisted_tabs: parse failed; ignoring"
+            );
             None
         }
     }
@@ -456,11 +470,7 @@ pub(crate) fn load_pane_buffers(repo: &PaneBufferRepo, project_id: &str) -> Vec<
 
 /// Serialize + upsert the snapshot. Best-effort; failure leaves the
 /// in-memory state intact and is logged at warn.
-pub(crate) fn save_persisted_tabs(
-    repo: &SettingsRepo,
-    project_id: &str,
-    snap: &PersistedTabs,
-) {
+pub(crate) fn save_persisted_tabs(repo: &SettingsRepo, project_id: &str, snap: &PersistedTabs) {
     let key = settings_key(project_id);
     let json = match serde_json::to_string(snap) {
         Ok(j) => j,

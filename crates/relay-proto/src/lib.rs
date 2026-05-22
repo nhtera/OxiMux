@@ -6,7 +6,7 @@ pub mod frame;
 pub mod messages;
 
 pub use error::{ErrCode, ProtoError};
-pub use frame::{decode_frame, encode_frame, Frame, FrameKind, MAX_FRAME_SIZE};
+pub use frame::{Frame, FrameKind, MAX_FRAME_SIZE, decode_frame, encode_frame};
 pub use messages::{
     Hello, HelloAck, Notification, PROTOCOL_VERSION, PtyDescriptor, PtyStats, Request, Response,
 };

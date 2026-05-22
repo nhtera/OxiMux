@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use oximux_relay_proto::{
-    Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response,
-};
+use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
 use thiserror::Error;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};

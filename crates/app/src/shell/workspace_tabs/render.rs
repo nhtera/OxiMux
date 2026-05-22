@@ -4,7 +4,7 @@
 //! `Entity<WorkspaceTabs>` passed in.
 
 use gpui::{
-    AnyElement, App, Entity, IntoElement, InteractiveElement, MouseButton, MouseDownEvent,
+    AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, svg,
 };

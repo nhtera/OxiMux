@@ -130,9 +130,11 @@ fn snapshot_mirrors_remote_state() {
 
     // Wait for the bytes to flow back; drain_events advances state
     // as a side-effect of the pump task.
-    let _ = drain_until(&mut fx.backend, Duration::from_secs(3), |e| {
-        matches!(e, TerminalEvent::Output { bytes, .. } if String::from_utf8_lossy(bytes).contains("LOCAL_GRID_OK"))
-    });
+    let _ = drain_until(
+        &mut fx.backend,
+        Duration::from_secs(3),
+        |e| matches!(e, TerminalEvent::Output { bytes, .. } if String::from_utf8_lossy(bytes).contains("LOCAL_GRID_OK")),
+    );
 
     let snap = fx.backend.snapshot(id).expect("snapshot");
     let rendered: String = snap
@@ -145,9 +147,7 @@ fn snapshot_mirrors_remote_state() {
         "grid missing marker; got {rendered:?}"
     );
 
-    fx.backend
-        .write(id, b"exit\n")
-        .expect("write exit");
+    fx.backend.write(id, b"exit\n").expect("write exit");
     let _ = drain_until(&mut fx.backend, Duration::from_secs(2), |e| {
         matches!(e, TerminalEvent::Exit { .. })
     });
@@ -180,9 +180,7 @@ fn keystroke_echo_latency() {
     // Disable line-editor echo confusion: tell the shell to echo a
     // unique marker on each input by reading one char in a loop. Use
     // `cat` so every byte we write comes back verbatim, no buffering.
-    fx.backend
-        .write(id, b"cat\n")
-        .expect("start cat");
+    fx.backend.write(id, b"cat\n").expect("start cat");
     std::thread::sleep(Duration::from_millis(200));
     let _ = fx.backend.drain_events();
 
@@ -194,9 +192,10 @@ fn keystroke_echo_latency() {
         // Spin-drain until we see at least one Output containing 'x'.
         loop {
             let events = fx.backend.drain_events();
-            if events.iter().any(|e| {
-                matches!(e, TerminalEvent::Output { bytes, .. } if bytes.contains(&b'x'))
-            }) {
+            if events
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::Output { bytes, .. } if bytes.contains(&b'x')))
+            {
                 samples_us.push(t0.elapsed().as_micros());
                 break;
             }
@@ -261,9 +260,10 @@ fn keystroke_echo_latency_in_process() {
         backend.write(id, b"x").expect("write");
         loop {
             let events = backend.drain_events();
-            if events.iter().any(|e| {
-                matches!(e, TerminalEvent::Output { bytes, .. } if bytes.contains(&b'x'))
-            }) {
+            if events
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::Output { bytes, .. } if bytes.contains(&b'x')))
+            {
                 samples_us.push(t0.elapsed().as_micros());
                 break;
             }
@@ -303,9 +303,11 @@ fn attach_existing_replays_into_local_state() {
         .write(original_id, b"printf 'PERSIST_MARKER\\n'\n")
         .expect("write");
     // Wait for the byte to land in the daemon's ring buffer.
-    let _ = drain_until(&mut fx.backend, Duration::from_secs(3), |e| {
-        matches!(e, TerminalEvent::Output { bytes, .. } if String::from_utf8_lossy(bytes).contains("PERSIST_MARKER"))
-    });
+    let _ = drain_until(
+        &mut fx.backend,
+        Duration::from_secs(3),
+        |e| matches!(e, TerminalEvent::Output { bytes, .. } if String::from_utf8_lossy(bytes).contains("PERSIST_MARKER")),
+    );
     let client = Arc::clone(fx.backend.client());
     let relay_pty_id = {
         let resp = fx
@@ -342,4 +344,3 @@ fn attach_existing_replays_into_local_state() {
     fx.backend.close(attached_id).expect("close");
     fx.backend.close(original_id).expect("close");
 }
-

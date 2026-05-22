@@ -171,15 +171,11 @@ fn spawn_idle_gc(
         let mut idle_for = Duration::ZERO;
         loop {
             tokio::time::sleep(tick).await;
-            let idle = registry.live_count() == 0
-                && active_sessions.load(Ordering::Relaxed) == 0;
+            let idle = registry.live_count() == 0 && active_sessions.load(Ordering::Relaxed) == 0;
             if idle {
                 idle_for += tick;
                 if idle_for >= timeout {
-                    tracing::info!(
-                        ?idle_for,
-                        "idle threshold reached; shutting down"
-                    );
+                    tracing::info!(?idle_for, "idle threshold reached; shutting down");
                     shutdown.notify_waiters();
                     return;
                 }
@@ -312,7 +308,11 @@ async fn session_loop(
     let outbound_for_pump = outbound_tx.clone();
     let pump = tokio::spawn(async move {
         while let Some(n) = notif_rx.recv().await {
-            if outbound_for_pump.send(Frame::Notification(n)).await.is_err() {
+            if outbound_for_pump
+                .send(Frame::Notification(n))
+                .await
+                .is_err()
+            {
                 break;
             }
         }

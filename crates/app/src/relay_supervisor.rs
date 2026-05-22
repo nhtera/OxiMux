@@ -281,8 +281,7 @@ fn write_token(path: &Path, token: &str) -> Result<()> {
         .write(true)
         .open(path)
         .with_context(|| format!("open token file {}", path.display()))?;
-    f.write_all(token.as_bytes())
-        .context("write token bytes")?;
+    f.write_all(token.as_bytes()).context("write token bytes")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

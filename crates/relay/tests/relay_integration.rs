@@ -7,9 +7,7 @@ use std::time::Duration;
 
 use oximux_relay::codec::{read_frame, write_frame};
 use oximux_relay::server::{ServerConfig, run_server};
-use oximux_relay_proto::{
-    Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response,
-};
+use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -267,10 +265,11 @@ async fn bad_token_rejected_with_auth_failed() {
     let f = read_frame(&mut stream, &mut buf).await.unwrap();
     match f {
         Frame::Response {
-            response: Response::Err {
-                code: oximux_relay_proto::ErrCode::AuthFailed,
-                ..
-            },
+            response:
+                Response::Err {
+                    code: oximux_relay_proto::ErrCode::AuthFailed,
+                    ..
+                },
             ..
         } => {}
         other => panic!("expected AuthFailed, got {other:?}"),
@@ -298,10 +297,11 @@ async fn version_mismatch_is_rejected() {
     let f = read_frame(&mut stream, &mut buf).await.unwrap();
     match f {
         Frame::Response {
-            response: Response::Err {
-                code: oximux_relay_proto::ErrCode::VersionMismatch,
-                ..
-            },
+            response:
+                Response::Err {
+                    code: oximux_relay_proto::ErrCode::VersionMismatch,
+                    ..
+                },
             ..
         } => {}
         other => panic!("expected VersionMismatch, got {other:?}"),
@@ -340,10 +340,9 @@ async fn shutdown_request_breaks_accept_loop_when_no_ptys_alive() {
     assert!(matches!(resp, Response::Ok), "shutdown got {resp:?}");
     drop(s);
 
-    let joined =
-        tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("server did not exit after Shutdown");
+    let joined = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("server did not exit after Shutdown");
     assert!(joined.is_ok(), "server task panicked: {joined:?}");
 }
 
@@ -424,7 +423,11 @@ async fn stats_endpoint_returns_per_pty_counters() {
         .find(|s| s.pty_id == pty_id)
         .expect("stats missing the spawned pty");
     assert_eq!(mine.bytes_in, written.len() as u64);
-    assert!(mine.bytes_out >= written.len() as u64, "bytes_out = {}", mine.bytes_out);
+    assert!(
+        mine.bytes_out >= written.len() as u64,
+        "bytes_out = {}",
+        mine.bytes_out
+    );
 }
 
 #[tokio::test]
@@ -447,10 +450,9 @@ async fn idle_gc_shuts_down_when_no_clients_and_no_ptys() {
 
     // No client ever connects. The idle GC should fire and break the
     // accept loop within ~5 ticks.
-    let joined =
-        tokio::time::timeout(Duration::from_secs(3), handle)
-            .await
-            .expect("idle GC never triggered shutdown");
+    let joined = tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("idle GC never triggered shutdown");
     assert!(joined.is_ok());
 }
 
@@ -534,5 +536,8 @@ async fn close_request_removes_pty_from_list() {
         Response::PtyList(v) => v,
         other => panic!("{other:?}"),
     };
-    assert!(listed.iter().all(|p| p.pty_id != pty_id), "pty still listed");
+    assert!(
+        listed.iter().all(|p| p.pty_id != pty_id),
+        "pty still listed"
+    );
 }

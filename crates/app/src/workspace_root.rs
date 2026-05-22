@@ -295,12 +295,11 @@ impl WorkspaceRoot {
                 // disruptive UX on a stale click.
                 if weak
                     .update_in(cx, |root, window, cx| {
-                        let activated =
-                            root.active_workspace_tabs().is_some_and(|tabs_entity| {
-                                tabs_entity.update(cx, |tabs, cx| {
-                                    tabs.set_active_by_tab_id(tab_id, window, cx)
-                                })
-                            });
+                        let activated = root.active_workspace_tabs().is_some_and(|tabs_entity| {
+                            tabs_entity.update(cx, |tabs, cx| {
+                                tabs.set_active_by_tab_id(tab_id, window, cx)
+                            })
+                        });
                         if activated {
                             window.activate_window();
                         }

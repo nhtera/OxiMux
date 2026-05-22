@@ -405,8 +405,16 @@ impl WorkspaceTabs {
                 cx,
             )
         });
-        let pane =
-            cx.new(|cx| MainPane::new(view, self.cwd.clone(), theme, density, typography.clone(), cx));
+        let pane = cx.new(|cx| {
+            MainPane::new(
+                view,
+                self.cwd.clone(),
+                theme,
+                density,
+                typography.clone(),
+                cx,
+            )
+        });
         let observer = cx.observe(&pane, |this, _pane, cx| {
             cx.notify();
             this.maybe_save_on_topology_change(cx);

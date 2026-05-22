@@ -10,9 +10,7 @@ use oximux_pty::TerminalSessionId;
 use oximux_storage::{PaneBufferRepo, PaneRelayIdRepo};
 
 use crate::notifier::TabId;
-use crate::persisted_terminals::{
-    PersistedAgentTab, PersistedTab, PersistedTabs, snapshot_tree,
-};
+use crate::persisted_terminals::{PersistedAgentTab, PersistedTab, PersistedTabs, snapshot_tree};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::main_pane::MainPane;
 use crate::shell::terminal_view::TerminalView;
@@ -217,7 +215,10 @@ impl WorkspaceTabs {
             if !matches!(tab.kind, WorkspaceTabKind::Terminal) {
                 continue;
             }
-            let buffers = tab.pane.read(cx).collect_pane_buffers(max_bytes_per_pane, cx);
+            let buffers = tab
+                .pane
+                .read(cx)
+                .collect_pane_buffers(max_bytes_per_pane, cx);
             for bytes in buffers {
                 if bytes.is_empty() {
                     ordinal += 1;
@@ -250,7 +251,11 @@ impl WorkspaceTabs {
         cx: &gpui::App,
     ) {
         if let Err(err) = repo.delete_for_project(project_id) {
-            tracing::warn!(?err, project_id, "pane_relay_ids: delete_for_project failed");
+            tracing::warn!(
+                ?err,
+                project_id,
+                "pane_relay_ids: delete_for_project failed"
+            );
             return;
         }
         let mut ordinal: u32 = 0;

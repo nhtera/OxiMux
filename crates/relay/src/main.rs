@@ -114,9 +114,7 @@ fn purge_old_logs(dir: &Path, retain: Duration) {
 // records.
 fn init_tracing(log_dir: Option<&Path>) -> Option<WorkerGuard> {
     let env_filter = compose_env_filter();
-    let stderr_layer = fmt::layer()
-        .with_target(false)
-        .with_writer(std::io::stderr);
+    let stderr_layer = fmt::layer().with_target(false).with_writer(std::io::stderr);
 
     let (file_layer, guard) = if let Some(dir) = log_dir {
         let _ = std::fs::create_dir_all(dir);
@@ -130,10 +128,7 @@ fn init_tracing(log_dir: Option<&Path>) -> Option<WorkerGuard> {
     };
 
     #[cfg(target_os = "macos")]
-    let oslog_layer = Some(tracing_oslog::OsLogger::new(
-        "dev.nhtera.oximux",
-        "relay",
-    ));
+    let oslog_layer = Some(tracing_oslog::OsLogger::new("dev.nhtera.oximux", "relay"));
     #[cfg(not(target_os = "macos"))]
     let oslog_layer: Option<fmt::Layer<tracing_subscriber::Registry>> = None;
 

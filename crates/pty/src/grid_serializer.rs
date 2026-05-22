@@ -64,9 +64,7 @@ pub fn serialize_term(term: &Term<VoidListener>, opts: SerializeOptions) -> Vec<
     let cursor = term.grid().cursor.point;
     let cursor_row_1based = (cursor.line.0.max(0) as usize + 1).min(rows.max(1));
     let cursor_col_1based = (cursor.column.0 + 1).min(cols.max(1));
-    out.extend_from_slice(
-        format!("\x1b[{cursor_row_1based};{cursor_col_1based}H").as_bytes(),
-    );
+    out.extend_from_slice(format!("\x1b[{cursor_row_1based};{cursor_col_1based}H").as_bytes());
 
     out
 }
@@ -74,12 +72,14 @@ pub fn serialize_term(term: &Term<VoidListener>, opts: SerializeOptions) -> Vec<
 /// Serialize with an automatic binary-search cap on `scrollback` so the
 /// final byte length fits under `max_bytes`. The visible grid is always
 /// emitted regardless of the cap.
-pub fn serialize_term_capped(
-    term: &Term<VoidListener>,
-    max_bytes: usize,
-) -> Vec<u8> {
+pub fn serialize_term_capped(term: &Term<VoidListener>, max_bytes: usize) -> Vec<u8> {
     let history = term.grid().history_size();
-    let full = serialize_term(term, SerializeOptions { scrollback: history });
+    let full = serialize_term(
+        term,
+        SerializeOptions {
+            scrollback: history,
+        },
+    );
     if full.len() <= max_bytes {
         return full;
     }

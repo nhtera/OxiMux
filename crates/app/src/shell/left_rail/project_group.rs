@@ -204,17 +204,14 @@ fn build_header(
         .gap(px(density.gap_inline))
         .cursor_pointer()
         .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(
-            MouseButton::Left,
-            move |_: &MouseDownEvent, window, cx| {
-                // `update` + outer `window` — `update_in` does a with_window
-                // lookup that returns Err from a mouse callback context.
-                let project = project_for_header.clone();
-                let _ = weak_for_header.update(cx, |root, cx| {
-                    root.set_active_project(project, window, cx);
-                });
-            },
-        )
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            // `update` + outer `window` — `update_in` does a with_window
+            // lookup that returns Err from a mouse callback context.
+            let project = project_for_header.clone();
+            let _ = weak_for_header.update(cx, |root, cx| {
+                root.set_active_project(project, window, cx);
+            });
+        })
         .child(folder_icon)
         .child(title)
         .child(count_chip)

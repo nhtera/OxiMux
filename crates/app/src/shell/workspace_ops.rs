@@ -304,7 +304,8 @@ impl WorkspaceRoot {
                 // Re-register the observer on the newly-active entity so its
                 // notifications bubble up. Drops the previous subscription.
                 self._workspace_tabs_observer = Some(cx.observe(&tabs, |_, _, cx| cx.notify()));
-                self.workspace_tabs_by_project.insert(project.id.clone(), tabs.clone());
+                self.workspace_tabs_by_project
+                    .insert(project.id.clone(), tabs.clone());
                 defer_focus_active(window, cx, tabs);
             } else {
                 tracing::warn!(project_id = %project.id, "build_workspace_tabs failed");

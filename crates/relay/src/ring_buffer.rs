@@ -100,7 +100,7 @@ mod tests {
     fn push_wraps_around() {
         let mut rb = RingBuffer::new(8);
         rb.push(b"abcdef"); // 6 bytes
-        rb.push(b"ghij");   // 4 bytes; total written = 10, cap = 8
+        rb.push(b"ghij"); // 4 bytes; total written = 10, cap = 8
         // Snapshot should be the last 8 bytes: "cdefghij".
         assert_eq!(rb.snapshot(), b"cdefghij");
     }
@@ -124,7 +124,9 @@ mod tests {
         for _ in 0..200 {
             state = state.wrapping_mul(1103515245).wrapping_add(12345);
             let n = (state as usize % 20) + 1;
-            let bytes: Vec<u8> = (0..n).map(|i| ((state >> (i % 4 * 8)) & 0xFF) as u8).collect();
+            let bytes: Vec<u8> = (0..n)
+                .map(|i| ((state >> (i % 4 * 8)) & 0xFF) as u8)
+                .collect();
             rb.push(&bytes);
             naive.extend_from_slice(&bytes);
             if naive.len() > cap {

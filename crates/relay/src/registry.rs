@@ -118,10 +118,7 @@ impl PtyRegistry {
         for (k, v) in &args.env {
             command.env(k, v);
         }
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .context("spawn shell")?;
+        let child = pair.slave.spawn_command(command).context("spawn shell")?;
         let killer = child.clone_killer();
         let pid = child.process_id();
         // The slave fd is duplicated into the child by spawn_command;
@@ -134,8 +131,7 @@ impl PtyRegistry {
 
         let pty_id = Uuid::new_v4().to_string();
         let ring = Arc::new(Mutex::new(RingBuffer::new(REPLAY_BUFFER_BYTES)));
-        let subscribers: Arc<Mutex<Vec<Sender<Notification>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let subscribers: Arc<Mutex<Vec<Sender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
         let child_exited = Arc::new(AtomicBool::new(false));
 
         // The reader thread owns the cloned read fd and the Child
@@ -214,7 +210,9 @@ impl PtyRegistry {
         let mut w = entry.writer.lock().expect("writer poisoned");
         w.write_all(bytes).context("pty write")?;
         w.flush().context("pty flush")?;
-        entry.bytes_in.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        entry
+            .bytes_in
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -342,10 +340,13 @@ fn reader_loop(
                 let mut rb = ring.lock().expect("ring poisoned");
                 rb.push(bytes);
                 drop(rb);
-                fan_out(&subscribers, Notification::Output {
-                    pty_id: pty_id.clone(),
-                    bytes: bytes.to_vec(),
-                });
+                fan_out(
+                    &subscribers,
+                    Notification::Output {
+                        pty_id: pty_id.clone(),
+                        bytes: bytes.to_vec(),
+                    },
+                );
             }
             Err(e) => {
                 tracing::debug!(?e, pty_id, "reader EOF/err");
@@ -357,10 +358,13 @@ fn reader_loop(
     // Release-ordered so the corresponding Acquire load in `close`
     // observes the flag flip without sequencing the fan_out below.
     child_exited.store(true, Ordering::Release);
-    fan_out(&subscribers, Notification::Exit {
-        pty_id: pty_id.clone(),
-        code,
-    });
+    fan_out(
+        &subscribers,
+        Notification::Exit {
+            pty_id: pty_id.clone(),
+            code,
+        },
+    );
 }
 
 fn fan_out(subscribers: &Arc<Mutex<Vec<Sender<Notification>>>>, notif: Notification) {

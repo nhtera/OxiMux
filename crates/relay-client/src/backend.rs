@@ -243,11 +243,7 @@ impl TerminalBackend for RelayBackend {
 
     fn resize(&mut self, id: TerminalSessionId, cols: u16, rows: u16) -> Result<()> {
         let pty_id = self.relay_pty_id_of(id)?;
-        let resp = self.request(Request::Resize {
-            pty_id,
-            cols,
-            rows,
-        })?;
+        let resp = self.request(Request::Resize { pty_id, cols, rows })?;
         match resp {
             Response::Ok => {
                 let mut sessions = self.sessions.lock().expect("sessions poisoned");
@@ -382,4 +378,3 @@ fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: Termina
         map.entry(id).or_default().push_back(event);
     }
 }
-
