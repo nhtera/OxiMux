@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
 **Updated**: 2026-05-23  
-**Phase**: 5 — relay hardening done; editor save round-trip + LSP lifecycle (step 2) + file tree backend (step 3) shipped  
-**Tests**: 510+ passed (editor crate: 28 tests — 21 prior + 7 file_tree integration)
+**Phase**: 5 — relay hardening done; editor steps 1-4 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI)  
+**Tests**: 510+ passed (editor crate: 28 tests — 21 prior + 7 file_tree integration; app crate: +8 file_tree_view unit tests)
 
 ---
 
@@ -68,6 +68,9 @@ src/
     ├── terminal_search_overlay.rs overlay render
     ├── key_input.rs        Keystroke → PTY bytes (xterm escapes, C0, Alt-prefix)
     ├── cell_metrics.rs     character cell size constants
+    ├── file_tree_view.rs   FileTreeView GPUI entity (step 4); subscribes to Entity<FileTree> from oximux-editor;
+    │                       lazy expand via placeholder child (RowKind::Placeholder sentinel → real rows on Loaded event);
+    │                       on_open: Arc<dyn Fn(PathBuf,…)> fires on file click; --file-tree-spike standalone binary
     ├── file_explorer/      FileExplorer entity; virtualized git-aware file tree (uniform_list, lazy load, git status badges)
     │   ├── mod.rs          FileExplorer entity; state machine; window-activation refresh trigger
     │   ├── tree_state.rs   flat-row build, expand toggle, should_include filter

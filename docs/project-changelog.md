@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-23 — Phase 5 / Step 04 — File tree UI (FileTreeView + --file-tree-spike)
+
+**Status**: 8 pure unit tests green; cargo check/clippy clean; file-size-lint pass  
+**Touches**: `crates/app/src/shell/file_tree_view.rs` (NEW), `crates/app/tests/file_tree_view_unit.rs` (NEW), `crates/app/src/main.rs`, `crates/app/src/shell/mod.rs`
+
+#### feat(app): phase-05 step 4 — file tree UI (FileTreeView + --file-tree-spike)
+
+- **`FileTreeView`** GPUI entity subscribing to `Entity<FileTree>` (from `oximux-editor`) via `cx.subscribe_in`; `expanded_ids: HashSet<TreeNodeId>` tracks UI expand state independently of walker-visited flag
+- **Lazy expand**: dir click → `tree.expand(id)` + `RowKind::Placeholder` sentinel rendered immediately; `Loaded(id)` event triggers `rebuild_rows()` swapping sentinel for real children
+- **Click flow**: dir click toggles expand; file click fires `on_open: Arc<dyn Fn(PathBuf, …)>` callback
+- **Raw `uniform_list`** (not `gpui-component::Tree`) — follows `FileExplorer` precedent to avoid auto-expand-on-click conflict with lazy walker model
+- **`build_display_rows`** pure fn extracted; 8 unit tests cover placeholder/empty-dir sentinels, collapse/expand, H1 chevron regression
+- **`--file-tree-spike`** CLI flag: standalone window against CWD; `on_open` stubs to `tracing::info!` until step 5 wires workspace
+
+---
+
 ### 2026-05-23 — Phase 5 / Step 03 — File tree backend (ignore + notify-debouncer-full)
 
 **Status**: 7 integration tests green; cargo check/clippy clean; file-size-lint pass  

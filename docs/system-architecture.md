@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
 **Updated**: 2026-05-23  
-**Phase**: 5 — relay hardening done; editor+LSP steps 1-3 shipped (save round-trip + LSP lifecycle + file tree backend)
+**Phase**: 5 — relay hardening done; editor+LSP steps 1-4 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI)
 
 ---
 
@@ -330,6 +330,30 @@ FileTree (GPUI entity)
 
 ---
 
+### Step 4 — file tree UI (FileTreeView)
+
+`FileTreeView` lives in `oximux-app/shell/file_tree_view.rs` and subscribes to `Entity<FileTree>` (from `oximux-editor`) via `cx.subscribe_in` registered before the first `expand()` call so no `Loaded` event can be missed.
+
+**Lazy expand pattern:**
+```
+dir click → tree.expand(id)           oximux-editor entity
+  immediately: RowKind::Placeholder    italic "…" sentinel shown
+  Loaded(id) event fires later
+    → rebuild_rows() swaps sentinel for real children
+```
+
+**Click flows:**
+- Dir click: toggles `expanded_ids: HashSet<TreeNodeId>` on view; calls `tree.expand(id)` if newly expanded
+- File click: fires `on_open: Arc<dyn Fn(PathBuf, &mut Window, &mut App)>` callback
+
+**Key invariants:**
+- `expanded_ids` (view) is separate from `FileTreeNode.loaded` (model) — chevron direction reads `expanded`, not `loaded`
+- Raw `uniform_list` used, not `gpui-component::Tree` — matches `FileExplorer` precedent; avoids auto-expand-on-click conflict with lazy walker model
+- `build_display_rows` is a pure fn extracted for unit testing (8 tests in `app/tests/file_tree_view_unit.rs`)
+- `--file-tree-spike` CLI flag mounts standalone window against CWD; `on_open` stubs to `tracing::info!` until step 5
+
+---
+
 ## Key architectural constraints
 
 | Constraint | Enforcement |
@@ -351,7 +375,7 @@ FileTree (GPUI entity)
 | ACP agent protocol | v1.1 (ADR-004) |
 | Side-by-side diff | Phase 6 |
 | Blame, file history, commit graph | Phase 6 |
-| Editor + LSP full integration | Phase 5 step 4+ (steps 1-3 shipped; step 4 = file-tree UI render) |
+| Editor + LSP full integration | Phase 5 step 5+ (steps 1-4 shipped; step 5 = workspace wiring) |
 | SQLite persistence / session restore | Phase 4 |
 | Multi-agent dashboard | Phase 7 |
 | embeddable terminal library terminal backend | v2 (ADR in brief.md) |
