@@ -9,8 +9,8 @@
 //! This is what `WorkspaceTabs` used to be in the pre-step-06 design —
 //! the surface API is similar (open_tab / close_tab / set_active /
 //! focus_active) but the entity is now per-leaf instead of per-project.
-//! Persistence wiring + render code land in later steps; this file
-//! holds the data model + mutation API only.
+
+mod render;
 
 use std::path::PathBuf;
 use std::sync::Arc;

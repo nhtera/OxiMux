@@ -25,6 +25,7 @@ pub mod pane_actions;
 pub mod pane_group;
 pub mod pane_group_manager;
 pub mod pane_layout;
+pub mod project_panes;
 pub mod pane_tree;
 pub mod project_picker;
 pub mod right_sidebar;
