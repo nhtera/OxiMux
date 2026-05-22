@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
 **Updated**: 2026-05-22  
-**Phase**: 5 — relay hardening done; editor+LSP spike landed (go/no-go pending smoke test)
+**Phase**: 5 — relay hardening done; editor+LSP steps 1-2 shipped (save round-trip + LSP lifecycle go)
 
 ---
 
@@ -214,9 +214,10 @@ boot_relay_supervisor(PaneRelayIdRepo)
 
 ---
 
-## Editor + LSP spike (Phase 5 step 1)
+## Editor + LSP (Phase 5)
 
-> Feasibility spike only — full integration pending manual smoke test go/no-go.
+### Step 1 — spike (go)
+
 > Cook report: `plans/reports/cook-260522-0240-phase-05-step01-editor-lsp-spike.md`
 
 ```
@@ -248,6 +249,53 @@ Key design decisions locked in spike:
 - Missing binary → `tracing::warn` + editor renders without LSP; no panic.
 - Spike is read-only: no `didChange`, no save round-trip (step 2 owns that).
 
+### Step 2 — save round-trip + LSP textDocument lifecycle (go, smoke green)
+
+> Tester report: `plans/reports/tester-260522-1939-phase-05-step02-editor-save.md`  
+> Code review: `plans/reports/code-review-260522-1939-phase-05-step02-editor-save.md` (8/10)
+
+**EditorView lifecycle (step 2 additions):**
+
+```
+EditorView::new(path, cx)
+  ├── uri: lsp_types::Uri  — parse-once from path_to_file_uri; reused for all LSP calls
+  ├── dirty = false, doc_version = 1, last_sent_text = file_content
+  └── cx.observe(&state, callback) → _observe_sub (keeps observer alive)
+        callback fires on every cx.notify() from InputState (incl. silent undo/redo)
+        decide_change_propagation(last_sent_text, current_text, doc_version)
+          → None if text unchanged (cursor moves, scroll) — no-op
+          → Some(prop) if text differs: last_sent_text = prop.text,
+                                        dirty = true,
+                                        doc_version = prop.new_version,
+                                        client.did_change(&uri, version, text)
+
+attach_lsp(program, lang, workspace_root, cx)
+  └── lsp_bridge::spawn_attach_lsp(...)
+        tokio: LspClient::spawn → initialize/initialized/didOpen (version=1)
+               reads file again → did_open_text
+        GPUI: entity.update → editor.set_lsp_client(client, did_open_text)
+               if last_sent_text ≠ did_open_text  ← buffer drifted during handshake
+                 doc_version += 1; client.did_change(catch-up)  ← Fix #3
+
+on Cmd+S (SaveFile action)
+  ├── fs::write(file_path, text)
+  ├── if Ok: dirty = false; client.did_save(&uri); cx.notify()
+  └── if Err: tracing::error; dirty stays true; cx.notify()
+
+impl Drop for EditorView
+  └── client.did_close(&uri)  — sync UnboundedSender::send; non-blocking; safe in Drop
+```
+
+**Why `cx.observe` not `cx.subscribe(InputEvent::Change)`:**  
+gpui-component's undo/redo calls `replace_text_in_range_silent` which bypasses `InputEvent::Change`. `cx.observe` catches every `cx.notify()` from `InputState`; the `decide_change_propagation` guard discards cursor-move noise at zero allocation cost.
+
+**Key invariants:**
+- `dirty` and `doc_version` live on `EditorView`, not `InputState` — no gpui-component fork needed.
+- `doc_version` is a plain `i32` (GPUI main-thread only; no atomic needed); strictly monotonic across normal edits + undo/redo.
+- `didChange` uses full-sync (entire buffer text, `range: None`) per LSP §3.17.2; 0ms debounce.
+- LSP calls are no-ops when `lsp_client` is `None` (editor-without-LSP degraded path preserved).
+- `SaveFile` action declared in `oximux-editor` (not `oximux-app::actions`) to break the `oximux-app → oximux-editor → oximux-app` circular crate dependency.
+
 ---
 
 ## Key architectural constraints
@@ -271,7 +319,7 @@ Key design decisions locked in spike:
 | ACP agent protocol | v1.1 (ADR-004) |
 | Side-by-side diff | Phase 6 |
 | Blame, file history, commit graph | Phase 6 |
-| Editor + LSP full integration | Phase 5 step 2+ (spike shipped step 1; go/no-go pending smoke) |
+| Editor + LSP full integration | Phase 5 step 3+ (steps 1-2 shipped; step 3 = file-tree backend) |
 | SQLite persistence / session restore | Phase 4 |
 | Multi-agent dashboard | Phase 7 |
 | embeddable terminal library terminal backend | v2 (ADR in brief.md) |

@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
 **Updated**: 2026-05-22  
-**Phase**: 5 — relay hardening done; editor+LSP spike landed (go/no-go pending smoke test)  
-**Tests**: 510+ passed (editor crate: 14 unit tests)
+**Phase**: 5 — relay hardening done; editor save round-trip + LSP didChange/didSave/didClose shipped (step 2 smoke green)  
+**Tests**: 510+ passed (editor crate: 21 tests — 17 unit + 4 integration)
 
 ---
 
@@ -246,30 +246,53 @@ src/
 
 ---
 
-## crates/editor — code editor + LSP (Phase 5 spike)
+## crates/editor — code editor + LSP (Phase 5)
 
-> Status: feasibility spike; go/no-go pending manual smoke test. See cook report:
-> `plans/reports/cook-260522-0240-phase-05-step01-editor-lsp-spike.md`
+> Step 1 spike (go): `plans/reports/cook-260522-0240-phase-05-step01-editor-lsp-spike.md`  
+> Step 2 (go): `plans/reports/tester-260522-1939-phase-05-step02-editor-save.md` — smoke green, 8/10 code review
 
 ```
 src/
-├── lib.rs              re-exports EditorView + lsp module
-├── editor_view.rs      EditorView GPUI entity wrapping gpui-component Input
-│                       configured as code editor; attach_lsp(program, language_id,
-│                       workspace_root, cx) spawns rust-analyzer + installs
-│                       HoverProvider + pumps publishDiagnostics
+├── lib.rs                  re-exports EditorView, SaveFile action, lsp module
+├── editor_view.rs          EditorView GPUI entity (step 1+2)
+│                           Fields: file_path, uri (lsp_types::Uri, parse-once),
+│                             state (Entity<InputState>), focus_handle,
+│                             lsp_client (Option<Arc<LspClient>>),
+│                             dirty (bool), doc_version (i32, starts at 1),
+│                             last_sent_text (String), _observe_sub
+│                           Step 1: gpui-component Input in code_editor("rust") mode;
+│                             attach_lsp → HoverProvider + publishDiagnostics pump
+│                           Step 2: cx.observe wired in new(); SaveFile action
+│                             (declared here for crate-cycle reasons); on_save writes
+│                             file via fs::write, sends didSave; window title shows
+│                             " •" dirty badge; impl Drop sends didClose via sync mpsc
+│                           Keyed by --editor-spike CLI flag
+├── lsp_bridge.rs           spawn_attach_lsp (factored from editor_view.rs)
+│                           Runs LSP handshake on tokio; calls set_lsp_client on
+│                           EditorView entity; passes did_open_text for catch-up
+│                           didChange when buffer drifted during handshake window
 └── lsp/
-    ├── mod.rs          module surface
-    ├── transport.rs    Content-Length framing read/write; 6 unit tests
-    ├── client.rs       LspClient: spawn child + handshake + request/notify +
-    │                   dispatch; captures tokio::runtime::Handle for GCD-bridge;
-    │                   server-initiated requests answered with {result:null};
-    │                   REQUEST_TIMEOUT = 5s; 8 unit tests
-    └── providers.rs    LspHoverProvider bridges gpui::Task ← tokio via
-                        handle.spawn (Rc<LspHoverProvider> — local executor only)
+    ├── mod.rs              module surface
+    ├── transport.rs        Content-Length framing read/write; 6 unit tests
+    ├── client.rs           LspClient: spawn child + handshake + request/notify +
+    │                       dispatch; captures tokio::runtime::Handle for GCD-bridge;
+    │                       server-initiated requests answered with {result:null};
+    │                       REQUEST_TIMEOUT = 5s; 8 unit tests
+    │                       Step 2: did_change / did_save / did_close — accept
+    │                       &lsp_types::Uri (parse-once, no per-keystroke allocation)
+    └── providers.rs        LspHoverProvider bridges gpui::Task ← tokio via
+                            handle.spawn (Rc<LspHoverProvider> — local executor only)
 ```
 
-Workspace deps added by spike: `lsp-types = "0.97"`, `url = "2"` (percent-encoding for file URIs).
+```
+tests/
+└── lsp_notification_serialization.rs   4 integration tests (step 2): did_change
+                                        full-sync JSON shape, did_save, did_close,
+                                        version monotonic; no GPUI runtime needed
+```
+
+Workspace deps: `lsp-types = "0.97"`, `url = "2"` (percent-encoding for file URIs).  
+New action: `SaveFile` (in `oximux-editor`; bound in `app/src/main.rs` via `use oximux_editor::SaveFile`).
 
 ---
 
