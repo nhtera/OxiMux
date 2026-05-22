@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-05-20  
-**Phase**: 3 — steps 1-4 + CliRuntime done; steps 5-14 pending  
-**Tests**: 510 passed, 0 failed (workspace)
+**Updated**: 2026-05-22  
+**Phase**: 5 — relay hardening done; editor+LSP spike landed (go/no-go pending smoke test)  
+**Tests**: 510+ passed (editor crate: 14 unit tests)
 
 ---
 
@@ -18,7 +18,7 @@ oximux/
     ├── pty/                portable-pty + alacritty_terminal backend
     ├── git/                git CLI wrappers, poller, diff parser
     ├── agents/             AgentRuntime async trait + CliAgentAdapter + StatusMachine (Phase 3 foundation)
-    ├── editor/             gpui-component editor stub (Phase 5)
+    ├── editor/             gpui-component code editor + LSP client (Phase 5 spike)
     ├── storage/            SQLite via rusqlite — Db wrapper + migrations + V001 schema + 5 typed repos (Phase 4 step 3)
     └── settings/           TOML config, theme tokens, typography
 ```
@@ -243,6 +243,33 @@ src/
 | `migrations/V001__init.sql` | 5 tables (projects, workspaces, agent_sessions [+ exit_code, status_detail for AgentStatus payloads], pane_sessions [ON DELETE SET NULL on agent FK], settings) + 3 FK-support indexes |
 
 `r2d2` deliberately **not** adopted in v1 — single `Arc<Mutex<Connection>>` over WAL is sufficient for the single-writer model. Read-pool split (write conn + N readers) is the documented upgrade path if profiling shows contention.
+
+---
+
+## crates/editor — code editor + LSP (Phase 5 spike)
+
+> Status: feasibility spike; go/no-go pending manual smoke test. See cook report:
+> `plans/reports/cook-260522-0240-phase-05-step01-editor-lsp-spike.md`
+
+```
+src/
+├── lib.rs              re-exports EditorView + lsp module
+├── editor_view.rs      EditorView GPUI entity wrapping gpui-component Input
+│                       configured as code editor; attach_lsp(program, language_id,
+│                       workspace_root, cx) spawns rust-analyzer + installs
+│                       HoverProvider + pumps publishDiagnostics
+└── lsp/
+    ├── mod.rs          module surface
+    ├── transport.rs    Content-Length framing read/write; 6 unit tests
+    ├── client.rs       LspClient: spawn child + handshake + request/notify +
+    │                   dispatch; captures tokio::runtime::Handle for GCD-bridge;
+    │                   server-initiated requests answered with {result:null};
+    │                   REQUEST_TIMEOUT = 5s; 8 unit tests
+    └── providers.rs    LspHoverProvider bridges gpui::Task ← tokio via
+                        handle.spawn (Rc<LspHoverProvider> — local executor only)
+```
+
+Workspace deps added by spike: `lsp-types = "0.97"`, `url = "2"` (percent-encoding for file URIs).
 
 ---
 

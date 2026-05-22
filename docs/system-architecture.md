@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-05-20  
-**Phase**: 3 — steps 1-4 + CliRuntime done; steps 5-14 pending
+**Updated**: 2026-05-22  
+**Phase**: 5 — relay hardening done; editor+LSP spike landed (go/no-go pending smoke test)
 
 ---
 
@@ -214,6 +214,42 @@ boot_relay_supervisor(PaneRelayIdRepo)
 
 ---
 
+## Editor + LSP spike (Phase 5 step 1)
+
+> Feasibility spike only — full integration pending manual smoke test go/no-go.
+> Cook report: `plans/reports/cook-260522-0240-phase-05-step01-editor-lsp-spike.md`
+
+```
+crates/app/src/main.rs
+  --editor-spike flag
+    └── run_editor_spike()
+          tokio Handle check (self-aborts with clear message if no reactor in scope)
+          cx.open_window("OxiMux — Editor Spike")
+            └── EditorView::new(file_path, cx)       crates/editor
+                  gpui-component Input (code_editor("rust") mode)
+                  attach_lsp("rust-analyzer", "rust", workspace_root, cx)
+                    ├── LspClient::spawn(program, workspace_root, handle)
+                    │     Content-Length framing (transport.rs)
+                    │     initialize + initialized + didOpen handshake
+                    │     dispatch loop: responses → pending_requests map
+                    │                   server-initiated requests → {result:null}
+                    │                   publishDiagnostics → WeakEntity<InputState>
+                    │
+                    └── register HoverProvider → LspHoverProvider
+                          hover(pos, cx):
+                            handle.spawn(async { LspClient::hover(pos) })  ← tokio worker
+                            gpui::Task awaits JoinHandle                    ← GCD thread
+```
+
+Key design decisions locked in spike:
+- One `LspClient` per (workspace_root, language); no pooling in v1.
+- `tokio::runtime::Handle` captured at spawn, passed into GPUI tasks — avoids `rt.enter()` thread-local vs GCD-worker mismatch.
+- `REQUEST_TIMEOUT = 5s` via `tokio::time::timeout`; no `$/cancelRequest`.
+- Missing binary → `tracing::warn` + editor renders without LSP; no panic.
+- Spike is read-only: no `didChange`, no save round-trip (step 2 owns that).
+
+---
+
 ## Key architectural constraints
 
 | Constraint | Enforcement |
@@ -235,7 +271,7 @@ boot_relay_supervisor(PaneRelayIdRepo)
 | ACP agent protocol | v1.1 (ADR-004) |
 | Side-by-side diff | Phase 6 |
 | Blame, file history, commit graph | Phase 6 |
-| Editor + LSP (rust-analyzer) | Phase 5 |
+| Editor + LSP full integration | Phase 5 step 2+ (spike shipped step 1; go/no-go pending smoke) |
 | SQLite persistence / session restore | Phase 4 |
 | Multi-agent dashboard | Phase 7 |
 | embeddable terminal library terminal backend | v2 (ADR in brief.md) |
