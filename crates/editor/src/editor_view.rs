@@ -233,11 +233,25 @@ impl Focusable for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        gpui::div().size_full().child(
-            Input::new(&self.state)
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_size(cx.theme().mono_font_size),
-        )
+        let theme = cx.theme();
+        // Outer wrapper fixes the GPUI flex collapse problem (a bare `Input`
+        // child without an explicit `flex_1`/`size_full` claim renders at
+        // intrinsic height 0 against a fullscreen parent — see the same
+        // pattern guard in `tabbed_pane::build_node`). Theme bg+fg avoid
+        // black-on-black: the spike's first window had macOS chrome but
+        // empty content because Input never grabbed the canvas.
+        gpui::div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(
+                Input::new(&self.state)
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(theme.mono_font_size)
+                    .size_full(),
+            )
     }
 }
 
