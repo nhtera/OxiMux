@@ -39,13 +39,14 @@ pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> i
     chrome_strip(theme, density).child(left_chrome_cluster(true, theme, typography))
 }
 
-/// Header strip for the center column. Hosts the workspace tab strip plus
-/// any chrome bits whose owning column is currently collapsed (so toggles
-/// stay reachable).
+/// Header strip for the center column. Hosts any chrome bits whose
+/// owning column is currently collapsed (so toggles stay reachable);
+/// the center zone is a spacer in the pane-groups layout — each group
+/// carries its own tab strip beneath this header.
 pub fn center_header(
     left_open: bool,
     right_open: bool,
-    workspace_tabs: Option<AnyElement>,
+    center_zone: Option<AnyElement>,
     right_tabs: Option<AnyElement>,
     theme: Theme,
     density: Density,
@@ -57,7 +58,7 @@ pub fn center_header(
         // the "open" icon since clicking it expands the rail).
         row = row.child(left_chrome_cluster(false, theme, typography));
     }
-    let center: AnyElement = workspace_tabs.unwrap_or_else(|| spacer_zone().into_any_element());
+    let center: AnyElement = center_zone.unwrap_or_else(|| spacer_zone().into_any_element());
     row = row.child(center);
     if !right_open {
         row = row.child(right_chrome_cluster(false, right_tabs, theme));

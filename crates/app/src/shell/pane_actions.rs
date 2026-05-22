@@ -1,8 +1,8 @@
 //! Pane Actions dropdown — split direction picker.
 //!
-//! A small popup anchored near the workspace tab strip's trailing "..."
-//! button. Each item dispatches a Split* action up the focus chain so the
-//! focused `MainPane` performs the split.
+//! A small popup anchored near the workspace's trailing "..." button.
+//! Each item dispatches a Split* action up the focus chain so the
+//! focused pane group performs the split.
 //!
 //! Positioning: takes a `right_anchor_px` at open time (so the dropdown
 //! tracks the current right-sidebar state) and pins to the top-right of
@@ -15,7 +15,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::workspace_tabs::{SplitDirection, split_icon};
+use crate::shell::split_direction::{SplitDirection, split_icon};
 
 /// Width of the dropdown card.
 const MENU_WIDTH: f32 = 184.0;

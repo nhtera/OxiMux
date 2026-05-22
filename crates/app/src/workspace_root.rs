@@ -11,7 +11,7 @@
 //! │ (chrome)     │ (workspace tab strip)       │ (activity + ×)   │
 //! ├──────────────┼─────────────────────────────┼──────────────────┤
 //! │              │                             │                  │
-//! │ left rail    │ active tab's MainPane       │ right sidebar    │  ← flex_1
+//! │ left rail    │ active project's pane groups │ right sidebar    │  ← flex_1
 //! │ (250px)      │ (flex_1)                    │ panel (360px)    │
 //! │              │                             │                  │
 //! ├──────────────┴─────────────────────────────┴──────────────────┤
@@ -67,9 +67,9 @@ use crate::shell::{
     status_bar,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS},
     top_bar,
+    project_panes::ProjectPanes,
     workspace_dialog::{OnSubmit as OnWorkspaceSubmit, WorkspaceDialog},
     workspace_ops::build_add_project_dialog,
-    workspace_tabs::{self, WorkspaceTabs},
 };
 
 /// Approximate horizontal inset (CSS px) of the `+` button from its
@@ -82,11 +82,12 @@ pub struct WorkspaceRoot {
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,
-    /// One `WorkspaceTabs` entity per project, keyed by `Project.id`. Tabs
-    /// persist across project switches (entity stays alive in the map);
-    /// `active_workspace_tabs()` resolves the current entity via
+    /// One `ProjectPanes` entity per project, keyed by `Project.id`. Each
+    /// `ProjectPanes` owns the project's pane-group layout tree. State
+    /// persists across project switches (entity stays alive in the map);
+    /// `active_project_panes()` resolves the current entity via
     /// `active_project.id`.
-    pub(crate) workspace_tabs_by_project: HashMap<String, Entity<WorkspaceTabs>>,
+    pub(crate) project_panes_by_project: HashMap<String, Entity<ProjectPanes>>,
     pub(crate) right_sidebar: Option<Entity<RightSidebar>>,
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
@@ -97,15 +98,15 @@ pub struct WorkspaceRoot {
     /// so tab close and spawn paths share a single runtime.
     pub(crate) cli_runtime: Arc<CliRuntime>,
     /// macOS notification sink (or `NullNotifier` on non-mac). Cached so
-    /// per-project `WorkspaceTabs` entities built lazily via
+    /// per-project `ProjectPanes` entities built lazily via
     /// `set_active_project` share the same notifier the initial mount used.
     pub(crate) notifier: Arc<dyn Notifier>,
     /// Cached registry of built-in adapters; resolves `AgentAdapter` at spawn.
     pub(crate) adapter_registry: Arc<AdapterRegistry>,
     /// Left rail visibility flag (Cmd+B).
     left_rail_open: bool,
-    /// Bubbles WorkspaceTabs change notifications up so the tab strip rerenders.
-    pub(crate) _workspace_tabs_observer: Option<Subscription>,
+    /// Bubbles ProjectPanes change notifications up so the workspace rerenders.
+    pub(crate) _project_panes_observer: Option<Subscription>,
     /// Pauses + kicks StatusPoller on window blur/focus.
     _window_activation_observer: Subscription,
     /// macOS notification click watcher → activates the matching tab.
@@ -176,11 +177,11 @@ impl WorkspaceRoot {
             Arc::new(crate::notifier::null::NullNotifier)
         };
 
-        // Tabs entities live in a per-project HashMap, lazily built on the
-        // first `set_active_project` call. Boot renders the welcome view
+        // ProjectPanes entities live in a per-project HashMap, lazily built on
+        // the first `set_active_project` call. Boot renders the welcome view
         // until the project-restore path (or user open) supplies one.
-        let workspace_tabs_by_project: HashMap<String, Entity<WorkspaceTabs>> = HashMap::new();
-        let workspace_tabs_observer: Option<Subscription> = None;
+        let project_panes_by_project: HashMap<String, Entity<ProjectPanes>> = HashMap::new();
+        let project_panes_observer: Option<Subscription> = None;
         // Shared weak self-handle: LeftRail + picker callbacks route through it.
         // Built before the right-sidebar so the Files-tab `OnOpenFile` callback
         // can capture it and route clicks back to `open_file_in_active_pane`.
@@ -302,9 +303,9 @@ impl WorkspaceRoot {
                 // disruptive UX on a stale click.
                 if weak
                     .update_in(cx, |root, window, cx| {
-                        let activated = root.active_workspace_tabs().is_some_and(|tabs_entity| {
-                            tabs_entity.update(cx, |tabs, cx| {
-                                tabs.set_active_by_tab_id(tab_id, window, cx)
+                        let activated = root.active_project_panes().is_some_and(|panes_entity| {
+                            panes_entity.update(cx, |panes, cx| {
+                                panes.set_active_by_tab_id(tab_id, window, cx)
                             })
                         });
                         if activated {
@@ -322,7 +323,7 @@ impl WorkspaceRoot {
             theme,
             density,
             typography,
-            workspace_tabs_by_project,
+            project_panes_by_project,
             notifier: notifier.clone(),
             right_sidebar,
             left_rail,
@@ -332,7 +333,7 @@ impl WorkspaceRoot {
             cli_runtime,
             adapter_registry,
             left_rail_open: true,
-            _workspace_tabs_observer: workspace_tabs_observer,
+            _project_panes_observer: project_panes_observer,
             _window_activation_observer: window_activation_observer,
             _click_router: click_router,
             app_state,
@@ -346,33 +347,30 @@ impl WorkspaceRoot {
         }
     }
 
-    /// Open a fresh local-PTY tab. Used by the picker's "+ New terminal"
-    /// row so the popover and the keyboard path stay in sync.
+    /// Open a fresh local-PTY tab in the active project's active pane group.
     fn spawn_local_terminal_tab(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_workspace_tabs() else {
+        let Some(panes) = self.active_project_panes() else {
             return;
         };
-        ws.update(cx, |tabs, cx| tabs.open_tab(window, cx));
+        panes.update(cx, |p, cx| p.open_terminal_tab_in_active_group(window, cx));
     }
 
-    /// Resolves the currently-visible `WorkspaceTabs` entity by reading
+    /// Resolves the currently-visible `ProjectPanes` entity by reading
     /// `active_project.id` against the per-project map. `None` when no
     /// project is active (welcome state) or when the project has no entity
     /// yet (mid-`set_active_project`).
-    pub(crate) fn active_workspace_tabs(&self) -> Option<Entity<WorkspaceTabs>> {
+    pub(crate) fn active_project_panes(&self) -> Option<Entity<ProjectPanes>> {
         let id = self.active_project.as_ref().map(|p| p.id.as_str())?;
-        self.workspace_tabs_by_project.get(id).cloned()
+        self.project_panes_by_project.get(id).cloned()
     }
 
-    /// Open `path` as a new editor tab in the active project's workspace
-    /// tab strip. If the file is already open in another tab, activate
-    /// that tab instead of opening a duplicate. The tab strip mixes
-    /// terminal and editor tabs in a single horizontal row (industry-
-    /// standard editor convention).
+    /// Open `path` as a new editor tab in the active project's active
+    /// pane group. If the file is already open in any tab of that group,
+    /// activate it instead of opening a duplicate.
     ///
-    /// Pre-filters binary / system files (`.DS_Store`, images, archives,
-    /// etc.) so the editor never opens an empty buffer on a UTF-8 decode
-    /// failure. No-op when there's no active project / workspace tabs.
+    /// Pre-filters binary / system files so the editor never opens an
+    /// empty buffer on a UTF-8 decode failure. No-op when there's no
+    /// active project.
     pub fn open_file_in_active_pane(
         &self,
         path: std::path::PathBuf,
@@ -386,11 +384,11 @@ impl WorkspaceRoot {
             );
             return;
         }
-        let Some(ws) = self.active_workspace_tabs() else {
+        let Some(panes) = self.active_project_panes() else {
             return;
         };
-        ws.update(cx, |tabs, cx| {
-            tabs.open_or_activate_editor_tab(path, window, cx);
+        panes.update(cx, |p, cx| {
+            p.open_or_activate_editor_tab(path, window, cx);
         });
     }
 
@@ -419,9 +417,8 @@ impl WorkspaceRoot {
     ) -> crate::shell::file_tree_view::OnQueryActivePath {
         Arc::new(move |cx| {
             let root = weak.upgrade()?;
-            let ws = root.read(cx).active_workspace_tabs()?;
-            let pane = ws.read(cx).active_pane()?;
-            pane.read(cx).active_editor_path(cx)
+            let panes = root.read(cx).active_project_panes()?;
+            panes.read(cx).active_editor_path(cx)
         })
     }
 
@@ -430,11 +427,11 @@ impl WorkspaceRoot {
     /// state restored on next launch reflects the user's final view.
     pub fn capture_all_pane_buffers(&self, cx: &gpui::App) {
         let repo = self.app_state.pane_buffer_repo.clone();
-        for (project_id, tabs) in &self.workspace_tabs_by_project {
-            tabs.read(cx).capture_pane_buffers(
+        for (project_id, panes) in &self.project_panes_by_project {
+            panes.read(cx).capture_pane_buffers(
                 &repo,
                 project_id,
-                crate::workspace_tabs_factory::PANE_BUFFER_MAX_BYTES,
+                crate::project_panes_factory::PANE_BUFFER_MAX_BYTES,
                 cx,
             );
         }
@@ -450,19 +447,20 @@ impl WorkspaceRoot {
             return;
         };
         let repo = self.app_state.pane_relay_id_repo.clone();
-        for (project_id, tabs) in &self.workspace_tabs_by_project {
-            tabs.read(cx)
+        for (project_id, panes) in &self.project_panes_by_project {
+            panes
+                .read(cx)
                 .capture_pane_relay_ids(&repo, project_id, &session_id, cx);
         }
     }
 
-    /// Spawn the chosen agent in a new workspace tab. Runs the
-    /// start_session → backend_for → terminal_session_id → subscribe_status
-    /// chain, then hands the assembled handles to `WorkspaceTabs::push_agent_tab`.
+    /// Spawn the chosen agent in a new tab inside the active pane group.
+    /// Runs the start_session → backend_for → terminal_session_id →
+    /// subscribe_status chain, then hands the assembled handles to
+    /// `ProjectPanes::push_agent_tab`.
     ///
     /// If `update_in` errors (window/workspace dropped mid-spawn), cancels
-    /// the half-mounted session so the PTY doesn't zombie (C2 fix
-    /// transferred from step 9b's `on_new_agent`).
+    /// the half-mounted session so the PTY doesn't zombie.
     pub(crate) fn spawn_agent_tab(
         &self,
         adapter: AgentAdapter,
@@ -471,7 +469,7 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_workspace_tabs() else {
+        let Some(panes) = self.active_project_panes() else {
             return;
         };
         let runtime = self.cli_runtime.clone();
@@ -527,8 +525,8 @@ impl WorkspaceRoot {
                 }
             };
 
-            let mount_result = ws.update_in(cx, |tabs, window, cx| {
-                tabs.push_agent_tab(
+            let mount_result = panes.update_in(cx, |p, window, cx| {
+                p.push_agent_tab(
                     adapter,
                     adapter_id,
                     cwd_for_tab,
@@ -555,8 +553,8 @@ impl WorkspaceRoot {
     }
 
     /// Accessor for the workspace's CLI agent runtime. Used by the (future)
-    /// settings panel + tests; the main consumer is the `WorkspaceTabs`
-    /// strip, which received its own `Arc` clone at construction time.
+    /// settings panel + tests; the main consumer is the per-project
+    /// `ProjectPanes`, which receives its own `Arc` clone at construction.
     #[doc(hidden)]
     pub fn cli_runtime(&self) -> Arc<CliRuntime> {
         self.cli_runtime.clone()
@@ -575,8 +573,8 @@ impl WorkspaceRoot {
     }
 }
 
-// `build_workspace_tabs` + restore helpers live in
-// `crate::workspace_tabs_factory` so this file stays under the 800-LOC cap.
+// `build_project_panes` + restore helpers live in
+// `crate::project_panes_factory` so this file stays under the 800-LOC cap.
 // `impl Focusable for WorkspaceRoot` lives in `shell::workspace_ops` for
 // the same reason.
 
@@ -588,30 +586,20 @@ impl Render for WorkspaceRoot {
         let density = self.density;
         let typography = &self.typography;
 
-        // Use the active tab's pane count for the status-bar readout. Inactive
-        // tabs' panes still exist but the user only sees the active grid.
-        let active_tabs = self.active_workspace_tabs();
-        let pane_count = active_tabs
+        // Status-bar pane count = visible pane-group leaves in the active
+        // project (1 when no splits, N after Cmd+D).
+        let active_panes = self.active_project_panes();
+        let pane_count = active_panes
             .as_ref()
-            .and_then(|ws| ws.read(cx).active_pane())
-            .map(|mp| mp.read(cx).leaf_count())
+            .map(|p| p.read(cx).manager().in_order_groups().len())
             .unwrap_or(0);
 
-        // Open-agent-tab count for the status-bar readout. Phase 3 step 9:
-        // replaces the hardcoded 0 with a live count sourced from
-        // `WorkspaceTabKind::Agent` entries.
-        //
-        // NOTE (M5, review 260520-1700): semantic asymmetry — `pane_count`
-        // reads the active tab only (via `active_pane().leaf_count()`),
-        // whereas `agent_count` aggregates across every workspace tab. For
-        // v1 single-workspace the difference is academic; the choice is
-        // deliberate because users care about total agents in flight
-        // ("I have 3 agents running"), not how many are in the foreground.
-        // If a multi-window or per-workspace status bar lands later, this
-        // is the seam to revisit.
-        let agent_count = active_tabs
+        // Aggregate open-agent-tab count across every group in the active
+        // project. Same semantics as before — users care about total
+        // agents in flight, not just the foreground group's.
+        let agent_count = active_panes
             .as_ref()
-            .map(|ws| ws.read(cx).agent_count())
+            .map(|p| p.read(cx).agent_count(cx))
             .unwrap_or(0);
 
         // Route poll state to the status bar via the RightSidebar getter.
@@ -647,10 +635,9 @@ impl Render for WorkspaceRoot {
             None => (false, None),
         };
 
-        // Push current chrome width into every workspace tab so PTY grids
-        // match the actual visible area. Each MainPane caches the width and
-        // re-applies on render; propagating to inactive tabs avoids a stale
-        // grid flash on tab switch.
+        // Push current chrome width into the active ProjectPanes so PTY
+        // grids match the actual visible area. ProjectPanes forwards the
+        // value into each group it owns.
         let left_chrome = if self.left_rail_open {
             density.w_left_rail
         } else {
@@ -661,21 +648,19 @@ impl Render for WorkspaceRoot {
         } else {
             0.0
         };
-        if let Some(ws) = active_tabs.as_ref() {
+        if let Some(panes) = active_panes.as_ref() {
             let chrome = left_chrome + right_chrome;
-            ws.update(cx, |ws, cx| ws.set_chrome_width(chrome, cx));
+            panes.update(cx, |p, cx| p.set_chrome_width(chrome, cx));
         }
 
-        // Workspace tab strip for the center column's header. None when no
-        // project is active (welcome view) or the active project has no
-        // tabs entity yet.
-        let workspace_tab_strip = active_tabs
-            .as_ref()
-            .map(|ws| workspace_tabs::render_tab_strip(ws.clone(), cx));
+        // Tab strips now live inside each pane group; the center header no
+        // longer carries one.
+        let workspace_tab_strip: Option<AnyElement> = None;
 
-        // Center column body: active project's MainPane via WorkspaceTabs,
-        // or welcome placeholder when no active project.
-        let center_body: AnyElement = match active_tabs.clone() {
+        // Center column body: active project's ProjectPanes (which renders
+        // its group tree internally), or welcome placeholder when no
+        // project is active.
+        let center_body: AnyElement = match active_panes.clone() {
             Some(view) => view.into_any_element(),
             None => main_area::view(theme, density, typography).into_any_element(),
         };
@@ -806,8 +791,8 @@ impl Render for WorkspaceRoot {
                         ADAPTER_PICKER_LEFT_INSET
                     };
                     let left_anchor = this
-                        .active_workspace_tabs()
-                        .and_then(|ws| ws.read(cx).take_plus_click_x())
+                        .active_project_panes()
+                        .and_then(|panes| panes.read(cx).take_plus_click_x())
                         .unwrap_or(fallback_anchor);
                     // Mutex: only one full-window popover can hold the click-outside path.
                     this.pane_actions.update(cx, |p, cx| p.close(cx));

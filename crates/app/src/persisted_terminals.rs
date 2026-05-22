@@ -110,7 +110,7 @@ pub fn snapshot_tree(t: &PaneTree) -> PersistedTree {
 }
 
 /// Walk a `PersistedTree` and produce a parallel `PaneTree` whose leaves
-/// are assigned fresh `PaneId`s via `alloc`. Caller (typically `MainPane`)
+/// are assigned fresh `PaneId`s via `alloc`. Caller
 /// supplies the allocator so id space stays monotonic.
 pub fn restore_tree<F>(p: &PersistedTree, alloc: &mut F) -> PaneTree
 where

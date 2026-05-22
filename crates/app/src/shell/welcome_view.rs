@@ -1,4 +1,5 @@
-//! Welcome screen — empty-state center pane shown when no MainPane is mounted.
+//! Welcome screen — empty-state center pane shown when no project panes
+//! are mounted.
 //!
 //! Borderless, centered directly on the workspace background. Logo tile,
 //! wordmark, tagline, and a flat list of keyboard shortcuts — no card
@@ -27,8 +28,7 @@ pub const SHORTCUT_HINTS: &[(&[&str], &str)] = &[
     (&["\u{2318}", "\u{21E7}", "P"], "Command Palette (Phase 05)"),
 ];
 
-/// Pure predicate — show welcome only when there is no live MainPane.
-/// Phase 04 will add a `has_active_workspace: bool` parameter.
+/// Pure predicate — show welcome only when there are no live project panes.
 pub fn should_show_welcome(has_pane: bool) -> bool {
     !has_pane
 }

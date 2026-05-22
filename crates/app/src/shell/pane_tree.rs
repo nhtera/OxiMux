@@ -1,6 +1,6 @@
 //! Pure-data pane tree — split / close / focus-order math for the workspace
-//! grid. No GPUI types here; `MainPane` keeps the entity store in a parallel
-//! `HashMap<PaneId, Entity<TerminalView>>` and looks up by id during render.
+//! grid. No GPUI types here; the host keeps the entity store in a parallel
+//! `HashMap` and looks up by id during render.
 //!
 //! Binary splits: every `split_leaf` wraps the target in a fresh `Split`
 //! node, halving the target's slice between old and new. Matches the default
@@ -9,8 +9,7 @@
 //! a same-axis cascade if/when the UX demands it).
 
 /// Stable identifier for a pane leaf in the content tree. Issued
-/// monotonically by the host (today `MainPane`); never reused after a
-/// pane closes.
+/// monotonically by the host; never reused after a pane closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u64);
 

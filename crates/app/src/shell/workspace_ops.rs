@@ -22,10 +22,10 @@ use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectP
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
-use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
-use crate::workspace_tabs_factory::{
-    build_workspace_tabs, compute_attach_hints, load_persisted_tabs, save_persisted_tabs,
+use crate::project_panes_factory::{
+    build_project_panes, compute_attach_hints, load_persisted_tabs, save_persisted_tabs,
 };
+use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
 
 /// Build the Add-Project dialog entity. Wires the `on_pick` callback to
 /// route the chosen project through `WorkspaceRoot::set_active_project`.
@@ -152,10 +152,10 @@ fn agent_adapter_id(kind: AgentAdapter) -> &'static str {
 fn defer_focus_active(
     window: &mut Window,
     cx: &mut Context<crate::workspace_root::WorkspaceRoot>,
-    tabs: Entity<crate::shell::workspace_tabs::WorkspaceTabs>,
+    panes: Entity<crate::shell::project_panes::ProjectPanes>,
 ) {
     window.defer(cx, move |window, app| {
-        tabs.update(app, |t, cx| t.focus_active(window, cx));
+        panes.update(app, |p, cx| p.focus_active(window, cx));
     });
 }
 
@@ -221,50 +221,39 @@ impl WorkspaceRoot {
         // No-op when no project was previously active.
         if let Some(outgoing) = self.active_project.as_ref().map(|p| p.id.clone())
             && outgoing != project.id
-            && let Some(tabs) = self.workspace_tabs_by_project.get(&outgoing).cloned()
+            && let Some(panes) = self.project_panes_by_project.get(&outgoing).cloned()
         {
             let repo = self.app_state.pane_buffer_repo.clone();
-            tabs.read(cx).capture_pane_buffers(
+            panes.read(cx).capture_pane_buffers(
                 &repo,
                 &outgoing,
-                crate::workspace_tabs_factory::PANE_BUFFER_MAX_BYTES,
+                crate::project_panes_factory::PANE_BUFFER_MAX_BYTES,
                 cx,
             );
-            // Same capture cadence for relay PTY ids — phase-06
-            // reconciliation needs the (project, ordinal) → pty_id
-            // map up-to-date across project switches, not just at
-            // app quit.
             let snap = crate::shell::terminal_view::relay_state_snapshot();
             if let Some(session_id) = snap.session_id {
                 let relay_repo = self.app_state.pane_relay_id_repo.clone();
-                tabs.read(cx)
+                panes
+                    .read(cx)
                     .capture_pane_relay_ids(&relay_repo, &outgoing, &session_id, cx);
             }
         }
         self.active_project = Some(project.clone());
         let project_root = PathBuf::from(&project.root_path);
-        // Lazy-build the tabs entity on first activation of this project so
-        // its terminals spawn with the correct cwd. Subsequent switches just
-        // resolve the existing entity via `active_workspace_tabs()` — tab
-        // state (open terminals + agent sessions) survives the switch.
-        if !self.workspace_tabs_by_project.contains_key(&project.id) {
+        // Lazy-build the project's panes entity on first activation. Subsequent
+        // switches just resolve the existing entity via `active_project_panes()`
+        // — pane-group + tab state survives the switch.
+        if !self.project_panes_by_project.contains_key(&project.id) {
             let theme = self.theme;
             let density = self.density;
             let typography = self.typography.clone();
             let cli_runtime = self.cli_runtime.clone();
             let notifier = self.notifier.clone();
-            // Try to restore from settings; missing/malformed = fresh start.
             let snapshot = load_persisted_tabs(&self.app_state.settings_repo, &project.id);
-            let pane_buffers = crate::workspace_tabs_factory::load_pane_buffers(
+            let pane_buffers = crate::project_panes_factory::load_pane_buffers(
                 &self.app_state.pane_buffer_repo,
                 &project.id,
             );
-            // Phase-06: build attach hints from the persisted
-            // (ordinal, relay_pty_id, session) rows + the live id
-            // set returned by the daemon's ListPtys. Any row whose
-            // id isn't live OR whose session doesn't match the
-            // current daemon falls out — those panes spawn fresh
-            // and lean on pane_buffers for visual continuity.
             let pane_relay_ids = self
                 .app_state
                 .pane_relay_id_repo
@@ -279,7 +268,7 @@ impl WorkspaceRoot {
                 &relay_snap.live_external_ids,
                 relay_snap.session_id.as_deref(),
             );
-            if let Some(tabs) = build_workspace_tabs(
+            let panes = build_project_panes(
                 project_root.clone(),
                 snapshot,
                 pane_buffers,
@@ -291,30 +280,23 @@ impl WorkspaceRoot {
                 notifier,
                 window,
                 cx,
-            ) {
-                // Install the save sink keyed to this project. Cloning the
-                // repo is cheap (it wraps `Arc<Db>`).
-                let settings_repo = self.app_state.settings_repo.clone();
-                let project_id = project.id.clone();
-                let save_cb: crate::shell::workspace_tabs::SaveCallback =
-                    std::sync::Arc::new(move |snap| {
-                        save_persisted_tabs(&settings_repo, &project_id, &snap);
-                    });
-                tabs.update(cx, |t, _| t.set_save_callback(save_cb));
-                // Re-register the observer on the newly-active entity so its
-                // notifications bubble up. Drops the previous subscription.
-                self._workspace_tabs_observer = Some(cx.observe(&tabs, |_, _, cx| cx.notify()));
-                self.workspace_tabs_by_project
-                    .insert(project.id.clone(), tabs.clone());
-                defer_focus_active(window, cx, tabs);
-            } else {
-                tracing::warn!(project_id = %project.id, "build_workspace_tabs failed");
-            }
-        } else if let Some(tabs) = self.workspace_tabs_by_project.get(&project.id).cloned() {
-            // Project's tabs already exist — re-point the observer at this
-            // entity so the active tab strip notifies the right one.
-            self._workspace_tabs_observer = Some(cx.observe(&tabs, |_, _, cx| cx.notify()));
-            defer_focus_active(window, cx, tabs);
+            );
+            // Install the save sink keyed to this project.
+            let settings_repo = self.app_state.settings_repo.clone();
+            let project_id = project.id.clone();
+            let save_cb: crate::shell::project_panes::SaveCallback =
+                std::sync::Arc::new(move |snap| {
+                    save_persisted_tabs(&settings_repo, &project_id, &snap);
+                });
+            panes.update(cx, |p, _| p.set_save_callback(save_cb));
+            self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
+            self.project_panes_by_project
+                .insert(project.id.clone(), panes.clone());
+            defer_focus_active(window, cx, panes);
+        } else if let Some(panes) = self.project_panes_by_project.get(&project.id).cloned() {
+            // Project already opened once — re-point observer.
+            self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
+            defer_focus_active(window, cx, panes);
         }
         cx.notify();
         cx.spawn_in(window, async move |weak, cx| {

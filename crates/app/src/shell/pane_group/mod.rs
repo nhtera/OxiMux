@@ -5,15 +5,12 @@
 //! splitting creates a new sibling group beside (or above/below) the
 //! focused one. Each group is independent: opening a file in one group
 //! does NOT affect any other group's tab list.
-//!
-//! This is what `WorkspaceTabs` used to be in the pre-step-06 design —
-//! the surface API is similar (open_tab / close_tab / set_active /
-//! focus_active) but the entity is now per-leaf instead of per-project.
 
 mod render;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use gpui::{
     AppContext, Context, FocusHandle, Focusable, SharedString, Subscription, Task, Window,
@@ -23,19 +20,16 @@ use oximux_core::{AgentAdapter, AgentSessionId};
 use oximux_pty::TerminalSessionId;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::main_pane::PaneContent;
+use crate::actions::{CloseTab, NewAgent, NewTab, NextTab, PrevTab, RequestOpenAdapterPicker};
+use crate::notifier::{Notifier, TabId};
+use crate::shell::agent_status_task::spawn_status_task;
+use crate::shell::agent_tab_label;
+use crate::shell::pane_content::PaneContent;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
 /// Discriminator for `PaneGroupTab` carrying any per-kind metadata.
-/// `PaneContent` answers "terminal vs editor" at the view level; this
-/// enum carries the higher-level data (the file path for editor tabs;
-/// the agent session metadata for agent tabs).
 pub enum PaneGroupTabKind {
-    /// User-spawned shell terminal. No extra metadata; the content
-    /// `TerminalView` owns the session id.
     Terminal,
-    /// Agent CLI tab. Carries the runtime session id + status stream so
-    /// the host can subscribe + cancel on tab close.
     Agent {
         adapter: AgentAdapter,
         adapter_id: &'static str,
@@ -45,23 +39,14 @@ pub enum PaneGroupTabKind {
         session_id: AgentSessionId,
         status_rx: AgentStatusStream,
     },
-    /// File editor tab. Path doubles as the dedup key for "is this file
-    /// already open?" lookups.
     Editor { path: PathBuf },
 }
 
-/// A single tab inside a `PaneGroup`. Bundles the label + content +
-/// kind metadata. The `_observer` keeps `cx.observe` alive for the
-/// lifetime of the tab so content notifies propagate to the group.
 pub struct PaneGroupTab {
     pub label: SharedString,
     pub content: PaneContent,
     pub kind: PaneGroupTabKind,
-    /// `cx.observe(content_entity, ...)` subscription — dropping
-    /// unregisters the observer. `Option` because tests can skip it.
     pub _observer: Option<Subscription>,
-    /// Per-tab status task (agent kinds only; `None` for terminal /
-    /// editor). Dropped on tab close, which cancels the future.
     pub _status_task: Option<Task<()>>,
 }
 
@@ -69,29 +54,32 @@ pub struct PaneGroup {
     tabs: Vec<PaneGroupTab>,
     active: usize,
     focus_handle: FocusHandle,
-    /// Monotonic counter for default terminal labels ("Terminal 1",
-    /// "Terminal 2", ...). Scoped per group — restart-from-1 inside a
-    /// new group is fine, matches the industry-standard editor
-    /// convention.
+    /// Monotonic counter for default terminal labels, scoped per group.
     next_terminal_n: u64,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,
     pub(crate) cwd: PathBuf,
     pub(crate) cli_runtime: Arc<CliRuntime>,
+    notifier: Arc<dyn Notifier>,
+    /// Shared with the owning `ProjectPanes` window-activation observer
+    /// so per-tab status watchers read the same flag.
+    window_active: Arc<AtomicBool>,
+    /// Chrome width in window pixels (rail + sidebar) — forwarded by the
+    /// workspace so terminal grid dispatch can compute target area.
+    chrome_w_px: f32,
 }
 
 impl PaneGroup {
-    /// Build an empty group. Caller usually follows up with
-    /// `open_terminal_tab` to seed it; an empty group renders as a
-    /// blank panel (no welcome view at this level — that's host
-    /// concern).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cwd: PathBuf,
         theme: Theme,
         density: Density,
         typography: Typography,
         cli_runtime: Arc<CliRuntime>,
+        notifier: Arc<dyn Notifier>,
+        window_active: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -104,10 +92,12 @@ impl PaneGroup {
             typography,
             cwd,
             cli_runtime,
+            notifier,
+            window_active,
+            chrome_w_px: density.w_left_rail,
         }
     }
 
-    /// Tab list (read-only). Render code walks this.
     pub fn tabs(&self) -> &[PaneGroupTab] {
         &self.tabs
     }
@@ -124,8 +114,35 @@ impl PaneGroup {
         self.tabs.is_empty()
     }
 
-    /// Spawn a fresh shell terminal and append it as a new tab. Returns
-    /// the index of the new tab; `None` if the PTY spawn failed.
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn agent_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|t| matches!(t.kind, PaneGroupTabKind::Agent { .. }))
+            .count()
+    }
+
+    pub(crate) fn chrome_w_px(&self) -> f32 {
+        self.chrome_w_px
+    }
+
+    pub(crate) fn focus_handle_clone(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    pub fn set_chrome_width(&mut self, new_chrome: f32, cx: &mut Context<Self>) {
+        if (self.chrome_w_px - new_chrome).abs() < f32::EPSILON {
+            return;
+        }
+        self.chrome_w_px = new_chrome;
+        cx.notify();
+    }
+
+    /// Append a freshly-spawned shell terminal as a new tab. Returns the
+    /// index of the new tab; `None` if PTY spawn failed.
     pub fn open_terminal_tab(
         &mut self,
         window: &mut Window,
@@ -155,10 +172,6 @@ impl PaneGroup {
         Some(self.active)
     }
 
-    /// Open `path` as an editor tab, or activate the existing tab if
-    /// it's already open. Returns the index of the activated tab.
-    /// Caller is expected to pre-filter unopenable files (see
-    /// `openable_text_file::is_openable_text_file`).
     pub fn open_or_activate_editor_tab(
         &mut self,
         path: PathBuf,
@@ -195,9 +208,6 @@ impl PaneGroup {
         self.active
     }
 
-    /// Append a pre-built agent tab. Backend + session id are supplied
-    /// by the caller (`WorkspaceRoot::spawn_agent_tab` runs the
-    /// CliRuntime spawn off-thread before calling this).
     #[allow(clippy::too_many_arguments)]
     pub fn push_agent_tab(
         &mut self,
@@ -221,9 +231,24 @@ impl PaneGroup {
             TerminalView::mount(backend, term_id, theme, density, typography, window, cx)
         });
         let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
-        let label = label_override.unwrap_or_else(|| adapter_id.to_string());
-        let tab = PaneGroupTab {
-            label: SharedString::from(label),
+        let label = match label_override {
+            Some(s) => SharedString::from(s),
+            None => {
+                let current_labels: Vec<SharedString> =
+                    self.tabs.iter().map(|t| t.label.clone()).collect();
+                agent_tab_label::next_label_for(adapter_id, &current_labels)
+            }
+        };
+        let status_task = spawn_status_task(
+            status_rx.clone(),
+            self.notifier.clone(),
+            self.window_active.clone(),
+            TabId::from(session_id),
+            label.clone(),
+            cx,
+        );
+        self.tabs.push(PaneGroupTab {
+            label,
             content: PaneContent::Terminal(view),
             kind: PaneGroupTabKind::Agent {
                 adapter,
@@ -235,19 +260,32 @@ impl PaneGroup {
                 status_rx,
             },
             _observer: observer,
-            _status_task: None,
-        };
-        self.tabs.push(tab);
+            _status_task: Some(status_task),
+        });
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
         cx.notify();
         self.active
     }
 
-    /// Close the tab at `idx`. For agent tabs, spawns a detached
-    /// `CliRuntime::cancel` so the agent process is reaped. Terminal
-    /// tabs drop straight through to `TerminalView::Drop` (PTY close).
-    /// Editor tabs drop to `EditorView::Drop` (LSP didClose).
+    /// Append a pre-built terminal tab (used by the restore path).
+    pub fn push_restored_terminal_tab(
+        &mut self,
+        label: String,
+        view: gpui::Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
+        self.tabs.push(PaneGroupTab {
+            label: SharedString::from(label),
+            content: PaneContent::Terminal(view),
+            kind: PaneGroupTabKind::Terminal,
+            _observer: observer,
+            _status_task: None,
+        });
+        cx.notify();
+    }
+
     pub fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if idx >= self.tabs.len() {
             return;
@@ -263,11 +301,8 @@ impl PaneGroup {
             .detach();
         }
         if self.tabs.is_empty() {
-            // Empty group — the host's PaneGroupManager is expected to
-            // detect this and either spawn a fresh terminal in the
-            // group or close the group entirely. Don't touch focus
-            // here; the host owns that decision.
             self.active = 0;
+            self.focus_handle.focus(window, cx);
             cx.notify();
             return;
         }
@@ -284,36 +319,48 @@ impl PaneGroup {
         if idx >= self.tabs.len() {
             return;
         }
+        if idx == self.active {
+            return;
+        }
         self.active = idx;
         self.focus_active(window, cx);
         cx.notify();
+    }
+
+    pub fn set_active_by_tab_id(
+        &mut self,
+        tab_id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(idx) = self.tabs.iter().position(|t| match &t.kind {
+            PaneGroupTabKind::Agent { session_id, .. } => TabId::from(*session_id) == tab_id,
+            PaneGroupTabKind::Terminal | PaneGroupTabKind::Editor { .. } => false,
+        }) else {
+            return false;
+        };
+        self.set_active(idx, window, cx);
+        true
     }
 
     pub fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() < 2 {
             return;
         }
-        self.active = (self.active + 1) % self.tabs.len();
-        self.focus_active(window, cx);
-        cx.notify();
+        let next = (self.active + 1) % self.tabs.len();
+        self.set_active(next, window, cx);
     }
 
     pub fn prev_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() < 2 {
             return;
         }
-        self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
-        self.focus_active(window, cx);
-        cx.notify();
+        let prev = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        self.set_active(prev, window, cx);
     }
 
-    /// Focus the active tab's content. Called whenever the active tab
-    /// changes; also called by the host when activating this group so
-    /// keystrokes route correctly. No-op if there are no tabs.
     pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else {
-            // Empty group — focus the group container so action
-            // keystrokes still bubble up to workspace handlers.
             self.focus_handle.focus(window, cx);
             return;
         };
@@ -321,15 +368,71 @@ impl PaneGroup {
         handle.focus(window, cx);
     }
 
-    /// File path of the active editor tab (`None` for terminal/agent
-    /// active or empty group). Drives the active-file highlight in the
-    /// Files sidebar.
     pub fn active_editor_path(&self, cx: &gpui::App) -> Option<PathBuf> {
         let tab = self.tabs.get(self.active)?;
         match &tab.content {
             PaneContent::Editor(view) => Some(view.read(cx).file_path().to_path_buf()),
             PaneContent::Terminal(_) => None,
         }
+    }
+
+    /// Walk every tab (active + inactive) and yield the captured PTY
+    /// scrollback bytes for the terminal kinds. Editor tabs contribute
+    /// an empty buffer so the ordinal counter stays aligned with the
+    /// tab vector.
+    pub fn collect_pane_buffers(&self, max_bytes: usize, cx: &gpui::App) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            match &tab.content {
+                PaneContent::Terminal(view) => {
+                    out.push(view.read(cx).serialize_buffer(max_bytes));
+                }
+                PaneContent::Editor(_) => out.push(Vec::new()),
+            }
+        }
+        out
+    }
+
+    pub fn collect_pane_external_ids(&self, cx: &gpui::App) -> Vec<Option<String>> {
+        let mut out = Vec::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            match &tab.content {
+                PaneContent::Terminal(view) => out.push(view.read(cx).external_id()),
+                PaneContent::Editor(_) => out.push(None),
+            }
+        }
+        out
+    }
+
+    pub(crate) fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_terminal_tab(window, cx);
+    }
+
+    pub(crate) fn on_close_tab(
+        &mut self,
+        _: &CloseTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ix = self.active;
+        self.close_tab(ix, window, cx);
+    }
+
+    pub(crate) fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.next_tab(window, cx);
+    }
+
+    pub(crate) fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.prev_tab(window, cx);
+    }
+
+    pub(crate) fn on_new_agent(
+        &mut self,
+        _: &NewAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.dispatch_action(Box::new(RequestOpenAdapterPicker), cx);
     }
 }
 

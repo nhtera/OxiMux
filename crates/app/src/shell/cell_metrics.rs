@@ -1,13 +1,13 @@
 //! Live cell metrics for the terminal grid.
 //!
 //! Centralises the `cell_width` / `line_height` math that used to live as
-//! magic-number constants (8.4 × 17 px) in `main_pane`. Measuring per render
+//! magic-number constants (8.4 × 17 px) in the legacy pane host. Measuring per render
 //! via `text_system().advance(font_id, font_size, 'm').width` lets the grid
 //! adapt when the user changes font or size in Typography, and removes the
 //! drift risk where `terminal_view` thought a row was 17 px tall while
-//! `main_pane` carved cells out of viewport space using a stale constant.
+//! the host carved cells out of viewport space using a stale constant.
 //!
-//! Cost: one `resolve_font` + one `advance('m')` per `MainPane` render.
+//! Cost: one `resolve_font` + one `advance('m')` per `PaneGroup` render.
 //! Both are cached inside GPUI's text system (LRU on `Font`), so steady-
 //! state cost is a hash lookup. Measured live in Zed's terminal pipeline
 //! the same way (`crates/terminal_view/src/terminal_element.rs:974–979`).
@@ -36,7 +36,7 @@ pub struct CellMetrics {
 impl CellMetrics {
     /// Measure live against the active text system. `window` is taken by
     /// `&Window` (not `&mut`) so callers can use this from any read path
-    /// — `MainPane::dispatch_grids` already only has `&Window`.
+    /// — `PaneGroup`'s grid dispatch already only has `&Window`.
     pub fn measure(typography: &Typography, window: &Window) -> Self {
         let font_size = px(typography.t_body_lg);
         let line_height = typography.t_body_lg + LINE_HEIGHT_EXTRA;

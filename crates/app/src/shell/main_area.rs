@@ -1,4 +1,4 @@
-//! Main area — center pane shown when no `MainPane` entity is mounted.
+//! Main area — center pane shown when no project is active (welcome state).
 //!
 //! Delegates to `welcome_view::view` so the empty state is a proper card
 //! (logo, brand, action stubs, keyboard hints) instead of a placeholder

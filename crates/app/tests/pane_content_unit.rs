@@ -22,10 +22,7 @@
 #[test]
 fn pane_content_module_exports_are_stable() {
     // Compile-time check: the enum and its accessor surface remain
-    // exported under the public path the host depends on. If a rename
-    // lands in `shell/main_pane/pane_content.rs` and the host's import
-    // path drifts, this test breaks at build time — catching the
-    // breakage before downstream callers do.
-    use oximux_app::shell::main_pane::PaneContent;
+    // exported under the public path the host depends on.
+    use oximux_app::shell::pane_content::PaneContent;
     let _ = std::mem::size_of::<PaneContent>();
 }

@@ -6,9 +6,10 @@
 //! tab is active. Click a tab to activate; mouse-down on the × closes
 //! the tab without activating it.
 //!
-//! Extracted from `mod.rs` to keep that file focused on data + API.
-//! This module reads `PaneGroup` state through `&self` only; all
-//! mutations go through `entity.update(cx, ...)` from event handlers.
+//! Action handlers for `NewTab`/`CloseTab`/`NextTab`/`PrevTab`/`NewAgent`
+//! live on this group's root container so keystrokes bubbling up from
+//! the focused leaf hit the right group's logic (not the entire
+//! workspace's).
 
 use gpui::{
     AnyElement, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
@@ -17,20 +18,27 @@ use gpui::{
 };
 
 use super::{PaneGroup, PaneGroupTabKind};
-use crate::shell::main_pane::PaneContent;
+use crate::shell::agent_status_badge::render_dot;
+use crate::shell::cell_metrics::CellMetrics;
+use crate::shell::pane_content::PaneContent;
 
 const TAB_STRIP_HEIGHT_PX: f32 = 32.0;
 const TAB_PAD_X_PX: f32 = 12.0;
 const CLOSE_BUTTON_SIZE_PX: f32 = 14.0;
 const ICON_SIZE_PX: f32 = 11.0;
+/// Match the workspace chrome (top bar + status bar) so terminal grid
+/// math budgets vertical space the same way the old MainPane did.
+const CHROME_H_PX: f32 = 40.0 + 24.0;
 
 impl Render for PaneGroup {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let active = self.active();
         let entity = cx.entity().clone();
+        let focus_handle = self.focus_handle_clone();
 
-        // Build the tab strip — one chip per open tab.
+        dispatch_active_grid(self, window, cx);
+
         let mut strip = div()
             .id("pane-group-tab-strip")
             .flex()
@@ -55,7 +63,6 @@ impl Render for PaneGroup {
             ));
         }
 
-        // Active content area.
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
             PaneContent::Terminal(view) => view.clone().into_any_element(),
             PaneContent::Editor(view) => view.clone().into_any_element(),
@@ -69,12 +76,49 @@ impl Render for PaneGroup {
             .when_some(active_content, |s, child| s.child(child));
 
         div()
+            .id(SharedString::from(format!(
+                "pane-group-{}",
+                entity.entity_id()
+            )))
+            .track_focus(&focus_handle)
             .flex()
             .flex_col()
             .size_full()
+            .on_action(cx.listener(PaneGroup::on_new_tab))
+            .on_action(cx.listener(PaneGroup::on_close_tab))
+            .on_action(cx.listener(PaneGroup::on_next_tab))
+            .on_action(cx.listener(PaneGroup::on_prev_tab))
+            .on_action(cx.listener(PaneGroup::on_new_agent))
             .child(strip)
             .child(body)
     }
+}
+
+/// Forward grid target to the active terminal tab so its PTY resizes
+/// when the window resizes or chrome width changes. No-op for editor /
+/// empty tabs. Mirrors the old `MainPane::dispatch_grids` budget math.
+fn dispatch_active_grid(
+    group: &PaneGroup,
+    window: &Window,
+    cx: &mut Context<PaneGroup>,
+) {
+    let Some(tab) = group.active_tab() else {
+        return;
+    };
+    let PaneContent::Terminal(view) = &tab.content else {
+        return;
+    };
+    let metrics = CellMetrics::measure(&group.typography, window);
+    let v = window.viewport_size();
+    let pad = group.density.pad_panel;
+    let w =
+        (f32::from(v.width) - group.chrome_w_px() - pad * 2.0).max(metrics.cell_width);
+    let h = (f32::from(v.height) - CHROME_H_PX - TAB_STRIP_HEIGHT_PX - pad * 2.0)
+        .max(metrics.line_height);
+    let cols = metrics.cols_in(w);
+    let rows = metrics.rows_in(h);
+    let view = view.clone();
+    view.update(cx, |v, _| v.set_target_grid(cols, rows));
 }
 
 fn render_tab(
@@ -108,6 +152,14 @@ fn render_tab(
     let group_name = SharedString::from(format!("pane-group-tab-{ix}"));
     let activate_entity = entity.clone();
 
+    let agent_dot: Option<AnyElement> = if let PaneGroupTabKind::Agent { status_rx, .. } = kind {
+        let status = status_rx.borrow().clone();
+        let dot_id = SharedString::from(format!("pane-group-agent-status-dot-{ix}"));
+        Some(render_dot(dot_id, &status, theme).into_any_element())
+    } else {
+        None
+    };
+
     div()
         .id(SharedString::from(format!("pane-group-tab-{ix}")))
         .group(group_name.clone())
@@ -131,6 +183,7 @@ fn render_tab(
             entity.update(cx, |this, cx| this.set_active(ix, window, cx));
         })
         .child(svg().path(icon_path).size(px(ICON_SIZE_PX)).text_color(icon_color))
+        .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
         .child(close_button(ix, is_active, entity, group_name, theme))
 }
@@ -146,8 +199,6 @@ fn close_button(
         .path("icons/close.svg")
         .size(px(9.0))
         .text_color(theme.fg_muted);
-    // Hide the X by default; show on tab hover OR when the tab is
-    // active. Matches industry-standard editor convention.
     let initial_opacity = if is_active { 1.0 } else { 0.0 };
     div()
         .id(SharedString::from(format!("pane-group-tab-close-{ix}")))
