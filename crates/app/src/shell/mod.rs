@@ -33,6 +33,7 @@ pub mod search_panel;
 pub mod source_control;
 pub mod stash_panel;
 pub mod status_bar;
+pub mod tab_context_menu;
 pub mod terminal_palette;
 pub mod terminal_row;
 pub mod terminal_search;

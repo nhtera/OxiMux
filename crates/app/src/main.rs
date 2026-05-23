@@ -17,11 +17,10 @@ use gpui::{
     px, size,
 };
 use oximux_app::actions::{
-    CloseTab, FocusNextPane, FocusPrevPane, NewAgent, NewTab, NextTab, OpenCommandPalette,
-    OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, Search,
-    SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitHorizontal,
-    SplitVertical,
-    ToggleLeftSidebar, ToggleRightSidebar,
+    CloseTab, DismissOverlay, FocusNextPane, FocusPrevPane, NewAgent, NewTab, NextTab,
+    OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
+    PrevTab, Search, SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab,
+    SplitHorizontal, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 // SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
 // crate dependency: oximux-app → oximux-editor → oximux-app would be a cycle.
@@ -189,6 +188,10 @@ fn main() {
             // cmd-s saves the active editor buffer. Handled by EditorView's
             // root div via `.on_action`; no-op when no editor is focused.
             KeyBinding::new("cmd-s", SaveFile, None),
+            // Escape dismisses any open transient overlay (pane actions
+            // menu, tab context menu, adapter picker). Handled at the
+            // WorkspaceRoot level; other components ignore the action.
+            KeyBinding::new("escape", DismissOverlay, None),
         ]);
         cx.activate(true);
 

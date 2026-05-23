@@ -7,7 +7,30 @@
 //! the focused `TerminalView` keystrokes still reach the shell while
 //! `Cmd-*` combos bubble up to `WorkspaceRoot`.
 
-use gpui::actions;
+use gpui::{Action, actions};
+
+/// Payload action used by the per-pane "..." button. Carries the click's
+/// absolute window coordinates so the shared `PaneActionsMenu` can anchor
+/// itself to the chip instead of the workspace's top-right edge.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenPaneActionsAt {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Payload action fired by a tab chip's right-click. Carries the cursor
+/// coords plus the target group's id and the right-clicked tab index so
+/// the shared `TabContextMenu` knows which (group, tab) the user picked
+/// even if focus moves before they select an item.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenTabContextMenuAt {
+    pub x: f32,
+    pub y: f32,
+    pub group_id: u64,
+    pub tab_idx: u32,
+}
 
 actions!(
     oximux,
@@ -26,6 +49,11 @@ actions!(
         SplitLeft,
         /// Four-direction split: new pane above focus.
         SplitUp,
+        /// Close the focused pane group. No-op when it's the only group.
+        CloseGroup,
+        /// Dismiss any open transient overlay (pane actions menu, tab
+        /// context menu, adapter picker). Bound to Escape.
+        DismissOverlay,
         /// Open the Pane Actions dropdown (split direction picker).
         OpenPaneActions,
         /// Cycle focus to the next pane in in-order traversal.

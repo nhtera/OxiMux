@@ -30,7 +30,8 @@ impl Render for ProjectPanes {
         // the workspace top bar (see `topmost_tab_strip`), so we skip
         // its inline strip here.
         let topmost = self.manager().in_order_groups().first().copied();
-        let body = render_tree(&tree, self, topmost, theme, cx);
+        let active_group_id = self.manager().active_group_id();
+        let body = render_tree(&tree, self, topmost, active_group_id, theme, cx);
         div().flex().flex_col().size_full().child(body)
     }
 }
@@ -39,10 +40,22 @@ impl ProjectPanes {
     /// Strip for the workspace's topmost (first-in-DFS) pane group,
     /// to be embedded in the top bar's center zone. `None` when no
     /// groups are mounted.
+    ///
+    /// `show_pane_actions = false` here because the top bar already
+    /// renders its own "..." button next to the sidebar toggles —
+    /// duplicating it inside the hoisted strip would crowd the chrome.
     pub fn topmost_tab_strip(&self, cx: &App) -> Option<AnyElement> {
         let id = self.manager().in_order_groups().first().copied()?;
         let entity = self.group(id)?;
-        Some(build_tab_strip_for(entity, self.theme, cx))
+        let is_focused = id == self.manager().active_group_id();
+        Some(build_tab_strip_for(
+            entity,
+            id,
+            is_focused,
+            false,
+            self.theme,
+            cx,
+        ))
     }
 }
 
@@ -50,6 +63,7 @@ fn render_tree(
     node: &PaneTree<PaneGroupId>,
     panes: &ProjectPanes,
     topmost: Option<PaneGroupId>,
+    active_group_id: PaneGroupId,
     theme: oximux_settings::Theme,
     cx: &App,
 ) -> AnyElement {
@@ -63,15 +77,23 @@ fn render_tree(
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_hidden();
+                let is_focused = *id == active_group_id;
                 // Topmost group's strip is hoisted into the top bar
                 // (see `topmost_tab_strip`); every other group renders
                 // its own inline strip above the active tab content.
                 if Some(*id) == topmost {
                     slot.child(group).into_any_element()
                 } else {
-                    slot.child(build_tab_strip_for(group.clone(), theme, cx))
-                        .child(group)
-                        .into_any_element()
+                    slot.child(build_tab_strip_for(
+                        group.clone(),
+                        *id,
+                        is_focused,
+                        true,
+                        theme,
+                        cx,
+                    ))
+                    .child(group)
+                    .into_any_element()
                 }
             }
             // Leaf in the tree but no entity registered — shouldn't
@@ -105,7 +127,14 @@ fn render_tree(
                     Axis::Horizontal => slot.w(gpui::relative(frac / 100.0)).h_full(),
                     Axis::Vertical => slot.h(gpui::relative(frac / 100.0)).w_full(),
                 };
-                row = row.child(slot.child(render_tree(child, panes, topmost, theme, cx)));
+                row = row.child(slot.child(render_tree(
+                    child,
+                    panes,
+                    topmost,
+                    active_group_id,
+                    theme,
+                    cx,
+                )));
                 if i + 1 < children.len() {
                     row = row.child(divider(*axis, theme));
                 }

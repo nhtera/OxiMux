@@ -47,10 +47,11 @@ use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenProjectPicker,
-    OpenQuickOpen, OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab,
-    SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitDown, SplitHorizontal, SplitLeft,
-    SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    CloseGroup, DismissOverlay, OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog,
+    OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
+    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
+    SelectSearchTab, SelectSourceControlTab, SplitDown, SplitHorizontal, SplitLeft, SplitRight,
+    SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -61,7 +62,8 @@ use crate::shell::{
     left_rail::{LeftRail, row_menu::WorkspaceRowMenu},
     main_area,
     openable_text_file::is_openable_text_file,
-    pane_actions::PaneActionsMenu,
+    pane_actions::{PaneActionsAnchor, PaneActionsMenu},
+    tab_context_menu::TabContextMenu,
     project_picker::{OnPick, ProjectPickerModal},
     right_sidebar::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
@@ -94,6 +96,7 @@ pub struct WorkspaceRoot {
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
     pub(crate) pane_actions: Entity<PaneActionsMenu>,
+    pub(crate) tab_context_menu: Entity<TabContextMenu>,
     /// Inline adapter-picker popover anchored to the workspace-tabs `+` button.
     pub(crate) adapter_picker: Entity<AdapterPicker>,
     /// PTY backend + status streams for every agent session. Held behind Arc
@@ -210,6 +213,8 @@ impl WorkspaceRoot {
         let left_rail = cx.new(|cx| LeftRail::new(weak_self.clone(), cx));
         let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
+        let tab_context_menu =
+            cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
@@ -331,6 +336,7 @@ impl WorkspaceRoot {
             left_rail,
             palette,
             pane_actions,
+            tab_context_menu,
             adapter_picker,
             cli_runtime,
             adapter_registry,
@@ -590,6 +596,18 @@ impl WorkspaceRoot {
             p.split_active_group(axis, insert, window, cx);
         });
     }
+
+    /// Close the focused pane group in the active project. Manager
+    /// returns `LastGroup` when no siblings exist; we swallow that so
+    /// the keybind / menu item is a no-op rather than an error popup.
+    fn close_active_pane_group(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        panes.update(cx, |p, cx| {
+            let _ = p.close_active_group(window, cx);
+        });
+    }
 }
 
 // `build_project_panes` + restore helpers live in
@@ -833,13 +851,70 @@ impl Render for WorkspaceRoot {
                 } else {
                     top_bar::TOGGLE_BUTTON_WIDTH
                 };
+                let has_siblings = this
+                    .active_project_panes()
+                    .map(|p| p.read(cx).manager().in_order_groups().len() > 1)
+                    .unwrap_or(false);
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
-                this.pane_actions
-                    .update(cx, |p, cx| p.open(right_anchor, cx));
+                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.pane_actions.update(cx, |p, cx| {
+                    p.open(
+                        PaneActionsAnchor::TopRight {
+                            right_px: right_anchor,
+                        },
+                        has_siblings,
+                        cx,
+                    )
+                });
+            }))
+            .on_action(cx.listener(|this, action: &OpenPaneActionsAt, _window, cx| {
+                // Per-pane "..." click carries the cursor's absolute window
+                // coords. The menu shifts itself left by its own width so
+                // the card stays inside the right edge when chips sit near
+                // it (see pane_actions::PaneActionsAnchor::Chip).
+                let has_siblings = this
+                    .active_project_panes()
+                    .map(|p| p.read(cx).manager().in_order_groups().len() > 1)
+                    .unwrap_or(false);
+                this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.pane_actions.update(cx, |p, cx| {
+                    p.open(
+                        PaneActionsAnchor::Chip {
+                            x_px: action.x,
+                            y_px: action.y,
+                        },
+                        has_siblings,
+                        cx,
+                    )
+                });
             }))
             // Four-direction split actions. SplitHorizontal / SplitVertical
             // are aliases preserved for the legacy Cmd+D / Cmd+Shift+D
             // bindings; they map to Right / Down respectively.
+            .on_action(cx.listener(|this, action: &OpenTabContextMenuAt, _window, cx| {
+                // Tab chip right-click. Carries enough state (group id,
+                // tab index, click coords) for the shared TabContextMenu
+                // to mutate the right group even if focus moves before
+                // the user picks an item.
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                let panes_ref = panes.read(cx);
+                let Some(group) = panes_ref.group(group_id) else {
+                    return;
+                };
+                let tab_count = group.read(cx).tabs().len();
+                let weak = group.downgrade();
+                let tab_idx = action.tab_idx as usize;
+                let x = action.x;
+                let y = action.y;
+                this.pane_actions.update(cx, |p, cx| p.close(cx));
+                this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.tab_context_menu
+                    .update(cx, |m, cx| m.open(x, y, weak, tab_idx, tab_count, cx));
+            }))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {
                 this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);
             }))
@@ -857,6 +932,18 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|this, _: &SplitUp, window, cx| {
                 this.split_active_pane_group(Axis::Vertical, SplitInsert::Before, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseGroup, window, cx| {
+                this.close_active_pane_group(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DismissOverlay, _window, cx| {
+                // Close every transient overlay so a single Escape dismisses
+                // whichever popover is currently visible. Modal dialogs
+                // (project picker / workspace create / palette) own their
+                // own focus and currently ignore this.
+                this.pane_actions.update(cx, |p, cx| p.close(cx));
+                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.adapter_picker.update(cx, |p, cx| p.close(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                 if let Some(rs) = &this.right_sidebar {
@@ -909,6 +996,10 @@ impl Render for WorkspaceRoot {
             // Pane Actions dropdown — appended before the palette so the
             // palette (more rare, larger) wins z-order when both are open.
             .child(self.pane_actions.clone())
+            // Tab right-click context menu — same z-band as pane_actions.
+            // Mutually exclusive with it via close-on-open logic in the
+            // OpenPaneActionsAt / OpenTabContextMenuAt action handlers.
+            .child(self.tab_context_menu.clone())
             // Adapter picker — same z-band as pane_actions; only one of
             // them can be open at a time so order between them is moot.
             .child(self.adapter_picker.clone())

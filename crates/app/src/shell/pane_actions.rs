@@ -15,12 +15,14 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::actions::CloseGroup;
 use crate::shell::split_direction::{SplitDirection, split_icon};
 
 /// Width of the dropdown card.
-const MENU_WIDTH: f32 = 184.0;
-/// Vertical gap below the chrome row before the dropdown starts.
-const ANCHOR_TOP_PX: f32 = 42.0;
+pub const MENU_WIDTH: f32 = 184.0;
+/// Vertical gap below the chrome row before the dropdown starts when
+/// anchored to the workspace's top-right "..." button.
+const TOP_BAR_ANCHOR_TOP_PX: f32 = 42.0;
 /// Edge padding around the card content.
 const CARD_PADDING: f32 = 6.0;
 /// Single menu item height.
@@ -32,12 +34,22 @@ const ROW_PADDING_X: f32 = 10.0;
 /// Gap between icon and label.
 const ROW_GAP: f32 = 10.0;
 
+/// Where the dropdown anchors. `TopRight` is the workspace's trailing
+/// "..." button — fixed top offset, right-edge inset. `Chip` is a
+/// per-pane "..." click — the menu opens at the cursor's absolute
+/// window position, shifted left so it doesn't fall off the right edge.
+#[derive(Clone, Copy)]
+pub enum PaneActionsAnchor {
+    TopRight { right_px: f32 },
+    Chip { x_px: f32, y_px: f32 },
+}
+
 pub struct PaneActionsMenu {
     open: bool,
-    /// Right-edge offset in CSS pixels — set by WorkspaceRoot at open()
-    /// so the dropdown sits beneath the "..." button regardless of
-    /// whether the right sidebar is open.
-    right_anchor_px: f32,
+    anchor: PaneActionsAnchor,
+    /// Show the Close Group row. Owner passes `in_order_groups().len() > 1`
+    /// so the action only appears when another group would survive.
+    has_siblings: bool,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -47,7 +59,8 @@ impl PaneActionsMenu {
     pub fn new(theme: Theme, density: Density, typography: Typography) -> Self {
         Self {
             open: false,
-            right_anchor_px: 0.0,
+            anchor: PaneActionsAnchor::TopRight { right_px: 0.0 },
+            has_siblings: false,
             theme,
             density,
             typography,
@@ -58,8 +71,14 @@ impl PaneActionsMenu {
         self.open
     }
 
-    pub fn open(&mut self, right_anchor_px: f32, cx: &mut Context<Self>) {
-        self.right_anchor_px = right_anchor_px;
+    pub fn open(
+        &mut self,
+        anchor: PaneActionsAnchor,
+        has_siblings: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.anchor = anchor;
+        self.has_siblings = has_siblings;
         self.open = true;
         cx.notify();
     }
@@ -78,7 +97,7 @@ impl Render for PaneActionsMenu {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
-        let right_px = self.right_anchor_px;
+        let anchor = self.anchor;
 
         let dirs = [
             SplitDirection::Right,
@@ -126,6 +145,62 @@ impl Render for PaneActionsMenu {
             card = card.child(row);
         }
 
+        if self.has_siblings {
+            let separator = div()
+                .h(px(1.0))
+                .my(px(4.0))
+                .bg(theme.border_inactive);
+            let close_icon = svg()
+                .path("icons/close.svg")
+                .size(px(ICON_SIZE))
+                .text_color(theme.fg_muted);
+            let close_row = div()
+                .id("pane-action-row-close-group")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(ROW_GAP))
+                .h(px(ITEM_HEIGHT))
+                .px(px(ROW_PADDING_X))
+                .rounded(px(density.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_panel_alt))
+                .text_size(px(typography.t_body_md))
+                .text_color(theme.fg_base)
+                .child(close_icon)
+                .child(div().flex_1().child("Close Group"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        window.dispatch_action(Box::new(CloseGroup), cx);
+                        this.close(cx);
+                    }),
+                );
+            card = card.child(separator).child(close_row);
+        }
+
+        // Anchored card: shared between the top-bar "..." (right-edge
+        // pin) and the per-pane "..." chip (cursor-pin). For the chip
+        // path, shift left by MENU_WIDTH so the card stays inside the
+        // window edge when the click lands near the right side.
+        let card_container = match anchor {
+            PaneActionsAnchor::TopRight { right_px } => div()
+                .absolute()
+                .top(px(TOP_BAR_ANCHOR_TOP_PX))
+                .right(px(right_px))
+                .w(px(MENU_WIDTH))
+                .child(card),
+            PaneActionsAnchor::Chip { x_px, y_px } => {
+                let left_px = (x_px - MENU_WIDTH).max(0.0);
+                div()
+                    .absolute()
+                    .top(px(y_px))
+                    .left(px(left_px))
+                    .w(px(MENU_WIDTH))
+                    .child(card)
+            }
+        };
+
         // Full-window invisible overlay for click-outside dismiss.
         div()
             .absolute()
@@ -137,14 +212,7 @@ impl Render for PaneActionsMenu {
                     this.close(cx);
                 }),
             )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(ANCHOR_TOP_PX))
-                    .right(px(right_px))
-                    .w(px(MENU_WIDTH))
-                    .child(card),
-            )
+            .child(card_container)
             .into_any_element()
     }
 }
@@ -167,9 +235,28 @@ mod tests {
     fn open_sets_anchor_and_visibility() {
         let mut m = test_menu();
         // Mirror open() body inline (no Context<Self> in unit tests).
-        m.right_anchor_px = 120.0;
+        m.anchor = PaneActionsAnchor::TopRight { right_px: 120.0 };
+        m.has_siblings = true;
         m.open = true;
         assert!(m.is_open());
-        assert_eq!(m.right_anchor_px, 120.0);
+        assert!(matches!(
+            m.anchor,
+            PaneActionsAnchor::TopRight { right_px } if right_px == 120.0
+        ));
+        assert!(m.has_siblings);
+    }
+
+    #[test]
+    fn chip_anchor_carries_xy() {
+        let mut m = test_menu();
+        m.anchor = PaneActionsAnchor::Chip {
+            x_px: 800.0,
+            y_px: 200.0,
+        };
+        m.open = true;
+        assert!(matches!(
+            m.anchor,
+            PaneActionsAnchor::Chip { x_px, y_px } if x_px == 800.0 && y_px == 200.0
+        ));
     }
 }

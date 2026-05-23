@@ -323,6 +323,51 @@ impl PaneGroup {
         cx.notify();
     }
 
+    /// Close every tab in this group except `keep_idx`. Iterates in
+    /// reverse so each `close_tab` call sees stable indices for the
+    /// untouched portion. No-op when `keep_idx` is out of range.
+    pub fn close_others(
+        &mut self,
+        keep_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if keep_idx >= self.tabs.len() {
+            return;
+        }
+        for idx in (0..self.tabs.len()).rev() {
+            if idx != keep_idx {
+                self.close_tab(idx, window, cx);
+            }
+        }
+    }
+
+    /// Close every tab whose index is greater than `from_idx`. Reverse
+    /// iteration keeps each `close_tab` index valid against the still-
+    /// unprocessed tail.
+    pub fn close_to_right(
+        &mut self,
+        from_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.tabs.len();
+        if from_idx + 1 >= len {
+            return;
+        }
+        for idx in (from_idx + 1..len).rev() {
+            self.close_tab(idx, window, cx);
+        }
+    }
+
+    /// Close every tab in this group. The empty group is purged by
+    /// `ProjectPanes::purge_empty_groups` on the next render frame.
+    pub fn close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for idx in (0..self.tabs.len()).rev() {
+            self.close_tab(idx, window, cx);
+        }
+    }
+
     pub fn set_active(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if idx >= self.tabs.len() {
             return;

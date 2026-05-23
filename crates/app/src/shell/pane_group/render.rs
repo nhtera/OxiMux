@@ -19,7 +19,8 @@ use gpui::{
 use oximux_settings::Theme;
 
 use super::{PaneGroup, PaneGroupTabKind};
-use crate::actions::RequestOpenAdapterPicker;
+use crate::actions::{OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker};
+use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::agent_status_badge::render_dot;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_content::PaneContent;
@@ -29,6 +30,9 @@ const TAB_PAD_X_PX: f32 = 12.0;
 const CLOSE_BUTTON_SIZE_PX: f32 = 14.0;
 const ICON_SIZE_PX: f32 = 11.0;
 const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
+/// "..." Pane Actions button width — matches the `+` neighbor so the
+/// trailing button cluster stays balanced.
+const ELLIPSIS_BUTTON_WIDTH_PX: f32 = 28.0;
 /// Match the workspace chrome (top bar + status bar) so terminal grid
 /// math budgets vertical space the same way the legacy host did.
 const CHROME_H_PX: f32 = 40.0 + 24.0;
@@ -74,7 +78,19 @@ impl Render for PaneGroup {
 /// so `ProjectPanes` can render the strip externally — either hoisted
 /// into the top bar (for the topmost group) or wrapped above the
 /// group's body (for non-topmost groups).
-pub fn build_tab_strip_for(entity: Entity<PaneGroup>, theme: Theme, cx: &App) -> AnyElement {
+///
+/// `is_focused` controls visibility of the per-pane "..." button (only
+/// the focused group shows it, matching the reference editor's
+/// behavior). `show_pane_actions` is `false` for the hoisted topmost
+/// strip — the top bar already renders its own "..." button there.
+pub fn build_tab_strip_for(
+    entity: Entity<PaneGroup>,
+    group_id: PaneGroupId,
+    is_focused: bool,
+    show_pane_actions: bool,
+    theme: Theme,
+    cx: &App,
+) -> AnyElement {
     let group = entity.read(cx);
     let tabs: Vec<PaneGroupTabHeader> = group
         .tabs()
@@ -87,7 +103,15 @@ pub fn build_tab_strip_for(entity: Entity<PaneGroup>, theme: Theme, cx: &App) ->
         .collect();
     let active = group.active();
     let _ = group;
-    build_tab_strip_from_headers(entity, &tabs, active, theme)
+    build_tab_strip_from_headers(
+        entity,
+        group_id,
+        &tabs,
+        active,
+        is_focused,
+        show_pane_actions,
+        theme,
+    )
 }
 
 /// Lightweight projection of a `PaneGroupTab` that the strip render
@@ -124,8 +148,11 @@ fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus>
 
 fn build_tab_strip_from_headers(
     entity: Entity<PaneGroup>,
+    group_id: PaneGroupId,
     tabs: &[PaneGroupTabHeader],
     active: usize,
+    is_focused: bool,
+    show_pane_actions: bool,
     theme: Theme,
 ) -> AnyElement {
     let entity_id = entity.entity_id();
@@ -144,6 +171,7 @@ fn build_tab_strip_from_headers(
     for (idx, header) in tabs.iter().enumerate() {
         strip = strip.child(render_tab_chip(
             entity_id.as_u64(),
+            group_id,
             idx,
             header.label.clone(),
             header.kind_marker,
@@ -155,6 +183,9 @@ fn build_tab_strip_from_headers(
     }
     strip = strip.child(plus_button(entity_id.as_u64(), theme));
     strip = strip.child(div().flex_1().min_w(px(0.0)));
+    if show_pane_actions {
+        strip = strip.child(pane_actions_button(entity_id.as_u64(), is_focused, theme));
+    }
     strip.into_any_element()
 }
 
@@ -188,6 +219,7 @@ fn dispatch_active_grid(
 #[allow(clippy::too_many_arguments)]
 fn render_tab_chip(
     entity_id_raw: u64,
+    group_id: PaneGroupId,
     ix: usize,
     label: SharedString,
     marker: PaneTabKindMarker,
@@ -249,10 +281,69 @@ fn render_tab_chip(
             let entity = activate_entity.clone();
             entity.update(cx, |this, cx| this.set_active(ix, window, cx));
         })
+        .on_mouse_down(
+            MouseButton::Right,
+            move |ev: &MouseDownEvent, window, cx| {
+                let pos = ev.position;
+                window.dispatch_action(
+                    Box::new(OpenTabContextMenuAt {
+                        x: f32::from(pos.x),
+                        y: f32::from(pos.y),
+                        group_id: group_id.0,
+                        tab_idx: ix as u32,
+                    }),
+                    cx,
+                );
+                cx.stop_propagation();
+            },
+        )
         .child(svg().path(icon_path).size(px(ICON_SIZE_PX)).text_color(icon_color))
         .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
         .child(close_button(entity_id_raw, ix, is_active, entity, group_name, theme))
+}
+
+/// Trailing "..." button on the focused group's strip. Dispatches
+/// `OpenPaneActionsAt` with the cursor's absolute window coordinates so
+/// the shared `PaneActionsMenu` popup anchors to the click point rather
+/// than the workspace top-right corner. Unfocused groups still reserve
+/// the slot via a zero-width collapse so focus shifts don't reflow the
+/// strip.
+fn pane_actions_button(entity_id_raw: u64, is_focused: bool, theme: Theme) -> impl IntoElement {
+    let glyph = svg()
+        .path("icons/ellipsis.svg")
+        .size(px(14.0))
+        .text_color(theme.fg_muted);
+    let (width_px, opacity) = if is_focused {
+        (ELLIPSIS_BUTTON_WIDTH_PX, 1.0_f32)
+    } else {
+        (0.0_f32, 0.0_f32)
+    };
+    div()
+        .id(SharedString::from(format!(
+            "pane-group-actions-{entity_id_raw}"
+        )))
+        .w(px(width_px))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .overflow_hidden()
+        .opacity(opacity)
+        .cursor_pointer()
+        .when(is_focused, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
+        .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
+            let pos = ev.position;
+            window.dispatch_action(
+                Box::new(OpenPaneActionsAt {
+                    x: f32::from(pos.x),
+                    y: f32::from(pos.y),
+                }),
+                cx,
+            );
+        })
+        .child(glyph)
 }
 
 fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
