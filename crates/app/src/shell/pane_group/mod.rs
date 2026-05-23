@@ -125,6 +125,18 @@ impl PaneGroup {
             .count()
     }
 
+    /// True when every tab in the group is a plain shell terminal.
+    /// Non-topmost terminal-only groups suppress their tab strip — the
+    /// terminal content reads cleaner without a header chip per pane,
+    /// and a new terminal is one keystroke (NewTab) or one split away.
+    pub fn is_terminal_only(&self) -> bool {
+        !self.tabs.is_empty()
+            && self
+                .tabs
+                .iter()
+                .all(|t| matches!(t.kind, PaneGroupTabKind::Terminal))
+    }
+
     pub(crate) fn chrome_w_px(&self) -> f32 {
         self.chrome_w_px
     }

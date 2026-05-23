@@ -63,11 +63,16 @@ fn render_tree(
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_hidden();
-                if Some(*id) == topmost {
-                    // Strip is hoisted to top bar; render body only.
+                let is_topmost = Some(*id) == topmost;
+                // Hoist the topmost group's strip into the top bar.
+                // Non-topmost groups composed entirely of plain shell
+                // terminals also drop the strip — clean split panes
+                // with raw terminal content, no per-pane header chip.
+                let suppress_inline_strip =
+                    is_topmost || group.read(cx).is_terminal_only();
+                if suppress_inline_strip {
                     slot.child(group).into_any_element()
                 } else {
-                    // Non-topmost: stack inline tab strip above the body.
                     slot.child(build_tab_strip_for(group.clone(), theme, cx))
                         .child(group)
                         .into_any_element()
