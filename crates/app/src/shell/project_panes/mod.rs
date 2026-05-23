@@ -284,6 +284,43 @@ impl ProjectPanes {
         Ok(closed)
     }
 
+    /// Close a specific group by id (no-op when unknown or last).
+    pub fn close_group_by_id(
+        &mut self,
+        id: PaneGroupId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<PaneGroupId, CloseGroupError> {
+        if !self.manager.set_active(id) {
+            return Err(CloseGroupError::NotFound);
+        }
+        self.close_active_group(window, cx)
+    }
+
+    /// Pre-render sweep: drop any group whose tabs hit zero. Refuses
+    /// to close the last group — that path falls through to render-as-
+    /// empty so the user still has a stable container.
+    pub(crate) fn purge_empty_groups(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.groups.len() <= 1 {
+            return;
+        }
+        let empties: Vec<PaneGroupId> = self
+            .groups
+            .iter()
+            .filter_map(|(id, g)| g.read(cx).is_empty().then_some(*id))
+            .collect();
+        for id in empties {
+            if self.groups.len() <= 1 {
+                break;
+            }
+            let _ = self.close_group_by_id(id, window, cx);
+        }
+    }
+
     pub fn open_or_activate_editor_tab(
         &mut self,
         path: PathBuf,

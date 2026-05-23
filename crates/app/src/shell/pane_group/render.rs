@@ -12,10 +12,11 @@
 //! workspace's).
 
 use gpui::{
-    AnyElement, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px, svg,
+    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, prelude::FluentBuilder, px, svg,
 };
+use oximux_settings::Theme;
 
 use super::{PaneGroup, PaneGroupTabKind};
 use crate::actions::RequestOpenAdapterPicker;
@@ -23,53 +24,21 @@ use crate::shell::agent_status_badge::render_dot;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_content::PaneContent;
 
-const TAB_STRIP_HEIGHT_PX: f32 = 32.0;
+pub const TAB_STRIP_HEIGHT_PX: f32 = 32.0;
 const TAB_PAD_X_PX: f32 = 12.0;
 const CLOSE_BUTTON_SIZE_PX: f32 = 14.0;
 const ICON_SIZE_PX: f32 = 11.0;
 const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
 /// Match the workspace chrome (top bar + status bar) so terminal grid
-/// math budgets vertical space the same way the old MainPane did.
+/// math budgets vertical space the same way the legacy host did.
 const CHROME_H_PX: f32 = 40.0 + 24.0;
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let active = self.active();
         let entity = cx.entity().clone();
         let focus_handle = self.focus_handle_clone();
 
         dispatch_active_grid(self, window, cx);
-
-        let mut strip = div()
-            .id("pane-group-tab-strip")
-            .flex()
-            .flex_row()
-            .items_stretch()
-            .h(px(TAB_STRIP_HEIGHT_PX))
-            .w_full()
-            .bg(theme.bg_panel)
-            .border_b_1()
-            .border_color(theme.border_inactive)
-            .overflow_x_scroll()
-            .overflow_y_hidden();
-
-        for (idx, tab) in self.tabs().iter().enumerate() {
-            strip = strip.child(render_tab(
-                idx,
-                tab.label.clone(),
-                &tab.kind,
-                idx == active,
-                theme,
-                entity.clone(),
-            ));
-        }
-        // "+" new-tab/agent button immediately after the last tab, then a
-        // flex spacer that pushes nothing (the strip's overflow-scroll
-        // already absorbs slack). Matches the per-group "+" pattern in
-        // the reference editor.
-        strip = strip.child(plus_button(theme));
-        strip = strip.child(div().flex_1().min_w(px(0.0)));
 
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
             PaneContent::Terminal(view) => view.clone().into_any_element(),
@@ -97,9 +66,96 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_next_tab))
             .on_action(cx.listener(PaneGroup::on_prev_tab))
             .on_action(cx.listener(PaneGroup::on_new_agent))
-            .child(strip)
             .child(body)
     }
+}
+
+/// Build a tab strip element for a `PaneGroup` entity. Free function
+/// so `ProjectPanes` can render the strip externally — either hoisted
+/// into the top bar (for the topmost group) or wrapped above the
+/// group's body (for non-topmost groups).
+pub fn build_tab_strip_for(entity: Entity<PaneGroup>, theme: Theme, cx: &App) -> AnyElement {
+    let group = entity.read(cx);
+    let tabs: Vec<PaneGroupTabHeader> = group
+        .tabs()
+        .iter()
+        .map(|t| PaneGroupTabHeader {
+            label: t.label.clone(),
+            kind_marker: kind_marker(&t.kind),
+            agent_status: agent_status_for(&t.kind),
+        })
+        .collect();
+    let active = group.active();
+    let _ = group;
+    build_tab_strip_from_headers(entity, &tabs, active, theme)
+}
+
+/// Lightweight projection of a `PaneGroupTab` that the strip render
+/// needs. Avoids holding a borrow of the group while we build elements
+/// (the strip itself uses `entity` for click handlers).
+struct PaneGroupTabHeader {
+    label: SharedString,
+    kind_marker: PaneTabKindMarker,
+    agent_status: Option<oximux_core::AgentStatus>,
+}
+
+#[derive(Clone, Copy)]
+enum PaneTabKindMarker {
+    Terminal,
+    Agent,
+    Editor,
+}
+
+fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
+    match kind {
+        PaneGroupTabKind::Terminal => PaneTabKindMarker::Terminal,
+        PaneGroupTabKind::Agent { .. } => PaneTabKindMarker::Agent,
+        PaneGroupTabKind::Editor { .. } => PaneTabKindMarker::Editor,
+    }
+}
+
+fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus> {
+    if let PaneGroupTabKind::Agent { status_rx, .. } = kind {
+        Some(status_rx.borrow().clone())
+    } else {
+        None
+    }
+}
+
+fn build_tab_strip_from_headers(
+    entity: Entity<PaneGroup>,
+    tabs: &[PaneGroupTabHeader],
+    active: usize,
+    theme: Theme,
+) -> AnyElement {
+    let entity_id = entity.entity_id();
+    let mut strip = div()
+        .id(SharedString::from(format!("pane-group-tab-strip-{entity_id}")))
+        .flex()
+        .flex_row()
+        .items_stretch()
+        .h(px(TAB_STRIP_HEIGHT_PX))
+        .w_full()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border_inactive)
+        .overflow_x_scroll()
+        .overflow_y_hidden();
+    for (idx, header) in tabs.iter().enumerate() {
+        strip = strip.child(render_tab_chip(
+            entity_id.as_u64(),
+            idx,
+            header.label.clone(),
+            header.kind_marker,
+            header.agent_status.as_ref(),
+            idx == active,
+            theme,
+            entity.clone(),
+        ));
+    }
+    strip = strip.child(plus_button(entity_id.as_u64(), theme));
+    strip = strip.child(div().flex_1().min_w(px(0.0)));
+    strip.into_any_element()
 }
 
 /// Forward grid target to the active terminal tab so its PTY resizes
@@ -129,17 +185,20 @@ fn dispatch_active_grid(
     view.update(cx, |v, _| v.set_target_grid(cols, rows));
 }
 
-fn render_tab(
+#[allow(clippy::too_many_arguments)]
+fn render_tab_chip(
+    entity_id_raw: u64,
     ix: usize,
     label: SharedString,
-    kind: &PaneGroupTabKind,
+    marker: PaneTabKindMarker,
+    agent_status: Option<&oximux_core::AgentStatus>,
     is_active: bool,
-    theme: oximux_settings::Theme,
+    theme: Theme,
     entity: Entity<PaneGroup>,
 ) -> impl IntoElement {
-    let icon_path = match kind {
-        PaneGroupTabKind::Editor { .. } => "icons/file.svg",
-        PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. } => "icons/square-terminal.svg",
+    let icon_path = match marker {
+        PaneTabKindMarker::Editor => "icons/file.svg",
+        PaneTabKindMarker::Terminal | PaneTabKindMarker::Agent => "icons/square-terminal.svg",
     };
     let icon_color = if is_active {
         theme.fg_muted
@@ -157,19 +216,19 @@ fn render_tab(
         gpui::transparent_black()
     };
 
-    let group_name = SharedString::from(format!("pane-group-tab-{ix}"));
+    let group_name = SharedString::from(format!("pane-group-tab-{entity_id_raw}-{ix}"));
     let activate_entity = entity.clone();
 
-    let agent_dot: Option<AnyElement> = if let PaneGroupTabKind::Agent { status_rx, .. } = kind {
-        let status = status_rx.borrow().clone();
-        let dot_id = SharedString::from(format!("pane-group-agent-status-dot-{ix}"));
-        Some(render_dot(dot_id, &status, theme).into_any_element())
-    } else {
-        None
-    };
+    let agent_dot: Option<AnyElement> = agent_status.map(|status| {
+        let dot_id =
+            SharedString::from(format!("pane-group-agent-status-dot-{entity_id_raw}-{ix}"));
+        render_dot(dot_id, status, theme).into_any_element()
+    });
 
     div()
-        .id(SharedString::from(format!("pane-group-tab-{ix}")))
+        .id(SharedString::from(format!(
+            "pane-group-tab-{entity_id_raw}-{ix}"
+        )))
         .group(group_name.clone())
         .flex()
         .flex_row()
@@ -193,16 +252,16 @@ fn render_tab(
         .child(svg().path(icon_path).size(px(ICON_SIZE_PX)).text_color(icon_color))
         .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
-        .child(close_button(ix, is_active, entity, group_name, theme))
+        .child(close_button(entity_id_raw, ix, is_active, entity, group_name, theme))
 }
 
-fn plus_button(theme: oximux_settings::Theme) -> impl IntoElement {
+fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
     let glyph = svg()
         .path("icons/plus.svg")
         .size(px(14.0))
         .text_color(theme.fg_muted);
     div()
-        .id("pane-group-plus")
+        .id(SharedString::from(format!("pane-group-plus-{entity_id_raw}")))
         .w(px(PLUS_BUTTON_WIDTH_PX))
         .h_full()
         .flex()
@@ -218,11 +277,12 @@ fn plus_button(theme: oximux_settings::Theme) -> impl IntoElement {
 }
 
 fn close_button(
+    entity_id_raw: u64,
     ix: usize,
     is_active: bool,
     entity: Entity<PaneGroup>,
     group_name: SharedString,
-    theme: oximux_settings::Theme,
+    theme: Theme,
 ) -> impl IntoElement {
     let glyph = svg()
         .path("icons/close.svg")
@@ -230,7 +290,9 @@ fn close_button(
         .text_color(theme.fg_muted);
     let initial_opacity = if is_active { 1.0 } else { 0.0 };
     div()
-        .id(SharedString::from(format!("pane-group-tab-close-{ix}")))
+        .id(SharedString::from(format!(
+            "pane-group-tab-close-{entity_id_raw}-{ix}"
+        )))
         .w(px(CLOSE_BUTTON_SIZE_PX))
         .h(px(CLOSE_BUTTON_SIZE_PX))
         .flex()

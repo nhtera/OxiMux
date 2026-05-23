@@ -672,9 +672,14 @@ impl Render for WorkspaceRoot {
             panes.update(cx, |p, cx| p.set_chrome_width(chrome, cx));
         }
 
-        // Tab strips now live inside each pane group; the center header no
-        // longer carries one.
-        let workspace_tab_strip: Option<AnyElement> = None;
+        // The topmost pane group's tab strip is hoisted into the center
+        // header — matches the reference editor's chrome layout where the
+        // primary group's tabs share the title-bar row. Other groups
+        // keep their tab strips inline above their bodies (handled by
+        // `ProjectPanes::render`).
+        let workspace_tab_strip: Option<AnyElement> = active_panes
+            .as_ref()
+            .and_then(|panes| panes.read(cx).topmost_tab_strip(cx));
 
         // Center column body: active project's ProjectPanes (which renders
         // its group tree internally), or welcome placeholder when no

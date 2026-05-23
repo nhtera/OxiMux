@@ -7,10 +7,11 @@
 //! v1 splits render at fixed 50/50.
 
 use gpui::{
-    AnyElement, Context, IntoElement, ParentElement, Render, Styled, Window, div, px,
+    AnyElement, App, Context, IntoElement, ParentElement, Render, Styled, Window, div, px,
 };
 
 use super::ProjectPanes;
+use crate::shell::pane_group::render::build_tab_strip_for;
 use crate::shell::pane_tree::{Axis, PaneGroupId, PaneTree};
 
 /// Visible width of a divider line, in pixels. Matches the in-group
@@ -18,28 +19,60 @@ use crate::shell::pane_tree::{Axis, PaneGroupId, PaneTree};
 const DIVIDER_THICKNESS_PX: f32 = 1.0;
 
 impl Render for ProjectPanes {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Drop any group whose tabs got closed down to zero. Refusing
+        // the last group keeps the workspace anchored.
+        self.purge_empty_groups(window, cx);
+
         let theme = self.theme;
         let tree = self.manager().group_tree().clone();
-        let body = render_tree(&tree, self, theme);
+        // The first group in DFS order has its tab strip hoisted into
+        // the workspace top bar (see `topmost_tab_strip`), so we skip
+        // its inline strip here.
+        let topmost = self.manager().in_order_groups().first().copied();
+        let body = render_tree(&tree, self, topmost, theme, cx);
         div().flex().flex_col().size_full().child(body)
+    }
+}
+
+impl ProjectPanes {
+    /// Strip for the workspace's topmost (first-in-DFS) pane group,
+    /// to be embedded in the top bar's center zone. `None` when no
+    /// groups are mounted.
+    pub fn topmost_tab_strip(&self, cx: &App) -> Option<AnyElement> {
+        let id = self.manager().in_order_groups().first().copied()?;
+        let entity = self.group(id)?;
+        Some(build_tab_strip_for(entity, self.theme, cx))
     }
 }
 
 fn render_tree(
     node: &PaneTree<PaneGroupId>,
     panes: &ProjectPanes,
+    topmost: Option<PaneGroupId>,
     theme: oximux_settings::Theme,
+    cx: &App,
 ) -> AnyElement {
     match node {
         PaneTree::Leaf(id) => match panes.group(*id) {
-            Some(group) => div()
-                .size_full()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .child(group)
-                .into_any_element(),
+            Some(group) => {
+                let slot = div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .overflow_hidden();
+                if Some(*id) == topmost {
+                    // Strip is hoisted to top bar; render body only.
+                    slot.child(group).into_any_element()
+                } else {
+                    // Non-topmost: stack inline tab strip above the body.
+                    slot.child(build_tab_strip_for(group.clone(), theme, cx))
+                        .child(group)
+                        .into_any_element()
+                }
+            }
             // Leaf in the tree but no entity registered — shouldn't
             // happen in well-formed state, but rendering an empty slot
             // is safer than panicking inside a render closure.
@@ -71,7 +104,7 @@ fn render_tree(
                     Axis::Horizontal => slot.w(gpui::relative(frac / 100.0)).h_full(),
                     Axis::Vertical => slot.h(gpui::relative(frac / 100.0)).w_full(),
                 };
-                row = row.child(slot.child(render_tree(child, panes, theme)));
+                row = row.child(slot.child(render_tree(child, panes, topmost, theme, cx)));
                 if i + 1 < children.len() {
                     row = row.child(divider(*axis, theme));
                 }

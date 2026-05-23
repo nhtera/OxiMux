@@ -6,7 +6,7 @@
 //! focused one. Each group is independent: opening a file in one group
 //! does NOT affect any other group's tab list.
 
-mod render;
+pub mod render;
 
 use std::path::PathBuf;
 use std::sync::Arc;
