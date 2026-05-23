@@ -131,6 +131,16 @@ impl PaneGroupManager {
         })
     }
 
+    /// Replace the weights at the Split node addressed by `path`. Returns
+    /// `true` when the path lands on a valid Split and the new weights
+    /// vector matches its child count. Used by the drag-resize handler
+    /// on dividers between sibling groups; `PaneTree::set_split_weights`
+    /// clamps each entry to `MIN_FLEX` so a drag can't shrink a group to
+    /// zero.
+    pub fn set_split_weights(&mut self, path: &[usize], new_weights: Vec<f32>) -> bool {
+        self.group_tree.set_split_weights(path, new_weights)
+    }
+
     /// Remove the active group. Last-group close is refused per D8 of
     /// the step-06 sub-plan; the caller is expected to surface that to
     /// the user (or silently ignore). On success, focus shifts to the

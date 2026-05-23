@@ -411,6 +411,29 @@ impl ProjectPanes {
         moved
     }
 
+    /// Apply new weights to the Split node at `path` (drag-resize handle
+    /// between sibling groups). Triggers a re-render only when the call
+    /// actually mutates the tree — the drag handler fires on every mouse
+    /// move at ~60 fps and unconditional notifies would thrash.
+    pub fn set_split_weights(
+        &mut self,
+        path: &[usize],
+        new_weights: Vec<f32>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let prev = self.manager.group_tree().split_weights(path);
+        let changed = self.manager.set_split_weights(path, new_weights);
+        if !changed {
+            return false;
+        }
+        let next = self.manager.group_tree().split_weights(path);
+        if prev == next {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
     pub fn split_active_group(
         &mut self,
         axis: Axis,

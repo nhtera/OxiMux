@@ -7,8 +7,9 @@
 //! v1 splits render at fixed 50/50.
 
 use gpui::{
-    AnyElement, App, Context, DragMoveEvent, Entity, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, prelude::FluentBuilder, px,
 };
 
 use std::collections::HashSet;
@@ -22,6 +23,40 @@ use crate::shell::pane_tree::{Axis, PaneGroupId, PaneTree};
 /// Visible width of a divider line, in pixels. Matches the in-group
 /// divider so the chrome reads as one consistent stripe.
 const DIVIDER_THICKNESS_PX: f32 = 1.0;
+
+/// Hit area added on each side of the visible divider so cursor pickup
+/// is forgiving — the visible line stays 1 px but the draggable hitbox
+/// is `DIVIDER_THICKNESS_PX + 2 * DIVIDER_HIT_PAD_PX` wide.
+const DIVIDER_HIT_PAD_PX: f32 = 3.0;
+
+/// Drag payload for a group-divider resize. Carries the path to the
+/// split node, which divider within it (children[i] / children[i+1]),
+/// the split axis, and the weights captured at drag-start so the
+/// move handler can recompute new weights without losing precision
+/// across many fast moves.
+#[derive(Clone, Debug)]
+struct DividerDragPayload {
+    split_path: Vec<usize>,
+    divider_idx: usize,
+    axis: Axis,
+    initial_weights: Vec<f32>,
+}
+
+/// Zero-sized placeholder for the drag visual. GPUI requires `on_drag`
+/// to return an Entity that renders the floating cursor preview; for a
+/// resize handle there's no preview — the divider itself moves on every
+/// `on_drag_move` tick.
+struct DividerDragGhost;
+
+impl Render for DividerDragGhost {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div().w(px(0.0)).h(px(0.0))
+    }
+}
 
 /// Walk the tree's TOP horizontal-layer leaves with their weights.
 ///
@@ -154,6 +189,7 @@ impl Render for ProjectPanes {
             entity,
             theme,
             &hoisted,
+            &[],
             cx,
         );
         div().flex().flex_col().size_full().child(body)
@@ -169,6 +205,7 @@ fn render_tree(
     project_panes_entity: Entity<ProjectPanes>,
     theme: oximux_settings::Theme,
     hoisted: &HashSet<PaneGroupId>,
+    path: &[usize],
     cx: &App,
 ) -> AnyElement {
     match node {
@@ -219,14 +256,71 @@ fn render_tree(
             children,
             weights,
         } => {
-            let mut row = div().flex().size_full().overflow_hidden();
-            row = match axis {
+            let split_axis = *axis;
+            // Path owned for the move handler so it survives the render
+            // closure dropping. Cheap clone — usually 0..3 entries deep.
+            let split_path = path.to_vec();
+            let weights_snapshot = weights.clone();
+            let move_path = split_path.clone();
+            let move_axis = split_axis;
+            let move_panes = project_panes_entity.clone();
+            let mut row = div()
+                .flex()
+                .size_full()
+                .overflow_hidden()
+                .on_drag_move::<DividerDragPayload>(
+                    move |ev: &DragMoveEvent<DividerDragPayload>, _window, cx| {
+                        // Snapshot what we need from the active drag BEFORE
+                        // calling cx.update: `ev.drag(cx)` borrows the payload
+                        // immutably from `cx.active_drag`, and `update`
+                        // requires mutable access to the same `cx`.
+                        let (split_path, divider_idx, initial_weights, p_axis) = {
+                            let payload = ev.drag(cx);
+                            (
+                                payload.split_path.clone(),
+                                payload.divider_idx,
+                                payload.initial_weights.clone(),
+                                payload.axis,
+                            )
+                        };
+                        // Each split row registers a move listener; the
+                        // payload's path filters back to the originating
+                        // row so unrelated splits don't fire.
+                        if split_path != move_path || p_axis != move_axis {
+                            return;
+                        }
+                        let bounds = ev.bounds;
+                        let pos = ev.event.position;
+                        let (axis_pos, axis_size) = match move_axis {
+                            Axis::Horizontal => (
+                                f32::from(pos.x - bounds.origin.x),
+                                f32::from(bounds.size.width),
+                            ),
+                            Axis::Vertical => (
+                                f32::from(pos.y - bounds.origin.y),
+                                f32::from(bounds.size.height),
+                            ),
+                        };
+                        if axis_size <= 0.0 {
+                            return;
+                        }
+                        let frac = (axis_pos / axis_size).clamp(0.0, 1.0);
+                        let new_weights =
+                            redistribute_weights(&initial_weights, divider_idx, frac);
+                        move_panes.update(cx, |p, cx| {
+                            p.set_split_weights(&split_path, new_weights, cx);
+                        });
+                    },
+                );
+            row = match split_axis {
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
             };
-            let sum: f32 = weights.iter().sum();
+            let sum: f32 = weights_snapshot.iter().sum();
             let sum = if sum > 0.0 { sum } else { 1.0 };
-            for (i, (child, weight)) in children.iter().zip(weights.iter()).enumerate() {
+            for (i, (child, weight)) in
+                children.iter().zip(weights_snapshot.iter()).enumerate()
+            {
                 let frac = (weight / sum) * 100.0;
                 // Slot must be a flex container so the inner leaf/split
                 // child (which uses size_full) gets a real box to fill.
@@ -236,10 +330,12 @@ fn render_tree(
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_hidden();
-                slot = match axis {
+                slot = match split_axis {
                     Axis::Horizontal => slot.w(gpui::relative(frac / 100.0)).h_full(),
                     Axis::Vertical => slot.h(gpui::relative(frac / 100.0)).w_full(),
                 };
+                let mut child_path = split_path.clone();
+                child_path.push(i);
                 row = row.child(slot.child(render_tree(
                     child,
                     panes,
@@ -248,15 +344,111 @@ fn render_tree(
                     project_panes_entity.clone(),
                     theme,
                     hoisted,
+                    &child_path,
                     cx,
                 )));
                 if i + 1 < children.len() {
-                    row = row.child(divider(*axis, theme));
+                    row = row.child(interactive_divider(
+                        split_path.clone(),
+                        i,
+                        split_axis,
+                        weights_snapshot.clone(),
+                        theme,
+                    ));
                 }
             }
             row.into_any_element()
         }
     }
+}
+
+/// Compute new weights when the user drags divider `divider_idx` to
+/// `frac` of the parent split (0.0 = pinned left/top edge, 1.0 = right/
+/// bottom). Only the two children adjacent to the divider are redistributed
+/// — siblings on either side keep their initial weight, matching the
+/// pane-resize semantics every other tiling tool uses. The returned
+/// vector still passes through `PaneTree::set_split_weights`, which
+/// clamps each entry to `MIN_FLEX` so a drag can't shrink a pane to zero.
+fn redistribute_weights(initial: &[f32], divider_idx: usize, frac: f32) -> Vec<f32> {
+    let mut out = initial.to_vec();
+    if divider_idx + 1 >= initial.len() {
+        return out;
+    }
+    let sum: f32 = initial.iter().sum();
+    if sum <= 0.0 {
+        return out;
+    }
+    let before_pair: f32 = initial[..divider_idx].iter().sum();
+    let pair_sum = initial[divider_idx] + initial[divider_idx + 1];
+    if pair_sum <= 0.0 {
+        return out;
+    }
+    let target_total = frac * sum;
+    let frac_in_pair = ((target_total - before_pair) / pair_sum).clamp(0.0, 1.0);
+    out[divider_idx] = pair_sum * frac_in_pair;
+    out[divider_idx + 1] = pair_sum * (1.0 - frac_in_pair);
+    out
+}
+
+/// Interactive resize handle between two sibling groups. The visible
+/// stripe is 1 px (matching `divider`) but a transparent padded area on
+/// each side widens the hitbox for forgiving cursor pickup. Dragging
+/// fires `on_drag` with a `DividerDragPayload`; the matching
+/// `on_drag_move` lives on the parent split row (which captures the
+/// parent's pixel bounds via `ev.bounds`).
+fn interactive_divider(
+    path: Vec<usize>,
+    divider_idx: usize,
+    axis: Axis,
+    weights: Vec<f32>,
+    theme: oximux_settings::Theme,
+) -> AnyElement {
+    let id_string = format!(
+        "divider-{}-{}",
+        path.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
+        divider_idx,
+    );
+    let payload = DividerDragPayload {
+        split_path: path,
+        divider_idx,
+        axis,
+        initial_weights: weights,
+    };
+    let stripe = div().flex_shrink_0().bg(theme.border_active);
+    let stripe = match axis {
+        Axis::Horizontal => stripe.w(px(DIVIDER_THICKNESS_PX)).h_full(),
+        Axis::Vertical => stripe.h(px(DIVIDER_THICKNESS_PX)).w_full(),
+    };
+    let mut handle = div()
+        .id(SharedString::from(id_string))
+        .flex()
+        .flex_shrink_0()
+        .occlude();
+    handle = match axis {
+        Axis::Horizontal => handle
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .w(px(DIVIDER_THICKNESS_PX + 2.0 * DIVIDER_HIT_PAD_PX))
+            .cursor_col_resize(),
+        Axis::Vertical => handle
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h(px(DIVIDER_THICKNESS_PX + 2.0 * DIVIDER_HIT_PAD_PX))
+            .cursor_row_resize(),
+    };
+    handle
+        .child(stripe)
+        .on_drag(payload, |_payload, _offset, _window, cx| {
+            cx.new(|_| DividerDragGhost)
+        })
+        .into_any_element()
 }
 
 /// Wrap a `PaneGroup` entity in its body container — a stateful div
@@ -398,16 +590,54 @@ fn zone_overlay(zone: Zone, theme: oximux_settings::Theme) -> impl IntoElement {
     }
 }
 
-fn divider(axis: Axis, theme: oximux_settings::Theme) -> AnyElement {
-    let base = div().flex_shrink_0().bg(theme.border_active);
-    match axis {
-        Axis::Horizontal => base
-            .w(px(DIVIDER_THICKNESS_PX))
-            .h_full()
-            .into_any_element(),
-        Axis::Vertical => base
-            .h(px(DIVIDER_THICKNESS_PX))
-            .w_full()
-            .into_any_element(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redistribute_two_pane_at_midpoint_is_half() {
+        let new_w = redistribute_weights(&[1.0, 1.0], 0, 0.5);
+        assert!((new_w[0] - 1.0).abs() < 1e-3);
+        assert!((new_w[1] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn redistribute_two_pane_drags_to_quarter() {
+        let new_w = redistribute_weights(&[1.0, 1.0], 0, 0.25);
+        let total = new_w.iter().sum::<f32>();
+        assert!((new_w[0] / total - 0.25).abs() < 1e-3);
+        assert!((new_w[1] / total - 0.75).abs() < 1e-3);
+    }
+
+    #[test]
+    fn redistribute_three_pane_leaves_outer_pane_untouched() {
+        // [1, 1, 1] split — drag divider 1 (between children 1 and 2)
+        // to 0.8 of the parent. Children 0 keeps its initial weight; only
+        // children 1 and 2 redistribute.
+        let new_w = redistribute_weights(&[1.0, 1.0, 1.0], 1, 0.8);
+        assert!((new_w[0] - 1.0).abs() < 1e-3, "outer pane untouched");
+        let pair_sum = new_w[1] + new_w[2];
+        assert!((pair_sum - 2.0).abs() < 1e-3, "pair sum preserved");
+        let total: f32 = new_w.iter().sum();
+        // Divider sits at fraction `target_total / total` of total weight.
+        let divider_frac = (new_w[0] + new_w[1]) / total;
+        assert!((divider_frac - 0.8).abs() < 1e-3, "divider lands at 0.8");
+    }
+
+    #[test]
+    fn redistribute_clamps_below_zero() {
+        // Dragging past the leading edge collapses left to 0; PaneTree's
+        // set_split_weights then clamps to MIN_FLEX on apply.
+        let new_w = redistribute_weights(&[1.0, 1.0], 0, -0.5);
+        assert!(new_w[0].abs() < 1e-3);
+        assert!((new_w[1] - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn redistribute_no_op_on_invalid_divider_idx() {
+        // divider_idx out of range → returns initial weights unchanged.
+        let new_w = redistribute_weights(&[1.0, 1.0], 5, 0.5);
+        assert_eq!(new_w, vec![1.0, 1.0]);
     }
 }
+
