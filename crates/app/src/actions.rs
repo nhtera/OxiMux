@@ -78,6 +78,9 @@ actions!(
         FocusNextSubPane,
         /// Cycle sub-pane focus to the PREVIOUS live sub-pane. Cmd+[.
         FocusPrevSubPane,
+        /// Zoom (maximize) the active sub-pane to fill the tab body;
+        /// toggle to restore the tree layout. Bound to Cmd+Shift+Enter.
+        ToggleZoomSubPane,
         /// Four-direction split: new pane on the right of focus.
         SplitRight,
         /// Four-direction split: new pane below focus.

@@ -20,7 +20,7 @@ use oximux_app::actions::{
     CloseTab, DismissOverlay, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab,
     OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
     PrevTab, Search, SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab,
-    SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar,
+    SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
 };
 // SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
 // crate dependency: oximux-app → oximux-editor → oximux-app would be a cycle.
@@ -159,6 +159,10 @@ fn main() {
             // Tab navigation lives on cmd-{ / cmd-} below.
             KeyBinding::new("cmd-]", FocusNextSubPane, None),
             KeyBinding::new("cmd-[", FocusPrevSubPane, None),
+            // cmd-shift-enter zooms (maximizes) the focused sub-pane; a
+            // second press restores the prior layout. Matches the
+            // reference editor's "zoom pane" binding.
+            KeyBinding::new("cmd-shift-enter", ToggleZoomSubPane, None),
             KeyBinding::new("cmd-t", NewTab, None),
             // macOS strips `shift` from the runtime keystroke and remaps the
             // key to the shifted character (`]`→`}`, `[`→`{`). Binding strings

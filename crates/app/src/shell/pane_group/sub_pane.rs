@@ -34,6 +34,11 @@ pub struct TerminalSplitTree {
     /// the parent `PaneGroup` re-rendering on inner-view notifications;
     /// `None` slots correspond to closed sub-panes.
     observers: Vec<Option<Subscription>>,
+    /// When `Some(idx)`, render bypasses the tree and shows ONLY the
+    /// named pane at full body size — Cmd+Shift+Enter "zoom" toggle.
+    /// Other panes stay alive (PTYs continue running, scrollback
+    /// accumulates) so a second toggle restores the prior layout.
+    zoomed: Option<usize>,
 }
 
 impl TerminalSplitTree {
@@ -44,6 +49,28 @@ impl TerminalSplitTree {
             tree: PaneTree::Leaf(0),
             active: 0,
             observers: vec![Some(observer)],
+            zoomed: None,
+        }
+    }
+
+    /// Currently-zoomed sub-pane index, if any. Render uses this to
+    /// short-circuit tree traversal and mount only the zoomed pane.
+    pub fn zoomed(&self) -> Option<usize> {
+        self.zoomed
+    }
+
+    /// Toggle zoom on the active sub-pane. When the active pane is
+    /// already zoomed, restore the tree layout. No-op when there's only
+    /// one live pane (nothing to zoom away from).
+    pub fn toggle_zoom_active(&mut self) {
+        if self.live_count() <= 1 {
+            self.zoomed = None;
+            return;
+        }
+        if self.zoomed.is_some() {
+            self.zoomed = None;
+        } else {
+            self.zoomed = Some(self.active);
         }
     }
 

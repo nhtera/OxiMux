@@ -80,6 +80,7 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_split_sub_pane_down))
             .on_action(cx.listener(PaneGroup::on_focus_next_sub_pane))
             .on_action(cx.listener(PaneGroup::on_focus_prev_sub_pane))
+            .on_action(cx.listener(PaneGroup::on_toggle_zoom_sub_pane))
             .child(body)
     }
 }
@@ -329,10 +330,20 @@ fn dispatch_active_grid(
 /// flex-row (horizontal axis) or flex-col (vertical axis) containers
 /// with `border_color(theme.border_active)` dividers between children.
 ///
+/// Zoom short-circuit: when `tree.zoomed()` is `Some(idx)`, the named
+/// sub-pane fills the body and the rest of the tree is ignored (other
+/// PTYs stay alive in memory — toggle off to restore).
+///
 /// Active-pane rim glow is deferred — the tree highlights the active
 /// pane via focus state, which TerminalView paints on its own.
 fn render_sub_pane_tree(tree: &TerminalSplitTree, theme: Theme) -> AnyElement {
     use crate::shell::pane_tree::{Axis, PaneTree};
+    // Zoom fast path: bypass tree traversal entirely.
+    if let Some(idx) = tree.zoomed() {
+        if let Some(view) = tree.get(idx) {
+            return view.clone().into_any_element();
+        }
+    }
     fn build(
         node: &PaneTree<usize>,
         tree: &TerminalSplitTree,

@@ -26,7 +26,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
     CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab, PrevTab,
-    RequestOpenAdapterPicker, SplitSubPaneDown, SplitSubPaneRight,
+    RequestOpenAdapterPicker, SplitSubPaneDown, SplitSubPaneRight, ToggleZoomSubPane,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::notifier::{Notifier, TabId};
@@ -947,6 +947,34 @@ impl PaneGroup {
             return;
         };
         tree.cycle_focus(forward);
+        if let Some(view) = tree.active_view() {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn on_toggle_zoom_sub_pane(
+        &mut self,
+        _: &ToggleZoomSubPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let PaneContent::Terminal(tree) = &mut active_tab.content else {
+            return;
+        };
+        // Re-resolve focused sub-pane first (same reasoning as the
+        // split / close paths — mouse clicks don't auto-update active).
+        let focused_idx = tree
+            .iter_live()
+            .find(|(_, v)| v.read(cx).focused())
+            .map(|(i, _)| i);
+        if let Some(idx) = focused_idx {
+            tree.set_active(idx);
+        }
+        tree.toggle_zoom_active();
         if let Some(view) = tree.active_view() {
             view.read(cx).focus_handle(cx).focus(window, cx);
         }
