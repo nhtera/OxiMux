@@ -28,6 +28,7 @@ pub mod pane_tree;
 pub mod project_panes;
 pub mod split_direction;
 pub mod project_picker;
+pub mod rename_tab_dialog;
 pub mod right_sidebar;
 pub mod search_panel;
 pub mod source_control;

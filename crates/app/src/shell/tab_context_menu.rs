@@ -15,7 +15,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::SplitGroupAt;
+use crate::actions::{RequestRenameTabAt, SplitGroupAt};
 use crate::shell::pane_group::{PaneGroup, TabColor};
 use crate::shell::pane_tree::PaneGroupId;
 
@@ -210,6 +210,36 @@ impl Render for TabContextMenu {
                 );
             card = card.child(row);
         }
+        card = card.child(
+            div()
+                .h(px(1.0))
+                .my(px(4.0))
+                .bg(theme.border_inactive),
+        );
+
+        let rename_idx = target.tab_idx;
+        card = card.child(menu_row(
+            "tab-ctx-rename",
+            "Change Title…",
+            true,
+            theme,
+            density,
+            typography.clone(),
+            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                // Closing FIRST so the rename modal can take focus
+                // without the menu's mouse-down-out closing it on the
+                // next dispatch tick.
+                this.close(cx);
+                window.dispatch_action(
+                    Box::new(RequestRenameTabAt {
+                        group_id: target_group_id,
+                        tab_idx: rename_idx as u32,
+                    }),
+                    cx,
+                );
+            }),
+        ));
+
         card = card.child(
             div()
                 .h(px(1.0))

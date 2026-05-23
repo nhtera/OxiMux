@@ -42,6 +42,17 @@ pub struct ActivateGroupTab {
     pub tab_idx: u32,
 }
 
+/// Payload action fired by the tab right-click "Change Title…" row.
+/// Carries (group_id, tab_idx) so `WorkspaceRoot` can open a rename
+/// modal targeted at that tab regardless of which group has focus when
+/// the user clicks the row.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct RequestRenameTabAt {
+    pub group_id: u64,
+    pub tab_idx: u32,
+}
+
 /// Payload action fired by the tab right-click "Split X" rows. Splits a
 /// SPECIFIC group (not necessarily the focused one) so right-clicking a
 /// tab in any group can split that group without first stealing focus.

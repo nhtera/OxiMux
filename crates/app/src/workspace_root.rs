@@ -125,6 +125,8 @@ pub struct WorkspaceRoot {
     pub(crate) workspace_dialog: Entity<WorkspaceDialog>,
     /// Active type-to-confirm dialog (per-request; `None` when idle).
     pub(crate) confirm_dialog: Option<Entity<ConfirmDialog>>,
+    /// Active rename-tab modal (per-request; `None` when idle).
+    pub(crate) rename_tab_dialog: Option<Entity<crate::shell::rename_tab_dialog::RenameTabDialog>>,
     /// Currently active project — `None` until the user opens one.
     pub(crate) active_project: Option<Project>,
     /// Sidebar Rename/Archive/Delete popover (mounted at root for full-window backdrop).
@@ -349,6 +351,7 @@ impl WorkspaceRoot {
             project_picker,
             workspace_dialog,
             confirm_dialog: None,
+            rename_tab_dialog: None,
             active_project: None,
             row_menu,
             add_project_dialog,
@@ -972,6 +975,53 @@ impl Render for WorkspaceRoot {
                     m.open(x, y, weak, group_id, tab_idx, tab_count, tab_kind, cx)
                 });
             }))
+            .on_action(cx.listener(|this, action: &crate::actions::RequestRenameTabAt, window, cx| {
+                // Tab right-click "Change Title…": open a RenameTabDialog
+                // bound to (group_id, tab_idx). Callback mutates the
+                // target group's custom_title via set_tab_title.
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                let tab_idx = action.tab_idx as usize;
+                let panes_ref = panes.read(cx);
+                let Some(group) = panes_ref.group(group_id) else {
+                    return;
+                };
+                let initial = group
+                    .read(cx)
+                    .visible_title(tab_idx)
+                    .unwrap_or_default();
+                let weak_root: gpui::WeakEntity<WorkspaceRoot> = cx.weak_entity();
+                let weak_group = group.downgrade();
+                let on_commit: crate::shell::rename_tab_dialog::RenameCallback =
+                    std::rc::Rc::new(move |new_title, _window, cx| {
+                        if let Some(g) = weak_group.upgrade() {
+                            g.update(cx, |g, cx| g.set_tab_title(tab_idx, new_title, cx));
+                        }
+                        let _ = weak_root.update(cx, |this, cx| {
+                            this.rename_tab_dialog = None;
+                            cx.notify();
+                        });
+                    });
+                let theme = this.theme;
+                let density = this.density;
+                let typography = this.typography.clone();
+                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.rename_tab_dialog = Some(cx.new(|cx| {
+                    crate::shell::rename_tab_dialog::RenameTabDialog::new(
+                        "Change Tab Title".into(),
+                        initial,
+                        on_commit,
+                        theme,
+                        density,
+                        typography,
+                        window,
+                        cx,
+                    )
+                }));
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {
                 this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);
             }))
@@ -1099,6 +1149,19 @@ impl Render for WorkspaceRoot {
             // per-request; `None` when idle. Wrapped in a full-window
             // overlay here so the inner `ConfirmDialog` card stays pure.
             .when_some(self.confirm_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
+            // Rename-tab modal — same overlay pattern as confirm_dialog.
+            .when_some(self.rename_tab_dialog.clone(), |parent, dialog| {
                 parent.child(
                     div()
                         .absolute()
