@@ -125,18 +125,6 @@ impl PaneGroup {
             .count()
     }
 
-    /// True when every tab in the group is a plain shell terminal.
-    /// Non-topmost terminal-only groups suppress their tab strip — the
-    /// terminal content reads cleaner without a header chip per pane,
-    /// and a new terminal is one keystroke (NewTab) or one split away.
-    pub fn is_terminal_only(&self) -> bool {
-        !self.tabs.is_empty()
-            && self
-                .tabs
-                .iter()
-                .all(|t| matches!(t.kind, PaneGroupTabKind::Terminal))
-    }
-
     /// Index of an existing editor tab for `path`, if any. Used by
     /// `ProjectPanes` to activate-rather-than-reopen across groups.
     pub fn editor_tab_index(&self, path: &std::path::Path) -> Option<usize> {

@@ -356,38 +356,17 @@ impl ProjectPanes {
             }));
         }
 
-        // New file: route away from terminal-only sub-panes (no editor
-        // headers there, so a mixed tab strip would pop into a layout
-        // slot that previously had none). Topmost is the workspace's
-        // main editor surface — fall back there.
-        let target_id = self.pick_editor_target_group(cx)?;
+        // New file: always land in the focused (active) group, mixing
+        // freely with whatever it already contains (terminals/agents).
+        // Falls back to the topmost group if no active group exists.
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied())?;
         self.set_active_group(target_id, window, cx);
         let target = self.groups.get(&target_id)?.clone();
         Some(target.update(cx, |g, cx| g.open_or_activate_editor_tab(path, window, cx)))
-    }
-
-    /// Choose which group an editor open should land in. Prefer the
-    /// focused group; if it's terminal-only, walk the in-order group
-    /// list and pick the first non-terminal-only group (i.e. one that
-    /// already houses editors, or is empty). Last resort: topmost.
-    fn pick_editor_target_group(&self, cx: &App) -> Option<PaneGroupId> {
-        let active_id = self.manager.active_group_id();
-        if let Some(active) = self.groups.get(&active_id)
-            && !active.read(cx).is_terminal_only()
-        {
-            return Some(active_id);
-        }
-        let in_order = self.manager.in_order_groups();
-        in_order
-            .iter()
-            .find(|id| {
-                self.groups
-                    .get(id)
-                    .map(|g| !g.read(cx).is_terminal_only())
-                    .unwrap_or(false)
-            })
-            .copied()
-            .or_else(|| in_order.first().copied())
     }
 
     pub fn open_terminal_tab_in_active_group(
