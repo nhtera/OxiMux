@@ -55,8 +55,50 @@ pub struct PaneGroupTab {
     pub label: SharedString,
     pub content: PaneContent,
     pub kind: PaneGroupTabKind,
+    /// User-assigned color tag, set via the right-click "Tab Color"
+    /// palette. Renders as a 2px left-edge accent bar on the chip.
+    /// `None` = no color (default chrome color).
+    pub color: Option<TabColor>,
+    /// User-assigned custom title from the "Change Title" menu row.
+    /// When `Some`, the chip and persistence use this in place of the
+    /// default label (e.g. "Terminal 5").
+    pub custom_title: Option<SharedString>,
     pub _observer: Option<Subscription>,
     pub _status_task: Option<Task<()>>,
+}
+
+/// Closed enum of user-pickable tab colors. Renders to a concrete
+/// theme-independent RGB at chip-paint time. Picked to match the
+/// reference editor's 9-swatch palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabColor {
+    Blue,
+    Purple,
+    Pink,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Teal,
+    Gray,
+}
+
+impl TabColor {
+    /// Resolve to a concrete hex (`u32` RGB). Theme-independent so the
+    /// user's color choice stays recognizable across light/dark modes.
+    pub fn rgb(self) -> u32 {
+        match self {
+            TabColor::Blue => 0x3B82F6,
+            TabColor::Purple => 0xA855F7,
+            TabColor::Pink => 0xEC4899,
+            TabColor::Red => 0xEF4444,
+            TabColor::Orange => 0xF97316,
+            TabColor::Yellow => 0xEAB308,
+            TabColor::Green => 0x22C55E,
+            TabColor::Teal => 0x14B8A6,
+            TabColor::Gray => 0x9CA3AF,
+        }
+    }
 }
 
 /// Hover state during an in-progress tab drag. Drives the 2px blue
@@ -314,6 +356,8 @@ impl PaneGroup {
             label: SharedString::from(format!("Terminal {n}")),
             content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
             kind: PaneGroupTabKind::Terminal,
+            color: None,
+            custom_title: None,
             // Tab-level observer is unused for terminal tabs — sub-pane
             // observers inside TerminalSplitTree drive re-renders.
             _observer: None,
@@ -354,6 +398,8 @@ impl PaneGroup {
             label: SharedString::from(label),
             content: PaneContent::Editor(view),
             kind: PaneGroupTabKind::Editor { path },
+            color: None,
+            custom_title: None,
             _observer: observer,
             _status_task: None,
         };
@@ -420,6 +466,8 @@ impl PaneGroup {
                 session_id,
                 status_rx,
             },
+            color: None,
+            custom_title: None,
             _observer: None,
             _status_task: Some(status_task),
         });
@@ -509,6 +557,8 @@ impl PaneGroup {
             label: SharedString::from(label),
             content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
             kind: PaneGroupTabKind::Terminal,
+            color: None,
+            custom_title: None,
             _observer: None,
             _status_task: None,
         });
@@ -601,6 +651,37 @@ impl PaneGroup {
         for idx in (0..self.tabs.len()).rev() {
             self.close_tab(idx, window, cx);
         }
+    }
+
+    /// Assign a color tag (or clear with `None`) to the tab at `idx`.
+    /// The chip renders a 2px left-edge bar in the chosen color.
+    pub fn set_tab_color(&mut self, idx: usize, color: Option<TabColor>, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.color = color;
+            cx.notify();
+        }
+    }
+
+    /// Override the tab's visible title with `title` (or restore the
+    /// default by passing `None`). The chip and persistence read
+    /// `custom_title.unwrap_or(label)`.
+    pub fn set_tab_title(
+        &mut self,
+        idx: usize,
+        title: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.custom_title = title;
+            cx.notify();
+        }
+    }
+
+    /// Resolve the tab's visible title — custom override if set, else
+    /// the default label. Used by the chip render and persistence.
+    pub fn visible_title(&self, idx: usize) -> Option<SharedString> {
+        let tab = self.tabs.get(idx)?;
+        Some(tab.custom_title.clone().unwrap_or_else(|| tab.label.clone()))
     }
 
     pub fn set_active(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {

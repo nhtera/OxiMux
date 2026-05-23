@@ -944,15 +944,32 @@ impl Render for WorkspaceRoot {
                 let Some(group) = panes_ref.group(group_id) else {
                     return;
                 };
-                let tab_count = group.read(cx).tabs().len();
-                let weak = group.downgrade();
+                let group_ref = group.read(cx);
+                let tab_count = group_ref.tabs().len();
                 let tab_idx = action.tab_idx as usize;
+                // Derive kind-specific payload (editor path) so the menu
+                // can render Copy Path / Reveal in Finder rows without
+                // walking back into the entity at click time.
+                let tab_kind = match group_ref.tabs().get(tab_idx).map(|t| &t.kind) {
+                    Some(crate::shell::pane_group::PaneGroupTabKind::Editor { path }) => {
+                        let project_root = this
+                            .active_project
+                            .as_ref()
+                            .map(|p| std::path::PathBuf::from(&p.root_path));
+                        crate::shell::tab_context_menu::TabContextKind::Editor {
+                            path: path.clone(),
+                            project_root,
+                        }
+                    }
+                    _ => crate::shell::tab_context_menu::TabContextKind::Terminal,
+                };
+                let weak = group.downgrade();
                 let x = action.x;
                 let y = action.y;
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| {
-                    m.open(x, y, weak, group_id, tab_idx, tab_count, cx)
+                    m.open(x, y, weak, group_id, tab_idx, tab_count, tab_kind, cx)
                 });
             }))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {

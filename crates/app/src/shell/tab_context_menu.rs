@@ -7,15 +7,34 @@
 //! `WeakEntity<PaneGroup>` so row clicks can mutate the right group
 //! even if focus has moved elsewhere by the time the user picks an item.
 
+use std::path::PathBuf;
+
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    Styled, WeakEntity, Window, div, px, svg,
+    ClipboardItem, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, Styled, WeakEntity, Window, div, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::SplitGroupAt;
-use crate::shell::pane_group::PaneGroup;
+use crate::shell::pane_group::{PaneGroup, TabColor};
 use crate::shell::pane_tree::PaneGroupId;
+
+/// Per-tab metadata that drives kind-specific rows in the menu. Set
+/// at open() time so render doesn't need to walk back into the
+/// `PaneGroup` entity for the path. Editor tabs carry their absolute
+/// path; terminal/agent tabs carry no extra payload.
+#[derive(Clone, Debug)]
+pub enum TabContextKind {
+    Terminal,
+    Editor {
+        /// Absolute file path for Copy/Reveal rows.
+        path: PathBuf,
+        /// Project root used to derive the "Copy Relative Path" string.
+        /// `None` if no project root is known — Copy Relative Path
+        /// falls back to the file name in that case.
+        project_root: Option<PathBuf>,
+    },
+}
 
 /// Width of the dropdown card.
 pub const MENU_WIDTH: f32 = 188.0;
@@ -43,6 +62,9 @@ struct TabContextTarget {
     /// somehow mutates the group between open and click the helpers
     /// will still bail safely (each verifies its own bounds).
     tab_count: usize,
+    /// Kind-specific payload for conditional rows (e.g. Copy Path /
+    /// Reveal in Finder on editor tabs only).
+    kind: TabContextKind,
 }
 
 pub struct TabContextMenu {
@@ -75,6 +97,7 @@ impl TabContextMenu {
         self.open
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &mut self,
         x_px: f32,
@@ -83,6 +106,7 @@ impl TabContextMenu {
         group_id: PaneGroupId,
         tab_idx: usize,
         tab_count: usize,
+        kind: TabContextKind,
         cx: &mut Context<Self>,
     ) {
         self.x_px = x_px;
@@ -92,6 +116,7 @@ impl TabContextMenu {
             group_id,
             tab_idx,
             tab_count,
+            kind,
         });
         self.open = true;
         cx.notify();
@@ -252,6 +277,98 @@ impl Render for TabContextMenu {
             }),
         ));
 
+        // Terminal-specific rows: Tab Color palette. Appended only when
+        // the right-clicked tab is a terminal/agent (editor tabs don't
+        // get a color tag for v1 — match the reference editor scope).
+        if matches!(target.kind, TabContextKind::Terminal) {
+            card = card.child(
+                div()
+                    .h(px(1.0))
+                    .my(px(4.0))
+                    .bg(theme.border_inactive),
+            );
+            card = card.child(color_palette_row(
+                target.group.clone(),
+                target.tab_idx,
+                theme,
+                cx,
+            ));
+        }
+
+        // Editor-specific rows: appended only when the right-clicked
+        // tab is an editor. Carries the file path so handlers don't
+        // need to walk back into the PaneGroup entity.
+        if let TabContextKind::Editor { path, project_root } = &target.kind {
+            card = card.child(
+                div()
+                    .h(px(1.0))
+                    .my(px(4.0))
+                    .bg(theme.border_inactive),
+            );
+            let copy_path = path.clone();
+            card = card.child(menu_row(
+                "tab-ctx-copy-path",
+                "Copy Path",
+                true,
+                theme,
+                density,
+                typography.clone(),
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        copy_path.to_string_lossy().into_owned(),
+                    ));
+                    this.close(cx);
+                }),
+            ));
+            // Compute relative path eagerly: strip the project_root
+            // prefix; if the file lives outside the root (or no root
+            // known) fall back to the file name. Closure captures the
+            // resolved string so the click handler is cheap.
+            let rel_string = project_root
+                .as_ref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            card = card.child(menu_row(
+                "tab-ctx-copy-relative",
+                "Copy Relative Path",
+                !rel_string.is_empty(),
+                theme,
+                density,
+                typography.clone(),
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(rel_string.clone()));
+                    this.close(cx);
+                }),
+            ));
+            let reveal_path = path.clone();
+            card = card.child(menu_row(
+                "tab-ctx-reveal-in-finder",
+                "Reveal in Finder",
+                true,
+                theme,
+                density,
+                typography.clone(),
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    // `open -R <path>` selects the file in Finder.
+                    // Failure here is non-fatal — log + ignore so a
+                    // permission denial doesn't crash the renderer.
+                    if let Err(err) = std::process::Command::new("open")
+                        .arg("-R")
+                        .arg(&reveal_path)
+                        .spawn()
+                    {
+                        tracing::warn!(?err, path = %reveal_path.display(), "reveal in finder failed");
+                    }
+                    this.close(cx);
+                }),
+            ));
+        }
+
         let left_px = (x_px - MENU_WIDTH).max(0.0);
         let card_container = div()
             .absolute()
@@ -280,6 +397,81 @@ impl Render for TabContextMenu {
             .child(card_container)
             .into_any_element()
     }
+}
+
+/// Build the Tab Color row — a horizontal palette of 9 color swatches
+/// plus a "clear" circle (Ban glyph) at the start. Each swatch click
+/// updates `PaneGroup::set_tab_color` for the given `tab_idx` then
+/// closes the menu. Matches the reference editor's tab color UX.
+fn color_palette_row(
+    group: WeakEntity<PaneGroup>,
+    tab_idx: usize,
+    theme: Theme,
+    cx: &mut Context<TabContextMenu>,
+) -> gpui::AnyElement {
+    use gpui::IntoElement;
+    let label = div()
+        .px(px(ROW_PADDING_X))
+        .py(px(4.0))
+        .text_size(px(11.0))
+        .text_color(theme.fg_subtle)
+        .child("Tab Color");
+    let swatches: [(&'static str, Option<TabColor>); 10] = [
+        ("clear", None),
+        ("blue", Some(TabColor::Blue)),
+        ("purple", Some(TabColor::Purple)),
+        ("pink", Some(TabColor::Pink)),
+        ("red", Some(TabColor::Red)),
+        ("orange", Some(TabColor::Orange)),
+        ("yellow", Some(TabColor::Yellow)),
+        ("green", Some(TabColor::Green)),
+        ("teal", Some(TabColor::Teal)),
+        ("gray", Some(TabColor::Gray)),
+    ];
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(ROW_PADDING_X))
+        .py(px(4.0));
+    for (index, (id, choice)) in swatches.iter().enumerate() {
+        let group_for_click = group.clone();
+        let choice = *choice;
+        let _ = id; // id kept for code clarity; element-id uses numeric index
+        let mut swatch = div()
+            .id(("tab-color-swatch", index))
+            .w(px(16.0))
+            .h(px(16.0))
+            .rounded_full()
+            .cursor_pointer()
+            .border_1();
+        swatch = match choice {
+            Some(c) => {
+                // gpui::rgb takes a u32 (0xRRGGBB) and returns Rgba.
+                let color = gpui::rgb(c.rgb());
+                swatch.bg(color).border_color(color)
+            }
+            None => swatch.border_color(theme.border_active),
+        };
+        row = row.child(
+            swatch.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    if let Some(g) = group_for_click.upgrade() {
+                        g.update(cx, |g, cx| g.set_tab_color(tab_idx, choice, cx));
+                    }
+                    this.close(cx);
+                }),
+            ),
+        );
+    }
+    div()
+        .flex()
+        .flex_col()
+        .child(label)
+        .child(row)
+        .into_any_element()
 }
 
 fn menu_row<H>(

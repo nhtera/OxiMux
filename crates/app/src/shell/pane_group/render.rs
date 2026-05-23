@@ -109,9 +109,11 @@ pub fn build_tab_strip_for(
         .visible_tabs()
         .map(|(idx, t)| PaneGroupTabHeader {
             tab_idx: idx,
-            label: t.label.clone(),
+            // Custom title overrides the default label when set.
+            label: t.custom_title.clone().unwrap_or_else(|| t.label.clone()),
             kind_marker: kind_marker(&t.kind),
             agent_status: agent_status_for(&t.kind),
+            color: t.color,
         })
         .collect();
     let active = group.active();
@@ -142,6 +144,9 @@ struct PaneGroupTabHeader {
     label: SharedString,
     kind_marker: PaneTabKindMarker,
     agent_status: Option<oximux_core::AgentStatus>,
+    /// User-picked color tag, rendered as a 2px left-edge bar on the
+    /// chip. `None` = no color (default chrome).
+    color: Option<super::TabColor>,
 }
 
 #[derive(Clone, Copy)]
@@ -256,6 +261,7 @@ fn build_tab_strip_from_headers(
             header.agent_status.as_ref(),
             tab_idx == active,
             drag_edge,
+            header.color,
             theme,
             entity.clone(),
         ));
@@ -394,6 +400,7 @@ fn render_tab_chip(
     agent_status: Option<&oximux_core::AgentStatus>,
     is_active: bool,
     drag_edge: Option<TabInsertSide>,
+    color_tag: Option<super::TabColor>,
     theme: Theme,
     entity: Entity<PaneGroup>,
 ) -> impl IntoElement {
@@ -436,6 +443,20 @@ fn render_tab_chip(
     let preview_label = label.clone();
     let preview_theme = theme;
 
+    // Optional left-edge color bar (2px) when the user has assigned a
+    // color tag. Rendered as an absolutely-positioned child so it
+    // overlays the chip's existing chrome without shifting layout.
+    let color_bar: Option<AnyElement> = color_tag.map(|c| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .w(px(2.0))
+            .bg(gpui::rgb(c.rgb()))
+            .into_any_element()
+    });
+
     div()
         .id(SharedString::from(format!(
             "pane-group-tab-{entity_id_raw}-{ix}"
@@ -457,6 +478,7 @@ fn render_tab_chip(
         .when(!is_active, |s| {
             s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
         })
+        .when_some(color_bar, |s, bar| s.child(bar))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
             // Activate the chip's tab within its OWN group, then dispatch
             // an `ActivateGroupTab` so the workspace also switches active
