@@ -21,10 +21,21 @@ use gpui_component::{
 use oximux_settings::{Density, Theme, Typography};
 use std::rc::Rc;
 
-/// Boxed callback fired when the user clicks Save / Reset. `Some(title)`
-/// sets the override; `None` clears it. `Rc` (not `Arc`) because GPUI
-/// views are single-threaded on the foreground executor.
-pub type RenameCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App) + 'static>;
+/// Outcome passed to the host callback when the user dismisses the
+/// dialog. The host MUST always clear its `rename_tab_dialog` Option
+/// regardless of variant — otherwise Cancel leaves the modal mounted.
+pub enum RenameOutcome {
+    /// User typed a new title and pressed Save / Enter.
+    Save(SharedString),
+    /// User clicked Reset — clear any custom title override.
+    Reset,
+    /// User clicked Cancel / pressed Escape — no mutation.
+    Cancel,
+}
+
+/// Boxed callback fired on any dismiss path. `Rc` (not `Arc`) because
+/// GPUI views are single-threaded on the foreground executor.
+pub type RenameCallback = Rc<dyn Fn(RenameOutcome, &mut Window, &mut App) + 'static>;
 
 pub struct RenameTabDialog {
     title: SharedString,
@@ -87,7 +98,7 @@ impl RenameTabDialog {
         }
         let value = SharedString::from(trimmed.to_string());
         if let Some(cb) = self.on_commit.take() {
-            cb(Some(value), window, cx);
+            cb(RenameOutcome::Save(value), window, cx);
         }
         self.closed = true;
         cx.notify();
@@ -95,14 +106,16 @@ impl RenameTabDialog {
 
     fn commit_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(cb) = self.on_commit.take() {
-            cb(None, window, cx);
+            cb(RenameOutcome::Reset, window, cx);
         }
         self.closed = true;
         cx.notify();
     }
 
-    fn commit_cancel(&mut self, cx: &mut Context<Self>) {
-        self.on_commit = None;
+    fn commit_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cb) = self.on_commit.take() {
+            cb(RenameOutcome::Cancel, window, cx);
+        }
         self.closed = true;
         cx.notify();
     }
@@ -129,7 +142,7 @@ impl Render for RenameTabDialog {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "enter" => this.commit_save(window, cx),
-                    "escape" => this.commit_cancel(cx),
+                    "escape" => this.commit_cancel(window, cx),
                     _ => {}
                 }
             }))
@@ -179,8 +192,8 @@ impl Render for RenameTabDialog {
                     .child(
                         Button::new("rename-tab-cancel")
                             .label("Cancel")
-                            .on_click(cx.listener(|dlg, _: &ClickEvent, _window, cx| {
-                                dlg.commit_cancel(cx);
+                            .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
+                                dlg.commit_cancel(window, cx);
                             })),
                     )
                     .child(

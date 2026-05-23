@@ -995,9 +995,20 @@ impl Render for WorkspaceRoot {
                 let weak_root: gpui::WeakEntity<WorkspaceRoot> = cx.weak_entity();
                 let weak_group = group.downgrade();
                 let on_commit: crate::shell::rename_tab_dialog::RenameCallback =
-                    std::rc::Rc::new(move |new_title, _window, cx| {
+                    std::rc::Rc::new(move |outcome, _window, cx| {
+                        use crate::shell::rename_tab_dialog::RenameOutcome;
+                        // Mutate first, then drop the dialog regardless of
+                        // outcome so Cancel actually dismisses the modal.
                         if let Some(g) = weak_group.upgrade() {
-                            g.update(cx, |g, cx| g.set_tab_title(tab_idx, new_title, cx));
+                            match outcome {
+                                RenameOutcome::Save(value) => g.update(cx, |g, cx| {
+                                    g.set_tab_title(tab_idx, Some(value), cx)
+                                }),
+                                RenameOutcome::Reset => g.update(cx, |g, cx| {
+                                    g.set_tab_title(tab_idx, None, cx)
+                                }),
+                                RenameOutcome::Cancel => {}
+                            }
                         }
                         let _ = weak_root.update(cx, |this, cx| {
                             this.rename_tab_dialog = None;
