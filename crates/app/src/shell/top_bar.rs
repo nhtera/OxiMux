@@ -18,7 +18,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{ToggleLeftSidebar, ToggleRightSidebar};
+use crate::actions::{OpenPaneActions, ToggleLeftSidebar, ToggleRightSidebar};
 
 /// Width reserved on the left for macOS traffic lights (12px inset +
 /// 3 × ~14px buttons with ~6px gaps + comfortable breathing room before
@@ -135,11 +135,35 @@ fn right_chrome_cluster(
     if right_open {
         zone = zone.child(div().flex_1().h_full());
     }
-    zone.child(toggle_button(
-        right_toggle_icon(right_open),
-        theme,
-        ToggleSide::Right,
-    ))
+    zone.child(pane_actions_button(theme))
+        .child(toggle_button(
+            right_toggle_icon(right_open),
+            theme,
+            ToggleSide::Right,
+        ))
+}
+
+/// "..." button — opens the four-direction split picker. Sits next to
+/// the right-sidebar toggle so it always rides the window's right edge.
+fn pane_actions_button(theme: Theme) -> impl IntoElement {
+    let glyph = svg()
+        .path("icons/ellipsis.svg")
+        .size(px(ICON_SIZE))
+        .text_color(theme.fg_muted);
+    div()
+        .w(px(TOGGLE_BUTTON_WIDTH))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_: &MouseDownEvent, window: &mut Window, cx: &mut gpui::App| {
+                window.dispatch_action(Box::new(OpenPaneActions), cx);
+            },
+        )
+        .child(glyph)
 }
 
 fn spacer_zone() -> impl IntoElement {
