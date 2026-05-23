@@ -1008,7 +1008,7 @@ impl Render for WorkspaceRoot {
                 let density = this.density;
                 let typography = this.typography.clone();
                 this.tab_context_menu.update(cx, |m, cx| m.close(cx));
-                this.rename_tab_dialog = Some(cx.new(|cx| {
+                let dialog = cx.new(|cx| {
                     crate::shell::rename_tab_dialog::RenameTabDialog::new(
                         "Change Tab Title".into(),
                         initial,
@@ -1019,7 +1019,12 @@ impl Render for WorkspaceRoot {
                         window,
                         cx,
                     )
-                }));
+                });
+                // Focus the dialog's input AFTER it's mounted so the user
+                // can type immediately. Focusing before assignment is a
+                // no-op (the element isn't in the tree yet).
+                dialog.read(cx).input_focus_handle(cx).focus(window, cx);
+                this.rename_tab_dialog = Some(dialog);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {

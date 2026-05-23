@@ -10,7 +10,8 @@
 
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled,
+    Window, div, px,
 };
 use gpui_component::{
     Disableable,
@@ -47,13 +48,13 @@ impl RenameTabDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("New title");
-            state.set_value(initial_value.clone(), window, cx);
-            state
-        });
-        // Focus the input so the user can type immediately.
-        input_state.read(cx).focus_handle(cx).focus(window, cx);
+        let input_state =
+            cx.new(|cx| InputState::new(window, cx).placeholder("New title"));
+        // Apply the initial value AFTER constructing the entity — set_value
+        // wants a fresh (window, cx) pair, and the closure inside cx.new
+        // can't surface them cleanly. Same pattern as workspace_dialog's
+        // open_rename().
+        input_state.update(cx, |s, cx| s.set_value(initial_value, window, cx));
         Self {
             title,
             input_state,
@@ -68,6 +69,13 @@ impl RenameTabDialog {
 
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// FocusHandle of the inner Input — the host action handler focuses
+    /// this AFTER mounting the dialog so keystrokes land in the field
+    /// without the user needing to click first.
+    pub fn input_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input_state.read(cx).focus_handle(cx)
     }
 
     fn commit_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -118,6 +126,17 @@ impl Render for RenameTabDialog {
 
         div()
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "enter" => this.commit_save(window, cx),
+                    "escape" => this.commit_cancel(cx),
+                    _ => {}
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, |_event, _window, _cx| {
+                // Swallow clicks inside the card so they don't bubble to
+                // any overlay dismiss handler above.
+            })
             .flex()
             .flex_col()
             .w(px(420.0))
