@@ -51,6 +51,11 @@ pub struct ProjectPanes {
     /// One observer per group entity so layout / focus changes inside a
     /// group bubble up to the workspace render + trigger a save.
     _observers: HashMap<PaneGroupId, Subscription>,
+    /// Focus-in subscription per group so the manager's `active_group_id`
+    /// follows wherever the user actually puts focus. Without this,
+    /// split / close-group actions target whichever group was last
+    /// explicitly activated, not the one the user is in.
+    _focus_observers: HashMap<PaneGroupId, Subscription>,
     focus_handle: FocusHandle,
     cwd: PathBuf,
     theme: Theme,
@@ -105,14 +110,18 @@ impl ProjectPanes {
             cx,
         );
         let group_observer = observe_group(&group, cx);
+        let group_focus_observer = observe_group_focus(&group, initial_id, window, cx);
         let mut groups = HashMap::new();
         groups.insert(initial_id, group);
         let mut observers = HashMap::new();
         observers.insert(initial_id, group_observer);
+        let mut focus_observers = HashMap::new();
+        focus_observers.insert(initial_id, group_focus_observer);
         Self {
             manager,
             groups,
             _observers: observers,
+            _focus_observers: focus_observers,
             focus_handle: cx.focus_handle(),
             cwd,
             theme,
@@ -260,8 +269,10 @@ impl ProjectPanes {
             g.open_terminal_tab(window, cx);
         });
         let group_observer = observe_group(&group, cx);
+        let group_focus_observer = observe_group_focus(&group, new_group, window, cx);
         self.groups.insert(new_group, group);
         self._observers.insert(new_group, group_observer);
+        self._focus_observers.insert(new_group, group_focus_observer);
         if let Some(group) = self.groups.get(&new_group) {
             group.update(cx, |g, cx| g.focus_active(window, cx));
         }
@@ -277,6 +288,7 @@ impl ProjectPanes {
         let closed = self.manager.close_active_group()?;
         self.groups.remove(&closed);
         self._observers.remove(&closed);
+        self._focus_observers.remove(&closed);
         if let Some(group) = self.groups.get(&self.manager.active_group_id()) {
             group.update(cx, |g, cx| g.focus_active(window, cx));
         }
@@ -666,6 +678,25 @@ fn build_group(
 
 fn observe_group(group: &Entity<PaneGroup>, cx: &mut Context<ProjectPanes>) -> Subscription {
     cx.observe(group, |_this, _g, cx| cx.notify())
+}
+
+/// Mirror the GPUI focus subtree of `group` onto the manager so that
+/// any action routed via `active_group_id` (split / close-group / open
+/// editor) lands on whichever group actually has the user's focus —
+/// whether they got there by click, keyboard, or typing into a
+/// terminal. Cheap: only re-notifies when the active id actually moves.
+fn observe_group_focus(
+    group: &Entity<PaneGroup>,
+    id: PaneGroupId,
+    window: &mut Window,
+    cx: &mut Context<ProjectPanes>,
+) -> Subscription {
+    let handle = group.read(cx).focus_handle_clone();
+    cx.on_focus_in(&handle, window, move |this, _window, cx| {
+        if this.manager.set_active(id) {
+            cx.notify();
+        }
+    })
 }
 
 impl Focusable for ProjectPanes {
