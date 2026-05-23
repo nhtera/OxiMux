@@ -34,7 +34,7 @@ fn render_tree(
     match node {
         PaneTree::Leaf(id) => match panes.group(*id) {
             Some(group) => div()
-                .flex_1()
+                .size_full()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
                 .overflow_hidden()
@@ -43,7 +43,7 @@ fn render_tree(
             // Leaf in the tree but no entity registered — shouldn't
             // happen in well-formed state, but rendering an empty slot
             // is safer than panicking inside a render closure.
-            None => div().flex_1().into_any_element(),
+            None => div().size_full().into_any_element(),
         },
         PaneTree::Split {
             axis,
@@ -59,7 +59,14 @@ fn render_tree(
             let sum = if sum > 0.0 { sum } else { 1.0 };
             for (i, (child, weight)) in children.iter().zip(weights.iter()).enumerate() {
                 let frac = (weight / sum) * 100.0;
-                let mut slot = div().min_w(px(0.0)).min_h(px(0.0)).overflow_hidden();
+                // Slot must be a flex container so the inner leaf/split
+                // child (which uses size_full) gets a real box to fill.
+                let mut slot = div()
+                    .flex()
+                    .flex_col()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .overflow_hidden();
                 slot = match axis {
                     Axis::Horizontal => slot.w(gpui::relative(frac / 100.0)).h_full(),
                     Axis::Vertical => slot.h(gpui::relative(frac / 100.0)).w_full(),
