@@ -33,11 +33,21 @@ use oximux_storage::{PaneBufferRepo, PaneRelayIdRepo};
 
 use crate::notifier::{Notifier, TabId};
 use crate::persisted_terminals::{PersistedAgentTab, PersistedTab, PersistedTabs, PersistedTree};
+use crate::shell::pane_group::tab_drag_zones::Zone;
 use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind};
 use crate::shell::pane_group_manager::{
     CloseGroupError, GroupSplitOutcome, PaneGroupManager,
 };
 use crate::shell::pane_tree::{Axis, PaneGroupId, SplitInsert};
+
+/// Hovered drop target during a cross-group tab drag — drives the
+/// pane-body 5-zone overlay render. Set by `on_drag_move` on the body
+/// container; cleared on drop or when the drag exits every body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabDragHoveredTarget {
+    pub group_id: PaneGroupId,
+    pub zone: Zone,
+}
 use crate::shell::terminal_view::TerminalView;
 
 /// Persistence sink invoked after every tab/topology change. Captures
@@ -76,6 +86,11 @@ pub struct ProjectPanes {
     /// Surrounding chrome width. Forwarded to every group on set so
     /// PTY grid math stays current.
     chrome_w_px: f32,
+    /// Hovered drop target during a cross-group tab drag (Phase D).
+    /// `None` whenever no drag is active OR the cursor sits outside every
+    /// pane body. The body's `on_drag_move` sets it to (group, zone) and
+    /// the matching render pass paints the overlay.
+    hovered_drop_target: Option<TabDragHoveredTarget>,
 }
 
 impl ProjectPanes {
@@ -134,6 +149,7 @@ impl ProjectPanes {
             save_callback: None,
             last_plus_click_x: Cell::new(None),
             chrome_w_px: density.w_left_rail,
+            hovered_drop_target: None,
         }
     }
 
@@ -243,6 +259,116 @@ impl ProjectPanes {
                 g.open_terminal_tab(window, cx);
             });
         }
+    }
+
+    /// Current hovered drop target during a tab drag — `Some` only while
+    /// the cursor is over a pane body. Render reads this to paint the
+    /// 5-zone overlay on the matching group.
+    pub fn hovered_drop_target(&self) -> Option<TabDragHoveredTarget> {
+        self.hovered_drop_target
+    }
+
+    /// Update the hovered drop target. Triggers a re-render only when
+    /// the value actually changes — `on_drag_move` fires on every pointer
+    /// move at ~60 fps and unconditional notifies would thrash.
+    pub fn set_hovered_drop_target(
+        &mut self,
+        target: Option<TabDragHoveredTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hovered_drop_target == target {
+            return;
+        }
+        self.hovered_drop_target = target;
+        cx.notify();
+    }
+
+    /// Move a tab from `source` group into `target` group by stealing its
+    /// `PaneGroupTab` (preserving the inner terminal/editor entity, PTY,
+    /// scrollback). Returns `false` when source/target/idx is invalid or
+    /// source==target (drop-on-self merge is a no-op).
+    pub fn transfer_tab(
+        &mut self,
+        source: PaneGroupId,
+        source_tab_idx: usize,
+        target: PaneGroupId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if source == target {
+            return false;
+        }
+        let Some(source_entity) = self.groups.get(&source).cloned() else {
+            return false;
+        };
+        let Some(target_entity) = self.groups.get(&target).cloned() else {
+            return false;
+        };
+        let Some(tab) = source_entity.update(cx, |g, cx| g.take_tab(source_tab_idx, cx)) else {
+            return false;
+        };
+        target_entity.update(cx, |g, cx| {
+            g.push_existing_tab(tab, window, cx);
+        });
+        // Focus follows the moved tab; the manager + project-panes
+        // notify chain will repaint and purge any group that's now empty.
+        self.set_active_group(target, window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Drag-to-split: insert a new sibling group next to `target` along
+    /// the axis implied by `zone`, then transfer the dragged tab into it.
+    /// `Zone::Center` is a no-op here (merge is handled by `transfer_tab`).
+    pub fn split_and_move_tab(
+        &mut self,
+        source: PaneGroupId,
+        source_tab_idx: usize,
+        target: PaneGroupId,
+        zone: Zone,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (axis, insert) = match zone {
+            Zone::Center => return false,
+            Zone::Left => (Axis::Horizontal, SplitInsert::Before),
+            Zone::Right => (Axis::Horizontal, SplitInsert::After),
+            Zone::Up => (Axis::Vertical, SplitInsert::Before),
+            Zone::Down => (Axis::Vertical, SplitInsert::After),
+        };
+        // 1. Allocate the new sibling group in the layout tree.
+        let Some(GroupSplitOutcome { new_group, .. }) =
+            self.manager.split_at_target(target, axis, insert)
+        else {
+            return false;
+        };
+        // 2. Create the matching PaneGroup entity (empty — we fill it via
+        // the transferred tab next).
+        let group = build_group(
+            self.cwd.clone(),
+            self.theme,
+            self.density,
+            self.typography.clone(),
+            self.cli_runtime.clone(),
+            self.notifier.clone(),
+            self.window_active.clone(),
+            cx,
+        );
+        group.update(cx, |g, cx| g.set_chrome_width(self.chrome_w_px, cx));
+        let group_observer = observe_group(&group, cx);
+        let group_focus_observer = observe_group_focus(&group, new_group, window, cx);
+        self.groups.insert(new_group, group);
+        self._observers.insert(new_group, group_observer);
+        self._focus_observers.insert(new_group, group_focus_observer);
+        // 3. Steal the tab from source into the new group.
+        let moved = self.transfer_tab(source, source_tab_idx, new_group, window, cx);
+        if !moved {
+            // Roll back the empty new group — purge_empty_groups will
+            // catch it on next render, but doing it inline keeps the
+            // tree consistent for the next user action.
+            let _ = self.close_group_by_id(new_group, window, cx);
+        }
+        moved
     }
 
     pub fn split_active_group(

@@ -779,6 +779,22 @@ impl Render for WorkspaceRoot {
             row = row.child(col);
         }
 
+        // Reserved drag handle that sits under the macOS title bar
+        // overlay region (FullSizeContentView extends the content view
+        // up under the system title bar). Without a child here the OS
+        // intercepts clicks on the topmost 28px as a title-bar drag,
+        // which would hijack chip drag-reorder gestures originating in
+        // the tab strip. Sized at 22px to leave the traffic-light
+        // glyphs visible at point(12, 12) without pushing the chrome
+        // row noticeably down. Background matches the panel chrome so
+        // the strip below reads as one continuous header.
+        const MAC_TITLEBAR_SAFE_PX: f32 = 22.0;
+        let titlebar_spacer = div()
+            .h(px(MAC_TITLEBAR_SAFE_PX))
+            .w_full()
+            .flex_shrink_0()
+            .bg(theme.bg_panel);
+
         div()
             .track_focus(&self.focus_handle)
             .flex()
@@ -786,6 +802,7 @@ impl Render for WorkspaceRoot {
             .size_full()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
+            .child(titlebar_spacer)
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();

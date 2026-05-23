@@ -108,6 +108,29 @@ impl PaneGroupManager {
         })
     }
 
+    /// Split a specific (non-necessarily-active) group along `axis`.
+    /// Used by drag-to-split so the new sibling lands next to the group
+    /// the user dropped onto, regardless of which group held focus when
+    /// the drag started. The new id is returned so the caller can
+    /// register the matching `PaneGroup` entity. The active group is
+    /// updated to `new_id` so the moved tab's group becomes focused.
+    pub fn split_at_target(
+        &mut self,
+        target: PaneGroupId,
+        axis: Axis,
+        insert: SplitInsert,
+    ) -> Option<GroupSplitOutcome> {
+        let new_id = PaneGroupId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        if !self.group_tree.split_leaf_at(target, axis, new_id, insert) {
+            return None;
+        }
+        self.active_group_id = new_id;
+        Some(GroupSplitOutcome {
+            source_group: target,
+            new_group: new_id,
+        })
+    }
+
     /// Remove the active group. Last-group close is refused per D8 of
     /// the step-06 sub-plan; the caller is expected to surface that to
     /// the user (or silently ignore). On success, focus shifts to the

@@ -7,6 +7,8 @@
 //! does NOT affect any other group's tab list.
 
 pub mod render;
+pub mod tab_drag;
+pub mod tab_drag_zones;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,8 +52,34 @@ pub struct PaneGroupTab {
     pub _status_task: Option<Task<()>>,
 }
 
+/// Hover state during an in-progress tab drag. Drives the 2px blue
+/// insertion bar rendered on the targeted chip's edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabDragHover {
+    /// Visible position the dragged tab would land relative to.
+    pub target_visible_idx: usize,
+    /// Whether the insertion bar paints on the left edge (Before) or
+    /// the right edge (After) of the target chip.
+    pub side: TabInsertSide,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabInsertSide {
+    Before,
+    After,
+}
+
 pub struct PaneGroup {
     tabs: Vec<PaneGroupTab>,
+    /// Visible tab order. Each entry is an index into `tabs` (the
+    /// insertion-order vector). `tabs.len() == tab_order.len()` is an
+    /// invariant maintained by every mutator. Drag-reorder mutates only
+    /// this vector; entity refs in `tabs` stay put.
+    tab_order: Vec<usize>,
+    /// `Some` while a tab inside this group is being dragged AND the
+    /// cursor is over one of its chips. Reset to `None` on drop or when
+    /// drag leaves the strip.
+    drag_hover: Option<TabDragHover>,
     active: usize,
     focus_handle: FocusHandle,
     /// Monotonic counter for default terminal labels, scoped per group.
@@ -84,6 +112,8 @@ impl PaneGroup {
     ) -> Self {
         Self {
             tabs: Vec::new(),
+            tab_order: Vec::new(),
+            drag_hover: None,
             active: 0,
             focus_handle: cx.focus_handle(),
             next_terminal_n: 1,
@@ -100,6 +130,59 @@ impl PaneGroup {
 
     pub fn tabs(&self) -> &[PaneGroupTab] {
         &self.tabs
+    }
+
+    /// Iterate tabs in their visible order (post-drag-reorder). Each
+    /// item carries the insertion-order index alongside the tab so
+    /// callers can keep using the canonical idx for click handlers and
+    /// active-tracking.
+    pub fn visible_tabs(&self) -> impl Iterator<Item = (usize, &PaneGroupTab)> + '_ {
+        self.tab_order.iter().filter_map(move |&idx| {
+            self.tabs.get(idx).map(|t| (idx, t))
+        })
+    }
+
+    /// Move a tab from one visible position to another. Mutates only
+    /// `tab_order`; entity refs in `tabs` and the `active` insertion
+    /// index are preserved so the active highlight follows the moved
+    /// tab automatically. No-op when indices are out of range or
+    /// identical.
+    pub fn move_tab(&mut self, from_visible_idx: usize, to_visible_idx: usize) {
+        if from_visible_idx == to_visible_idx {
+            return;
+        }
+        if from_visible_idx >= self.tab_order.len() || to_visible_idx >= self.tab_order.len() {
+            return;
+        }
+        let moved = self.tab_order.remove(from_visible_idx);
+        self.tab_order.insert(to_visible_idx, moved);
+        debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+    }
+
+    pub fn drag_hover(&self) -> Option<TabDragHover> {
+        self.drag_hover
+    }
+
+    /// Update the drag hover indicator. Triggers a re-render only when
+    /// the value actually changes — `on_drag_move` fires on every
+    /// pointer move, so naive `cx.notify()` would thrash.
+    pub fn set_drag_hover(
+        &mut self,
+        hover: Option<TabDragHover>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag_hover == hover {
+            return;
+        }
+        self.drag_hover = hover;
+        cx.notify();
+    }
+
+    /// Visible position of the tab with `insertion_idx`, if any. Used
+    /// by drop handlers to translate the drag payload's insertion-idx
+    /// into the visible-idx that `move_tab` expects.
+    pub fn visible_position_of(&self, insertion_idx: usize) -> Option<usize> {
+        self.tab_order.iter().position(|&i| i == insertion_idx)
     }
 
     pub fn active(&self) -> usize {
@@ -174,6 +257,7 @@ impl PaneGroup {
             _status_task: None,
         };
         self.tabs.push(tab);
+        self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
         cx.notify();
@@ -210,6 +294,7 @@ impl PaneGroup {
             _status_task: None,
         };
         self.tabs.push(tab);
+        self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
         cx.notify();
@@ -270,6 +355,70 @@ impl PaneGroup {
             _observer: observer,
             _status_task: Some(status_task),
         });
+        self.tab_order.push(self.tabs.len() - 1);
+        self.active = self.tabs.len() - 1;
+        self.focus_active(window, cx);
+        cx.notify();
+        self.active
+    }
+
+    /// Remove a tab from this group by its insertion-order idx and
+    /// return its owning `PaneGroupTab`. Used by the drag-to-split path
+    /// to transfer entity ownership across `PaneGroup`s without rebuilding
+    /// the inner terminal/editor view (preserves PTY + scrollback).
+    ///
+    /// Fixes `tab_order` (drops the entry pointing at `idx`, shifts the
+    /// higher indices down by one) and `active` (decrements past the
+    /// removed slot) so the source group renders correctly afterwards.
+    pub fn take_tab(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<PaneGroupTab> {
+        if idx >= self.tabs.len() {
+            return None;
+        }
+        let removed = self.tabs.remove(idx);
+        if let Some(pos) = self.tab_order.iter().position(|&i| i == idx) {
+            self.tab_order.remove(pos);
+        }
+        for entry in self.tab_order.iter_mut() {
+            if *entry > idx {
+                *entry -= 1;
+            }
+        }
+        debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active == idx {
+            // Active tab moved out — clamp to the last visible position.
+            self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        } else if idx < self.active {
+            self.active -= 1;
+        }
+        cx.notify();
+        Some(removed)
+    }
+
+    /// Append a `PaneGroupTab` that was moved in from another group.
+    /// The original `_observer` is re-attached against this `cx` so the
+    /// destination group re-renders on inner view updates. Returns the
+    /// insertion-order index in the destination group.
+    pub fn push_existing_tab(
+        &mut self,
+        mut tab: PaneGroupTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        // Drop the prior cx's observer (would point at the source group's
+        // entity) and re-subscribe under this group so notify() fires
+        // here on inner-view changes.
+        tab._observer = match &tab.content {
+            PaneContent::Terminal(view) => {
+                Some(cx.observe(view, |_this, _v, cx| cx.notify()))
+            }
+            PaneContent::Editor(view) => {
+                Some(cx.observe(view, |_this, _v, cx| cx.notify()))
+            }
+        };
+        self.tabs.push(tab);
+        self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
         cx.notify();
@@ -291,6 +440,7 @@ impl PaneGroup {
             _observer: observer,
             _status_task: None,
         });
+        self.tab_order.push(self.tabs.len() - 1);
         cx.notify();
     }
 
@@ -299,6 +449,18 @@ impl PaneGroup {
             return;
         }
         let removed = self.tabs.remove(idx);
+        // Drop the removed index from `tab_order`, then decrement every
+        // remaining entry that pointed past it so the vector stays
+        // consistent with the now-shifted `tabs` vector.
+        if let Some(pos) = self.tab_order.iter().position(|&i| i == idx) {
+            self.tab_order.remove(pos);
+        }
+        for entry in self.tab_order.iter_mut() {
+            if *entry > idx {
+                *entry -= 1;
+            }
+        }
+        debug_assert_eq!(self.tabs.len(), self.tab_order.len());
         if let PaneGroupTabKind::Agent { session_id, .. } = removed.kind {
             let runtime = self.cli_runtime.clone();
             cx.spawn_in(window, async move |_this, _cx| {

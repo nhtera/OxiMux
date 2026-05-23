@@ -12,13 +12,14 @@
 //! workspace's).
 
 use gpui::{
-    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Window, div, prelude::FluentBuilder, px, svg,
+    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::Theme;
 
-use super::{PaneGroup, PaneGroupTabKind};
+use super::tab_drag::{TabDragPayload, TabDragPreview};
+use super::{PaneGroup, PaneGroupTabKind, TabDragHover, TabInsertSide};
 use crate::actions::{OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker};
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::agent_status_badge::render_dot;
@@ -92,22 +93,27 @@ pub fn build_tab_strip_for(
     cx: &App,
 ) -> AnyElement {
     let group = entity.read(cx);
+    // Walk `visible_tabs` so reordered chips render in their new slot
+    // while their original insertion idx (used by click / close /
+    // context-menu handlers) is preserved.
     let tabs: Vec<PaneGroupTabHeader> = group
-        .tabs()
-        .iter()
-        .map(|t| PaneGroupTabHeader {
+        .visible_tabs()
+        .map(|(idx, t)| PaneGroupTabHeader {
+            tab_idx: idx,
             label: t.label.clone(),
             kind_marker: kind_marker(&t.kind),
             agent_status: agent_status_for(&t.kind),
         })
         .collect();
     let active = group.active();
+    let drag_hover = group.drag_hover();
     let _ = group;
     build_tab_strip_from_headers(
         entity,
         group_id,
         &tabs,
         active,
+        drag_hover,
         is_focused,
         show_pane_actions,
         theme,
@@ -118,6 +124,10 @@ pub fn build_tab_strip_for(
 /// needs. Avoids holding a borrow of the group while we build elements
 /// (the strip itself uses `entity` for click handlers).
 struct PaneGroupTabHeader {
+    /// Insertion-order index — what click / close / drag handlers
+    /// pass back to the group. Distinct from the chip's visual
+    /// position once the user has reordered tabs.
+    tab_idx: usize,
     label: SharedString,
     kind_marker: PaneTabKindMarker,
     agent_status: Option<oximux_core::AgentStatus>,
@@ -151,11 +161,14 @@ fn build_tab_strip_from_headers(
     group_id: PaneGroupId,
     tabs: &[PaneGroupTabHeader],
     active: usize,
+    drag_hover: Option<TabDragHover>,
     is_focused: bool,
     show_pane_actions: bool,
     theme: Theme,
 ) -> AnyElement {
     let entity_id = entity.entity_id();
+    let strip_hover_entity = entity.clone();
+    let strip_drop_entity = entity.clone();
     let mut strip = div()
         .id(SharedString::from(format!("pane-group-tab-strip-{entity_id}")))
         .flex()
@@ -167,16 +180,45 @@ fn build_tab_strip_from_headers(
         .border_b_1()
         .border_color(theme.border_inactive)
         .overflow_x_scroll()
-        .overflow_y_hidden();
-    for (idx, header) in tabs.iter().enumerate() {
+        .overflow_y_hidden()
+        // Strip-level capture-phase pass: clears the hover state so a
+        // cursor that has left every chip (over the `+`, the trailing
+        // spacer, or outside the strip entirely) doesn't keep the last
+        // chip's insertion bar pinned on. Each chip's own on_drag_move
+        // re-sets the hover when the cursor is inside its bounds.
+        .on_drag_move::<TabDragPayload>(move |ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
+            let payload = ev.drag(cx);
+            if payload.source_group != group_id {
+                return;
+            }
+            strip_hover_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+        })
+        // Catch a drop that lands inside the strip but not over a chip
+        // (e.g. on the `+` button gap or the trailing spacer) so the
+        // hover state is always cleared at drop time. Same-group reorder
+        // is handled by the chip-level on_drop; here we just zero out.
+        .on_drop::<TabDragPayload>(move |_payload: &TabDragPayload, _window, cx| {
+            strip_drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+        });
+    for (visible_idx, header) in tabs.iter().enumerate() {
+        let tab_idx = header.tab_idx;
+        let drag_edge = drag_hover.and_then(|h| {
+            if h.target_visible_idx == visible_idx {
+                Some(h.side)
+            } else {
+                None
+            }
+        });
         strip = strip.child(render_tab_chip(
             entity_id.as_u64(),
             group_id,
-            idx,
+            tab_idx,
+            visible_idx,
             header.label.clone(),
             header.kind_marker,
             header.agent_status.as_ref(),
-            idx == active,
+            tab_idx == active,
+            drag_edge,
             theme,
             entity.clone(),
         ));
@@ -221,10 +263,12 @@ fn render_tab_chip(
     entity_id_raw: u64,
     group_id: PaneGroupId,
     ix: usize,
+    visible_idx: usize,
     label: SharedString,
     marker: PaneTabKindMarker,
     agent_status: Option<&oximux_core::AgentStatus>,
     is_active: bool,
+    drag_edge: Option<TabInsertSide>,
     theme: Theme,
     entity: Entity<PaneGroup>,
 ) -> impl IntoElement {
@@ -250,12 +294,22 @@ fn render_tab_chip(
 
     let group_name = SharedString::from(format!("pane-group-tab-{entity_id_raw}-{ix}"));
     let activate_entity = entity.clone();
+    let hover_entity = entity.clone();
+    let drop_entity = entity.clone();
 
     let agent_dot: Option<AnyElement> = agent_status.map(|status| {
         let dot_id =
             SharedString::from(format!("pane-group-agent-status-dot-{entity_id_raw}-{ix}"));
         render_dot(dot_id, status, theme).into_any_element()
     });
+
+    let drag_payload = TabDragPayload {
+        source_group: group_id,
+        source_tab_idx: ix,
+        source_visible_idx: visible_idx,
+    };
+    let preview_label = label.clone();
+    let preview_theme = theme;
 
     div()
         .id(SharedString::from(format!(
@@ -274,6 +328,7 @@ fn render_tab_chip(
         .text_color(text_color)
         .flex_shrink_0()
         .cursor_pointer()
+        .relative()
         .when(!is_active, |s| {
             s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
         })
@@ -297,10 +352,103 @@ fn render_tab_chip(
                 cx.stop_propagation();
             },
         )
+        .on_drag(drag_payload, move |_payload, _offset, _window, cx| {
+            cx.new(|_| TabDragPreview::new(preview_label.clone(), preview_theme))
+        })
+        .on_drag_move::<TabDragPayload>(move |ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
+            // Mid-bounds split: cursor left of center → insert before
+            // this chip; right of center → insert after. Cross-group
+            // drags (Phase D) ignore the per-chip hover and route via
+            // the body-level zone overlay instead.
+            let payload = ev.drag(cx);
+            if payload.source_group != group_id {
+                return;
+            }
+            // GPUI fires on_drag_move on EVERY registered listener for
+            // every move event (no hitbox filter), so without this
+            // bounds check every chip in the strip would update hover
+            // state on every frame — last-rendered chip wins, dragging
+            // the insertion bar to the rightmost chip regardless of
+            // cursor. The strip-level capture pass clears hover first;
+            // we re-set it only when the cursor is actually inside this
+            // chip's bounds.
+            let bounds = ev.bounds;
+            if !bounds.contains(&ev.event.position) {
+                return;
+            }
+            let mid_x = bounds.origin.x + bounds.size.width / 2.0;
+            let side = if ev.event.position.x < mid_x {
+                TabInsertSide::Before
+            } else {
+                TabInsertSide::After
+            };
+            let hover = Some(TabDragHover {
+                target_visible_idx: visible_idx,
+                side,
+            });
+            hover_entity.update(cx, |g, cx| g.set_drag_hover(hover, cx));
+        })
+        .on_drop::<TabDragPayload>(move |payload: &TabDragPayload, _window, cx| {
+            if payload.source_group != group_id {
+                return;
+            }
+            // Resolve destination visible idx from the live hover hint
+            // (set by the most-recent on_drag_move). Falling back to the
+            // chip's own visible idx keeps the no-op case safe.
+            drop_entity.update(cx, |g, cx| {
+                let Some(hover) = g.drag_hover() else {
+                    g.set_drag_hover(None, cx);
+                    return;
+                };
+                let from = g
+                    .visible_position_of(payload.source_tab_idx)
+                    .unwrap_or(payload.source_visible_idx);
+                let raw_to = match hover.side {
+                    TabInsertSide::Before => hover.target_visible_idx,
+                    TabInsertSide::After => hover.target_visible_idx + 1,
+                };
+                // `move_tab` removes `from` first then inserts at `to`,
+                // so a drop that aims for the slot AFTER `from`
+                // collapses into the same position. Translate the
+                // visible-slot target into the post-remove insert index.
+                let to = if raw_to > from { raw_to - 1 } else { raw_to };
+                let bounded = to.min(g.tabs().len().saturating_sub(1));
+                g.move_tab(from, bounded);
+                g.set_drag_hover(None, cx);
+            });
+        })
         .child(svg().path(icon_path).size(px(ICON_SIZE_PX)).text_color(icon_color))
         .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
         .child(close_button(entity_id_raw, ix, is_active, entity, group_name, theme))
+        .when_some(drag_edge, |s, side| {
+            s.child(insertion_bar(entity_id_raw, ix, side, theme))
+        })
+}
+
+/// 2px-wide blue insertion bar overlay. Painted on the chip's leading
+/// or trailing edge when the user is dragging another chip toward that
+/// slot. `top:0 / bottom:0` so it spans the full strip height; absolute
+/// positioning keeps the chip's content from reflowing under it.
+fn insertion_bar(
+    entity_id_raw: u64,
+    ix: usize,
+    side: TabInsertSide,
+    theme: Theme,
+) -> impl IntoElement {
+    let base = div()
+        .id(SharedString::from(format!(
+            "pane-group-tab-insertion-bar-{entity_id_raw}-{ix}"
+        )))
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .w(px(2.0))
+        .bg(theme.focus_ring);
+    match side {
+        TabInsertSide::Before => base.left_0(),
+        TabInsertSide::After => base.right_0(),
+    }
 }
 
 /// Trailing "..." button on the focused group's strip. Dispatches
