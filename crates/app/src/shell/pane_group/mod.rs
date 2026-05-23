@@ -137,6 +137,14 @@ impl PaneGroup {
                 .all(|t| matches!(t.kind, PaneGroupTabKind::Terminal))
     }
 
+    /// Index of an existing editor tab for `path`, if any. Used by
+    /// `ProjectPanes` to activate-rather-than-reopen across groups.
+    pub fn editor_tab_index(&self, path: &std::path::Path) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == path))
+    }
+
     pub(crate) fn chrome_w_px(&self) -> f32 {
         self.chrome_w_px
     }
