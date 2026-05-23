@@ -20,13 +20,15 @@ use oximux_settings::Theme;
 
 use super::tab_drag::{TabDragPayload, TabDragPreview};
 use super::{PaneGroup, PaneGroupTabKind, TabDragHover, TabInsertSide};
-use crate::actions::{OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker};
+use crate::actions::{
+    ActivateGroupTab, OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker,
+};
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::agent_status_badge::render_dot;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_content::PaneContent;
 
-pub const TAB_STRIP_HEIGHT_PX: f32 = 32.0;
+pub const TAB_STRIP_HEIGHT_PX: f32 = 28.0;
 const TAB_PAD_X_PX: f32 = 12.0;
 const CLOSE_BUTTON_SIZE_PX: f32 = 14.0;
 const ICON_SIZE_PX: f32 = 11.0;
@@ -34,9 +36,10 @@ const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
 /// "..." Pane Actions button width — matches the `+` neighbor so the
 /// trailing button cluster stays balanced.
 const ELLIPSIS_BUTTON_WIDTH_PX: f32 = 28.0;
-/// Match the workspace chrome (top bar + status bar) so terminal grid
-/// math budgets vertical space the same way the legacy host did.
-const CHROME_H_PX: f32 = 40.0 + 24.0;
+/// Workspace chrome height (top bar + status bar). The strip is inline
+/// per-group; its height is subtracted by `dispatch_active_grid` so
+/// terminal grid math budgets vertical space correctly.
+const CHROME_H_PX: f32 = 30.0 + 24.0;
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -107,6 +110,7 @@ pub fn build_tab_strip_for(
         .collect();
     let active = group.active();
     let drag_hover = group.drag_hover();
+    let scroll_handle = group.tab_strip_scroll_handle();
     let _ = group;
     build_tab_strip_from_headers(
         entity,
@@ -117,6 +121,7 @@ pub fn build_tab_strip_for(
         is_focused,
         show_pane_actions,
         theme,
+        scroll_handle,
     )
 }
 
@@ -156,6 +161,7 @@ fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_tab_strip_from_headers(
     entity: Entity<PaneGroup>,
     group_id: PaneGroupId,
@@ -165,22 +171,40 @@ fn build_tab_strip_from_headers(
     is_focused: bool,
     show_pane_actions: bool,
     theme: Theme,
+    scroll_handle: gpui::ScrollHandle,
 ) -> AnyElement {
     let entity_id = entity.entity_id();
     let strip_hover_entity = entity.clone();
     let strip_drop_entity = entity.clone();
-    let mut strip = div()
-        .id(SharedString::from(format!("pane-group-tab-strip-{entity_id}")))
+    // Visible insertion slot the drag would land on. `Before` → slot is
+    // at target_visible_idx; `After` → slot is at target_visible_idx + 1.
+    // Both adjacent chips paint a single edge each so the user reads ONE
+    // continuous 2px bar between them (the reference UX pattern from
+    // resolveTabIndicatorEdges).
+    let insertion_slot = drag_hover.map(|h| match h.side {
+        TabInsertSide::Before => h.target_visible_idx,
+        TabInsertSide::After => h.target_visible_idx + 1,
+    });
+
+    // Inner scroll container: ONLY the tab chips scroll. The "+" and
+    // "..." buttons sit OUTSIDE this div so they stay pinned at the
+    // right edge of the strip even when many tabs overflow. The
+    // `track_scroll(handle)` wires this viewport to the group's
+    // `ScrollHandle` so `PaneGroup::pin_tab_strip_to_end` (called on
+    // every tab append) snaps the viewport to its right edge.
+    let mut chips = div()
+        .id(SharedString::from(format!(
+            "pane-group-tab-strip-{entity_id}"
+        )))
         .flex()
         .flex_row()
         .items_stretch()
-        .h(px(TAB_STRIP_HEIGHT_PX))
-        .w_full()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border_inactive)
+        .h_full()
+        .flex_1()
+        .min_w(px(0.0))
         .overflow_x_scroll()
         .overflow_y_hidden()
+        .track_scroll(&scroll_handle)
         // Strip-level capture-phase pass: clears the hover state so a
         // cursor that has left every chip (over the `+`, the trailing
         // spacer, or outside the strip entirely) doesn't keep the last
@@ -200,16 +224,23 @@ fn build_tab_strip_from_headers(
         .on_drop::<TabDragPayload>(move |_payload: &TabDragPayload, _window, cx| {
             strip_drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
         });
+    let tab_count = tabs.len();
     for (visible_idx, header) in tabs.iter().enumerate() {
         let tab_idx = header.tab_idx;
-        let drag_edge = drag_hover.and_then(|h| {
-            if h.target_visible_idx == visible_idx {
-                Some(h.side)
+        // Two-edge insertion bar: this chip paints a Right bar when the
+        // slot is just AFTER it, and a Left bar when the slot is at this
+        // chip's position. The two adjacent edges combine into one
+        // visually continuous 2px line between chips.
+        let drag_edge: Option<TabInsertSide> = insertion_slot.and_then(|slot| {
+            if slot == visible_idx + 1 {
+                Some(TabInsertSide::After)
+            } else if slot == visible_idx {
+                Some(TabInsertSide::Before)
             } else {
                 None
             }
         });
-        strip = strip.child(render_tab_chip(
+        chips = chips.child(render_tab_chip(
             entity_id.as_u64(),
             group_id,
             tab_idx,
@@ -223,12 +254,27 @@ fn build_tab_strip_from_headers(
             entity.clone(),
         ));
     }
-    strip = strip.child(plus_button(entity_id.as_u64(), theme));
-    strip = strip.child(div().flex_1().min_w(px(0.0)));
+    let _ = tab_count;
+
+    // Outer container holds the scroll viewport + pinned trailing
+    // cluster. `flex_row` keeps everything on one line; the inner
+    // `chips` div takes flex_1 so it absorbs all remaining width while
+    // the trailing buttons stay flex-shrink-0.
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_stretch()
+        .h(px(TAB_STRIP_HEIGHT_PX))
+        .w_full()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border_inactive)
+        .child(chips)
+        .child(plus_button(entity_id.as_u64(), theme));
     if show_pane_actions {
-        strip = strip.child(pane_actions_button(entity_id.as_u64(), is_focused, theme));
+        row = row.child(pane_actions_button(entity_id.as_u64(), is_focused, theme));
     }
-    strip.into_any_element()
+    row.into_any_element()
 }
 
 /// Forward grid target to the active terminal tab so its PTY resizes
@@ -250,6 +296,8 @@ fn dispatch_active_grid(
     let pad = group.density.pad_panel;
     let w =
         (f32::from(v.width) - group.chrome_w_px() - pad * 2.0).max(metrics.cell_width);
+    // Strip lives inline above each leaf body; subtract its height in
+    // addition to CHROME_H_PX (top bar + status bar).
     let h = (f32::from(v.height) - CHROME_H_PX - TAB_STRIP_HEIGHT_PX - pad * 2.0)
         .max(metrics.line_height);
     let cols = metrics.cols_in(w);
@@ -333,8 +381,18 @@ fn render_tab_chip(
             s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
         })
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            // Activate the chip's tab within its OWN group, then dispatch
+            // an `ActivateGroupTab` so the workspace also switches active
+            // group focus when the chip belongs to a non-active group.
             let entity = activate_entity.clone();
             entity.update(cx, |this, cx| this.set_active(ix, window, cx));
+            window.dispatch_action(
+                Box::new(ActivateGroupTab {
+                    group_id: group_id.0,
+                    tab_idx: ix as u32,
+                }),
+                cx,
+            );
         })
         .on_mouse_down(
             MouseButton::Right,

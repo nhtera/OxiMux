@@ -47,11 +47,12 @@ use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    CloseGroup, DismissOverlay, OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog,
-    OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
-    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
-    SelectSearchTab, SelectSourceControlTab, SplitDown, SplitHorizontal, SplitLeft, SplitRight,
-    SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    ActivateGroupTab, CloseGroup, DismissOverlay, OpenAddProjectDialog, OpenCommandPalette,
+    OpenCommitDialog, OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen,
+    OpenTabContextMenuAt, OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab,
+    SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitDown, SplitGroupAt,
+    SplitHorizontal, SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar,
+    ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -639,6 +640,12 @@ impl Render for WorkspaceRoot {
             .map(|p| p.read(cx).agent_count(cx))
             .unwrap_or(0);
 
+        // True TTY count = terminal + agent tabs across every group.
+        let tty_count = active_panes
+            .as_ref()
+            .map(|p| p.read(cx).tty_count(cx))
+            .unwrap_or(0);
+
         // Route poll state to the status bar via the RightSidebar getter.
         // Non-git projects keep their PollState pinned at Loading forever
         // (no poller exists), so gate on `has_repo` to keep the status
@@ -690,11 +697,9 @@ impl Render for WorkspaceRoot {
             panes.update(cx, |p, cx| p.set_chrome_width(chrome, cx));
         }
 
-        // The topmost pane group's tab strip is hoisted into the center
-        // header — matches the reference editor's chrome layout where the
-        // primary group's tabs share the title-bar row. Other groups
-        // keep their tab strips inline above their bodies (handled by
-        // `ProjectPanes::render`).
+        // Top-row pane groups hoist their per-group strips INTO the
+        // top-bar row (mirroring tree column widths). Lower vertical-
+        // split rows render their strips inline above their bodies.
         let workspace_tab_strip: Option<AnyElement> = active_panes
             .as_ref()
             .and_then(|panes| panes.read(cx).topmost_tab_strip(cx));
@@ -909,6 +914,23 @@ impl Render for WorkspaceRoot {
             // Four-direction split actions. SplitHorizontal / SplitVertical
             // are aliases preserved for the legacy Cmd+D / Cmd+Shift+D
             // bindings; they map to Right / Down respectively.
+            .on_action(cx.listener(|this, action: &ActivateGroupTab, window, cx| {
+                // Global workspace strip chip click. The chip's own
+                // group already set its inner active tab; here we route
+                // workspace focus to the chip's group so the body shows
+                // its content.
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                let tab_idx = action.tab_idx as usize;
+                panes.update(cx, |p, cx| {
+                    p.set_active_group(group_id, window, cx);
+                    if let Some(group) = p.group(group_id) {
+                        group.update(cx, |g, cx| g.set_active(tab_idx, window, cx));
+                    }
+                });
+            }))
             .on_action(cx.listener(|this, action: &OpenTabContextMenuAt, _window, cx| {
                 // Tab chip right-click. Carries enough state (group id,
                 // tab index, click coords) for the shared TabContextMenu
@@ -929,8 +951,9 @@ impl Render for WorkspaceRoot {
                 let y = action.y;
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
-                this.tab_context_menu
-                    .update(cx, |m, cx| m.open(x, y, weak, tab_idx, tab_count, cx));
+                this.tab_context_menu.update(cx, |m, cx| {
+                    m.open(x, y, weak, group_id, tab_idx, tab_count, cx)
+                });
             }))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {
                 this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);
@@ -952,6 +975,31 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|this, _: &CloseGroup, window, cx| {
                 this.close_active_pane_group(window, cx);
+            }))
+            .on_action(cx.listener(|this, action: &SplitGroupAt, window, cx| {
+                // Tab right-click "Split X" → target a SPECIFIC group
+                // (the right-clicked one), not the focused one. We
+                // first activate that group so the split lands on it,
+                // then perform the directional split. Matches the reference UX's
+                // per-tab Split menu behavior.
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                let axis = if action.axis == 0 {
+                    Axis::Horizontal
+                } else {
+                    Axis::Vertical
+                };
+                let insert = if action.insert_before {
+                    SplitInsert::Before
+                } else {
+                    SplitInsert::After
+                };
+                panes.update(cx, |p, cx| {
+                    p.set_active_group(group_id, window, cx);
+                    p.split_active_group(axis, insert, window, cx);
+                });
             }))
             .on_action(cx.listener(|this, _: &DismissOverlay, _window, cx| {
                 // Close every transient overlay so a single Escape dismisses
@@ -1007,6 +1055,7 @@ impl Render for WorkspaceRoot {
                 density,
                 typography,
                 pane_count,
+                tty_count,
                 agent_count,
                 git_state.as_ref(),
             ))

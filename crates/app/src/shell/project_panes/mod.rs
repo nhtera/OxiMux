@@ -91,6 +91,10 @@ pub struct ProjectPanes {
     /// pane body. The body's `on_drag_move` sets it to (group, zone) and
     /// the matching render pass paints the overlay.
     hovered_drop_target: Option<TabDragHoveredTarget>,
+    /// Workspace-global counter for default terminal labels. Bumped on
+    /// every shell spawn (initial group, split-spawn, +-new-tab) so
+    /// labels stay unique across panes — matches the reference UX's numbering.
+    next_terminal_n: u64,
 }
 
 impl ProjectPanes {
@@ -150,7 +154,32 @@ impl ProjectPanes {
             last_plus_click_x: Cell::new(None),
             chrome_w_px: density.w_left_rail,
             hovered_drop_target: None,
+            next_terminal_n: 1,
         }
+    }
+
+    /// Pull-and-bump the workspace-global terminal counter. Called right
+    /// before every shell spawn so labels stay monotonic across panes.
+    /// Walks every existing tab label, parses any `Terminal N` suffix,
+    /// and floors the counter at `max(N) + 1` so restored sessions don't
+    /// re-issue colliding labels (the per-group counter resets on app
+    /// boot but labels persist).
+    fn take_next_terminal_n(&mut self, cx: &App) -> u64 {
+        let mut highest = self.next_terminal_n.saturating_sub(1);
+        for group in self.groups.values() {
+            let g = group.read(cx);
+            highest = highest.max(g.next_terminal_n_peek().saturating_sub(1));
+            for (_, tab) in g.visible_tabs() {
+                if let Some(rest) = tab.label.strip_prefix("Terminal ") {
+                    if let Ok(parsed) = rest.parse::<u64>() {
+                        highest = highest.max(parsed);
+                    }
+                }
+            }
+        }
+        let n = highest + 1;
+        self.next_terminal_n = n + 1;
+        n
     }
 
     pub fn manager(&self) -> &PaneGroupManager {
@@ -188,6 +217,15 @@ impl ProjectPanes {
         self.groups
             .values()
             .map(|g| g.read(cx).tab_count())
+            .sum()
+    }
+
+    /// Total TTY-backed tab count across every pane group. Drives the
+    /// status bar's "N TTY" metric.
+    pub fn tty_count(&self, cx: &App) -> usize {
+        self.groups
+            .values()
+            .map(|g| g.read(cx).tty_count())
             .sum()
     }
 
@@ -255,7 +293,9 @@ impl ProjectPanes {
     /// Spawn the first Terminal tab in the only (initial) pane group.
     pub fn seed_default_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(group) = self.active_group() {
+            let n = self.take_next_terminal_n(cx);
             group.update(cx, |g, cx| {
+                g.set_next_terminal_n(n);
                 g.open_terminal_tab(window, cx);
             });
         }
@@ -390,8 +430,10 @@ impl ProjectPanes {
             self.window_active.clone(),
             cx,
         );
+        let n = self.take_next_terminal_n(cx);
         group.update(cx, |g, cx| {
             g.set_chrome_width(self.chrome_w_px, cx);
+            g.set_next_terminal_n(n);
             g.open_terminal_tab(window, cx);
         });
         let group_observer = observe_group(&group, cx);
@@ -503,7 +545,9 @@ impl ProjectPanes {
         let Some(group) = self.active_group() else {
             return;
         };
+        let n = self.take_next_terminal_n(cx);
         group.update(cx, |g, cx| {
+            g.set_next_terminal_n(n);
             g.open_terminal_tab(window, cx);
         });
     }

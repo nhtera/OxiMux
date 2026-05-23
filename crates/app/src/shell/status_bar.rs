@@ -86,6 +86,7 @@ pub fn view(
     density: Density,
     typography: &Typography,
     pane_count: usize,
+    tty_count: usize,
     agent_count: usize,
     git_state: Option<&PollState>,
 ) -> impl IntoElement {
@@ -130,8 +131,8 @@ pub fn view(
                 .child(
                     div()
                         .text_size(px(typography.t_body_sm))
-                        .text_color(metric_color(pane_count, 1, theme))
-                        .child(tty_label(pane_count)),
+                        .text_color(metric_color(tty_count, 1, theme))
+                        .child(tty_label(tty_count)),
                 )
                 .child(separator(theme, typography))
                 .child(

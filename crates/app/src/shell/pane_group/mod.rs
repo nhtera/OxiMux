@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use gpui::{
-    AppContext, Context, FocusHandle, Focusable, SharedString, Subscription, Task, Window,
+    AppContext, Context, FocusHandle, Focusable, Point, ScrollHandle, SharedString, Subscription,
+    Task, Window, px,
 };
 use oximux_agents::{AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend};
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -82,7 +83,9 @@ pub struct PaneGroup {
     drag_hover: Option<TabDragHover>,
     active: usize,
     focus_handle: FocusHandle,
-    /// Monotonic counter for default terminal labels, scoped per group.
+    /// Monotonic counter for default terminal labels. `ProjectPanes`
+    /// overrides this via `set_next_terminal_n` before each spawn so the
+    /// numbering is global across panes (the reference UX-style), not per-group.
     next_terminal_n: u64,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
@@ -96,6 +99,11 @@ pub struct PaneGroup {
     /// Chrome width in window pixels (rail + sidebar) — forwarded by the
     /// workspace so terminal grid dispatch can compute target area.
     chrome_w_px: f32,
+    /// Scroll state for the tab-strip viewport. Render attaches via
+    /// `.track_scroll(handle)`; the auto-pin logic below sets the offset
+    /// to a large negative x after every tab append so the strip's paint
+    /// phase clamps to the right edge (keeping new + active tabs visible).
+    tab_strip_scroll: ScrollHandle,
 }
 
 impl PaneGroup {
@@ -125,6 +133,7 @@ impl PaneGroup {
             notifier,
             window_active,
             chrome_w_px: density.w_left_rail,
+            tab_strip_scroll: ScrollHandle::new(),
         }
     }
 
@@ -208,6 +217,20 @@ impl PaneGroup {
             .count()
     }
 
+    /// Count of TTY-backed tabs (terminals + agents) in this group.
+    /// Excludes editor tabs.
+    pub fn tty_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. }
+                )
+            })
+            .count()
+    }
+
     /// Index of an existing editor tab for `path`, if any. Used by
     /// `ProjectPanes` to activate-rather-than-reopen across groups.
     pub fn editor_tab_index(&self, path: &std::path::Path) -> Option<usize> {
@@ -220,6 +243,24 @@ impl PaneGroup {
         self.chrome_w_px
     }
 
+    /// ScrollHandle the render layer should attach to the tab-strip
+    /// viewport via `.track_scroll(...)`. Exposed so the strip builder
+    /// (free function in `render.rs`) can wire it up.
+    pub(crate) fn tab_strip_scroll_handle(&self) -> ScrollHandle {
+        self.tab_strip_scroll.clone()
+    }
+
+    /// Snap the tab-strip viewport to its right edge. Called after every
+    /// tab append so the newly-added (and now-active) tab is visible —
+    /// matches the reference editor's `stickToEndRef` behavior. The raw
+    /// offset value is intentionally far-negative; the strip's paint
+    /// phase clamps it to the actual `max_offset` once the new tab is
+    /// measured. Idempotent if the strip already fits without overflow.
+    fn pin_tab_strip_to_end(&self) {
+        self.tab_strip_scroll
+            .set_offset(Point::new(px(-100_000.0), px(0.0)));
+    }
+
     pub(crate) fn focus_handle_clone(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -230,6 +271,20 @@ impl PaneGroup {
         }
         self.chrome_w_px = new_chrome;
         cx.notify();
+    }
+
+    /// Override the next-terminal-label seed. `ProjectPanes` uses this to
+    /// route a workspace-global counter into each group right before a
+    /// spawn, keeping terminal numbering monotonic across splits.
+    pub fn set_next_terminal_n(&mut self, n: u64) {
+        self.next_terminal_n = n;
+    }
+
+    /// Peek at the next-terminal seed (without mutating). Used by
+    /// `ProjectPanes::take_next_terminal_n` to compute the workspace-wide
+    /// floor across every group's local counter.
+    pub fn next_terminal_n_peek(&self) -> u64 {
+        self.next_terminal_n
     }
 
     /// Append a freshly-spawned shell terminal as a new tab. Returns the
@@ -260,6 +315,7 @@ impl PaneGroup {
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
         cx.notify();
         Some(self.active)
     }
@@ -297,6 +353,7 @@ impl PaneGroup {
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
         cx.notify();
         self.active
     }
@@ -421,6 +478,7 @@ impl PaneGroup {
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
         cx.notify();
         self.active
     }
@@ -441,6 +499,7 @@ impl PaneGroup {
             _status_task: None,
         });
         self.tab_order.push(self.tabs.len() - 1);
+        self.pin_tab_strip_to_end();
         cx.notify();
     }
 

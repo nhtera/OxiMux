@@ -11,6 +11,8 @@ use gpui::{
     ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
+use std::collections::HashSet;
+
 use super::{ProjectPanes, TabDragHoveredTarget};
 use crate::shell::pane_group::render::build_tab_strip_for;
 use crate::shell::pane_group::tab_drag::TabDragPayload;
@@ -21,6 +23,114 @@ use crate::shell::pane_tree::{Axis, PaneGroupId, PaneTree};
 /// divider so the chrome reads as one consistent stripe.
 const DIVIDER_THICKNESS_PX: f32 = 1.0;
 
+/// Walk the tree's TOP horizontal-layer leaves with their weights.
+///
+/// "Top layer" rules — each group's strip below is hoisted into the
+/// workspace's top bar row IF its leaf is in this top layer. Lower
+/// vertical-split rows keep their strips inline above their bodies.
+///
+///  * Leaf node → that leaf alone (weight 1.0).
+///  * Horizontal split → recurse into every child; their weights flow
+///    into the top-bar split layout.
+///  * Vertical split → only the FIRST child contributes (the visually-
+///    topmost row); its sub-tree is then walked as the new root.
+///
+/// Returned weights are RAW (post-multiplication) so callers can splice
+/// them straight into a flex layout that mirrors body column widths.
+fn collect_top_row_leaves(node: &PaneTree<PaneGroupId>) -> Vec<(PaneGroupId, f32)> {
+    fn walk(node: &PaneTree<PaneGroupId>, weight: f32, out: &mut Vec<(PaneGroupId, f32)>) {
+        match node {
+            PaneTree::Leaf(id) => out.push((*id, weight)),
+            PaneTree::Split {
+                axis: Axis::Horizontal,
+                children,
+                weights,
+            } => {
+                let sum: f32 = weights.iter().sum();
+                let sum = if sum > 0.0 { sum } else { 1.0 };
+                for (child, w) in children.iter().zip(weights.iter()) {
+                    walk(child, weight * (w / sum), out);
+                }
+            }
+            PaneTree::Split {
+                axis: Axis::Vertical,
+                children,
+                weights,
+            } => {
+                // Only the topmost row hoists. Its sub-tree may itself
+                // contain horizontal splits, which we keep walking.
+                if let (Some(first), Some(first_weight)) =
+                    (children.first(), weights.first())
+                {
+                    let sum: f32 = weights.iter().sum();
+                    let _ = sum; // unused — vertical weight stays full at this level
+                    let _ = first_weight; // vertical weight collapses; horizontal weight passes through unchanged
+                    walk(first, weight, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, 1.0, &mut out);
+    out
+}
+
+impl ProjectPanes {
+    /// Build the hoisted top-bar strip row. Mirrors the tree's top
+    /// horizontal layer — each top-row leaf renders its strip in a slot
+    /// whose width matches that leaf's column in the body below. Lower
+    /// vertical-split rows keep their strips inline (rendered by
+    /// `render_tree`'s inline branch).
+    pub fn topmost_tab_strip(&self, cx: &App) -> Option<AnyElement> {
+        let tree = self.manager().group_tree();
+        let entries = collect_top_row_leaves(tree);
+        if entries.is_empty() {
+            return None;
+        }
+        let theme = self.theme;
+        let active_id = self.manager().active_group_id();
+        let sum: f32 = entries.iter().map(|(_, w)| *w).sum();
+        let sum = if sum > 0.0 { sum } else { 1.0 };
+        // flex_1 + min_w(0) matches the spacer pattern in
+        // `top_bar::center_header` so the row absorbs the entire
+        // available width between left chrome and right toggles.
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .h_full()
+            .flex_1()
+            .min_w(px(0.0));
+        for (id, weight) in entries {
+            let Some(entity) = self.group(id) else {
+                continue;
+            };
+            let frac = weight / sum;
+            let is_focused = id == active_id;
+            let strip = build_tab_strip_for(entity, id, is_focused, true, theme, cx);
+            row = row.child(
+                div()
+                    .w(gpui::relative(frac))
+                    .h_full()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .child(strip),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    /// Set of group ids whose strips are hoisted into the top bar.
+    /// `render_tree` consults this to skip the inline strip for those
+    /// leaves — they'd otherwise paint twice (once hoisted, once inline).
+    fn hoisted_leaf_ids(&self) -> HashSet<PaneGroupId> {
+        collect_top_row_leaves(self.manager().group_tree())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+}
+
 impl Render for ProjectPanes {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Drop any group whose tabs got closed down to zero. Refusing
@@ -29,47 +139,24 @@ impl Render for ProjectPanes {
 
         let theme = self.theme;
         let tree = self.manager().group_tree().clone();
-        // The first group in DFS order has its tab strip hoisted into
-        // the workspace top bar (see `topmost_tab_strip`), so we skip
-        // its inline strip here.
-        let topmost = self.manager().in_order_groups().first().copied();
         let active_group_id = self.manager().active_group_id();
         let hovered = self.hovered_drop_target();
         let entity = cx.entity().clone();
+        // Top-row leaves hoist their strip into the workspace's top bar
+        // (`topmost_tab_strip`); inline-strip rendering below skips them
+        // so the strip never paints twice.
+        let hoisted = self.hoisted_leaf_ids();
         let body = render_tree(
             &tree,
             self,
-            topmost,
             active_group_id,
             hovered,
             entity,
             theme,
+            &hoisted,
             cx,
         );
         div().flex().flex_col().size_full().child(body)
-    }
-}
-
-impl ProjectPanes {
-    /// Strip for the workspace's topmost (first-in-DFS) pane group,
-    /// to be embedded in the top bar's center zone. `None` when no
-    /// groups are mounted.
-    ///
-    /// `show_pane_actions = false` here because the top bar already
-    /// renders its own "..." button next to the sidebar toggles —
-    /// duplicating it inside the hoisted strip would crowd the chrome.
-    pub fn topmost_tab_strip(&self, cx: &App) -> Option<AnyElement> {
-        let id = self.manager().in_order_groups().first().copied()?;
-        let entity = self.group(id)?;
-        let is_focused = id == self.manager().active_group_id();
-        Some(build_tab_strip_for(
-            entity,
-            id,
-            is_focused,
-            false,
-            self.theme,
-            cx,
-        ))
     }
 }
 
@@ -77,11 +164,11 @@ impl ProjectPanes {
 fn render_tree(
     node: &PaneTree<PaneGroupId>,
     panes: &ProjectPanes,
-    topmost: Option<PaneGroupId>,
     active_group_id: PaneGroupId,
     hovered: Option<TabDragHoveredTarget>,
     project_panes_entity: Entity<ProjectPanes>,
     theme: oximux_settings::Theme,
+    hoisted: &HashSet<PaneGroupId>,
     cx: &App,
 ) -> AnyElement {
     match node {
@@ -103,14 +190,15 @@ fn render_tree(
                     project_panes_entity.clone(),
                     theme,
                 );
-                // Topmost group's strip is hoisted into the top bar
-                // (see `topmost_tab_strip`); every other group renders
-                // its own inline strip above the active tab content.
-                if Some(*id) == topmost {
+                // Hoisted leaves render BARE bodies — their strip is
+                // already painted in the workspace top bar (see
+                // `topmost_tab_strip`). Non-hoisted leaves (e.g. a
+                // vertical-split's bottom row) keep their strip inline.
+                if hoisted.contains(id) {
                     slot.child(group_body).into_any_element()
                 } else {
                     slot.child(build_tab_strip_for(
-                        group.clone(),
+                        group,
                         *id,
                         is_focused,
                         true,
@@ -155,11 +243,11 @@ fn render_tree(
                 row = row.child(slot.child(render_tree(
                     child,
                     panes,
-                    topmost,
                     active_group_id,
                     hovered,
                     project_panes_entity.clone(),
                     theme,
+                    hoisted,
                     cx,
                 )));
                 if i + 1 < children.len() {

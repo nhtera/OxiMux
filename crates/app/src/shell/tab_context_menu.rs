@@ -9,11 +9,13 @@
 
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    Styled, WeakEntity, Window, div, px,
+    Styled, WeakEntity, Window, div, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::actions::SplitGroupAt;
 use crate::shell::pane_group::PaneGroup;
+use crate::shell::pane_tree::PaneGroupId;
 
 /// Width of the dropdown card.
 pub const MENU_WIDTH: f32 = 188.0;
@@ -23,11 +25,18 @@ const CARD_PADDING: f32 = 6.0;
 const ITEM_HEIGHT: f32 = 30.0;
 /// Horizontal padding inside each row.
 const ROW_PADDING_X: f32 = 10.0;
+/// Split icon glyph size inside each split row.
+const SPLIT_ICON_SIZE: f32 = 14.0;
+/// Gap between icon and label in a split row.
+const SPLIT_ROW_GAP: f32 = 10.0;
 
 /// Right-click context target: which group + which tab inside it.
 #[derive(Clone)]
 struct TabContextTarget {
     group: WeakEntity<PaneGroup>,
+    /// Stable group id forwarded to `SplitGroupAt` so Split rows can
+    /// target the right-clicked group even if focus has moved.
+    group_id: PaneGroupId,
     tab_idx: usize,
     /// Tab count snapshot at open time — drives "Close Others" / "Close
     /// to Right" disabled rendering. Not refreshed on tick: if the user
@@ -71,6 +80,7 @@ impl TabContextMenu {
         x_px: f32,
         y_px: f32,
         group: WeakEntity<PaneGroup>,
+        group_id: PaneGroupId,
         tab_idx: usize,
         tab_count: usize,
         cx: &mut Context<Self>,
@@ -79,6 +89,7 @@ impl TabContextMenu {
         self.y_px = y_px;
         self.target = Some(TabContextTarget {
             group,
+            group_id,
             tab_idx,
             tab_count,
         });
@@ -112,6 +123,7 @@ impl Render for TabContextMenu {
         let close_idx = target.tab_idx;
         let others_idx = target.tab_idx;
         let right_idx = target.tab_idx;
+        let target_group_id = target.group_id.0;
 
         let group_close = target.group.clone();
         let group_others = target.group.clone();
@@ -127,6 +139,58 @@ impl Render for TabContextMenu {
             .border_color(theme.border_active)
             .rounded(px(density.r_card))
             .shadow_lg();
+
+        // Four-direction split actions — match the reference UX's per-tab context menu.
+        // Each row dispatches `SplitGroupAt` carrying the right-clicked
+        // group id so the split lands on this group regardless of focus.
+        let splits: [(&'static str, &'static str, &'static str, u8, bool); 4] = [
+            ("tab-ctx-split-right", "Split Right", "icons/arrow-right.svg", 0, false),
+            ("tab-ctx-split-down", "Split Down", "icons/arrow-down.svg", 1, false),
+            ("tab-ctx-split-left", "Split Left", "icons/arrow-left.svg", 0, true),
+            ("tab-ctx-split-up", "Split Up", "icons/arrow-up.svg", 1, true),
+        ];
+        for (row_id, label, icon_path, axis, insert_before) in splits {
+            let icon = svg()
+                .path(icon_path)
+                .size(px(SPLIT_ICON_SIZE))
+                .text_color(theme.fg_muted);
+            let row = div()
+                .id(row_id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(SPLIT_ROW_GAP))
+                .h(px(ITEM_HEIGHT))
+                .px(px(ROW_PADDING_X))
+                .rounded(px(density.r_xs))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_panel_alt))
+                .text_size(px(typography.t_body_md))
+                .text_color(theme.fg_base)
+                .child(icon)
+                .child(div().flex_1().child(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        window.dispatch_action(
+                            Box::new(SplitGroupAt {
+                                group_id: target_group_id,
+                                axis,
+                                insert_before,
+                            }),
+                            cx,
+                        );
+                        this.close(cx);
+                    }),
+                );
+            card = card.child(row);
+        }
+        card = card.child(
+            div()
+                .h(px(1.0))
+                .my(px(4.0))
+                .bg(theme.border_inactive),
+        );
 
         card = card.child(menu_row(
             "tab-ctx-close",

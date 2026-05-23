@@ -32,6 +32,30 @@ pub struct OpenTabContextMenuAt {
     pub tab_idx: u32,
 }
 
+/// Payload action fired by a workspace-strip chip's left-click. Carries
+/// (group_id, tab_idx) so `WorkspaceRoot` can switch the active pane group
+/// AND activate the right tab within it.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct ActivateGroupTab {
+    pub group_id: u64,
+    pub tab_idx: u32,
+}
+
+/// Payload action fired by the tab right-click "Split X" rows. Splits a
+/// SPECIFIC group (not necessarily the focused one) so right-clicking a
+/// tab in any group can split that group without first stealing focus.
+/// `direction` is encoded as a `(axis, insert_before)` pair:
+///   - axis: 0 = Horizontal (left/right), 1 = Vertical (up/down)
+///   - insert_before: true = Left/Up (insert before), false = Right/Down
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct SplitGroupAt {
+    pub group_id: u64,
+    pub axis: u8,
+    pub insert_before: bool,
+}
+
 actions!(
     oximux,
     [
