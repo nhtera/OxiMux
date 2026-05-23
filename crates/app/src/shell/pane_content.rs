@@ -1,34 +1,43 @@
-//! Pane content variants — terminal or editor leaf.
+//! Pane content variants — terminal split-tree or editor leaf.
 //!
-//! Carries the per-tab content entity inside a `PaneGroup`. The enum
-//! exposes uniform accessors for focus handle, focused state, and a
-//! discriminator (`is_editor`). PTY-only operations stay on
-//! `TerminalView` and are reached by matching `PaneContent::Terminal`
-//! at the call site.
+//! Carries the per-tab content inside a `PaneGroup`. Terminal tabs can
+//! hold MULTIPLE PTYs in a sub-pane split tree (Cmd+D / Cmd+Shift+D);
+//! editor tabs are always single. Both expose uniform accessors for
+//! focus handle and focused state. PTY-only operations stay reachable
+//! via `terminal_active_view()` for ergonomic single-pane access, and
+//! via the inner `TerminalSplitTree` for multi-pane iteration.
 
 use std::path::Path;
 
 use gpui::{App, Entity, FocusHandle, Focusable};
 use oximux_editor::EditorView;
 
+use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::terminal_view::TerminalView;
 
 pub enum PaneContent {
-    Terminal(Entity<TerminalView>),
+    /// Tree of one or more sub-pane terminal views. A single-pane tab
+    /// is a tree-of-one; split via `Cmd+D` / `Cmd+Shift+D`.
+    Terminal(TerminalSplitTree),
     Editor(Entity<EditorView>),
 }
 
 impl PaneContent {
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
-            Self::Terminal(view) => view.read(cx).focus_handle(cx),
+            // Focus always follows the ACTIVE sub-pane so keyboard
+            // input lands where the rim glow draws.
+            Self::Terminal(tree) => tree
+                .active_view()
+                .map(|v| v.read(cx).focus_handle(cx))
+                .unwrap_or_else(|| cx.focus_handle()),
             Self::Editor(view) => view.read(cx).focus_handle(cx),
         }
     }
 
     pub fn focused(&self, cx: &App) -> bool {
         match self {
-            Self::Terminal(view) => view.read(cx).focused(),
+            Self::Terminal(tree) => tree.active_view().is_some_and(|v| v.read(cx).focused()),
             Self::Editor(view) => view.read(cx).focused(),
         }
     }
@@ -41,6 +50,17 @@ impl PaneContent {
         match self {
             Self::Terminal(_) => None,
             Self::Editor(view) => Some(view.read(cx).file_path()),
+        }
+    }
+
+    /// Ergonomic accessor for callers that only care about the ACTIVE
+    /// sub-pane of a terminal tab. Returns `None` for editor tabs or
+    /// degenerate trees. Used by persistence (active scrollback) and
+    /// IPC routing (active PTY).
+    pub fn terminal_active_view(&self) -> Option<&Entity<TerminalView>> {
+        match self {
+            Self::Terminal(tree) => tree.active_view(),
+            Self::Editor(_) => None,
         }
     }
 }

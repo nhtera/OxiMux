@@ -17,10 +17,10 @@ use gpui::{
     px, size,
 };
 use oximux_app::actions::{
-    CloseTab, DismissOverlay, FocusNextPane, FocusPrevPane, NewAgent, NewTab, NextTab,
+    CloseTab, DismissOverlay, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab,
     OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
     PrevTab, Search, SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab,
-    SplitHorizontal, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar,
 };
 // SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
 // crate dependency: oximux-app → oximux-editor → oximux-app would be a cycle.
@@ -145,13 +145,20 @@ fn main() {
             component_theme.colors.ring = palette.focus_ring;
         }
         cx.bind_keys([
-            KeyBinding::new("cmd-d", SplitHorizontal, None),
-            KeyBinding::new("cmd-shift-d", SplitVertical, None),
-            // cmd-w closes the active tab. If it was the last tab in the pane,
-            // the handler cascades into the existing ClosePane logic.
+            // cmd-d / cmd-shift-d trigger SUB-PANE splits inside the
+            // focused terminal tab (matches iTerm / the reference terminal / the
+            // reference editor). Tab-GROUP splits remain accessible via
+            // tab right-click → "Split X" and the Pane Actions "..." menu.
+            KeyBinding::new("cmd-d", SplitSubPaneRight, None),
+            KeyBinding::new("cmd-shift-d", SplitSubPaneDown, None),
+            // cmd-w closes the active sub-pane when the focused tab has
+            // multiple sub-panes; otherwise it closes the whole tab.
+            // Disambiguation lives in `PaneGroup::on_close_tab`.
             KeyBinding::new("cmd-w", CloseTab, None),
-            KeyBinding::new("cmd-]", FocusNextPane, None),
-            KeyBinding::new("cmd-[", FocusPrevPane, None),
+            // cmd-[ / cmd-] cycle sub-pane focus within the active tab.
+            // Tab navigation lives on cmd-{ / cmd-} below.
+            KeyBinding::new("cmd-]", FocusNextSubPane, None),
+            KeyBinding::new("cmd-[", FocusPrevSubPane, None),
             KeyBinding::new("cmd-t", NewTab, None),
             // macOS strips `shift` from the runtime keystroke and remaps the
             // key to the shifted character (`]`→`}`, `[`→`{`). Binding strings

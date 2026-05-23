@@ -18,6 +18,7 @@ use gpui::{
 };
 use oximux_settings::Theme;
 
+use super::sub_pane::TerminalSplitTree;
 use super::tab_drag::{TabDragPayload, TabDragPreview};
 use super::{PaneGroup, PaneGroupTabKind, TabDragHover, TabInsertSide};
 use crate::actions::{
@@ -45,11 +46,12 @@ impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let focus_handle = self.focus_handle_clone();
+        let theme = self.theme;
 
         dispatch_active_grid(self, window, cx);
 
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
-            PaneContent::Terminal(view) => view.clone().into_any_element(),
+            PaneContent::Terminal(tree) => render_sub_pane_tree(tree, theme),
             PaneContent::Editor(view) => view.clone().into_any_element(),
         });
 
@@ -74,6 +76,10 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_next_tab))
             .on_action(cx.listener(PaneGroup::on_prev_tab))
             .on_action(cx.listener(PaneGroup::on_new_agent))
+            .on_action(cx.listener(PaneGroup::on_split_sub_pane_right))
+            .on_action(cx.listener(PaneGroup::on_split_sub_pane_down))
+            .on_action(cx.listener(PaneGroup::on_focus_next_sub_pane))
+            .on_action(cx.listener(PaneGroup::on_focus_prev_sub_pane))
             .child(body)
     }
 }
@@ -288,7 +294,10 @@ fn dispatch_active_grid(
     let Some(tab) = group.active_tab() else {
         return;
     };
-    let PaneContent::Terminal(view) = &tab.content else {
+    let PaneContent::Terminal(tree) = &tab.content else {
+        return;
+    };
+    let Some(view) = tree.active_view() else {
         return;
     };
     let metrics = CellMetrics::measure(&group.typography, window);
@@ -297,13 +306,81 @@ fn dispatch_active_grid(
     let w =
         (f32::from(v.width) - group.chrome_w_px() - pad * 2.0).max(metrics.cell_width);
     // Strip lives inline above each leaf body; subtract its height in
-    // addition to CHROME_H_PX (top bar + status bar).
+    // addition to CHROME_H_PX (top bar + status bar). When sub-panes
+    // are present, each sub-pane gets its own portion via flex layout —
+    // the per-sub-pane TerminalView's own resize listener handles the
+    // fine-grained fitting after we set the parent target.
     let h = (f32::from(v.height) - CHROME_H_PX - TAB_STRIP_HEIGHT_PX - pad * 2.0)
         .max(metrics.line_height);
     let cols = metrics.cols_in(w);
     let rows = metrics.rows_in(h);
     let view = view.clone();
     view.update(cx, |v, _| v.set_target_grid(cols, rows));
+}
+
+/// Recursively render a `TerminalSplitTree` into a flex layout. Single-
+/// pane trees collapse to just the sub-pane view; split nodes become
+/// flex-row (horizontal axis) or flex-col (vertical axis) containers
+/// with `border_color(theme.border_active)` dividers between children.
+///
+/// Active-pane rim glow is deferred — the tree highlights the active
+/// pane via focus state, which TerminalView paints on its own.
+fn render_sub_pane_tree(tree: &TerminalSplitTree, theme: Theme) -> AnyElement {
+    use crate::shell::pane_tree::{Axis, PaneTree};
+    fn build(
+        node: &PaneTree<usize>,
+        tree: &TerminalSplitTree,
+        theme: Theme,
+    ) -> Option<AnyElement> {
+        match node {
+            PaneTree::Leaf(idx) => tree
+                .get(*idx)
+                .map(|view| view.clone().into_any_element()),
+            PaneTree::Split {
+                axis,
+                children,
+                weights,
+            } => {
+                let sum: f32 = weights.iter().sum();
+                let sum = if sum > 0.0 { sum } else { 1.0 };
+                let mut row = div().flex().size_full().overflow_hidden();
+                row = match axis {
+                    Axis::Horizontal => row.flex_row(),
+                    Axis::Vertical => row.flex_col(),
+                };
+                for (i, (child, weight)) in children.iter().zip(weights.iter()).enumerate() {
+                    let frac = weight / sum;
+                    let mut slot = div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .overflow_hidden();
+                    slot = match axis {
+                        Axis::Horizontal => slot.w(gpui::relative(frac)).h_full(),
+                        Axis::Vertical => slot.h(gpui::relative(frac)).w_full(),
+                    };
+                    if let Some(child_el) = build(child, tree, theme) {
+                        row = row.child(slot.child(child_el));
+                    } else {
+                        row = row.child(slot);
+                    }
+                    if i + 1 < children.len() {
+                        let divider = div()
+                            .flex_shrink_0()
+                            .bg(theme.border_active);
+                        let divider = match axis {
+                            Axis::Horizontal => divider.w(px(1.0)).h_full(),
+                            Axis::Vertical => divider.h(px(1.0)).w_full(),
+                        };
+                        row = row.child(divider);
+                    }
+                }
+                Some(row.into_any_element())
+            }
+        }
+    }
+    build(tree.tree(), tree, theme).unwrap_or_else(|| div().size_full().into_any_element())
 }
 
 #[allow(clippy::too_many_arguments)]

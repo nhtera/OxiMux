@@ -7,6 +7,7 @@
 //! does NOT affect any other group's tab list.
 
 pub mod render;
+pub mod sub_pane;
 pub mod tab_drag;
 pub mod tab_drag_zones;
 
@@ -23,11 +24,16 @@ use oximux_core::{AgentAdapter, AgentSessionId};
 use oximux_pty::TerminalSessionId;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{CloseTab, NewAgent, NewTab, NextTab, PrevTab, RequestOpenAdapterPicker};
+use crate::actions::{
+    CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab, PrevTab,
+    RequestOpenAdapterPicker, SplitSubPaneDown, SplitSubPaneRight,
+};
+use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::notifier::{Notifier, TabId};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
 use crate::shell::pane_content::PaneContent;
+use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
 /// Discriminator for `PaneGroupTab` carrying any per-kind metadata.
@@ -301,14 +307,16 @@ impl PaneGroup {
         let view = cx.new(|cx| {
             TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
         });
-        let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
+        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         let n = self.next_terminal_n;
         self.next_terminal_n += 1;
         let tab = PaneGroupTab {
             label: SharedString::from(format!("Terminal {n}")),
-            content: PaneContent::Terminal(view),
+            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
             kind: PaneGroupTabKind::Terminal,
-            _observer: observer,
+            // Tab-level observer is unused for terminal tabs — sub-pane
+            // observers inside TerminalSplitTree drive re-renders.
+            _observer: None,
             _status_task: None,
         };
         self.tabs.push(tab);
@@ -397,9 +405,12 @@ impl PaneGroup {
             label.clone(),
             cx,
         );
+        // Agent tabs are terminal-backed: wrap the agent PTY view in a
+        // single-leaf sub-pane tree so Cmd+D can later add side PTYs.
+        let agent_observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         self.tabs.push(PaneGroupTab {
             label,
-            content: PaneContent::Terminal(view),
+            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, agent_observer)),
             kind: PaneGroupTabKind::Agent {
                 adapter,
                 adapter_id,
@@ -409,9 +420,10 @@ impl PaneGroup {
                 session_id,
                 status_rx,
             },
-            _observer: observer,
+            _observer: None,
             _status_task: Some(status_task),
         });
+        let _ = observer; // legacy single-view observer no longer used
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
         self.focus_active(window, cx);
@@ -465,11 +477,13 @@ impl PaneGroup {
     ) -> usize {
         // Drop the prior cx's observer (would point at the source group's
         // entity) and re-subscribe under this group so notify() fires
-        // here on inner-view changes.
+        // here on inner-view changes. For terminal tabs we re-attach to
+        // the ACTIVE sub-pane only — splits inside the moved tab keep
+        // working because their inner observers stay alive in the tree.
         tab._observer = match &tab.content {
-            PaneContent::Terminal(view) => {
-                Some(cx.observe(view, |_this, _v, cx| cx.notify()))
-            }
+            PaneContent::Terminal(tree) => tree
+                .active_view()
+                .map(|view| cx.observe(view, |_this, _v, cx| cx.notify())),
             PaneContent::Editor(view) => {
                 Some(cx.observe(view, |_this, _v, cx| cx.notify()))
             }
@@ -490,12 +504,12 @@ impl PaneGroup {
         view: gpui::Entity<TerminalView>,
         cx: &mut Context<Self>,
     ) {
-        let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
+        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         self.tabs.push(PaneGroupTab {
             label: SharedString::from(label),
-            content: PaneContent::Terminal(view),
+            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
             kind: PaneGroupTabKind::Terminal,
-            _observer: observer,
+            _observer: None,
             _status_task: None,
         });
         self.tab_order.push(self.tabs.len() - 1);
@@ -658,8 +672,15 @@ impl PaneGroup {
         let mut out = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
             match &tab.content {
-                PaneContent::Terminal(view) => {
-                    out.push(view.read(cx).serialize_buffer(max_bytes));
+                PaneContent::Terminal(tree) => {
+                    // Persist the ACTIVE sub-pane's scrollback only.
+                    // Multi-sub-pane persistence is a follow-up; v1
+                    // restore restores a single sub-pane per tab.
+                    let bytes = tree
+                        .active_view()
+                        .map(|v| v.read(cx).serialize_buffer(max_bytes))
+                        .unwrap_or_default();
+                    out.push(bytes);
                 }
                 PaneContent::Editor(_) => out.push(Vec::new()),
             }
@@ -671,7 +692,9 @@ impl PaneGroup {
         let mut out = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
             match &tab.content {
-                PaneContent::Terminal(view) => out.push(view.read(cx).external_id()),
+                PaneContent::Terminal(tree) => {
+                    out.push(tree.active_view().and_then(|v| v.read(cx).external_id()));
+                }
                 PaneContent::Editor(_) => out.push(None),
             }
         }
@@ -688,8 +711,33 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ix = self.active;
-        self.close_tab(ix, window, cx);
+        // Cmd+W disambiguation: if the active tab's sub-pane tree has
+        // MORE THAN ONE live sub-pane, close just the FOCUSED sub-pane
+        // (re-resolved here for the same reason as split — `tree.active`
+        // doesn't auto-track mouse-driven focus changes). Otherwise
+        // fall through to closing the whole tab.
+        let active_idx = self.active;
+        if let Some(active_tab) = self.tabs.get_mut(active_idx) {
+            if let PaneContent::Terminal(tree) = &mut active_tab.content {
+                if tree.live_count() > 1 {
+                    let focused_idx = tree
+                        .iter_live()
+                        .find(|(_, v)| v.read(cx).focused())
+                        .map(|(i, _)| i);
+                    if let Some(idx) = focused_idx {
+                        tree.set_active(idx);
+                    }
+                    if tree.close_active() {
+                        if let Some(view) = tree.active_view() {
+                            view.read(cx).focus_handle(cx).focus(window, cx);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+        self.close_tab(active_idx, window, cx);
     }
 
     pub(crate) fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -707,6 +755,121 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         window.dispatch_action(Box::new(RequestOpenAdapterPicker), cx);
+    }
+
+    /// Split the active terminal tab's CURRENTLY-FOCUSED sub-pane along
+    /// `axis`. Before splitting we re-resolve which sub-pane actually
+    /// has keyboard focus (by walking the tree and asking each
+    /// `TerminalView`) — necessary because the stored `tree.active`
+    /// only updates on previous splits/cycles, not when the user clicks
+    /// into a different sub-pane to give it focus. Without this
+    /// re-resolution Cmd+D would split whichever pane was last cycled
+    /// to, not the one the user is actually typing in.
+    ///
+    /// Spawns a fresh PTY rooted at the group's `cwd` (full CWD
+    /// inheritance from the source pane is a follow-up — for now we
+    /// use the tab group's working directory). No-op when the active
+    /// tab is not a terminal or PTY spawn fails.
+    fn split_active_sub_pane(
+        &mut self,
+        axis: Axis,
+        insert: SplitInsert,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self.cwd.clone();
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let Some(active_tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        // Sub-panes only apply to terminal-backed tabs; editor tabs are
+        // single-view.
+        let PaneContent::Terminal(tree) = &mut active_tab.content else {
+            return;
+        };
+        // Re-resolve focused sub-pane: scan live entries and pick the one
+        // whose view reports `focused()`. Fallback to stored active
+        // (covers the keyboard-only case where focus query may race
+        // against terminal mount; the cycle/split paths keep active
+        // correct in that flow). Two-step borrow: collect the index
+        // through an immutable borrow, then mutate.
+        let focused_idx = tree
+            .iter_live()
+            .find(|(_, v)| v.read(cx).focused())
+            .map(|(i, _)| i);
+        if let Some(idx) = focused_idx {
+            tree.set_active(idx);
+        }
+        let Some((backend, session_id)) = spawn_local_pty(cwd) else {
+            return;
+        };
+        let view = cx.new(|cx| {
+            TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
+        });
+        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+        tree.split_active(axis, insert, view, observer);
+        // Focus the just-spawned sub-pane so keyboard input lands there.
+        if let Some(active_view) = tree.active_view() {
+            active_view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn on_split_sub_pane_right(
+        &mut self,
+        _: &SplitSubPaneRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.split_active_sub_pane(Axis::Horizontal, SplitInsert::After, window, cx);
+    }
+
+    pub(crate) fn on_split_sub_pane_down(
+        &mut self,
+        _: &SplitSubPaneDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.split_active_sub_pane(Axis::Vertical, SplitInsert::After, window, cx);
+    }
+
+    pub(crate) fn on_focus_next_sub_pane(
+        &mut self,
+        _: &FocusNextSubPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_sub_pane_focus(true, window, cx);
+    }
+
+    pub(crate) fn on_focus_prev_sub_pane(
+        &mut self,
+        _: &FocusPrevSubPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_sub_pane_focus(false, window, cx);
+    }
+
+    fn cycle_sub_pane_focus(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let PaneContent::Terminal(tree) = &mut active_tab.content else {
+            return;
+        };
+        tree.cycle_focus(forward);
+        if let Some(view) = tree.active_view() {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
     }
 }
 

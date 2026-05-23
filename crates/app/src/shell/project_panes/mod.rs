@@ -793,10 +793,11 @@ impl ProjectPanes {
                 if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
                     continue;
                 }
-                let crate::shell::pane_content::PaneContent::Terminal(view) = &tab.content
+                let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content
                 else {
                     continue;
                 };
+                let Some(view) = tree.active_view() else { continue };
                 let bytes = view.read(cx).serialize_buffer(max_bytes_per_pane);
                 if !bytes.is_empty()
                     && let Err(err) = repo.set(project_id, ordinal, &bytes)
@@ -832,10 +833,11 @@ impl ProjectPanes {
                 if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
                     continue;
                 }
-                let crate::shell::pane_content::PaneContent::Terminal(view) = &tab.content
+                let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content
                 else {
                     continue;
                 };
+                let Some(view) = tree.active_view() else { continue };
                 if let Some(pty_id) = view.read(cx).external_id()
                     && let Err(err) = repo.set(project_id, ordinal, &pty_id, relay_session_id)
                 {

@@ -60,11 +60,24 @@ actions!(
     oximux,
     [
         /// Split the focused pane horizontally — new pane on the right.
-        /// Alias of `SplitRight` (kept for the existing Cmd+D binding).
+        /// Alias of `SplitRight`. Kept for legacy callers; the Cmd+D
+        /// keybinding now drives `SplitSubPaneRight` instead so it
+        /// matches the reference editor's sub-pane semantics.
         SplitHorizontal,
         /// Split the focused pane vertically — new pane on the bottom.
-        /// Alias of `SplitDown` (kept for the existing Cmd+Shift+D binding).
+        /// Alias of `SplitDown`. See `SplitHorizontal` note above.
         SplitVertical,
+        /// Sub-pane split: add a new PTY column to the RIGHT of the
+        /// active terminal sub-pane in the focused tab. Bound to Cmd+D.
+        SplitSubPaneRight,
+        /// Sub-pane split: add a new PTY row BELOW the active terminal
+        /// sub-pane in the focused tab. Bound to Cmd+Shift+D.
+        SplitSubPaneDown,
+        /// Cycle sub-pane focus to the NEXT live sub-pane in in-order
+        /// traversal of the active tab's tree. Bound to Cmd+].
+        FocusNextSubPane,
+        /// Cycle sub-pane focus to the PREVIOUS live sub-pane. Cmd+[.
+        FocusPrevSubPane,
         /// Four-direction split: new pane on the right of focus.
         SplitRight,
         /// Four-direction split: new pane below focus.
