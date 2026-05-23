@@ -49,8 +49,10 @@ use crate::state::AppState;
 use crate::actions::{
     OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenPaneActions, OpenProjectPicker,
     OpenQuickOpen, OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab,
-    SelectFilesTab, SelectSearchTab, SelectSourceControlTab, ToggleLeftSidebar, ToggleRightSidebar,
+    SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitDown, SplitHorizontal, SplitLeft,
+    SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
+use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
     adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
     add_project_dialog::AddProjectDialog,
@@ -571,6 +573,23 @@ impl WorkspaceRoot {
     pub fn left_rail_open(&self) -> bool {
         self.left_rail_open
     }
+
+    /// Route a directional split to the active project's pane groups.
+    /// New sibling spawns one Terminal tab + steals focus.
+    fn split_active_pane_group(
+        &self,
+        axis: Axis,
+        insert: SplitInsert,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        panes.update(cx, |p, cx| {
+            p.split_active_group(axis, insert, window, cx);
+        });
+    }
 }
 
 // `build_project_panes` + restore helpers live in
@@ -812,6 +831,27 @@ impl Render for WorkspaceRoot {
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.pane_actions
                     .update(cx, |p, cx| p.open(right_anchor, cx));
+            }))
+            // Four-direction split actions. SplitHorizontal / SplitVertical
+            // are aliases preserved for the legacy Cmd+D / Cmd+Shift+D
+            // bindings; they map to Right / Down respectively.
+            .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {
+                this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitVertical, window, cx| {
+                this.split_active_pane_group(Axis::Vertical, SplitInsert::After, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+                this.split_active_pane_group(Axis::Vertical, SplitInsert::After, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitLeft, window, cx| {
+                this.split_active_pane_group(Axis::Horizontal, SplitInsert::Before, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitUp, window, cx| {
+                this.split_active_pane_group(Axis::Vertical, SplitInsert::Before, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                 if let Some(rs) = &this.right_sidebar {

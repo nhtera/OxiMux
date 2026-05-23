@@ -18,6 +18,7 @@ use gpui::{
 };
 
 use super::{PaneGroup, PaneGroupTabKind};
+use crate::actions::OpenPaneActions;
 use crate::shell::agent_status_badge::render_dot;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_content::PaneContent;
@@ -26,6 +27,7 @@ const TAB_STRIP_HEIGHT_PX: f32 = 32.0;
 const TAB_PAD_X_PX: f32 = 12.0;
 const CLOSE_BUTTON_SIZE_PX: f32 = 14.0;
 const ICON_SIZE_PX: f32 = 11.0;
+const PANE_ACTIONS_BUTTON_WIDTH_PX: f32 = 28.0;
 /// Match the workspace chrome (top bar + status bar) so terminal grid
 /// math budgets vertical space the same way the old MainPane did.
 const CHROME_H_PX: f32 = 40.0 + 24.0;
@@ -62,6 +64,10 @@ impl Render for PaneGroup {
                 entity.clone(),
             ));
         }
+        // Trailing spacer + "..." button (split-direction picker) so the
+        // chip sits at the right edge of the group's tab strip.
+        strip = strip.child(div().flex_1().min_w(px(0.0)));
+        strip = strip.child(pane_actions_button(theme));
 
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
             PaneContent::Terminal(view) => view.clone().into_any_element(),
@@ -186,6 +192,27 @@ fn render_tab(
         .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
         .child(close_button(ix, is_active, entity, group_name, theme))
+}
+
+fn pane_actions_button(theme: oximux_settings::Theme) -> impl IntoElement {
+    let glyph = svg()
+        .path("icons/ellipsis.svg")
+        .size(px(14.0))
+        .text_color(theme.fg_muted);
+    div()
+        .id("pane-group-actions")
+        .w(px(PANE_ACTIONS_BUTTON_WIDTH_PX))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.bg_panel_alt))
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+            window.dispatch_action(Box::new(OpenPaneActions), cx);
+        })
+        .child(glyph)
 }
 
 fn close_button(
