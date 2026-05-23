@@ -847,10 +847,10 @@ impl PaneGroup {
     /// re-resolution Cmd+D would split whichever pane was last cycled
     /// to, not the one the user is actually typing in.
     ///
-    /// Spawns a fresh PTY rooted at the group's `cwd` (full CWD
-    /// inheritance from the source pane is a follow-up — for now we
-    /// use the tab group's working directory). No-op when the active
-    /// tab is not a terminal or PTY spawn fails.
+    /// Spawns a fresh PTY at the CWD of the active sub-pane's shell
+    /// (via libproc on macOS, falling back to the group's cwd when the
+    /// pid is unknown or the lookup fails). No-op when the active tab
+    /// is not a terminal or PTY spawn fails.
     fn split_active_sub_pane(
         &mut self,
         axis: Axis,
@@ -858,7 +858,7 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.cwd.clone();
+        let fallback_cwd = self.cwd.clone();
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
@@ -883,7 +883,15 @@ impl PaneGroup {
         if let Some(idx) = focused_idx {
             tree.set_active(idx);
         }
-        let Some((backend, session_id)) = spawn_local_pty(cwd) else {
+        // Inherit the source shell's CWD. libproc returns None when the
+        // backend has no local pid (relay) or the shell already exited;
+        // either way we fall back to the tab group's working directory.
+        let inherited_cwd = tree
+            .active_view()
+            .and_then(|v| v.read(cx).os_pid())
+            .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+            .unwrap_or(fallback_cwd);
+        let Some((backend, session_id)) = spawn_local_pty(inherited_cwd) else {
             return;
         };
         let view = cx.new(|cx| {

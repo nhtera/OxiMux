@@ -366,6 +366,15 @@ impl TerminalView {
         self.with_backend(|be| be.external_id_of(id))
     }
 
+    /// OS pid of the shell child the backend spawned for this session.
+    /// `None` for remote/relay backends and for already-exited shells.
+    /// Sub-pane split path uses this to query the current shell CWD
+    /// via libproc and inherit it for the new pane.
+    pub fn os_pid(&self) -> Option<u32> {
+        let id = self.session_id;
+        self.with_backend(|be| be.os_pid(id))
+    }
+
     /// Replay captured bytes into this pane's grid BEFORE the live PTY
     /// produces output, so prior scrollback is visible on restart.
     pub fn prefill_grid(&self, bytes: &[u8]) {

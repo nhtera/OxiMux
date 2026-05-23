@@ -145,6 +145,16 @@ pub trait TerminalBackend: Send + 'static {
             .collect()
     }
 
+    /// OS pid of the shell child for this session, when the backend
+    /// spawned one locally. Returns `None` for remote/relay backends
+    /// where the child runs on another host, or when the child has
+    /// already exited. Used by the app crate's libproc-based CWD
+    /// lookup so sub-pane splits can inherit the current shell's
+    /// working directory.
+    fn os_pid(&self, _id: TerminalSessionId) -> Option<u32> {
+        None
+    }
+
     /// Tear down a session. Idempotent — safe to call on an already-closed id.
     fn close(&mut self, id: TerminalSessionId) -> Result<()>;
 }

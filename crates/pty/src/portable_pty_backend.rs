@@ -240,6 +240,10 @@ impl TerminalBackend for PortablePtyBackend {
             .unwrap_or_default()
     }
 
+    fn os_pid(&self, id: TerminalSessionId) -> Option<u32> {
+        self.sessions.get(&id).and_then(|s| s.pid)
+    }
+
     fn drain_events(&mut self) -> Vec<TerminalEvent> {
         let mut out = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
