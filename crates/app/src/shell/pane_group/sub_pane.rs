@@ -167,6 +167,21 @@ impl TerminalSplitTree {
         }
     }
 
+    /// Apply new weights to the Split node at `path` inside this tab's
+    /// sub-pane tree. Returns `true` when the path lands on a Split and
+    /// the new vector matches its child count. `PaneTree::set_split_weights`
+    /// clamps each entry to `MIN_FLEX` so a drag can't shrink a sub-pane
+    /// to zero. Used by the sub-pane divider resize handle.
+    pub fn set_split_weights(&mut self, path: &[usize], weights: Vec<f32>) -> bool {
+        self.tree.set_split_weights(path, weights)
+    }
+
+    /// Read-only snapshot of the Split weights at `path`. Used by drag
+    /// short-circuit logic to skip cx.notify when nothing changed.
+    pub fn split_weights(&self, path: &[usize]) -> Option<Vec<f32>> {
+        self.tree.split_weights(path)
+    }
+
     /// Cycle focus to the next (or previous, when `forward == false`)
     /// live sub-pane in in-order traversal. Wraps around. No-op when
     /// fewer than 2 sub-panes are live.

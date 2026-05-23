@@ -953,6 +953,36 @@ impl PaneGroup {
         cx.notify();
     }
 
+    /// Apply new weights to a Split node inside the active tab's
+    /// sub-pane tree. Used by the divider resize handle. Triggers a
+    /// re-render only when the call actually mutates the tree — the
+    /// drag handler fires at ~60 fps and unconditional notifies would
+    /// thrash.
+    pub fn set_active_sub_pane_weights(
+        &mut self,
+        path: &[usize],
+        weights: Vec<f32>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(active_tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        let PaneContent::Terminal(tree) = &mut active_tab.content else {
+            return false;
+        };
+        let prev = tree.split_weights(path);
+        let changed = tree.set_split_weights(path, weights);
+        if !changed {
+            return false;
+        }
+        let next = tree.split_weights(path);
+        if prev == next {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
     pub(crate) fn on_toggle_zoom_sub_pane(
         &mut self,
         _: &ToggleZoomSubPane,

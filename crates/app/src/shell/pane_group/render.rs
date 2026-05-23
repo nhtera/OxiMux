@@ -50,8 +50,11 @@ impl Render for PaneGroup {
 
         dispatch_active_grid(self, window, cx);
 
+        let group_entity = entity.clone();
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
-            PaneContent::Terminal(tree) => render_sub_pane_tree(tree, theme),
+            PaneContent::Terminal(tree) => {
+                render_sub_pane_tree(tree, group_entity.clone(), theme)
+            }
             PaneContent::Editor(view) => view.clone().into_any_element(),
         });
 
@@ -336,68 +339,259 @@ fn dispatch_active_grid(
 ///
 /// Active-pane rim glow is deferred — the tree highlights the active
 /// pane via focus state, which TerminalView paints on its own.
-fn render_sub_pane_tree(tree: &TerminalSplitTree, theme: Theme) -> AnyElement {
-    use crate::shell::pane_tree::{Axis, PaneTree};
+fn render_sub_pane_tree(
+    tree: &TerminalSplitTree,
+    group: Entity<PaneGroup>,
+    theme: Theme,
+) -> AnyElement {
     // Zoom fast path: bypass tree traversal entirely.
     if let Some(idx) = tree.zoomed() {
         if let Some(view) = tree.get(idx) {
             return view.clone().into_any_element();
         }
     }
-    fn build(
-        node: &PaneTree<usize>,
-        tree: &TerminalSplitTree,
-        theme: Theme,
-    ) -> Option<AnyElement> {
-        match node {
-            PaneTree::Leaf(idx) => tree
-                .get(*idx)
-                .map(|view| view.clone().into_any_element()),
-            PaneTree::Split {
-                axis,
-                children,
-                weights,
-            } => {
-                let sum: f32 = weights.iter().sum();
-                let sum = if sum > 0.0 { sum } else { 1.0 };
-                let mut row = div().flex().size_full().overflow_hidden();
-                row = match axis {
-                    Axis::Horizontal => row.flex_row(),
-                    Axis::Vertical => row.flex_col(),
-                };
-                for (i, (child, weight)) in children.iter().zip(weights.iter()).enumerate() {
-                    let frac = weight / sum;
-                    let mut slot = div()
-                        .flex()
-                        .flex_col()
-                        .min_w(px(0.0))
-                        .min_h(px(0.0))
-                        .overflow_hidden();
-                    slot = match axis {
-                        Axis::Horizontal => slot.w(gpui::relative(frac)).h_full(),
-                        Axis::Vertical => slot.h(gpui::relative(frac)).w_full(),
-                    };
-                    if let Some(child_el) = build(child, tree, theme) {
-                        row = row.child(slot.child(child_el));
-                    } else {
-                        row = row.child(slot);
-                    }
-                    if i + 1 < children.len() {
-                        let divider = div()
-                            .flex_shrink_0()
-                            .bg(theme.border_active);
-                        let divider = match axis {
-                            Axis::Horizontal => divider.w(px(1.0)).h_full(),
-                            Axis::Vertical => divider.h(px(1.0)).w_full(),
+    build_sub_pane_node(tree.tree(), tree, group, theme, &[])
+        .unwrap_or_else(|| div().size_full().into_any_element())
+}
+
+/// Recursive walker for `render_sub_pane_tree`. Each Split node renders
+/// as a flex row/col with interactive resize handles between siblings;
+/// each Leaf renders as a `TerminalView`. `path` tracks the index trail
+/// to the current Split so divider drags can target it precisely via
+/// `PaneGroup::set_active_sub_pane_weights`.
+fn build_sub_pane_node(
+    node: &crate::shell::pane_tree::PaneTree<usize>,
+    tree: &TerminalSplitTree,
+    group: Entity<PaneGroup>,
+    theme: Theme,
+    path: &[usize],
+) -> Option<AnyElement> {
+    use crate::shell::pane_tree::{Axis, PaneTree};
+    match node {
+        PaneTree::Leaf(idx) => tree
+            .get(*idx)
+            .map(|view| view.clone().into_any_element()),
+        PaneTree::Split {
+            axis,
+            children,
+            weights,
+        } => {
+            let split_axis = *axis;
+            let sum: f32 = weights.iter().sum();
+            let sum = if sum > 0.0 { sum } else { 1.0 };
+            // Path owned for the move handler so it survives the render
+            // closure dropping. Cheap clone — usually 0..3 entries deep.
+            let split_path = path.to_vec();
+            let weights_snapshot = weights.clone();
+            let move_path = split_path.clone();
+            let move_axis = split_axis;
+            let move_group = group.clone();
+            let mut row = div()
+                .flex()
+                .size_full()
+                .overflow_hidden()
+                .on_drag_move::<SubPaneDividerPayload>(
+                    move |ev: &DragMoveEvent<SubPaneDividerPayload>, _window, cx| {
+                        let (split_path_p, divider_idx, initial_weights, p_axis) = {
+                            let payload = ev.drag(cx);
+                            (
+                                payload.split_path.clone(),
+                                payload.divider_idx,
+                                payload.initial_weights.clone(),
+                                payload.axis,
+                            )
                         };
-                        row = row.child(divider);
-                    }
+                        if split_path_p != move_path || p_axis != move_axis {
+                            return;
+                        }
+                        let bounds = ev.bounds;
+                        let pos = ev.event.position;
+                        let (axis_pos, axis_size) = match move_axis {
+                            Axis::Horizontal => (
+                                f32::from(pos.x - bounds.origin.x),
+                                f32::from(bounds.size.width),
+                            ),
+                            Axis::Vertical => (
+                                f32::from(pos.y - bounds.origin.y),
+                                f32::from(bounds.size.height),
+                            ),
+                        };
+                        if axis_size <= 0.0 {
+                            return;
+                        }
+                        let frac = (axis_pos / axis_size).clamp(0.0, 1.0);
+                        let new_weights = redistribute_sub_pane_weights(
+                            &initial_weights,
+                            divider_idx,
+                            frac,
+                        );
+                        move_group.update(cx, |g, cx| {
+                            g.set_active_sub_pane_weights(&split_path_p, new_weights, cx);
+                        });
+                    },
+                );
+            row = match split_axis {
+                Axis::Horizontal => row.flex_row(),
+                Axis::Vertical => row.flex_col(),
+            };
+            for (i, (child, weight)) in
+                children.iter().zip(weights_snapshot.iter()).enumerate()
+            {
+                let frac = weight / sum;
+                let mut slot = div()
+                    .flex()
+                    .flex_col()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .overflow_hidden();
+                slot = match split_axis {
+                    Axis::Horizontal => slot.w(gpui::relative(frac)).h_full(),
+                    Axis::Vertical => slot.h(gpui::relative(frac)).w_full(),
+                };
+                let mut child_path = split_path.clone();
+                child_path.push(i);
+                if let Some(child_el) =
+                    build_sub_pane_node(child, tree, group.clone(), theme, &child_path)
+                {
+                    row = row.child(slot.child(child_el));
+                } else {
+                    row = row.child(slot);
                 }
-                Some(row.into_any_element())
+                if i + 1 < children.len() {
+                    row = row.child(sub_pane_divider(
+                        split_path.clone(),
+                        i,
+                        split_axis,
+                        weights_snapshot.clone(),
+                        theme,
+                    ));
+                }
             }
+            Some(row.into_any_element())
         }
     }
-    build(tree.tree(), tree, theme).unwrap_or_else(|| div().size_full().into_any_element())
+}
+
+/// Hit-area padding around the visible 1 px stripe — matches the
+/// workspace-level divider so the drag-pickup feel is consistent.
+const SUB_PANE_DIVIDER_HIT_PAD_PX: f32 = 3.0;
+
+/// Drag payload for a sub-pane divider resize. Kept distinct from the
+/// workspace `DividerDragPayload` so the two on_drag_move handlers
+/// never cross-fire (different type ID → GPUI dispatches separately).
+#[derive(Clone, Debug)]
+struct SubPaneDividerPayload {
+    split_path: Vec<usize>,
+    divider_idx: usize,
+    axis: crate::shell::pane_tree::Axis,
+    initial_weights: Vec<f32>,
+}
+
+/// Zero-sized drag visual placeholder. GPUI requires `on_drag` to return
+/// an Entity; for a resize handle there's no preview because the divider
+/// itself moves on each `on_drag_move` tick.
+struct SubPaneDividerGhost;
+
+impl Render for SubPaneDividerGhost {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div().w(px(0.0)).h(px(0.0))
+    }
+}
+
+/// Build an interactive resize handle for a sub-pane divider. 1 px
+/// visible stripe + transparent 3 px hit-pad on each side; cursor flips
+/// to col/row-resize on hover; drag fires the shared on_drag_move on
+/// the parent split row.
+fn sub_pane_divider(
+    path: Vec<usize>,
+    divider_idx: usize,
+    axis: crate::shell::pane_tree::Axis,
+    weights: Vec<f32>,
+    theme: Theme,
+) -> AnyElement {
+    use crate::shell::pane_tree::Axis;
+    let id_string = format!(
+        "sub-pane-divider-{}-{}",
+        path.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
+        divider_idx,
+    );
+    let payload = SubPaneDividerPayload {
+        split_path: path,
+        divider_idx,
+        axis,
+        initial_weights: weights,
+    };
+    let stripe = div().flex_shrink_0().bg(theme.border_active);
+    let stripe = match axis {
+        Axis::Horizontal => stripe.w(px(1.0)).h_full(),
+        Axis::Vertical => stripe.h(px(1.0)).w_full(),
+    };
+    let mut handle = div()
+        .id(SharedString::from(id_string))
+        .flex()
+        .flex_shrink_0()
+        .occlude();
+    handle = match axis {
+        Axis::Horizontal => handle
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .w(px(1.0 + 2.0 * SUB_PANE_DIVIDER_HIT_PAD_PX))
+            .cursor_col_resize(),
+        Axis::Vertical => handle
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h(px(1.0 + 2.0 * SUB_PANE_DIVIDER_HIT_PAD_PX))
+            .cursor_row_resize(),
+    };
+    handle
+        .child(stripe)
+        .on_drag(payload, |_payload, _offset, _window, cx| {
+            cx.new(|_| SubPaneDividerGhost)
+        })
+        .into_any_element()
+}
+
+/// Compute new sub-pane weights when divider `divider_idx` is dragged
+/// to `frac` of the parent split (0.0 = left/top edge, 1.0 = right/
+/// bottom). Only the two children adjacent to the divider redistribute
+/// — outer siblings keep their initial weight. Matches
+/// `redistribute_weights` in project_panes/render.rs; duplicated here
+/// because the two callers operate on different leaf-id types and the
+/// math itself is identical and tiny.
+fn redistribute_sub_pane_weights(
+    initial: &[f32],
+    divider_idx: usize,
+    frac: f32,
+) -> Vec<f32> {
+    let mut out = initial.to_vec();
+    if divider_idx + 1 >= initial.len() {
+        return out;
+    }
+    let sum: f32 = initial.iter().sum();
+    if sum <= 0.0 {
+        return out;
+    }
+    let before_pair: f32 = initial[..divider_idx].iter().sum();
+    let pair_sum = initial[divider_idx] + initial[divider_idx + 1];
+    if pair_sum <= 0.0 {
+        return out;
+    }
+    let target_total = frac * sum;
+    let frac_in_pair = ((target_total - before_pair) / pair_sum).clamp(0.0, 1.0);
+    out[divider_idx] = pair_sum * frac_in_pair;
+    out[divider_idx + 1] = pair_sum * (1.0 - frac_in_pair);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,4 +910,30 @@ fn close_button(
             cx.stop_propagation();
         })
         .child(glyph)
+}
+
+#[cfg(test)]
+mod sub_pane_resize_tests {
+    use super::redistribute_sub_pane_weights;
+
+    #[test]
+    fn midpoint_keeps_two_pane_balanced() {
+        let new_w = redistribute_sub_pane_weights(&[1.0, 1.0], 0, 0.5);
+        assert!((new_w[0] - 1.0).abs() < 1e-3);
+        assert!((new_w[1] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn three_pane_outer_pane_untouched() {
+        let new_w = redistribute_sub_pane_weights(&[1.0, 1.0, 1.0], 1, 0.8);
+        assert!((new_w[0] - 1.0).abs() < 1e-3, "outer pane untouched");
+        let pair_sum = new_w[1] + new_w[2];
+        assert!((pair_sum - 2.0).abs() < 1e-3, "pair sum preserved");
+    }
+
+    #[test]
+    fn invalid_divider_idx_returns_initial() {
+        let new_w = redistribute_sub_pane_weights(&[1.0, 1.0], 5, 0.5);
+        assert_eq!(new_w, vec![1.0, 1.0]);
+    }
 }
