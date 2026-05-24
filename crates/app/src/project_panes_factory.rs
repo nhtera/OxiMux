@@ -26,6 +26,7 @@ use crate::notifier::Notifier;
 use crate::persisted_terminals::{
     PersistedAgentTab, PersistedTabKind, PersistedTabs, settings_key,
 };
+use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{TerminalView, attach_pty_existing, spawn_local_pty};
 use crate::workspace_root::WorkspaceRoot;
@@ -93,11 +94,32 @@ pub(crate) fn build_project_panes(
         return panes_entity;
     };
 
-    // v2 schema: flat tab list, single restored group. Each terminal tab
-    // gets one buffer from `pane_buffers` (DFS-aligned with capture).
-    // Editor tabs (added in this slice) are restored via `open_or_activate_editor_tab`;
-    // missing files surface a tracing warning and the tab is skipped.
-    // Multi-group layout is still NOT persisted (deferred to a follow-up).
+    // v3 path: multi-group restore when `group_tree` + `groups` are
+    // present. Falls through to the legacy single-group path otherwise.
+    // Clone the tree out so we can hand it (by reference) into the
+    // helper while still moving `snap` for the per-group iteration.
+    if snap.group_tree.is_some() && !snap.groups.is_empty() {
+        let tree = snap.group_tree.clone().expect("group_tree just checked");
+        return restore_multi_group(
+            panes_entity,
+            snap,
+            &tree,
+            pane_buffers,
+            attach_hints,
+            cwd,
+            theme,
+            density,
+            typography,
+            cli_runtime,
+            window,
+            cx,
+        );
+    }
+
+    // Legacy v2 single-group path. Flat tab list, every tab lands in
+    // the placeholder initial group. Editor tabs whose file is missing
+    // are skipped with a warn. Pane buffers align DFS-flat with the
+    // saved tab list.
     let mut buf_iter = pane_buffers.into_iter();
     let mut ordinal: u32 = 0;
     for tab in &snap.tabs {
@@ -133,6 +155,7 @@ pub(crate) fn build_project_panes(
                     restore_agent_tab(
                         agent,
                         tab.label.clone(),
+                        None,
                         cli_runtime.clone(),
                         panes_entity.downgrade(),
                         window,
@@ -167,9 +190,140 @@ pub(crate) fn build_project_panes(
     panes_entity
 }
 
+/// v3 multi-group restore. Walks `snap.groups` in DFS order, distributing
+/// the flat `snap.tabs` across the freshly-allocated groups using each
+/// group's `tab_count`. Pane buffers + agent restores plumb the target
+/// `PaneGroupId` so async completions don't race the active-group pointer.
+#[allow(clippy::too_many_arguments)]
+fn restore_multi_group(
+    panes_entity: Entity<ProjectPanes>,
+    snap: PersistedTabs,
+    tree: &crate::persisted_terminals::PersistedTree,
+    pane_buffers: Vec<Vec<u8>>,
+    attach_hints: AttachHints,
+    cwd: PathBuf,
+    theme: Theme,
+    density: Density,
+    typography: Typography,
+    cli_runtime: Arc<CliRuntime>,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceRoot>,
+) -> Entity<ProjectPanes> {
+    // 1. Allocate group ids in DFS order; replaces the placeholder
+    // initial group inside `ProjectPanes`.
+    let allocated: Vec<PaneGroupId> = panes_entity.update(cx, |p, cx| {
+        p.rebuild_groups_from_tree(tree, snap.active_group, window, cx)
+    });
+    if allocated.is_empty() {
+        // Defensive: rebuild_groups_from_tree always returns at least one
+        // leaf for a well-formed tree, so this only fires on a malformed
+        // blob. Fall back to a default terminal so the user sees something.
+        panes_entity.update(cx, |p, cx| p.seed_default_terminal(window, cx));
+        return panes_entity;
+    }
+    // 2. Walk flat `snap.tabs`, distribute across groups by `tab_count`.
+    let mut buf_iter = pane_buffers.into_iter();
+    let mut ordinal: u32 = 0;
+    let mut flat_iter = snap.tabs.iter();
+    for (g_idx, group_snap) in snap.groups.iter().enumerate() {
+        let Some(&group_id) = allocated.get(g_idx) else {
+            // Tree leaf count > groups vec — malformed blob. Stop.
+            tracing::warn!(
+                g_idx,
+                allocated_len = allocated.len(),
+                "multi-group restore: group index past allocated tree leaves"
+            );
+            break;
+        };
+        for _ in 0..group_snap.tab_count {
+            let Some(tab) = flat_iter.next() else {
+                tracing::warn!("multi-group restore: tabs exhausted mid-group");
+                break;
+            };
+            match &tab.kind {
+                PersistedTabKind::Editor { path } => {
+                    let path_buf = PathBuf::from(path);
+                    if !path_buf.exists() {
+                        tracing::warn!(
+                            ?path,
+                            "editor tab restore: file no longer exists; skipping tab"
+                        );
+                        continue;
+                    }
+                    panes_entity.update(cx, |p, cx| {
+                        p.open_editor_in_group_restore(group_id, path_buf, window, cx);
+                    });
+                }
+                PersistedTabKind::Terminal => {
+                    if let Some(agent) = &tab.agent {
+                        restore_agent_tab(
+                            agent,
+                            tab.label.clone(),
+                            Some(group_id),
+                            cli_runtime.clone(),
+                            panes_entity.downgrade(),
+                            window,
+                            cx,
+                        );
+                    } else if let Some(view) = build_terminal_view_for_tab(
+                        cwd.clone(),
+                        &attach_hints,
+                        ordinal,
+                        theme,
+                        density,
+                        typography.clone(),
+                        window,
+                        cx,
+                    ) {
+                        let bytes = buf_iter.next().unwrap_or_default();
+                        if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
+                            view.read(cx).prefill_grid(&bytes);
+                        }
+                        panes_entity.update(cx, |p, cx| {
+                            p.push_restored_terminal_tab_in(
+                                group_id,
+                                tab.label.clone(),
+                                view,
+                                cx,
+                            );
+                        });
+                        ordinal += 1;
+                    }
+                }
+            }
+        }
+    }
+    // 3. Apply per-group active + tab_order; activate saved focused group.
+    let per_group: Vec<(PaneGroupId, Vec<usize>, usize)> = snap
+        .groups
+        .iter()
+        .enumerate()
+        .filter_map(|(g_idx, group_snap)| {
+            allocated
+                .get(g_idx)
+                .copied()
+                .map(|gid| (gid, group_snap.tab_order.clone(), group_snap.active))
+        })
+        .collect();
+    let active_group_id = allocated
+        .get(snap.active_group)
+        .copied()
+        .unwrap_or(allocated[0]);
+    panes_entity.update(cx, |p, cx| {
+        p.apply_restored_state_multi(per_group, active_group_id, window, cx);
+    });
+    panes_entity
+}
+
+/// Spawn-and-mount an agent tab during restore. `target_group` is
+/// `None` for legacy single-group restores (mount lands in the active
+/// group at completion) and `Some(group_id)` for v3 multi-group
+/// restores (mount lands in the named group regardless of which group
+/// holds focus when the async work finishes).
 fn restore_agent_tab(
     persisted: &PersistedAgentTab,
     label: String,
+    target_group: Option<PaneGroupId>,
     cli_runtime: Arc<CliRuntime>,
     panes: WeakEntity<ProjectPanes>,
     window: &mut Window,
@@ -224,8 +378,9 @@ fn restore_agent_tab(
                 return;
             }
         };
-        let mount = panes.update_in(cx, |p, window, cx| {
-            p.push_restored_agent_tab(
+        let mount = panes.update_in(cx, |p, window, cx| match target_group {
+            Some(group_id) => p.push_restored_agent_tab_in(
+                group_id,
                 &persisted_clone,
                 adapter_id,
                 label,
@@ -235,7 +390,18 @@ fn restore_agent_tab(
                 term_id,
                 window,
                 cx,
-            );
+            ),
+            None => p.push_restored_agent_tab(
+                &persisted_clone,
+                adapter_id,
+                label,
+                session_id,
+                status_rx,
+                backend,
+                term_id,
+                window,
+                cx,
+            ),
         });
         if mount.is_err() {
             tracing::warn!(

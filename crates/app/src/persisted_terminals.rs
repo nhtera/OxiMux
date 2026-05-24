@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use oximux_core::AgentAdapter;
 
-use crate::shell::pane_tree::{Axis, PaneId, PaneTree};
+use crate::shell::pane_tree::{Axis, PaneTree};
+#[cfg(test)]
+use crate::shell::pane_tree::PaneId;
 
 const KEY_PREFIX: &str = "terminal_tabs:";
 
@@ -27,7 +29,7 @@ pub fn settings_key(project_id: &str) -> String {
     format!("{KEY_PREFIX}{project_id}")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedTabs {
     pub tabs: Vec<PersistedTab>,
     pub active: usize,
@@ -40,6 +42,46 @@ pub struct PersistedTabs {
     /// `#[serde(default)]` keeps pre-v2 blobs readable — they parse with
     /// `tab_order: Vec::new()` and the restorer falls back to insertion
     /// order via the empty-vec check.
+    #[serde(default)]
+    pub tab_order: Vec<usize>,
+    /// Workspace-level pane-group split tree. `None` = legacy single-group
+    /// snapshot (every tab lands in one group on restore). `Some(...)` =
+    /// multi-group layout; the tree's DFS leaf order pairs 1:1 with
+    /// `groups` below.
+    ///
+    /// `#[serde(default)]` resolves to `None` for pre-v3 blobs so single-
+    /// group restores keep working untouched.
+    #[serde(default)]
+    pub group_tree: Option<PersistedTree>,
+    /// Per-group state, one entry per leaf in `group_tree` in DFS order.
+    /// `tabs` (top-level) holds the FLAT concatenation of every group's
+    /// tabs; each `PersistedGroup.tab_count` tells the restorer how many
+    /// to consume off the front for that group. Empty when `group_tree`
+    /// is `None`.
+    #[serde(default)]
+    pub groups: Vec<PersistedGroup>,
+    /// DFS index of the active group in `groups`. `0` is the default for
+    /// pre-v3 blobs (which only ever had one group anyway). Saturating-
+    /// clamped to `groups.len() - 1` on restore.
+    #[serde(default)]
+    pub active_group: usize,
+}
+
+/// Per-group restore state emitted alongside the workspace-level
+/// `group_tree`. Tabs themselves live in the flat `PersistedTabs.tabs`
+/// Vec; `tab_count` says how many consecutive entries belong to THIS
+/// group (visited in DFS leaf order). Per-group `active` + `tab_order`
+/// are LOCAL indices into the group's own slice of that flat vec.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PersistedGroup {
+    /// Number of tabs in this group. Restorer pulls `tab_count` entries
+    /// off the flat `PersistedTabs.tabs` iterator in order.
+    pub tab_count: usize,
+    /// Local active index into the group's tab slice. Clamped to
+    /// `[0, tab_count)` on restore.
+    pub active: usize,
+    /// Visual order — local indices in `[0, tab_count)` matching the
+    /// per-group `tab_order_iter()`. Empty = "insertion order" fallback.
     #[serde(default)]
     pub tab_order: Vec<usize>,
 }
@@ -125,8 +167,12 @@ impl From<PersistedAxis> for Axis {
     }
 }
 
-/// Convert a live `PaneTree` (with `PaneId`s) into a persistable shape.
-pub fn snapshot_tree(t: &PaneTree) -> PersistedTree {
+/// Convert any live `PaneTree<L>` into a persistable shape. Leaf ids are
+/// discarded — `PersistedTree::Leaf` carries no payload; the restorer
+/// re-allocates ids by walking the persisted tree in DFS order. Generic
+/// over leaf type so the same helper covers both per-tab content trees
+/// (`PaneTree<PaneId>`) and workspace group layout (`PaneTree<PaneGroupId>`).
+pub fn snapshot_tree<L: Copy + PartialEq>(t: &PaneTree<L>) -> PersistedTree {
     match t {
         PaneTree::Leaf(_) => PersistedTree::Leaf,
         PaneTree::Split {
@@ -141,12 +187,15 @@ pub fn snapshot_tree(t: &PaneTree) -> PersistedTree {
     }
 }
 
-/// Walk a `PersistedTree` and produce a parallel `PaneTree` whose leaves
-/// are assigned fresh `PaneId`s via `alloc`. Caller
-/// supplies the allocator so id space stays monotonic.
-pub fn restore_tree<F>(p: &PersistedTree, alloc: &mut F) -> PaneTree
+/// Walk a `PersistedTree` and produce a parallel `PaneTree<L>` whose
+/// leaves are assigned fresh ids via `alloc`. Generic over leaf type
+/// so the same helper rebuilds per-tab pane trees AND the workspace
+/// group tree (`PaneGroupId`). Caller supplies the allocator so id
+/// space stays monotonic across the rebuild.
+pub fn restore_tree<L, F>(p: &PersistedTree, alloc: &mut F) -> PaneTree<L>
 where
-    F: FnMut() -> PaneId,
+    L: Copy + PartialEq,
+    F: FnMut() -> L,
 {
     match p {
         PersistedTree::Leaf => PaneTree::Leaf(alloc()),
@@ -228,6 +277,7 @@ mod tests {
             active: 0,
             next_label_n: 2,
             tab_order: vec![0],
+            ..PersistedTabs::default()
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
@@ -272,6 +322,7 @@ mod tests {
             active: 0,
             next_label_n: 2,
             tab_order: vec![0],
+            ..PersistedTabs::default()
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
@@ -297,6 +348,7 @@ mod tests {
             active: 0,
             next_label_n: 2,
             tab_order: vec![0],
+            ..PersistedTabs::default()
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
@@ -333,9 +385,212 @@ mod tests {
             active: 1,
             next_label_n: 3,
             tab_order: vec![2, 0, 1],
+            ..PersistedTabs::default()
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
         assert_eq!(back.tab_order, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn legacy_blob_defaults_group_tree_to_none() {
+        // Pre-v3 blobs had no `group_tree` / `groups` / `active_group`
+        // fields. Serde-default keeps them readable; restore falls back
+        // to the single-group path (driven by `group_tree.is_none()`).
+        let legacy =
+            r#"{"tabs":[{"label":"Terminal 1","tree":"Leaf"}],"active":0,"next_label_n":2}"#;
+        let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.group_tree.is_none());
+        assert!(parsed.groups.is_empty());
+        assert_eq!(parsed.active_group, 0);
+    }
+
+    #[test]
+    fn multi_group_tree_round_trips() {
+        // Two side-by-side groups with one terminal each. The flat tabs
+        // vec carries both in DFS order; `groups` records per-group
+        // tab_count + active + tab_order. Restoring this blob in the
+        // app would rebuild a 2-group horizontal split.
+        let blob = PersistedTabs {
+            tabs: vec![
+                PersistedTab {
+                    label: "G0-T0".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+                PersistedTab {
+                    label: "G1-T0".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+            ],
+            active: 1,
+            next_label_n: 3,
+            tab_order: vec![0, 1],
+            group_tree: Some(PersistedTree::Split {
+                axis: PersistedAxis::Horizontal,
+                children: vec![PersistedTree::Leaf, PersistedTree::Leaf],
+                weights: vec![1.0, 1.0],
+            }),
+            groups: vec![
+                PersistedGroup {
+                    tab_count: 1,
+                    active: 0,
+                    tab_order: vec![0],
+                },
+                PersistedGroup {
+                    tab_count: 1,
+                    active: 0,
+                    tab_order: vec![0],
+                },
+            ],
+            active_group: 1,
+        };
+        let s = serde_json::to_string(&blob).unwrap();
+        let back: PersistedTabs = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tabs.len(), 2);
+        assert_eq!(back.active_group, 1);
+        assert_eq!(back.groups.len(), 2);
+        assert_eq!(back.groups[0].tab_count, 1);
+        assert_eq!(back.groups[1].tab_count, 1);
+        match back.group_tree.as_ref().expect("group_tree present") {
+            PersistedTree::Split {
+                axis,
+                children,
+                weights,
+            } => {
+                assert!(matches!(axis, PersistedAxis::Horizontal));
+                assert_eq!(children.len(), 2);
+                assert_eq!(weights, &vec![1.0, 1.0]);
+            }
+            _ => panic!("expected Split at root"),
+        }
+    }
+
+    #[test]
+    fn multi_group_preserves_per_group_active_and_order() {
+        // Three groups, the middle one has 3 tabs reordered to [2,0,1]
+        // with the second slot active. Verify the per-group state
+        // round-trips through JSON intact.
+        let blob = PersistedTabs {
+            tabs: vec![
+                PersistedTab {
+                    label: "G0-T0".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+                PersistedTab {
+                    label: "G1-T0".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+                PersistedTab {
+                    label: "G1-T1".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+                PersistedTab {
+                    label: "G1-T2".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+                PersistedTab {
+                    label: "G2-T0".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+            ],
+            active: 2, // G1-T1 globally
+            next_label_n: 5,
+            tab_order: vec![0, 3, 1, 2, 4], // G0=[0], G1=[T2,T0,T1], G2=[0]
+            group_tree: Some(PersistedTree::Split {
+                axis: PersistedAxis::Horizontal,
+                children: vec![
+                    PersistedTree::Leaf,
+                    PersistedTree::Split {
+                        axis: PersistedAxis::Vertical,
+                        children: vec![PersistedTree::Leaf, PersistedTree::Leaf],
+                        weights: vec![1.0, 1.0],
+                    },
+                ],
+                weights: vec![1.0, 2.0],
+            }),
+            groups: vec![
+                PersistedGroup {
+                    tab_count: 1,
+                    active: 0,
+                    tab_order: vec![0],
+                },
+                PersistedGroup {
+                    tab_count: 3,
+                    active: 1, // G1-T1 locally
+                    tab_order: vec![2, 0, 1],
+                },
+                PersistedGroup {
+                    tab_count: 1,
+                    active: 0,
+                    tab_order: vec![0],
+                },
+            ],
+            active_group: 1,
+        };
+        let s = serde_json::to_string(&blob).unwrap();
+        let back: PersistedTabs = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.groups.len(), 3);
+        assert_eq!(back.groups[1].tab_count, 3);
+        assert_eq!(back.groups[1].active, 1);
+        assert_eq!(back.groups[1].tab_order, vec![2, 0, 1]);
+        assert_eq!(back.active_group, 1);
+        // Flat tab_order projection survives too.
+        assert_eq!(back.tab_order, vec![0, 3, 1, 2, 4]);
+        // Tree's nested vertical split preserved on G1's leaf side.
+        let group_tree = back.group_tree.as_ref().expect("group_tree present");
+        let PersistedTree::Split { children, .. } = group_tree else {
+            panic!("expected Split at root");
+        };
+        let PersistedTree::Split { axis, .. } = &children[1] else {
+            panic!("expected nested split on right");
+        };
+        assert!(matches!(axis, PersistedAxis::Vertical));
+    }
+
+    #[test]
+    fn group_tree_snapshot_then_restore_via_pane_group_id() {
+        // The same `snapshot_tree` / `restore_tree` helpers must work
+        // for the workspace's `PaneTree<PaneGroupId>` (not just the
+        // per-tab content tree). Pin the genericity here.
+        use crate::shell::pane_tree::PaneGroupId;
+        let original: PaneTree<PaneGroupId> = PaneTree::Split {
+            axis: Axis::Horizontal,
+            children: vec![
+                PaneTree::Leaf(PaneGroupId(0)),
+                PaneTree::Leaf(PaneGroupId(1)),
+            ],
+            weights: vec![1.0, 2.5],
+        };
+        let snap = snapshot_tree(&original);
+        let mut next = 10u64;
+        let restored: PaneTree<PaneGroupId> = restore_tree(&snap, &mut || {
+            let id = PaneGroupId(next);
+            next += 1;
+            id
+        });
+        // Ids re-allocated, weights + topology preserved.
+        let PaneTree::Split {
+            children, weights, ..
+        } = &restored
+        else {
+            panic!("expected split");
+        };
+        assert_eq!(weights, &vec![1.0, 2.5]);
+        assert_eq!(children.len(), 2);
+        assert_eq!(restored.in_order_leaves(), vec![PaneGroupId(10), PaneGroupId(11)]);
     }
 }

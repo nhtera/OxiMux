@@ -32,7 +32,8 @@ use oximux_storage::{PaneBufferRepo, PaneRelayIdRepo};
 
 use crate::notifier::{Notifier, TabId};
 use crate::persisted_terminals::{
-    PersistedAgentTab, PersistedTab, PersistedTabKind, PersistedTabs, PersistedTree,
+    PersistedAgentTab, PersistedGroup, PersistedTab, PersistedTabKind, PersistedTabs,
+    PersistedTree, snapshot_tree,
 };
 use crate::shell::pane_group::tab_drag_zones::Zone;
 use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind};
@@ -716,28 +717,47 @@ impl ProjectPanes {
         });
     }
 
-    /// v1 snapshot — flattens every group's tabs into one linear list
-    /// keyed by terminal/editor/agent kind. Custom-agent tabs are still
-    /// skipped (their `(program, args)` config isn't captured anywhere
-    /// yet). Multi-group layout is NOT yet persisted; restore reconstructs
-    /// a single group with every tab. v2 schema (this slice) adds:
-    /// - `kind: PersistedTabKind::Editor { path }` so editor tabs round-trip.
-    /// - `tab_order: Vec<usize>` so drag-reordered visual sequence survives.
+    /// Workspace snapshot. v3 schema captures both the flat (legacy) tab
+    /// projection AND the workspace-level group split tree + per-group
+    /// state so multi-group layouts survive restart. Custom-agent tabs
+    /// are skipped (their `(program, args)` config isn't captured).
+    ///
+    /// **Flat fields (back-compat):**
+    /// - `tabs` — every group's tabs concatenated in DFS group order.
+    /// - `active` — flat index of the focused tab.
+    /// - `tab_order` — flat projection of all per-group orders, in DFS group order.
+    ///
+    /// **Multi-group fields (v3):**
+    /// - `group_tree` — `PersistedTree` mirror of `manager.group_tree()`.
+    /// - `groups` — per-leaf state (`tab_count` + local `active` + local `tab_order`).
+    /// - `active_group` — DFS index of the focused group.
+    ///
+    /// The flat + multi-group views agree at all times: each
+    /// `PersistedGroup.tab_count` is a contiguous slice of the flat `tabs`
+    /// vec, in DFS leaf order. Legacy readers ignore the new fields and
+    /// rebuild a single group from the flat slice; v3 readers walk
+    /// `group_tree` instead.
     pub fn snapshot(&self, cx: &App) -> PersistedTabs {
         let mut tabs: Vec<PersistedTab> = Vec::new();
-        // Per-group (local insertion idx → flat idx) translation. Built
-        // while emitting `tabs` so the same skip rules apply to both the
-        // tabs vec AND the tab_order projection below.
-        let mut local_to_flat: HashMap<(PaneGroupId, usize), usize> = HashMap::new();
+        let mut groups: Vec<PersistedGroup> = Vec::new();
         let mut active_offset: Option<usize> = None;
-        let mut flat_idx: usize = 0;
+        let mut active_group_dfs_idx: Option<usize> = None;
         let active_group_id = self.manager.active_group_id();
-        for group_id in self.manager.in_order_groups() {
+        for (dfs_idx, group_id) in self.manager.in_order_groups().into_iter().enumerate() {
             let Some(group) = self.groups.get(&group_id) else {
                 continue;
             };
             let group_ref = group.read(cx);
             let group_active = group_ref.active();
+            // Per-group emit bookkeeping. `orig_to_emitted` maps the
+            // group's source tab index → its position WITHIN this group's
+            // emitted slice. Custom-agent tabs drop out, shifting every
+            // surviving tab's local position; this map keeps `tab_order`
+            // projection honest across the skip.
+            let mut emitted_in_group: usize = 0;
+            let mut orig_to_emitted: HashMap<usize, usize> = HashMap::new();
+            let mut local_active: usize = 0;
+            let slice_start = tabs.len();
             for (idx, tab) in group_ref.tabs().iter().enumerate() {
                 let (agent, kind) = match &tab.kind {
                     PaneGroupTabKind::Terminal => (None, PersistedTabKind::Terminal),
@@ -771,7 +791,9 @@ impl ProjectPanes {
                     }
                 };
                 if group_id == active_group_id && idx == group_active {
-                    active_offset = Some(flat_idx);
+                    active_offset = Some(tabs.len());
+                    active_group_dfs_idx = Some(dfs_idx);
+                    local_active = emitted_in_group;
                 }
                 tabs.push(PersistedTab {
                     label: tab.label.to_string(),
@@ -779,29 +801,60 @@ impl ProjectPanes {
                     agent,
                     kind,
                 });
-                local_to_flat.insert((group_id, idx), flat_idx);
-                flat_idx += 1;
+                orig_to_emitted.insert(idx, emitted_in_group);
+                emitted_in_group += 1;
             }
-        }
-        // Project each group's visual `tab_order` into the flat space.
-        // Skipped tabs (custom-agent) drop out cleanly because the
-        // `local_to_flat` lookup misses for them.
-        let mut tab_order: Vec<usize> = Vec::with_capacity(tabs.len());
-        for group_id in self.manager.in_order_groups() {
-            let Some(group) = self.groups.get(&group_id) else {
-                continue;
-            };
-            for &local_idx in group.read(cx).tab_order_iter() {
-                if let Some(&flat) = local_to_flat.get(&(group_id, local_idx)) {
-                    tab_order.push(flat);
+            // Per-group visual order → LOCAL indices (within this group's
+            // slice). Empty when every tab was custom-agent.
+            let mut local_order: Vec<usize> = Vec::with_capacity(emitted_in_group);
+            for &orig_local in group_ref.tab_order_iter() {
+                if let Some(&emitted) = orig_to_emitted.get(&orig_local) {
+                    local_order.push(emitted);
                 }
             }
+            // Always record a PersistedGroup — even when empty — so
+            // `groups.len()` matches `group_tree.leaf_count()`. The
+            // restorer skips zero-tab groups (they consume nothing off
+            // the flat tabs iterator), and an all-custom-agent group
+            // restores as a fresh empty group. `slice_start` is the
+            // first index of THIS group's slice; keeps invariants
+            // visible in debug builds.
+            debug_assert_eq!(slice_start + emitted_in_group, tabs.len());
+            groups.push(PersistedGroup {
+                tab_count: emitted_in_group,
+                active: local_active,
+                tab_order: local_order,
+            });
         }
+        // Flat tab_order — concatenate per-group local orders into global
+        // indices. Tracks the same DFS group order as `groups`.
+        let mut tab_order: Vec<usize> = Vec::with_capacity(tabs.len());
+        let mut flat_base = 0usize;
+        for group_snap in &groups {
+            for &local in &group_snap.tab_order {
+                tab_order.push(flat_base + local);
+            }
+            flat_base += group_snap.tab_count;
+        }
+        // Group tree mirror. Only emit when we have >1 group with the
+        // shape matching the live tree — single-group snapshots stay
+        // maximally back-compat with v2 readers (which expect
+        // `group_tree: null`).
+        let live_leaf_count = self.manager.group_tree().leaf_count();
+        let multi_group = groups.len() > 1 && groups.len() == live_leaf_count;
+        let group_tree =
+            multi_group.then(|| snapshot_tree::<PaneGroupId>(self.manager.group_tree()));
+        let active_group = active_group_dfs_idx
+            .unwrap_or(0)
+            .min(groups.len().saturating_sub(1));
         PersistedTabs {
             tabs,
             active: active_offset.unwrap_or(0),
             next_label_n: 1,
             tab_order,
+            group_tree,
+            groups: if multi_group { groups } else { Vec::new() },
+            active_group,
         }
     }
 
@@ -890,6 +943,171 @@ impl ProjectPanes {
             }
             g.focus_active(window, cx);
         });
+        cx.notify();
+    }
+
+    /// Multi-group restore (v3 snapshot path). Replaces the placeholder
+    /// initial group with N empty groups arranged per `persisted_tree`
+    /// and returns their freshly-allocated ids in DFS leaf order. Caller
+    /// then pushes each group's tabs via `push_restored_terminal_tab_in`
+    /// / `open_editor_in_group_restore` / `push_restored_agent_tab_in`,
+    /// and finally calls `apply_restored_state_multi` to apply per-group
+    /// active + tab_order + activate the saved focused group.
+    pub fn rebuild_groups_from_tree(
+        &mut self,
+        persisted_tree: &PersistedTree,
+        active_group_dfs_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<PaneGroupId> {
+        // Walk the persisted tree to allocate fresh PaneGroupIds in DFS
+        // order. The closure pushes each newly-minted id into
+        // `allocated`, so the returned tree's leaves and the vec stay
+        // index-aligned.
+        let mut allocated: Vec<PaneGroupId> = Vec::new();
+        let mut next_raw: u64 = 1;
+        let restored_tree = crate::persisted_terminals::restore_tree::<PaneGroupId, _>(
+            persisted_tree,
+            &mut || {
+                let id = PaneGroupId(next_raw);
+                next_raw += 1;
+                allocated.push(id);
+                id
+            },
+        );
+        // Drop placeholder group(s) + every observer wired to them.
+        self.groups.clear();
+        self._observers.clear();
+        self._focus_observers.clear();
+        // Resolve active group id; default to the first leaf when the
+        // saved index is stale (defensive against truncated blobs).
+        let active = allocated
+            .get(active_group_dfs_idx)
+            .copied()
+            .or_else(|| allocated.first().copied())
+            .unwrap_or(PaneGroupId(0));
+        self.manager = PaneGroupManager::from_tree(restored_tree, active, next_raw);
+        // Build empty PaneGroup entities for each allocated id.
+        for &id in &allocated {
+            let group = build_group(
+                self.cwd.clone(),
+                self.theme,
+                self.density,
+                self.typography.clone(),
+                self.cli_runtime.clone(),
+                self.notifier.clone(),
+                self.window_active.clone(),
+                cx,
+            );
+            group.update(cx, |g, cx| g.set_chrome_width(self.chrome_w_px, cx));
+            let group_observer = observe_group(&group, cx);
+            let group_focus_observer = observe_group_focus(&group, id, window, cx);
+            self.groups.insert(id, group);
+            self._observers.insert(id, group_observer);
+            self._focus_observers.insert(id, group_focus_observer);
+        }
+        cx.notify();
+        allocated
+    }
+
+    /// Push a restored terminal tab into a SPECIFIC group (multi-group
+    /// restore path). No-op when `group_id` isn't registered.
+    pub fn push_restored_terminal_tab_in(
+        &mut self,
+        group_id: PaneGroupId,
+        label: String,
+        view: Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(&group_id) else {
+            return;
+        };
+        group.update(cx, |g, cx| g.push_restored_terminal_tab(label, view, cx));
+    }
+
+    /// Open an editor tab inside a SPECIFIC group during multi-group
+    /// restore. Bypasses the active-group resolution so a file dropped
+    /// in a non-focused group is restored to the same group it was
+    /// captured from. No-op when `group_id` isn't registered.
+    pub fn open_editor_in_group_restore(
+        &mut self,
+        group_id: PaneGroupId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(&group_id).cloned() else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            g.open_or_activate_editor_tab(path, window, cx);
+        });
+    }
+
+    /// Push a restored agent tab into a SPECIFIC group. Multi-group
+    /// counterpart of `push_restored_agent_tab` — the active-group
+    /// pointer is irrelevant here because the target is named
+    /// explicitly. No-op when `group_id` isn't registered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_restored_agent_tab_in(
+        &mut self,
+        group_id: PaneGroupId,
+        persisted: &PersistedAgentTab,
+        adapter_id: &'static str,
+        label: String,
+        session_id: AgentSessionId,
+        status_rx: AgentStatusStream,
+        backend: SharedBackend,
+        term_id: TerminalSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(&group_id).cloned() else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            g.push_agent_tab(
+                persisted.adapter,
+                adapter_id,
+                PathBuf::from(&persisted.worktree_path),
+                persisted.model.clone(),
+                persisted.effort.clone(),
+                session_id,
+                status_rx,
+                backend,
+                term_id,
+                Some(label),
+                window,
+                cx,
+            );
+        });
+    }
+
+    /// Finalize multi-group restore. Applies per-group `tab_order` +
+    /// local `active` to each registered group, then activates the
+    /// saved focused group + focuses its active tab. Mirrors
+    /// `apply_restored_state` for the multi-group path.
+    pub fn apply_restored_state_multi(
+        &mut self,
+        per_group: Vec<(PaneGroupId, Vec<usize>, usize)>,
+        active_group: PaneGroupId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (group_id, tab_order, active) in per_group {
+            let Some(group) = self.groups.get(&group_id).cloned() else {
+                continue;
+            };
+            group.update(cx, |g, cx| {
+                if !tab_order.is_empty() {
+                    g.set_tab_order(tab_order);
+                }
+                if active < g.tab_count() {
+                    g.set_active(active, window, cx);
+                }
+            });
+        }
+        self.set_active_group(active_group, window, cx);
         cx.notify();
     }
 

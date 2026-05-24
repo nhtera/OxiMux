@@ -60,6 +60,19 @@ impl PaneGroupManager {
         }
     }
 
+    /// Rebuild a manager from a restored layout tree + active group id +
+    /// the next-free id to issue. Used by the snapshot restore path so
+    /// the workspace's multi-group split layout survives restart. Caller
+    /// is responsible for registering matching `PaneGroup` entities in
+    /// its own map; this is the pure-data half only.
+    pub fn from_tree(tree: GroupTree, active: PaneGroupId, next_id: u64) -> Self {
+        Self {
+            group_tree: tree,
+            active_group_id: active,
+            next_id: AtomicU64::new(next_id),
+        }
+    }
+
     /// Read accessor for the layout tree — caller uses this to walk the
     /// tree on render. Mutations stay encapsulated.
     pub fn group_tree(&self) -> &GroupTree {
@@ -290,6 +303,34 @@ mod tests {
         assert_eq!(closed, PaneGroupId(0));
         // No left of leftmost → new leftmost survivor.
         assert_eq!(mgr.active_group_id(), PaneGroupId(1));
+    }
+
+    #[test]
+    fn from_tree_seeds_layout_and_active() {
+        // Workspace restore handoff: rebuild a manager from a known
+        // tree + active id + next-issued id. The tree's leaves drive
+        // `in_order_groups`, the active id sets focus, and the next-id
+        // counter resumes monotonic allocation past whatever the
+        // restorer used.
+        let tree: GroupTree = PaneTree::Split {
+            axis: Axis::Horizontal,
+            children: vec![
+                PaneTree::Leaf(PaneGroupId(7)),
+                PaneTree::Leaf(PaneGroupId(8)),
+            ],
+            weights: vec![1.0, 1.0],
+        };
+        let mut mgr = PaneGroupManager::from_tree(tree, PaneGroupId(8), 9);
+        assert_eq!(mgr.active_group_id(), PaneGroupId(8));
+        assert_eq!(
+            mgr.in_order_groups(),
+            vec![PaneGroupId(7), PaneGroupId(8)]
+        );
+        // Next split allocates the saved `next_id` (9), not 1.
+        let outcome = mgr
+            .split_active_group(Axis::Vertical, SplitInsert::After)
+            .expect("split should succeed");
+        assert_eq!(outcome.new_group, PaneGroupId(9));
     }
 
     #[test]
