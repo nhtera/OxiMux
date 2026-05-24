@@ -39,7 +39,9 @@ pub struct Migration {
 /// indexes. V002 adds `pane_buffers` (per-pane scrollback snapshots for
 /// terminal-tab restore, Phase 4 step 16). V003 adds `pane_relay_ids`
 /// (per-pane mapping to relay-side PTY ids for cross-restart attach,
-/// Phase 5 step 5). Future migrations append; never reorder, never
+/// Phase 5 step 5). V004 extends `pane_buffers` with `sub_pane_ordinal`
+/// so multi-sub-pane terminal tabs (Cmd+D splits, F3.4) keep one
+/// scrollback per leaf. Future migrations append; never reorder, never
 /// rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -56,6 +58,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "pane_relay_ids",
         sql: include_str!("../migrations/V003__pane_relay_ids.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "pane_buffers_sub_pane",
+        sql: include_str!("../migrations/V004__pane_buffers_sub_pane.sql"),
     },
 ];
 

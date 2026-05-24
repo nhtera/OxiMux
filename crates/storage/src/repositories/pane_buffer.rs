@@ -1,6 +1,13 @@
 //! `PaneBufferRepo` — per-pane scrollback BLOB storage backing the
-//! terminal-tab restore path (Phase 4 step 16). One row per leaf inside a
-//! project's persisted tab snapshot, keyed by `(project_id, ordinal)`.
+//! terminal-tab restore path (Phase 4 step 16, F3.4). One row per leaf
+//! inside a project's persisted tab snapshot, keyed by `(project_id,
+//! ordinal, sub_pane_ordinal)`.
+//!
+//! `ordinal` indexes the DFS terminal-tab order across all groups.
+//! `sub_pane_ordinal` indexes the DFS leaf order WITHIN a multi-
+//! sub-pane terminal tab (`0` for single-pane tabs, matching pre-v4
+//! snapshots). Together they identify the unique leaf whose scrollback
+//! the row carries.
 //!
 //! Bytes are raw `serialize_term_capped` output (ANSI escapes + cells +
 //! final CUP). The restore path feeds them into a fresh PTY's grid via
@@ -23,36 +30,51 @@ impl PaneBufferRepo {
         Self { db }
     }
 
-    /// Upsert one pane's bytes at the given ordinal.
-    pub fn set(&self, project_id: &str, ordinal: u32, bytes: &[u8]) -> Result<(), StorageError> {
+    /// Upsert one sub-pane's bytes at the given `(ordinal,
+    /// sub_pane_ordinal)`. Single-sub-pane tabs always pass `0` for
+    /// `sub_pane_ordinal` so legacy single-pane behavior is unchanged.
+    pub fn set(
+        &self,
+        project_id: &str,
+        ordinal: u32,
+        sub_pane_ordinal: u32,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
         let ts = now();
         self.db.with_conn(|c| {
             c.execute(
-                "INSERT INTO pane_buffers (project_id, ordinal, bytes, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(project_id, ordinal) DO UPDATE SET \
+                "INSERT INTO pane_buffers \
+                    (project_id, ordinal, sub_pane_ordinal, bytes, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(project_id, ordinal, sub_pane_ordinal) DO UPDATE SET \
                     bytes = excluded.bytes, updated_at = excluded.updated_at",
-                params![project_id, ordinal, bytes, ts],
+                params![project_id, ordinal, sub_pane_ordinal, bytes, ts],
             )
             .map(|_| ())
         })?;
         Ok(())
     }
 
-    /// Fetch every buffer for a project, ordered by `ordinal` ascending.
-    /// Caller pairs the returned bytes with leaves in the matching DFS
-    /// order produced by the tab restore path.
+    /// Fetch every buffer for a project, ordered by `(ordinal,
+    /// sub_pane_ordinal)` ascending. Returns triples of `(tab_ordinal,
+    /// sub_pane_ordinal, bytes)` so the restore path can dispatch
+    /// scrollback into the right sub-pane via a HashMap lookup.
     pub fn get_all_for_project(
         &self,
         project_id: &str,
-    ) -> Result<Vec<(u32, Vec<u8>)>, StorageError> {
+    ) -> Result<Vec<(u32, u32, Vec<u8>)>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT ordinal, bytes FROM pane_buffers \
-                 WHERE project_id = ?1 ORDER BY ordinal ASC",
+                "SELECT ordinal, sub_pane_ordinal, bytes FROM pane_buffers \
+                 WHERE project_id = ?1 \
+                 ORDER BY ordinal ASC, sub_pane_ordinal ASC",
             )?;
             let rows = stmt.query_map([project_id], |row| {
-                Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
             })?;
             let mut out = Vec::new();
             for r in rows {

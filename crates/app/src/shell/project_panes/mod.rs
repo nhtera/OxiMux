@@ -1191,12 +1191,32 @@ impl ProjectPanes {
                 else {
                     continue;
                 };
-                let Some(view) = tree.active_view() else { continue };
-                let bytes = view.read(cx).serialize_buffer(max_bytes_per_pane);
-                if !bytes.is_empty()
-                    && let Err(err) = repo.set(project_id, ordinal, &bytes)
-                {
-                    tracing::warn!(?err, project_id, ordinal, "pane_buffers: set failed");
+                // F3.4: capture EVERY live sub-pane's scrollback (not
+                // just the active one). `sub_pane_ordinal` is the DFS
+                // leaf position inside this tab; matches the DFS-leaf
+                // order the restorer uses to dispatch bytes back into
+                // each sub-pane. Single-sub-pane tabs end up writing
+                // one row at `(ordinal, 0)`, identical to pre-F3.4.
+                for (sub_pane_ordinal, slot) in tree.tree().in_order_leaves().iter().enumerate() {
+                    let Some(view) = tree.get(*slot) else { continue };
+                    let bytes = view.read(cx).serialize_buffer(max_bytes_per_pane);
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) = repo.set(
+                        project_id,
+                        ordinal,
+                        sub_pane_ordinal as u32,
+                        &bytes,
+                    ) {
+                        tracing::warn!(
+                            ?err,
+                            project_id,
+                            ordinal,
+                            sub_pane_ordinal,
+                            "pane_buffers: set failed"
+                        );
+                    }
                 }
                 ordinal += 1;
             }

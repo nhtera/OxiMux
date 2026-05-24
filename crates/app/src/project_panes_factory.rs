@@ -12,7 +12,7 @@
 //! - `load_pane_buffers` — captured scrollback bytes for a project, in
 //!   ordinal-ascending order.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -43,7 +43,14 @@ pub const PANE_BUFFER_MAX_BYTES: usize = 512 * 1024;
 
 /// Per-ordinal hint: "this leaf should attach to this surviving daemon
 /// PTY id instead of spawning fresh."
-pub type AttachHints = std::collections::HashMap<u32, String>;
+pub type AttachHints = HashMap<u32, String>;
+
+/// F3.4 — per-sub-pane scrollback bytes keyed by `(tab_ordinal,
+/// sub_pane_ordinal)`. Replaces the pre-v4 flat `Vec<Vec<u8>>` so
+/// multi-sub-pane tabs prefill every leaf's grid independently. Bytes
+/// for pre-v4 rows resolve to `sub_pane_ordinal = 0` (via the V004
+/// migration), keeping single-sub-pane tabs identical to the old path.
+pub type PaneBuffersMap = HashMap<(u32, u32), Vec<u8>>;
 
 /// Pre-filter persisted (ordinal, relay_pty_id, relay_session) rows
 /// down to the ordinals that should re-attach.
@@ -67,7 +74,7 @@ pub fn compute_attach_hints(
 pub(crate) fn build_project_panes(
     cwd: PathBuf,
     snapshot: Option<PersistedTabs>,
-    pane_buffers: Vec<Vec<u8>>,
+    pane_buffers: PaneBuffersMap,
     attach_hints: AttachHints,
     theme: Theme,
     density: Density,
@@ -120,9 +127,10 @@ pub(crate) fn build_project_panes(
 
     // Legacy v2 single-group path. Flat tab list, every tab lands in
     // the placeholder initial group. Editor tabs whose file is missing
-    // are skipped with a warn. Pane buffers align DFS-flat with the
-    // saved tab list.
-    let mut buf_iter = pane_buffers.into_iter();
+    // are skipped with a warn. Pane buffers align by `(tab_ordinal,
+    // sub_pane_ordinal)` — single-sub-pane tabs read at sub_pane_ord=0
+    // which is exactly how V004 stores legacy rows.
+    let mut pane_buffers = pane_buffers;
     let mut ordinal: u32 = 0;
     for tab in &snap.tabs {
         match &tab.kind {
@@ -165,10 +173,13 @@ pub(crate) fn build_project_panes(
                     );
                 } else if tab.sub_panes.len() > 1 {
                     // Multi-sub-pane restore — spawn one fresh PTY per
-                    // leaf at the captured cwd (no relay attach). Active
-                    // sub-pane gets the saved scrollback.
+                    // leaf at the captured cwd (no relay attach). Every
+                    // sub-pane gets its own scrollback bytes from the
+                    // pane_buffers map, keyed by `(ordinal, sub_pane_ord)`.
                     if let Some(tree) = build_multi_sub_pane_tree(
                         tab,
+                        ordinal,
+                        &mut pane_buffers,
                         cwd.clone(),
                         theme,
                         density,
@@ -176,12 +187,6 @@ pub(crate) fn build_project_panes(
                         window,
                         cx,
                     ) {
-                        let bytes = buf_iter.next().unwrap_or_default();
-                        if !bytes.is_empty()
-                            && let Some(active_view) = tree.active_view()
-                        {
-                            active_view.read(cx).prefill_grid(&bytes);
-                        }
                         panes_entity.update(cx, |p, cx| {
                             p.push_restored_terminal_tab_with_tree(tab.label.clone(), tree, cx);
                         });
@@ -197,7 +202,7 @@ pub(crate) fn build_project_panes(
                     window,
                     cx,
                 ) {
-                    let bytes = buf_iter.next().unwrap_or_default();
+                    let bytes = pane_buffers.remove(&(ordinal, 0)).unwrap_or_default();
                     if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
                         view.read(cx).prefill_grid(&bytes);
                     }
@@ -225,7 +230,7 @@ fn restore_multi_group(
     panes_entity: Entity<ProjectPanes>,
     snap: PersistedTabs,
     tree: &crate::persisted_terminals::PersistedTree,
-    pane_buffers: Vec<Vec<u8>>,
+    pane_buffers: PaneBuffersMap,
     attach_hints: AttachHints,
     cwd: PathBuf,
     theme: Theme,
@@ -248,7 +253,7 @@ fn restore_multi_group(
         return panes_entity;
     }
     // 2. Walk flat `snap.tabs`, distribute across groups by `tab_count`.
-    let mut buf_iter = pane_buffers.into_iter();
+    let mut pane_buffers = pane_buffers;
     let mut ordinal: u32 = 0;
     let mut flat_iter = snap.tabs.iter();
     for (g_idx, group_snap) in snap.groups.iter().enumerate() {
@@ -297,6 +302,8 @@ fn restore_multi_group(
                         // the push API differs.
                         if let Some(tree) = build_multi_sub_pane_tree(
                             tab,
+                            ordinal,
+                            &mut pane_buffers,
                             cwd.clone(),
                             theme,
                             density,
@@ -304,12 +311,6 @@ fn restore_multi_group(
                             window,
                             cx,
                         ) {
-                            let bytes = buf_iter.next().unwrap_or_default();
-                            if !bytes.is_empty()
-                                && let Some(active_view) = tree.active_view()
-                            {
-                                active_view.read(cx).prefill_grid(&bytes);
-                            }
                             panes_entity.update(cx, |p, cx| {
                                 p.push_restored_terminal_tab_with_tree_in(
                                     group_id,
@@ -330,7 +331,8 @@ fn restore_multi_group(
                         window,
                         cx,
                     ) {
-                        let bytes = buf_iter.next().unwrap_or_default();
+                        let bytes =
+                            pane_buffers.remove(&(ordinal, 0)).unwrap_or_default();
                         if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
                             view.read(cx).prefill_grid(&bytes);
                         }
@@ -472,12 +474,15 @@ fn restore_agent_tab(
 /// Spawn one fresh PTY + TerminalView per leaf in `tab.sub_panes`, then
 /// fold them into a `TerminalSplitTree` matching the persisted shape.
 /// Each leaf inherits the cwd captured at snapshot time (or
-/// `project_cwd` when missing/invalid). Returns `None` when at least
-/// one PTY spawn fails — the whole tab is dropped rather than leaving a
-/// partially-restored tree with phantom slots.
+/// `project_cwd` when missing/invalid) and prefills its grid with any
+/// scrollback bytes saved at `(tab_ordinal, sub_pane_ordinal)`. Returns
+/// `None` when at least one PTY spawn fails — the whole tab is dropped
+/// rather than leaving a partially-restored tree with phantom slots.
 #[allow(clippy::too_many_arguments)]
 fn build_multi_sub_pane_tree(
     tab: &PersistedTab,
+    tab_ordinal: u32,
+    pane_buffers: &mut PaneBuffersMap,
     project_cwd: PathBuf,
     theme: Theme,
     density: Density,
@@ -487,7 +492,7 @@ fn build_multi_sub_pane_tree(
 ) -> Option<TerminalSplitTree> {
     let mut leaves: Vec<(Entity<TerminalView>, gpui::Subscription)> =
         Vec::with_capacity(tab.sub_panes.len());
-    for sp in &tab.sub_panes {
+    for (sub_pane_ordinal, sp) in tab.sub_panes.iter().enumerate() {
         let leaf_cwd = resolve_sub_pane_cwd(sp, &project_cwd);
         let Some((backend, session_id)) = spawn_local_pty(leaf_cwd) else {
             tracing::warn!(label = %tab.label, "sub-pane PTY spawn failed; dropping tab");
@@ -504,6 +509,16 @@ fn build_multi_sub_pane_tree(
                 cx,
             )
         });
+        // F3.4: prefill each sub-pane's grid with its own saved
+        // scrollback bytes. Map keyed by `(tab_ordinal,
+        // sub_pane_ordinal)` aligns DFS-flat with `capture_pane_buffers`.
+        // Missing rows (e.g. blank panes at capture time) skip cleanly.
+        let bytes = pane_buffers
+            .remove(&(tab_ordinal, sub_pane_ordinal as u32))
+            .unwrap_or_default();
+        if !bytes.is_empty() {
+            view.read(cx).prefill_grid(&bytes);
+        }
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         leaves.push((view, observer));
     }
@@ -575,22 +590,15 @@ pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Opti
     }
 }
 
-pub(crate) fn load_pane_buffers(repo: &PaneBufferRepo, project_id: &str) -> Vec<Vec<u8>> {
+pub(crate) fn load_pane_buffers(repo: &PaneBufferRepo, project_id: &str) -> PaneBuffersMap {
     match repo.get_all_for_project(project_id) {
-        Ok(rows) => {
-            let cap = rows.last().map(|(o, _)| *o as usize + 1).unwrap_or(0);
-            let mut out: Vec<Vec<u8>> = vec![Vec::new(); cap];
-            for (ord, bytes) in rows {
-                let idx = ord as usize;
-                if idx < out.len() {
-                    out[idx] = bytes;
-                }
-            }
-            out
-        }
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(ord, sub_ord, bytes)| ((ord, sub_ord), bytes))
+            .collect(),
         Err(err) => {
             tracing::warn!(?err, project_id, "load_pane_buffers: get failed");
-            Vec::new()
+            HashMap::new()
         }
     }
 }
