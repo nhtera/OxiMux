@@ -13,15 +13,15 @@
 
 use gpui::{
     AnyElement, App, AppContext, Context, DragMoveEvent, Entity, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, point,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
     prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::Theme;
 
 use super::sub_pane::TerminalSplitTree;
 use super::tab_drag::{TabDragPayload, TabDragPreview};
-use super::{PaneGroup, PaneGroupTabKind, TabDragHover, TabInsertSide};
+use super::{PaneGroup, PaneGroupTab, PaneGroupTabKind, TabDragHover, TabInsertSide};
 use crate::actions::{
     ActivateGroupTab, OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker,
 };
@@ -29,6 +29,7 @@ use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::agent_status_badge::render_dot;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_content::PaneContent;
+use crate::shell::pane_group::file_drag::FilePathDragPayload;
 
 pub const TAB_STRIP_HEIGHT_PX: f32 = 28.0;
 const TAB_PAD_X_PX: f32 = 12.0;
@@ -55,6 +56,11 @@ impl Render for PaneGroup {
             self.set_drag_hover(None, cx);
         }
 
+        // Lazy install — first render is the first paint where we have
+        // window + cx + focus_handle in the same scope. Subsequent calls
+        // are idempotent.
+        self.ensure_mru_focus_out_sub(window, cx);
+
         let entity = cx.entity().clone();
         let focus_handle = self.focus_handle_clone();
         let theme = self.theme;
@@ -76,6 +82,14 @@ impl Render for PaneGroup {
             .overflow_hidden()
             .when_some(active_content, |s, child| s.child(child));
 
+        // Optional MRU HUD overlay — only visible while the user holds
+        // Ctrl after pressing Ctrl+Tab. Rendered AFTER body in the same
+        // outer flex column then positioned absolute over it via the
+        // helper's own styling.
+        let mru_overlay: Option<AnyElement> = self.mru_switcher().map(|state| {
+            render_mru_hud(state.snapshot.as_slice(), state.cursor, &self.tabs, theme)
+        });
+
         div()
             .id(SharedString::from(format!(
                 "pane-group-{}",
@@ -85,6 +99,7 @@ impl Render for PaneGroup {
             .flex()
             .flex_col()
             .size_full()
+            .relative()
             .on_action(cx.listener(PaneGroup::on_new_tab))
             .on_action(cx.listener(PaneGroup::on_close_tab))
             .on_action(cx.listener(PaneGroup::on_next_tab))
@@ -97,7 +112,20 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_focus_next_sub_pane))
             .on_action(cx.listener(PaneGroup::on_focus_prev_sub_pane))
             .on_action(cx.listener(PaneGroup::on_toggle_zoom_sub_pane))
+            // Modifier-up listener — commits the MRU switch when the
+            // user releases Ctrl. Mirrors the upstream zed/sidebar
+            // thread-switcher pattern. We commit when `ctrl` flips OFF
+            // and a switcher is currently open; everything else is a
+            // no-op so other modifier transitions don't disturb state.
+            .on_modifiers_changed(cx.listener(
+                |this, ev: &ModifiersChangedEvent, window, cx| {
+                    if this.mru_switcher().is_some() && !ev.control {
+                        this.commit_mru_switch(window, cx);
+                    }
+                },
+            ))
             .child(body)
+            .when_some(mru_overlay, |s, overlay| s.child(overlay))
     }
 }
 
@@ -208,6 +236,8 @@ fn build_tab_strip_from_headers(
     let entity_id = entity.entity_id();
     let strip_hover_entity = entity.clone();
     let strip_drop_entity = entity.clone();
+    let strip_file_hover_entity = entity.clone();
+    let strip_file_drop_entity = entity.clone();
     // Visible insertion slot the drag would land on. `Before` → slot is
     // at target_visible_idx; `After` → slot is at target_visible_idx + 1.
     // Both adjacent chips paint a single edge each so the user reads ONE
@@ -260,6 +290,28 @@ fn build_tab_strip_from_headers(
         .on_drop::<TabDragPayload>(move |_payload: &TabDragPayload, _window, cx| {
             strip_drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
         })
+        // File-tree drag passing through the strip — same capture-pass
+        // clear so a cursor that's left every chip (over `+`, trailing
+        // spacer, or outside the strip) loses the insertion bar. Each
+        // chip's own FilePathDragPayload `on_drag_move` re-sets the
+        // hover when the cursor returns inside its bounds.
+        .on_drag_move::<FilePathDragPayload>(
+            move |_: &DragMoveEvent<FilePathDragPayload>, _window, cx| {
+                strip_file_hover_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+            },
+        )
+        // File drop in the strip but outside any chip's bounds (e.g. on
+        // the `+` button gap) → append the file at the end. Same hover
+        // cleanup so the insertion bar disappears.
+        .on_drop::<FilePathDragPayload>(
+            move |payload: &FilePathDragPayload, window, cx| {
+                let path = payload.path.clone();
+                strip_file_drop_entity.update(cx, |g, cx| {
+                    g.set_drag_hover(None, cx);
+                    g.open_or_activate_editor_tab_at(path, None, window, cx);
+                });
+            },
+        )
         // Mouse-wheel horizontal scroll: map vertical wheel delta onto
         // the strip's horizontal scroll offset. Trackpad horizontal
         // swipes already flow through the native `overflow_x_scroll`
@@ -684,6 +736,8 @@ fn render_tab_chip(
     let activate_entity = entity.clone();
     let hover_entity = entity.clone();
     let drop_entity = entity.clone();
+    let file_hover_entity = entity.clone();
+    let file_drop_entity = entity.clone();
 
     let agent_dot: Option<AnyElement> = agent_status.map(|status| {
         let dot_id =
@@ -839,6 +893,45 @@ fn render_tab_chip(
                 g.set_drag_hover(None, cx);
             });
         })
+        // File-row drag passing over this chip — same insertion-bar feel
+        // as tab reorder. Pure UI mirroring: bounds check, mid-x → side,
+        // set hover. No source-self guard (a file row can't be the chip
+        // itself) and no cross-group filter (file rows aren't bound to a
+        // group).
+        .on_drag_move::<FilePathDragPayload>(
+            move |ev: &DragMoveEvent<FilePathDragPayload>, _window, cx| {
+                let bounds = ev.bounds;
+                if !bounds.contains(&ev.event.position) {
+                    return;
+                }
+                let mid_x = bounds.origin.x + bounds.size.width / 2.0;
+                let side = if ev.event.position.x < mid_x {
+                    TabInsertSide::Before
+                } else {
+                    TabInsertSide::After
+                };
+                let hover = Some(TabDragHover {
+                    target_visible_idx: visible_idx,
+                    side,
+                });
+                file_hover_entity.update(cx, |g, cx| g.set_drag_hover(hover, cx));
+            },
+        )
+        // File drop on a chip → insert (or move-and-activate) the editor
+        // tab at the resolved visual slot.
+        .on_drop::<FilePathDragPayload>(
+            move |payload: &FilePathDragPayload, window, cx| {
+                let path = payload.path.clone();
+                file_drop_entity.update(cx, |g, cx| {
+                    let visible_target = g.drag_hover().map(|h| match h.side {
+                        TabInsertSide::Before => h.target_visible_idx,
+                        TabInsertSide::After => h.target_visible_idx + 1,
+                    });
+                    g.set_drag_hover(None, cx);
+                    g.open_or_activate_editor_tab_at(path, visible_target, window, cx);
+                });
+            },
+        )
         .child(svg().path(icon_path).size(px(ICON_SIZE_PX)).text_color(icon_color))
         .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
@@ -977,6 +1070,97 @@ fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
             );
         })
         .child(glyph)
+}
+
+/// Render the floating MRU switcher panel — shown while the user holds
+/// Ctrl after pressing Ctrl+Tab. Lists the captured snapshot of tab
+/// indices with the current cursor row highlighted.
+///
+/// Pure render — no input handling. Activation happens on Ctrl release
+/// in `PaneGroup::commit_mru_switch`; advancing happens on Ctrl+Tab key
+/// dispatch in `on_mru_next`/`on_mru_prev`. The panel intentionally
+/// stops mouse propagation so clicks on the body underneath don't steal
+/// focus mid-cycle.
+fn render_mru_hud(
+    snapshot: &[usize],
+    cursor: usize,
+    tabs: &[PaneGroupTab],
+    theme: Theme,
+) -> AnyElement {
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .min_w(px(320.0))
+        .max_w(px(560.0))
+        .p(px(8.0))
+        .bg(theme.bg_overlay)
+        .border_1()
+        .border_color(theme.border_active)
+        .rounded(px(8.0))
+        .shadow_lg();
+    card = card.child(
+        div()
+            .px(px(8.0))
+            .pb(px(6.0))
+            .text_size(px(11.0))
+            .text_color(theme.fg_subtle)
+            .child("Switch Tab"),
+    );
+    for (row_ix, &tab_idx) in snapshot.iter().enumerate() {
+        let Some(tab) = tabs.get(tab_idx) else {
+            continue;
+        };
+        let label = tab
+            .custom_title
+            .clone()
+            .unwrap_or_else(|| tab.label.clone());
+        let icon_path = match tab.kind {
+            PaneGroupTabKind::Editor { .. } => "icons/file.svg",
+            PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. } => {
+                "icons/square-terminal.svg"
+            }
+        };
+        let is_highlighted = row_ix == cursor;
+        let row_bg = if is_highlighted {
+            theme.selection
+        } else {
+            gpui::transparent_black()
+        };
+        let row_fg = if is_highlighted {
+            theme.fg_base
+        } else {
+            theme.fg_muted
+        };
+        let row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded(px(4.0))
+            .bg(row_bg)
+            .text_size(px(12.0))
+            .text_color(row_fg)
+            .child(svg().path(icon_path).size(px(12.0)).text_color(row_fg))
+            .child(div().flex_1().child(label));
+        card = card.child(row);
+    }
+    // Position absolute, centered horizontally + ~30% from top.
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(120.0))
+        // Block clicks reaching the body so a stray pointerdown doesn't
+        // refocus another tab mid-cycle.
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        })
+        .child(card)
+        .into_any_element()
 }
 
 fn close_button(

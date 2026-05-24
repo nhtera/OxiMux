@@ -164,6 +164,31 @@ pub struct PaneGroup {
     /// etc. Kept in sync with `tabs` via `bump_mru` / `forget_mru`;
     /// indices stay aligned with the (sometimes-shifted) `tabs` Vec.
     mru: Vec<usize>,
+    /// Snapshot of `mru` captured at the first Ctrl+Tab press of a
+    /// switching session. `None` outside of a switch. The HUD reads
+    /// this list directly; cursor commits AT MODIFIER RELEASE rather
+    /// than at each Tab press, so repeated Tabs can walk all the way
+    /// through the list without each press disrupting future MRU order.
+    mru_switcher: Option<MruSwitcher>,
+    /// Lazy focus-out subscription. Installed on first render (which is
+    /// when we first have access to `&mut Window`). Closes the MRU HUD
+    /// when focus leaves this group — otherwise the `on_modifiers_changed`
+    /// listener would never fire in a multi-group layout where the user
+    /// releases Ctrl while focus is on a sibling group.
+    _mru_focus_out_sub: Option<Subscription>,
+}
+
+/// Active MRU-switcher state. Lives only while the user holds Ctrl
+/// after pressing Ctrl+Tab — the snapshot freezes so each Tab press
+/// advances the cursor through the SAME list (otherwise the first
+/// `set_active` would `bump_mru` and re-shuffle the underlying order).
+#[derive(Clone, Debug)]
+pub struct MruSwitcher {
+    /// Frozen MRU at switch start. `snapshot[0]` is the tab that was
+    /// active when the user first pressed Ctrl+Tab.
+    pub snapshot: Vec<usize>,
+    /// Highlighted row index. Wraps modulo `snapshot.len()`.
+    pub cursor: usize,
 }
 
 impl PaneGroup {
@@ -195,7 +220,23 @@ impl PaneGroup {
             chrome_w_px: density.w_left_rail,
             tab_strip_scroll: ScrollHandle::new(),
             mru: Vec::new(),
+            mru_switcher: None,
+            _mru_focus_out_sub: None,
         }
+    }
+
+    /// Install the focus-out subscription that auto-dismisses the MRU
+    /// HUD. Called once from the renderer on first paint (when we first
+    /// have a `&mut Window`). Idempotent — subsequent calls no-op.
+    pub fn ensure_mru_focus_out_sub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._mru_focus_out_sub.is_some() {
+            return;
+        }
+        let handle = self.focus_handle.clone();
+        let sub = cx.on_focus_out(&handle, window, |this, _ev, _window, cx| {
+            this.cancel_mru_switch(cx);
+        });
+        self._mru_focus_out_sub = Some(sub);
     }
 
     pub fn tabs(&self) -> &[PaneGroupTab] {
@@ -514,14 +555,51 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
+        self.open_or_activate_editor_tab_at(path, None, window, cx)
+    }
+
+    /// Open `path` as an editor tab, optionally inserting it at a specific
+    /// VISUAL slot in the strip. `insert_at_visible_idx` semantics:
+    /// `None` → append (tab lands at the end of the strip);
+    /// `Some(idx)` → tab lands at visual position `idx` (clamped to the
+    /// strip length, with pinned tabs always staying clustered at front).
+    ///
+    /// When the file is already open as a tab, the existing tab is moved
+    /// to the requested slot AND activated — this matches the drag-onto-
+    /// strip muscle memory: the user expects "drop here" to place the tab
+    /// here regardless of whether it's new or pre-existing.
+    pub fn open_or_activate_editor_tab_at(
+        &mut self,
+        path: PathBuf,
+        insert_at_visible_idx: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        // Already-open path: move + activate the existing tab.
         if let Some(idx) = self.tabs.iter().position(
             |t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == &path),
         ) {
-            self.active = idx;
-            self.focus_active(window, cx);
-            cx.notify();
+            if let Some(visible_target) = insert_at_visible_idx {
+                if let Some(from) = self.visible_position_of(idx) {
+                    // `move_tab` removes `from` first then inserts at the
+                    // post-remove index. When `visible_target > from`, the
+                    // remove step shifts the destination left by one — so
+                    // adjust before clamping. Mirrors the same dance in
+                    // the chip-level TabDragPayload drop handler.
+                    let raw_to = visible_target.min(self.tab_order.len());
+                    let to = if raw_to > from { raw_to - 1 } else { raw_to };
+                    let bounded = to.min(self.tab_order.len().saturating_sub(1));
+                    self.move_tab(from, bounded);
+                }
+            }
+            // Route through `set_active` so `bump_mru` + `focus_active`
+            // + `pin_tab_strip_to_end` + `cx.notify` all fire — same as
+            // every other activation path in the file.
+            self.set_active(idx, window, cx);
             return idx;
         }
+        // New tab path — construct, push, then optionally re-slot inside
+        // tab_order at the requested visible index.
         let path_for_view = path.clone();
         let view = cx.new(|cx| oximux_editor::EditorView::new(path_for_view, window, cx));
         let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
@@ -541,8 +619,22 @@ impl PaneGroup {
             _status_task: None,
         };
         self.tabs.push(tab);
-        self.tab_order.push(self.tabs.len() - 1);
-        self.active = self.tabs.len() - 1;
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        // Keep MRU in step with every other tab-open path — without this
+        // the new editor tab is invisible to the MRU switcher until the
+        // user manually re-activates it.
+        self.bump_mru(new_idx);
+        if let Some(visible_target) = insert_at_visible_idx {
+            let from = self.tab_order.len() - 1;
+            let bounded = visible_target.min(from);
+            // Skip the no-op (already at end) — `move_tab` would still
+            // succeed, but `pin_tab_strip_to_end` below covers append case.
+            if bounded < from {
+                self.move_tab(from, bounded);
+            }
+        }
         self.focus_active(window, cx);
         self.pin_tab_strip_to_end();
         cx.notify();
@@ -1033,39 +1125,113 @@ impl PaneGroup {
         self.prev_tab(window, cx);
     }
 
-    /// Switch to MRU[1] — the tab that was active just before the current
-    /// one. Repeated press toggles back to MRU[0]'s previous (now MRU[1]
-    /// after the first switch), giving the "Alt+Tab to last" cycle.
-    /// No-op when fewer than 2 tabs exist or no prior switch is tracked.
+    /// Ctrl+Tab while Ctrl is held — advance the MRU switcher cursor
+    /// through a FROZEN MRU snapshot. The first press captures the
+    /// snapshot and lands cursor on row 1 (the most-recent prior tab,
+    /// matching JetBrains "jump back"). Subsequent presses advance
+    /// cursor through the list, wrapping at the end.
+    ///
+    /// The tab is NOT activated here — the commit happens at
+    /// `commit_mru_switch` on Ctrl release. This matches the reference
+    /// editor's "Switch Tab" HUD pattern: hold Ctrl, tap Tab N times to
+    /// land N-th entry into focus, release to commit.
     pub(crate) fn on_mru_next(
         &mut self,
         _: &crate::actions::MruNext,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(&target) = self.mru.get(1) else {
-            return;
-        };
-        self.set_active(target, window, cx);
-    }
-
-    /// Switch to MRU.last() — the least-recently-used tab. Useful for
-    /// jumping to a tab you haven't touched in a while without scrolling
-    /// the strip. No-op when fewer than 2 tabs exist.
-    pub(crate) fn on_mru_prev(
-        &mut self,
-        _: &crate::actions::MruPrev,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.mru.len() < 2 {
             return;
         }
-        let target = *self.mru.last().expect("len >= 2 above");
-        if target == self.active {
+        self.advance_mru_switcher(1, cx);
+    }
+
+    /// Ctrl+Shift+Tab — advance the MRU switcher cursor BACKWARD.
+    /// Same snapshot/HUD lifecycle as `on_mru_next`.
+    pub(crate) fn on_mru_prev(
+        &mut self,
+        _: &crate::actions::MruPrev,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mru.len() < 2 {
             return;
         }
-        self.set_active(target, window, cx);
+        self.advance_mru_switcher(-1, cx);
+    }
+
+    fn advance_mru_switcher(&mut self, step: isize, cx: &mut Context<Self>) {
+        // Capture snapshot on first press of the cycle.
+        if self.mru_switcher.is_none() {
+            self.mru_switcher = Some(MruSwitcher {
+                snapshot: self.mru.clone(),
+                cursor: 0,
+            });
+        }
+        let Some(state) = self.mru_switcher.as_mut() else {
+            return;
+        };
+        match advance_mru_cursor(state.cursor, step, state.snapshot.len()) {
+            Some(next) => {
+                state.cursor = next;
+                cx.notify();
+            }
+            None => {
+                // Snapshot too short to cycle — drop the switcher so the
+                // HUD doesn't get stuck open over a now-empty MRU.
+                self.mru_switcher = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Active MRU switcher (if any). View layer reads this to decide
+    /// whether to paint the floating HUD.
+    pub fn mru_switcher(&self) -> Option<&MruSwitcher> {
+        self.mru_switcher.as_ref()
+    }
+
+    /// Called when the modifier key (Ctrl) that opened the MRU switcher
+    /// is released. Activates the highlighted tab and clears the HUD.
+    /// No-op when no switcher is active.
+    pub fn commit_mru_switch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.mru_switcher.take() else {
+            return;
+        };
+        let Some(&target) = state.snapshot.get(state.cursor) else {
+            cx.notify();
+            return;
+        };
+        if target == self.active {
+            cx.notify();
+            return;
+        }
+        // Defense against tab close during a cycle: the snapshot freezes
+        // indices captured BEFORE any close, so `target` may now point
+        // to a different (or no) tab after `forget_mru` shifted things.
+        // The `mru` vec stays consistent across closes — if `target` is
+        // no longer in `mru`, the underlying tab is gone or shifted.
+        if !self.mru.contains(&target) {
+            cx.notify();
+            return;
+        }
+        // `set_active` does its own `bump_mru` so the activated tab
+        // floats to mru[0] for the NEXT switching session.
+        if self.tabs.get(target).is_some() {
+            self.set_active(target, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Forcibly clear an in-flight MRU switcher. Called when focus leaves
+    /// the group (the `on_modifiers_changed` listener won't fire on a
+    /// different focus path, so the HUD would otherwise stay open).
+    pub fn cancel_mru_switch(&mut self, cx: &mut Context<Self>) {
+        if self.mru_switcher.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub(crate) fn on_new_agent(
@@ -1279,6 +1445,56 @@ fn resolve_adjacent_visible_tab(tab_order: &[usize], active: usize, step: isize)
     let here = tab_order.iter().position(|&i| i == active)?;
     let next = ((here as isize + step).rem_euclid(len as isize)) as usize;
     tab_order.get(next).copied()
+}
+
+/// Pure helper isolated from `Context` so the MRU cursor-wrap math is
+/// unit-testable. Returns the new cursor after advancing `step` slots
+/// through a snapshot of length `len`. Wraps via `rem_euclid` so negative
+/// `step` also wraps cleanly. `None` when the snapshot is too short.
+fn advance_mru_cursor(cursor: usize, step: isize, len: usize) -> Option<usize> {
+    if len < 2 {
+        return None;
+    }
+    let len_i = len as isize;
+    Some(((cursor as isize + step).rem_euclid(len_i)) as usize)
+}
+
+#[cfg(test)]
+mod mru_switcher_tests {
+    use super::advance_mru_cursor;
+
+    #[test]
+    fn first_press_lands_on_row_1() {
+        // Snapshot length 4 — starting cursor 0 + step 1 → 1.
+        assert_eq!(advance_mru_cursor(0, 1, 4), Some(1));
+    }
+
+    #[test]
+    fn forward_wraps_at_end() {
+        // cursor at last → next is 0 (back to current active).
+        assert_eq!(advance_mru_cursor(3, 1, 4), Some(0));
+    }
+
+    #[test]
+    fn backward_wraps_at_start() {
+        // cursor at 0 + step -1 → last.
+        assert_eq!(advance_mru_cursor(0, -1, 4), Some(3));
+    }
+
+    #[test]
+    fn single_entry_returns_none() {
+        // Switcher is meaningless with one tab; helper signals "drop the
+        // switcher" via None.
+        assert_eq!(advance_mru_cursor(0, 1, 1), None);
+        assert_eq!(advance_mru_cursor(0, -1, 0), None);
+    }
+
+    #[test]
+    fn deep_wrap_via_rem_euclid() {
+        // Verify that very negative steps still produce a valid index
+        // (would panic on plain `%` with negative LHS in some idioms).
+        assert_eq!(advance_mru_cursor(0, -7, 4), Some(1));
+    }
 }
 
 #[cfg(test)]
