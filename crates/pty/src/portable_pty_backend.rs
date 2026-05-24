@@ -45,9 +45,12 @@ const CANCEL_GRACE: Duration = Duration::from_secs(5);
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 struct Session {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// PTY-bound handles. `None` for sessions in the dormant state
+    /// (F3.4: restored sub-panes that hold a prefilled grid but haven't
+    /// spawned a shell child yet). `promote_to_live` fills them in.
+    master: Option<Box<dyn MasterPty + Send>>,
+    writer: Option<Box<dyn Write + Send>>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     state: Arc<Mutex<TerminalState>>,
     watcher: Option<JoinHandle<()>>,
     cols: u16,
@@ -59,6 +62,16 @@ struct Session {
     /// descendant the agent CLI spawned. `None` is a safe fallback —
     /// `close()` skips SIGTERM and goes straight to SIGKILL.
     pid: Option<u32>,
+}
+
+impl Session {
+    /// True when this session has no live PTY child — only the grid
+    /// emulator is populated (typically by `prefill_grid` during a
+    /// restore from snapshot). Operations that touch the PTY return
+    /// `Err` until `promote_to_live` runs.
+    fn is_dormant(&self) -> bool {
+        self.master.is_none()
+    }
 }
 
 pub struct PortablePtyBackend {
@@ -134,9 +147,9 @@ impl TerminalBackend for PortablePtyBackend {
         self.sessions.insert(
             id,
             Session {
-                master: pair.master,
-                writer,
-                killer,
+                master: Some(pair.master),
+                writer: Some(writer),
+                killer: Some(killer),
                 state,
                 watcher: Some(watcher),
                 cols: cfg.cols,
@@ -147,13 +160,100 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(id)
     }
 
+    fn spawn_dormant(&mut self, cols: u16, rows: u16) -> Result<TerminalSessionId> {
+        // F3.4: register a session WITHOUT spawning a PTY child. The
+        // grid emulator is wired up so `prefill_grid` + `snapshot` can
+        // populate + render restored scrollback. `write` / `resize` /
+        // `external_id_of` / `os_pid` all return `Err` until
+        // `promote_to_live` swaps in a real PTY.
+        let id = self.mint_id();
+        let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, SCROLLBACK_ROWS)));
+        self.sessions.insert(
+            id,
+            Session {
+                master: None,
+                writer: None,
+                killer: None,
+                state,
+                watcher: None,
+                cols,
+                rows,
+                pid: None,
+            },
+        );
+        Ok(id)
+    }
+
+    fn promote_to_live(&mut self, id: TerminalSessionId, cfg: SpawnConfig) -> Result<()> {
+        // F3.4: turn a dormant session into a live one by spawning a
+        // PTY child + watcher. The session keeps its existing grid
+        // emulator (with any prefilled scrollback intact), so the user
+        // sees a continuous transition from "restored" view to a fresh
+        // shell prompt.
+        let session = self
+            .sessions
+            .get_mut(&id)
+            .with_context(|| format!("unknown session {id:?}"))?;
+        if !session.is_dormant() {
+            return Err(anyhow::anyhow!("session {id:?} is already live"));
+        }
+        // Resize the grid emulator to match the requested geometry
+        // BEFORE openpty so the child sees the right WINSIZE.
+        let cols = cfg.cols;
+        let rows = cfg.rows;
+        if let Ok(mut state) = session.state.lock() {
+            state.resize(cols, rows);
+        }
+        session.cols = cols;
+        session.rows = rows;
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("openpty failed")?;
+
+        let mut command = CommandBuilder::new(&cfg.shell);
+        command.args(&cfg.args);
+        command.cwd(&cfg.cwd);
+        for (k, v) in &cfg.env {
+            command.env(k, v);
+        }
+        let child = pair.slave.spawn_command(command).context("spawn shell")?;
+        let killer = child.clone_killer();
+        let pid = child.process_id();
+        drop(pair.slave);
+
+        let reader = pair.master.try_clone_reader().context("clone reader")?;
+        let writer = pair.master.take_writer().context("take writer")?;
+        let tx = self.event_tx.clone();
+        let watcher_state = Arc::clone(&session.state);
+        let watcher =
+            std::thread::spawn(move || watch_session(id, reader, child, tx, watcher_state));
+
+        session.master = Some(pair.master);
+        session.writer = Some(writer);
+        session.killer = Some(killer);
+        session.watcher = Some(watcher);
+        session.pid = pid;
+        Ok(())
+    }
+
     fn write(&mut self, id: TerminalSessionId, bytes: &[u8]) -> Result<()> {
         let session = self
             .sessions
             .get_mut(&id)
             .with_context(|| format!("unknown session {id:?}"))?;
-        session.writer.write_all(bytes).context("pty write")?;
-        session.writer.flush().context("pty flush")?;
+        let writer = session
+            .writer
+            .as_mut()
+            .with_context(|| format!("session {id:?} is dormant; promote_to_live first"))?;
+        writer.write_all(bytes).context("pty write")?;
+        writer.flush().context("pty flush")?;
         Ok(())
     }
 
@@ -162,15 +262,18 @@ impl TerminalBackend for PortablePtyBackend {
             .sessions
             .get_mut(&id)
             .with_context(|| format!("unknown session {id:?}"))?;
-        session
-            .master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("pty resize")?;
+        // Dormant sessions: bookkeep cols/rows + grid resize only. No
+        // PTY child to push the geometry to.
+        if let Some(master) = session.master.as_ref() {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("pty resize")?;
+        }
         session.cols = cols;
         session.rows = rows;
         if let Ok(mut state) = session.state.lock() {
@@ -256,9 +359,15 @@ impl TerminalBackend for PortablePtyBackend {
         let Some(mut session) = self.sessions.remove(&id) else {
             return Ok(());
         };
+        // Dormant sessions have no PTY child / watcher / killer. Drop
+        // them directly; the grid emulator state goes with the
+        // `session` move and there's nothing to signal.
+        if session.is_dormant() {
+            return Ok(());
+        }
         // Drop writer immediately so write() callers get EBADF rather than
         // racing with the pending kill.
-        drop(session.writer);
+        drop(session.writer.take());
         // Build the SIGTERM step. On Unix, target the whole process group
         // (negative pid) so children spawned by the agent CLI also receive
         // the signal. The negative-pid contract works because portable-pty
@@ -266,7 +375,10 @@ impl TerminalBackend for PortablePtyBackend {
         let pid = session.pid;
         let term_fn = move || term_step(pid);
         // The SIGKILL fallback uses the existing portable-pty killer.
-        let mut killer = session.killer;
+        let mut killer = session
+            .killer
+            .take()
+            .expect("live session must hold a killer");
         let kill_fn = move || {
             let _ = killer.kill();
         };
@@ -274,7 +386,7 @@ impl TerminalBackend for PortablePtyBackend {
         // unblocks the watcher's read() and lets it observe EOF + reap the
         // child. SIGTERM gives the agent a chance to exit cleanly first;
         // master-drop ensures even a stubborn agent's read loop unblocks.
-        drop(session.master);
+        drop(session.master.take());
         if let Some(handle) = session.watcher.take() {
             close_with_grace(
                 JoinHandleWatcher(handle),

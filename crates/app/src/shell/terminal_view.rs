@@ -167,6 +167,40 @@ fn spawn_fallback_portable(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessi
     Some((Arc::new(Mutex::new(boxed)), session_id))
 }
 
+/// F3.4: spawn a dormant session — grid emulator wired up but no PTY
+/// child. The caller is expected to prefill the grid with restored
+/// scrollback and then call `TerminalView::respawn` when the user
+/// first interacts with the pane. Mirrors `spawn_local_pty`'s
+/// relay-then-fallback pattern.
+pub fn spawn_local_pty_dormant(
+    cols: u16,
+    rows: u16,
+) -> Option<(SharedBackend, TerminalSessionId)> {
+    if let Some(shared) = SHARED_BACKEND.get() {
+        let mut guard = shared.lock().expect("shared backend poisoned");
+        match guard.spawn_dormant(cols, rows) {
+            Ok(session_id) => {
+                drop(guard);
+                return Some((Arc::clone(shared), session_id));
+            }
+            Err(err) => {
+                drop(guard);
+                tracing::debug!(?err, "shared backend rejected spawn_dormant; falling back");
+            }
+        }
+    }
+    let mut backend = PortablePtyBackend::new();
+    let session_id = match backend.spawn_dormant(cols, rows) {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(?err, "spawn_dormant failed");
+            return None;
+        }
+    };
+    let boxed: Box<dyn TerminalBackend> = Box::new(backend);
+    Some((Arc::new(Mutex::new(boxed)), session_id))
+}
+
 pub struct TerminalView {
     /// `Arc<Mutex<Box<dyn TerminalBackend>>>` — shared with whoever spawned
     /// the session. For local terminals the renderer is the only holder;
@@ -201,7 +235,15 @@ pub struct TerminalView {
     /// until the shell emits one. Reserved for future use by the workspace
     /// tab strip — current labels are static `"Terminal N"` slugs.
     title: Option<String>,
-    _poll_task: Task<()>,
+    /// F3.4 dormant state: when `Some(cwd)`, this view holds a grid
+    /// emulator with prefilled scrollback but NO live PTY child. The
+    /// next focus-in / keystroke calls `respawn` to spawn a shell at
+    /// `cwd` and arm the poll task. `None` = live (default).
+    dormant_cwd: Option<PathBuf>,
+    /// PTY-drain timer. `None` while the view is dormant — there's no
+    /// PTY to drain. Armed by `mount` (live path) or `respawn`
+    /// (post-dormancy).
+    _poll_task: Option<Task<()>>,
     _blink_task: Task<()>,
 }
 
@@ -271,9 +313,126 @@ impl TerminalView {
             focused: false,
             search: SearchState::new(),
             title: None,
-            _poll_task: poll_task,
+            dormant_cwd: None,
+            _poll_task: Some(poll_task),
             _blink_task: blink_task,
         }
+    }
+
+    /// F3.4: build a view backed by a DORMANT session — grid emulator
+    /// populated by `prefill_grid` with restored scrollback, but no
+    /// shell child running. The view renders the snapshot identically
+    /// to a live view; the first user interaction (focus-in or
+    /// keystroke) calls `respawn` to spawn a shell at `cwd` and arm the
+    /// PTY-drain task.
+    ///
+    /// `backend` + `session_id` come from `spawn_local_pty_dormant` —
+    /// the caller checks that result before invoking `cx.new`. Keeping
+    /// the spawn outside this constructor lets `cx.new` stay
+    /// infallible (its builder closure isn't allowed to fail).
+    pub fn mount_dormant(
+        backend: SharedBackend,
+        session_id: TerminalSessionId,
+        cwd: PathBuf,
+        prefill_bytes: &[u8],
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Apply the saved scrollback to the dormant grid emulator.
+        if !prefill_bytes.is_empty() {
+            let mut guard = backend.lock().expect("pty backend mutex poisoned");
+            if let Err(err) = guard.prefill_grid(session_id, prefill_bytes) {
+                tracing::warn!(?err, "dormant prefill_grid failed");
+            }
+        }
+        let snapshot = backend
+            .lock()
+            .expect("pty backend mutex poisoned")
+            .snapshot(session_id)
+            .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS));
+
+        let focus_handle = cx.focus_handle();
+        // On focus-in: flip the live-cursor state, then wake the PTY.
+        // The respawn is a no-op when the view is already live (e.g.
+        // user clicks back into a sub-pane they already woke), so it's
+        // safe to fire unconditionally.
+        cx.on_focus(&focus_handle, window, |view, window, cx| {
+            view.focused = true;
+            view.cursor_visible = true;
+            view.respawn_if_dormant(window, cx);
+            cx.notify();
+        })
+        .detach();
+        cx.on_blur(&focus_handle, window, |view, _, cx| {
+            view.focused = false;
+            cx.notify();
+        })
+        .detach();
+        // NOTE: NO `focus_handle.focus(window, cx)` here. The active
+        // sub-pane is focused explicitly by the restore orchestrator
+        // (PaneGroup::focus_active). Dormant non-active sub-panes stay
+        // unfocused — they wake when the user clicks/types into them.
+
+        let blink_task = Self::start_blink_task(cx);
+
+        Self {
+            backend,
+            session_id,
+            snapshot,
+            theme,
+            density,
+            typography,
+            focus_handle,
+            target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
+            last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
+            cursor_visible: true,
+            focused: false,
+            search: SearchState::new(),
+            title: None,
+            dormant_cwd: Some(cwd),
+            _poll_task: None,
+            _blink_task: blink_task,
+        }
+    }
+
+    /// True when this view is in the F3.4 dormant state (grid populated
+    /// from snapshot, no PTY child yet). Public so the render layer can
+    /// optionally surface an indicator badge.
+    pub fn is_dormant(&self) -> bool {
+        self.dormant_cwd.is_some()
+    }
+
+    /// F3.4: promote the dormant PTY session to live. Spawns a shell
+    /// child at the saved cwd, wires it to the existing grid emulator
+    /// (preserving prefilled scrollback), and arms the PTY-drain task.
+    /// No-op when the view is already live.
+    pub fn respawn_if_dormant(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cwd) = self.dormant_cwd.take() else {
+            return;
+        };
+        let cfg = SpawnConfig {
+            cwd,
+            cols: self.target_grid.0.max(DEFAULT_COLS),
+            rows: self.target_grid.1.max(DEFAULT_ROWS),
+            ..SpawnConfig::default()
+        };
+        let session_id = self.session_id;
+        let promote_result = self
+            .backend
+            .lock()
+            .expect("pty backend mutex poisoned")
+            .promote_to_live(session_id, cfg);
+        if let Err(err) = promote_result {
+            tracing::warn!(?err, "respawn promote_to_live failed; staying dormant");
+            // Leaving dormant_cwd unset; user will see no shell. They
+            // can still scroll through the prefilled grid.
+            return;
+        }
+        self._poll_task = Some(Self::start_poll_task(cx));
+        cx.notify();
     }
 
     /// 16 ms PTY-drain timer. Drains the event channel + re-snapshots + one
@@ -453,6 +612,22 @@ impl TerminalView {
         if bytes.is_empty() {
             return;
         }
+        // F3.4: paste / cmd-shortcut paths bypass the focus-in respawn
+        // (no focus transition fires). Treat the keystroke itself as
+        // implicit "wake this pane" — without this guard the write
+        // below would surface a dormant-session error and the bytes
+        // would silently drop on the floor.
+        if self.is_dormant() {
+            // We have no `&mut Window` in scope here; the respawn path
+            // doesn't actually need it (see `respawn_if_dormant`),
+            // and the dummy below keeps the call shape consistent
+            // even if the helper grows window-dependent work later.
+            let _ = self.dormant_cwd.is_some();
+            // Force the wake through the same code path as on_focus.
+            // We construct a synthetic window-less wake by inlining
+            // the body without the closure / focus event.
+            self.wake_dormant_inline(cx);
+        }
         let session_id = self.session_id;
         if let Err(err) = self.with_backend(|be| be.write(session_id, bytes)) {
             tracing::warn!(?err, "pty write failed");
@@ -463,6 +638,33 @@ impl TerminalView {
         // see it.
         self.cursor_visible = true;
         cx.notify();
+    }
+
+    /// F3.4: window-less variant of `respawn_if_dormant` used from
+    /// `send_bytes`. The promote-to-live + poll-task arm steps don't
+    /// actually need a `&mut Window` (no focus changes, no platform
+    /// integration). Kept separate so the focus path stays the same.
+    fn wake_dormant_inline(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.dormant_cwd.take() else {
+            return;
+        };
+        let cfg = SpawnConfig {
+            cwd,
+            cols: self.target_grid.0.max(DEFAULT_COLS),
+            rows: self.target_grid.1.max(DEFAULT_ROWS),
+            ..SpawnConfig::default()
+        };
+        let session_id = self.session_id;
+        let promote_result = self
+            .backend
+            .lock()
+            .expect("pty backend mutex poisoned")
+            .promote_to_live(session_id, cfg);
+        if let Err(err) = promote_result {
+            tracing::warn!(?err, "wake_dormant promote_to_live failed");
+            return;
+        }
+        self._poll_task = Some(Self::start_poll_task(cx));
     }
 
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {

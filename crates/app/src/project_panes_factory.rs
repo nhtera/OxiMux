@@ -30,7 +30,9 @@ use crate::persisted_terminals::{
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
-use crate::shell::terminal_view::{TerminalView, attach_pty_existing, spawn_local_pty};
+use crate::shell::terminal_view::{
+    TerminalView, attach_pty_existing, spawn_local_pty, spawn_local_pty_dormant,
+};
 use crate::workspace_root::WorkspaceRoot;
 
 const DEFAULT_AGENT_COLS: u16 = 120;
@@ -494,14 +496,28 @@ fn build_multi_sub_pane_tree(
         Vec::with_capacity(tab.sub_panes.len());
     for (sub_pane_ordinal, sp) in tab.sub_panes.iter().enumerate() {
         let leaf_cwd = resolve_sub_pane_cwd(sp, &project_cwd);
-        let Some((backend, session_id)) = spawn_local_pty(leaf_cwd) else {
-            tracing::warn!(label = %tab.label, "sub-pane PTY spawn failed; dropping tab");
+        // F3.4 slice 2: spawn each sub-pane DORMANT (grid emulator with
+        // restored scrollback, no PTY child). The first focus-in /
+        // keystroke wakes it via `respawn_if_dormant`. The active
+        // sub-pane gets focused by the workspace restore orchestrator
+        // and wakes automatically on the first paint; non-active
+        // sub-panes stay dormant until the user clicks them.
+        let prefill_bytes = pane_buffers
+            .remove(&(tab_ordinal, sub_pane_ordinal as u32))
+            .unwrap_or_default();
+        // `cx.new` is infallible, so the fallible `spawn_local_pty_dormant`
+        // runs out here; on failure we drop the whole tab.
+        let Some((backend, session_id)) = spawn_local_pty_dormant(80, 24) else {
+            tracing::warn!(label = %tab.label, "sub-pane spawn_dormant failed; dropping tab");
             return None;
         };
+        let leaf_cwd_for_view = leaf_cwd.clone();
         let view = cx.new(|cx| {
-            TerminalView::mount(
+            TerminalView::mount_dormant(
                 backend,
                 session_id,
+                leaf_cwd_for_view,
+                &prefill_bytes,
                 theme,
                 density,
                 typography.clone(),
@@ -509,16 +525,6 @@ fn build_multi_sub_pane_tree(
                 cx,
             )
         });
-        // F3.4: prefill each sub-pane's grid with its own saved
-        // scrollback bytes. Map keyed by `(tab_ordinal,
-        // sub_pane_ordinal)` aligns DFS-flat with `capture_pane_buffers`.
-        // Missing rows (e.g. blank panes at capture time) skip cleanly.
-        let bytes = pane_buffers
-            .remove(&(tab_ordinal, sub_pane_ordinal as u32))
-            .unwrap_or_default();
-        if !bytes.is_empty() {
-            view.read(cx).prefill_grid(&bytes);
-        }
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         leaves.push((view, observer));
     }

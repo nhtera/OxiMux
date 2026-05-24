@@ -47,6 +47,41 @@ pub trait TerminalBackend: Send + 'static {
     /// Spawn a new session. Returns a fresh `TerminalSessionId`.
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId>;
 
+    /// F3.4: register a session that has a grid emulator but NO live
+    /// PTY child yet. The caller usually follows up with `prefill_grid`
+    /// to populate restored scrollback and renders the snapshot. Until
+    /// `promote_to_live` runs, `write` / `resize` (on the PTY side) /
+    /// `os_pid` / `external_id_of` all surface "dormant" errors.
+    ///
+    /// Default impl returns an error — only backends that implement
+    /// dormancy override (currently the in-process portable-pty backend).
+    fn spawn_dormant(
+        &mut self,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<TerminalSessionId> {
+        Err(anyhow::anyhow!(
+            "this backend does not support dormant sessions"
+        ))
+    }
+
+    /// F3.4: promote a dormant session to live by spawning a PTY child
+    /// and wiring read/write. The grid emulator + any prefilled
+    /// scrollback survive intact; the user sees a continuous transition
+    /// from the "restored" view into a fresh prompt at `cfg.cwd`.
+    ///
+    /// Default impl returns an error — only backends that implement
+    /// dormancy override.
+    fn promote_to_live(
+        &mut self,
+        _id: TerminalSessionId,
+        _cfg: SpawnConfig,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "this backend does not support promote_to_live"
+        ))
+    }
+
     /// Attach to a session that already exists in this backend's
     /// underlying source (e.g., a daemon-owned PTY that outlived the
     /// previous app launch). The default implementation returns an
