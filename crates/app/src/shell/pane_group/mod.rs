@@ -906,20 +906,30 @@ impl PaneGroup {
         true
     }
 
+    /// Cycle to the tab AFTER the active tab in VISUAL order. After the
+    /// user drag-reorders chips, `tab_order` no longer matches the
+    /// insertion-order `tabs` vector — walking `tabs.len()` directly
+    /// would jump in the original insertion sequence, which feels broken.
+    /// We locate the active tab's position inside `tab_order`, advance
+    /// one slot (wrap), and map back to its insertion index.
     pub fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.len() < 2 {
-            return;
+        if let Some(next) = self.adjacent_visible_tab(1) {
+            self.set_active(next, window, cx);
         }
-        let next = (self.active + 1) % self.tabs.len();
-        self.set_active(next, window, cx);
     }
 
+    /// Symmetric counterpart of `next_tab` walking backwards.
     pub fn prev_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.len() < 2 {
-            return;
+        if let Some(prev) = self.adjacent_visible_tab(-1) {
+            self.set_active(prev, window, cx);
         }
-        let prev = (self.active + self.tabs.len() - 1) % self.tabs.len();
-        self.set_active(prev, window, cx);
+    }
+
+    /// Resolve the insertion-order index of the tab `step` slots away
+    /// from the active tab in visual order. Returns `None` when fewer
+    /// than 2 visible tabs exist or the active tab isn't tracked.
+    fn adjacent_visible_tab(&self, step: isize) -> Option<usize> {
+        resolve_adjacent_visible_tab(&self.tab_order, self.active, step)
     }
 
     pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1064,7 +1074,9 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.dispatch_action(Box::new(RequestOpenAdapterPicker), cx);
+        // Keyboard path — no cursor x available. `x: None` tells
+        // `WorkspaceRoot` to use the post-rail fallback anchor.
+        window.dispatch_action(Box::new(RequestOpenAdapterPicker { x: None }), cx);
     }
 
     /// Split the active terminal tab's CURRENTLY-FOCUSED sub-pane along
@@ -1252,5 +1264,59 @@ impl PaneGroup {
 impl Focusable for PaneGroup {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Pure helper isolated from `PaneGroup` state so it's trivially testable.
+/// Returns the insertion-order index of the tab `step` slots away in
+/// visual order from `active`, wrapping at both ends. Returns `None` when
+/// the list is too short or `active` doesn't appear in `tab_order`.
+fn resolve_adjacent_visible_tab(tab_order: &[usize], active: usize, step: isize) -> Option<usize> {
+    let len = tab_order.len();
+    if len < 2 {
+        return None;
+    }
+    let here = tab_order.iter().position(|&i| i == active)?;
+    let next = ((here as isize + step).rem_euclid(len as isize)) as usize;
+    tab_order.get(next).copied()
+}
+
+#[cfg(test)]
+mod adjacent_visible_tab_tests {
+    use super::resolve_adjacent_visible_tab;
+
+    #[test]
+    fn next_walks_visual_order_after_reorder() {
+        // tabs inserted as 0,1,2,3 → user drag-moved insertion idx 3 to
+        // visual slot 1, so visual layout is 0,3,1,2.
+        let order = [0_usize, 3, 1, 2];
+        // active = 0 → next should be insertion-idx 3 (visual slot 1).
+        assert_eq!(resolve_adjacent_visible_tab(&order, 0, 1), Some(3));
+        // active = 3 (visual slot 1) → next is insertion-idx 1 (visual slot 2).
+        assert_eq!(resolve_adjacent_visible_tab(&order, 3, 1), Some(1));
+        // active = 2 (last visual) → wraps to insertion-idx 0.
+        assert_eq!(resolve_adjacent_visible_tab(&order, 2, 1), Some(0));
+    }
+
+    #[test]
+    fn prev_walks_visual_order_after_reorder() {
+        let order = [0_usize, 3, 1, 2];
+        // active = 0 (first visual) → wraps to last visual (insertion-idx 2).
+        assert_eq!(resolve_adjacent_visible_tab(&order, 0, -1), Some(2));
+        // active = 1 (visual slot 2) → prev is insertion-idx 3 (visual slot 1).
+        assert_eq!(resolve_adjacent_visible_tab(&order, 1, -1), Some(3));
+    }
+
+    #[test]
+    fn single_tab_returns_none() {
+        let order = [5_usize];
+        assert_eq!(resolve_adjacent_visible_tab(&order, 5, 1), None);
+        assert_eq!(resolve_adjacent_visible_tab(&order, 5, -1), None);
+    }
+
+    #[test]
+    fn untracked_active_returns_none() {
+        let order = [0_usize, 1, 2];
+        assert_eq!(resolve_adjacent_visible_tab(&order, 99, 1), None);
     }
 }

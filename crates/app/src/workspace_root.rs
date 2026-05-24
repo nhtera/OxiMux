@@ -858,18 +858,16 @@ impl Render for WorkspaceRoot {
                     .update(cx, |p, cx| p.open(projects, window, cx));
             }))
             .on_action(
-                cx.listener(|this, _: &RequestOpenAdapterPicker, window, cx| {
-                    // Anchor under the `+` button; the click handler stashes
-                    // event.position.x. Keyboard path falls back to a post-rail inset.
+                cx.listener(|this, action: &RequestOpenAdapterPicker, window, cx| {
+                    // Anchor precedence:
+                    //   `Some(px)` → mouse path; popover lands under cursor.
+                    //   `None`     → keyboard path; use the post-rail fallback.
                     let fallback_anchor = if this.left_rail_open {
                         this.density.w_left_rail + ADAPTER_PICKER_LEFT_INSET
                     } else {
                         ADAPTER_PICKER_LEFT_INSET
                     };
-                    let left_anchor = this
-                        .active_project_panes()
-                        .and_then(|panes| panes.read(cx).take_plus_click_x())
-                        .unwrap_or(fallback_anchor);
+                    let left_anchor = action.x.unwrap_or(fallback_anchor);
                     // Mutex: only one full-window popover can hold the click-outside path.
                     this.pane_actions.update(cx, |p, cx| p.close(cx));
                     this.adapter_picker

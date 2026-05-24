@@ -150,10 +150,14 @@ impl Render for PaneActionsMenu {
                 .h(px(1.0))
                 .my(px(4.0))
                 .bg(theme.border_inactive);
+            // Destructive row — icon + label painted with `status_error` so
+            // the user reads "this is the dangerous one" at a glance. Hover
+            // bg stays `bg_panel_alt` (consistent feedback); we don't tint
+            // the hover red because that conflicts with the focus cursor.
             let close_icon = svg()
                 .path("icons/close.svg")
                 .size(px(ICON_SIZE))
-                .text_color(theme.fg_muted);
+                .text_color(theme.status_error);
             let close_row = div()
                 .id("pane-action-row-close-group")
                 .flex()
@@ -166,7 +170,7 @@ impl Render for PaneActionsMenu {
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.bg_panel_alt))
                 .text_size(px(typography.t_body_md))
-                .text_color(theme.fg_base)
+                .text_color(theme.status_error)
                 .child(close_icon)
                 .child(div().flex_1().child("Close Group"))
                 .on_mouse_down(

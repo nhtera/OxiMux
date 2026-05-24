@@ -316,6 +316,15 @@ fn build_tab_strip_from_headers(
     // cluster. `flex_row` keeps everything on one line; the inner
     // `chips` div takes flex_1 so it absorbs all remaining width while
     // the trailing buttons stay flex-shrink-0.
+    //
+    // Bottom-border doubles as the focused-group highlight: 2px accent
+    // when this group has focus, 2px subtle border otherwise. Same width
+    // in both states so focus toggling doesn't reflow the strip.
+    let border_color = if is_focused {
+        theme.focus_ring
+    } else {
+        theme.border_inactive
+    };
     let mut row = div()
         .flex()
         .flex_row()
@@ -323,8 +332,8 @@ fn build_tab_strip_from_headers(
         .h(px(TAB_STRIP_HEIGHT_PX))
         .w_full()
         .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border_inactive)
+        .border_b_2()
+        .border_color(border_color)
         .child(chips)
         .child(plus_button(entity_id.as_u64(), theme));
     if show_pane_actions {
@@ -934,6 +943,16 @@ fn pane_actions_button(entity_id_raw: u64, is_focused: bool, theme: Theme) -> im
         .child(glyph)
 }
 
+/// Trailing "+" button on every group's strip.
+///
+/// Left-click opens the adapter picker popover — the picker offers
+/// "New Terminal" (⌘T), "New Agent" / Claude / Codex / ... rows. Direct
+/// terminal spawn is reachable via the ⌘T keybind on `NewTab`; the `+`
+/// button is the surface for picking a non-default kind.
+///
+/// The click x is passed as `Some(cursor_x)` so the popover anchors
+/// under THIS group's `+` — fixes the multi-group anchor bug acknowledged
+/// in `plans/reports/refactor-260524-0131-tab-manager-parity.md`.
 fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
     let glyph = svg()
         .path("icons/plus.svg")
@@ -949,8 +968,13 @@ fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
         .flex_shrink_0()
         .cursor_pointer()
         .hover(|s| s.bg(theme.bg_panel_alt))
-        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
-            window.dispatch_action(Box::new(RequestOpenAdapterPicker), cx);
+        .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
+            window.dispatch_action(
+                Box::new(RequestOpenAdapterPicker {
+                    x: Some(f32::from(ev.position.x)),
+                }),
+                cx,
+            );
         })
         .child(glyph)
 }

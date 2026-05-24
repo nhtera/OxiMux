@@ -14,7 +14,6 @@
 
 mod render;
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,9 +79,6 @@ pub struct ProjectPanes {
     _window_activation_observer: Subscription,
     /// Snapshot sink. `None` during tests / construction.
     save_callback: Option<SaveCallback>,
-    /// Window-x of the most-recent `+` click. The button moves with the
-    /// tab strip, so a static inset can't anchor the popover.
-    last_plus_click_x: Cell<Option<f32>>,
     /// Surrounding chrome width. Forwarded to every group on set so
     /// PTY grid math stays current.
     chrome_w_px: f32,
@@ -151,7 +147,6 @@ impl ProjectPanes {
             window_active,
             _window_activation_observer: observer,
             save_callback: None,
-            last_plus_click_x: Cell::new(None),
             chrome_w_px: density.w_left_rail,
             hovered_drop_target: None,
             next_terminal_n: 1,
@@ -231,14 +226,6 @@ impl ProjectPanes {
 
     pub fn is_empty(&self, cx: &App) -> bool {
         self.tab_count(cx) == 0
-    }
-
-    pub fn take_plus_click_x(&self) -> Option<f32> {
-        self.last_plus_click_x.take()
-    }
-
-    pub fn set_plus_click_x(&self, x: f32) {
-        self.last_plus_click_x.set(Some(x));
     }
 
     pub fn set_chrome_width(&mut self, chrome: f32, cx: &mut App) {

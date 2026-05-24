@@ -237,6 +237,7 @@ fn render_tree(
                     body_zone,
                     project_panes_entity.clone(),
                     theme,
+                    is_focused,
                 );
                 // Hoisted leaves render BARE bodies — their strip is
                 // already painted in the workspace top bar (see
@@ -472,12 +473,17 @@ fn leaf_body(
     active_zone: Option<Zone>,
     project_panes: Entity<ProjectPanes>,
     theme: oximux_settings::Theme,
+    is_focused: bool,
 ) -> AnyElement {
     let body_id = SharedString::from(format!("pane-group-body-{}", group.entity_id()));
     let hover_panes = project_panes.clone();
     let drop_panes = project_panes.clone();
     let file_hover_panes = project_panes.clone();
     let file_drop_panes = project_panes.clone();
+    // Subtle dim on the unfocused group body so the eye finds the focused
+    // group faster. Tab strip stays at full opacity — only the content
+    // area dims (matches the reference editor's `opacity-95` pattern).
+    let body_opacity: f32 = if is_focused { 1.0 } else { 0.95 };
 
     div()
         .id(body_id)
@@ -486,6 +492,7 @@ fn leaf_body(
         .w_full()
         .relative()
         .overflow_hidden()
+        .opacity(body_opacity)
         .on_drag_move::<TabDragPayload>(
             move |ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
                 // Zone resolver wants the LOCAL position inside the body

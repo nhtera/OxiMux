@@ -19,6 +19,34 @@ pub struct OpenPaneActionsAt {
     pub y: f32,
 }
 
+/// Open the inline adapter-picker popover anchored to the `+` button.
+///
+/// Fired by:
+/// - The `+` button's right-click handler — `x = Some(cursor_x)` so the
+///   popover anchors under the clicked group's `+`. Fixes the multi-group
+///   anchor bug (without this, the popover always landed under the first
+///   group's `+`).
+/// - The `NewAgent` keybind handler — `x = None`, meaning "use the
+///   keyboard fallback anchor" (post-rail inset, computed by the handler).
+///
+/// `WorkspaceRoot`'s handler treats `x` as: `Some(px)` → anchor directly
+/// at that pixel; `None` → use the post-rail fallback. A second dispatch
+/// while the popover is open toggles it closed.
+///
+/// `Default` is hand-written because `Option::None` is the keyboard
+/// fallback — both `derive(Default)` and dispatcher tests rely on it.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct RequestOpenAdapterPicker {
+    pub x: Option<f32>,
+}
+
+impl Default for RequestOpenAdapterPicker {
+    fn default() -> Self {
+        Self { x: None }
+    }
+}
+
 /// Payload action fired by a tab chip's right-click. Carries the cursor
 /// coords plus the target group's id and the right-clicked tab index so
 /// the shared `TabContextMenu` knows which (group, tab) the user picked
@@ -217,12 +245,6 @@ actions!(
         /// paths converge on the same surface. A second dispatch while the
         /// popover is open closes it (toggle).
         NewAgent,
-        /// Workspace-internal request to open the adapter picker. Fired by
-        /// the `+` button's `on_mouse_down` and by the `NewAgent` action
-        /// handler; handled in `WorkspaceRoot`. Kept distinct from
-        /// `NewAgent` so the button-fired path doesn't fight a focus-chain
-        /// keystroke during state recovery.
-        RequestOpenAdapterPicker,
         /// Open the project picker modal (Cmd+O). Shows recent projects +
         /// "Open Folder…" affordance backed by a native NSOpenPanel.
         OpenProjectPicker,
