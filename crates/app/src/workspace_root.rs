@@ -950,6 +950,7 @@ impl Render for WorkspaceRoot {
                 let group_ref = group.read(cx);
                 let tab_count = group_ref.tabs().len();
                 let tab_idx = action.tab_idx as usize;
+                let is_pinned = group_ref.is_pinned(tab_idx);
                 // Derive kind-specific payload (editor path) so the menu
                 // can render Copy Path / Reveal in Finder rows without
                 // walking back into the entity at click time.
@@ -972,7 +973,7 @@ impl Render for WorkspaceRoot {
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| {
-                    m.open(x, y, weak, group_id, tab_idx, tab_count, tab_kind, cx)
+                    m.open(x, y, weak, group_id, tab_idx, tab_count, tab_kind, is_pinned, cx)
                 });
             }))
             .on_action(cx.listener(|this, action: &crate::actions::RequestRenameTabAt, window, cx| {
@@ -1037,6 +1038,25 @@ impl Render for WorkspaceRoot {
                 dialog.read(cx).input_focus_handle(cx).focus(window, cx);
                 this.rename_tab_dialog = Some(dialog);
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &crate::actions::TogglePinTabAt, _window, cx| {
+                // Tab right-click "Pin Tab" / "Unpin Tab": flip the
+                // pinned flag and re-cluster the chip inside the
+                // group's tab_order. Reading the live `pinned` from
+                // the group at dispatch time keeps the menu's stale
+                // snapshot from producing a wrong toggle (e.g. two
+                // rapid clicks).
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                let tab_idx = action.tab_idx as usize;
+                let panes_ref = panes.read(cx);
+                let Some(group) = panes_ref.group(group_id) else {
+                    return;
+                };
+                let group = group.clone();
+                group.update(cx, |g, cx| g.toggle_pin(tab_idx, cx));
             }))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {
                 this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);

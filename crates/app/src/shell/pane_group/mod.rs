@@ -63,6 +63,12 @@ pub struct PaneGroupTab {
     /// When `Some`, the chip and persistence use this in place of the
     /// default label (e.g. "Terminal 5").
     pub custom_title: Option<SharedString>,
+    /// `true` once the user picks "Pin Tab" in the right-click menu.
+    /// Pinned tabs cluster at the front of `tab_order`, can't be moved
+    /// across the pinned/unpinned boundary by drag-reorder, can't be
+    /// torn out by drag-to-split, and are skipped by Close Others /
+    /// Close to Right.
+    pub pinned: bool,
     pub _observer: Option<Subscription>,
     pub _status_task: Option<Task<()>>,
 }
@@ -210,16 +216,80 @@ impl PaneGroup {
     /// index are preserved so the active highlight follows the moved
     /// tab automatically. No-op when indices are out of range or
     /// identical.
+    ///
+    /// Pinned tabs cluster at the front of `tab_order` — drag-reorder
+    /// clamps the destination to stay inside the moved tab's bucket
+    /// (pinned tabs can't slide into the unpinned zone and vice versa).
     pub fn move_tab(&mut self, from_visible_idx: usize, to_visible_idx: usize) {
-        if from_visible_idx == to_visible_idx {
+        if from_visible_idx >= self.tab_order.len() {
             return;
         }
-        if from_visible_idx >= self.tab_order.len() || to_visible_idx >= self.tab_order.len() {
+        let moved_insertion = self.tab_order[from_visible_idx];
+        let pinned = self
+            .tabs
+            .get(moved_insertion)
+            .map(|t| t.pinned)
+            .unwrap_or(false);
+        let split = self.pinned_count();
+        let (min_idx, max_idx) = if pinned {
+            (0, split.saturating_sub(1))
+        } else {
+            (split, self.tab_order.len().saturating_sub(1))
+        };
+        let clamped_to = to_visible_idx.clamp(min_idx, max_idx);
+        if from_visible_idx == clamped_to {
             return;
         }
         let moved = self.tab_order.remove(from_visible_idx);
-        self.tab_order.insert(to_visible_idx, moved);
+        self.tab_order.insert(clamped_to, moved);
         debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+    }
+
+    /// `true` if the tab at insertion index `idx` is pinned.
+    pub fn is_pinned(&self, idx: usize) -> bool {
+        self.tabs.get(idx).map(|t| t.pinned).unwrap_or(false)
+    }
+
+    /// Number of pinned tabs — also the visible index where the
+    /// unpinned cluster starts. Walks `tab_order` so the answer
+    /// reflects the actual cluster boundary (pinned tabs always sort
+    /// to the front via `toggle_pin`'s re-cluster step).
+    pub fn pinned_count(&self) -> usize {
+        self.tab_order
+            .iter()
+            .take_while(|&&i| self.tabs.get(i).map(|t| t.pinned).unwrap_or(false))
+            .count()
+    }
+
+    /// Toggle the pinned flag on tab `idx`. After flipping the flag we
+    /// re-cluster the chip inside `tab_order` so pinned tabs stay
+    /// packed at the front and unpinned tabs at the back. No-op when
+    /// `idx` is out of range. Notifies on every successful flip.
+    pub fn toggle_pin(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        tab.pinned = !tab.pinned;
+        let now_pinned = tab.pinned;
+        let Some(visible_from) = self.tab_order.iter().position(|&i| i == idx) else {
+            cx.notify();
+            return;
+        };
+        // Pop the chip out, then re-insert at the cluster boundary —
+        // last slot of the pinned cluster (newly pinned) or first slot
+        // of the unpinned cluster (newly unpinned). pinned_count() is
+        // re-read AFTER the pop so the destination index lines up with
+        // the shifted vector.
+        let moved = self.tab_order.remove(visible_from);
+        // Same dest for both directions: pin → end of pinned cluster
+        // (= split, since other pinned tabs sit at [0..split)); unpin
+        // → start of unpinned cluster (= split, right after the still-
+        // pinned tabs).
+        let _ = now_pinned;
+        let dest = self.pinned_count();
+        self.tab_order.insert(dest, moved);
+        debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+        cx.notify();
     }
 
     pub fn drag_hover(&self) -> Option<TabDragHover> {
@@ -364,6 +434,7 @@ impl PaneGroup {
             kind: PaneGroupTabKind::Terminal,
             color: None,
             custom_title: None,
+            pinned: false,
             // Tab-level observer is unused for terminal tabs — sub-pane
             // observers inside TerminalSplitTree drive re-renders.
             _observer: None,
@@ -407,6 +478,7 @@ impl PaneGroup {
             kind: PaneGroupTabKind::Editor { path },
             color: None,
             custom_title: None,
+            pinned: false,
             _observer: observer,
             _status_task: None,
         };
@@ -475,6 +547,7 @@ impl PaneGroup {
             },
             color: None,
             custom_title: None,
+            pinned: false,
             _observer: None,
             _status_task: Some(status_task),
         });
@@ -497,6 +570,13 @@ impl PaneGroup {
     /// removed slot) so the source group renders correctly afterwards.
     pub fn take_tab(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<PaneGroupTab> {
         if idx >= self.tabs.len() {
+            return None;
+        }
+        // Refuse to tear out a pinned tab — pinning is a "keep here"
+        // promise to the user. Drag-to-split drop becomes a no-op when
+        // this fires; the drag overlay clears via the standard cancel
+        // path.
+        if self.tabs[idx].pinned {
             return None;
         }
         let removed = self.tabs.remove(idx);
@@ -569,6 +649,7 @@ impl PaneGroup {
             kind: PaneGroupTabKind::Terminal,
             color: None,
             custom_title: None,
+            pinned: false,
             _observer: None,
             _status_task: None,
         });
@@ -619,9 +700,10 @@ impl PaneGroup {
         cx.notify();
     }
 
-    /// Close every tab in this group except `keep_idx`. Iterates in
-    /// reverse so each `close_tab` call sees stable indices for the
-    /// untouched portion. No-op when `keep_idx` is out of range.
+    /// Close every tab in this group except `keep_idx` and any pinned
+    /// tabs. Iterates in reverse so each `close_tab` call sees stable
+    /// indices for the untouched portion. No-op when `keep_idx` is out
+    /// of range.
     pub fn close_others(
         &mut self,
         keep_idx: usize,
@@ -632,15 +714,19 @@ impl PaneGroup {
             return;
         }
         for idx in (0..self.tabs.len()).rev() {
-            if idx != keep_idx {
-                self.close_tab(idx, window, cx);
+            if idx == keep_idx {
+                continue;
             }
+            if self.tabs[idx].pinned {
+                continue;
+            }
+            self.close_tab(idx, window, cx);
         }
     }
 
-    /// Close every tab whose index is greater than `from_idx`. Reverse
-    /// iteration keeps each `close_tab` index valid against the still-
-    /// unprocessed tail.
+    /// Close every tab whose index is greater than `from_idx`, skipping
+    /// pinned tabs. Reverse iteration keeps each `close_tab` index
+    /// valid against the still-unprocessed tail.
     pub fn close_to_right(
         &mut self,
         from_idx: usize,
@@ -652,6 +738,9 @@ impl PaneGroup {
             return;
         }
         for idx in (from_idx + 1..len).rev() {
+            if self.tabs[idx].pinned {
+                continue;
+            }
             self.close_tab(idx, window, cx);
         }
     }

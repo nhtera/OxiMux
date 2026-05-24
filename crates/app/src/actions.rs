@@ -67,6 +67,17 @@ pub struct SplitGroupAt {
     pub insert_before: bool,
 }
 
+/// Payload action fired by the tab right-click "Pin Tab" / "Unpin Tab"
+/// row. Carries (group_id, tab_idx) so the handler can flip the right
+/// chip even after focus moves. The action is a toggle — render reads
+/// `is_pinned(tab_idx)` to pick the row label.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct TogglePinTabAt {
+    pub group_id: u64,
+    pub tab_idx: u32,
+}
+
 actions!(
     oximux,
     [

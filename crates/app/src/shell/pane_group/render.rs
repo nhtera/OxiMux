@@ -120,6 +120,7 @@ pub fn build_tab_strip_for(
             kind_marker: kind_marker(&t.kind),
             agent_status: agent_status_for(&t.kind),
             color: t.color,
+            pinned: t.pinned,
         })
         .collect();
     let active = group.active();
@@ -153,6 +154,9 @@ struct PaneGroupTabHeader {
     /// User-picked color tag, rendered as a 2px left-edge bar on the
     /// chip. `None` = no color (default chrome).
     color: Option<super::TabColor>,
+    /// Pinned state — drives the pin-icon-in-place-of-close button on
+    /// the chip.
+    pinned: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -268,6 +272,7 @@ fn build_tab_strip_from_headers(
             tab_idx == active,
             drag_edge,
             header.color,
+            header.pinned,
             theme,
             entity.clone(),
         ));
@@ -597,6 +602,7 @@ fn redistribute_sub_pane_weights(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn render_tab_chip(
     entity_id_raw: u64,
     group_id: PaneGroupId,
@@ -608,6 +614,7 @@ fn render_tab_chip(
     is_active: bool,
     drag_edge: Option<TabInsertSide>,
     color_tag: Option<super::TabColor>,
+    is_pinned: bool,
     theme: Theme,
     entity: Entity<PaneGroup>,
 ) -> impl IntoElement {
@@ -784,10 +791,37 @@ fn render_tab_chip(
         .child(svg().path(icon_path).size(px(ICON_SIZE_PX)).text_color(icon_color))
         .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
-        .child(close_button(entity_id_raw, ix, is_active, entity, group_name, theme))
+        .child(if is_pinned {
+            pin_indicator(entity_id_raw, ix, theme).into_any_element()
+        } else {
+            close_button(entity_id_raw, ix, is_active, entity, group_name, theme)
+                .into_any_element()
+        })
         .when_some(drag_edge, |s, side| {
             s.child(insertion_bar(entity_id_raw, ix, side, theme))
         })
+}
+
+/// Pin-state indicator that replaces the close button on a pinned tab.
+/// Same footprint as `close_button` so swapping doesn't reflow the chip;
+/// non-interactive (the right-click "Unpin Tab" row is the toggle path)
+/// to keep accidental clicks from un-pinning.
+fn pin_indicator(entity_id_raw: u64, ix: usize, theme: Theme) -> impl IntoElement {
+    let glyph = svg()
+        .path("icons/pin.svg")
+        .size(px(10.0))
+        .text_color(theme.fg_muted);
+    div()
+        .id(SharedString::from(format!(
+            "pane-group-tab-pin-{entity_id_raw}-{ix}"
+        )))
+        .w(px(CLOSE_BUTTON_SIZE_PX))
+        .h(px(CLOSE_BUTTON_SIZE_PX))
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .child(glyph)
 }
 
 /// 2px-wide blue insertion bar overlay. Painted on the chip's leading

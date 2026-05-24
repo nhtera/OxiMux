@@ -15,7 +15,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{RequestRenameTabAt, SplitGroupAt};
+use crate::actions::{RequestRenameTabAt, SplitGroupAt, TogglePinTabAt};
 use crate::shell::pane_group::{PaneGroup, TabColor};
 use crate::shell::pane_tree::PaneGroupId;
 
@@ -65,6 +65,11 @@ struct TabContextTarget {
     /// Kind-specific payload for conditional rows (e.g. Copy Path /
     /// Reveal in Finder on editor tabs only).
     kind: TabContextKind,
+    /// Whether the right-clicked tab is currently pinned. Drives the
+    /// "Pin Tab" vs "Unpin Tab" row label; the action handler reads
+    /// the live flag from the PaneGroup at dispatch time so a stale
+    /// snapshot here never produces a wrong flip.
+    is_pinned: bool,
 }
 
 pub struct TabContextMenu {
@@ -107,6 +112,7 @@ impl TabContextMenu {
         tab_idx: usize,
         tab_count: usize,
         kind: TabContextKind,
+        is_pinned: bool,
         cx: &mut Context<Self>,
     ) {
         self.x_px = x_px;
@@ -117,6 +123,7 @@ impl TabContextMenu {
             tab_idx,
             tab_count,
             kind,
+            is_pinned,
         });
         self.open = true;
         cx.notify();
@@ -234,6 +241,27 @@ impl Render for TabContextMenu {
                     Box::new(RequestRenameTabAt {
                         group_id: target_group_id,
                         tab_idx: rename_idx as u32,
+                    }),
+                    cx,
+                );
+            }),
+        ));
+
+        let pin_idx = target.tab_idx;
+        let pin_label = if target.is_pinned { "Unpin Tab" } else { "Pin Tab" };
+        card = card.child(menu_row(
+            "tab-ctx-pin",
+            pin_label,
+            true,
+            theme,
+            density,
+            typography.clone(),
+            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                this.close(cx);
+                window.dispatch_action(
+                    Box::new(TogglePinTabAt {
+                        group_id: target_group_id,
+                        tab_idx: pin_idx as u32,
                     }),
                     cx,
                 );
