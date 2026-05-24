@@ -377,12 +377,29 @@ fn build_tab_strip_from_headers(
     } else {
         theme.border_inactive
     };
+    // Scroll-edge fade hints. Subtle 8px gradients painted absolutely
+    // over the strip's left and right edges of the SCROLLING region
+    // (right edge offset by the trailing cluster so the fade doesn't
+    // bleed onto the `+` / `...` buttons). Visibility is keyed off the
+    // scroll handle: show LEFT when the user has scrolled right (offset
+    // negative); show RIGHT when there's more content offscreen to the
+    // right. When both checks are false the strip fits exactly.
+    let offset_x = f32::from(scroll_handle.offset().x);
+    let max_offset_x = f32::from(scroll_handle.max_offset().x);
+    let show_left_fade = offset_x < -0.5;
+    let show_right_fade = offset_x > -(max_offset_x - 0.5);
+    let trailing_cluster_px = if show_pane_actions {
+        PLUS_BUTTON_WIDTH_PX + ELLIPSIS_BUTTON_WIDTH_PX
+    } else {
+        PLUS_BUTTON_WIDTH_PX
+    };
     let mut row = div()
         .flex()
         .flex_row()
         .items_stretch()
         .h(px(TAB_STRIP_HEIGHT_PX))
         .w_full()
+        .relative()
         .bg(theme.bg_panel)
         .border_b_2()
         .border_color(border_color)
@@ -390,6 +407,13 @@ fn build_tab_strip_from_headers(
         .child(plus_button(entity_id.as_u64(), theme));
     if show_pane_actions {
         row = row.child(pane_actions_button(entity_id.as_u64(), is_focused, theme));
+    }
+    // Overlays last so they paint on top of the chips.
+    if show_left_fade {
+        row = row.child(scroll_fade_overlay(true, trailing_cluster_px, theme));
+    }
+    if show_right_fade {
+        row = row.child(scroll_fade_overlay(false, trailing_cluster_px, theme));
     }
     row.into_any_element()
 }
@@ -1161,6 +1185,39 @@ fn render_mru_hud(
         })
         .child(card)
         .into_any_element()
+}
+
+/// Thin 8-px gradient overlay painted at the strip's left or right
+/// scroll edge. Acts as a visual cue that more chips exist offscreen.
+/// Left fade reserves no trailing offset; right fade is inset by the
+/// trailing chrome cluster width so it doesn't bleed onto the `+` /
+/// `...` buttons.
+///
+/// The gradient is a single-color overlay with low opacity — gpui's
+/// linear-gradient builder isn't trivially exposed for tiny edge fades,
+/// so a solid-bg with a low alpha gives the same visual hint at a
+/// fraction of the complexity.
+fn scroll_fade_overlay(
+    is_left: bool,
+    trailing_cluster_px: f32,
+    theme: Theme,
+) -> impl IntoElement {
+    let mut overlay = div()
+        .absolute()
+        .top(px(0.0))
+        // -2px so the fade clears the strip's bottom border without
+        // covering it (the border is the focused-group highlight).
+        .bottom(px(2.0))
+        .w(px(8.0))
+        .bg(theme.bg_panel)
+        .opacity(0.7)
+        .child(div());
+    if is_left {
+        overlay = overlay.left(px(0.0));
+    } else {
+        overlay = overlay.right(px(trailing_cluster_px));
+    }
+    overlay
 }
 
 fn close_button(

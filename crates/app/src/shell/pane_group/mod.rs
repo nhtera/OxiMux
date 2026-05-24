@@ -1314,6 +1314,15 @@ impl PaneGroup {
         if let Some(idx) = focused_idx {
             tree.set_active(idx);
         }
+        // Exit zoom mode before splitting — a zoomed sub-pane fills the
+        // body while siblings are collapsed to width 0. Splitting under
+        // that state hands the new sub-pane a zero-width slot, so the
+        // user sees nothing until they zoom back out. Toggling zoom off
+        // first restores the tree layout; the just-split pane gets a
+        // real slice of the body. Matches the reference editor.
+        if tree.zoomed().is_some() {
+            tree.toggle_zoom_active();
+        }
         // Inherit the source shell's CWD. libproc returns None when the
         // backend has no local pid (relay) or the shell already exited;
         // either way we fall back to the tab group's working directory.

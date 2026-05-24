@@ -152,17 +152,35 @@ impl PaneGroupManager {
         if self.group_tree.leaf_count() <= 1 {
             return Err(CloseGroupError::LastGroup);
         }
+        // Capture the closed group's visual position BEFORE removing it so
+        // we can refocus the sibling on its left (the user's intuition:
+        // closing a group sends focus back the way the eye reads). Falls
+        // back to the new leftmost survivor when the closed group was
+        // already leftmost.
+        let closed_visual_idx = self
+            .group_tree
+            .in_order_leaves()
+            .iter()
+            .position(|leaf| *leaf == id);
         if !self.group_tree.remove_leaf(id) {
             return Err(CloseGroupError::NotFound);
         }
-        // Pick the first surviving group as the new active. The caller
-        // may override (e.g., to focus the spatial neighbor).
-        let new_active = self
-            .group_tree
-            .in_order_leaves()
-            .first()
-            .copied()
-            .expect("leaf_count > 1 above guarantees at least one survivor");
+        let survivors = self.group_tree.in_order_leaves();
+        let new_active = match closed_visual_idx {
+            // `idx > 0` → left neighbor at `idx - 1` (survivors share the
+            // pre-removal layout because remove_leaf only drops one entry).
+            Some(idx) if idx > 0 => survivors
+                .get(idx - 1)
+                .copied()
+                .unwrap_or_else(|| survivors[0]),
+            // Closed group was leftmost OR not found (shouldn't happen
+            // after the remove_leaf above succeeded) → focus the new
+            // leftmost survivor. `leaf_count > 1` above guarantees a
+            // survivor exists.
+            _ => *survivors
+                .first()
+                .expect("leaf_count > 1 above guarantees at least one survivor"),
+        };
         self.active_group_id = new_active;
         Ok(id)
     }
@@ -241,6 +259,37 @@ mod tests {
         // Layout collapses back to a single leaf at id 0 (the survivor).
         assert_eq!(mgr.group_tree().leaf_count(), 1);
         assert_eq!(mgr.active_group_id(), PaneGroupId(0));
+    }
+
+    #[test]
+    fn close_rightmost_focuses_left_sibling() {
+        // Three-group layout: [0, 1, 2]. Close 2 → 1 should become
+        // active (left-of-removed), not 0 (leftmost).
+        let mut mgr = PaneGroupManager::new();
+        mgr.split_active_group(Axis::Horizontal, SplitInsert::After); // 0,1; active=1
+        mgr.split_active_group(Axis::Horizontal, SplitInsert::After); // 0,1,2; active=2
+        assert_eq!(
+            mgr.in_order_groups(),
+            vec![PaneGroupId(0), PaneGroupId(1), PaneGroupId(2)]
+        );
+        let closed = mgr.close_active_group().expect("non-last close succeeds");
+        assert_eq!(closed, PaneGroupId(2));
+        // Left-of-removed = PaneGroupId(1). NOT 0.
+        assert_eq!(mgr.active_group_id(), PaneGroupId(1));
+    }
+
+    #[test]
+    fn close_leftmost_focuses_new_leftmost() {
+        // Three groups [0, 1, 2]. Close 0 → no left sibling, so focus
+        // the new leftmost which is 1.
+        let mut mgr = PaneGroupManager::new();
+        mgr.split_active_group(Axis::Horizontal, SplitInsert::After); // 0,1; active=1
+        mgr.split_active_group(Axis::Horizontal, SplitInsert::After); // 0,1,2; active=2
+        assert!(mgr.set_active(PaneGroupId(0)));
+        let closed = mgr.close_active_group().expect("non-last close succeeds");
+        assert_eq!(closed, PaneGroupId(0));
+        // No left of leftmost → new leftmost survivor.
+        assert_eq!(mgr.active_group_id(), PaneGroupId(1));
     }
 
     #[test]
