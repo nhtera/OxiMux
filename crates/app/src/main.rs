@@ -17,10 +17,11 @@ use gpui::{
     px, size,
 };
 use oximux_app::actions::{
-    CloseTab, DismissOverlay, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab,
-    OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
-    PrevTab, Search, SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab,
-    SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
+    CloseTab, DismissOverlay, FocusNextSubPane, FocusPrevSubPane, MruNext, MruPrev, NewAgent,
+    NewTab, NextTab, OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen,
+    OpenWorkspaceCreate, PrevTab, Search, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
+    SelectSourceControlTab, SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar,
+    ToggleRightSidebar, ToggleZoomSubPane,
 };
 // SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
 // crate dependency: oximux-app → oximux-editor → oximux-app would be a cycle.
@@ -170,6 +171,11 @@ fn main() {
             // match. Mirrors Zed's own `pane::ActivateNextItem` binding.
             KeyBinding::new("cmd-}", NextTab, None),
             KeyBinding::new("cmd-{", PrevTab, None),
+            // MRU cycle — ctrl-tab is the cross-platform standard for
+            // "switch to last tab" (cmd-tab is reserved by macOS for
+            // app switching).
+            KeyBinding::new("ctrl-tab", MruNext, None),
+            KeyBinding::new("ctrl-shift-tab", MruPrev, None),
             // cmd-f opens the per-pane scrollback search overlay. Handled
             // on the focused TerminalView's root div — when no pane is
             // focused (no editor exists yet in v1), the action no-ops.

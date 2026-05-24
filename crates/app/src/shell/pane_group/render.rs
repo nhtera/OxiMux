@@ -78,6 +78,8 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_close_tab))
             .on_action(cx.listener(PaneGroup::on_next_tab))
             .on_action(cx.listener(PaneGroup::on_prev_tab))
+            .on_action(cx.listener(PaneGroup::on_mru_next))
+            .on_action(cx.listener(PaneGroup::on_mru_prev))
             .on_action(cx.listener(PaneGroup::on_new_agent))
             .on_action(cx.listener(PaneGroup::on_split_sub_pane_right))
             .on_action(cx.listener(PaneGroup::on_split_sub_pane_down))

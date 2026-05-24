@@ -152,6 +152,11 @@ pub struct PaneGroup {
     /// to a large negative x after every tab append so the strip's paint
     /// phase clamps to the right edge (keeping new + active tabs visible).
     tab_strip_scroll: ScrollHandle,
+    /// Most-recently-used tab order. `mru[0]` is the current active tab,
+    /// `mru[1]` is the previously-active tab (Cmd+Tab default target),
+    /// etc. Kept in sync with `tabs` via `bump_mru` / `forget_mru`;
+    /// indices stay aligned with the (sometimes-shifted) `tabs` Vec.
+    mru: Vec<usize>,
 }
 
 impl PaneGroup {
@@ -182,6 +187,7 @@ impl PaneGroup {
             window_active,
             chrome_w_px: density.w_left_rail,
             tab_strip_scroll: ScrollHandle::new(),
+            mru: Vec::new(),
         }
     }
 
@@ -366,6 +372,7 @@ impl PaneGroup {
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
+        self.bump_mru(self.active);
         self.focus_active(window, cx);
         self.pin_tab_strip_to_end();
         cx.notify();
@@ -474,6 +481,7 @@ impl PaneGroup {
         let _ = observer; // legacy single-view observer no longer used
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
+        self.bump_mru(self.active);
         self.focus_active(window, cx);
         cx.notify();
         self.active
@@ -501,6 +509,7 @@ impl PaneGroup {
             }
         }
         debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+        self.forget_mru(idx);
         if self.tabs.is_empty() {
             self.active = 0;
         } else if self.active == idx {
@@ -539,6 +548,7 @@ impl PaneGroup {
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
         self.active = self.tabs.len() - 1;
+        self.bump_mru(self.active);
         self.focus_active(window, cx);
         self.pin_tab_strip_to_end();
         cx.notify();
@@ -584,6 +594,7 @@ impl PaneGroup {
             }
         }
         debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+        self.forget_mru(idx);
         if let PaneGroupTabKind::Agent { session_id, .. } = removed.kind {
             let runtime = self.cli_runtime.clone();
             cx.spawn_in(window, async move |_this, _cx| {
@@ -688,12 +699,42 @@ impl PaneGroup {
         if idx >= self.tabs.len() {
             return;
         }
+        // Bump MRU first so the switcher overlay reflects the new
+        // ordering even when set_active early-returns (e.g., clicking
+        // the already-active tab still confirms it as most-recent).
+        self.bump_mru(idx);
         if idx == self.active {
             return;
         }
         self.active = idx;
         self.focus_active(window, cx);
         cx.notify();
+    }
+
+    /// Move `idx` to the front of the MRU queue (deduped). Called from
+    /// every path that activates a tab: set_active, new-tab spawn
+    /// paths, drag-transfer push. Cheap O(n) — n = visible tab count.
+    fn bump_mru(&mut self, idx: usize) {
+        self.mru.retain(|&i| i != idx);
+        self.mru.insert(0, idx);
+    }
+
+    /// Drop `idx` from the MRU queue and decrement every later entry
+    /// so MRU indices stay aligned with the post-remove `tabs` Vec.
+    /// Called from close_tab.
+    fn forget_mru(&mut self, idx: usize) {
+        self.mru.retain(|&i| i != idx);
+        for entry in self.mru.iter_mut() {
+            if *entry > idx {
+                *entry -= 1;
+            }
+        }
+    }
+
+    /// Read-only MRU order — front is most-recently-used. The switcher
+    /// overlay walks this to render its candidate list.
+    pub fn mru_order(&self) -> &[usize] {
+        &self.mru
     }
 
     pub fn set_active_by_tab_id(
@@ -827,6 +868,41 @@ impl PaneGroup {
 
     pub(crate) fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
         self.prev_tab(window, cx);
+    }
+
+    /// Switch to MRU[1] — the tab that was active just before the current
+    /// one. Repeated press toggles back to MRU[0]'s previous (now MRU[1]
+    /// after the first switch), giving the "Alt+Tab to last" cycle.
+    /// No-op when fewer than 2 tabs exist or no prior switch is tracked.
+    pub(crate) fn on_mru_next(
+        &mut self,
+        _: &crate::actions::MruNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&target) = self.mru.get(1) else {
+            return;
+        };
+        self.set_active(target, window, cx);
+    }
+
+    /// Switch to MRU.last() — the least-recently-used tab. Useful for
+    /// jumping to a tab you haven't touched in a while without scrolling
+    /// the strip. No-op when fewer than 2 tabs exist.
+    pub(crate) fn on_mru_prev(
+        &mut self,
+        _: &crate::actions::MruPrev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mru.len() < 2 {
+            return;
+        }
+        let target = *self.mru.last().expect("len >= 2 above");
+        if target == self.active {
+            return;
+        }
+        self.set_active(target, window, cx);
     }
 
     pub(crate) fn on_new_agent(

@@ -121,6 +121,15 @@ actions!(
         NextTab,
         /// Cycle to the previous tab inside the focused pane.
         PrevTab,
+        /// Switch to the most-recently-used previous tab (MRU[1]) in the
+        /// focused group. Repeated press toggles between the two most-
+        /// recent tabs — the classic "Alt+Tab to last" muscle memory.
+        /// Bound to Ctrl+Tab.
+        MruNext,
+        /// Switch to the LEAST-recently-used tab in the focused group
+        /// (MRU.last()). Useful for cycling back through history without
+        /// a HUD. Bound to Ctrl+Shift+Tab.
+        MruPrev,
         /// Open the scrollback search overlay on the focused terminal pane.
         Search,
         /// Toggle the git changed-files panel (binding moved to SelectSourceControlTab).
