@@ -172,6 +172,16 @@ impl Render for ProjectPanes {
         // the last group keeps the workspace anchored.
         self.purge_empty_groups(window, cx);
 
+        // Stale-hover guard: GPUI fires on_drop only when the user
+        // releases over a listening target. Drops onto empty space,
+        // off-window releases, or drag-cancel (Escape, app switch) just
+        // dump `cx.active_drag` to None with no callback. Without this
+        // check the last-painted 5-zone overlay stays on screen until
+        // the next pointer move triggers a re-render.
+        if !cx.has_active_drag() && self.hovered_drop_target().is_some() {
+            self.set_hovered_drop_target(None, cx);
+        }
+
         let theme = self.theme;
         let tree = self.manager().group_tree().clone();
         let active_group_id = self.manager().active_group_id();
