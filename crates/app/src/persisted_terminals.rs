@@ -86,9 +86,15 @@ pub struct PersistedGroup {
     pub tab_order: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedTab {
     pub label: String,
+    /// Per-tab sub-pane layout tree (one terminal tab → multiple PTY
+    /// splits via `Cmd+D`). Pre-v4 snapshots always emitted
+    /// `PersistedTree::Leaf` here regardless of the live split state, so
+    /// restored multi-sub-pane tabs collapsed back to a single pane.
+    /// v4 reflects the actual `TerminalSplitTree::tree()` topology so
+    /// Cmd+D layouts survive restart.
     pub tree: PersistedTree,
     /// Present iff the tab was an agent tab. `None` keeps the existing
     /// plain-terminal restore path. `#[serde(default)]` lets older snapshots
@@ -102,6 +108,31 @@ pub struct PersistedTab {
     /// editor tabs (which the legacy schema dropped entirely).
     #[serde(default)]
     pub kind: PersistedTabKind,
+    /// Per-leaf sub-pane state in DFS leaf-walk order of `tree`. Length
+    /// must equal `tree`'s leaf count (>= 1). Empty for legacy
+    /// (pre-v4) blobs — restorer falls back to a single sub-pane at the
+    /// project cwd. Active leaf is `active_sub_pane` below (also a DFS
+    /// position).
+    #[serde(default)]
+    pub sub_panes: Vec<PersistedSubPane>,
+    /// Active sub-pane's position in DFS leaf order of `tree`. `0` for
+    /// single-leaf trees (the default for pre-v4 blobs).
+    #[serde(default)]
+    pub active_sub_pane: usize,
+}
+
+/// Per-leaf state captured by `PersistedTab.sub_panes`. Carries enough
+/// metadata to respawn a PTY in the same shell location on restore.
+/// Scrollback is NOT stored here — it stays in the existing
+/// `pane_buffers` table (one row per tab; only the active sub-pane's
+/// buffer is captured today, matching pre-v4 behavior).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PersistedSubPane {
+    /// Working directory at capture time. `None` → restore falls back
+    /// to the project cwd. Resolved at snapshot via `cwd_of_pid` on the
+    /// PTY's local process id.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// Tab kind tag persisted alongside `PersistedTab`. The agent variant
@@ -133,8 +164,11 @@ pub struct PersistedAgentTab {
 
 /// Mirrors `PaneTree` but without GPUI-side `PaneId`s (regenerated on
 /// restore). `Split` keeps weights so drag-resize is preserved.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` resolves to `Leaf` so `PersistedTab::default()` produces a
+/// well-formed single-pane tab.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum PersistedTree {
+    #[default]
     Leaf,
     Split {
         axis: PersistedAxis,
@@ -273,6 +307,7 @@ mod tests {
                 tree: snap,
                 agent: None,
                 kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
             }],
             active: 0,
             next_label_n: 2,
@@ -318,6 +353,7 @@ mod tests {
                     effort: Some("high".into()),
                 }),
                 kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
             }],
             active: 0,
             next_label_n: 2,
@@ -344,6 +380,7 @@ mod tests {
                 kind: PersistedTabKind::Editor {
                     path: "/tmp/proj/README.md".into(),
                 },
+                ..PersistedTab::default()
             }],
             active: 0,
             next_label_n: 2,
@@ -368,18 +405,21 @@ mod tests {
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
                 PersistedTab {
                     label: "T1".into(),
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
                 PersistedTab {
                     label: "T2".into(),
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
             ],
             active: 1,
@@ -418,12 +458,14 @@ mod tests {
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
                 PersistedTab {
                     label: "G1-T0".into(),
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
             ],
             active: 1,
@@ -481,30 +523,35 @@ mod tests {
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
                 PersistedTab {
                     label: "G1-T0".into(),
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
                 PersistedTab {
                     label: "G1-T1".into(),
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
                 PersistedTab {
                     label: "G1-T2".into(),
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
                 PersistedTab {
                     label: "G2-T0".into(),
                     tree: PersistedTree::Leaf,
                     agent: None,
                     kind: PersistedTabKind::Terminal,
+                    ..PersistedTab::default()
                 },
             ],
             active: 2, // G1-T1 globally
@@ -559,6 +606,88 @@ mod tests {
             panic!("expected nested split on right");
         };
         assert!(matches!(axis, PersistedAxis::Vertical));
+    }
+
+    #[test]
+    fn sub_pane_tree_with_cwds_round_trips() {
+        // 3-sub-pane terminal tab: horizontal split with the right side
+        // further split vertically. Each leaf carries its captured cwd.
+        // The blob must round-trip per-leaf cwd + active position
+        // through JSON intact.
+        let mut tab = PersistedTab {
+            label: "Terminal 1".into(),
+            tree: PersistedTree::Split {
+                axis: PersistedAxis::Horizontal,
+                children: vec![
+                    PersistedTree::Leaf,
+                    PersistedTree::Split {
+                        axis: PersistedAxis::Vertical,
+                        children: vec![PersistedTree::Leaf, PersistedTree::Leaf],
+                        weights: vec![1.0, 2.0],
+                    },
+                ],
+                weights: vec![1.0, 1.5],
+            },
+            ..PersistedTab::default()
+        };
+        tab.sub_panes = vec![
+            PersistedSubPane {
+                cwd: Some("/tmp/a".into()),
+            },
+            PersistedSubPane {
+                cwd: Some("/tmp/b".into()),
+            },
+            PersistedSubPane { cwd: None },
+        ];
+        tab.active_sub_pane = 2; // bottom-right leaf in DFS order
+        let blob = PersistedTabs {
+            tabs: vec![tab],
+            active: 0,
+            next_label_n: 2,
+            tab_order: vec![0],
+            ..PersistedTabs::default()
+        };
+        let s = serde_json::to_string(&blob).unwrap();
+        let back: PersistedTabs = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tabs[0].sub_panes.len(), 3);
+        assert_eq!(back.tabs[0].active_sub_pane, 2);
+        assert_eq!(
+            back.tabs[0].sub_panes[0].cwd.as_deref(),
+            Some("/tmp/a")
+        );
+        assert_eq!(
+            back.tabs[0].sub_panes[1].cwd.as_deref(),
+            Some("/tmp/b")
+        );
+        assert_eq!(back.tabs[0].sub_panes[2].cwd, None);
+        // Tree shape preserved.
+        let PersistedTree::Split {
+            axis,
+            children,
+            weights,
+        } = &back.tabs[0].tree
+        else {
+            panic!("expected split root");
+        };
+        assert!(matches!(axis, PersistedAxis::Horizontal));
+        assert_eq!(weights, &vec![1.0, 1.5]);
+        assert_eq!(children.len(), 2);
+        let PersistedTree::Split { axis: inner, .. } = &children[1] else {
+            panic!("expected nested split");
+        };
+        assert!(matches!(inner, PersistedAxis::Vertical));
+    }
+
+    #[test]
+    fn legacy_blob_defaults_sub_panes_empty() {
+        // Pre-v4 blobs had no `sub_panes` / `active_sub_pane` fields.
+        // Restore falls back to single-pane (handled by the factory's
+        // `tab.sub_panes.len() > 1` check, which fails for empty).
+        let legacy =
+            r#"{"tabs":[{"label":"Terminal 1","tree":"Leaf"}],"active":0,"next_label_n":2}"#;
+        let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.tabs[0].sub_panes.is_empty());
+        assert_eq!(parsed.tabs[0].active_sub_pane, 0);
     }
 
     #[test]

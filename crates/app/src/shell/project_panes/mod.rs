@@ -32,9 +32,10 @@ use oximux_storage::{PaneBufferRepo, PaneRelayIdRepo};
 
 use crate::notifier::{Notifier, TabId};
 use crate::persisted_terminals::{
-    PersistedAgentTab, PersistedGroup, PersistedTab, PersistedTabKind, PersistedTabs,
-    PersistedTree, snapshot_tree,
+    PersistedAgentTab, PersistedGroup, PersistedSubPane, PersistedTab, PersistedTabKind,
+    PersistedTabs, PersistedTree, snapshot_tree,
 };
+use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::tab_drag_zones::Zone;
 use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind};
 use crate::shell::pane_group_manager::{
@@ -795,11 +796,25 @@ impl ProjectPanes {
                     active_group_dfs_idx = Some(dfs_idx);
                     local_active = emitted_in_group;
                 }
+                // For terminal tabs (non-agent), capture the sub-pane
+                // tree topology + per-leaf cwd. Agent tabs are always
+                // single-sub-pane; skipping keeps their blobs minimal.
+                let (sub_tree, sub_panes, active_sub_pane) = if matches!(
+                    tab.kind,
+                    PaneGroupTabKind::Terminal
+                ) && agent.is_none()
+                {
+                    snapshot_sub_pane_tree(tab, cx)
+                } else {
+                    (PersistedTree::Leaf, Vec::new(), 0)
+                };
                 tabs.push(PersistedTab {
                     label: tab.label.to_string(),
-                    tree: PersistedTree::Leaf,
+                    tree: sub_tree,
                     agent,
                     kind,
+                    sub_panes,
+                    active_sub_pane,
                 });
                 orig_to_emitted.insert(idx, emitted_in_group);
                 emitted_in_group += 1;
@@ -879,6 +894,42 @@ impl ProjectPanes {
             return;
         };
         group.update(cx, |g, cx| g.push_restored_terminal_tab(label, view, cx));
+    }
+
+    /// Multi-sub-pane restore: append a terminal tab whose
+    /// `TerminalSplitTree` has been fully reconstructed by the factory
+    /// (per-leaf views + observers + tree shape + active position).
+    /// Targets the active group; the `_in` variant takes an explicit
+    /// group id for multi-group restore.
+    pub fn push_restored_terminal_tab_with_tree(
+        &mut self,
+        label: String,
+        tree: crate::shell::pane_group::sub_pane::TerminalSplitTree,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.active_group() else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            g.push_restored_terminal_tab_with_tree(label, tree, cx)
+        });
+    }
+
+    /// Multi-sub-pane restore into a SPECIFIC group (multi-group restore
+    /// path). No-op when `group_id` isn't registered.
+    pub fn push_restored_terminal_tab_with_tree_in(
+        &mut self,
+        group_id: PaneGroupId,
+        label: String,
+        tree: crate::shell::pane_group::sub_pane::TerminalSplitTree,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(&group_id) else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            g.push_restored_terminal_tab_with_tree(label, tree, cx)
+        });
     }
 
     /// Append a restored agent tab to the active group. Builds the view
@@ -1244,4 +1295,36 @@ impl Focusable for ProjectPanes {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+/// Capture a terminal tab's `TerminalSplitTree` for persistence: the
+/// shape (axes + weights via `snapshot_tree`), the per-leaf cwd via
+/// `os_pid()` → `cwd_of_pid`, and the active leaf's DFS position. The
+/// DFS-position contract pairs with `from_persisted` on the restore side:
+/// the restorer walks the persisted tree in DFS order, allocating fresh
+/// slot ids 0..N — `sub_panes[i]` lands on the i-th DFS leaf, and
+/// `active_sub_pane` is interpreted the same way.
+fn snapshot_sub_pane_tree(
+    tab: &crate::shell::pane_group::PaneGroupTab,
+    cx: &App,
+) -> (PersistedTree, Vec<PersistedSubPane>, usize) {
+    let PaneContent::Terminal(tree) = &tab.content else {
+        return (PersistedTree::Leaf, Vec::new(), 0);
+    };
+    let shape = snapshot_tree(tree.tree());
+    let leaves = tree.tree().in_order_leaves();
+    let mut sub_panes: Vec<PersistedSubPane> = Vec::with_capacity(leaves.len());
+    for slot in &leaves {
+        let cwd = tree
+            .get(*slot)
+            .and_then(|view| view.read(cx).os_pid())
+            .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+            .map(|p| p.display().to_string());
+        sub_panes.push(PersistedSubPane { cwd });
+    }
+    let active_dfs_pos = leaves
+        .iter()
+        .position(|&slot| slot == tree.active())
+        .unwrap_or(0);
+    (shape, sub_panes, active_dfs_pos)
 }

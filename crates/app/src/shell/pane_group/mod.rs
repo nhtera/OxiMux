@@ -832,6 +832,36 @@ impl PaneGroup {
         cx.notify();
     }
 
+    /// Append a pre-built terminal tab with a fully-restored sub-pane
+    /// tree. Restore path for multi-sub-pane tabs (Cmd+D splits): the
+    /// caller constructs the `TerminalSplitTree` via `from_persisted`
+    /// with all child views + observers already in place, then hands
+    /// the whole tree over here. Observers stay inside the tree's
+    /// per-leaf `observers` Vec; the tab-level `_observer` slot is
+    /// unused for this path (single-leaf shape would use it, but the
+    /// per-leaf observers in the tree drive notifications for every
+    /// pane already).
+    pub fn push_restored_terminal_tab_with_tree(
+        &mut self,
+        label: String,
+        tree: TerminalSplitTree,
+        cx: &mut Context<Self>,
+    ) {
+        self.tabs.push(PaneGroupTab {
+            label: SharedString::from(label),
+            content: PaneContent::Terminal(tree),
+            kind: PaneGroupTabKind::Terminal,
+            color: None,
+            custom_title: None,
+            pinned: false,
+            _observer: None,
+            _status_task: None,
+        });
+        self.tab_order.push(self.tabs.len() - 1);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+    }
+
     pub fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if idx >= self.tabs.len() {
             return;

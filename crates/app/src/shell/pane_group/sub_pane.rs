@@ -12,6 +12,7 @@
 
 use gpui::{Entity, Subscription};
 
+use crate::persisted_terminals::{PersistedTree, restore_tree};
 use crate::shell::pane_tree::{Axis, PaneTree, SplitInsert};
 use crate::shell::terminal_view::TerminalView;
 
@@ -49,6 +50,49 @@ impl TerminalSplitTree {
             tree: PaneTree::Leaf(0),
             active: 0,
             observers: vec![Some(observer)],
+            zoomed: None,
+        }
+    }
+
+    /// Restore-side constructor. `tree_proto` carries the shape (axes +
+    /// weights); `leaves` is the per-leaf (view, observer) pair in DFS
+    /// visit order; `active_dfs_pos` is the active leaf's DFS position.
+    ///
+    /// The restorer walks `tree_proto` in DFS order and allocates slot
+    /// ids `0..N` in the same order, so the i-th DFS leaf binds to
+    /// `leaves[i]` AND to slot `i` in the resulting `panes` vec. The
+    /// active sub-pane index is therefore identical to the DFS
+    /// position — no remapping needed.
+    ///
+    /// `leaves.len()` must equal `count_leaves(tree_proto)`; debug-asserted.
+    pub fn from_persisted(
+        tree_proto: &PersistedTree,
+        leaves: Vec<(Entity<TerminalView>, Subscription)>,
+        active_dfs_pos: usize,
+    ) -> Self {
+        let mut next_slot: usize = 0;
+        let tree = restore_tree::<usize, _>(tree_proto, &mut || {
+            let s = next_slot;
+            next_slot += 1;
+            s
+        });
+        debug_assert_eq!(
+            next_slot,
+            leaves.len(),
+            "leaves count must match tree leaf count"
+        );
+        let mut panes: Vec<Option<Entity<TerminalView>>> = Vec::with_capacity(leaves.len());
+        let mut observers: Vec<Option<Subscription>> = Vec::with_capacity(leaves.len());
+        for (view, obs) in leaves {
+            panes.push(Some(view));
+            observers.push(Some(obs));
+        }
+        let active = active_dfs_pos.min(panes.len().saturating_sub(1));
+        Self {
+            panes,
+            tree,
+            active,
+            observers,
             zoomed: None,
         }
     }

@@ -24,8 +24,10 @@ use oximux_storage::{PaneBufferRepo, SettingsRepo};
 
 use crate::notifier::Notifier;
 use crate::persisted_terminals::{
-    PersistedAgentTab, PersistedTabKind, PersistedTabs, settings_key,
+    PersistedAgentTab, PersistedSubPane, PersistedTab, PersistedTabKind, PersistedTabs,
+    settings_key,
 };
+use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{TerminalView, attach_pty_existing, spawn_local_pty};
@@ -161,6 +163,30 @@ pub(crate) fn build_project_panes(
                         window,
                         cx,
                     );
+                } else if tab.sub_panes.len() > 1 {
+                    // Multi-sub-pane restore — spawn one fresh PTY per
+                    // leaf at the captured cwd (no relay attach). Active
+                    // sub-pane gets the saved scrollback.
+                    if let Some(tree) = build_multi_sub_pane_tree(
+                        tab,
+                        cwd.clone(),
+                        theme,
+                        density,
+                        typography.clone(),
+                        window,
+                        cx,
+                    ) {
+                        let bytes = buf_iter.next().unwrap_or_default();
+                        if !bytes.is_empty()
+                            && let Some(active_view) = tree.active_view()
+                        {
+                            active_view.read(cx).prefill_grid(&bytes);
+                        }
+                        panes_entity.update(cx, |p, cx| {
+                            p.push_restored_terminal_tab_with_tree(tab.label.clone(), tree, cx);
+                        });
+                        ordinal += 1;
+                    }
                 } else if let Some(view) = build_terminal_view_for_tab(
                     cwd.clone(),
                     &attach_hints,
@@ -265,6 +291,35 @@ fn restore_multi_group(
                             window,
                             cx,
                         );
+                    } else if tab.sub_panes.len() > 1 {
+                        // Multi-sub-pane restore into a specific group.
+                        // Same machinery as the single-group path; only
+                        // the push API differs.
+                        if let Some(tree) = build_multi_sub_pane_tree(
+                            tab,
+                            cwd.clone(),
+                            theme,
+                            density,
+                            typography.clone(),
+                            window,
+                            cx,
+                        ) {
+                            let bytes = buf_iter.next().unwrap_or_default();
+                            if !bytes.is_empty()
+                                && let Some(active_view) = tree.active_view()
+                            {
+                                active_view.read(cx).prefill_grid(&bytes);
+                            }
+                            panes_entity.update(cx, |p, cx| {
+                                p.push_restored_terminal_tab_with_tree_in(
+                                    group_id,
+                                    tab.label.clone(),
+                                    tree,
+                                    cx,
+                                );
+                            });
+                            ordinal += 1;
+                        }
                     } else if let Some(view) = build_terminal_view_for_tab(
                         cwd.clone(),
                         &attach_hints,
@@ -412,6 +467,62 @@ fn restore_agent_tab(
         }
     })
     .detach();
+}
+
+/// Spawn one fresh PTY + TerminalView per leaf in `tab.sub_panes`, then
+/// fold them into a `TerminalSplitTree` matching the persisted shape.
+/// Each leaf inherits the cwd captured at snapshot time (or
+/// `project_cwd` when missing/invalid). Returns `None` when at least
+/// one PTY spawn fails — the whole tab is dropped rather than leaving a
+/// partially-restored tree with phantom slots.
+#[allow(clippy::too_many_arguments)]
+fn build_multi_sub_pane_tree(
+    tab: &PersistedTab,
+    project_cwd: PathBuf,
+    theme: Theme,
+    density: Density,
+    typography: Typography,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceRoot>,
+) -> Option<TerminalSplitTree> {
+    let mut leaves: Vec<(Entity<TerminalView>, gpui::Subscription)> =
+        Vec::with_capacity(tab.sub_panes.len());
+    for sp in &tab.sub_panes {
+        let leaf_cwd = resolve_sub_pane_cwd(sp, &project_cwd);
+        let Some((backend, session_id)) = spawn_local_pty(leaf_cwd) else {
+            tracing::warn!(label = %tab.label, "sub-pane PTY spawn failed; dropping tab");
+            return None;
+        };
+        let view = cx.new(|cx| {
+            TerminalView::mount(
+                backend,
+                session_id,
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
+        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+        leaves.push((view, observer));
+    }
+    Some(TerminalSplitTree::from_persisted(
+        &tab.tree,
+        leaves,
+        tab.active_sub_pane,
+    ))
+}
+
+/// Validate + materialize a sub-pane's persisted cwd. Falls back to
+/// `project_cwd` when the saved cwd is missing, blank, or no longer
+/// exists on disk. Avoids spawning a shell into a stale directory.
+fn resolve_sub_pane_cwd(sp: &PersistedSubPane, project_cwd: &PathBuf) -> PathBuf {
+    let candidate = sp.cwd.as_deref().map(PathBuf::from);
+    match candidate {
+        Some(p) if p.is_dir() => p,
+        _ => project_cwd.clone(),
+    }
 }
 
 fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
