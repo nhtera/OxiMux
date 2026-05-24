@@ -875,7 +875,12 @@ impl ProjectPanes {
 
     /// Build a snapshot + hand it to the save callback. No-op when no
     /// callback is registered.
-    pub fn save_now(&self, cx: &mut Context<Self>) {
+    ///
+    /// Takes `&App` (not `&mut Context<Self>`) so the on-quit hook in
+    /// `main.rs` — which only has `&App` in its closure — can call it.
+    /// Snapshotting is a pure read of `self` + per-leaf grid reads; no
+    /// mutation, so a shared-ref context is sufficient.
+    pub fn save_now(&self, cx: &gpui::App) {
         if let Some(cb) = self.save_callback.clone() {
             let snap = self.snapshot(cx);
             cb(snap);

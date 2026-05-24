@@ -259,9 +259,15 @@ fn main() {
             // GPUI's grace window (default 100 ms); BLOB writes for ~10
             // panes fit comfortably. Restore on next launch reads these
             // same rows in `set_active_project` (Phase 4 step 16).
+            //
+            // `capture_all_layouts` must fire too — otherwise the per-project
+            // PersistedTabs blob never sees tab creations / closures / group
+            // splits made during the session, so the next launch reads the
+            // STALE layout and the user's session-recent tabs vanish.
             let workspace_for_quit = workspace.clone();
             cx.on_app_quit(move |cx| {
                 let root = workspace_for_quit.read(cx);
+                root.capture_all_layouts(cx);
                 root.capture_all_pane_buffers(cx);
                 root.capture_all_pane_relay_ids(cx);
                 async {}

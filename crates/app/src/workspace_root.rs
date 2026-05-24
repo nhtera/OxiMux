@@ -458,6 +458,19 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Walk every open project's `ProjectPanes` and persist its full
+    /// layout snapshot (groups, sub-pane trees, tab_order, active
+    /// indices, editor paths, agent metadata). Without this hook the
+    /// on-quit save chain would only persist pane scrollback + relay
+    /// ids — every tab/group structural change made during the session
+    /// would be lost. Pairs with `capture_all_pane_buffers` so a single
+    /// quit fires both writes.
+    pub fn capture_all_layouts(&self, cx: &gpui::App) {
+        for panes in self.project_panes_by_project.values() {
+            panes.read(cx).save_now(cx);
+        }
+    }
+
     /// Walk every open project's tabs and persist each plain-terminal
     /// leaf's relay PTY id (Phase 5 step 6). Called from the same
     /// hooks as `capture_all_pane_buffers` so the two tables stay in
