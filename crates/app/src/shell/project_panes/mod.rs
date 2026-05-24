@@ -31,7 +31,9 @@ use oximux_pty::TerminalSessionId;
 use oximux_storage::{PaneBufferRepo, PaneRelayIdRepo};
 
 use crate::notifier::{Notifier, TabId};
-use crate::persisted_terminals::{PersistedAgentTab, PersistedTab, PersistedTabs, PersistedTree};
+use crate::persisted_terminals::{
+    PersistedAgentTab, PersistedTab, PersistedTabKind, PersistedTabs, PersistedTree,
+};
 use crate::shell::pane_group::tab_drag_zones::Zone;
 use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind};
 use crate::shell::pane_group_manager::{
@@ -715,12 +717,18 @@ impl ProjectPanes {
     }
 
     /// v1 snapshot — flattens every group's tabs into one linear list
-    /// keyed by terminal/agent kind. Editor + Custom-agent tabs are
-    /// skipped (consistent with the legacy schema). Multi-group layout
-    /// is NOT yet persisted; restore reconstructs a single group with
-    /// every tab. v2 schema lives in a follow-up slice.
+    /// keyed by terminal/editor/agent kind. Custom-agent tabs are still
+    /// skipped (their `(program, args)` config isn't captured anywhere
+    /// yet). Multi-group layout is NOT yet persisted; restore reconstructs
+    /// a single group with every tab. v2 schema (this slice) adds:
+    /// - `kind: PersistedTabKind::Editor { path }` so editor tabs round-trip.
+    /// - `tab_order: Vec<usize>` so drag-reordered visual sequence survives.
     pub fn snapshot(&self, cx: &App) -> PersistedTabs {
         let mut tabs: Vec<PersistedTab> = Vec::new();
+        // Per-group (local insertion idx → flat idx) translation. Built
+        // while emitting `tabs` so the same skip rules apply to both the
+        // tabs vec AND the tab_order projection below.
+        let mut local_to_flat: HashMap<(PaneGroupId, usize), usize> = HashMap::new();
         let mut active_offset: Option<usize> = None;
         let mut flat_idx: usize = 0;
         let active_group_id = self.manager.active_group_id();
@@ -731,9 +739,14 @@ impl ProjectPanes {
             let group_ref = group.read(cx);
             let group_active = group_ref.active();
             for (idx, tab) in group_ref.tabs().iter().enumerate() {
-                let agent = match &tab.kind {
-                    PaneGroupTabKind::Terminal => None,
-                    PaneGroupTabKind::Editor { .. } => continue,
+                let (agent, kind) = match &tab.kind {
+                    PaneGroupTabKind::Terminal => (None, PersistedTabKind::Terminal),
+                    PaneGroupTabKind::Editor { path } => (
+                        None,
+                        PersistedTabKind::Editor {
+                            path: path.display().to_string(),
+                        },
+                    ),
                     PaneGroupTabKind::Agent {
                         adapter,
                         adapter_id,
@@ -745,13 +758,16 @@ impl ProjectPanes {
                         if matches!(adapter, AgentAdapter::Custom) {
                             continue;
                         }
-                        Some(PersistedAgentTab {
-                            adapter: *adapter,
-                            adapter_id: (*adapter_id).to_string(),
-                            worktree_path: worktree_path.display().to_string(),
-                            model: model.clone(),
-                            effort: effort.clone(),
-                        })
+                        (
+                            Some(PersistedAgentTab {
+                                adapter: *adapter,
+                                adapter_id: (*adapter_id).to_string(),
+                                worktree_path: worktree_path.display().to_string(),
+                                model: model.clone(),
+                                effort: effort.clone(),
+                            }),
+                            PersistedTabKind::Terminal,
+                        )
                     }
                 };
                 if group_id == active_group_id && idx == group_active {
@@ -761,14 +777,31 @@ impl ProjectPanes {
                     label: tab.label.to_string(),
                     tree: PersistedTree::Leaf,
                     agent,
+                    kind,
                 });
+                local_to_flat.insert((group_id, idx), flat_idx);
                 flat_idx += 1;
+            }
+        }
+        // Project each group's visual `tab_order` into the flat space.
+        // Skipped tabs (custom-agent) drop out cleanly because the
+        // `local_to_flat` lookup misses for them.
+        let mut tab_order: Vec<usize> = Vec::with_capacity(tabs.len());
+        for group_id in self.manager.in_order_groups() {
+            let Some(group) = self.groups.get(&group_id) else {
+                continue;
+            };
+            for &local_idx in group.read(cx).tab_order_iter() {
+                if let Some(&flat) = local_to_flat.get(&(group_id, local_idx)) {
+                    tab_order.push(flat);
+                }
             }
         }
         PersistedTabs {
             tabs,
             active: active_offset.unwrap_or(0),
             next_label_n: 1,
+            tab_order,
         }
     }
 
@@ -831,12 +864,17 @@ impl ProjectPanes {
         });
     }
 
-    /// Finalize a restore: activate the requested tab inside the
-    /// single restored group, focus it, and trigger a render.
+    /// Finalize a restore: re-apply the saved visual `tab_order`,
+    /// activate the requested tab inside the single restored group,
+    /// focus it, and trigger a render. `tab_order.is_empty()` means
+    /// the snapshot was pre-v2 with no order field — caller passes the
+    /// empty vec and the method skips the re-order pass (insertion
+    /// order survives as the visual order, which matches pre-v2 behavior).
     pub fn apply_restored_state(
         &mut self,
         active: usize,
         _next_label_n: u64,
+        tab_order: Vec<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -844,6 +882,9 @@ impl ProjectPanes {
             return;
         };
         group.update(cx, |g, cx| {
+            if !tab_order.is_empty() {
+                g.set_tab_order(tab_order);
+            }
             if active < g.tab_count() {
                 g.set_active(active, window, cx);
             }

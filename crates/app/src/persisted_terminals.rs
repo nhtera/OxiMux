@@ -32,6 +32,16 @@ pub struct PersistedTabs {
     pub tabs: Vec<PersistedTab>,
     pub active: usize,
     pub next_label_n: u64,
+    /// Visual order of tabs as a list of flat indices into `tabs`. Empty
+    /// = "use insertion order" (legacy snapshots). New snapshots always
+    /// emit a populated vector matching `tabs.len()` so drag-reordered
+    /// strips survive restart.
+    ///
+    /// `#[serde(default)]` keeps pre-v2 blobs readable — they parse with
+    /// `tab_order: Vec::new()` and the restorer falls back to insertion
+    /// order via the empty-vec check.
+    #[serde(default)]
+    pub tab_order: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +53,28 @@ pub struct PersistedTab {
     /// (no `agent` field) parse cleanly.
     #[serde(default)]
     pub agent: Option<PersistedAgentTab>,
+    /// Explicit kind tag. `#[serde(default)]` resolves to
+    /// `PersistedTabKind::Terminal` for pre-v2 blobs — combined with the
+    /// existing `agent` field (`Some` → Agent restoration path), this
+    /// keeps every legacy snapshot readable. New snapshots set this for
+    /// editor tabs (which the legacy schema dropped entirely).
+    #[serde(default)]
+    pub kind: PersistedTabKind,
+}
+
+/// Tab kind tag persisted alongside `PersistedTab`. The agent variant
+/// is unused (Agent metadata lives in the legacy `agent: Option<...>`
+/// field to keep diffs small + back-compat trivial). Terminal is the
+/// default — see `PersistedTab::kind` doc.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub enum PersistedTabKind {
+    #[default]
+    Terminal,
+    /// Editor tab — `path` is the absolute filesystem path. Restore
+    /// reopens the file (or surfaces a missing-file warning if gone).
+    Editor {
+        path: String,
+    },
 }
 
 /// Per-tab agent metadata sufficient to respawn the same CLI session on
@@ -191,15 +223,19 @@ mod tests {
                 label: "Terminal 1".into(),
                 tree: snap,
                 agent: None,
+                kind: PersistedTabKind::Terminal,
             }],
             active: 0,
             next_label_n: 2,
+            tab_order: vec![0],
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
         assert_eq!(back.tabs.len(), 1);
         assert_eq!(back.next_label_n, 2);
         assert!(back.tabs[0].agent.is_none());
+        assert_eq!(back.tab_order, vec![0]);
+        assert_eq!(back.tabs[0].kind, PersistedTabKind::Terminal);
     }
 
     #[test]
@@ -212,6 +248,10 @@ mod tests {
         let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.tabs.len(), 1);
         assert!(parsed.tabs[0].agent.is_none());
+        // Pre-v2 fields fall back to defaults — Terminal kind and empty
+        // tab_order (caller infers insertion order).
+        assert_eq!(parsed.tabs[0].kind, PersistedTabKind::Terminal);
+        assert!(parsed.tab_order.is_empty());
     }
 
     #[test]
@@ -227,9 +267,11 @@ mod tests {
                     model: Some("claude-opus-4-7".into()),
                     effort: Some("high".into()),
                 }),
+                kind: PersistedTabKind::Terminal,
             }],
             active: 0,
             next_label_n: 2,
+            tab_order: vec![0],
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
@@ -239,5 +281,61 @@ mod tests {
         assert_eq!(agent.worktree_path, "/tmp/proj");
         assert_eq!(agent.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(agent.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn round_trip_editor_tab_carries_path() {
+        let blob = PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "README.md".into(),
+                tree: PersistedTree::Leaf,
+                agent: None,
+                kind: PersistedTabKind::Editor {
+                    path: "/tmp/proj/README.md".into(),
+                },
+            }],
+            active: 0,
+            next_label_n: 2,
+            tab_order: vec![0],
+        };
+        let s = serde_json::to_string(&blob).unwrap();
+        let back: PersistedTabs = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back.tabs[0].kind,
+            PersistedTabKind::Editor { ref path } if path == "/tmp/proj/README.md"
+        ));
+    }
+
+    #[test]
+    fn tab_order_round_trips() {
+        // Three tabs, dragged to visual sequence [2, 0, 1].
+        let blob = PersistedTabs {
+            tabs: vec![
+                PersistedTab {
+                    label: "T0".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+                PersistedTab {
+                    label: "T1".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+                PersistedTab {
+                    label: "T2".into(),
+                    tree: PersistedTree::Leaf,
+                    agent: None,
+                    kind: PersistedTabKind::Terminal,
+                },
+            ],
+            active: 1,
+            next_label_n: 3,
+            tab_order: vec![2, 0, 1],
+        };
+        let s = serde_json::to_string(&blob).unwrap();
+        let back: PersistedTabs = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tab_order, vec![2, 0, 1]);
     }
 }

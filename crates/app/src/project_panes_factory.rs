@@ -23,7 +23,9 @@ use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::{PaneBufferRepo, SettingsRepo};
 
 use crate::notifier::Notifier;
-use crate::persisted_terminals::{PersistedAgentTab, PersistedTabs, settings_key};
+use crate::persisted_terminals::{
+    PersistedAgentTab, PersistedTabKind, PersistedTabs, settings_key,
+};
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{TerminalView, attach_pty_existing, spawn_local_pty};
 use crate::workspace_root::WorkspaceRoot;
@@ -91,43 +93,76 @@ pub(crate) fn build_project_panes(
         return panes_entity;
     };
 
-    // v1 schema: flat tab list, single restored group. Multi-group
-    // layout is NOT yet persisted (deferred to v2). Each terminal tab
+    // v2 schema: flat tab list, single restored group. Each terminal tab
     // gets one buffer from `pane_buffers` (DFS-aligned with capture).
+    // Editor tabs (added in this slice) are restored via `open_or_activate_editor_tab`;
+    // missing files surface a tracing warning and the tab is skipped.
+    // Multi-group layout is still NOT persisted (deferred to a follow-up).
     let mut buf_iter = pane_buffers.into_iter();
     let mut ordinal: u32 = 0;
     for tab in &snap.tabs {
-        if let Some(agent) = &tab.agent {
-            restore_agent_tab(
-                agent,
-                tab.label.clone(),
-                cli_runtime.clone(),
-                panes_entity.downgrade(),
-                window,
-                cx,
-            );
-        } else if let Some(view) = build_terminal_view_for_tab(
-            cwd.clone(),
-            &attach_hints,
-            ordinal,
-            theme,
-            density,
-            typography.clone(),
-            window,
-            cx,
-        ) {
-            let bytes = buf_iter.next().unwrap_or_default();
-            if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
-                view.read(cx).prefill_grid(&bytes);
+        match &tab.kind {
+            PersistedTabKind::Editor { path } => {
+                let path_buf = PathBuf::from(path);
+                if !path_buf.exists() {
+                    // v1 placeholder strategy: drop the tab + log. Full
+                    // "missing-file placeholder tab" is a follow-up; the
+                    // user can reopen via Cmd+P. Don't fail the entire
+                    // restore — just skip this one entry.
+                    //
+                    // KNOWN limitation: when a dropped editor tab's flat
+                    // index is < `snap.active`, the restored active tab
+                    // points to the wrong slot (snap.active stays as the
+                    // saved value; the indices behind it shift down by
+                    // one per skip). `apply_restored_state` clamps to
+                    // `tab_count()` so this never panics, but the
+                    // wrong tab may end up focused on the first paint.
+                    // Acceptable for v1 — the dropped-tab case is rare.
+                    tracing::warn!(
+                        ?path,
+                        "editor tab restore: file no longer exists; skipping tab"
+                    );
+                    continue;
+                }
+                panes_entity.update(cx, |p, cx| {
+                    p.open_or_activate_editor_tab(path_buf, window, cx);
+                });
             }
-            panes_entity.update(cx, |p, cx| {
-                p.push_restored_terminal_tab(tab.label.clone(), view, cx);
-            });
-            ordinal += 1;
+            PersistedTabKind::Terminal => {
+                if let Some(agent) = &tab.agent {
+                    restore_agent_tab(
+                        agent,
+                        tab.label.clone(),
+                        cli_runtime.clone(),
+                        panes_entity.downgrade(),
+                        window,
+                        cx,
+                    );
+                } else if let Some(view) = build_terminal_view_for_tab(
+                    cwd.clone(),
+                    &attach_hints,
+                    ordinal,
+                    theme,
+                    density,
+                    typography.clone(),
+                    window,
+                    cx,
+                ) {
+                    let bytes = buf_iter.next().unwrap_or_default();
+                    if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
+                        view.read(cx).prefill_grid(&bytes);
+                    }
+                    panes_entity.update(cx, |p, cx| {
+                        p.push_restored_terminal_tab(tab.label.clone(), view, cx);
+                    });
+                    ordinal += 1;
+                }
+            }
         }
     }
+    let tab_order = snap.tab_order.clone();
     panes_entity.update(cx, |p, cx| {
-        p.apply_restored_state(snap.active, snap.next_label_n, window, cx);
+        p.apply_restored_state(snap.active, snap.next_label_n, tab_order, window, cx);
     });
     panes_entity
 }

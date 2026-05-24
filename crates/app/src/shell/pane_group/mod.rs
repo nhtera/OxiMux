@@ -253,6 +253,30 @@ impl PaneGroup {
         })
     }
 
+    /// Walk `tab_order` directly (yields insertion indices in visual
+    /// order). Used by the snapshot path that needs the raw indices,
+    /// not the (idx, tab) pairs `visible_tabs` returns.
+    pub fn tab_order_iter(&self) -> impl Iterator<Item = &usize> + '_ {
+        self.tab_order.iter()
+    }
+
+    /// Replace `tab_order` with the supplied vector. The restorer uses
+    /// this after pushing every restored tab to re-apply the saved
+    /// visual sequence in one shot — sequencing N `move_tab` calls would
+    /// be O(N²) and confuse the active-tracking guards in `move_tab`.
+    ///
+    /// Defensive: out-of-range indices are dropped, duplicates are
+    /// dropped (keeping the first occurrence), and any insertion-index
+    /// missing from `order` is appended at the end. These three guards
+    /// keep a stale or corrupted snapshot from rendering the same tab
+    /// twice / skipping a real tab — the invariant
+    /// `tab_order.len() == tabs.len()` is preserved.
+    pub fn set_tab_order(&mut self, order: Vec<usize>) {
+        let next = canonicalize_tab_order(order, self.tabs.len());
+        debug_assert_eq!(next.len(), self.tabs.len());
+        self.tab_order = next;
+    }
+
     /// Move a tab from one visible position to another. Mutates only
     /// `tab_order`; entity refs in `tabs` and the `active` insertion
     /// index are preserved so the active highlight follows the moved
@@ -1451,12 +1475,84 @@ fn resolve_adjacent_visible_tab(tab_order: &[usize], active: usize, step: isize)
 /// unit-testable. Returns the new cursor after advancing `step` slots
 /// through a snapshot of length `len`. Wraps via `rem_euclid` so negative
 /// `step` also wraps cleanly. `None` when the snapshot is too short.
+/// Pure helper isolated for unit-test reach. Build the canonical
+/// `tab_order` vector from a possibly-corrupted snapshot input:
+/// 1. Drop out-of-range indices (`i >= tabs_len`).
+/// 2. Drop duplicates (keep first occurrence).
+/// 3. Append any missing insertion-index at the end.
+///
+/// Result invariant: `output.len() == tabs_len`, each value in
+/// `0..tabs_len` appears exactly once.
+fn canonicalize_tab_order(order: Vec<usize>, tabs_len: usize) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::with_capacity(tabs_len);
+    let mut next: Vec<usize> = Vec::with_capacity(tabs_len);
+    for i in order {
+        if i < tabs_len && seen.insert(i) {
+            next.push(i);
+        }
+    }
+    for i in 0..tabs_len {
+        if seen.insert(i) {
+            next.push(i);
+        }
+    }
+    next
+}
+
 fn advance_mru_cursor(cursor: usize, step: isize, len: usize) -> Option<usize> {
     if len < 2 {
         return None;
     }
     let len_i = len as isize;
     Some(((cursor as isize + step).rem_euclid(len_i)) as usize)
+}
+
+#[cfg(test)]
+mod canonicalize_tab_order_tests {
+    use super::canonicalize_tab_order;
+
+    #[test]
+    fn happy_path_passes_through() {
+        let order = vec![2_usize, 0, 1];
+        assert_eq!(canonicalize_tab_order(order, 3), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn out_of_range_indices_are_dropped() {
+        // Old snapshot referenced 4 tabs; current group has only 3.
+        let order = vec![3_usize, 1, 0];
+        // 3 dropped → [1, 0], then missing index 2 appended → [1, 0, 2].
+        assert_eq!(canonicalize_tab_order(order, 3), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn duplicates_collapse_to_first_occurrence() {
+        // Corrupted snapshot — `1` appears twice. Without dedup, len would
+        // exceed tabs_len and the same tab would render twice. With dedup:
+        // first `1` kept, second dropped; missing `2` appended.
+        let order = vec![1_usize, 0, 1];
+        assert_eq!(canonicalize_tab_order(order, 3), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn missing_indices_append_at_end() {
+        // Snapshot only mentions [0]. Tab 1 + 2 must still appear.
+        assert_eq!(canonicalize_tab_order(vec![0_usize], 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn empty_input_yields_insertion_order() {
+        // Pre-v2 snapshot (no tab_order) → caller passes empty vec → all
+        // tabs land in insertion order.
+        assert_eq!(canonicalize_tab_order(vec![], 4), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn empty_tabs_returns_empty() {
+        // Edge: no tabs at all (post-close-all) — both axes empty.
+        assert!(canonicalize_tab_order(vec![], 0).is_empty());
+        assert!(canonicalize_tab_order(vec![5], 0).is_empty());
+    }
 }
 
 #[cfg(test)]
