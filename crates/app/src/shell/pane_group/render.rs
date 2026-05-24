@@ -13,8 +13,9 @@
 
 use gpui::{
     AnyElement, App, AppContext, Context, DragMoveEvent, Entity, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, point,
+    prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::Theme;
 
@@ -44,6 +45,16 @@ const CHROME_H_PX: f32 = 30.0 + 24.0;
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Drag-cancel cleanup: chips' `on_drag_move` fires only while a
+        // drag is live, so a press-Escape (or off-window release) leaves
+        // the last hover state painted. Mirrors the body-level guard in
+        // `ProjectPanes::render` — if no drag is in flight but our
+        // hover is set, clear it so the next paint has no stale insertion
+        // bar.
+        if !cx.has_active_drag() && self.drag_hover().is_some() {
+            self.set_drag_hover(None, cx);
+        }
+
         let entity = cx.entity().clone();
         let focus_handle = self.focus_handle_clone();
         let theme = self.theme;
@@ -207,6 +218,10 @@ fn build_tab_strip_from_headers(
         TabInsertSide::After => h.target_visible_idx + 1,
     });
 
+    // Clone for the wheel-scroll handler — the original `scroll_handle`
+    // is still consumed by `.track_scroll(&scroll_handle)` below.
+    let wheel_scroll_handle = scroll_handle.clone();
+
     // Inner scroll container: ONLY the tab chips scroll. The "+" and
     // "..." buttons sit OUTSIDE this div so they stay pinned at the
     // right edge of the strip even when many tabs overflow. The
@@ -244,6 +259,24 @@ fn build_tab_strip_from_headers(
         // is handled by the chip-level on_drop; here we just zero out.
         .on_drop::<TabDragPayload>(move |_payload: &TabDragPayload, _window, cx| {
             strip_drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+        })
+        // Mouse-wheel horizontal scroll: map vertical wheel delta onto
+        // the strip's horizontal scroll offset. Trackpad horizontal
+        // swipes already flow through the native `overflow_x_scroll`
+        // axis, so they arrive as `delta.x` and bypass this remap.
+        // GPUI's `ScrollDelta::pixel_delta(line_height)` normalizes
+        // pixel-deltas (trackpad) and line-deltas (USB wheel) to a
+        // consistent pixel space; `TAB_STRIP_HEIGHT_PX` is a sensible
+        // line-height for chips that are exactly one strip tall.
+        .on_scroll_wheel(move |ev: &ScrollWheelEvent, _window, _cx| {
+            let pixel_delta: Point<Pixels> =
+                ev.delta.pixel_delta(px(TAB_STRIP_HEIGHT_PX));
+            let dy = pixel_delta.y;
+            if f32::from(dy).abs() < f32::EPSILON {
+                return;
+            }
+            let current = wheel_scroll_handle.offset();
+            wheel_scroll_handle.set_offset(point(current.x - dy, current.y));
         });
     let tab_count = tabs.len();
     for (visible_idx, header) in tabs.iter().enumerate() {
@@ -733,6 +766,15 @@ fn render_tab_chip(
             // the body-level zone overlay instead.
             let payload = ev.drag(cx);
             if payload.source_group != group_id {
+                return;
+            }
+            // Drop-on-self silence: when the user drags a chip across
+            // its own bounds, do NOT re-set the hover. The strip-level
+            // capture pass already cleared it, so leaving it cleared
+            // means the insertion bar disappears over the source chip
+            // (where dropping would be a no-op layout move) instead of
+            // briefly painting on the chip itself.
+            if payload.source_tab_idx == ix {
                 return;
             }
             // GPUI fires on_drag_move on EVERY registered listener for

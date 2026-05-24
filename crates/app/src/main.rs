@@ -17,11 +17,11 @@ use gpui::{
     px, size,
 };
 use oximux_app::actions::{
-    CloseTab, DismissOverlay, FocusNextSubPane, FocusPrevSubPane, MruNext, MruPrev, NewAgent,
-    NewTab, NextTab, OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen,
-    OpenWorkspaceCreate, PrevTab, Search, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
-    SelectSourceControlTab, SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar,
-    ToggleRightSidebar, ToggleZoomSubPane,
+    CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
+    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NextTab, OpenCommandPalette,
+    OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, Search,
+    SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitSubPaneDown,
+    SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
 };
 // SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
 // crate dependency: oximux-app → oximux-editor → oximux-app would be a cycle.
@@ -156,10 +156,21 @@ fn main() {
             // multiple sub-panes; otherwise it closes the whole tab.
             // Disambiguation lives in `PaneGroup::on_close_tab`.
             KeyBinding::new("cmd-w", CloseTab, None),
+            // cmd-shift-w closes the focused PANE GROUP (no-op when only
+            // one group exists). Sub-pane / tab close stays on cmd-w
+            // above so the muscle-memory split is consistent with the
+            // reference editor's group-vs-tab tier.
+            KeyBinding::new("cmd-shift-w", CloseGroup, None),
             // cmd-[ / cmd-] cycle sub-pane focus within the active tab.
             // Tab navigation lives on cmd-{ / cmd-} below.
             KeyBinding::new("cmd-]", FocusNextSubPane, None),
             KeyBinding::new("cmd-[", FocusPrevSubPane, None),
+            // cmd-shift-] / cmd-shift-[ cycle GROUP focus across the
+            // pane-group tree's in-order traversal. macOS shifts the
+            // key to `}` / `{` post-modifier, matching the cmd-} / cmd-{
+            // remap explanation below.
+            KeyBinding::new("cmd-shift-}", FocusNextPane, None),
+            KeyBinding::new("cmd-shift-{", FocusPrevPane, None),
             // cmd-shift-enter zooms (maximizes) the focused sub-pane; a
             // second press restores the prior layout. Matches the
             // reference editor's "zoom pane" binding.

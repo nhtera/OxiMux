@@ -15,6 +15,7 @@ use gpui::{
 use std::collections::HashSet;
 
 use super::{ProjectPanes, TabDragHoveredTarget};
+use crate::shell::pane_group::file_drag::FilePathDragPayload;
 use crate::shell::pane_group::render::build_tab_strip_for;
 use crate::shell::pane_group::tab_drag::TabDragPayload;
 use crate::shell::pane_group::tab_drag_zones::{Zone, resolve_drop_zone};
@@ -475,6 +476,8 @@ fn leaf_body(
     let body_id = SharedString::from(format!("pane-group-body-{}", group.entity_id()));
     let hover_panes = project_panes.clone();
     let drop_panes = project_panes.clone();
+    let file_hover_panes = project_panes.clone();
+    let file_drop_panes = project_panes.clone();
 
     div()
         .id(body_id)
@@ -555,6 +558,50 @@ fn leaf_body(
                                 window,
                                 cx,
                             );
+                        }
+                    }
+                });
+            },
+        )
+        // File-row drag-drop: same overlay + zone math, payload carries a
+        // filesystem path instead of a (group, tab) reference. GPUI
+        // dispatches by TypeId so these handlers never cross-fire with
+        // the `TabDragPayload` pair above.
+        .on_drag_move::<FilePathDragPayload>(
+            move |ev: &DragMoveEvent<FilePathDragPayload>, _window, cx| {
+                let bounds = ev.bounds;
+                if !bounds.contains(&ev.event.position) {
+                    return;
+                }
+                let zone = resolve_drop_zone(bounds, ev.event.position);
+                file_hover_panes.update(cx, |p, cx| {
+                    p.set_hovered_drop_target(
+                        Some(TabDragHoveredTarget { group_id, zone }),
+                        cx,
+                    );
+                });
+            },
+        )
+        .on_drop::<FilePathDragPayload>(
+            move |payload: &FilePathDragPayload, window, cx| {
+                let zone = file_drop_panes
+                    .read(cx)
+                    .hovered_drop_target()
+                    .filter(|t| t.group_id == group_id)
+                    .map(|t| t.zone);
+                let Some(zone) = zone else {
+                    file_drop_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
+                    return;
+                };
+                let path = payload.path.clone();
+                file_drop_panes.update(cx, |p, cx| {
+                    p.set_hovered_drop_target(None, cx);
+                    match zone {
+                        Zone::Center => {
+                            p.open_file_in_group(group_id, path, window, cx);
+                        }
+                        Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
+                            p.split_and_open_file(group_id, zone, path, window, cx);
                         }
                     }
                 });

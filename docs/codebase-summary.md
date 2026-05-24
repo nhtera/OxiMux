@@ -72,7 +72,14 @@ src/
     ├── cell_metrics.rs     character cell size constants
     ├── file_tree_view.rs   FileTreeView GPUI entity (step 4); subscribes to Entity<FileTree> from oximux-editor;
     │                       lazy expand via placeholder child (RowKind::Placeholder sentinel → real rows on Loaded event);
-    │                       on_open: Arc<dyn Fn(PathBuf,…)> fires on file click; wired to WorkspaceRoot::open_file_in_active_pane (step 5)
+    │                       on_open: Arc<dyn Fn(PathBuf,…)> fires on file click; wired to WorkspaceRoot::open_file_in_active_pane (step 5);
+    │                       file rows emit `FilePathDragPayload` (shell/pane_group/file_drag.rs) on .on_drag — dropped on
+    │                       pane bodies via project_panes::leaf_body → ProjectPanes::open_file_in_group / split_and_open_file;
+    │                       right-click dispatches OpenFileTreeContextMenuAt → FileTreeContextMenu (Open / Open to the Side /
+    │                       Copy Path / Copy Relative Path / Reveal in Finder; reduced item set for directories)
+    ├── file_tree_context_menu.rs Right-click overlay for Files-tab rows. WorkspaceRoot owns one shared entity (mirrors
+    │                       tab_context_menu pattern). Open / Open to the Side dispatch OpenFileFromContextMenu →
+    │                       routes through the same open_file_in_group / split_and_open_file as the file-drag flow.
     ├── file_explorer/      FileExplorer entity; virtualized git-aware file tree (uniform_list, lazy load, git status badges)
     │   ├── mod.rs          FileExplorer entity; state machine; window-activation refresh trigger
     │   ├── tree_state.rs   flat-row build, expand toggle, should_include filter

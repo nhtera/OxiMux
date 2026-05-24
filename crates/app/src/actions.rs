@@ -78,6 +78,34 @@ pub struct TogglePinTabAt {
     pub tab_idx: u32,
 }
 
+/// Payload action fired by a file-tree row's right-click. Carries the
+/// cursor coords + the right-clicked path + a directory flag so the
+/// shared `FileTreeContextMenu` can render the right item set (files
+/// get Open / Open to the Side / Copy Relative; directories get just
+/// Copy Path + Reveal).
+///
+/// `PathBuf` doesn't implement `Action`, so the path is shipped as a
+/// `String`; receivers parse via `PathBuf::from`.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenFileTreeContextMenuAt {
+    pub x: f32,
+    pub y: f32,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// Payload action fired by `FileTreeContextMenu`'s Open / Open to the
+/// Side rows. Carries the path + a flag deciding whether to split right
+/// before opening. Lives at the workspace level so the menu doesn't
+/// need a weak self-handle into `ProjectPanes`.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenFileFromContextMenu {
+    pub path: String,
+    pub split_right: bool,
+}
+
 actions!(
     oximux,
     [

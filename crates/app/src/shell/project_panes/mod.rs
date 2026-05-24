@@ -575,6 +575,80 @@ impl ProjectPanes {
         });
     }
 
+    /// Open `path` as an editor tab inside the SPECIFIC group identified
+    /// by `group_id` (does not consult / mutate the active-group pointer
+    /// until the call succeeds). Drag-drop center-zone target uses this
+    /// so a file dropped onto a non-focused pane opens there, not in the
+    /// previously-focused pane.
+    ///
+    /// Activates the target group on success. No-op on unknown id.
+    pub fn open_file_in_group(
+        &mut self,
+        group_id: PaneGroupId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target = self.groups.get(&group_id)?.clone();
+        let idx = target.update(cx, |g, cx| g.open_or_activate_editor_tab(path, window, cx));
+        self.set_active_group(group_id, window, cx);
+        Some(idx)
+    }
+
+    /// Drag-to-split for the file-drag flow: insert a new sibling group
+    /// next to `target` along the axis implied by `zone`, then open
+    /// `path` as the new group's first (and only) editor tab.
+    /// `Zone::Center` is rejected — merge is handled by
+    /// `open_file_in_group`.
+    pub fn split_and_open_file(
+        &mut self,
+        target: PaneGroupId,
+        zone: Zone,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (axis, insert) = match zone {
+            Zone::Center => return false,
+            Zone::Left => (Axis::Horizontal, SplitInsert::Before),
+            Zone::Right => (Axis::Horizontal, SplitInsert::After),
+            Zone::Up => (Axis::Vertical, SplitInsert::Before),
+            Zone::Down => (Axis::Vertical, SplitInsert::After),
+        };
+        // 1. Allocate the new sibling group in the layout tree. Mirrors
+        // `split_and_move_tab` minus the source-tab transfer.
+        let Some(GroupSplitOutcome { new_group, .. }) =
+            self.manager.split_at_target(target, axis, insert)
+        else {
+            return false;
+        };
+        // 2. Create the matching `PaneGroup` entity (empty — populated by
+        // the editor-tab push below).
+        let group = build_group(
+            self.cwd.clone(),
+            self.theme,
+            self.density,
+            self.typography.clone(),
+            self.cli_runtime.clone(),
+            self.notifier.clone(),
+            self.window_active.clone(),
+            cx,
+        );
+        group.update(cx, |g, cx| g.set_chrome_width(self.chrome_w_px, cx));
+        let group_observer = observe_group(&group, cx);
+        let group_focus_observer = observe_group_focus(&group, new_group, window, cx);
+        self.groups.insert(new_group, group.clone());
+        self._observers.insert(new_group, group_observer);
+        self._focus_observers.insert(new_group, group_focus_observer);
+        // 3. Push the editor tab into the new group + activate it.
+        group.update(cx, |g, cx| {
+            g.open_or_activate_editor_tab(path, window, cx);
+        });
+        self.set_active_group(new_group, window, cx);
+        cx.notify();
+        true
+    }
+
     /// Focus the active tab in the active group. Called when activating
     /// this project's panes so keystrokes route correctly.
     pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {

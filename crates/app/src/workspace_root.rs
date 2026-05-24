@@ -48,11 +48,11 @@ use crate::state::AppState;
 
 use crate::actions::{
     ActivateGroupTab, CloseGroup, DismissOverlay, OpenAddProjectDialog, OpenCommandPalette,
-    OpenCommitDialog, OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen,
-    OpenTabContextMenuAt, OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab,
-    SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitDown, SplitGroupAt,
-    SplitHorizontal, SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    OpenCommitDialog, OpenFileFromContextMenu, OpenFileTreeContextMenuAt, OpenPaneActions,
+    OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
+    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
+    SelectSearchTab, SelectSourceControlTab, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft,
+    SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -60,6 +60,7 @@ use crate::shell::{
     add_project_dialog::AddProjectDialog,
     command_palette::{PaletteModal, entry::PaletteMode},
     confirm_dialog::ConfirmDialog,
+    file_tree_context_menu::FileTreeContextMenu,
     left_rail::{LeftRail, row_menu::WorkspaceRowMenu},
     main_area,
     openable_text_file::is_openable_text_file,
@@ -98,6 +99,11 @@ pub struct WorkspaceRoot {
     pub(crate) palette: Entity<PaletteModal>,
     pub(crate) pane_actions: Entity<PaneActionsMenu>,
     pub(crate) tab_context_menu: Entity<TabContextMenu>,
+    /// File-tree right-click menu (Open / Open to the Side / Copy Path /
+    /// Copy Relative Path / Reveal in Finder). Same shared-entity pattern
+    /// as `tab_context_menu` — one menu owned at the workspace level so
+    /// click-outside dismiss + z-order behave consistently.
+    pub(crate) file_tree_context_menu: Entity<FileTreeContextMenu>,
     /// Inline adapter-picker popover anchored to the workspace-tabs `+` button.
     pub(crate) adapter_picker: Entity<AdapterPicker>,
     /// PTY backend + status streams for every agent session. Held behind Arc
@@ -218,6 +224,8 @@ impl WorkspaceRoot {
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
         let tab_context_menu =
             cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
+        let file_tree_context_menu =
+            cx.new(|_| FileTreeContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
@@ -340,6 +348,7 @@ impl WorkspaceRoot {
             palette,
             pane_actions,
             tab_context_menu,
+            file_tree_context_menu,
             adapter_picker,
             cli_runtime,
             adapter_registry,
@@ -882,6 +891,7 @@ impl Render for WorkspaceRoot {
                     .unwrap_or(false);
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.pane_actions.update(cx, |p, cx| {
                     p.open(
                         PaneActionsAnchor::TopRight {
@@ -903,6 +913,7 @@ impl Render for WorkspaceRoot {
                     .unwrap_or(false);
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.pane_actions.update(cx, |p, cx| {
                     p.open(
                         PaneActionsAnchor::Chip {
@@ -972,8 +983,57 @@ impl Render for WorkspaceRoot {
                 let y = action.y;
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| {
                     m.open(x, y, weak, group_id, tab_idx, tab_count, tab_kind, is_pinned, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, action: &OpenFileTreeContextMenuAt, _window, cx| {
+                // File-tree row right-click — opens the shared
+                // `FileTreeContextMenu` with the clicked path. Directory
+                // rows get a reduced item set (Reveal + Copy Path only).
+                let path = std::path::PathBuf::from(&action.path);
+                let project_root = this
+                    .active_project
+                    .as_ref()
+                    .map(|p| std::path::PathBuf::from(&p.root_path));
+                this.pane_actions.update(cx, |p, cx| p.close(cx));
+                this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.file_tree_context_menu.update(cx, |m, cx| {
+                    m.open(action.x, action.y, path, project_root, action.is_dir, cx)
+                });
+            }))
+            .on_action(cx.listener(|this, action: &OpenFileFromContextMenu, window, cx| {
+                // File-tree menu "Open" / "Open to the Side" row. The
+                // menu has already closed itself; this handler routes
+                // to ProjectPanes via the same code paths the drag-drop
+                // flow uses (open_file_in_group / split_and_open_file).
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                let path = std::path::PathBuf::from(&action.path);
+                if !is_openable_text_file(&path) {
+                    tracing::info!(
+                        file = %path.display(),
+                        "open-from-context-menu: refusing non-text file"
+                    );
+                    return;
+                }
+                let split_right = action.split_right;
+                panes.update(cx, |p, cx| {
+                    let target = p.manager().active_group_id();
+                    if split_right {
+                        p.split_and_open_file(
+                            target,
+                            crate::shell::pane_group::tab_drag_zones::Zone::Right,
+                            path,
+                            window,
+                            cx,
+                        );
+                    } else {
+                        p.open_file_in_group(target, path, window, cx);
+                    }
                 });
             }))
             .on_action(cx.listener(|this, action: &crate::actions::RequestRenameTabAt, window, cx| {
@@ -1111,6 +1171,7 @@ impl Render for WorkspaceRoot {
                 // own focus and currently ignore this.
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
@@ -1169,6 +1230,9 @@ impl Render for WorkspaceRoot {
             // Mutually exclusive with it via close-on-open logic in the
             // OpenPaneActionsAt / OpenTabContextMenuAt action handlers.
             .child(self.tab_context_menu.clone())
+            // File-tree right-click context menu — same z-band; mutually
+            // exclusive via close-on-open in OpenFileTreeContextMenuAt.
+            .child(self.file_tree_context_menu.clone())
             // Adapter picker — same z-band as pane_actions; only one of
             // them can be open at a time so order between them is moot.
             .child(self.adapter_picker.clone())

@@ -8,14 +8,18 @@
 //! whenever it changes or a `FileTreeEvent::Loaded` arrives.
 
 use gpui::{
-    AnyElement, App, Context, ElementId, Entity, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, Styled, Subscription, UniformListScrollHandle, Window,
-    div, prelude::FluentBuilder, px, rgb, uniform_list,
+    AnyElement, App, AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, UniformListScrollHandle, Window, div, prelude::FluentBuilder, px, rgb,
+    uniform_list,
 };
 use oximux_editor::{FileTree, FileTreeEvent, FileTreeNode, TreeNodeId};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::shell::openable_text_file::is_openable_text_file;
+use crate::shell::pane_group::file_drag::{FilePathDragPayload, FilePathDragPreview};
 
 /// Click-on-file callback. `Arc` rather than `Box` so the closure can be
 /// cloned into every row's `cx.listener` without ownership ceremony.
@@ -418,14 +422,69 @@ fn render_row(
                     me.handle_dir_click(id, loaded, cx);
                 }),
             );
+            // Right-click — dispatch a workspace-level action carrying
+            // the clicked dir path so `WorkspaceRoot` can open the shared
+            // FileTreeContextMenu (reduced item set for directories).
+            let ctx_path = path.clone();
+            el = el.on_mouse_down(
+                MouseButton::Right,
+                move |ev: &MouseDownEvent, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::actions::OpenFileTreeContextMenuAt {
+                            x: ev.position.x.into(),
+                            y: ev.position.y.into(),
+                            path: ctx_path.to_string_lossy().into_owned(),
+                            is_dir: true,
+                        }),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                },
+            );
         }
         RowKind::File { id } => {
-            let click_path = path;
+            let click_path = path.clone();
             el = el.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |me, _: &MouseDownEvent, window, cx| {
                     me.handle_file_click(id, click_path.clone(), window, cx);
                 }),
+            );
+            // Drag-from-sidebar wiring. GPUI's drag activation distance
+            // means small motions still trigger the click handler above,
+            // so click-to-open is unaffected. Non-text rows
+            // (binaries, system metadata) are gated below so a stray
+            // drag from `.DS_Store` doesn't promote it to an editor tab.
+            if is_openable_text_file(&path) {
+                let drag_path = path.clone();
+                let drag_label = SharedString::from(row.label.clone());
+                el = el.on_drag(
+                    FilePathDragPayload {
+                        path: drag_path,
+                    },
+                    move |_payload, _offset, _window, cx| {
+                        let label = drag_label.clone();
+                        cx.new(|_| FilePathDragPreview::new(label))
+                    },
+                );
+            }
+            // Right-click — files get the full menu (Open / Open to the
+            // Side / Copy Path / Copy Relative Path / Reveal in Finder).
+            let ctx_path = path.clone();
+            el = el.on_mouse_down(
+                MouseButton::Right,
+                move |ev: &MouseDownEvent, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::actions::OpenFileTreeContextMenuAt {
+                            x: ev.position.x.into(),
+                            y: ev.position.y.into(),
+                            path: ctx_path.to_string_lossy().into_owned(),
+                            is_dir: false,
+                        }),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                },
             );
         }
         RowKind::Placeholder { .. } | RowKind::EmptyDir { .. } => {}

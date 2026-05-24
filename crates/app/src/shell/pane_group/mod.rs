@@ -6,6 +6,7 @@
 //! focused one. Each group is independent: opening a file in one group
 //! does NOT affect any other group's tab list.
 
+pub mod file_drag;
 pub mod render;
 pub mod sub_pane;
 pub mod tab_drag;
@@ -383,6 +384,63 @@ impl PaneGroup {
     fn pin_tab_strip_to_end(&self) {
         self.tab_strip_scroll
             .set_offset(Point::new(px(-100_000.0), px(0.0)));
+    }
+
+    /// Returns true when the tab strip viewport is currently snapped to
+    /// its rightmost extent (i.e. the user is "pinned to end"). Used by
+    /// the label-change re-pin path so widening a chip after a tab is
+    /// already on screen doesn't kick the active tab + `+` button off
+    /// the right edge.
+    ///
+    /// `max_offset.x` is the absolute maximum negative-x the viewport
+    /// can scroll to (positive value). When `|offset.x| >= max_x - 1`,
+    /// the strip is at its right-edge limit. Zero `max_x` means no
+    /// overflow → vacuously pinned (anything appended afterwards must
+    /// stay visible since there's no slack to scroll).
+    pub(crate) fn was_pinned_to_end(&self) -> bool {
+        let offset = self.tab_strip_scroll.offset();
+        let max_x = f32::from(self.tab_strip_scroll.max_offset().x);
+        if max_x.abs() < 1.0 {
+            return true;
+        }
+        f32::from(offset.x).abs() >= max_x - 1.0
+    }
+
+    /// Schedule a one-frame-deferred re-pin to the strip's right edge.
+    /// Used after any mutation that may have widened a tab chip (custom
+    /// title set, agent status badge appears) — the new `max_offset`
+    /// isn't known until after the next paint, so we sleep 16 ms then
+    /// re-pin. No-op when `was_pinned` is false (user had manually
+    /// scrolled left → respect their position).
+    pub(crate) fn schedule_repin_if_was_pinned(
+        &self,
+        was_pinned: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !was_pinned {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(16))
+                .await;
+            let _ = weak.update(cx, |g, _cx| {
+                g.pin_tab_strip_to_end();
+            });
+        })
+        .detach();
+    }
+
+    /// Wraps `cx.notify()` with a snapshot of the strip's pin state and
+    /// a deferred re-pin if the user was pinned. Called by the agent
+    /// status watcher (which mutates the badge dot's visibility,
+    /// changing chip width) and by any other label-mutating path that
+    /// goes through `cx.notify()` without explicitly handling the pin
+    /// snapshot itself.
+    pub(crate) fn notify_with_label_change_check(&self, cx: &mut Context<Self>) {
+        let was_pinned = self.was_pinned_to_end();
+        cx.notify();
+        self.schedule_repin_if_was_pinned(was_pinned, cx);
     }
 
     pub(crate) fn focus_handle_clone(&self) -> FocusHandle {
@@ -765,16 +823,22 @@ impl PaneGroup {
     /// Override the tab's visible title with `title` (or restore the
     /// default by passing `None`). The chip and persistence read
     /// `custom_title.unwrap_or(label)`.
+    ///
+    /// Title changes can widen the chip; snapshot pin state and schedule
+    /// a deferred re-pin so the strip stays anchored to the new active
+    /// tab if the user was at the right edge.
     pub fn set_tab_title(
         &mut self,
         idx: usize,
         title: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        let was_pinned = self.was_pinned_to_end();
         if let Some(tab) = self.tabs.get_mut(idx) {
             tab.custom_title = title;
             cx.notify();
         }
+        self.schedule_repin_if_was_pinned(was_pinned, cx);
     }
 
     /// Resolve the tab's visible title — custom override if set, else

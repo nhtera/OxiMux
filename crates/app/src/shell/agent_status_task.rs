@@ -42,7 +42,15 @@ pub fn spawn_status_task(
                 return;
             }
             let new_status: AgentStatus = status_rx.borrow_and_update().clone();
-            if weak.update(cx, |_group, cx| cx.notify()).is_err() {
+            // Use the label-change-aware notify: the agent status badge
+            // appears/disappears with these transitions, which can change
+            // chip width. The PaneGroup helper snapshots pin state +
+            // schedules a one-frame-deferred re-pin so the active tab
+            // stays anchored to the strip's right edge.
+            if weak
+                .update(cx, |group, cx| group.notify_with_label_change_check(cx))
+                .is_err()
+            {
                 return;
             }
             let window_active_now = window_active.load(Ordering::Relaxed);
