@@ -12,10 +12,10 @@
 //! workspace's).
 
 use gpui::{
-    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, InteractiveElement, IntoElement,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
-    prelude::FluentBuilder, px, svg,
+    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths,
+    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::Theme;
 
@@ -238,6 +238,12 @@ fn build_tab_strip_from_headers(
     let strip_drop_entity = entity.clone();
     let strip_file_hover_entity = entity.clone();
     let strip_file_drop_entity = entity.clone();
+    // F4.6: parallel pair for the OS-level (Finder) native drop. GPUI
+    // routes Finder drops as an internal drag with `ExternalPaths`
+    // payload, so the dispatch is identical — we just need a second
+    // listener registered for that type.
+    let strip_native_hover_entity = entity.clone();
+    let strip_native_drop_entity = entity.clone();
     // Visible insertion slot the drag would land on. `Before` → slot is
     // at target_visible_idx; `After` → slot is at target_visible_idx + 1.
     // Both adjacent chips paint a single edge each so the user reads ONE
@@ -309,6 +315,28 @@ fn build_tab_strip_from_headers(
                 strip_file_drop_entity.update(cx, |g, cx| {
                     g.set_drag_hover(None, cx);
                     g.open_or_activate_editor_tab_at(path, None, window, cx);
+                });
+            },
+        )
+        // F4.6: OS-native Finder drop variant. GPUI synthesises an
+        // internal drag carrying `ExternalPaths` when the user drags
+        // files from Finder over the window; same capture-pass + drop
+        // logic as the in-app file-tree drag.
+        .on_drag_move::<ExternalPaths>(
+            move |_: &DragMoveEvent<ExternalPaths>, _window, cx| {
+                strip_native_hover_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+            },
+        )
+        .on_drop::<ExternalPaths>(
+            move |payload: &ExternalPaths, window, cx| {
+                let paths = filter_droppable_files(payload.paths());
+                strip_native_drop_entity.update(cx, |g, cx| {
+                    g.set_drag_hover(None, cx);
+                    // Multi-file Finder drops append in sequence so the
+                    // user reads them left-to-right in the strip.
+                    for path in paths {
+                        g.open_or_activate_editor_tab_at(path, None, window, cx);
+                    }
                 });
             },
         )
@@ -719,6 +747,24 @@ fn redistribute_sub_pane_weights(
     out
 }
 
+/// F4.6: filter an OS-native drop's payload down to paths we can open
+/// as editor tabs. Directories are silently dropped — opening a folder
+/// as a tab makes no sense (and there's no project-open contract here
+/// yet); a future plan can wire directory drops into the workspace
+/// picker. Nonexistent paths are also skipped because the editor view
+/// would surface a missing-file placeholder for them anyway; better to
+/// noop the drop than create a junk tab.
+///
+/// `pub(crate)` so `project_panes::render` can share the same filter
+/// from its body-zone drop handler.
+pub(crate) fn filter_droppable_files(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    paths
+        .iter()
+        .filter(|p| p.is_file())
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn render_tab_chip(
@@ -762,6 +808,12 @@ fn render_tab_chip(
     let drop_entity = entity.clone();
     let file_hover_entity = entity.clone();
     let file_drop_entity = entity.clone();
+    // F4.6: separate clones for the OS-native (Finder) drop variants —
+    // GPUI dispatches by TypeId so registering for both `ExternalPaths`
+    // and `FilePathDragPayload` is necessary; one set of closures can't
+    // serve both because each `on_drag_move`/`on_drop` is typed.
+    let native_hover_entity = entity.clone();
+    let native_drop_entity = entity.clone();
 
     let agent_dot: Option<AnyElement> = agent_status.map(|status| {
         let dot_id =
@@ -953,6 +1005,46 @@ fn render_tab_chip(
                     });
                     g.set_drag_hover(None, cx);
                     g.open_or_activate_editor_tab_at(path, visible_target, window, cx);
+                });
+            },
+        )
+        // F4.6: chip-level OS-native drop. Mirrors the FilePathDragPayload
+        // hover/drop pair so the insertion bar paints the same way for
+        // Finder drops. Multi-file Finder drops insert in sequence at
+        // increasing visible indices so the strip reads left-to-right
+        // in the order Finder selected them.
+        .on_drag_move::<ExternalPaths>(
+            move |ev: &DragMoveEvent<ExternalPaths>, _window, cx| {
+                let bounds = ev.bounds;
+                if !bounds.contains(&ev.event.position) {
+                    return;
+                }
+                let mid_x = bounds.origin.x + bounds.size.width / 2.0;
+                let side = if ev.event.position.x < mid_x {
+                    TabInsertSide::Before
+                } else {
+                    TabInsertSide::After
+                };
+                let hover = Some(TabDragHover {
+                    target_visible_idx: visible_idx,
+                    side,
+                });
+                native_hover_entity.update(cx, |g, cx| g.set_drag_hover(hover, cx));
+            },
+        )
+        .on_drop::<ExternalPaths>(
+            move |payload: &ExternalPaths, window, cx| {
+                let paths = filter_droppable_files(payload.paths());
+                native_drop_entity.update(cx, |g, cx| {
+                    let base_target = g.drag_hover().map(|h| match h.side {
+                        TabInsertSide::Before => h.target_visible_idx,
+                        TabInsertSide::After => h.target_visible_idx + 1,
+                    });
+                    g.set_drag_hover(None, cx);
+                    for (offset, path) in paths.into_iter().enumerate() {
+                        let target = base_target.map(|t| t + offset);
+                        g.open_or_activate_editor_tab_at(path, target, window, cx);
+                    }
                 });
             },
         )
@@ -1278,5 +1370,47 @@ mod sub_pane_resize_tests {
     fn invalid_divider_idx_returns_initial() {
         let new_w = redistribute_sub_pane_weights(&[1.0, 1.0], 5, 0.5);
         assert_eq!(new_w, vec![1.0, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod filter_droppable_files_tests {
+    use super::filter_droppable_files;
+    use std::path::PathBuf;
+
+    /// Use this crate's own Cargo.toml as a known-real file; Cargo runs
+    /// tests with CWD set to the crate root.
+    fn known_file() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
+    }
+
+    fn known_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn real_file_passes_through() {
+        let out = filter_droppable_files(&[known_file()]);
+        assert_eq!(out, vec![known_file()]);
+    }
+
+    #[test]
+    fn directory_is_filtered_out() {
+        let out = filter_droppable_files(&[known_dir()]);
+        assert!(out.is_empty(), "directory drops must not become tabs");
+    }
+
+    #[test]
+    fn missing_path_is_filtered_out() {
+        let phantom = PathBuf::from("/tmp/this/path/cannot/exist/xyz123");
+        let out = filter_droppable_files(&[phantom]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn mixed_drop_keeps_only_files() {
+        let inputs = vec![known_file(), known_dir(), PathBuf::from("/nope/missing")];
+        let out = filter_droppable_files(&inputs);
+        assert_eq!(out, vec![known_file()]);
     }
 }

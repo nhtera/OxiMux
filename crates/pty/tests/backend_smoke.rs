@@ -186,3 +186,99 @@ fn promote_to_live_rejects_already_live_session() {
     assert!(format!("{err:#}").contains("already live"));
     backend.close(id).expect("close");
 }
+
+/// F4.7: spawn a shell that prints an OSC 7 file:// URI, drain output,
+/// and confirm `cwd_hint` returns the path the shell emitted. Catches
+/// regressions in:
+///   - watcher wiring the OSC 7 scanner alongside grid advancement,
+///   - the Arc<Mutex<Option<PathBuf>>> threading,
+///   - `cwd_hint` accessor on the backend.
+#[test]
+fn osc7_emission_populates_cwd_hint() {
+    let mut backend = PortablePtyBackend::new();
+    // Shell prints the OSC 7 sequence to stdout. `\033]7;file:///tmp/osc7-test\007`
+    // is `ESC ] 7 ; file:///tmp/osc7-test BEL`. We add a final newline +
+    // an OXIMUX_DONE marker so the test knows when the chunk landed.
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "printf '\\033]7;file:///tmp/osc7-test\\007OXIMUX_DONE\\n'".into(),
+        ],
+        cwd: PathBuf::from("/"),
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+    };
+    let id = backend.spawn(cfg).expect("spawn shell");
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut saw_done = false;
+    let mut output_acc: Vec<u8> = Vec::new();
+    while Instant::now() < deadline && !saw_done {
+        for event in backend.drain_events() {
+            if let TerminalEvent::Output { id: eid, bytes } = event
+                && eid == id
+            {
+                output_acc.extend_from_slice(&bytes);
+                if output_acc
+                    .windows(b"OXIMUX_DONE".len())
+                    .any(|w| w == b"OXIMUX_DONE")
+                {
+                    saw_done = true;
+                }
+            }
+        }
+        if !saw_done {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+    assert!(saw_done, "shell never produced OXIMUX_DONE marker");
+
+    let hint = backend.cwd_hint(id);
+    assert_eq!(
+        hint,
+        Some(PathBuf::from("/tmp/osc7-test")),
+        "cwd_hint should reflect the OSC 7 file:// path the shell emitted"
+    );
+
+    backend.close(id).expect("close");
+}
+
+/// `cwd_hint` returns `None` for a session that has never seen an OSC 7
+/// sequence. The caller is expected to fall back to libproc. Dormant
+/// sessions also report `None` because they have no shell child.
+#[test]
+fn cwd_hint_is_none_before_first_osc7() {
+    let mut backend = PortablePtyBackend::new();
+    // Dormant: no PTY, no scanner, no shell — cwd_hint must be None.
+    let id = backend.spawn_dormant(80, 24).expect("dormant");
+    assert!(backend.cwd_hint(id).is_none());
+    backend.close(id).expect("close");
+
+    // Live session that never emits OSC 7: cwd_hint also None.
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        args: vec!["-c".into(), "echo no-osc7-here".into()],
+        cwd: PathBuf::from("/"),
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+    };
+    let id2 = backend.spawn(cfg).expect("spawn");
+    // Drain output to ensure the watcher ran.
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut acc: Vec<u8> = Vec::new();
+    while Instant::now() < deadline
+        && !acc.windows(11).any(|w| w == b"no-osc7-here")
+    {
+        for event in backend.drain_events() {
+            if let TerminalEvent::Output { bytes, .. } = event {
+                acc.extend_from_slice(&bytes);
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    assert!(backend.cwd_hint(id2).is_none());
+    backend.close(id2).expect("close");
+}

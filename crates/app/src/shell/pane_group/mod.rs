@@ -1353,13 +1353,24 @@ impl PaneGroup {
         if tree.zoomed().is_some() {
             tree.toggle_zoom_active();
         }
-        // Inherit the source shell's CWD. libproc returns None when the
-        // backend has no local pid (relay) or the shell already exited;
-        // either way we fall back to the tab group's working directory.
+        // Inherit the source shell's CWD. Three-tier lookup:
+        //   1. OSC 7 cache (F4.7) — populated every prompt by the shell's
+        //      OSC 7 hook. Lock-free read, no syscall. Empty only before
+        //      the first prompt fires post-spawn.
+        //   2. libproc / proc_pidinfo on the shell's pid — works for any
+        //      local shell, including ones without an OSC 7 hook, at the
+        //      cost of a syscall (~80–200 µs on macOS).
+        //   3. The tab group's cwd — last-resort fallback for relay
+        //      backends, dormant sub-panes, or shells that already exited.
         let inherited_cwd = tree
             .active_view()
-            .and_then(|v| v.read(cx).os_pid())
-            .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+            .and_then(|v| {
+                let view = v.read(cx);
+                view.cwd_hint().or_else(|| {
+                    view.os_pid()
+                        .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+                })
+            })
             .unwrap_or(fallback_cwd);
         let Some((backend, session_id)) = spawn_local_pty(inherited_cwd) else {
             return;

@@ -534,6 +534,16 @@ impl TerminalView {
         self.with_backend(|be| be.os_pid(id))
     }
 
+    /// F4.7: shell-tracked CWD via OSC 7. Returns `None` when the shell
+    /// hasn't emitted an OSC 7 sequence yet (fresh spawn before first
+    /// prompt) — callers fall back to libproc-on-`os_pid`. Reading this
+    /// hint avoids a syscall per Cmd+D / Cmd+Shift+D and is what makes
+    /// rapid-fire splits feel instant.
+    pub fn cwd_hint(&self) -> Option<std::path::PathBuf> {
+        let id = self.session_id;
+        self.with_backend(|be| be.cwd_hint(id))
+    }
+
     /// Replay captured bytes into this pane's grid BEFORE the live PTY
     /// produces output, so prior scrollback is visible on restart.
     pub fn prefill_grid(&self, bytes: &[u8]) {
@@ -956,6 +966,13 @@ impl Render for TerminalView {
             None
         };
 
+        // F3.4 slice 3: surface dormancy. A restored sub-pane keeps its
+        // prefilled scrollback but holds no shell child yet — the user
+        // could otherwise see static text and wonder why nothing reacts.
+        // The badge auto-clears once `respawn_if_dormant` flips the
+        // backend live + `cx.notify()` re-renders.
+        let dormant_badge = self.is_dormant().then(|| build_dormant_badge(&theme));
+
         let mut root = div()
             .id("oximux-terminal-view")
             .track_focus(&focus_handle)
@@ -963,6 +980,11 @@ impl Render for TerminalView {
             .flex_col()
             .h_full()
             .w_full()
+            // Anchor for the absolute-positioned dormant badge below.
+            // Already set the search-overlay sibling positions itself
+            // via its own container, so adding `relative()` here is
+            // safe — the rows stay in flex flow.
+            .relative()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
             // `.font(...)` over `.font_family(...)` so the configured
@@ -992,6 +1014,33 @@ impl Render for TerminalView {
         if let Some(o) = overlay {
             root = root.child(o);
         }
+        if let Some(badge) = dormant_badge {
+            root = root.child(badge);
+        }
         root
     }
+}
+
+/// F3.4 slice 3: tiny corner chip indicating a restored-dormant sub-pane.
+/// Renders as an absolutely-positioned tag in the top-right of the pane
+/// body. Click/focus anywhere in the pane already wakes it via the
+/// `on_focus` observer wired in `mount_dormant`, so the badge is purely
+/// informational — no click handler needed.
+fn build_dormant_badge(theme: &Theme) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(6.0))
+        .right(px(10.0))
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded(px(4.0))
+        .bg(theme.bg_overlay)
+        .text_color(theme.fg_muted)
+        .text_size(px(11.0))
+        .border_1()
+        .border_color(theme.border_inactive)
+        // `↻` = U+21BB Clockwise Open Circle Arrow. Hint copy mirrors
+        // the dormancy contract: the shell isn't running yet; first
+        // focus or keystroke wakes it at the saved cwd.
+        .child("↻ restored — click to wake")
 }

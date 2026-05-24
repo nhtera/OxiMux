@@ -190,6 +190,18 @@ pub trait TerminalBackend: Send + 'static {
         None
     }
 
+    /// Best-known current working directory for this session, populated
+    /// by the OSC 7 (`file://`) tracker if the shell emits it. Returns
+    /// `None` when no OSC 7 has been seen yet (most likely a fresh
+    /// spawn before the first prompt) — callers fall back to a libproc
+    /// query on `os_pid` in that case.
+    ///
+    /// Reading the cached value is lock-free amortized and ~100x faster
+    /// than `proc_pidinfo`; rapid Cmd+D chains benefit the most.
+    fn cwd_hint(&self, _id: TerminalSessionId) -> Option<PathBuf> {
+        None
+    }
+
     /// Tear down a session. Idempotent — safe to call on an already-closed id.
     fn close(&mut self, id: TerminalSessionId) -> Result<()>;
 }

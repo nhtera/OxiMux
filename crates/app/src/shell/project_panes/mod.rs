@@ -1335,10 +1335,19 @@ fn snapshot_sub_pane_tree(
     let leaves = tree.tree().in_order_leaves();
     let mut sub_panes: Vec<PersistedSubPane> = Vec::with_capacity(leaves.len());
     for slot in &leaves {
+        // Prefer the OSC 7 hint (F4.7) before paying for `proc_pidinfo`
+        // on every leaf. Snapshotting a workspace with many sub-panes
+        // becomes O(N) syscalls otherwise; with the cache it's O(N)
+        // mutex reads.
         let cwd = tree
             .get(*slot)
-            .and_then(|view| view.read(cx).os_pid())
-            .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+            .and_then(|slot_view| {
+                let view = slot_view.read(cx);
+                view.cwd_hint().or_else(|| {
+                    view.os_pid()
+                        .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+                })
+            })
             .map(|p| p.display().to_string());
         sub_panes.push(PersistedSubPane { cwd });
     }

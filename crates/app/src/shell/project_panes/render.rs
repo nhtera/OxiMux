@@ -7,16 +7,16 @@
 //! v1 splits render at fixed 50/50.
 
 use gpui::{
-    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
 use std::collections::HashSet;
 
 use super::{ProjectPanes, TabDragHoveredTarget};
 use crate::shell::pane_group::file_drag::FilePathDragPayload;
-use crate::shell::pane_group::render::build_tab_strip_for;
+use crate::shell::pane_group::render::{build_tab_strip_for, filter_droppable_files};
 use crate::shell::pane_group::tab_drag::TabDragPayload;
 use crate::shell::pane_group::tab_drag_zones::{Zone, resolve_drop_zone};
 use crate::shell::pane_tree::{Axis, PaneGroupId, PaneTree};
@@ -480,6 +480,9 @@ fn leaf_body(
     let drop_panes = project_panes.clone();
     let file_hover_panes = project_panes.clone();
     let file_drop_panes = project_panes.clone();
+    // F4.6: separate clones for the OS-native (Finder) drop variant.
+    let native_hover_panes = project_panes.clone();
+    let native_drop_panes = project_panes.clone();
     // Subtle dim on the unfocused group body so the eye finds the focused
     // group faster. Tab strip stays at full opacity — only the content
     // area dims (matches the reference editor's `opacity-95` pattern).
@@ -609,6 +612,61 @@ fn leaf_body(
                         }
                         Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
                             p.split_and_open_file(group_id, zone, path, window, cx);
+                        }
+                    }
+                });
+            },
+        )
+        // F4.6: OS-native (Finder) drop variant for body-zone targeting.
+        // GPUI translates Finder file drops into an internal drag with
+        // `ExternalPaths` payload, so we mirror the FilePathDragPayload
+        // pair above. Multi-file drops open in sequence in the same zone.
+        .on_drag_move::<ExternalPaths>(
+            move |ev: &DragMoveEvent<ExternalPaths>, _window, cx| {
+                let bounds = ev.bounds;
+                if !bounds.contains(&ev.event.position) {
+                    return;
+                }
+                let zone = resolve_drop_zone(bounds, ev.event.position);
+                native_hover_panes.update(cx, |p, cx| {
+                    p.set_hovered_drop_target(
+                        Some(TabDragHoveredTarget { group_id, zone }),
+                        cx,
+                    );
+                });
+            },
+        )
+        .on_drop::<ExternalPaths>(
+            move |payload: &ExternalPaths, window, cx| {
+                let zone = native_drop_panes
+                    .read(cx)
+                    .hovered_drop_target()
+                    .filter(|t| t.group_id == group_id)
+                    .map(|t| t.zone);
+                let Some(zone) = zone else {
+                    native_drop_panes
+                        .update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
+                    return;
+                };
+                let paths = filter_droppable_files(payload.paths());
+                native_drop_panes.update(cx, |p, cx| {
+                    p.set_hovered_drop_target(None, cx);
+                    // First path drives the split-vs-merge zone semantics.
+                    // Remaining paths (multi-file Finder drop) fall back
+                    // to opening as regular tabs in the resulting group —
+                    // the split itself already happened on path[0].
+                    let mut iter = paths.into_iter();
+                    if let Some(first) = iter.next() {
+                        match zone {
+                            Zone::Center => {
+                                p.open_file_in_group(group_id, first, window, cx);
+                            }
+                            Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
+                                p.split_and_open_file(group_id, zone, first, window, cx);
+                            }
+                        }
+                        for extra in iter {
+                            p.open_file_in_group(group_id, extra, window, cx);
                         }
                     }
                 });

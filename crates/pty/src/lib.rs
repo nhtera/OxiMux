@@ -13,6 +13,7 @@ pub mod backend;
 pub(crate) mod close_grace;
 pub mod events;
 pub mod grid_serializer;
+pub mod osc7;
 pub mod portable_pty_backend;
 pub mod snapshot;
 pub mod state;

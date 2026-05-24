@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -26,6 +27,7 @@ use std::time::Duration;
 use crate::backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 use crate::close_grace::{JoinHandleWatcher, close_with_grace, term_step};
 use crate::events::TerminalEvent;
+use crate::osc7::Osc7Scanner;
 use crate::snapshot::{Cell, TerminalSnapshot};
 use crate::state::TerminalState;
 
@@ -62,6 +64,11 @@ struct Session {
     /// descendant the agent CLI spawned. `None` is a safe fallback —
     /// `close()` skips SIGTERM and goes straight to SIGKILL.
     pid: Option<u32>,
+    /// F4.7: shell-emitted CWD via OSC 7. The watcher thread updates this
+    /// every time the shell prints `ESC ] 7 ; file://host/path ST`; the
+    /// UI reads it for cheap inherit-cwd on Cmd+D / Cmd+Shift+D. Falls
+    /// back to libproc on a miss (first split before any prompt fires).
+    cwd_hint: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl Session {
@@ -139,10 +146,13 @@ impl TerminalBackend for PortablePtyBackend {
             cfg.rows,
             SCROLLBACK_ROWS,
         )));
+        let cwd_hint: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let tx = self.event_tx.clone();
         let watcher_state = Arc::clone(&state);
-        let watcher =
-            std::thread::spawn(move || watch_session(id, reader, child, tx, watcher_state));
+        let watcher_cwd = Arc::clone(&cwd_hint);
+        let watcher = std::thread::spawn(move || {
+            watch_session(id, reader, child, tx, watcher_state, watcher_cwd)
+        });
 
         self.sessions.insert(
             id,
@@ -155,6 +165,7 @@ impl TerminalBackend for PortablePtyBackend {
                 cols: cfg.cols,
                 rows: cfg.rows,
                 pid,
+                cwd_hint,
             },
         );
         Ok(id)
@@ -179,6 +190,7 @@ impl TerminalBackend for PortablePtyBackend {
                 cols,
                 rows,
                 pid: None,
+                cwd_hint: Arc::new(Mutex::new(None)),
             },
         );
         Ok(id)
@@ -232,8 +244,10 @@ impl TerminalBackend for PortablePtyBackend {
         let writer = pair.master.take_writer().context("take writer")?;
         let tx = self.event_tx.clone();
         let watcher_state = Arc::clone(&session.state);
-        let watcher =
-            std::thread::spawn(move || watch_session(id, reader, child, tx, watcher_state));
+        let watcher_cwd = Arc::clone(&session.cwd_hint);
+        let watcher = std::thread::spawn(move || {
+            watch_session(id, reader, child, tx, watcher_state, watcher_cwd)
+        });
 
         session.master = Some(pair.master);
         session.writer = Some(writer);
@@ -347,6 +361,15 @@ impl TerminalBackend for PortablePtyBackend {
         self.sessions.get(&id).and_then(|s| s.pid)
     }
 
+    fn cwd_hint(&self, id: TerminalSessionId) -> Option<PathBuf> {
+        // F4.7: cheap shell-emitted cwd lookup. None until the shell has
+        // emitted at least one OSC 7 since spawn; the caller falls back
+        // to libproc on miss. Poisoned mutex → None (the watcher panicked;
+        // can't trust the cache).
+        let session = self.sessions.get(&id)?;
+        session.cwd_hint.lock().ok()?.clone()
+    }
+
     fn drain_events(&mut self) -> Vec<TerminalEvent> {
         let mut out = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
@@ -405,8 +428,12 @@ fn watch_session(
     mut child: Box<dyn Child + Send + Sync>,
     tx: SyncSender<TerminalEvent>,
     state: Arc<Mutex<TerminalState>>,
+    cwd_hint: Arc<Mutex<Option<PathBuf>>>,
 ) {
     let mut buf = [0u8; READ_BUFFER_BYTES];
+    // F4.7: scanner persists across reads — OSC 7 sequences can span
+    // chunk boundaries. Allocated once per session lifetime.
+    let mut osc7 = Osc7Scanner::new();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
@@ -414,6 +441,16 @@ fn watch_session(
                 let bytes_slice = &buf[..n];
                 if let Ok(mut s) = state.lock() {
                     s.advance(bytes_slice);
+                }
+                // Snoop for the most recent OSC 7 in this chunk. Last
+                // win — if the shell printed several (rare), we want
+                // the freshest cwd.
+                let mut latest: Option<PathBuf> = None;
+                osc7.feed(bytes_slice, |p| latest = Some(p));
+                if let Some(path) = latest
+                    && let Ok(mut slot) = cwd_hint.lock()
+                {
+                    *slot = Some(path);
                 }
                 let bytes = bytes_slice.to_vec();
                 if tx.send(TerminalEvent::Output { id, bytes }).is_err() {
