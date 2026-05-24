@@ -11,6 +11,8 @@
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use gpui::{
     AnyView, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point,
@@ -273,10 +275,76 @@ fn main() {
                 async {}
             })
             .detach();
+            // Window-close → save + quit. Without this, clicking the red
+            // traffic light closes the window but leaves the app alive in
+            // the dock; a follow-up Ctrl+C in the launching terminal then
+            // kills the process via SIGINT without firing on_app_quit, so
+            // any session-recent state would be lost. Save synchronously
+            // here as belt-and-braces (covers the race where on_app_quit
+            // is skipped) AND issue cx.quit() so the app fully exits and
+            // on_app_quit runs the redundant-but-cheap save.
+            let workspace_for_window_close = workspace.clone();
+            cx.on_window_closed(move |cx, _window_id| {
+                let root = workspace_for_window_close.read(cx);
+                root.capture_all_layouts(cx);
+                root.capture_all_pane_buffers(cx);
+                root.capture_all_pane_relay_ids(cx);
+                cx.quit();
+            })
+            .detach();
+            // SIGINT / SIGTERM handler. The signal can arrive in two
+            // ways: (1) user runs `cargo run` and Ctrl+Cs the terminal,
+            // SIGINT cascades to the child OxiMux process; (2) launchd /
+            // killall sends SIGTERM. Cocoa's terminate flow never gets a
+            // chance, so on_app_quit observers don't fire. Install a
+            // signal handler that flips an atomic flag, then a tiny
+            // background task polls the flag and triggers cx.quit() from
+            // inside the GPUI event loop — that goes through the normal
+            // shutdown path and on_app_quit DOES fire, persisting state.
+            install_signal_watchdog(cx);
             let view: AnyView = workspace.into();
             cx.new(|cx| gpui_component::Root::new(view, window, cx))
         });
     });
+}
+
+/// Flag flipped by the SIGINT/SIGTERM handler. Read by the watchdog
+/// poll loop installed via `install_signal_watchdog`. Static so the
+/// signal handler can touch it from an async-signal-safe context
+/// (any thread, no allocation, no mutex).
+static SHUTDOWN_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+/// Async-signal-safe handler. Stores to an atomic and returns.
+/// Anything else (logging, locking, calling into GPUI) would risk
+/// deadlock if the signal interrupted a critical section.
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN_SIGNAL.store(true, Ordering::SeqCst);
+}
+
+/// Install SIGINT + SIGTERM handlers + start a GPUI task that polls
+/// the flag every 200 ms and triggers `cx.quit()` once flipped. Calling
+/// quit from inside the GPUI event loop is what makes on_app_quit fire
+/// — a bare process exit (e.g. SIGKILL) cannot be rescued.
+fn install_signal_watchdog(cx: &mut gpui::App) {
+    // SAFETY: libc::signal is async-signal-safe for installing a
+    // handler. We pass a plain extern "C" fn with no captured state.
+    unsafe {
+        let handler = handle_shutdown_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+    cx.spawn(async move |cx| {
+        loop {
+            if SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+                let _ = cx.update(|cx| cx.quit());
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+        }
+    })
+    .detach();
 }
 
 /// Phase 5 step 1 spike entry point. Opens a single window mounting
