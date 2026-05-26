@@ -368,11 +368,11 @@ fn line_row(
             '+',
             rctx.theme.status_ok,
             // Faded green background telegraphs the added range stronger
-            // than the `+` glyph alone. `a = 0.18` is the sweet spot
-            // against the charcoal cockpit theme: clearly green to the
-            // eye without bleaching the foreground text.
+            // than the `+` glyph alone. `a = 0.22` reads as clearly green
+            // against the charcoal cockpit theme without bleaching the
+            // foreground text.
             Some(gpui::Hsla {
-                a: 0.18,
+                a: 0.22,
                 ..rctx.theme.git.added
             }),
         ),
@@ -380,26 +380,26 @@ fn line_row(
             '-',
             rctx.theme.status_error,
             Some(gpui::Hsla {
-                a: 0.18,
+                a: 0.22,
                 ..rctx.theme.git.deleted
             }),
         ),
         DiffLineKind::NoNewlineHint => ('\\', rctx.theme.fg_subtle, None),
     };
-    let old_cell = match line.old_line {
-        Some(n) => format!("{n:>width$}", width = gutter_digits),
-        None => " ".repeat(gutter_digits),
-    };
-    let new_cell = match line.new_line {
-        Some(n) => format!("{n:>width$}", width = gutter_digits),
-        None => " ".repeat(gutter_digits),
-    };
+    // Each gutter cell packs `<number><sign>` so the eye lands on the
+    // number first and the sign second — matches the convention used by
+    // GitLens / GitHub / VS Code. The sign is rendered per-cell rather
+    // than per-row so a removal in the old cell still reads as removed
+    // even when the row also has an addition mirror.
+    let old_cell = pack_gutter_cell(line.old_line, line.kind, /*is_new_side=*/ false, gutter_digits);
+    let new_cell = pack_gutter_cell(line.new_line, line.kind, /*is_new_side=*/ true, gutter_digits);
     let gutter = div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
-        .px(px(rctx.density.pad_panel))
+        .gap(px(4.0))
+        .pl(px(rctx.density.pad_panel))
+        .pr(px(rctx.density.pad_panel))
         .text_size(px(rctx.typography.t_body_sm))
         .text_color(rctx.theme.fg_subtle)
         .child(div().child(old_cell))
@@ -417,9 +417,30 @@ fn line_row(
         .child(
             div()
                 .flex_1()
-                .px(px(rctx.density.pad_panel))
+                .pr(px(rctx.density.pad_panel))
                 .child(format!("{prefix} {}", line.content)),
         )
+}
+
+/// Build one gutter cell as `<right-aligned number><sign>`. The sign
+/// column is always 1 char wide, so cells align regardless of whether
+/// they carry a sign or not.
+fn pack_gutter_cell(
+    line_no: Option<u32>,
+    kind: DiffLineKind,
+    is_new_side: bool,
+    digits: usize,
+) -> String {
+    let n = match line_no {
+        Some(n) => format!("{n:>width$}", width = digits),
+        None => " ".repeat(digits),
+    };
+    let sign = match (kind, is_new_side, line_no.is_some()) {
+        (DiffLineKind::Added, true, true) => '+',
+        (DiffLineKind::Removed, false, true) => '-',
+        _ => ' ',
+    };
+    format!("{n}{sign}")
 }
 
 fn expand_row(label: String, rctx: &RenderCtx<'_>, cx: &mut Context<DiffView>) -> impl IntoElement {
