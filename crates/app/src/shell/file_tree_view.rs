@@ -28,12 +28,18 @@ use crate::shell::pane_group::file_drag::{FilePathDragPayload, FilePathDragPrevi
 /// executor or tokio paths capture this Arc.
 pub type OnOpenFile = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + 'static>;
 
-/// Diff open callback. Same shape as `OnOpenFile` but carries an
-/// extra `staged: bool` discriminator so a single host method can
-/// route to `open_or_activate_diff_tab(path, staged, …)`. Lives here
-/// next to `OnOpenFile` because both are right-sidebar-injected
-/// callbacks consumed by the same set of panels.
-pub type OnOpenDiff = Arc<dyn Fn(PathBuf, bool, &mut Window, &mut App) + 'static>;
+/// Diff open callback. Same shape as `OnOpenFile` but carries two
+/// discriminators: `staged` (index-vs-HEAD when true, worktree-vs-index
+/// when false) and `untracked` (file is not yet in git — read from disk
+/// to synthesize an all-additions diff). Lives here next to `OnOpenFile`
+/// because both are right-sidebar-injected callbacks consumed by the
+/// same set of panels.
+///
+/// Signature: `(path, staged, untracked, window, app)`. `untracked` is
+/// honored only when `staged == false` — a staged untracked file is a
+/// contradiction (staging promotes it to "added in index").
+pub type OnOpenDiff =
+    Arc<dyn Fn(PathBuf, bool, bool, &mut Window, &mut App) + 'static>;
 
 /// Active-file query callback. Invoked once per render to find the file
 /// currently open in the focused pane; the matching tree row is then

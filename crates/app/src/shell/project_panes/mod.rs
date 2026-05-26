@@ -542,6 +542,7 @@ impl ProjectPanes {
         repo: oximux_git::Repository,
         path: PathBuf,
         staged: bool,
+        untracked: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
@@ -553,7 +554,7 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         let target = self.groups.get(&target_id)?.clone();
         Some(target.update(cx, |g, cx| {
-            g.open_or_activate_diff_tab(repo, path, staged, window, cx)
+            g.open_or_activate_diff_tab(repo, path, staged, untracked, window, cx)
         }))
     }
 

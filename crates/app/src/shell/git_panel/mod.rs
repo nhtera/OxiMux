@@ -13,6 +13,7 @@
 //! instead of panicking. Step 14 wires runtime setup at the shell mount point.
 
 pub mod changed_files;
+pub mod row_actions;
 
 use crate::actions::{RevertFile, StageFile, UnstageFile};
 use crate::shell::diff_view::DiffView;
@@ -182,10 +183,35 @@ impl GitPanel {
         })
     }
 
-    fn on_stage_file(&mut self, _: &StageFile, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_stage_file(&mut self, _: &StageFile, _window: &mut Window, cx: &mut Context<Self>) {
         let Some((path, _)) = self.selected.clone() else {
             return;
         };
+        self.stage_path(path, cx);
+    }
+
+    fn on_unstage_file(&mut self, _: &UnstageFile, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.selected.clone() else {
+            return;
+        };
+        self.unstage_path(path, cx);
+    }
+
+    fn on_revert_file(&mut self, _: &RevertFile, _window: &mut Window, cx: &mut Context<Self>) {
+        // Keyboard / command-palette entrypoint. Goes through the same
+        // `discard_path` method that the hover-action button uses so any
+        // confirmation modal added later (Phase 01b) covers both paths.
+        let Some((path, _)) = self.selected.clone() else {
+            return;
+        };
+        self.discard_path(path, cx);
+    }
+
+    /// Stage a specific path — hover-action entrypoint. Doesn't read
+    /// `self.selected` so it works on any row, not just the highlighted
+    /// one. Spawns the git op on the current tokio runtime; failures land
+    /// in tracing.
+    pub fn stage_path(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
         spawn_repo_op(
             self.repo.clone(),
             move |repo| async move { repo.stage_paths(&[path.as_path()]).await },
@@ -193,10 +219,8 @@ impl GitPanel {
         );
     }
 
-    fn on_unstage_file(&mut self, _: &UnstageFile, _window: &mut Window, _cx: &mut Context<Self>) {
-        let Some((path, _)) = self.selected.clone() else {
-            return;
-        };
+    /// Unstage a specific path. Symmetric counterpart to `stage_path`.
+    pub fn unstage_path(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
         spawn_repo_op(
             self.repo.clone(),
             move |repo| async move { repo.unstage_paths(&[path.as_path()]).await },
@@ -204,15 +228,22 @@ impl GitPanel {
         );
     }
 
-    fn on_revert_file(&mut self, _: &RevertFile, _window: &mut Window, _cx: &mut Context<Self>) {
-        // Step 8 stub. Step 11 wires the type-to-confirm modal before any
-        // worktree mutation. Logging here so the wiring is visible end-to-end.
-        if let Some((path, _)) = self.selected.as_ref() {
-            tracing::info!(
-                ?path,
-                "RevertFile dispatched — confirm modal lands in step 11"
-            );
-        }
+    /// Discard worktree changes for a path. Destructive — Phase 01b lands
+    /// the type-to-confirm modal that wraps this call. For now the op
+    /// fires directly so the wiring is end-to-end testable; gating
+    /// behind the modal is a strict additive change that won't reshape
+    /// the API.
+    pub fn discard_path(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        tracing::info!(
+            target: "oximux_app::git_panel",
+            ?path,
+            "discard_path dispatched (confirm modal lands in Phase 01b)"
+        );
+        spawn_repo_op(
+            self.repo.clone(),
+            move |repo| async move { repo.discard_paths(&[path.as_path()]).await },
+            "discard_paths",
+        );
     }
 }
 

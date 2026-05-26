@@ -16,6 +16,7 @@
 //! switch). Filter / scope / commit state lives on `SourceControlPanel`.
 
 pub mod commit_area;
+pub mod commit_ops;
 pub mod filter;
 pub mod graph;
 pub mod primary_action;
@@ -239,7 +240,25 @@ impl SourceControlPanel {
             })
             .unwrap_or((0, false, false, false, None));
 
-        let in_flight = self.in_flight_remote.lock().ok().and_then(|g| *g);
+        // Derive the in-flight remote op directly from the commit area's
+        // status. The legacy `self.in_flight_remote` mutex was intended for
+        // a callback-driven flow that never landed; deriving from the
+        // already-correct `CommitStatus` eliminates the two-sources-of-truth
+        // gap (the mutex was never written, so the primary button stayed
+        // enabled during dropdown-driven Push/Pull/Sync/Fetch).
+        let commit_status = self.commit_area.read(cx).status.clone();
+        let in_flight_remote_kind = match &commit_status {
+            commit_area::CommitStatus::Pushing => Some(RemoteOpKind::Push),
+            commit_area::CommitStatus::Pulling => Some(RemoteOpKind::Pull),
+            commit_area::CommitStatus::Syncing => Some(RemoteOpKind::Sync),
+            commit_area::CommitStatus::Fetching => Some(RemoteOpKind::Fetch),
+            _ => None,
+        };
+        // Sync the legacy mutex so the field stays consistent for any
+        // future caller; harmless if nothing else reads it.
+        if let Ok(mut g) = self.in_flight_remote.lock() {
+            *g = in_flight_remote_kind;
+        }
         let inputs = PrimaryActionInputs {
             staged_count,
             has_unstaged_changes: has_unstaged,
@@ -247,12 +266,12 @@ impl SourceControlPanel {
             has_message: self.commit_area.read(cx).has_message(cx),
             has_unresolved_conflicts: has_conflict,
             is_committing: matches!(
-                self.commit_area.read(cx).status,
+                commit_status,
                 commit_area::CommitStatus::Committing
             ),
-            is_remote_operation_active: in_flight.is_some(),
+            is_remote_operation_active: in_flight_remote_kind.is_some(),
             upstream_status: upstream,
-            in_flight_remote_op_kind: in_flight,
+            in_flight_remote_op_kind: in_flight_remote_kind,
         };
         resolve_primary_action(&inputs)
     }
@@ -507,6 +526,12 @@ impl Render for SourceControlPanel {
             .overflow_hidden()
             .child(self.git_panel.clone());
 
+        // Layout order: scope tabs → toolbar → filter →
+        // **files (flex_1)** → **commit area docked at bottom** → graph.
+        // The previous order rendered the commit textarea mid-panel,
+        // floating above the file list when the list was short. Anchoring
+        // the composer to the bottom keeps the cockpit's "type-and-commit"
+        // surface in a stable position regardless of file-list height.
         let mut body = div()
             .flex()
             .flex_col()
@@ -516,8 +541,8 @@ impl Render for SourceControlPanel {
             .child(scope_tabs)
             .child(toolbar)
             .child(filter_row)
-            .child(commit_area_render)
-            .child(files_block);
+            .child(files_block)
+            .child(commit_area_render);
         if self.scope.shows_graph() {
             // Graph sits at its natural height, pinned to the bottom of the
             // panel by the `flex_1` files_block above. Top border separates

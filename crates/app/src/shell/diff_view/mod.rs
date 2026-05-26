@@ -91,7 +91,20 @@ impl DiffView {
 
     /// Begin loading `path` in the requested stage. Cancels any in-flight
     /// load by dropping the previous task.
-    pub fn load(&mut self, path: PathBuf, staged: bool, cx: &mut Context<Self>) {
+    ///
+    /// Routing: tracked files go through `diff_for_path` (normal git diff
+    /// against index or HEAD). When `untracked = true`, the path bypasses
+    /// git entirely and `diff_for_untracked` reads the file off disk to
+    /// synthesize an "all-additions" diff — `git diff` returns nothing for
+    /// untracked paths, which would leave the user staring at "No diff"
+    /// when they clicked a new file row.
+    pub fn load(
+        &mut self,
+        path: PathBuf,
+        staged: bool,
+        untracked: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -102,10 +115,15 @@ impl DiffView {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let r = repo
-                        .diff_for_path(&path_for_fetch, staged)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let r = if untracked {
+                        repo.diff_for_untracked(&path_for_fetch)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        repo.diff_for_path(&path_for_fetch, staged)
+                            .await
+                            .map_err(|e| e.to_string())
+                    };
                     let _ = tx.send(r);
                 });
             }

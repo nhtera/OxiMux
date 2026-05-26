@@ -139,6 +139,92 @@ impl Repository {
         self.diff_with_args(extra, Some(path)).await
     }
 
+    /// Synthesize an "all-additions" diff for an untracked file by reading
+    /// its content directly off disk. Git's normal `diff` ignores untracked
+    /// files (they're not in the index), so a vanilla `diff_for_path` on a
+    /// new file returns an empty `Vec` and the diff view shows "No diff" —
+    /// not useful when the user clicks an untracked row to inspect it.
+    ///
+    /// `path` may be relative-to-workdir or absolute inside the workdir;
+    /// resolution mirrors `diff_for_path`.
+    pub async fn diff_for_untracked(&self, path: &Path) -> Result<Vec<FileDiff>> {
+        use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, LARGE_DIFF_LINE_THRESHOLD};
+
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workdir.join(path)
+        };
+        let bytes = match tokio::fs::read(&abs).await {
+            Ok(b) => b,
+            Err(e) => return Err(GitError::parse(format!("read {}: {e}", abs.display()))),
+        };
+        // Binary detection: same heuristic as `git diff` — if the first 8K
+        // contains a NUL byte, treat as binary and surface the same status
+        // git would emit.
+        let preview = &bytes[..bytes.len().min(8192)];
+        if preview.contains(&0u8) {
+            return Ok(vec![FileDiff {
+                path: path.to_path_buf(),
+                status: DiffStatus::Binary,
+                hunks: Vec::new(),
+                large: false,
+            }]);
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|e| GitError::parse(format!("untracked file not utf-8: {e}")))?;
+        let lines: Vec<&str> = if text.is_empty() {
+            Vec::new()
+        } else {
+            // `split('\n')` keeps a trailing empty after a final '\n' which
+            // would render as an extra blank line; trim it out. For files
+            // without a trailing newline the marker line is appended below.
+            let mut v: Vec<&str> = text.split('\n').collect();
+            if text.ends_with('\n') {
+                v.pop();
+            }
+            v
+        };
+        let line_count = lines.len() as u32;
+        let mut diff_lines: Vec<DiffLine> = lines
+            .into_iter()
+            .map(|l| DiffLine {
+                kind: DiffLineKind::Added,
+                content: l.to_string(),
+            })
+            .collect();
+        // Mirror git's "\ No newline at end of file" hint when applicable so
+        // the diff view can render the EOF marker the same way it does for
+        // tracked files. Empty files don't need the hint.
+        if !text.is_empty() && !text.ends_with('\n') {
+            diff_lines.push(DiffLine {
+                kind: DiffLineKind::NoNewlineHint,
+                content: "\\ No newline at end of file".to_string(),
+            });
+        }
+        let hunks = if diff_lines.is_empty() {
+            // Zero-byte file: no hunk; renderer falls back to the empty
+            // state but the file is correctly classified as Added.
+            Vec::new()
+        } else {
+            vec![DiffHunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: line_count,
+                header_suffix: String::new(),
+                lines: diff_lines,
+            }]
+        };
+        let large = line_count as usize > LARGE_DIFF_LINE_THRESHOLD;
+        Ok(vec![FileDiff {
+            path: path.to_path_buf(),
+            status: DiffStatus::Added,
+            hunks,
+            large,
+        }])
+    }
+
     async fn diff_with_args(&self, extra: &[&str], path: Option<&Path>) -> Result<Vec<FileDiff>> {
         let mut cmd = GitCmd::new(&self.workdir)
             .timeout(DIFF_TIMEOUT)

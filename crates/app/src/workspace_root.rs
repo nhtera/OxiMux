@@ -423,6 +423,7 @@ impl WorkspaceRoot {
         repo: oximux_git::Repository,
         path: std::path::PathBuf,
         staged: bool,
+        untracked: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -430,7 +431,7 @@ impl WorkspaceRoot {
             return;
         };
         panes.update(cx, |p, cx| {
-            p.open_or_activate_diff_tab(repo, path, staged, window, cx);
+            p.open_or_activate_diff_tab(repo, path, staged, untracked, window, cx);
         });
     }
 
@@ -443,10 +444,10 @@ impl WorkspaceRoot {
         weak: WeakEntity<Self>,
         repo: oximux_git::Repository,
     ) -> crate::shell::file_tree_view::OnOpenDiff {
-        Arc::new(move |path, staged, window, cx| {
+        Arc::new(move |path, staged, untracked, window, cx| {
             let repo = repo.clone();
             let _ = weak.update(cx, |this, cx| {
-                this.open_diff_in_active_pane(repo, path, staged, window, cx);
+                this.open_diff_in_active_pane(repo, path, staged, untracked, window, cx);
             });
         })
     }

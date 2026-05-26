@@ -49,6 +49,19 @@ impl Repository {
         self.push().await
     }
 
+    /// `git fetch --all --prune`. Updates remote-tracking refs without
+    /// touching the working tree. Pruned refs disappear locally to match
+    /// the remote; useful as a low-risk verb before deciding whether to
+    /// pull or sync.
+    pub async fn fetch(&self) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["fetch", "--all", "--prune"])
+            .timeout(REMOTE_TIMEOUT)
+            .run()
+            .await?;
+        Ok(())
+    }
+
     /// Publish a new branch by pushing it with `-u <remote> <current-branch>`.
     /// Resolves the current branch name via `rev-parse --abbrev-ref HEAD`;
     /// detached HEAD returns `InvalidInput`.

@@ -42,6 +42,10 @@ impl<'a> FileSections<'a> {
 /// Filtering: `Ignored` rows are dropped from all sections. Conflicts
 /// (`Unmerged`) surface in **Unstaged only** — the user must `git add` to
 /// mark resolved, so showing them as already-staged would mislead.
+///
+/// Ordering: within Unstaged, conflict rows are pinned to the top so an
+/// unresolved merge can't hide below ordinary modifications. Matches the
+/// common SCM convention of surfacing conflicts first.
 pub fn partition_files(files: &[FileStatus]) -> FileSections<'_> {
     let mut s = FileSections::default();
     for f in files {
@@ -68,7 +72,16 @@ pub fn partition_files(files: &[FileStatus]) -> FileSections<'_> {
             s.unstaged.push(f);
         }
     }
+    // Stable partition: conflicts before non-conflicts; original relative
+    // order preserved within each group (sort_by_key with stable sort).
+    s.unstaged.sort_by_key(|f| !is_conflict(f));
     s
+}
+
+/// Convenience predicate used by sorting + row rendering to highlight
+/// merge-conflict files. Either side carrying `Unmerged` flags the row.
+pub(crate) fn is_conflict(f: &FileStatus) -> bool {
+    matches!(f.index, IndexStatus::Unmerged) || matches!(f.worktree, WorktreeStatus::Unmerged)
 }
 
 #[derive(Copy, Clone)]
@@ -76,6 +89,27 @@ enum RowKind {
     Staged,
     Unstaged,
     Untracked,
+}
+
+/// Re-exported `RowKind` shape for `row_actions::action_cluster`. Defining
+/// it here (rather than passing the private `RowKind` directly) keeps
+/// `changed_files` the owner of the section taxonomy while letting the
+/// out-of-file action helpers see the variants.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RowKindForActions {
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+impl From<RowKind> for RowKindForActions {
+    fn from(k: RowKind) -> Self {
+        match k {
+            RowKind::Staged => RowKindForActions::Staged,
+            RowKind::Unstaged => RowKindForActions::Unstaged,
+            RowKind::Untracked => RowKindForActions::Untracked,
+        }
+    }
 }
 
 /// Bundle of styling + selection state threaded through the render helpers.
@@ -257,6 +291,11 @@ fn row(
     let theme = rctx.theme;
     let click_path = f.path.clone();
     let click_staged = matches!(kind, RowKind::Staged);
+    // Untracked rows are git-invisible — `git diff` returns nothing for
+    // them. The host's `OnOpenDiff` callback routes such clicks through
+    // `Repository::diff_for_untracked` instead, reading the file off disk
+    // to synthesize an all-additions diff.
+    let click_untracked = matches!(kind, RowKind::Untracked);
     // Skip the editor-open dispatch for rows whose worktree file no
     // longer exists (deleted in working tree) — opening would surface an
     // empty editor buffer for a path the user explicitly removed. The
@@ -308,15 +347,15 @@ fn row(
         f.path.display()
     );
 
-    // Hover-only inverse-action icon (— to unstage, + to stage). On hover the
-    // status badge fades out and this icon fades in within the same column —
-    // matches the common SCM convention. The button is a placeholder until
-    // stage/unstage are wired through the panel handlers.
-    let (action_icon_path, action_tooltip) = match kind {
-        RowKind::Staged => ("icons/minus.svg", "Unstage file (coming soon)"),
-        RowKind::Unstaged | RowKind::Untracked => ("icons/plus.svg", "Stage file (coming soon)"),
-    };
-    let action_id = format!("git-row-action-{}", row_id);
+    // Hover-only action cluster (stage / unstage / discard). On hover the
+    // status badge fades out and these icons fade in within the same column
+    // via `group_hover`. The set varies by row kind — see `row_actions`.
+    let action_cluster = crate::shell::git_panel::row_actions::action_cluster(
+        f.path.clone(),
+        kind.into(),
+        gpui::SharedString::from(row_id.clone()),
+        cx,
+    );
 
     div()
         .id(gpui::SharedString::from(row_id.clone()))
@@ -342,7 +381,7 @@ fn row(
                 // deleted on disk — the sidebar mini-diff already shows
                 // the `-` block for those.
                 if click_should_open_editor && let Some(cb) = panel.on_open.clone() {
-                    (cb)(click_path.clone(), click_staged, window, cx);
+                    (cb)(click_path.clone(), click_staged, click_untracked, window, cx);
                 }
                 cx.notify();
             }),
@@ -376,12 +415,13 @@ fn row(
                 ),
         )
         .child(
-            // Right slot stacks badge + action; group_hover toggles which is
-            // visible. Both occupy the same w(14)×h(row) slot via absolute
-            // positioning so the swap is jitter-free.
+            // Right slot stacks badge + action cluster; group_hover toggles
+            // which is visible. Both occupy the same slot via absolute
+            // positioning so the swap is jitter-free. The slot is wider
+            // (38px) than before to host up to two action buttons.
             div()
                 .relative()
-                .w(px(18.0))
+                .w(px(38.0))
                 .h(px(rctx.density.h_row))
                 .child(
                     div()
@@ -402,18 +442,10 @@ fn row(
                         .inset_0()
                         .flex()
                         .items_center()
-                        .justify_center()
+                        .justify_end()
                         .invisible()
                         .group_hover(row_id, |s| s.visible())
-                        .child(
-                            Button::new(gpui::SharedString::from(action_id))
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::default().path(action_icon_path))
-                                .tooltip(action_tooltip)
-                                .disabled(true)
-                                .on_click(|_: &ClickEvent, _, _| {}),
-                        ),
+                        .child(action_cluster),
                 ),
         )
 }

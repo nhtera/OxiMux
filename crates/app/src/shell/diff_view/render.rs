@@ -68,6 +68,12 @@ pub struct FileHeader {
 pub struct HunkPlan {
     /// `@@ -A,B +C,D @@ suffix` header line.
     pub header: String,
+    /// Suppress the visual `@@` header for hunks that carry no useful
+    /// positional info — e.g. an all-additions hunk on a brand-new file
+    /// (`-0,0 +1,N`) or an all-deletions hunk on a removed file. The
+    /// renderer hides the row when this is true; the `header` string is
+    /// retained for tests + telemetry.
+    pub suppress_header: bool,
     pub rows: Vec<LinePlan>,
 }
 
@@ -75,6 +81,12 @@ pub struct HunkPlan {
 pub struct LinePlan {
     pub kind: DiffLineKind,
     pub content: String,
+    /// 1-based old-side line number, or `None` for additions / hunk-marker
+    /// rows. Drives the left gutter cell.
+    pub old_line: Option<u32>,
+    /// 1-based new-side line number, or `None` for deletions / hunk-marker
+    /// rows. Drives the right gutter cell.
+    pub new_line: Option<u32>,
 }
 
 /// Build the pure render plan.
@@ -110,27 +122,63 @@ fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
                 let hunks = d
                     .hunks
                     .iter()
-                    .map(|h| HunkPlan {
-                        header: format!(
-                            "@@ -{},{} +{},{} @@{}",
-                            h.old_start,
-                            h.old_lines,
-                            h.new_start,
-                            h.new_lines,
-                            if h.header_suffix.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" {}", h.header_suffix)
-                            }
-                        ),
-                        rows: h
+                    .map(|h| {
+                        // Walk the hunk once, tracking the running line
+                        // numbers on each side. Context bumps both;
+                        // Added bumps new only; Removed bumps old only;
+                        // NoNewlineHint carries no positional info.
+                        let mut old_n = h.old_start.saturating_sub(1);
+                        let mut new_n = h.new_start.saturating_sub(1);
+                        let rows: Vec<LinePlan> = h
                             .lines
                             .iter()
-                            .map(|l| LinePlan {
-                                kind: l.kind,
-                                content: l.content.clone(),
+                            .map(|l| {
+                                let (old_line, new_line) = match l.kind {
+                                    DiffLineKind::Context => {
+                                        old_n += 1;
+                                        new_n += 1;
+                                        (Some(old_n), Some(new_n))
+                                    }
+                                    DiffLineKind::Added => {
+                                        new_n += 1;
+                                        (None, Some(new_n))
+                                    }
+                                    DiffLineKind::Removed => {
+                                        old_n += 1;
+                                        (Some(old_n), None)
+                                    }
+                                    DiffLineKind::NoNewlineHint => (None, None),
+                                };
+                                LinePlan {
+                                    kind: l.kind,
+                                    content: l.content.clone(),
+                                    old_line,
+                                    new_line,
+                                }
                             })
-                            .collect(),
+                            .collect();
+                        // Suppress the `@@` header when one side of the
+                        // hunk carries no information — the user can already
+                        // tell from the "Added" / "Deleted" status label
+                        // plus the all-`+`/`-` row stream.
+                        let suppress_header = (h.old_start == 0 && h.old_lines == 0)
+                            || (h.new_start == 0 && h.new_lines == 0);
+                        HunkPlan {
+                            header: format!(
+                                "@@ -{},{} +{},{} @@{}",
+                                h.old_start,
+                                h.old_lines,
+                                h.new_start,
+                                h.new_lines,
+                                if h.header_suffix.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" {}", h.header_suffix)
+                                }
+                            ),
+                            suppress_header,
+                            rows,
+                        }
                     })
                     .collect();
                 FilePlan::Hunked {
@@ -267,14 +315,34 @@ fn file_header_strip(text: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
 }
 
 fn hunks_body(hunks: &[HunkPlan], rctx: &RenderCtx<'_>) -> impl IntoElement {
+    // Gutter width auto-fits the largest line number across all hunks so
+    // the divider between gutter and content stays aligned across the
+    // whole file (no per-hunk shift when one hunk ends at line 9 and the
+    // next starts at line 1004).
+    let max_line: u32 = hunks
+        .iter()
+        .flat_map(|h| h.rows.iter())
+        .map(|r| r.old_line.unwrap_or(0).max(r.new_line.unwrap_or(0)))
+        .max()
+        .unwrap_or(0);
+    let gutter_digits = digit_count(max_line);
+
     let mut col = div().flex().flex_col();
     for h in hunks {
-        col = col.child(hunk_header(h.header.clone(), rctx));
+        if !h.suppress_header {
+            col = col.child(hunk_header(h.header.clone(), rctx));
+        }
         for r in &h.rows {
-            col = col.child(line_row(r, rctx));
+            col = col.child(line_row(r, rctx, gutter_digits));
         }
     }
     col
+}
+
+fn digit_count(n: u32) -> usize {
+    // Minimum gutter cell width of 2 digits keeps narrow files (≤ 9 lines)
+    // from looking cramped against the divider.
+    n.checked_ilog10().map(|d| d as usize + 1).unwrap_or(0).max(2)
 }
 
 fn hunk_header(header: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
@@ -289,22 +357,69 @@ fn hunk_header(header: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
         .child(header)
 }
 
-fn line_row(line: &LinePlan, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    let (prefix, fg) = match line.kind {
-        DiffLineKind::Context => (' ', rctx.theme.fg_muted),
-        DiffLineKind::Added => ('+', rctx.theme.status_ok),
-        DiffLineKind::Removed => ('-', rctx.theme.status_error),
-        DiffLineKind::NoNewlineHint => ('\\', rctx.theme.fg_subtle),
+fn line_row(
+    line: &LinePlan,
+    rctx: &RenderCtx<'_>,
+    gutter_digits: usize,
+) -> impl IntoElement {
+    let (prefix, fg, row_bg) = match line.kind {
+        DiffLineKind::Context => (' ', rctx.theme.fg_muted, None),
+        DiffLineKind::Added => (
+            '+',
+            rctx.theme.status_ok,
+            // Faded green background telegraphs the added range stronger
+            // than the `+` glyph alone. `a = 0.18` is the sweet spot
+            // against the charcoal cockpit theme: clearly green to the
+            // eye without bleaching the foreground text.
+            Some(gpui::Hsla {
+                a: 0.18,
+                ..rctx.theme.git.added
+            }),
+        ),
+        DiffLineKind::Removed => (
+            '-',
+            rctx.theme.status_error,
+            Some(gpui::Hsla {
+                a: 0.18,
+                ..rctx.theme.git.deleted
+            }),
+        ),
+        DiffLineKind::NoNewlineHint => ('\\', rctx.theme.fg_subtle, None),
     };
-    let text = format!("{prefix}{}", line.content);
-    div()
+    let old_cell = match line.old_line {
+        Some(n) => format!("{n:>width$}", width = gutter_digits),
+        None => " ".repeat(gutter_digits),
+    };
+    let new_cell = match line.new_line {
+        Some(n) => format!("{n:>width$}", width = gutter_digits),
+        None => " ".repeat(gutter_digits),
+    };
+    let gutter = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(rctx.density.pad_panel))
+        .text_size(px(rctx.typography.t_body_sm))
+        .text_color(rctx.theme.fg_subtle)
+        .child(div().child(old_cell))
+        .child(div().child(new_cell));
+    let mut row = div()
         .flex()
         .items_center()
         .h(px(rctx.density.h_row))
-        .px(px(rctx.density.pad_panel))
         .text_size(px(rctx.typography.t_body_sm))
-        .text_color(fg)
-        .child(text)
+        .text_color(fg);
+    if let Some(bg) = row_bg {
+        row = row.bg(bg);
+    }
+    row.child(gutter)
+        .child(
+            div()
+                .flex_1()
+                .px(px(rctx.density.pad_panel))
+                .child(format!("{prefix} {}", line.content)),
+        )
 }
 
 fn expand_row(label: String, rctx: &RenderCtx<'_>, cx: &mut Context<DiffView>) -> impl IntoElement {

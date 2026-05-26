@@ -8,7 +8,7 @@
 //! triggers one commit.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use gpui::{
     Anchor, AppContext, ClickEvent, Context, Entity, FocusHandle, IntoElement, ParentElement,
@@ -22,30 +22,44 @@ use gpui_component::{
 };
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
-use tokio::sync::oneshot;
 
 use crate::shell::source_control::primary_action::{PrimaryAction, PrimaryActionKind};
 use crate::shell::source_control::style as sc_style;
 
-/// Last error surfaced from a commit attempt. Reset on a fresh submit.
+/// Last status surfaced from a commit / remote operation. Mirrors the
+/// primary-action lifecycle in the panel header so the user sees the
+/// op-in-flight even when the dropdown chevron triggered it (not just the
+/// main split button).
+///
+/// `Failed(label, message)` includes the failing op's verb so the toast
+/// reads "Push failed: …" rather than the generic "Commit failed". Reset
+/// to `Idle` on the next successful op.
 #[derive(Debug, Clone, Default)]
 pub enum CommitStatus {
     #[default]
     Idle,
     Committing,
-    Failed(String),
+    Pushing,
+    Pulling,
+    Syncing,
+    Fetching,
+    Failed(String, String),
 }
 
 pub struct CommitArea {
-    repo: Repository,
+    // `pub(in crate::shell::source_control)` on the fields the sibling
+    // `commit_ops` module pokes. Restricting visibility this way (rather
+    // than `pub(crate)`) keeps the fields out of the wider app surface
+    // while still letting the in-module helper module reach them.
+    pub(in crate::shell::source_control) repo: Repository,
     pub message_state: Entity<InputState>,
     pub status: CommitStatus,
-    in_flight: Arc<AtomicBool>,
+    pub(in crate::shell::source_control) in_flight: Arc<AtomicBool>,
     theme: Theme,
     density: Density,
     typography: Typography,
     /// Drop cancels the in-flight commit observer task.
-    _commit_task: Option<Task<()>>,
+    pub(in crate::shell::source_control) _commit_task: Option<Task<()>>,
 }
 
 impl CommitArea {
@@ -97,60 +111,62 @@ impl CommitArea {
         if action.disabled || action.kind != PrimaryActionKind::Commit {
             return;
         }
-        if self.in_flight.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let message = self.message_state.read(cx).value().to_string();
-        let trimmed = message.trim();
-        if trimmed.is_empty() {
-            self.in_flight.store(false, Ordering::SeqCst);
-            self.status = CommitStatus::Failed("Message is empty".to_string());
-            return;
-        }
-        let message = trimmed.to_string();
-        self.status = CommitStatus::Committing;
-        let repo = self.repo.clone();
-        let (tx, rx) = oneshot::channel::<Result<String, String>>();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    let r = repo.commit(&message).await.map_err(|e| e.to_string());
-                    let _ = tx.send(r);
-                });
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "oximux_app::source_control",
-                    "no tokio runtime entered; commit skipped"
-                );
-                self.status = CommitStatus::Failed("no tokio runtime".to_string());
-                self.in_flight.store(false, Ordering::SeqCst);
-                return;
-            }
-        }
-        let task = cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.await else {
-                return;
-            };
-            let _ = this.update(cx, |area, cx| {
-                area.in_flight.store(false, Ordering::SeqCst);
-                area.apply_result(result, cx);
-                cx.notify();
-            });
-        });
-        self._commit_task = Some(task);
+        super::commit_ops::run_commit(self, false, false, cx);
     }
 
-    fn apply_result(&mut self, result: Result<String, String>, _cx: &mut Context<Self>) {
+    /// Commit-then-push convenience used by the dropdown's "Commit & Push"
+    /// item. Push only fires on a successful commit; partial failure
+    /// surfaces via `CommitStatus::Failed("commit"/"push", …)`.
+    pub fn commit_and_push(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_commit(self, true, false, cx);
+    }
+
+    /// Commit-then-sync (pull + push). Same single-flight + status surface
+    /// as `commit_and_push`.
+    pub fn commit_and_sync(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_commit(self, false, true, cx);
+    }
+
+    /// Standalone `git push` — used by the dropdown's Push item and the
+    /// primary action when `PrimaryActionKind::Push` resolves.
+    pub fn push(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Push, cx);
+    }
+
+    /// Standalone `git pull --ff-only`.
+    pub fn pull(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Pull, cx);
+    }
+
+    /// Standalone `git pull --ff-only && git push`.
+    pub fn sync(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Sync, cx);
+    }
+
+    /// `git fetch --all --prune`. Low-risk — never mutates the working
+    /// tree, only updates remote-tracking refs.
+    pub fn fetch(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Fetch, cx);
+    }
+
+    /// Apply a completed op result to the status surface. Called from the
+    /// commit-ops completion task; pub(super) so the helper module can
+    /// reach it without re-exposing the field.
+    pub(super) fn apply_result(
+        &mut self,
+        result: Result<&'static str, (&'static str, String)>,
+    ) {
         match result {
-            Ok(_sha) => {
+            Ok(_label) => {
                 self.status = CommitStatus::Idle;
                 // `InputState::set_value` requires `&mut Window`, which isn't
                 // available in this oneshot result callback. v1 trade-off:
                 // leave the message in place after commit; the user clears
                 // manually.
             }
-            Err(error) => self.status = CommitStatus::Failed(error),
+            Err((label, error)) => {
+                self.status = CommitStatus::Failed(label.to_string(), error)
+            }
         }
     }
 
@@ -248,9 +264,15 @@ impl CommitArea {
 }
 
 /// Chevron dropdown items: commit-with-followups, standalone remote verbs,
-/// host-integrations. Only "Commit" actually dispatches today — `action.kind`
-/// already encodes whether commit is viable (resolver checks has_message +
-/// staged_count). Remote/PR verbs ship disabled until their backends land.
+/// host-integrations. Commit / Commit & Push / Commit & Sync / Push / Pull /
+/// Sync / Fetch are functional. Create PR / Push & Create PR remain disabled
+/// — they depend on the PR adapter (Phase 06c).
+///
+/// Gating:
+/// - `Commit*` items need a non-empty message + something to commit
+///   (delegates to `PrimaryActionKind::Commit` resolution).
+/// - Remote verbs are always enabled when a tokio runtime exists; the verb
+///   surfaces its own "no upstream" / network errors via `CommitStatus`.
 fn build_commit_menu(
     menu: gpui_component::menu::PopupMenu,
     window: &mut Window,
@@ -259,6 +281,12 @@ fn build_commit_menu(
 ) -> gpui_component::menu::PopupMenu {
     let can_commit = matches!(action.kind, PrimaryActionKind::Commit) && !action.disabled;
     let view_commit = view.clone();
+    let view_commit_push = view.clone();
+    let view_commit_sync = view.clone();
+    let view_push = view.clone();
+    let view_pull = view.clone();
+    let view_sync = view.clone();
+    let view_fetch = view.clone();
     let action_commit = action.clone();
 
     menu.min_w(px(224.0))
@@ -270,15 +298,64 @@ fn build_commit_menu(
                     cx.notify();
                 })),
         )
-        .item(PopupMenuItem::new("Commit & Push").disabled(true))
-        .item(PopupMenuItem::new("Commit & Sync").disabled(true))
+        .item(
+            PopupMenuItem::new("Commit & Push")
+                .disabled(!can_commit)
+                .on_click(window.listener_for(&view_commit_push, move |area, _, _, cx| {
+                    area.commit_and_push(cx);
+                    cx.notify();
+                })),
+        )
+        .item(
+            PopupMenuItem::new("Commit & Sync")
+                .disabled(!can_commit)
+                .on_click(window.listener_for(&view_commit_sync, move |area, _, _, cx| {
+                    area.commit_and_sync(cx);
+                    cx.notify();
+                })),
+        )
         .separator()
-        .item(PopupMenuItem::new("Push").disabled(true))
+        .item(
+            PopupMenuItem::new("Push").on_click(window.listener_for(
+                &view_push,
+                move |area, _, _, cx| {
+                    area.push(cx);
+                    cx.notify();
+                },
+            )),
+        )
+        // PR-creation items stay disabled until Phase 06c lands the GitHub
+        // adapter. Showing them keeps the menu shape stable across versions
+        // so the user's muscle memory doesn't change post-upgrade.
         .item(PopupMenuItem::new("Create PR").disabled(true))
         .item(PopupMenuItem::new("Push & Create PR").disabled(true))
-        .item(PopupMenuItem::new("Pull").disabled(true))
-        .item(PopupMenuItem::new("Sync").disabled(true))
-        .item(PopupMenuItem::new("Fetch").disabled(true))
+        .item(
+            PopupMenuItem::new("Pull").on_click(window.listener_for(
+                &view_pull,
+                move |area, _, _, cx| {
+                    area.pull(cx);
+                    cx.notify();
+                },
+            )),
+        )
+        .item(
+            PopupMenuItem::new("Sync").on_click(window.listener_for(
+                &view_sync,
+                move |area, _, _, cx| {
+                    area.sync(cx);
+                    cx.notify();
+                },
+            )),
+        )
+        .item(
+            PopupMenuItem::new("Fetch").on_click(window.listener_for(
+                &view_fetch,
+                move |area, _, _, cx| {
+                    area.fetch(cx);
+                    cx.notify();
+                },
+            )),
+        )
 }
 
 fn primary_icon_for(kind: PrimaryActionKind) -> Option<IconName> {
@@ -299,10 +376,33 @@ fn render_status_row(
     let (color, msg) = match status {
         CommitStatus::Idle => (theme.fg_subtle, String::new()),
         CommitStatus::Committing => (theme.fg_muted, "Committing…".to_string()),
-        CommitStatus::Failed(error) => (theme.status_error, format!("Commit failed: {error}")),
+        CommitStatus::Pushing => (theme.fg_muted, "Pushing…".to_string()),
+        CommitStatus::Pulling => (theme.fg_muted, "Pulling…".to_string()),
+        CommitStatus::Syncing => (theme.fg_muted, "Syncing…".to_string()),
+        CommitStatus::Fetching => (theme.fg_muted, "Fetching…".to_string()),
+        CommitStatus::Failed(label, error) => (
+            theme.status_error,
+            // Title-case the verb so "Push failed: …" reads naturally;
+            // labels are always short ASCII so the manual capitalize is fine.
+            format!(
+                "{} failed: {error}",
+                title_case_first(label)
+            ),
+        ),
     };
     div()
         .text_size(px(sc_style::META_TEXT))
         .text_color(color)
         .child(msg)
 }
+
+fn title_case_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+// `RemoteVerb` moved to `commit_ops.rs` — the helper module owns the
+// op-execution machinery and the verb enum it dispatches on.

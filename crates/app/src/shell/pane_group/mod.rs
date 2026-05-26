@@ -683,10 +683,14 @@ impl PaneGroup {
         repo: oximux_git::Repository,
         path: PathBuf,
         staged: bool,
+        untracked: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
         // Already-open (same path AND same staged flag) → activate.
+        // `untracked` is not part of the tab key because a file can't be
+        // both tracked and untracked at the same time; whichever variant
+        // opened first wins until the user closes the tab.
         if let Some(idx) = self.tabs.iter().position(|t| {
             matches!(
                 &t.kind,
@@ -697,9 +701,9 @@ impl PaneGroup {
             return idx;
         }
         // New diff tab path. DiffView::new takes (repo, theme, density,
-        // typography, cx). Then load(path, staged, cx) kicks off the
-        // async fetch — the view paints a "Loading…" state until the
-        // patch arrives.
+        // typography, cx). Then load(path, staged, untracked, cx) kicks
+        // off the async fetch — the view paints a "Loading…" state until
+        // the patch arrives.
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
@@ -707,7 +711,7 @@ impl PaneGroup {
         let view = cx.new(|cx| {
             let mut v =
                 crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
-            v.load(path_for_load, staged, cx);
+            v.load(path_for_load, staged, untracked, cx);
             v
         });
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
