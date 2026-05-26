@@ -111,6 +111,11 @@ pub fn paint_row(
     let hover_bg = ctx.theme.bg_panel_alt;
     let selection_bg = ctx.theme.selection;
 
+    // Right-click dispatches the shared `FileTreeContextMenu` action.
+    // Captured separately from the left-click closure so each handler
+    // owns its own clone of the path (avoids the borrow gymnastics of
+    // sharing a single capture across both).
+    let ctx_path = path.clone();
     let mut row = div()
         .id(row_id)
         .flex()
@@ -142,6 +147,21 @@ pub fn paint_row(
                     cx.notify();
                 }
             }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            move |ev: &MouseDownEvent, window, cx| {
+                window.dispatch_action(
+                    Box::new(crate::actions::OpenFileTreeContextMenuAt {
+                        x: ev.position.x.into(),
+                        y: ev.position.y.into(),
+                        path: ctx_path.to_string_lossy().into_owned(),
+                        is_dir,
+                    }),
+                    cx,
+                );
+                cx.stop_propagation();
+            },
         )
         .child(chevron_el)
         .child(node_icon_el)

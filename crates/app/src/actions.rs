@@ -134,6 +134,73 @@ pub struct OpenFileFromContextMenu {
     pub split_right: bool,
 }
 
+/// Right-click in the empty area below the file tree. Carries the
+/// active project's root path so the menu can offer "New File" /
+/// "New Folder" at the workspace root without the path being inferred
+/// from a row.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenFileTreeBackgroundMenuAt {
+    pub x: f32,
+    pub y: f32,
+    pub root: String,
+}
+
+/// Open Search panel seeded with a glob targeting the clicked folder.
+/// `path` is the absolute folder path; the action handler converts it
+/// to a `<rel>/**` include glob and switches the right sidebar's
+/// active tab to Search.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct FindInFolder {
+    pub path: String,
+}
+
+/// Open the active project's root (or a specific subdirectory) in
+/// VS Code. Falls back to a tracing warning when `code` isn't on PATH.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenInVSCode {
+    pub path: String,
+}
+
+/// Open a directory in Finder (not Reveal — used by the toolbar
+/// overflow "Open in Finder" item, which targets the workspace root).
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenInFinder {
+    pub path: String,
+}
+
+/// Phase 02 stub: dispatched from the context-menu New File / New
+/// Folder / Rename / Delete rows. Phase 03 wires the inline-input,
+/// confirm-dialog, and fs ops behind it. Today the handler logs to
+/// tracing so the end-to-end click → action → handler path is testable.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct FileTreeNewFile {
+    /// Parent directory the new file should land in.
+    pub parent: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct FileTreeNewFolder {
+    pub parent: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct FileTreeRename {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct FileTreeDelete {
+    pub path: String,
+}
+
 actions!(
     oximux,
     [

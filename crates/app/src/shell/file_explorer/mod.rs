@@ -22,8 +22,8 @@ use crate::shell::file_explorer::status_display::{
 use crate::shell::file_explorer::tree_state::{DirCache, TreeNode, filter_visible, flatten};
 use crate::shell::file_tree_view::OnOpenFile;
 use gpui::{
-    AnyElement, App, Context, IntoElement, ParentElement, Render, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, div, px, uniform_list,
+    AnyElement, App, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Subscription, Task, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use oximux_core::FileStatus;
 use oximux_git::PollState;
@@ -359,12 +359,33 @@ impl Render for FileExplorer {
         // Flex column with explicit h_full + bg so the uniform_list child has
         // a defined height to lay rows against. Avoid nested flex_1 — uniform_list
         // already sets overflow_y: scroll so it manages its own scroll area.
+        //
+        // Right-click anywhere inside the list region that isn't on a row
+        // opens the background context menu (New File / New Folder at the
+        // workspace root). Row right-clicks call `stop_propagation`, so
+        // they're filtered out before reaching this listener.
+        let bg_root = self.repo_root.clone();
         div()
+            .id("file-explorer-shell")
             .flex()
             .flex_col()
             .h_full()
             .w_full()
             .bg(theme.bg_panel)
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                move |ev: &gpui::MouseDownEvent, window, cx| {
+                    window.dispatch_action(
+                        Box::new(crate::actions::OpenFileTreeBackgroundMenuAt {
+                            x: ev.position.x.into(),
+                            y: ev.position.y.into(),
+                            root: bg_root.to_string_lossy().into_owned(),
+                        }),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                },
+            )
             .child(header)
             .child(list)
             .into_any_element()

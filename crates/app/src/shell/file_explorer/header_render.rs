@@ -1,10 +1,11 @@
 //! Header strip for the file explorer panel.
 //!
-//! Renders the workspace name (folder leaf) on the left and a small action
-//! row on the right with three icon buttons: show/hide git-ignored entries,
-//! collapse all expanded directories, and manually refresh from disk. The
-//! eye toggle only appears when the current poll has at least one ignored
-//! entry, so a clean repo doesn't show a no-op control.
+//! Renders the workspace name (folder leaf) on the left and four
+//! actions on the right: show/hide git-ignored entries (eye), collapse
+//! all expanded directories, manually refresh from disk, and a `⋯`
+//! overflow opening additional items (Open in VS Code / Open in Finder).
+//! The eye toggle only appears when the current poll has at least one
+//! ignored entry, so a clean repo doesn't show a no-op control.
 //!
 //! The action buttons use the upstream `Button` widget so their tooltips go
 //! through `managed_tooltip` — that gives proper cursor-anchored placement
@@ -12,10 +13,16 @@
 //! gets clamped far to the side near a panel edge.
 
 use crate::shell::file_explorer::FileExplorer;
-use gpui::{AnyElement, ClickEvent, Context, IntoElement, ParentElement, Styled, div, px};
+use gpui::{
+    Anchor, AnyElement, ClickEvent, Context, IntoElement, ParentElement, Styled, Window, div, px,
+};
+// `gpui::Context<PopupMenu>` is required by `dropdown_menu_with_anchor`'s
+// closure signature even though the menu builder doesn't use it.
+type MenuCtx<'a> = gpui::Context<'a, PopupMenu>;
 use gpui_component::{
     Disableable as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
+    menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
 };
 
 /// Identifies which toolbar action a header button maps to.
@@ -83,7 +90,8 @@ pub fn render_header(explorer: &FileExplorer, cx: &mut Context<FileExplorer>) ->
             HeaderAction::Refresh,
             true,
             cx,
-        ));
+        ))
+        .child(overflow_menu(explorer.repo_root().clone(), show_ignored));
 
     div()
         .flex()
@@ -99,6 +107,49 @@ pub fn render_header(explorer: &FileExplorer, cx: &mut Context<FileExplorer>) ->
         .child(title_el)
         .child(actions)
         .into_any_element()
+}
+
+/// Build the `⋯` overflow dropdown. The trigger is a ghost icon button
+/// that opens the menu on its own click — the `DropdownMenu` trait
+/// renders the popup anchored to the button's top-right, matching the
+/// "click anywhere to open" affordance the user expects from a `⋯` icon.
+fn overflow_menu(root: std::path::PathBuf, show_ignored: bool) -> impl IntoElement {
+    let root_vs = root.clone();
+    let root_finder = root;
+    Button::new("fe-toolbar-overflow")
+        .ghost()
+        .xsmall()
+        .icon(Icon::default().path("icons/ellipsis.svg"))
+        .tooltip("More actions")
+        .dropdown_menu_with_anchor(
+            Anchor::TopRight,
+            move |menu: PopupMenu, _window: &mut Window, _cx: &mut MenuCtx<'_>| {
+                build_overflow_menu(menu, show_ignored, root_vs.clone(), root_finder.clone())
+            },
+        )
+}
+
+fn build_overflow_menu(
+    menu: PopupMenu,
+    _show_ignored: bool,
+    root_vs_code: std::path::PathBuf,
+    root_finder: std::path::PathBuf,
+) -> PopupMenu {
+    // Show Git Ignored Files lives next to the inline eye button rather
+    // than in this menu — the eye is more discoverable when it matters
+    // (i.e. when there are ignored entries). The overflow stays focused
+    // on workspace-level external opens.
+    menu.min_w(px(200.0))
+        .item(PopupMenuItem::new("Open in VS Code").on_click(move |_, _window, cx| {
+            cx.dispatch_action(&crate::actions::OpenInVSCode {
+                path: root_vs_code.to_string_lossy().into_owned(),
+            });
+        }))
+        .item(PopupMenuItem::new("Open in Finder").on_click(move |_, _window, cx| {
+            cx.dispatch_action(&crate::actions::OpenInFinder {
+                path: root_finder.to_string_lossy().into_owned(),
+            });
+        }))
 }
 
 fn action_button(

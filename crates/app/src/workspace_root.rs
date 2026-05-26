@@ -435,6 +435,30 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Seed the Search panel's include-glob field and switch the right
+    /// sidebar to the Search tab. Drives the file-tree "Find in Folder"
+    /// context-menu item. No-ops when no right sidebar is mounted (the
+    /// active project isn't a git repo OR no project is active).
+    pub(crate) fn seed_search_include_and_switch(
+        &self,
+        include_glob: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rs) = self.right_sidebar.clone() else {
+            return;
+        };
+        rs.update(cx, |sidebar, cx| {
+            // Seed first, then flip the tab so the rendered panel
+            // already shows the glob when it appears.
+            let include_input = sidebar.search_panel.read(cx).include_input_ref().clone();
+            include_input.update(cx, |state, cx| {
+                state.set_value(include_glob.as_str(), window, cx);
+            });
+            sidebar.select_tab(crate::shell::right_sidebar::tab::RightTab::Search, cx);
+        });
+    }
+
     /// Build the on-click callback handed to the SCM panel for diff
     /// opens. Captures a weak self-handle so the callback survives
     /// project switches that rebuild `RightSidebar`. The `repo`
@@ -1062,6 +1086,109 @@ impl Render for WorkspaceRoot {
                     });
                 }),
             )
+            .on_action(cx.listener(
+                |this, action: &crate::actions::OpenFileTreeBackgroundMenuAt, _window, cx| {
+                    // Right-click in the empty area below the file tree —
+                    // opens the smaller "New File / New Folder" menu rooted
+                    // at the workspace root.
+                    let root = std::path::PathBuf::from(&action.root);
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu
+                        .update(cx, |m, cx| m.open_background(action.x, action.y, root, cx));
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &crate::actions::FindInFolder, window, cx| {
+                    // Switch right sidebar to Search and seed its include
+                    // glob with `<rel>/**`. Resolution: prefer relative-to-
+                    // workspace-root; fall back to the file name.
+                    let target = std::path::PathBuf::from(&action.path);
+                    let glob = this
+                        .active_project
+                        .as_ref()
+                        .map(|p| std::path::PathBuf::from(&p.root_path))
+                        .and_then(|root| {
+                            target.strip_prefix(root.as_path()).ok().map(|r| r.to_path_buf())
+                        })
+                        .map(|rel| {
+                            let s = rel.to_string_lossy().into_owned();
+                            if s.is_empty() {
+                                String::from("**")
+                            } else {
+                                format!("{s}/**")
+                            }
+                        })
+                        .unwrap_or_else(|| String::from("**"));
+                    this.seed_search_include_and_switch(glob, window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |_this, action: &crate::actions::OpenInVSCode, _window, _cx| {
+                    // `code <path>` requires the VS Code shell integration
+                    // (`Shell Command: Install 'code' command in PATH`).
+                    // Errors land in tracing — no UI surface because the
+                    // user already left the cockpit by choosing this action.
+                    let path = std::path::PathBuf::from(&action.path);
+                    if let Err(err) = std::process::Command::new("code").arg(&path).spawn() {
+                        tracing::warn!(
+                            ?err,
+                            path = %path.display(),
+                            "open in vs code failed (is `code` on PATH?)"
+                        );
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |_this, action: &crate::actions::OpenInFinder, _window, _cx| {
+                    // `open <dir>` opens Finder at the target. Distinct from
+                    // `open -R` (reveal) which opens Finder with the path
+                    // selected — used for the workspace-root overflow item.
+                    let path = std::path::PathBuf::from(&action.path);
+                    if let Err(err) = std::process::Command::new("open").arg(&path).spawn() {
+                        tracing::warn!(?err, path = %path.display(), "open in finder failed");
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |_this, action: &crate::actions::FileTreeNewFile, _window, _cx| {
+                    // Phase 02 stub: logs the dispatch. Phase 03 wires the
+                    // inline-input row in the file tree.
+                    tracing::info!(
+                        target: "oximux_app::file_explorer",
+                        parent = %action.parent,
+                        "FileTreeNewFile dispatched (inline input lands in Phase 03)"
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |_this, action: &crate::actions::FileTreeNewFolder, _window, _cx| {
+                    tracing::info!(
+                        target: "oximux_app::file_explorer",
+                        parent = %action.parent,
+                        "FileTreeNewFolder dispatched (inline input lands in Phase 03)"
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |_this, action: &crate::actions::FileTreeRename, _window, _cx| {
+                    tracing::info!(
+                        target: "oximux_app::file_explorer",
+                        path = %action.path,
+                        "FileTreeRename dispatched (inline rename lands in Phase 03)"
+                    );
+                },
+            ))
+            .on_action(cx.listener(
+                |_this, action: &crate::actions::FileTreeDelete, _window, _cx| {
+                    tracing::info!(
+                        target: "oximux_app::file_explorer",
+                        path = %action.path,
+                        "FileTreeDelete dispatched (confirm dialog lands in Phase 03)"
+                    );
+                },
+            ))
             .on_action(
                 cx.listener(|this, action: &OpenFileFromContextMenu, window, cx| {
                     // File-tree menu "Open" / "Open to the Side" row. The
