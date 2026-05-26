@@ -19,7 +19,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::file_explorer::FileExplorer;
-use crate::shell::file_tree_view::{FileTreeView, OnOpenFile, OnQueryActivePath};
+use crate::shell::file_tree_view::{FileTreeView, OnOpenDiff, OnOpenFile, OnQueryActivePath};
 use crate::shell::git_panel::GitPanel;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
@@ -82,6 +82,7 @@ impl RightSidebar {
         root_path: PathBuf,
         initial_open: bool,
         on_open_file: Option<OnOpenFile>,
+        on_open_diff: Option<OnOpenDiff>,
         on_query_active_path: Option<OnQueryActivePath>,
         theme: Theme,
         density: Density,
@@ -114,6 +115,13 @@ impl RightSidebar {
         let source_control = repo.as_ref().map(|repo| {
             let diff_view =
                 cx.new(|cx| DiffView::new(repo.clone(), theme, density, typography.clone(), cx));
+            // SCM row clicks open a diff tab in the main pane via the
+            // host's `OnOpenDiff` callback (the inline sidebar mini-diff
+            // remains as a glanceable preview). `OnOpenFile` is no longer
+            // passed to GitPanel — the diff path covers the use case
+            // and avoids spawning both a diff tab and a plain editor
+            // tab on the same click.
+            let on_open_for_scm = on_open_diff.clone();
             let git_panel = cx.new(|cx| {
                 GitPanel::new(
                     repo.clone(),
@@ -122,6 +130,7 @@ impl RightSidebar {
                     theme,
                     density,
                     typography.clone(),
+                    on_open_for_scm,
                     cx,
                 )
             });
@@ -142,6 +151,9 @@ impl RightSidebar {
             })
         });
 
+        // Clone the on_open callback so both Explorer and FileTreeView can
+        // own it. `OnOpenFile` is `Arc<dyn Fn ...>` — clone is O(1).
+        let on_open_for_explorer = on_open_file.clone();
         let file_explorer = cx.new(|cx| {
             FileExplorer::new(
                 root_path.clone(),
@@ -149,6 +161,7 @@ impl RightSidebar {
                 theme,
                 density,
                 typography.clone(),
+                on_open_for_explorer,
                 window,
                 cx,
             )
@@ -177,10 +190,14 @@ impl RightSidebar {
 
         let poll_observer = Self::start_poll_observer(bar_rx, cx);
 
+        // Default to SourceControl when a repo is present; otherwise Explorer.
+        // Files is no longer in the visible-tab list (see tab.rs::visible_tabs)
+        // so we mustn't default to it — `select_tab` would clamp it to Explorer
+        // anyway, but starting on Explorer skips the silent clamp.
         let active_tab = if source_control.is_some() {
             RightTab::SourceControl
         } else {
-            RightTab::Files
+            RightTab::Explorer
         };
 
         Self {
@@ -254,6 +271,7 @@ impl RightSidebar {
                 theme,
                 density,
                 typography.clone(),
+                None, // test wiring: no host on_open
                 cx,
             )
         });
@@ -273,6 +291,9 @@ impl RightSidebar {
             )
         }));
         let repo_root = repo.workdir().to_path_buf();
+        // Test constructor: no host on_open callback — pass `None` so
+        // file clicks during tests silently no-op (rather than triggering
+        // `std::process::Command::new("open")` like before).
         let file_explorer = cx.new(|cx| {
             FileExplorer::new(
                 repo_root.clone(),
@@ -280,6 +301,7 @@ impl RightSidebar {
                 theme,
                 density,
                 typography.clone(),
+                None,
                 window,
                 cx,
             )

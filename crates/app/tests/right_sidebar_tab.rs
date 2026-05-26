@@ -3,12 +3,16 @@
 use oximux_app::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 
 #[test]
-fn visible_tabs_with_repo_returns_all_four() {
+fn visible_tabs_with_repo_returns_explorer_search_source_control() {
+    // `Files` is intentionally hidden from `visible_tabs` (see
+    // tab.rs::visible_tabs doc). The variant + view code remain so the
+    // editor-crate FileTree model + watcher stay reachable; the surface
+    // re-appears here once LSP-aware affordances justify a second file
+    // tab under a non-"Files" label.
     let tabs = visible_tabs(TabVisibility { has_repo: true });
     assert_eq!(
         tabs,
         vec![
-            RightTab::Files,
             RightTab::Explorer,
             RightTab::Search,
             RightTab::SourceControl,
@@ -17,21 +21,19 @@ fn visible_tabs_with_repo_returns_all_four() {
 }
 
 #[test]
-fn visible_tabs_without_repo_omits_source_control() {
+fn visible_tabs_without_repo_omits_source_control_and_files() {
     let tabs = visible_tabs(TabVisibility { has_repo: false });
-    assert_eq!(
-        tabs,
-        vec![RightTab::Files, RightTab::Explorer, RightTab::Search]
-    );
+    assert_eq!(tabs, vec![RightTab::Explorer, RightTab::Search]);
 }
 
 #[test]
-fn files_tab_always_visible_regardless_of_repo() {
-    // Files tab is workspace-wide — not gated on git presence.
+fn files_tab_hidden_from_visible_in_both_repo_states() {
+    // Guard against accidentally re-exposing Files before the LSP-aware
+    // re-launch lands. Flip the assertion when intentionally reintroducing.
     let with_repo = visible_tabs(TabVisibility { has_repo: true });
     let without_repo = visible_tabs(TabVisibility { has_repo: false });
-    assert!(with_repo.contains(&RightTab::Files));
-    assert!(without_repo.contains(&RightTab::Files));
+    assert!(!with_repo.contains(&RightTab::Files));
+    assert!(!without_repo.contains(&RightTab::Files));
 }
 
 #[test]
@@ -45,8 +47,10 @@ fn right_tab_roundtrip_derives() {
 }
 
 #[test]
-fn files_tab_has_distinct_icon_label_title() {
-    // Guard against accidental aliasing with another tab's chrome.
+fn files_tab_metadata_still_present_for_future_reintroduction() {
+    // Even though Files is not in `visible_tabs`, the variant must keep
+    // its metadata (icon / label / title) so re-exposing later is a
+    // one-line change in `visible_tabs` rather than a metadata rebuild.
     assert_eq!(RightTab::Files.label(), "F");
     assert_eq!(RightTab::Files.title(), "Files");
     assert_eq!(RightTab::Files.icon_path(), "icons/folder.svg");

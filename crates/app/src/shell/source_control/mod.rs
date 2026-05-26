@@ -320,22 +320,37 @@ impl SourceControlPanel {
     fn render_branch_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let _ = (self.density, &self.typography);
-        let (ahead, behind) = self
+        let (ahead, behind, branch) = self
             .git_state
             .as_ref()
-            .map(|s| (s.ahead, s.behind))
-            .unwrap_or((0, 0));
+            .map(|s| (s.ahead, s.behind, s.branch.clone()))
+            .unwrap_or((0, 0, None));
+        // Branch name is appended ("of {branch}") so the cockpit reads
+        // like the rest of the chrome (status bar already shows branch).
+        // Detached HEAD / pre-poll → branch is None; drop the suffix so we
+        // don't render "ahead of None". `filter(!is_empty)` is defensive
+        // against a corrupt/synthetic `GitState` carrying `Some("")` —
+        // the live parser never emits empty, but the guard keeps the
+        // toolbar from showing a stray trailing " of ".
+        let suffix = branch
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(|b| format!(" of {b}"))
+            .unwrap_or_default();
         let summary = if behind == 0 && ahead == 0 {
-            "0 commits ahead".to_string()
+            format!("0 commits ahead{suffix}")
         } else if behind == 0 {
-            format!("{ahead} commit{} ahead", if ahead == 1 { "" } else { "s" })
+            format!(
+                "{ahead} commit{} ahead{suffix}",
+                if ahead == 1 { "" } else { "s" }
+            )
         } else if ahead == 0 {
             format!(
-                "{behind} commit{} behind",
+                "{behind} commit{} behind{suffix}",
                 if behind == 1 { "" } else { "s" }
             )
         } else {
-            format!("{ahead} ahead • {behind} behind")
+            format!("{ahead} ahead • {behind} behind{suffix}")
         };
 
         // Right-aligned compact icon cluster.
@@ -478,14 +493,19 @@ impl Render for SourceControlPanel {
         // `min_h_0` lets the file list shrink below its intrinsic content
         // height (required for the inner scroll region to actually scroll
         // rather than pushing the graph off-screen).
+        //
+        // The inline sidebar `DiffView` is no longer mounted — diffs open
+        // as real editor tabs in the main pane via `OnOpenDiff` (see
+        // `WorkspaceRoot::build_on_open_diff_callback`). The `diff_view`
+        // entity is kept on `Self` to avoid churning the constructor
+        // signature; it stays in `Empty` state and never renders.
         let files_block = div()
             .flex()
             .flex_1()
             .min_h(px(0.0))
             .flex_col()
             .overflow_hidden()
-            .child(self.git_panel.clone())
-            .child(self.diff_view.clone());
+            .child(self.git_panel.clone());
 
         let mut body = div()
             .flex()

@@ -21,7 +21,8 @@ use std::path::Path;
 
 /// Borrowed-slice sectioning of `GitState::files` into Staged / Unstaged /
 /// Untracked. A partially-staged file (non-`Unmodified` on both sides) appears
-/// in BOTH Staged and Unstaged — matches VSCode / Magit convention.
+/// in BOTH Staged and Unstaged — the conventional SCM dual-listing so a
+/// partial stage stays visible in the unstaged column for the remaining hunks.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct FileSections<'a> {
     pub staged: Vec<&'a FileStatus>,
@@ -88,6 +89,10 @@ pub struct RenderCtx<'a> {
     /// duration of a single render pass — re-reading the entity from `cx`
     /// during render panics because GPUI already holds a mut borrow.
     pub collapsed: &'a HashSet<&'static str>,
+    /// Current branch name from `GitState::branch`. Used by the empty
+    /// state to emit "no changes ahead of {branch}" rather than the bare
+    /// "No changes". `None` covers detached HEAD or pre-status states.
+    pub branch: Option<&'a str>,
 }
 
 /// Top-level renderer. Builds the three sections in order; emits a single
@@ -101,7 +106,7 @@ pub fn render_sections(
         return empty_state(rctx).into_any_element();
     }
     // Order: unstaged first (CHANGES), then staged, then untracked. Mirrors
-    // the common VSCode SCM convention so users edit-then-stage left-to-right.
+    // the common SCM staging flow so users edit-then-stage top-to-bottom.
     //
     // No `h_full()` here: the parent scroll container needs this column to
     // grow to its natural (sum-of-rows) height so `overflow_y_scroll` sees
@@ -252,6 +257,13 @@ fn row(
     let theme = rctx.theme;
     let click_path = f.path.clone();
     let click_staged = matches!(kind, RowKind::Staged);
+    // Skip the editor-open dispatch for rows whose worktree file no
+    // longer exists (deleted in working tree) — opening would surface an
+    // empty editor buffer for a path the user explicitly removed. The
+    // inline mini-diff in the sidebar still loads (showing the removed
+    // content as a `-` block) via `set_selected → DiffView::load`.
+    let click_should_open_editor = !matches!(f.worktree, oximux_core::WorktreeStatus::Deleted)
+        && !matches!(f.index, oximux_core::IndexStatus::Deleted);
 
     let file_name = f
         .path
@@ -320,8 +332,18 @@ fn row(
         .when(!is_selected, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |panel, _: &MouseDownEvent, _window, cx| {
+            cx.listener(move |panel, _: &MouseDownEvent, window, cx| {
                 panel.set_selected(Some((click_path.clone(), click_staged)), cx);
+                // Open a real diff tab in the main pane via the host
+                // callback. The inline sidebar mini-diff also loads
+                // (via `set_selected` → `DiffView::load` above) as a
+                // glanceable summary alongside the main-pane tab.
+                // `click_should_open_editor` gates out files that are
+                // deleted on disk — the sidebar mini-diff already shows
+                // the `-` block for those.
+                if click_should_open_editor && let Some(cb) = panel.on_open.clone() {
+                    (cb)(click_path.clone(), click_staged, window, cx);
+                }
                 cx.notify();
             }),
         )
@@ -397,14 +419,34 @@ fn row(
 }
 
 fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
+    // Two-line empty state: a strong "No changes on this branch" headline
+    // followed by a muted subline that surfaces the branch name when known.
+    // Falls back to a single-line headline when branch is unknown (detached
+    // HEAD, pre-first-poll, etc.) — avoids "no changes ahead of None".
+    let headline = div()
+        .text_size(px(sc_style::TEXT))
+        .font_weight(rctx.typography.w_medium)
+        .text_color(rctx.theme.fg_base)
+        .child("No changes on this branch");
+    // `filter(!is_empty)`: same defensive guard used in the branch
+    // toolbar suffix — never trust `Some("")` for the subline either.
+    let subline = rctx.branch.filter(|b| !b.is_empty()).map(|b| {
+        div()
+            .mt(px(4.0))
+            .text_size(px(sc_style::TEXT - 1.0))
+            .text_color(rctx.theme.fg_subtle)
+            .child(format!(
+                "This workspace is clean and this branch has no changes ahead of {b}"
+            ))
+    });
     div()
         .flex()
+        .flex_col()
         .items_center()
         .justify_center()
         .h_full()
         .px(px(sc_style::PAD_H))
         .py(px(rctx.density.pad_panel))
-        .text_size(px(sc_style::TEXT))
-        .text_color(rctx.theme.fg_subtle)
-        .child("No changes")
+        .child(headline)
+        .children(subline)
 }

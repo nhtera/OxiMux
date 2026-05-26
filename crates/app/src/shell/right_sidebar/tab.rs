@@ -17,19 +17,28 @@ pub struct TabVisibility {
 
 /// Returns the ordered list of tabs that should be visible given `v`.
 ///
-/// Files is always visible (the file tree is a workspace-wide affordance).
+/// `Files` is intentionally **omitted** here even though the variant still
+/// exists. The `oximux-editor::FileTree` model (live filesystem watcher +
+/// background walker + future LSP-aware affordances) is wired through
+/// `FileTreeView`, but exposing it as a second file-tab alongside
+/// `Explorer` confuses users (two folder icons, no clear semantic split).
+/// We hide the surface until LSP affordances justify reintroducing it
+/// under a non-"Files" label. The view code stays — re-add the variant
+/// to this list to expose it again. See gap report
+/// `plans/reports/uiux-gap-260525-2258-right-sidebar.md` §1 + §5(X1)
+/// and `plans/260525-2258-right-sidebar-uiux-parity/phase-01-…`.
+///
 /// Source Control is hidden when there is no repository — avoids showing a
 /// broken panel before Phase 04 adds graceful no-repo handling.
 pub fn visible_tabs(v: TabVisibility) -> Vec<RightTab> {
     if v.has_repo {
         vec![
-            RightTab::Files,
             RightTab::Explorer,
             RightTab::Search,
             RightTab::SourceControl,
         ]
     } else {
-        vec![RightTab::Files, RightTab::Explorer, RightTab::Search]
+        vec![RightTab::Explorer, RightTab::Search]
     }
 }
 

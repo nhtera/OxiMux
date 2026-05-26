@@ -31,6 +31,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::sync::watch;
 
+use crate::shell::file_tree_view::OnOpenDiff;
+
 pub struct GitPanel {
     repo: Repository,
     /// Last `Ready` payload observed on the watch channel. Cleared back to
@@ -43,9 +45,13 @@ pub struct GitPanel {
     /// Untracked) so we know which side of the diff to fetch when routing
     /// to `DiffView::load`.
     selected: Option<(PathBuf, bool)>,
-    /// Optional sibling diff view. `None` keeps the panel buildable before
-    /// step 14 wires the shell. When `Some`, row clicks call
-    /// `diff_view.load(path, staged)`.
+    /// Held but no longer driven — kept on the struct so the
+    /// constructor signature doesn't churn while the inline sidebar
+    /// `DiffView` is dormant. Diffs now open as real editor tabs in
+    /// the main pane via `on_open: OnOpenDiff` (see `set_selected`
+    /// doc). A follow-up can drop the field + constructor arg + the
+    /// `DiffView` mount in `right_sidebar/mod.rs`.
+    #[allow(dead_code)]
     diff_view: Option<Entity<DiffView>>,
     focus_handle: FocusHandle,
     theme: Theme,
@@ -65,12 +71,21 @@ pub struct GitPanel {
     /// Drop cancels the receiver-watching task (mirrors `_poll_task` /
     /// `_blink_task` lifetime semantics in `TerminalView`).
     _watch_task: Task<()>,
+    /// Host callback: open a read-only diff tab in the active project's
+    /// pane group for the clicked file (with the staged-vs-unstaged
+    /// discriminator). `None` in test wiring silently no-ops the click;
+    /// the existing inline sidebar `DiffView` keeps working as a glanceable
+    /// summary. Routing through `OnOpenDiff` (not `OnOpenFile`) means SCM
+    /// clicks land in a tab that is explicitly a diff — no risk of
+    /// confusing the diff with an editable text buffer.
+    pub(crate) on_open: Option<OnOpenDiff>,
 }
 
 impl GitPanel {
     /// Build the panel. `state_rx` is `StatusPoller::subscribe()`; the caller
     /// owns the poller so the same receiver can fan out to sidebar / status
     /// bar consumers later.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Repository,
         state_rx: watch::Receiver<PollState>,
@@ -78,6 +93,7 @@ impl GitPanel {
         theme: Theme,
         density: Density,
         typography: Typography,
+        on_open: Option<OnOpenDiff>,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -101,6 +117,7 @@ impl GitPanel {
             collapsed_sections: HashSet::new(),
             scroll_handle: ScrollHandle::new(),
             _watch_task: watch_task,
+            on_open,
         }
     }
 
@@ -123,18 +140,21 @@ impl GitPanel {
         cx.notify();
     }
 
-    /// Update the highlighted row and route to the sibling `DiffView` when
-    /// present. Called by `changed_files::row` click handlers; pub-crate so
-    /// the sibling module reaches it without exposing the field directly.
+    /// Update the highlighted row. Previously also routed the patch
+    /// fetch into the sibling sidebar `DiffView`; diffs now open as
+    /// real editor tabs in the main pane (via `on_open: OnOpenDiff`
+    /// dispatched from `changed_files::row`), so the inline view stays
+    /// in `Empty` state and we skip the fetch — no point spending git
+    /// I/O on a surface nobody mounts. The `diff_view` field is kept
+    /// on `Self` to avoid churning the constructor signature; future
+    /// cleanup can drop it once the field has no other callers.
     pub(crate) fn set_selected(
         &mut self,
         selection: Option<(PathBuf, bool)>,
         cx: &mut Context<Self>,
     ) {
-        self.selected = selection.clone();
-        if let (Some((path, staged)), Some(view)) = (selection, self.diff_view.as_ref()) {
-            view.update(cx, |v, cx| v.load(path, staged, cx));
-        }
+        self.selected = selection;
+        cx.notify();
     }
 
     fn start_watch_task(mut rx: watch::Receiver<PollState>, cx: &mut Context<Self>) -> Task<()> {
@@ -233,6 +253,7 @@ impl Render for GitPanel {
                     typography: &self.typography,
                     selected: self.selected.as_ref().map(|(p, _)| p.as_path()),
                     collapsed: &self.collapsed_sections,
+                    branch: state.branch.as_deref(),
                 };
                 render_sections(&sections, &rctx, cx).into_any_element()
             }
