@@ -24,7 +24,7 @@ use crate::actions::ExpandDiff;
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan, render_plan};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    Styled, Task, Window, div, px,
+    StatefulInteractiveElement as _, Styled, Task, Window, div, px,
 };
 use oximux_core::FileDiff;
 use oximux_git::Repository;
@@ -207,6 +207,22 @@ impl Render for DiffView {
                 render_plan(&plan, &rctx, cx).into_any_element()
             }
         };
+        // Wrap the body in a stateful scroll container. The previous
+        // layout had `.h_full().w_full()` without an overflow handler,
+        // which worked when DiffView was mounted in the sidebar (the
+        // outer column was the scroll surface). Now that DiffView lives
+        // as a main-pane tab, it has to own its own scroll — without
+        // `flex_1 + min_h(0) + overflow_y_scroll` long diffs clip past
+        // the visible viewport. `id` is required for `overflow_y_scroll`
+        // to wire up; the constant string is safe because each tab has
+        // its own `Entity<DiffView>` so the GPUI ids don't collide.
+        let scroll_body = div()
+            .id("diff-view-scroll")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .overflow_y_scroll()
+            .child(body);
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_expand_diff))
@@ -217,7 +233,7 @@ impl Render for DiffView {
             .bg(self.theme.bg_base)
             .border_l_1()
             .border_color(self.theme.border_inactive)
-            .child(body)
+            .child(scroll_body)
             .into_any_element()
     }
 }

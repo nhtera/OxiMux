@@ -12,6 +12,7 @@ use std::path::Path;
 use gpui::{App, Entity, FocusHandle, Focusable};
 use oximux_editor::EditorView;
 
+use crate::shell::diff_view::DiffView;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::terminal_view::TerminalView;
 
@@ -20,6 +21,13 @@ pub enum PaneContent {
     /// is a tree-of-one; split via `Cmd+D` / `Cmd+Shift+D`.
     Terminal(TerminalSplitTree),
     Editor(Entity<EditorView>),
+    /// Read-only diff renderer for a single tracked file. Constructed by
+    /// the SCM panel when the user clicks a changed-file row, then
+    /// `load(path, staged)`'d to fetch the patch. Distinct from
+    /// `Editor` so we never accidentally try to save / mutate a diff
+    /// view, and so the tab kind survives same-file editor + diff
+    /// being open simultaneously.
+    Diff(Entity<DiffView>),
 }
 
 impl PaneContent {
@@ -32,6 +40,7 @@ impl PaneContent {
                 .map(|v| v.read(cx).focus_handle(cx))
                 .unwrap_or_else(|| cx.focus_handle()),
             Self::Editor(view) => view.read(cx).focus_handle(cx),
+            Self::Diff(view) => view.read(cx).focus_handle(cx),
         }
     }
 
@@ -39,6 +48,13 @@ impl PaneContent {
         match self {
             Self::Terminal(tree) => tree.active_view().is_some_and(|v| v.read(cx).focused()),
             Self::Editor(view) => view.read(cx).focused(),
+            // DiffView is read-only and doesn't track platform focus in
+            // a cached flag (unlike `EditorView::focused`). The host's
+            // per-leaf focus bookkeeping doesn't consume diff focus for
+            // routing — terminals/editor are the focusable surfaces. Return
+            // `false` so a diff-tab being active never claims "focused"
+            // semantics that callers would route input to.
+            Self::Diff(_) => false,
         }
     }
 
@@ -48,7 +64,7 @@ impl PaneContent {
 
     pub fn editor_path<'a>(&'a self, cx: &'a App) -> Option<&'a Path> {
         match self {
-            Self::Terminal(_) => None,
+            Self::Terminal(_) | Self::Diff(_) => None,
             Self::Editor(view) => Some(view.read(cx).file_path()),
         }
     }
@@ -60,7 +76,7 @@ impl PaneContent {
     pub fn terminal_active_view(&self) -> Option<&Entity<TerminalView>> {
         match self {
             Self::Terminal(tree) => tree.active_view(),
-            Self::Editor(_) => None,
+            Self::Editor(_) | Self::Diff(_) => None,
         }
     }
 }

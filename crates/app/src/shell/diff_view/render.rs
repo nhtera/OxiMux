@@ -167,16 +167,24 @@ pub fn render_plan(
     rctx: &RenderCtx<'_>,
     cx: &mut Context<DiffView>,
 ) -> impl IntoElement {
-    // GPUI's base `div()` has no vertical scroll. The diff body is sized by
-    // its parent container in `DiffView::render`; long bodies overflow until
-    // a virtualized list lands in a later phase. Cap at 1000 lines (via
-    // `Collapsed` plan) keeps the worst case bounded for v1.
-    let mut col = div().flex().flex_col().h_full().w_full();
+    // The body's height MUST be its intrinsic content height, not
+    // `h_full()`. The parent in `DiffView::render` wraps this element
+    // in an `overflow_y_scroll` container which can only detect
+    // overflow when its child reports a height larger than the viewport.
+    // Setting `h_full()` here makes the body claim exactly the viewport
+    // height and the scroll affordance never fires — long diffs clip
+    // silently. Empty / placeholder paths still get `h_full` because
+    // they want to center vertically inside the available viewport.
     if plan.is_empty() {
-        return col
+        return div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .w_full()
             .child(placeholder("No diff".to_string(), rctx))
             .into_any_element();
     }
+    let mut col = div().flex().flex_col().w_full();
     for fp in plan {
         col = col.child(render_file_plan(fp, rctx, cx));
     }
