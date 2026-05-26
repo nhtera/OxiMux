@@ -53,6 +53,7 @@ async fn file_explorer_constructs_without_panic(cx: &mut TestAppContext) {
             Theme::default(),
             Density::default(),
             Typography::default(),
+            None, // no host on_open callback in test wiring
             win,
             cx,
         )
@@ -109,6 +110,7 @@ async fn file_explorer_renders_without_panic_before_dir_load(cx: &mut TestAppCon
             Theme::default(),
             Density::default(),
             Typography::default(),
+            None, // no host on_open callback in test wiring
             win,
             cx,
         )

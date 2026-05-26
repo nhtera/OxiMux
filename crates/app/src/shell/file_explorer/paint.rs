@@ -128,12 +128,17 @@ pub fn paint_row(
         .hover(|s| s.bg(hover_bg))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |me, _: &MouseDownEvent, _window, cx| {
+            cx.listener(move |me, _: &MouseDownEvent, window, cx| {
                 if is_dir {
                     me.toggle_dir(click_path.clone(), cx);
                 } else {
                     me.selected = Some(click_path.clone());
-                    FileExplorer::open_file(&click_path);
+                    // Route through the host callback so the file opens
+                    // as an editor tab in the active pane group, not via
+                    // macOS `open` (which launched the file outside the
+                    // cockpit). Test contexts pass `on_open=None`, in
+                    // which case this silently no-ops.
+                    me.open_file(click_path.clone(), window, cx);
                     cx.notify();
                 }
             }),

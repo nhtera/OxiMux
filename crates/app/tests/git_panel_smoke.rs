@@ -53,6 +53,7 @@ async fn git_panel_constructs_and_renders_without_panic(cx: &mut TestAppContext)
             Theme::default(),
             Density::default(),
             Typography::default(),
+            None, // no host on_open callback in test wiring
             cx,
         )
     });

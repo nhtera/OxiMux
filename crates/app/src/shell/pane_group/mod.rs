@@ -29,12 +29,12 @@ use crate::actions::{
     CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab, PrevTab,
     RequestOpenAdapterPicker, SplitSubPaneDown, SplitSubPaneRight, ToggleZoomSubPane,
 };
-use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::notifier::{Notifier, TabId};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
+use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
 /// Discriminator for `PaneGroupTab` carrying any per-kind metadata.
@@ -49,7 +49,18 @@ pub enum PaneGroupTabKind {
         session_id: AgentSessionId,
         status_rx: AgentStatusStream,
     },
-    Editor { path: PathBuf },
+    Editor {
+        path: PathBuf,
+    },
+    /// Read-only diff tab. `staged` distinguishes index-vs-worktree so
+    /// the same `path` can have BOTH a "staged" diff tab and an
+    /// "unstaged" diff tab open simultaneously without conflict. Not
+    /// persisted across restarts — diff tabs regenerate from current
+    /// `git diff` state when the user clicks the SCM row again.
+    Diff {
+        path: PathBuf,
+        staged: bool,
+    },
 }
 
 pub struct PaneGroupTab {
@@ -248,9 +259,9 @@ impl PaneGroup {
     /// callers can keep using the canonical idx for click handlers and
     /// active-tracking.
     pub fn visible_tabs(&self) -> impl Iterator<Item = (usize, &PaneGroupTab)> + '_ {
-        self.tab_order.iter().filter_map(move |&idx| {
-            self.tabs.get(idx).map(|t| (idx, t))
-        })
+        self.tab_order
+            .iter()
+            .filter_map(move |&idx| self.tabs.get(idx).map(|t| (idx, t)))
     }
 
     /// Walk `tab_order` directly (yields insertion indices in visual
@@ -365,11 +376,7 @@ impl PaneGroup {
     /// Update the drag hover indicator. Triggers a re-render only when
     /// the value actually changes — `on_drag_move` fires on every
     /// pointer move, so naive `cx.notify()` would thrash.
-    pub fn set_drag_hover(
-        &mut self,
-        hover: Option<TabDragHover>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_drag_hover(&mut self, hover: Option<TabDragHover>, cx: &mut Context<Self>) {
         if self.drag_hover == hover {
             return;
         }
@@ -477,11 +484,7 @@ impl PaneGroup {
     /// isn't known until after the next paint, so we sleep 16 ms then
     /// re-pin. No-op when `was_pinned` is false (user had manually
     /// scrolled left → respect their position).
-    pub(crate) fn schedule_repin_if_was_pinned(
-        &self,
-        was_pinned: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn schedule_repin_if_was_pinned(&self, was_pinned: bool, cx: &mut Context<Self>) {
         if !was_pinned {
             return;
         }
@@ -600,9 +603,11 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) -> usize {
         // Already-open path: move + activate the existing tab.
-        if let Some(idx) = self.tabs.iter().position(
-            |t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == &path),
-        ) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == &path))
+        {
             if let Some(visible_target) = insert_at_visible_idx {
                 if let Some(from) = self.visible_position_of(idx) {
                     // `move_tab` removes `from` first then inserts at the
@@ -663,6 +668,79 @@ impl PaneGroup {
         self.pin_tab_strip_to_end();
         cx.notify();
         self.active
+    }
+
+    /// Open a read-only diff tab for `path` (staged-vs-HEAD when
+    /// `staged=true`, worktree-vs-index otherwise). Idempotent: if a
+    /// diff tab for the same (path, staged) pair already exists in this
+    /// group, it's activated rather than duplicated.
+    ///
+    /// Constructs a fresh `DiffView` entity bound to `repo` and kicks
+    /// off the patch fetch via `DiffView::load`. The DiffView is then
+    /// mounted as `PaneContent::Diff`.
+    pub fn open_or_activate_diff_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        path: PathBuf,
+        staged: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        // Already-open (same path AND same staged flag) → activate.
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(
+                &t.kind,
+                PaneGroupTabKind::Diff { path: p, staged: s } if p == &path && *s == staged
+            )
+        }) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        // New diff tab path. DiffView::new takes (repo, theme, density,
+        // typography, cx). Then load(path, staged, cx) kicks off the
+        // async fetch — the view paints a "Loading…" state until the
+        // patch arrives.
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let path_for_load = path.clone();
+        let view = cx.new(|cx| {
+            let mut v =
+                crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
+            v.load(path_for_load, staged, cx);
+            v
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let label = {
+            let leaf = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("diff")
+                .to_string();
+            // Suffix tells the user which side they're looking at. Kept
+            // short so narrow tab strips don't truncate the filename.
+            let suffix = if staged { " · staged" } else { " · diff" };
+            SharedString::from(format!("{leaf}{suffix}"))
+        };
+        let tab = PaneGroupTab {
+            label,
+            content: PaneContent::Diff(view),
+            kind: PaneGroupTabKind::Diff { path, staged },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -795,9 +873,9 @@ impl PaneGroup {
             PaneContent::Terminal(tree) => tree
                 .active_view()
                 .map(|view| cx.observe(view, |_this, _v, cx| cx.notify())),
-            PaneContent::Editor(view) => {
-                Some(cx.observe(view, |_this, _v, cx| cx.notify()))
-            }
+            PaneContent::Editor(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
+            // Diff tabs notify the host the same way as editor tabs.
+            PaneContent::Diff(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
         };
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
@@ -908,12 +986,7 @@ impl PaneGroup {
     /// tabs. Iterates in reverse so each `close_tab` call sees stable
     /// indices for the untouched portion. No-op when `keep_idx` is out
     /// of range.
-    pub fn close_others(
-        &mut self,
-        keep_idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn close_others(&mut self, keep_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if keep_idx >= self.tabs.len() {
             return;
         }
@@ -931,12 +1004,7 @@ impl PaneGroup {
     /// Close every tab whose index is greater than `from_idx`, skipping
     /// pinned tabs. Reverse iteration keeps each `close_tab` index
     /// valid against the still-unprocessed tail.
-    pub fn close_to_right(
-        &mut self,
-        from_idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn close_to_right(&mut self, from_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.tabs.len();
         if from_idx + 1 >= len {
             return;
@@ -991,7 +1059,11 @@ impl PaneGroup {
     /// the default label. Used by the chip render and persistence.
     pub fn visible_title(&self, idx: usize) -> Option<SharedString> {
         let tab = self.tabs.get(idx)?;
-        Some(tab.custom_title.clone().unwrap_or_else(|| tab.label.clone()))
+        Some(
+            tab.custom_title
+                .clone()
+                .unwrap_or_else(|| tab.label.clone()),
+        )
     }
 
     pub fn set_active(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1044,7 +1116,9 @@ impl PaneGroup {
     ) -> bool {
         let Some(idx) = self.tabs.iter().position(|t| match &t.kind {
             PaneGroupTabKind::Agent { session_id, .. } => TabId::from(*session_id) == tab_id,
-            PaneGroupTabKind::Terminal | PaneGroupTabKind::Editor { .. } => false,
+            PaneGroupTabKind::Terminal
+            | PaneGroupTabKind::Editor { .. }
+            | PaneGroupTabKind::Diff { .. } => false,
         }) else {
             return false;
         };
@@ -1091,7 +1165,9 @@ impl PaneGroup {
         let tab = self.tabs.get(self.active)?;
         match &tab.content {
             PaneContent::Editor(view) => Some(view.read(cx).file_path().to_path_buf()),
-            PaneContent::Terminal(_) => None,
+            // Diff tabs aren't editors and don't surface a file path the
+            // host's editor-tracking flows treat as an editable target.
+            PaneContent::Terminal(_) | PaneContent::Diff(_) => None,
         }
     }
 
@@ -1113,7 +1189,11 @@ impl PaneGroup {
                         .unwrap_or_default();
                     out.push(bytes);
                 }
-                PaneContent::Editor(_) => out.push(Vec::new()),
+                // Editor and Diff tabs have no PTY scrollback. Diff tabs
+                // are also not persisted across restarts, but we still
+                // push an empty slot so the index alignment with `tabs`
+                // is preserved for the duration of this collection call.
+                PaneContent::Editor(_) | PaneContent::Diff(_) => out.push(Vec::new()),
             }
         }
         out
@@ -1126,7 +1206,7 @@ impl PaneGroup {
                 PaneContent::Terminal(tree) => {
                     out.push(tree.active_view().and_then(|v| v.read(cx).external_id()));
                 }
-                PaneContent::Editor(_) => out.push(None),
+                PaneContent::Editor(_) | PaneContent::Diff(_) => out.push(None),
             }
         }
         out
@@ -1423,12 +1503,7 @@ impl PaneGroup {
         self.cycle_sub_pane_focus(false, window, cx);
     }
 
-    fn cycle_sub_pane_focus(
-        &mut self,
-        forward: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn cycle_sub_pane_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active_tab) = self.tabs.get_mut(self.active) else {
             return;
         };

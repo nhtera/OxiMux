@@ -49,10 +49,10 @@ use crate::state::AppState;
 use crate::actions::{
     ActivateGroupTab, CloseGroup, DismissOverlay, OpenAddProjectDialog, OpenCommandPalette,
     OpenCommitDialog, OpenFileFromContextMenu, OpenFileTreeContextMenuAt, OpenPaneActions,
-    OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
-    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
-    SelectSearchTab, SelectSourceControlTab, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft,
-    SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate,
+    RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
+    SelectSourceControlTab, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft, SplitRight,
+    SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -65,15 +65,15 @@ use crate::shell::{
     main_area,
     openable_text_file::is_openable_text_file,
     pane_actions::{PaneActionsAnchor, PaneActionsMenu},
-    tab_context_menu::TabContextMenu,
+    project_panes::ProjectPanes,
     project_picker::{OnPick, ProjectPickerModal},
     right_sidebar::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
     },
     status_bar,
+    tab_context_menu::TabContextMenu,
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS},
     top_bar,
-    project_panes::ProjectPanes,
     workspace_dialog::{OnSubmit as OnWorkspaceSubmit, WorkspaceDialog},
     workspace_ops::build_add_project_dialog,
 };
@@ -203,6 +203,7 @@ impl WorkspaceRoot {
         let right_sidebar = repo.clone().map(|r| {
             let root_path = r.workdir().to_path_buf();
             let on_open = Self::build_on_open_file_callback(weak_self.clone());
+            let on_open_diff = Self::build_on_open_diff_callback(weak_self.clone(), r.clone());
             let on_query = Self::build_on_query_active_path_callback(weak_self.clone());
             cx.new(|cx| {
                 RightSidebar::new(
@@ -210,6 +211,7 @@ impl WorkspaceRoot {
                     root_path,
                     false, // default-collapsed on app boot
                     Some(on_open),
+                    Some(on_open_diff),
                     Some(on_query),
                     theme,
                     density,
@@ -222,8 +224,7 @@ impl WorkspaceRoot {
         let left_rail = cx.new(|cx| LeftRail::new(weak_self.clone(), cx));
         let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
-        let tab_context_menu =
-            cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
+        let tab_context_menu = cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
         let file_tree_context_menu =
             cx.new(|_| FileTreeContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
@@ -411,6 +412,43 @@ impl WorkspaceRoot {
         panes.update(cx, |p, cx| {
             p.open_or_activate_editor_tab(path, window, cx);
         });
+    }
+
+    /// Open `path` as a read-only diff tab in the active project's active
+    /// pane group. `staged=true` shows the staged-vs-HEAD diff; `false`
+    /// shows worktree-vs-index. Idempotent — clicking the same SCM row
+    /// re-focuses the existing diff tab rather than opening a duplicate.
+    pub fn open_diff_in_active_pane(
+        &self,
+        repo: oximux_git::Repository,
+        path: std::path::PathBuf,
+        staged: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        panes.update(cx, |p, cx| {
+            p.open_or_activate_diff_tab(repo, path, staged, window, cx);
+        });
+    }
+
+    /// Build the on-click callback handed to the SCM panel for diff
+    /// opens. Captures a weak self-handle so the callback survives
+    /// project switches that rebuild `RightSidebar`. The `repo`
+    /// argument is captured at build time — RightSidebar already owns
+    /// it for the lifetime of the source-control surface.
+    pub(crate) fn build_on_open_diff_callback(
+        weak: WeakEntity<Self>,
+        repo: oximux_git::Repository,
+    ) -> crate::shell::file_tree_view::OnOpenDiff {
+        Arc::new(move |path, staged, window, cx| {
+            let repo = repo.clone();
+            let _ = weak.update(cx, |this, cx| {
+                this.open_diff_in_active_pane(repo, path, staged, window, cx);
+            });
+        })
     }
 
     /// Build the on-click callback handed to the Files-tab `FileTreeView`.
@@ -913,29 +951,31 @@ impl Render for WorkspaceRoot {
                     )
                 });
             }))
-            .on_action(cx.listener(|this, action: &OpenPaneActionsAt, _window, cx| {
-                // Per-pane "..." click carries the cursor's absolute window
-                // coords. The menu shifts itself left by its own width so
-                // the card stays inside the right edge when chips sit near
-                // it (see pane_actions::PaneActionsAnchor::Chip).
-                let has_siblings = this
-                    .active_project_panes()
-                    .map(|p| p.read(cx).manager().in_order_groups().len() > 1)
-                    .unwrap_or(false);
-                this.adapter_picker.update(cx, |p, cx| p.close(cx));
-                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
-                this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
-                this.pane_actions.update(cx, |p, cx| {
-                    p.open(
-                        PaneActionsAnchor::Chip {
-                            x_px: action.x,
-                            y_px: action.y,
-                        },
-                        has_siblings,
-                        cx,
-                    )
-                });
-            }))
+            .on_action(
+                cx.listener(|this, action: &OpenPaneActionsAt, _window, cx| {
+                    // Per-pane "..." click carries the cursor's absolute window
+                    // coords. The menu shifts itself left by its own width so
+                    // the card stays inside the right edge when chips sit near
+                    // it (see pane_actions::PaneActionsAnchor::Chip).
+                    let has_siblings = this
+                        .active_project_panes()
+                        .map(|p| p.read(cx).manager().in_order_groups().len() > 1)
+                        .unwrap_or(false);
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.pane_actions.update(cx, |p, cx| {
+                        p.open(
+                            PaneActionsAnchor::Chip {
+                                x_px: action.x,
+                                y_px: action.y,
+                            },
+                            has_siblings,
+                            cx,
+                        )
+                    });
+                }),
+            )
             // Four-direction split actions. SplitHorizontal / SplitVertical
             // are aliases preserved for the legacy Cmd+D / Cmd+Shift+D
             // bindings; they map to Right / Down respectively.
@@ -956,179 +996,188 @@ impl Render for WorkspaceRoot {
                     }
                 });
             }))
-            .on_action(cx.listener(|this, action: &OpenTabContextMenuAt, _window, cx| {
-                // Tab chip right-click. Carries enough state (group id,
-                // tab index, click coords) for the shared TabContextMenu
-                // to mutate the right group even if focus moves before
-                // the user picks an item.
-                let Some(panes) = this.active_project_panes() else {
-                    return;
-                };
-                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
-                let panes_ref = panes.read(cx);
-                let Some(group) = panes_ref.group(group_id) else {
-                    return;
-                };
-                let group_ref = group.read(cx);
-                let tab_count = group_ref.tabs().len();
-                let tab_idx = action.tab_idx as usize;
-                let is_pinned = group_ref.is_pinned(tab_idx);
-                // Derive kind-specific payload (editor path) so the menu
-                // can render Copy Path / Reveal in Finder rows without
-                // walking back into the entity at click time.
-                let tab_kind = match group_ref.tabs().get(tab_idx).map(|t| &t.kind) {
-                    Some(crate::shell::pane_group::PaneGroupTabKind::Editor { path }) => {
-                        let project_root = this
-                            .active_project
-                            .as_ref()
-                            .map(|p| std::path::PathBuf::from(&p.root_path));
-                        crate::shell::tab_context_menu::TabContextKind::Editor {
-                            path: path.clone(),
-                            project_root,
-                        }
-                    }
-                    _ => crate::shell::tab_context_menu::TabContextKind::Terminal,
-                };
-                let weak = group.downgrade();
-                let x = action.x;
-                let y = action.y;
-                this.pane_actions.update(cx, |p, cx| p.close(cx));
-                this.adapter_picker.update(cx, |p, cx| p.close(cx));
-                this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
-                this.tab_context_menu.update(cx, |m, cx| {
-                    m.open(x, y, weak, group_id, tab_idx, tab_count, tab_kind, is_pinned, cx)
-                });
-            }))
-            .on_action(cx.listener(|this, action: &OpenFileTreeContextMenuAt, _window, cx| {
-                // File-tree row right-click — opens the shared
-                // `FileTreeContextMenu` with the clicked path. Directory
-                // rows get a reduced item set (Reveal + Copy Path only).
-                let path = std::path::PathBuf::from(&action.path);
-                let project_root = this
-                    .active_project
-                    .as_ref()
-                    .map(|p| std::path::PathBuf::from(&p.root_path));
-                this.pane_actions.update(cx, |p, cx| p.close(cx));
-                this.adapter_picker.update(cx, |p, cx| p.close(cx));
-                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
-                this.file_tree_context_menu.update(cx, |m, cx| {
-                    m.open(action.x, action.y, path, project_root, action.is_dir, cx)
-                });
-            }))
-            .on_action(cx.listener(|this, action: &OpenFileFromContextMenu, window, cx| {
-                // File-tree menu "Open" / "Open to the Side" row. The
-                // menu has already closed itself; this handler routes
-                // to ProjectPanes via the same code paths the drag-drop
-                // flow uses (open_file_in_group / split_and_open_file).
-                let Some(panes) = this.active_project_panes() else {
-                    return;
-                };
-                let path = std::path::PathBuf::from(&action.path);
-                if !is_openable_text_file(&path) {
-                    tracing::info!(
-                        file = %path.display(),
-                        "open-from-context-menu: refusing non-text file"
-                    );
-                    return;
-                }
-                let split_right = action.split_right;
-                panes.update(cx, |p, cx| {
-                    let target = p.manager().active_group_id();
-                    if split_right {
-                        p.split_and_open_file(
-                            target,
-                            crate::shell::pane_group::tab_drag_zones::Zone::Right,
-                            path,
-                            window,
-                            cx,
-                        );
-                    } else {
-                        p.open_file_in_group(target, path, window, cx);
-                    }
-                });
-            }))
-            .on_action(cx.listener(|this, action: &crate::actions::RequestRenameTabAt, window, cx| {
-                // Tab right-click "Change Title…": open a RenameTabDialog
-                // bound to (group_id, tab_idx). Callback mutates the
-                // target group's custom_title via set_tab_title.
-                let Some(panes) = this.active_project_panes() else {
-                    return;
-                };
-                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
-                let tab_idx = action.tab_idx as usize;
-                let panes_ref = panes.read(cx);
-                let Some(group) = panes_ref.group(group_id) else {
-                    return;
-                };
-                let initial = group
-                    .read(cx)
-                    .visible_title(tab_idx)
-                    .unwrap_or_default();
-                let weak_root: gpui::WeakEntity<WorkspaceRoot> = cx.weak_entity();
-                let weak_group = group.downgrade();
-                let on_commit: crate::shell::rename_tab_dialog::RenameCallback =
-                    std::rc::Rc::new(move |outcome, _window, cx| {
-                        use crate::shell::rename_tab_dialog::RenameOutcome;
-                        // Mutate first, then drop the dialog regardless of
-                        // outcome so Cancel actually dismisses the modal.
-                        if let Some(g) = weak_group.upgrade() {
-                            match outcome {
-                                RenameOutcome::Save(value) => g.update(cx, |g, cx| {
-                                    g.set_tab_title(tab_idx, Some(value), cx)
-                                }),
-                                RenameOutcome::Reset => g.update(cx, |g, cx| {
-                                    g.set_tab_title(tab_idx, None, cx)
-                                }),
-                                RenameOutcome::Cancel => {}
+            .on_action(
+                cx.listener(|this, action: &OpenTabContextMenuAt, _window, cx| {
+                    // Tab chip right-click. Carries enough state (group id,
+                    // tab index, click coords) for the shared TabContextMenu
+                    // to mutate the right group even if focus moves before
+                    // the user picks an item.
+                    let Some(panes) = this.active_project_panes() else {
+                        return;
+                    };
+                    let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                    let panes_ref = panes.read(cx);
+                    let Some(group) = panes_ref.group(group_id) else {
+                        return;
+                    };
+                    let group_ref = group.read(cx);
+                    let tab_count = group_ref.tabs().len();
+                    let tab_idx = action.tab_idx as usize;
+                    let is_pinned = group_ref.is_pinned(tab_idx);
+                    // Derive kind-specific payload (editor path) so the menu
+                    // can render Copy Path / Reveal in Finder rows without
+                    // walking back into the entity at click time.
+                    let tab_kind = match group_ref.tabs().get(tab_idx).map(|t| &t.kind) {
+                        Some(crate::shell::pane_group::PaneGroupTabKind::Editor { path }) => {
+                            let project_root = this
+                                .active_project
+                                .as_ref()
+                                .map(|p| std::path::PathBuf::from(&p.root_path));
+                            crate::shell::tab_context_menu::TabContextKind::Editor {
+                                path: path.clone(),
+                                project_root,
                             }
                         }
-                        let _ = weak_root.update(cx, |this, cx| {
-                            this.rename_tab_dialog = None;
-                            cx.notify();
-                        });
+                        _ => crate::shell::tab_context_menu::TabContextKind::Terminal,
+                    };
+                    let weak = group.downgrade();
+                    let x = action.x;
+                    let y = action.y;
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| {
+                        m.open(
+                            x, y, weak, group_id, tab_idx, tab_count, tab_kind, is_pinned, cx,
+                        )
                     });
-                let theme = this.theme;
-                let density = this.density;
-                let typography = this.typography.clone();
-                this.tab_context_menu.update(cx, |m, cx| m.close(cx));
-                let dialog = cx.new(|cx| {
-                    crate::shell::rename_tab_dialog::RenameTabDialog::new(
-                        "Change Tab Title".into(),
-                        initial,
-                        on_commit,
-                        theme,
-                        density,
-                        typography,
-                        window,
-                        cx,
-                    )
-                });
-                // Focus the dialog's input AFTER it's mounted so the user
-                // can type immediately. Focusing before assignment is a
-                // no-op (the element isn't in the tree yet).
-                dialog.read(cx).input_focus_handle(cx).focus(window, cx);
-                this.rename_tab_dialog = Some(dialog);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, action: &crate::actions::TogglePinTabAt, _window, cx| {
-                // Tab right-click "Pin Tab" / "Unpin Tab": flip the
-                // pinned flag and re-cluster the chip inside the
-                // group's tab_order. Reading the live `pinned` from
-                // the group at dispatch time keeps the menu's stale
-                // snapshot from producing a wrong toggle (e.g. two
-                // rapid clicks).
-                let Some(panes) = this.active_project_panes() else {
-                    return;
-                };
-                let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
-                let tab_idx = action.tab_idx as usize;
-                let panes_ref = panes.read(cx);
-                let Some(group) = panes_ref.group(group_id) else {
-                    return;
-                };
-                let group = group.clone();
-                group.update(cx, |g, cx| g.toggle_pin(tab_idx, cx));
-            }))
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &OpenFileTreeContextMenuAt, _window, cx| {
+                    // File-tree row right-click — opens the shared
+                    // `FileTreeContextMenu` with the clicked path. Directory
+                    // rows get a reduced item set (Reveal + Copy Path only).
+                    let path = std::path::PathBuf::from(&action.path);
+                    let project_root = this
+                        .active_project
+                        .as_ref()
+                        .map(|p| std::path::PathBuf::from(&p.root_path));
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| {
+                        m.open(action.x, action.y, path, project_root, action.is_dir, cx)
+                    });
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &OpenFileFromContextMenu, window, cx| {
+                    // File-tree menu "Open" / "Open to the Side" row. The
+                    // menu has already closed itself; this handler routes
+                    // to ProjectPanes via the same code paths the drag-drop
+                    // flow uses (open_file_in_group / split_and_open_file).
+                    let Some(panes) = this.active_project_panes() else {
+                        return;
+                    };
+                    let path = std::path::PathBuf::from(&action.path);
+                    if !is_openable_text_file(&path) {
+                        tracing::info!(
+                            file = %path.display(),
+                            "open-from-context-menu: refusing non-text file"
+                        );
+                        return;
+                    }
+                    let split_right = action.split_right;
+                    panes.update(cx, |p, cx| {
+                        let target = p.manager().active_group_id();
+                        if split_right {
+                            p.split_and_open_file(
+                                target,
+                                crate::shell::pane_group::tab_drag_zones::Zone::Right,
+                                path,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            p.open_file_in_group(target, path, window, cx);
+                        }
+                    });
+                }),
+            )
+            .on_action(cx.listener(
+                |this, action: &crate::actions::RequestRenameTabAt, window, cx| {
+                    // Tab right-click "Change Title…": open a RenameTabDialog
+                    // bound to (group_id, tab_idx). Callback mutates the
+                    // target group's custom_title via set_tab_title.
+                    let Some(panes) = this.active_project_panes() else {
+                        return;
+                    };
+                    let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                    let tab_idx = action.tab_idx as usize;
+                    let panes_ref = panes.read(cx);
+                    let Some(group) = panes_ref.group(group_id) else {
+                        return;
+                    };
+                    let initial = group.read(cx).visible_title(tab_idx).unwrap_or_default();
+                    let weak_root: gpui::WeakEntity<WorkspaceRoot> = cx.weak_entity();
+                    let weak_group = group.downgrade();
+                    let on_commit: crate::shell::rename_tab_dialog::RenameCallback =
+                        std::rc::Rc::new(move |outcome, _window, cx| {
+                            use crate::shell::rename_tab_dialog::RenameOutcome;
+                            // Mutate first, then drop the dialog regardless of
+                            // outcome so Cancel actually dismisses the modal.
+                            if let Some(g) = weak_group.upgrade() {
+                                match outcome {
+                                    RenameOutcome::Save(value) => g.update(cx, |g, cx| {
+                                        g.set_tab_title(tab_idx, Some(value), cx)
+                                    }),
+                                    RenameOutcome::Reset => {
+                                        g.update(cx, |g, cx| g.set_tab_title(tab_idx, None, cx))
+                                    }
+                                    RenameOutcome::Cancel => {}
+                                }
+                            }
+                            let _ = weak_root.update(cx, |this, cx| {
+                                this.rename_tab_dialog = None;
+                                cx.notify();
+                            });
+                        });
+                    let theme = this.theme;
+                    let density = this.density;
+                    let typography = this.typography.clone();
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    let dialog = cx.new(|cx| {
+                        crate::shell::rename_tab_dialog::RenameTabDialog::new(
+                            "Change Tab Title".into(),
+                            initial,
+                            on_commit,
+                            theme,
+                            density,
+                            typography,
+                            window,
+                            cx,
+                        )
+                    });
+                    // Focus the dialog's input AFTER it's mounted so the user
+                    // can type immediately. Focusing before assignment is a
+                    // no-op (the element isn't in the tree yet).
+                    dialog.read(cx).input_focus_handle(cx).focus(window, cx);
+                    this.rename_tab_dialog = Some(dialog);
+                    cx.notify();
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &crate::actions::TogglePinTabAt, _window, cx| {
+                    // Tab right-click "Pin Tab" / "Unpin Tab": flip the
+                    // pinned flag and re-cluster the chip inside the
+                    // group's tab_order. Reading the live `pinned` from
+                    // the group at dispatch time keeps the menu's stale
+                    // snapshot from producing a wrong toggle (e.g. two
+                    // rapid clicks).
+                    let Some(panes) = this.active_project_panes() else {
+                        return;
+                    };
+                    let group_id = crate::shell::pane_tree::PaneGroupId(action.group_id);
+                    let tab_idx = action.tab_idx as usize;
+                    let panes_ref = panes.read(cx);
+                    let Some(group) = panes_ref.group(group_id) else {
+                        return;
+                    };
+                    let group = group.clone();
+                    group.update(cx, |g, cx| g.toggle_pin(tab_idx, cx));
+                },
+            ))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {
                 this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);
             }))

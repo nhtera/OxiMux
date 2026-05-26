@@ -28,6 +28,13 @@ use crate::shell::pane_group::file_drag::{FilePathDragPayload, FilePathDragPrevi
 /// executor or tokio paths capture this Arc.
 pub type OnOpenFile = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + 'static>;
 
+/// Diff open callback. Same shape as `OnOpenFile` but carries an
+/// extra `staged: bool` discriminator so a single host method can
+/// route to `open_or_activate_diff_tab(path, staged, …)`. Lives here
+/// next to `OnOpenFile` because both are right-sidebar-injected
+/// callbacks consumed by the same set of panels.
+pub type OnOpenDiff = Arc<dyn Fn(PathBuf, bool, &mut Window, &mut App) + 'static>;
+
 /// Active-file query callback. Invoked once per render to find the file
 /// currently open in the focused pane; the matching tree row is then
 /// rendered with the active-file highlight in addition to (or instead of)
@@ -361,7 +368,9 @@ fn render_row(
     // is meaningless (active files are files), so this only fires on
     // File rows.
     let is_active = matches!(&row.kind, RowKind::File { .. })
-        && active_path.map(|p| p == row.path.as_path()).unwrap_or(false);
+        && active_path
+            .map(|p| p == row.path.as_path())
+            .unwrap_or(false);
     let is_sentinel = matches!(
         &row.kind,
         RowKind::Placeholder { .. } | RowKind::EmptyDir { .. }
@@ -406,7 +415,9 @@ fn render_row(
         .pl(indent)
         .pr(px(6.0))
         .rounded(px(4.0))
-        .when(is_active, |s| s.bg(rgb(ACTIVE_BG)).text_color(rgb(ACTIVE_FG)))
+        .when(is_active, |s| {
+            s.bg(rgb(ACTIVE_BG)).text_color(rgb(ACTIVE_FG))
+        })
         .when(is_selected && !is_active, |s| s.bg(rgb(SELECT_BG)))
         .when(!is_sentinel, |s| s.hover(|h| h.bg(rgb(HOVER_BG))))
         .child(chevron_el)
@@ -459,9 +470,7 @@ fn render_row(
                 let drag_path = path.clone();
                 let drag_label = SharedString::from(row.label.clone());
                 el = el.on_drag(
-                    FilePathDragPayload {
-                        path: drag_path,
-                    },
+                    FilePathDragPayload { path: drag_path },
                     move |_payload, _offset, _window, cx| {
                         let label = drag_label.clone();
                         cx.new(|_| FilePathDragPreview::new(label))

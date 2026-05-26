@@ -19,9 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, Subscription, Window,
-};
+use gpui::{App, AppContext, Context, Entity, FocusHandle, Focusable, Subscription, Window};
 use oximux_agents::CliRuntime;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -38,9 +36,7 @@ use crate::persisted_terminals::{
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::tab_drag_zones::Zone;
 use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind};
-use crate::shell::pane_group_manager::{
-    CloseGroupError, GroupSplitOutcome, PaneGroupManager,
-};
+use crate::shell::pane_group_manager::{CloseGroupError, GroupSplitOutcome, PaneGroupManager};
 use crate::shell::pane_tree::{Axis, PaneGroupId, SplitInsert};
 
 /// Hovered drop target during a cross-group tab drag — drives the
@@ -111,11 +107,9 @@ impl ProjectPanes {
     ) -> Self {
         let window_active = Arc::new(AtomicBool::new(window.is_window_active()));
         let window_active_for_observer = window_active.clone();
-        let observer =
-            cx.observe_window_activation(window, move |_this, window, _cx| {
-                window_active_for_observer
-                    .store(window.is_window_active(), Ordering::Relaxed);
-            });
+        let observer = cx.observe_window_activation(window, move |_this, window, _cx| {
+            window_active_for_observer.store(window.is_window_active(), Ordering::Relaxed);
+        });
         let manager = PaneGroupManager::new();
         let initial_id = manager.active_group_id();
         let group = build_group(
@@ -206,26 +200,17 @@ impl ProjectPanes {
     }
 
     pub fn agent_count(&self, cx: &App) -> usize {
-        self.groups
-            .values()
-            .map(|g| g.read(cx).agent_count())
-            .sum()
+        self.groups.values().map(|g| g.read(cx).agent_count()).sum()
     }
 
     pub fn tab_count(&self, cx: &App) -> usize {
-        self.groups
-            .values()
-            .map(|g| g.read(cx).tab_count())
-            .sum()
+        self.groups.values().map(|g| g.read(cx).tab_count()).sum()
     }
 
     /// Total TTY-backed tab count across every pane group. Drives the
     /// status bar's "N TTY" metric.
     pub fn tty_count(&self, cx: &App) -> usize {
-        self.groups
-            .values()
-            .map(|g| g.read(cx).tty_count())
-            .sum()
+        self.groups.values().map(|g| g.read(cx).tty_count()).sum()
     }
 
     pub fn is_empty(&self, cx: &App) -> bool {
@@ -390,7 +375,8 @@ impl ProjectPanes {
         let group_focus_observer = observe_group_focus(&group, new_group, window, cx);
         self.groups.insert(new_group, group);
         self._observers.insert(new_group, group_observer);
-        self._focus_observers.insert(new_group, group_focus_observer);
+        self._focus_observers
+            .insert(new_group, group_focus_observer);
         // 3. Steal the tab from source into the new group.
         let moved = self.transfer_tab(source, source_tab_idx, new_group, window, cx);
         if !moved {
@@ -432,8 +418,7 @@ impl ProjectPanes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PaneGroupId> {
-        let GroupSplitOutcome { new_group, .. } =
-            self.manager.split_active_group(axis, insert)?;
+        let GroupSplitOutcome { new_group, .. } = self.manager.split_active_group(axis, insert)?;
         let group = build_group(
             self.cwd.clone(),
             self.theme,
@@ -454,7 +439,8 @@ impl ProjectPanes {
         let group_focus_observer = observe_group_focus(&group, new_group, window, cx);
         self.groups.insert(new_group, group);
         self._observers.insert(new_group, group_observer);
-        self._focus_observers.insert(new_group, group_focus_observer);
+        self._focus_observers
+            .insert(new_group, group_focus_observer);
         if let Some(group) = self.groups.get(&new_group) {
             group.update(cx, |g, cx| g.focus_active(window, cx));
         }
@@ -494,11 +480,7 @@ impl ProjectPanes {
     /// Pre-render sweep: drop any group whose tabs hit zero. Refuses
     /// to close the last group — that path falls through to render-as-
     /// empty so the user still has a stable container.
-    pub(crate) fn purge_empty_groups(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn purge_empty_groups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.groups.len() <= 1 {
             return;
         }
@@ -522,13 +504,12 @@ impl ProjectPanes {
         cx: &mut Context<Self>,
     ) -> Option<usize> {
         // Already open somewhere? Activate that group + that tab.
-        let existing: Option<(PaneGroupId, usize)> =
-            self.groups.iter().find_map(|(id, group)| {
-                group
-                    .read(cx)
-                    .editor_tab_index(path.as_path())
-                    .map(|idx| (*id, idx))
-            });
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .editor_tab_index(path.as_path())
+                .map(|idx| (*id, idx))
+        });
         if let Some((id, idx)) = existing {
             self.set_active_group(id, window, cx);
             let group = self.groups.get(&id)?.clone();
@@ -549,6 +530,31 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         let target = self.groups.get(&target_id)?.clone();
         Some(target.update(cx, |g, cx| g.open_or_activate_editor_tab(path, window, cx)))
+    }
+
+    /// Open or activate a diff tab in the active group for `(path, staged)`.
+    /// Mirrors `open_or_activate_editor_tab` but routes through `PaneGroup::
+    /// open_or_activate_diff_tab` which constructs a fresh `DiffView` bound
+    /// to `repo`. Diff tabs don't deduplicate across groups (unlike editor
+    /// tabs) — clicking an SCM row always opens in the focused group.
+    pub fn open_or_activate_diff_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        path: PathBuf,
+        staged: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied())?;
+        self.set_active_group(target_id, window, cx);
+        let target = self.groups.get(&target_id)?.clone();
+        Some(target.update(cx, |g, cx| {
+            g.open_or_activate_diff_tab(repo, path, staged, window, cx)
+        }))
     }
 
     pub fn open_terminal_tab_in_active_group(
@@ -630,7 +636,8 @@ impl ProjectPanes {
         let group_focus_observer = observe_group_focus(&group, new_group, window, cx);
         self.groups.insert(new_group, group.clone());
         self._observers.insert(new_group, group_observer);
-        self._focus_observers.insert(new_group, group_focus_observer);
+        self._focus_observers
+            .insert(new_group, group_focus_observer);
         // 3. Push the editor tab into the new group + activate it.
         group.update(cx, |g, cx| {
             g.open_or_activate_editor_tab(path, window, cx);
@@ -768,6 +775,11 @@ impl ProjectPanes {
                             path: path.display().to_string(),
                         },
                     ),
+                    // Diff tabs are intentionally NOT persisted — they
+                    // regenerate from current `git diff` state when the
+                    // user clicks the SCM row again. Skip the slot so
+                    // the persisted tab list stays compact.
+                    PaneGroupTabKind::Diff { .. } => continue,
                     PaneGroupTabKind::Agent {
                         adapter,
                         adapter_id,
@@ -799,15 +811,12 @@ impl ProjectPanes {
                 // For terminal tabs (non-agent), capture the sub-pane
                 // tree topology + per-leaf cwd. Agent tabs are always
                 // single-sub-pane; skipping keeps their blobs minimal.
-                let (sub_tree, sub_panes, active_sub_pane) = if matches!(
-                    tab.kind,
-                    PaneGroupTabKind::Terminal
-                ) && agent.is_none()
-                {
-                    snapshot_sub_pane_tree(tab, cx)
-                } else {
-                    (PersistedTree::Leaf, Vec::new(), 0)
-                };
+                let (sub_tree, sub_panes, active_sub_pane) =
+                    if matches!(tab.kind, PaneGroupTabKind::Terminal) && agent.is_none() {
+                        snapshot_sub_pane_tree(tab, cx)
+                    } else {
+                        (PersistedTree::Leaf, Vec::new(), 0)
+                    };
                 tabs.push(PersistedTab {
                     label: tab.label.to_string(),
                     tree: sub_tree,
@@ -1022,15 +1031,13 @@ impl ProjectPanes {
         // index-aligned.
         let mut allocated: Vec<PaneGroupId> = Vec::new();
         let mut next_raw: u64 = 1;
-        let restored_tree = crate::persisted_terminals::restore_tree::<PaneGroupId, _>(
-            persisted_tree,
-            &mut || {
+        let restored_tree =
+            crate::persisted_terminals::restore_tree::<PaneGroupId, _>(persisted_tree, &mut || {
                 let id = PaneGroupId(next_raw);
                 next_raw += 1;
                 allocated.push(id);
                 id
-            },
-        );
+            });
         // Drop placeholder group(s) + every observer wired to them.
         self.groups.clear();
         self._observers.clear();
@@ -1192,8 +1199,7 @@ impl ProjectPanes {
                 if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
                     continue;
                 }
-                let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content
-                else {
+                let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content else {
                     continue;
                 };
                 // F3.4: capture EVERY live sub-pane's scrollback (not
@@ -1203,17 +1209,15 @@ impl ProjectPanes {
                 // each sub-pane. Single-sub-pane tabs end up writing
                 // one row at `(ordinal, 0)`, identical to pre-F3.4.
                 for (sub_pane_ordinal, slot) in tree.tree().in_order_leaves().iter().enumerate() {
-                    let Some(view) = tree.get(*slot) else { continue };
+                    let Some(view) = tree.get(*slot) else {
+                        continue;
+                    };
                     let bytes = view.read(cx).serialize_buffer(max_bytes_per_pane);
                     if bytes.is_empty() {
                         continue;
                     }
-                    if let Err(err) = repo.set(
-                        project_id,
-                        ordinal,
-                        sub_pane_ordinal as u32,
-                        &bytes,
-                    ) {
+                    if let Err(err) = repo.set(project_id, ordinal, sub_pane_ordinal as u32, &bytes)
+                    {
                         tracing::warn!(
                             ?err,
                             project_id,
@@ -1239,7 +1243,11 @@ impl ProjectPanes {
         cx: &App,
     ) {
         if let Err(err) = repo.delete_for_project(project_id) {
-            tracing::warn!(?err, project_id, "pane_relay_ids: delete_for_project failed");
+            tracing::warn!(
+                ?err,
+                project_id,
+                "pane_relay_ids: delete_for_project failed"
+            );
             return;
         }
         let mut ordinal: u32 = 0;
@@ -1252,11 +1260,12 @@ impl ProjectPanes {
                 if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
                     continue;
                 }
-                let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content
-                else {
+                let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content else {
                     continue;
                 };
-                let Some(view) = tree.active_view() else { continue };
+                let Some(view) = tree.active_view() else {
+                    continue;
+                };
                 if let Some(pty_id) = view.read(cx).external_id()
                     && let Err(err) = repo.set(project_id, ordinal, &pty_id, relay_session_id)
                 {

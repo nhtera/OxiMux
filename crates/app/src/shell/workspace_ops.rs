@@ -18,13 +18,13 @@ use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::{ProjectRepo, StorageError, WorkspaceRepo};
 
+use crate::project_panes_factory::{
+    build_project_panes, compute_attach_hints, load_persisted_tabs, save_persisted_tabs,
+};
 use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
-use crate::project_panes_factory::{
-    build_project_panes, compute_attach_hints, load_persisted_tabs, save_persisted_tabs,
-};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
 
 /// Build the Add-Project dialog entity. Wires the `on_pick` callback to
@@ -332,6 +332,12 @@ impl WorkspaceRoot {
                 let weak = cx.weak_entity();
                 let on_open =
                     crate::workspace_root::WorkspaceRoot::build_on_open_file_callback(weak.clone());
+                let on_open_diff = repo.as_ref().map(|r| {
+                    crate::workspace_root::WorkspaceRoot::build_on_open_diff_callback(
+                        weak.clone(),
+                        r.clone(),
+                    )
+                });
                 let on_query =
                     crate::workspace_root::WorkspaceRoot::build_on_query_active_path_callback(weak);
                 this.right_sidebar = Some(cx.new(|cx| {
@@ -340,6 +346,7 @@ impl WorkspaceRoot {
                         project_root.clone(),
                         prior_open,
                         Some(on_open),
+                        on_open_diff,
                         Some(on_query),
                         theme,
                         density,

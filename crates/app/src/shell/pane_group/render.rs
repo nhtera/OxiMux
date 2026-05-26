@@ -12,10 +12,10 @@
 //! workspace's).
 
 use gpui::{
-    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths,
-    InteractiveElement, IntoElement, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, svg,
+    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths, InteractiveElement,
+    IntoElement, ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
+    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
+    prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::Theme;
 
@@ -25,11 +25,11 @@ use super::{PaneGroup, PaneGroupTab, PaneGroupTabKind, TabDragHover, TabInsertSi
 use crate::actions::{
     ActivateGroupTab, OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker,
 };
-use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::agent_status_badge::render_dot;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::file_drag::FilePathDragPayload;
+use crate::shell::pane_tree::PaneGroupId;
 
 pub const TAB_STRIP_HEIGHT_PX: f32 = 28.0;
 const TAB_PAD_X_PX: f32 = 12.0;
@@ -69,10 +69,12 @@ impl Render for PaneGroup {
 
         let group_entity = entity.clone();
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
-            PaneContent::Terminal(tree) => {
-                render_sub_pane_tree(tree, group_entity.clone(), theme)
-            }
+            PaneContent::Terminal(tree) => render_sub_pane_tree(tree, group_entity.clone(), theme),
             PaneContent::Editor(view) => view.clone().into_any_element(),
+            // Diff tabs render the DiffView entity directly as the active
+            // pane content — same pattern as Editor. The DiffView owns
+            // its own scroll, header, and per-hunk layout.
+            PaneContent::Diff(view) => view.clone().into_any_element(),
         });
 
         let body = div()
@@ -117,13 +119,11 @@ impl Render for PaneGroup {
             // thread-switcher pattern. We commit when `ctrl` flips OFF
             // and a switcher is currently open; everything else is a
             // no-op so other modifier transitions don't disturb state.
-            .on_modifiers_changed(cx.listener(
-                |this, ev: &ModifiersChangedEvent, window, cx| {
-                    if this.mru_switcher().is_some() && !ev.control {
-                        this.commit_mru_switch(window, cx);
-                    }
-                },
-            ))
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, window, cx| {
+                if this.mru_switcher().is_some() && !ev.control {
+                    this.commit_mru_switch(window, cx);
+                }
+            }))
             .child(body)
             .when_some(mru_overlay, |s, overlay| s.child(overlay))
     }
@@ -203,6 +203,10 @@ enum PaneTabKindMarker {
     Terminal,
     Agent,
     Editor,
+    /// Diff tabs reuse the Editor chip styling (file icon, no agent
+    /// status badge) but keep their own marker so future visual
+    /// differentiation (e.g. a `±` adornment) is a single-line change.
+    Diff,
 }
 
 fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
@@ -210,6 +214,7 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         PaneGroupTabKind::Terminal => PaneTabKindMarker::Terminal,
         PaneGroupTabKind::Agent { .. } => PaneTabKindMarker::Agent,
         PaneGroupTabKind::Editor { .. } => PaneTabKindMarker::Editor,
+        PaneGroupTabKind::Diff { .. } => PaneTabKindMarker::Diff,
     }
 }
 
@@ -309,37 +314,31 @@ fn build_tab_strip_from_headers(
         // File drop in the strip but outside any chip's bounds (e.g. on
         // the `+` button gap) → append the file at the end. Same hover
         // cleanup so the insertion bar disappears.
-        .on_drop::<FilePathDragPayload>(
-            move |payload: &FilePathDragPayload, window, cx| {
-                let path = payload.path.clone();
-                strip_file_drop_entity.update(cx, |g, cx| {
-                    g.set_drag_hover(None, cx);
-                    g.open_or_activate_editor_tab_at(path, None, window, cx);
-                });
-            },
-        )
+        .on_drop::<FilePathDragPayload>(move |payload: &FilePathDragPayload, window, cx| {
+            let path = payload.path.clone();
+            strip_file_drop_entity.update(cx, |g, cx| {
+                g.set_drag_hover(None, cx);
+                g.open_or_activate_editor_tab_at(path, None, window, cx);
+            });
+        })
         // F4.6: OS-native Finder drop variant. GPUI synthesises an
         // internal drag carrying `ExternalPaths` when the user drags
         // files from Finder over the window; same capture-pass + drop
         // logic as the in-app file-tree drag.
-        .on_drag_move::<ExternalPaths>(
-            move |_: &DragMoveEvent<ExternalPaths>, _window, cx| {
-                strip_native_hover_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
-            },
-        )
-        .on_drop::<ExternalPaths>(
-            move |payload: &ExternalPaths, window, cx| {
-                let paths = filter_droppable_files(payload.paths());
-                strip_native_drop_entity.update(cx, |g, cx| {
-                    g.set_drag_hover(None, cx);
-                    // Multi-file Finder drops append in sequence so the
-                    // user reads them left-to-right in the strip.
-                    for path in paths {
-                        g.open_or_activate_editor_tab_at(path, None, window, cx);
-                    }
-                });
-            },
-        )
+        .on_drag_move::<ExternalPaths>(move |_: &DragMoveEvent<ExternalPaths>, _window, cx| {
+            strip_native_hover_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+        })
+        .on_drop::<ExternalPaths>(move |payload: &ExternalPaths, window, cx| {
+            let paths = filter_droppable_files(payload.paths());
+            strip_native_drop_entity.update(cx, |g, cx| {
+                g.set_drag_hover(None, cx);
+                // Multi-file Finder drops append in sequence so the
+                // user reads them left-to-right in the strip.
+                for path in paths {
+                    g.open_or_activate_editor_tab_at(path, None, window, cx);
+                }
+            });
+        })
         // Mouse-wheel horizontal scroll: map vertical wheel delta onto
         // the strip's horizontal scroll offset. Trackpad horizontal
         // swipes already flow through the native `overflow_x_scroll`
@@ -349,8 +348,7 @@ fn build_tab_strip_from_headers(
         // consistent pixel space; `TAB_STRIP_HEIGHT_PX` is a sensible
         // line-height for chips that are exactly one strip tall.
         .on_scroll_wheel(move |ev: &ScrollWheelEvent, _window, _cx| {
-            let pixel_delta: Point<Pixels> =
-                ev.delta.pixel_delta(px(TAB_STRIP_HEIGHT_PX));
+            let pixel_delta: Point<Pixels> = ev.delta.pixel_delta(px(TAB_STRIP_HEIGHT_PX));
             let dy = pixel_delta.y;
             if f32::from(dy).abs() < f32::EPSILON {
                 return;
@@ -449,11 +447,7 @@ fn build_tab_strip_from_headers(
 /// Forward grid target to the active terminal tab so its PTY resizes
 /// when the window resizes or chrome width changes. No-op for editor /
 /// empty tabs. Mirrors the old `MainPane::dispatch_grids` budget math.
-fn dispatch_active_grid(
-    group: &PaneGroup,
-    window: &Window,
-    cx: &mut Context<PaneGroup>,
-) {
+fn dispatch_active_grid(group: &PaneGroup, window: &Window, cx: &mut Context<PaneGroup>) {
     let Some(tab) = group.active_tab() else {
         return;
     };
@@ -466,8 +460,7 @@ fn dispatch_active_grid(
     let metrics = CellMetrics::measure(&group.typography, window);
     let v = window.viewport_size();
     let pad = group.density.pad_panel;
-    let w =
-        (f32::from(v.width) - group.chrome_w_px() - pad * 2.0).max(metrics.cell_width);
+    let w = (f32::from(v.width) - group.chrome_w_px() - pad * 2.0).max(metrics.cell_width);
     // Strip lives inline above each leaf body; subtract its height in
     // addition to CHROME_H_PX (top bar + status bar). When sub-panes
     // are present, each sub-pane gets its own portion via flex layout —
@@ -521,9 +514,7 @@ fn build_sub_pane_node(
 ) -> Option<AnyElement> {
     use crate::shell::pane_tree::{Axis, PaneTree};
     match node {
-        PaneTree::Leaf(idx) => tree
-            .get(*idx)
-            .map(|view| view.clone().into_any_element()),
+        PaneTree::Leaf(idx) => tree.get(*idx).map(|view| view.clone().into_any_element()),
         PaneTree::Split {
             axis,
             children,
@@ -573,11 +564,8 @@ fn build_sub_pane_node(
                             return;
                         }
                         let frac = (axis_pos / axis_size).clamp(0.0, 1.0);
-                        let new_weights = redistribute_sub_pane_weights(
-                            &initial_weights,
-                            divider_idx,
-                            frac,
-                        );
+                        let new_weights =
+                            redistribute_sub_pane_weights(&initial_weights, divider_idx, frac);
                         move_group.update(cx, |g, cx| {
                             g.set_active_sub_pane_weights(&split_path_p, new_weights, cx);
                         });
@@ -587,9 +575,7 @@ fn build_sub_pane_node(
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
             };
-            for (i, (child, weight)) in
-                children.iter().zip(weights_snapshot.iter()).enumerate()
-            {
+            for (i, (child, weight)) in children.iter().zip(weights_snapshot.iter()).enumerate() {
                 let frac = weight / sum;
                 let mut slot = div()
                     .flex()
@@ -646,11 +632,7 @@ struct SubPaneDividerPayload {
 struct SubPaneDividerGhost;
 
 impl Render for SubPaneDividerGhost {
-    fn render(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().w(px(0.0)).h(px(0.0))
     }
 }
@@ -722,11 +704,7 @@ fn sub_pane_divider(
 /// `redistribute_weights` in project_panes/render.rs; duplicated here
 /// because the two callers operate on different leaf-id types and the
 /// math itself is identical and tiny.
-fn redistribute_sub_pane_weights(
-    initial: &[f32],
-    divider_idx: usize,
-    frac: f32,
-) -> Vec<f32> {
+fn redistribute_sub_pane_weights(initial: &[f32], divider_idx: usize, frac: f32) -> Vec<f32> {
     let mut out = initial.to_vec();
     if divider_idx + 1 >= initial.len() {
         return out;
@@ -758,11 +736,7 @@ fn redistribute_sub_pane_weights(
 /// `pub(crate)` so `project_panes::render` can share the same filter
 /// from its body-zone drop handler.
 pub(crate) fn filter_droppable_files(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
-    paths
-        .iter()
-        .filter(|p| p.is_file())
-        .cloned()
-        .collect()
+    paths.iter().filter(|p| p.is_file()).cloned().collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -783,7 +757,9 @@ fn render_tab_chip(
     entity: Entity<PaneGroup>,
 ) -> impl IntoElement {
     let icon_path = match marker {
-        PaneTabKindMarker::Editor => "icons/file.svg",
+        // Diff tabs reuse the editor "file" glyph until a dedicated
+        // diff icon ships (deferred — see plan phase 04 file-type icons).
+        PaneTabKindMarker::Editor | PaneTabKindMarker::Diff => "icons/file.svg",
         PaneTabKindMarker::Terminal | PaneTabKindMarker::Agent => "icons/square-terminal.svg",
     };
     let icon_color = if is_active {
@@ -995,67 +971,65 @@ fn render_tab_chip(
         )
         // File drop on a chip → insert (or move-and-activate) the editor
         // tab at the resolved visual slot.
-        .on_drop::<FilePathDragPayload>(
-            move |payload: &FilePathDragPayload, window, cx| {
-                let path = payload.path.clone();
-                file_drop_entity.update(cx, |g, cx| {
-                    let visible_target = g.drag_hover().map(|h| match h.side {
-                        TabInsertSide::Before => h.target_visible_idx,
-                        TabInsertSide::After => h.target_visible_idx + 1,
-                    });
-                    g.set_drag_hover(None, cx);
-                    g.open_or_activate_editor_tab_at(path, visible_target, window, cx);
+        .on_drop::<FilePathDragPayload>(move |payload: &FilePathDragPayload, window, cx| {
+            let path = payload.path.clone();
+            file_drop_entity.update(cx, |g, cx| {
+                let visible_target = g.drag_hover().map(|h| match h.side {
+                    TabInsertSide::Before => h.target_visible_idx,
+                    TabInsertSide::After => h.target_visible_idx + 1,
                 });
-            },
-        )
+                g.set_drag_hover(None, cx);
+                g.open_or_activate_editor_tab_at(path, visible_target, window, cx);
+            });
+        })
         // F4.6: chip-level OS-native drop. Mirrors the FilePathDragPayload
         // hover/drop pair so the insertion bar paints the same way for
         // Finder drops. Multi-file Finder drops insert in sequence at
         // increasing visible indices so the strip reads left-to-right
         // in the order Finder selected them.
-        .on_drag_move::<ExternalPaths>(
-            move |ev: &DragMoveEvent<ExternalPaths>, _window, cx| {
-                let bounds = ev.bounds;
-                if !bounds.contains(&ev.event.position) {
-                    return;
+        .on_drag_move::<ExternalPaths>(move |ev: &DragMoveEvent<ExternalPaths>, _window, cx| {
+            let bounds = ev.bounds;
+            if !bounds.contains(&ev.event.position) {
+                return;
+            }
+            let mid_x = bounds.origin.x + bounds.size.width / 2.0;
+            let side = if ev.event.position.x < mid_x {
+                TabInsertSide::Before
+            } else {
+                TabInsertSide::After
+            };
+            let hover = Some(TabDragHover {
+                target_visible_idx: visible_idx,
+                side,
+            });
+            native_hover_entity.update(cx, |g, cx| g.set_drag_hover(hover, cx));
+        })
+        .on_drop::<ExternalPaths>(move |payload: &ExternalPaths, window, cx| {
+            let paths = filter_droppable_files(payload.paths());
+            native_drop_entity.update(cx, |g, cx| {
+                let base_target = g.drag_hover().map(|h| match h.side {
+                    TabInsertSide::Before => h.target_visible_idx,
+                    TabInsertSide::After => h.target_visible_idx + 1,
+                });
+                g.set_drag_hover(None, cx);
+                for (offset, path) in paths.into_iter().enumerate() {
+                    let target = base_target.map(|t| t + offset);
+                    g.open_or_activate_editor_tab_at(path, target, window, cx);
                 }
-                let mid_x = bounds.origin.x + bounds.size.width / 2.0;
-                let side = if ev.event.position.x < mid_x {
-                    TabInsertSide::Before
-                } else {
-                    TabInsertSide::After
-                };
-                let hover = Some(TabDragHover {
-                    target_visible_idx: visible_idx,
-                    side,
-                });
-                native_hover_entity.update(cx, |g, cx| g.set_drag_hover(hover, cx));
-            },
+            });
+        })
+        .child(
+            svg()
+                .path(icon_path)
+                .size(px(ICON_SIZE_PX))
+                .text_color(icon_color),
         )
-        .on_drop::<ExternalPaths>(
-            move |payload: &ExternalPaths, window, cx| {
-                let paths = filter_droppable_files(payload.paths());
-                native_drop_entity.update(cx, |g, cx| {
-                    let base_target = g.drag_hover().map(|h| match h.side {
-                        TabInsertSide::Before => h.target_visible_idx,
-                        TabInsertSide::After => h.target_visible_idx + 1,
-                    });
-                    g.set_drag_hover(None, cx);
-                    for (offset, path) in paths.into_iter().enumerate() {
-                        let target = base_target.map(|t| t + offset);
-                        g.open_or_activate_editor_tab_at(path, target, window, cx);
-                    }
-                });
-            },
-        )
-        .child(svg().path(icon_path).size(px(ICON_SIZE_PX)).text_color(icon_color))
         .when_some(agent_dot, |s, dot| s.child(dot))
         .child(div().child(label))
         .child(if is_pinned {
             pin_indicator(entity_id_raw, ix, theme).into_any_element()
         } else {
-            close_button(entity_id_raw, ix, is_active, entity, group_name, theme)
-                .into_any_element()
+            close_button(entity_id_raw, ix, is_active, entity, group_name, theme).into_any_element()
         })
         .when_some(drag_edge, |s, side| {
             s.child(insertion_bar(entity_id_raw, ix, side, theme))
@@ -1168,7 +1142,9 @@ fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
         .size(px(14.0))
         .text_color(theme.fg_muted);
     div()
-        .id(SharedString::from(format!("pane-group-plus-{entity_id_raw}")))
+        .id(SharedString::from(format!(
+            "pane-group-plus-{entity_id_raw}"
+        )))
         .w(px(PLUS_BUTTON_WIDTH_PX))
         .h_full()
         .flex()
@@ -1231,7 +1207,9 @@ fn render_mru_hud(
             .clone()
             .unwrap_or_else(|| tab.label.clone());
         let icon_path = match tab.kind {
-            PaneGroupTabKind::Editor { .. } => "icons/file.svg",
+            // Diff tabs share the file glyph with editor tabs (see
+            // marker note above).
+            PaneGroupTabKind::Editor { .. } | PaneGroupTabKind::Diff { .. } => "icons/file.svg",
             PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. } => {
                 "icons/square-terminal.svg"
             }
@@ -1289,11 +1267,7 @@ fn render_mru_hud(
 /// linear-gradient builder isn't trivially exposed for tiny edge fades,
 /// so a solid-bg with a low alpha gives the same visual hint at a
 /// fraction of the complexity.
-fn scroll_fade_overlay(
-    is_left: bool,
-    trailing_cluster_px: f32,
-    theme: Theme,
-) -> impl IntoElement {
+fn scroll_fade_overlay(is_left: bool, trailing_cluster_px: f32, theme: Theme) -> impl IntoElement {
     let mut overlay = div()
         .absolute()
         .top(px(0.0))

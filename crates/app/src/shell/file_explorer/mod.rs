@@ -20,8 +20,9 @@ use crate::shell::file_explorer::status_display::{
     BadgeStatus, build_folder_status_map, build_status_map,
 };
 use crate::shell::file_explorer::tree_state::{DirCache, TreeNode, filter_visible, flatten};
+use crate::shell::file_tree_view::OnOpenFile;
 use gpui::{
-    AnyElement, Context, IntoElement, ParentElement, Render, Styled, Subscription, Task,
+    AnyElement, App, Context, IntoElement, ParentElement, Render, Styled, Subscription, Task,
     UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use oximux_core::FileStatus;
@@ -65,15 +66,22 @@ pub struct FileExplorer {
     _poll_observer: Task<()>,
     /// Window-activation subscription for focus-regain refresh.
     _activation_sub: Subscription,
+    /// Callback to open a clicked file as an editor tab in the active
+    /// project's pane group. `None` in test contexts (no host wired) —
+    /// falls back to a no-op so unit tests don't accidentally shell out.
+    /// Pattern mirrors `file_tree_view::FileTreeView::on_open`.
+    on_open: Option<OnOpenFile>,
 }
 
 impl FileExplorer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo_root: PathBuf,
         state_rx: tokio::sync::watch::Receiver<PollState>,
         theme: Theme,
         density: Density,
         typography: Typography,
+        on_open: Option<OnOpenFile>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -106,6 +114,7 @@ impl FileExplorer {
             _load_tasks: Vec::new(),
             _poll_observer: poll_observer,
             _activation_sub: activation_sub,
+            on_open,
         };
 
         // Kick off root directory load on mount.
@@ -238,8 +247,16 @@ impl FileExplorer {
         }
     }
 
-    pub(crate) fn open_file(path: &PathBuf) {
-        let _ = std::process::Command::new("open").arg(path).spawn();
+    /// Dispatch a file click to the host's open-file callback (opens the
+    /// file as an editor tab in the active project's active pane group).
+    /// When `on_open` is `None` (test wiring without a host) the click is
+    /// silently dropped — must not shell out to `open(1)` because that
+    /// would launch the file outside OxiMux, breaking the cockpit-tight
+    /// contract: clicked files belong in the center pane.
+    pub(crate) fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut App) {
+        if let Some(cb) = self.on_open.as_ref() {
+            (cb)(path, window, cx);
+        }
     }
 
     /// Read-only slice of the current flat row list. Used by tests.
