@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use gpui::{Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px, rgb};
+use gpui::{
+    Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px, rgb,
+};
 
 /// Payload attached to an in-flight file-row drag. Carries the absolute
 /// filesystem path so the drop site can open the file directly without

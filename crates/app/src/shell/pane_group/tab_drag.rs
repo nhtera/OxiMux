@@ -6,9 +6,7 @@
 //! consume it. Cross-group drag lives in Phase D — for now the drop
 //! handler asserts the source group equals the dropping group.
 
-use gpui::{
-    Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px,
-};
+use gpui::{Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px};
 use oximux_settings::Theme;
 
 use crate::shell::pane_tree::PaneGroupId;

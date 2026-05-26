@@ -172,10 +172,7 @@ fn spawn_fallback_portable(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessi
 /// scrollback and then call `TerminalView::respawn` when the user
 /// first interacts with the pane. Mirrors `spawn_local_pty`'s
 /// relay-then-fallback pattern.
-pub fn spawn_local_pty_dormant(
-    cols: u16,
-    rows: u16,
-) -> Option<(SharedBackend, TerminalSessionId)> {
+pub fn spawn_local_pty_dormant(cols: u16, rows: u16) -> Option<(SharedBackend, TerminalSessionId)> {
     if let Some(shared) = SHARED_BACKEND.get() {
         let mut guard = shared.lock().expect("shared backend poisoned");
         match guard.spawn_dormant(cols, rows) {

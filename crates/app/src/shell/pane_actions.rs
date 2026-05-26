@@ -71,12 +71,7 @@ impl PaneActionsMenu {
         self.open
     }
 
-    pub fn open(
-        &mut self,
-        anchor: PaneActionsAnchor,
-        has_siblings: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open(&mut self, anchor: PaneActionsAnchor, has_siblings: bool, cx: &mut Context<Self>) {
         self.anchor = anchor;
         self.has_siblings = has_siblings;
         self.open = true;
@@ -146,10 +141,7 @@ impl Render for PaneActionsMenu {
         }
 
         if self.has_siblings {
-            let separator = div()
-                .h(px(1.0))
-                .my(px(4.0))
-                .bg(theme.border_inactive);
+            let separator = div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive);
             // Destructive row — icon + label painted with `status_error` so
             // the user reads "this is the dangerous one" at a glance. Hover
             // bg stays `bg_panel_alt` (consistent feedback); we don't tint

@@ -254,10 +254,7 @@ mod tests {
     #[test]
     fn close_last_group_refuses() {
         let mut mgr = PaneGroupManager::new();
-        assert_eq!(
-            mgr.close_active_group(),
-            Err(CloseGroupError::LastGroup)
-        );
+        assert_eq!(mgr.close_active_group(), Err(CloseGroupError::LastGroup));
         // State unchanged.
         assert_eq!(mgr.active_group_id(), PaneGroupId(0));
     }
@@ -322,10 +319,7 @@ mod tests {
         };
         let mut mgr = PaneGroupManager::from_tree(tree, PaneGroupId(8), 9);
         assert_eq!(mgr.active_group_id(), PaneGroupId(8));
-        assert_eq!(
-            mgr.in_order_groups(),
-            vec![PaneGroupId(7), PaneGroupId(8)]
-        );
+        assert_eq!(mgr.in_order_groups(), vec![PaneGroupId(7), PaneGroupId(8)]);
         // Next split allocates the saved `next_id` (9), not 1.
         let outcome = mgr
             .split_active_group(Axis::Vertical, SplitInsert::After)

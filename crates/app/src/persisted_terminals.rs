@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use oximux_core::AgentAdapter;
 
-use crate::shell::pane_tree::{Axis, PaneTree};
 #[cfg(test)]
 use crate::shell::pane_tree::PaneId;
+use crate::shell::pane_tree::{Axis, PaneTree};
 
 const KEY_PREFIX: &str = "terminal_tabs:";
 
@@ -145,9 +145,7 @@ pub enum PersistedTabKind {
     Terminal,
     /// Editor tab — `path` is the absolute filesystem path. Restore
     /// reopens the file (or surfaces a missing-file warning if gone).
-    Editor {
-        path: String,
-    },
+    Editor { path: String },
 }
 
 /// Per-tab agent metadata sufficient to respawn the same CLI session on
@@ -307,7 +305,7 @@ mod tests {
                 tree: snap,
                 agent: None,
                 kind: PersistedTabKind::Terminal,
-                    ..PersistedTab::default()
+                ..PersistedTab::default()
             }],
             active: 0,
             next_label_n: 2,
@@ -353,7 +351,7 @@ mod tests {
                     effort: Some("high".into()),
                 }),
                 kind: PersistedTabKind::Terminal,
-                    ..PersistedTab::default()
+                ..PersistedTab::default()
             }],
             active: 0,
             next_label_n: 2,
@@ -651,14 +649,8 @@ mod tests {
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
         assert_eq!(back.tabs[0].sub_panes.len(), 3);
         assert_eq!(back.tabs[0].active_sub_pane, 2);
-        assert_eq!(
-            back.tabs[0].sub_panes[0].cwd.as_deref(),
-            Some("/tmp/a")
-        );
-        assert_eq!(
-            back.tabs[0].sub_panes[1].cwd.as_deref(),
-            Some("/tmp/b")
-        );
+        assert_eq!(back.tabs[0].sub_panes[0].cwd.as_deref(), Some("/tmp/a"));
+        assert_eq!(back.tabs[0].sub_panes[1].cwd.as_deref(), Some("/tmp/b"));
         assert_eq!(back.tabs[0].sub_panes[2].cwd, None);
         // Tree shape preserved.
         let PersistedTree::Split {
@@ -720,6 +712,9 @@ mod tests {
         };
         assert_eq!(weights, &vec![1.0, 2.5]);
         assert_eq!(children.len(), 2);
-        assert_eq!(restored.in_order_leaves(), vec![PaneGroupId(10), PaneGroupId(11)]);
+        assert_eq!(
+            restored.in_order_leaves(),
+            vec![PaneGroupId(10), PaneGroupId(11)]
+        );
     }
 }

@@ -37,11 +37,7 @@ pub fn resolve_drop_zone(bounds: Bounds<Pixels>, point: Point<Pixels>) -> Zone {
     let split_w_third = bw / 3.0;
 
     // 10% perimeter buffer carved out as Center, matching the reference.
-    if local_x > edge_w
-        && local_x < bw - edge_w
-        && local_y > edge_h
-        && local_y < bh - edge_h
-    {
+    if local_x > edge_w && local_x < bw - edge_w && local_y > edge_h && local_y < bh - edge_h {
         return Zone::Center;
     }
     if local_x < split_w_third {

@@ -133,13 +133,7 @@ impl<L: Copy + PartialEq> PaneTree<L> {
     /// Like [`split_leaf`] but lets the caller pick whether the new leaf
     /// goes before or after the focused leaf along the new axis. Drives the
     /// four-direction menu: Right/Down = After, Left/Up = Before.
-    pub fn split_leaf_at(
-        &mut self,
-        target: L,
-        axis: Axis,
-        new_id: L,
-        insert: SplitInsert,
-    ) -> bool {
+    pub fn split_leaf_at(&mut self, target: L, axis: Axis, new_id: L, insert: SplitInsert) -> bool {
         let Some(path) = self.path_to(target) else {
             return false;
         };
@@ -482,10 +476,7 @@ mod tests {
         let mut t: PaneTree<PaneGroupId> = PaneTree::Leaf(PaneGroupId(0));
         assert!(t.split_leaf(PaneGroupId(0), Axis::Horizontal, PaneGroupId(1)));
         assert_eq!(t.leaf_count(), 2);
-        assert_eq!(
-            t.in_order_leaves(),
-            vec![PaneGroupId(0), PaneGroupId(1)]
-        );
+        assert_eq!(t.in_order_leaves(), vec![PaneGroupId(0), PaneGroupId(1)]);
         assert!(t.remove_leaf(PaneGroupId(1)));
         assert_eq!(t, PaneTree::Leaf(PaneGroupId(0)));
     }

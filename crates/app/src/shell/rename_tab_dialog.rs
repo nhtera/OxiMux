@@ -10,8 +10,8 @@
 
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled,
-    Window, div, px,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window,
+    div, px,
 };
 use gpui_component::{
     Disableable,
@@ -59,8 +59,7 @@ impl RenameTabDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input_state =
-            cx.new(|cx| InputState::new(window, cx).placeholder("New title"));
+        let input_state = cx.new(|cx| InputState::new(window, cx).placeholder("New title"));
         // Apply the initial value AFTER constructing the entity — set_value
         // wants a fresh (window, cx) pair, and the closure inside cx.new
         // can't surface them cleanly. Same pattern as workspace_dialog's
@@ -132,8 +131,13 @@ impl Render for RenameTabDialog {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
-        let typed_non_empty =
-            !self.input_state.read(cx).value().to_string().trim().is_empty();
+        let typed_non_empty = !self
+            .input_state
+            .read(cx)
+            .value()
+            .to_string()
+            .trim()
+            .is_empty();
         let can_save = typed_non_empty && !self.closed;
         let can_reset = !self.closed;
 

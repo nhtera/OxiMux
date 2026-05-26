@@ -176,10 +176,34 @@ impl Render for TabContextMenu {
         // Each row dispatches `SplitGroupAt` carrying the right-clicked
         // group id so the split lands on this group regardless of focus.
         let splits: [(&'static str, &'static str, &'static str, u8, bool); 4] = [
-            ("tab-ctx-split-right", "Split Right", "icons/arrow-right.svg", 0, false),
-            ("tab-ctx-split-down", "Split Down", "icons/arrow-down.svg", 1, false),
-            ("tab-ctx-split-left", "Split Left", "icons/arrow-left.svg", 0, true),
-            ("tab-ctx-split-up", "Split Up", "icons/arrow-up.svg", 1, true),
+            (
+                "tab-ctx-split-right",
+                "Split Right",
+                "icons/arrow-right.svg",
+                0,
+                false,
+            ),
+            (
+                "tab-ctx-split-down",
+                "Split Down",
+                "icons/arrow-down.svg",
+                1,
+                false,
+            ),
+            (
+                "tab-ctx-split-left",
+                "Split Left",
+                "icons/arrow-left.svg",
+                0,
+                true,
+            ),
+            (
+                "tab-ctx-split-up",
+                "Split Up",
+                "icons/arrow-up.svg",
+                1,
+                true,
+            ),
         ];
         for (row_id, label, icon_path, axis, insert_before) in splits {
             let icon = svg()
@@ -217,12 +241,7 @@ impl Render for TabContextMenu {
                 );
             card = card.child(row);
         }
-        card = card.child(
-            div()
-                .h(px(1.0))
-                .my(px(4.0))
-                .bg(theme.border_inactive),
-        );
+        card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
 
         let rename_idx = target.tab_idx;
         card = card.child(menu_row(
@@ -248,7 +267,11 @@ impl Render for TabContextMenu {
         ));
 
         let pin_idx = target.tab_idx;
-        let pin_label = if target.is_pinned { "Unpin Tab" } else { "Pin Tab" };
+        let pin_label = if target.is_pinned {
+            "Unpin Tab"
+        } else {
+            "Pin Tab"
+        };
         card = card.child(menu_row(
             "tab-ctx-pin",
             pin_label,
@@ -268,12 +291,7 @@ impl Render for TabContextMenu {
             }),
         ));
 
-        card = card.child(
-            div()
-                .h(px(1.0))
-                .my(px(4.0))
-                .bg(theme.border_inactive),
-        );
+        card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
 
         card = card.child(menu_row(
             "tab-ctx-close",
@@ -339,12 +357,7 @@ impl Render for TabContextMenu {
         // the right-clicked tab is a terminal/agent (editor tabs don't
         // get a color tag for v1 — match the reference editor scope).
         if matches!(target.kind, TabContextKind::Terminal) {
-            card = card.child(
-                div()
-                    .h(px(1.0))
-                    .my(px(4.0))
-                    .bg(theme.border_inactive),
-            );
+            card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
             card = card.child(color_palette_row(
                 target.group.clone(),
                 target.tab_idx,
@@ -357,12 +370,7 @@ impl Render for TabContextMenu {
         // tab is an editor. Carries the file path so handlers don't
         // need to walk back into the PaneGroup entity.
         if let TabContextKind::Editor { path, project_root } = &target.kind {
-            card = card.child(
-                div()
-                    .h(px(1.0))
-                    .my(px(4.0))
-                    .bg(theme.border_inactive),
-            );
+            card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
             let copy_path = path.clone();
             card = card.child(menu_row(
                 "tab-ctx-copy-path",
@@ -512,17 +520,15 @@ fn color_palette_row(
             }
             None => swatch.border_color(theme.border_active),
         };
-        row = row.child(
-            swatch.on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                    if let Some(g) = group_for_click.upgrade() {
-                        g.update(cx, |g, cx| g.set_tab_color(tab_idx, choice, cx));
-                    }
-                    this.close(cx);
-                }),
-            ),
-        );
+        row = row.child(swatch.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                if let Some(g) = group_for_click.upgrade() {
+                    g.update(cx, |g, cx| g.set_tab_color(tab_idx, choice, cx));
+                }
+                this.close(cx);
+            }),
+        ));
     }
     div()
         .flex()

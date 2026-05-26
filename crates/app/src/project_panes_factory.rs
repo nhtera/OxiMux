@@ -333,18 +333,12 @@ fn restore_multi_group(
                         window,
                         cx,
                     ) {
-                        let bytes =
-                            pane_buffers.remove(&(ordinal, 0)).unwrap_or_default();
+                        let bytes = pane_buffers.remove(&(ordinal, 0)).unwrap_or_default();
                         if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
                             view.read(cx).prefill_grid(&bytes);
                         }
                         panes_entity.update(cx, |p, cx| {
-                            p.push_restored_terminal_tab_in(
-                                group_id,
-                                tab.label.clone(),
-                                view,
-                                cx,
-                            );
+                            p.push_restored_terminal_tab_in(group_id, tab.label.clone(), view, cx);
                         });
                         ordinal += 1;
                     }
@@ -409,7 +403,11 @@ fn restore_agent_tab(
         let session_id = match cli_runtime.start_session(cfg).await {
             Ok(id) => id,
             Err(err) => {
-                tracing::warn!(?err, adapter = adapter_id, "agent restore: start_session failed");
+                tracing::warn!(
+                    ?err,
+                    adapter = adapter_id,
+                    "agent restore: start_session failed"
+                );
                 return;
             }
         };
@@ -573,9 +571,11 @@ fn build_terminal_view_for_tab(
     } else {
         spawn_local_pty(cwd)?
     };
-    Some(cx.new(|cx| {
-        TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
-    }))
+    Some(
+        cx.new(|cx| {
+            TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
+        }),
+    )
 }
 
 pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Option<PersistedTabs> {
@@ -590,7 +590,11 @@ pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Opti
     match serde_json::from_str::<PersistedTabs>(&raw) {
         Ok(snap) => Some(snap),
         Err(err) => {
-            tracing::warn!(?err, project_id, "load_persisted_tabs: parse failed; ignoring");
+            tracing::warn!(
+                ?err,
+                project_id,
+                "load_persisted_tabs: parse failed; ignoring"
+            );
             None
         }
     }

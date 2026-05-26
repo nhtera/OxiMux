@@ -7,9 +7,9 @@
 //! v1 splits render at fixed 50/50.
 
 use gpui::{
-    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px,
 };
 
 use std::collections::HashSet;
@@ -50,11 +50,7 @@ struct DividerDragPayload {
 struct DividerDragGhost;
 
 impl Render for DividerDragGhost {
-    fn render(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().w(px(0.0)).h(px(0.0))
     }
 }
@@ -95,9 +91,7 @@ fn collect_top_row_leaves(node: &PaneTree<PaneGroupId>) -> Vec<(PaneGroupId, f32
             } => {
                 // Only the topmost row hoists. Its sub-tree may itself
                 // contain horizontal splits, which we keep walking.
-                if let (Some(first), Some(first_weight)) =
-                    (children.first(), weights.first())
-                {
+                if let (Some(first), Some(first_weight)) = (children.first(), weights.first()) {
                     let sum: f32 = weights.iter().sum();
                     let _ = sum; // unused — vertical weight stays full at this level
                     let _ = first_weight; // vertical weight collapses; horizontal weight passes through unchanged
@@ -246,16 +240,9 @@ fn render_tree(
                 if hoisted.contains(id) {
                     slot.child(group_body).into_any_element()
                 } else {
-                    slot.child(build_tab_strip_for(
-                        group,
-                        *id,
-                        is_focused,
-                        true,
-                        theme,
-                        cx,
-                    ))
-                    .child(group_body)
-                    .into_any_element()
+                    slot.child(build_tab_strip_for(group, *id, is_focused, true, theme, cx))
+                        .child(group_body)
+                        .into_any_element()
                 }
             }
             // Leaf in the tree but no entity registered — shouldn't
@@ -317,8 +304,7 @@ fn render_tree(
                             return;
                         }
                         let frac = (axis_pos / axis_size).clamp(0.0, 1.0);
-                        let new_weights =
-                            redistribute_weights(&initial_weights, divider_idx, frac);
+                        let new_weights = redistribute_weights(&initial_weights, divider_idx, frac);
                         move_panes.update(cx, |p, cx| {
                             p.set_split_weights(&split_path, new_weights, cx);
                         });
@@ -330,9 +316,7 @@ fn render_tree(
             };
             let sum: f32 = weights_snapshot.iter().sum();
             let sum = if sum > 0.0 { sum } else { 1.0 };
-            for (i, (child, weight)) in
-                children.iter().zip(weights_snapshot.iter()).enumerate()
-            {
+            for (i, (child, weight)) in children.iter().zip(weights_snapshot.iter()).enumerate() {
                 let frac = (weight / sum) * 100.0;
                 // Slot must be a flex container so the inner leaf/split
                 // child (which uses size_full) gets a real box to fill.
@@ -496,83 +480,66 @@ fn leaf_body(
         .relative()
         .overflow_hidden()
         .opacity(body_opacity)
-        .on_drag_move::<TabDragPayload>(
-            move |ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
-                // Zone resolver wants the LOCAL position inside the body
-                // bounds; the event carries window-space coords + the
-                // body's window-space bounds, so `resolve_drop_zone`
-                // subtracts the origin internally.
-                let bounds = ev.bounds;
-                if !bounds.contains(&ev.event.position) {
-                    return;
-                }
-                let payload = ev.drag(cx);
-                // Suppress overlay when dropping a tab back on its own
-                // group's body would be a layout no-op (single-tab group
-                // dragged onto itself can't split anywhere visible).
-                if payload.source_group == group_id {
-                    let source_tabs = hover_panes
-                        .read(cx)
-                        .group(group_id)
-                        .map(|g| g.read(cx).tab_count())
-                        .unwrap_or(0);
-                    if source_tabs <= 1 {
-                        hover_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
-                        return;
-                    }
-                }
-                let zone = resolve_drop_zone(bounds, ev.event.position);
-                hover_panes.update(cx, |p, cx| {
-                    p.set_hovered_drop_target(
-                        Some(TabDragHoveredTarget {
-                            group_id,
-                            zone,
-                        }),
-                        cx,
-                    );
-                });
-            },
-        )
-        .on_drop::<TabDragPayload>(
-            move |payload: &TabDragPayload, window, cx| {
-                // Resolve the zone from the live hover state (set by the
-                // most-recent on_drag_move). If somehow stale (no hover
-                // recorded but a drop arrived) bail safely.
-                let zone = drop_panes
+        .on_drag_move::<TabDragPayload>(move |ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
+            // Zone resolver wants the LOCAL position inside the body
+            // bounds; the event carries window-space coords + the
+            // body's window-space bounds, so `resolve_drop_zone`
+            // subtracts the origin internally.
+            let bounds = ev.bounds;
+            if !bounds.contains(&ev.event.position) {
+                return;
+            }
+            let payload = ev.drag(cx);
+            // Suppress overlay when dropping a tab back on its own
+            // group's body would be a layout no-op (single-tab group
+            // dragged onto itself can't split anywhere visible).
+            if payload.source_group == group_id {
+                let source_tabs = hover_panes
                     .read(cx)
-                    .hovered_drop_target()
-                    .filter(|t| t.group_id == group_id)
-                    .map(|t| t.zone);
-                let Some(zone) = zone else {
-                    drop_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
+                    .group(group_id)
+                    .map(|g| g.read(cx).tab_count())
+                    .unwrap_or(0);
+                if source_tabs <= 1 {
+                    hover_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
                     return;
-                };
-                let source = payload.source_group;
-                let source_tab_idx = payload.source_tab_idx;
-                drop_panes.update(cx, |p, cx| {
-                    p.set_hovered_drop_target(None, cx);
-                    match zone {
-                        Zone::Center => {
-                            // Merge into the target group's strip. No-op
-                            // when source == target — that case is
-                            // already filtered above in on_drag_move so
-                            // the overlay never appears.
-                            p.transfer_tab(source, source_tab_idx, group_id, window, cx);
-                        }
-                        Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
-                            p.split_and_move_tab(
-                                source,
-                                source_tab_idx,
-                                group_id,
-                                zone,
-                                window,
-                                cx,
-                            );
-                        }
+                }
+            }
+            let zone = resolve_drop_zone(bounds, ev.event.position);
+            hover_panes.update(cx, |p, cx| {
+                p.set_hovered_drop_target(Some(TabDragHoveredTarget { group_id, zone }), cx);
+            });
+        })
+        .on_drop::<TabDragPayload>(move |payload: &TabDragPayload, window, cx| {
+            // Resolve the zone from the live hover state (set by the
+            // most-recent on_drag_move). If somehow stale (no hover
+            // recorded but a drop arrived) bail safely.
+            let zone = drop_panes
+                .read(cx)
+                .hovered_drop_target()
+                .filter(|t| t.group_id == group_id)
+                .map(|t| t.zone);
+            let Some(zone) = zone else {
+                drop_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
+                return;
+            };
+            let source = payload.source_group;
+            let source_tab_idx = payload.source_tab_idx;
+            drop_panes.update(cx, |p, cx| {
+                p.set_hovered_drop_target(None, cx);
+                match zone {
+                    Zone::Center => {
+                        // Merge into the target group's strip. No-op
+                        // when source == target — that case is
+                        // already filtered above in on_drag_move so
+                        // the overlay never appears.
+                        p.transfer_tab(source, source_tab_idx, group_id, window, cx);
                     }
-                });
-            },
-        )
+                    Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
+                        p.split_and_move_tab(source, source_tab_idx, group_id, zone, window, cx);
+                    }
+                }
+            });
+        })
         // File-row drag-drop: same overlay + zone math, payload carries a
         // filesystem path instead of a (group, tab) reference. GPUI
         // dispatches by TypeId so these handlers never cross-fire with
@@ -585,93 +552,80 @@ fn leaf_body(
                 }
                 let zone = resolve_drop_zone(bounds, ev.event.position);
                 file_hover_panes.update(cx, |p, cx| {
-                    p.set_hovered_drop_target(
-                        Some(TabDragHoveredTarget { group_id, zone }),
-                        cx,
-                    );
+                    p.set_hovered_drop_target(Some(TabDragHoveredTarget { group_id, zone }), cx);
                 });
             },
         )
-        .on_drop::<FilePathDragPayload>(
-            move |payload: &FilePathDragPayload, window, cx| {
-                let zone = file_drop_panes
-                    .read(cx)
-                    .hovered_drop_target()
-                    .filter(|t| t.group_id == group_id)
-                    .map(|t| t.zone);
-                let Some(zone) = zone else {
-                    file_drop_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
-                    return;
-                };
-                let path = payload.path.clone();
-                file_drop_panes.update(cx, |p, cx| {
-                    p.set_hovered_drop_target(None, cx);
-                    match zone {
-                        Zone::Center => {
-                            p.open_file_in_group(group_id, path, window, cx);
-                        }
-                        Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
-                            p.split_and_open_file(group_id, zone, path, window, cx);
-                        }
+        .on_drop::<FilePathDragPayload>(move |payload: &FilePathDragPayload, window, cx| {
+            let zone = file_drop_panes
+                .read(cx)
+                .hovered_drop_target()
+                .filter(|t| t.group_id == group_id)
+                .map(|t| t.zone);
+            let Some(zone) = zone else {
+                file_drop_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
+                return;
+            };
+            let path = payload.path.clone();
+            file_drop_panes.update(cx, |p, cx| {
+                p.set_hovered_drop_target(None, cx);
+                match zone {
+                    Zone::Center => {
+                        p.open_file_in_group(group_id, path, window, cx);
                     }
-                });
-            },
-        )
+                    Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
+                        p.split_and_open_file(group_id, zone, path, window, cx);
+                    }
+                }
+            });
+        })
         // F4.6: OS-native (Finder) drop variant for body-zone targeting.
         // GPUI translates Finder file drops into an internal drag with
         // `ExternalPaths` payload, so we mirror the FilePathDragPayload
         // pair above. Multi-file drops open in sequence in the same zone.
-        .on_drag_move::<ExternalPaths>(
-            move |ev: &DragMoveEvent<ExternalPaths>, _window, cx| {
-                let bounds = ev.bounds;
-                if !bounds.contains(&ev.event.position) {
-                    return;
-                }
-                let zone = resolve_drop_zone(bounds, ev.event.position);
-                native_hover_panes.update(cx, |p, cx| {
-                    p.set_hovered_drop_target(
-                        Some(TabDragHoveredTarget { group_id, zone }),
-                        cx,
-                    );
-                });
-            },
-        )
-        .on_drop::<ExternalPaths>(
-            move |payload: &ExternalPaths, window, cx| {
-                let zone = native_drop_panes
-                    .read(cx)
-                    .hovered_drop_target()
-                    .filter(|t| t.group_id == group_id)
-                    .map(|t| t.zone);
-                let Some(zone) = zone else {
-                    native_drop_panes
-                        .update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
-                    return;
-                };
-                let paths = filter_droppable_files(payload.paths());
-                native_drop_panes.update(cx, |p, cx| {
-                    p.set_hovered_drop_target(None, cx);
-                    // First path drives the split-vs-merge zone semantics.
-                    // Remaining paths (multi-file Finder drop) fall back
-                    // to opening as regular tabs in the resulting group —
-                    // the split itself already happened on path[0].
-                    let mut iter = paths.into_iter();
-                    if let Some(first) = iter.next() {
-                        match zone {
-                            Zone::Center => {
-                                p.open_file_in_group(group_id, first, window, cx);
-                            }
-                            Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
-                                p.split_and_open_file(group_id, zone, first, window, cx);
-                            }
+        .on_drag_move::<ExternalPaths>(move |ev: &DragMoveEvent<ExternalPaths>, _window, cx| {
+            let bounds = ev.bounds;
+            if !bounds.contains(&ev.event.position) {
+                return;
+            }
+            let zone = resolve_drop_zone(bounds, ev.event.position);
+            native_hover_panes.update(cx, |p, cx| {
+                p.set_hovered_drop_target(Some(TabDragHoveredTarget { group_id, zone }), cx);
+            });
+        })
+        .on_drop::<ExternalPaths>(move |payload: &ExternalPaths, window, cx| {
+            let zone = native_drop_panes
+                .read(cx)
+                .hovered_drop_target()
+                .filter(|t| t.group_id == group_id)
+                .map(|t| t.zone);
+            let Some(zone) = zone else {
+                native_drop_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
+                return;
+            };
+            let paths = filter_droppable_files(payload.paths());
+            native_drop_panes.update(cx, |p, cx| {
+                p.set_hovered_drop_target(None, cx);
+                // First path drives the split-vs-merge zone semantics.
+                // Remaining paths (multi-file Finder drop) fall back
+                // to opening as regular tabs in the resulting group —
+                // the split itself already happened on path[0].
+                let mut iter = paths.into_iter();
+                if let Some(first) = iter.next() {
+                    match zone {
+                        Zone::Center => {
+                            p.open_file_in_group(group_id, first, window, cx);
                         }
-                        for extra in iter {
-                            p.open_file_in_group(group_id, extra, window, cx);
+                        Zone::Left | Zone::Right | Zone::Up | Zone::Down => {
+                            p.split_and_open_file(group_id, zone, first, window, cx);
                         }
                     }
-                });
-            },
-        )
+                    for extra in iter {
+                        p.open_file_in_group(group_id, extra, window, cx);
+                    }
+                }
+            });
+        })
         .child(group)
         .when_some(active_zone, |s, zone| s.child(zone_overlay(zone, theme)))
         .into_any_element()
@@ -689,26 +643,10 @@ fn zone_overlay(zone: Zone, theme: oximux_settings::Theme) -> impl IntoElement {
         .border_color(theme.focus_ring);
     match zone {
         Zone::Center => base.inset_0(),
-        Zone::Left => base
-            .top_0()
-            .left_0()
-            .h_full()
-            .w(gpui::relative(0.5)),
-        Zone::Right => base
-            .top_0()
-            .right_0()
-            .h_full()
-            .w(gpui::relative(0.5)),
-        Zone::Up => base
-            .top_0()
-            .left_0()
-            .w_full()
-            .h(gpui::relative(0.5)),
-        Zone::Down => base
-            .bottom_0()
-            .left_0()
-            .w_full()
-            .h(gpui::relative(0.5)),
+        Zone::Left => base.top_0().left_0().h_full().w(gpui::relative(0.5)),
+        Zone::Right => base.top_0().right_0().h_full().w(gpui::relative(0.5)),
+        Zone::Up => base.top_0().left_0().w_full().h(gpui::relative(0.5)),
+        Zone::Down => base.bottom_0().left_0().w_full().h(gpui::relative(0.5)),
     }
 }
 
@@ -762,4 +700,3 @@ mod tests {
         assert_eq!(new_w, vec![1.0, 1.0]);
     }
 }
-
