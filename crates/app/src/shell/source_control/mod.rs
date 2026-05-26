@@ -208,6 +208,20 @@ impl SourceControlPanel {
                 let mut partial = false;
                 let mut conflict = false;
                 for f in &s.files {
+                    // Skip Ignored entries — they show up in `git status
+                    // --ignored` but the user never thinks of them as
+                    // "unstaged changes". Mirrors the filter in
+                    // `changed_files::partition_files` so the primary
+                    // button state stays consistent with the file-list
+                    // sections rendered above it (otherwise a clean repo
+                    // with one ignored `dist/` directory would render
+                    // "No changes on this branch" alongside a "Stage All"
+                    // button).
+                    if matches!(f.index, IndexStatus::Ignored)
+                        || matches!(f.worktree, WorktreeStatus::Ignored)
+                    {
+                        continue;
+                    }
                     if matches!(f.index, IndexStatus::Unmerged)
                         || matches!(f.worktree, WorktreeStatus::Unmerged)
                     {

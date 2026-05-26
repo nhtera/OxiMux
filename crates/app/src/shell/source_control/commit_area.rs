@@ -238,15 +238,26 @@ impl CommitArea {
         // chevron half can't render brighter than the disabled main half.
         // `.small()` brings the chunky default-size pill down to ~32px tall
         // so it sits proportional to the textarea above.
-        let primary = DropdownButton::new("sc-commit-split")
+        //
+        // Variant switch: a `.primary()` button retains its bright fill even
+        // when disabled, which reads as "active" to the eye. Fall back to
+        // `.secondary()` when disabled so the button matches the dimmed
+        // visual treatment users expect (e.g. the reference UX's gray disabled-Commit
+        // state). Enabled state keeps `.primary()` so the affirmative action
+        // still pops.
+        let mut primary = DropdownButton::new("sc-commit-split")
             .button(inner_button)
-            .primary()
             .small()
             .disabled(submit_disabled)
-            .w_full()
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _cx| {
-                build_commit_menu(menu, window, &action_view, &action_for_menu)
-            });
+            .w_full();
+        primary = if submit_disabled {
+            primary.secondary()
+        } else {
+            primary.primary()
+        };
+        let primary = primary.dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _cx| {
+            build_commit_menu(menu, window, &action_view, &action_for_menu)
+        });
 
         div()
             .flex()
