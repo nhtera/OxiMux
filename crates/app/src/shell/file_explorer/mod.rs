@@ -9,6 +9,7 @@ pub mod fs_load;
 pub mod header_render;
 pub mod load_ops;
 pub mod paint;
+pub mod rename_ops;
 pub mod row_render;
 pub mod status_display;
 pub mod tree_state;
@@ -71,6 +72,10 @@ pub struct FileExplorer {
     /// falls back to a no-op so unit tests don't accidentally shell out.
     /// Pattern mirrors `file_tree_view::FileTreeView::on_open`.
     on_open: Option<OnOpenFile>,
+    /// Inline-rename state. `Some` while the user is editing a row's
+    /// basename; the row builder swaps the matching path's label for an
+    /// `Input` widget bound to this entity. See `rename_ops.rs`.
+    pub(crate) renaming: Option<rename_ops::RenameState>,
 }
 
 impl FileExplorer {
@@ -115,6 +120,7 @@ impl FileExplorer {
             _poll_observer: poll_observer,
             _activation_sub: activation_sub,
             on_open,
+            renaming: None,
         };
 
         // Kick off root directory load on mount.
@@ -327,6 +333,11 @@ impl Render for FileExplorer {
                         typography: &typography,
                     };
 
+                    // Snapshot the rename target (if any) once, before the
+                    // per-row loop, so each iteration just does a cheap
+                    // PathBuf::eq instead of touching the entity tree.
+                    let rename_path = me.renaming.as_ref().map(|r| r.path.clone());
+                    let rename_input = me.renaming.as_ref().map(|r| r.input.clone());
                     range
                         .map(|i| {
                             let node = &rows[i];
@@ -346,7 +357,24 @@ impl Render for FileExplorer {
                             );
                             let path = node.path.clone();
                             let is_dir = node.is_directory;
-                            paint_row(plan, &pctx, path, is_dir, is_loading, cx).into_any_element()
+                            // This row gets the inline input only if it
+                            // matches the current rename target. Cloning the
+                            // entity handle is cheap (Arc bump) so we don't
+                            // bother caching it across iterations.
+                            let row_rename_input = match &rename_path {
+                                Some(p) if p == &path => rename_input.clone(),
+                                _ => None,
+                            };
+                            paint_row(
+                                plan,
+                                &pctx,
+                                path,
+                                is_dir,
+                                is_loading,
+                                row_rename_input,
+                                cx,
+                            )
+                            .into_any_element()
                         })
                         .collect::<Vec<AnyElement>>()
                 },
@@ -372,9 +400,24 @@ impl Render for FileExplorer {
             .h_full()
             .w_full()
             .bg(theme.bg_panel)
+            // Background left-click (in the empty area below the rows)
+            // cancels any in-flight inline rename. The renaming row
+            // calls `stop_propagation` on its own mouse_down so clicks
+            // inside the row (input, icon, chevron) don't reach here;
+            // clicks on OTHER rows are handled at the row level (those
+            // also cancel). Without this, clicking blank space below
+            // the list would leave an orphaned input mounted.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|me, _: &gpui::MouseDownEvent, _window, cx| {
+                    me.cancel_rename(cx);
+                }),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Right,
-                move |ev: &gpui::MouseDownEvent, window, cx| {
+                cx.listener(move |me, ev: &gpui::MouseDownEvent, window, cx| {
+                    // Background right-click also discards the rename.
+                    me.cancel_rename(cx);
                     window.dispatch_action(
                         Box::new(crate::actions::OpenFileTreeBackgroundMenuAt {
                             x: ev.position.x.into(),
@@ -384,7 +427,7 @@ impl Render for FileExplorer {
                         cx,
                     );
                     cx.stop_propagation();
-                },
+                }),
             )
             .child(header)
             .child(list)
