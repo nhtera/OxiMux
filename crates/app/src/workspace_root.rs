@@ -832,6 +832,12 @@ impl Render for WorkspaceRoot {
         let workspace_tab_strip: Option<AnyElement> = active_panes
             .as_ref()
             .and_then(|panes| panes.read(cx).topmost_tab_strip(cx));
+        // Drag-claim band (below) is only needed when there are tab
+        // chips to protect from AppKit title-bar drag hijack. When
+        // there are no tabs (welcome state), skipping the band trims
+        // ~22px of dead chrome and aligns the empty-state chrome with
+        // the reference editor's compact single-row header.
+        let has_tabs = workspace_tab_strip.is_some();
 
         // Center column body: active project's ProjectPanes (which renders
         // its group tree internally), or welcome placeholder when no
@@ -841,8 +847,36 @@ impl Render for WorkspaceRoot {
             None => main_area::view(theme, density, typography).into_any_element(),
         };
 
-        // Per-column composition. Each column owns its own 40px header on top
-        // of its body so the tab strip cannot extend across the side panels.
+        // Per-column header layout — single 30-px chrome band at top
+        // with each column owning its own header segment side-by-side:
+        //   - left_header  : traffic-light gutter + wordmark + left toggle
+        //   - center_header: collapsed clusters when rails closed;
+        //                    otherwise just a flex spacer (the tab
+        //                    strip lives in its OWN row below — see
+        //                    `strip_row` further down)
+        //   - right_header : activity tabs + right toggle (only when
+        //                    sidebar open)
+        //
+        // Because each header is per-column, the activity tabs naturally
+        // dock at the LEFT edge of the right sidebar (NOT at the far
+        // right of the window).
+        //
+        // The per-pane tab strip is hoisted into a SEPARATE row inside
+        // the center column, BELOW center_header — keeps tab chips at
+        // `y > 30`, safely outside AppKit's title-bar drag zone (top
+        // ~28px). Required for chip drag-reorder to work — empirically
+        // verified: putting chips at `y < 28` (e.g. inside
+        // center_header at y=1..29) breaks GPUI drag delivery.
+
+        // Activity tabs route through the OPEN right column's header
+        // when the sidebar is open; otherwise they collapse into the
+        // center header (so the user can still see them).
+        let (center_right_tabs, right_column_tabs) = if right_open {
+            (None, right_tabs)
+        } else {
+            (right_tabs, None)
+        };
+
         let left_column = if self.left_rail_open {
             Some(
                 div()
@@ -857,39 +891,50 @@ impl Render for WorkspaceRoot {
             None
         };
 
-        // Activity tabs are owned by exactly one header: when the sidebar is
-        // open, they live in the right column's header; when closed,
-        // `right_tabs` is already `None` and the center header just appends
-        // the right-toggle button.
-        let (center_right_tabs, right_column_tabs) = if right_open {
-            (None, right_tabs)
-        } else {
-            (right_tabs, None)
-        };
-
-        let center_column = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
-            .child(top_bar::center_header(
+        // Tab strip row height matches the chrome row (h_top_bar) for
+        // VS Code-style visual symmetry — two equal-height rows stacked.
+        // Chips inside still render at their natural 28px height
+        // (`TAB_STRIP_HEIGHT_PX`); `items_center` on the outer row
+        // gives them top/bottom breathing room inside the 36px band.
+        let strip_row_height_px = density.h_top_bar;
+        let center_column = {
+            let header = top_bar::center_header(
                 self.left_rail_open,
                 right_open,
-                workspace_tab_strip,
+                None, // tab strip lives in its own row below — not in center_header
                 center_right_tabs,
                 theme,
                 density,
                 typography,
-            ))
-            .child(
+            );
+            let strip_row = workspace_tab_strip.map(|strip| {
                 div()
                     .flex()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .min_w(px(0.))
-                    .child(center_body),
-            );
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .h(px(strip_row_height_px))
+                    .bg(theme.bg_panel)
+                    .border_b_1()
+                    .border_color(theme.border_inactive)
+                    .child(strip)
+            });
+            let body = div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .min_w(px(0.))
+                .child(center_body);
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .child(header)
+                .when_some(strip_row, |s, r| s.child(r))
+                .child(body)
+        };
 
         let right_column = match (self.right_sidebar.clone(), right_open) {
             (Some(sidebar), true) => Some(
@@ -912,22 +957,7 @@ impl Render for WorkspaceRoot {
         if let Some(col) = right_column {
             row = row.child(col);
         }
-
-        // Reserved drag handle that sits under the macOS title bar
-        // overlay region (FullSizeContentView extends the content view
-        // up under the system title bar). Without a child here the OS
-        // intercepts clicks on the topmost 28px as a title-bar drag,
-        // which would hijack chip drag-reorder gestures originating in
-        // the tab strip. Sized at 22px to leave the traffic-light
-        // glyphs visible at point(12, 12) without pushing the chrome
-        // row noticeably down. Background matches the panel chrome so
-        // the strip below reads as one continuous header.
-        const MAC_TITLEBAR_SAFE_PX: f32 = 22.0;
-        let titlebar_spacer = div()
-            .h(px(MAC_TITLEBAR_SAFE_PX))
-            .w_full()
-            .flex_shrink_0()
-            .bg(theme.bg_panel);
+        let _ = has_tabs;
 
         div()
             .track_focus(&self.focus_handle)
@@ -936,7 +966,6 @@ impl Render for WorkspaceRoot {
             .size_full()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
-            .child(titlebar_spacer)
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();

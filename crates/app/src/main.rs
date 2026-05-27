@@ -235,17 +235,22 @@ fn main() {
         let window_size = size(px(1400.0), px(900.0));
         let bounds = Bounds::centered(None, window_size, cx);
 
-        // Transparent unified titlebar: macOS draws traffic lights into the
-        // app chrome at point(12, 12); WorkspaceRoot's 40px top_bar sits
-        // beneath them with a 56px left gutter for the inset. On non-macOS,
-        // `traffic_light_position` is a no-op (system titlebar still drawn).
+        // Transparent unified titlebar: macOS draws traffic-light glyphs
+        // into the app chrome at `point(12, 8)` — visually aligned with
+        // the wordmark text in the 32-px chrome row. Y origin tuned
+        // empirically; GPUI's text renderer parks glyph mass slightly
+        // above the line-box center, so the traffic-light glyph
+        // origin sits a touch above the chrome row's geometric center
+        // (y=16) to put glyph centers on the same horizontal line.
+        // On non-macOS, `traffic_light_position` is a no-op (system
+        // titlebar still drawn).
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(720.0), px(480.0))),
             titlebar: Some(TitlebarOptions {
                 title: Some("OxiMux".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(12.), px(12.))),
+                traffic_light_position: Some(point(px(12.), px(8.))),
             }),
             ..Default::default()
         };
@@ -406,7 +411,7 @@ fn run_editor_spike() {
             titlebar: Some(TitlebarOptions {
                 title: Some("OxiMux — Editor Spike".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(12.), px(12.))),
+                traffic_light_position: Some(point(px(12.), px(8.))),
             }),
             ..Default::default()
         };
@@ -469,7 +474,7 @@ fn run_file_tree_spike() {
             titlebar: Some(TitlebarOptions {
                 title: Some("OxiMux — File Tree Spike".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(12.), px(12.))),
+                traffic_light_position: Some(point(px(12.), px(8.))),
             }),
             ..Default::default()
         };

@@ -35,14 +35,19 @@ const ICON_SIZE: f32 = 16.0;
 
 /// Header strip for the left-rail column (when open). Hosts traffic-light
 /// gutter, wordmark, and the left-rail close toggle.
+///
+/// Wordmark is centered at y=15 inside the 30-px chrome strip; the OS
+/// draws macOS traffic lights centered at y=19 over the
+/// `TRAFFIC_LIGHT_GUTTER`, so the two visually align on a single row.
 pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
     chrome_strip(theme, density).child(left_chrome_cluster(true, theme, typography))
 }
 
 /// Header strip for the center column. Hosts any chrome bits whose
 /// owning column is currently collapsed (so toggles stay reachable);
-/// the center zone is a spacer in the pane-groups layout — each group
-/// carries its own tab strip beneath this header.
+/// the center zone is a spacer (the tab strip lives in its own row
+/// in `workspace_root.rs`, BELOW this header, so chip drag-reorder
+/// works correctly — see the layout comment there).
 pub fn center_header(
     left_open: bool,
     right_open: bool,
@@ -67,7 +72,11 @@ pub fn center_header(
 }
 
 /// Header strip for the right-sidebar column (when open). Hosts the
-/// activity-bar tab buttons and the right-sidebar close toggle.
+/// activity-bar tab buttons (Files / Search / Source Control) at the
+/// left edge of the right-sidebar column, plus the close toggle at the
+/// far-right. Per-column scoping ensures the activity tabs visually
+/// dock at the boundary between center and right sidebar — not at the
+/// far right of the window.
 pub fn right_header(
     right_tabs: Option<AnyElement>,
     theme: Theme,
@@ -91,7 +100,27 @@ fn chrome_strip(theme: Theme, density: Density) -> Div {
 fn left_chrome_cluster(left_open: bool, theme: Theme, typography: &Typography) -> impl IntoElement {
     // Order: traffic gutter → wordmark → left-rail toggle. Keeping the
     // wordmark anchored left mirrors macOS native chrome.
+    //
+    // The wordmark uses `flex + items_center + h_full` (instead of
+    // relying solely on the outer cluster's `items_center`) so its
+    // text is centered along the CHROME ROW's vertical center — same
+    // vertical position as the macOS traffic-light glyphs drawn at
+    // `point(12, 12)`. Without the inner centering, the wordmark's
+    // shrink-to-text-box behavior parks the glyphs above the row
+    // center because font ascender/descender padding is asymmetric.
+    // `line_height` forces the text-box to equal the chrome row height
+    // (`h_top_bar`). Without this, the text's natural line-box (font
+    // size × 1.2-ish default leading) is smaller than the chrome row,
+    // so `items_center` on the parent centers the SMALL box — which
+    // places the visible glyphs above the row's mid-line because font
+    // ascender padding is asymmetric. Forcing the box to fill the row
+    // height makes the glyphs sit on the row's own baseline (the
+    // platform-default text positioning), aligning with the macOS
+    // traffic-light glyph center.
+    let row_h = px(32.0);
     let wordmark = div()
+        .h(row_h)
+        .line_height(row_h)
         .px(px(8.0))
         .text_size(px(typography.t_brand))
         .font_weight(typography.w_semibold)
@@ -119,21 +148,30 @@ fn right_chrome_cluster(
     theme: Theme,
 ) -> impl IntoElement {
     // When the right sidebar is open this cluster sits inside its own
-    // `right_header` strip and should span the full strip width so the toggle
-    // can anchor at the far right. When the sidebar is closed the cluster is
-    // appended to `center_header`; the preceding `flex_1` spacer there
-    // already shoves it to the right edge, so `flex_shrink_0` keeps it intact.
+    // `right_header` strip and should span the full strip width so the
+    // activity-tabs + toggle group can anchor at the far right of the
+    // right column (= near the boundary with the sidebar body's right
+    // edge). When the sidebar is closed the cluster is appended to
+    // `center_header`; the preceding `flex_1` spacer there already
+    // shoves it to the right edge, so `flex_shrink_0` keeps it intact.
+    //
+    // Child order:
+    //   open  → [flex_1 spacer, activity tabs, toggle] (right-docked)
+    //   closed → [activity tabs, toggle]                (compact, no spacer)
     let zone_base = div().flex().flex_row().items_center().h_full();
     let mut zone = if right_open {
         zone_base.w_full()
     } else {
         zone_base.flex_shrink_0()
     };
+    if right_open {
+        // Push the activity-tabs + toggle group to the right edge of
+        // the right column so the icons sit next to the close toggle
+        // instead of leaving an awkward gap at the column's leading edge.
+        zone = zone.child(div().flex_1().h_full());
+    }
     if let Some(tabs) = right_tabs {
         zone = zone.child(tabs);
-    }
-    if right_open {
-        zone = zone.child(div().flex_1().h_full());
     }
     // The "..." pane-actions button used to live here; it now ships
     // inside the hoisted tab strip itself so it stays adjacent to the

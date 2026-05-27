@@ -31,11 +31,14 @@ impl Density {
     /// Tight cockpit density. The only density in v1.
     pub fn cockpit() -> Self {
         Self {
-            // 30 (was 40): compact title-bar row aligned with the reference
-            // editor's chrome density. Traffic lights inset at point(12, 12)
-            // with ~14px buttons clear at y≈26, leaving ~4px below — see
-            // main.rs TitlebarOptions block.
-            h_top_bar: 30.0,
+            // Per-column chrome row height. Sized so the chrome row's
+            // vertical center (y=16) lines up with where the macOS
+            // traffic-light glyphs are drawn — `traffic_light_position
+            // = point(12, 10)` puts the 12-px button at y=10..22,
+            // center y=16. Tab strip lives in its own row BELOW this
+            // one — see `workspace_root.rs` — keeping chip drag
+            // delivery clear of any AppKit title-bar drag region.
+            h_top_bar: 32.0,
             // 24 (not 22): room for the metric strip without descender clipping.
             h_status_bar: 24.0,
             h_tab: 28.0,
