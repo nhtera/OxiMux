@@ -64,6 +64,9 @@ impl Render for PaneGroup {
         let entity = cx.entity().clone();
         let focus_handle = self.focus_handle_clone();
         let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let is_empty = self.tabs.is_empty();
 
         dispatch_active_grid(self, window, cx);
 
@@ -77,12 +80,22 @@ impl Render for PaneGroup {
             PaneContent::Diff(view) => view.clone().into_any_element(),
         });
 
+        // Empty-pane placeholder: when the user closes the last tab of
+        // the only surviving group, render the welcome card (logo +
+        // shortcut hints) so the center pane never falls back to a
+        // black void. `purge_empty_groups` ensures any non-last empty
+        // group has already been removed by the time we get here.
+        let empty_placeholder: Option<AnyElement> = is_empty.then(|| {
+            crate::shell::welcome_view::view(theme, density, &typography).into_any_element()
+        });
+
         let body = div()
             .flex_1()
             .min_h(px(0.0))
             .w_full()
             .overflow_hidden()
-            .when_some(active_content, |s, child| s.child(child));
+            .when_some(active_content, |s, child| s.child(child))
+            .when_some(empty_placeholder, |s, child| s.child(child));
 
         // Optional MRU HUD overlay — only visible while the user holds
         // Ctrl after pressing Ctrl+Tab. Rendered AFTER body in the same
