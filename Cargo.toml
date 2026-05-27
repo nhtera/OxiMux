@@ -47,7 +47,14 @@ oximux-relay-client = { path = "crates/relay-client" }
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui_macros = { git = "https://github.com/zed-industries/zed" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c", features = ["tree-sitter-rust"] }
+# Enable a broad set of tree-sitter grammars so the code editor can syntax-
+# highlight the language families a typical workspace contains. The
+# `tree-sitter-languages` meta-feature pulls in every grammar shipped by
+# `gpui-component` (rust, ts, js, python, go, c, cpp, java, kotlin, swift,
+# php, ruby, lua, zig, scala, sql, css, html, json, markdown, yaml, toml,
+# bash, make, cmake, proto, graphql, diff, ...). Build time is a few extra
+# seconds; the runtime cost is per-file (lazy parser construction).
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c", features = ["tree-sitter-languages"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c" }
 
 # Async + util

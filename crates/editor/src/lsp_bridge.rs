@@ -34,7 +34,17 @@ pub fn spawn_attach_lsp(
     let file_path = editor_view.file_path().to_path_buf();
     let language_id = language_id.to_string();
     let program = program.to_string();
-    let state_weak = editor_view.state().downgrade();
+    // `state()` returns `None` for non-text content (image/binary). The
+    // public `attach_lsp` gates this case already, so reaching here without
+    // a state means the gate was bypassed — log + bail.
+    let Some(state_entity) = editor_view.state() else {
+        tracing::debug!(
+            file = %editor_view.file_path().display(),
+            "lsp_bridge: spawn_attach_lsp called for non-text content; skipping"
+        );
+        return;
+    };
+    let state_weak = state_entity.downgrade();
     let view_weak: WeakEntity<super::editor_view::EditorView> = cx.weak_entity();
 
     cx.spawn(async move |_view, cx| {
