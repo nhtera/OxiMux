@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Window, img, px,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription, Window,
+    img, px,
 };
 use gpui_component::{
     ActiveTheme,
@@ -460,13 +461,38 @@ impl Render for EditorView {
             EditorContent::Binary => render_binary_placeholder(muted_fg),
         };
 
+        // Wire focus tracking so action dispatch (e.g. Cmd+W → CloseTab on
+        // the ancestor PaneGroup, Cmd+S → SaveFile on this div) routes
+        // correctly. Without `.track_focus(...)`, the focus_handle this
+        // view exposes via `Focusable` is never anchored in the rendered
+        // dispatch tree — `focus_active()` puts platform focus on a
+        // dangling handle, and key events from a focused child (the
+        // `Input` widget) don't bubble through this view's on_action
+        // handlers. Mirrors the pattern used by `TerminalView` and
+        // `DiffView`.
         gpui::div()
+            .id(("oximux-editor-view", cx.entity_id()))
+            .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::on_save))
+            // Re-claim focus on click for Image / Binary surfaces. For
+            // Text content the child `Input` widget grabs focus on its
+            // own click path; this handler is the fallback so the
+            // editor's focus_handle becomes the active focus even when
+            // the body has no inner focusable (image/binary placeholder).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    if !this.is_text() {
+                        this.focus_handle.focus(window, cx);
+                        cx.notify();
+                    }
+                }),
+            )
             .child(breadcrumb)
             .child(body)
     }
