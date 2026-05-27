@@ -117,6 +117,19 @@ impl ProjectPanes {
         if entries.is_empty() {
             return None;
         }
+        // Skip the entire hoisted strip when EVERY top-row group has
+        // zero tabs — drops the focused-group blue border, the empty
+        // chip rail, and the trailing "+ / ..." cluster so the chrome
+        // row collapses to a clean single header matching the
+        // reference editor's empty-workspace UX. Empty groups inside a
+        // vertical split still exist (purge keeps the last group), so
+        // we check live tab counts rather than group presence.
+        if entries
+            .iter()
+            .all(|(id, _)| self.group(*id).is_none_or(|g| g.read(cx).is_empty()))
+        {
+            return None;
+        }
         let theme = self.theme;
         let active_id = self.manager().active_group_id();
         let sum: f32 = entries.iter().map(|(_, w)| *w).sum();

@@ -39,10 +39,16 @@ const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
 /// "..." Pane Actions button width — matches the `+` neighbor so the
 /// trailing button cluster stays balanced.
 const ELLIPSIS_BUTTON_WIDTH_PX: f32 = 28.0;
-/// Workspace chrome height (top bar + status bar). The strip is inline
-/// per-group; its height is subtracted by `dispatch_active_grid` so
-/// terminal grid math budgets vertical space correctly.
-const CHROME_H_PX: f32 = 30.0 + 24.0;
+/// Workspace chrome height — the constant vertical band above and
+/// below the center body that `dispatch_active_grid` must subtract
+/// when budgeting terminal grid rows. Composition:
+///   - top chrome row (`h_top_bar = 32`)
+///   - workspace tab-strip row (also `h_top_bar = 32`, rendered when
+///     any pane group has tabs — see `workspace_root.rs`)
+///   - bottom status bar (`h_status_bar = 24`)
+/// Total: 32 + 32 + 24 = 88. Plus the per-pane-group inline strip
+/// (`TAB_STRIP_HEIGHT_PX = 28`) is subtracted separately below.
+const CHROME_H_PX: f32 = 32.0 + 32.0 + 24.0;
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
