@@ -338,6 +338,17 @@ impl WorkspaceRoot {
             }
         });
 
+        // Focus the workspace-root handle immediately so the root div's
+        // `on_action(...)` listeners (ToggleRightSidebar, ToggleLeftSidebar,
+        // and the rest of the chrome) have a valid dispatch path from the
+        // first frame. Without this, actions dispatched by mouse clicks on
+        // toolbar buttons (which themselves carry no focus) before the
+        // user has clicked into any pane silently drop on the floor —
+        // matches the "can't expand right sidebar until I click a tab"
+        // bug. `defer_focus_active` later moves focus to the active tab;
+        // until that fires, this fallback keeps actions routable.
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
         Self {
             theme,
             density,
@@ -365,7 +376,7 @@ impl WorkspaceRoot {
             active_project: None,
             row_menu,
             add_project_dialog,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
         }
     }
 
@@ -384,6 +395,36 @@ impl WorkspaceRoot {
     pub(crate) fn active_project_panes(&self) -> Option<Entity<ProjectPanes>> {
         let id = self.active_project.as_ref().map(|p| p.id.as_str())?;
         self.project_panes_by_project.get(id).cloned()
+    }
+
+    /// Route the Explorer context-menu Rename action into the FileExplorer's
+    /// inline-rename flow. Matches the reference UX: the row turns into an editable
+    /// Input in-place (no modal). FileExplorer owns the actual fs op +
+    /// post-rename refresh; this handler just kicks the state transition.
+    pub(crate) fn start_inline_file_rename(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Refuse paths without a parent (i.e. filesystem root) — rename
+        // isn't meaningful there and `std::fs::rename` would fail anyway.
+        if path.parent().is_none() {
+            tracing::warn!(
+                target: "oximux_app::file_explorer",
+                path = %path.display(),
+                "rename refused: path has no parent directory"
+            );
+            return;
+        }
+        // Close the context menu so its backdrop doesn't sit on top of
+        // the inline input the explorer is about to mount.
+        self.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+        let Some(rs) = self.right_sidebar.as_ref() else {
+            return;
+        };
+        let fe = rs.read(cx).file_explorer.clone();
+        fe.update(cx, |fe, cx| fe.start_rename(path, window, cx));
     }
 
     /// Open `path` as a new editor tab in the active project's active
@@ -1172,11 +1213,11 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
-                |_this, action: &crate::actions::FileTreeRename, _window, _cx| {
-                    tracing::info!(
-                        target: "oximux_app::file_explorer",
-                        path = %action.path,
-                        "FileTreeRename dispatched (inline rename lands in Phase 03)"
+                |this, action: &crate::actions::FileTreeRename, window, cx| {
+                    this.start_inline_file_rename(
+                        std::path::PathBuf::from(&action.path),
+                        window,
+                        cx,
                     );
                 },
             ))

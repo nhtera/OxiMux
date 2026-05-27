@@ -159,6 +159,27 @@ fn defer_focus_active(
     });
 }
 
+/// Focus the active project's active pane group's active tab. Called
+/// AFTER the async right-sidebar rebuild completes — without this,
+/// the rebuild's `cx.notify` repaint can land focus somewhere other
+/// than the user's last-active terminal/editor, leaving the chrome
+/// action listeners (`ToggleRightSidebar`, etc.) without a focused
+/// element to dispatch through. The post-rebuild defer is the second
+/// of the two-step focus restoration, mirroring the per-frame focus
+/// pin used in upstream IDE shells.
+pub(crate) fn refocus_active_pane(
+    this: &crate::workspace_root::WorkspaceRoot,
+    window: &mut Window,
+    cx: &mut Context<crate::workspace_root::WorkspaceRoot>,
+) {
+    let Some(panes) = this.active_project_panes() else {
+        return;
+    };
+    window.defer(cx, move |window, app| {
+        panes.update(app, |p, cx| p.focus_active(window, cx));
+    });
+}
+
 /// Compose the worktree dir path:
 /// `<app_data>/dev.nhtera.oximux/projects/<project_id>/worktrees/<slug>`.
 /// Returns `None` when `dirs::data_dir()` is unavailable (sandbox or
@@ -355,6 +376,16 @@ impl WorkspaceRoot {
                         cx,
                     )
                 }));
+                // Re-focus the active pane after the right_sidebar
+                // rebuild — the rebuild's `cx.notify` triggers a
+                // repaint that can land focus on a freshly-mounted
+                // sub-element of the sidebar (FileExplorer, etc.)
+                // instead of the user's last-active terminal/editor.
+                // Mirrors the reference UX's "open project → cursor in last
+                // working terminal" behavior; also keeps the chrome
+                // toggle buttons routable since their actions need a
+                // focused element inside the workspace_root subtree.
+                refocus_active_pane(this, window, cx);
                 cx.notify();
             });
         })
