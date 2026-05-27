@@ -70,6 +70,8 @@ fn hunked_modified_file_renders_lines_in_order() {
             path,
             header,
             hunks,
+            added,
+            removed,
         } => {
             assert_eq!(path, "src/main.rs");
             assert_eq!(header.label, "Modified");
@@ -80,6 +82,10 @@ fn hunked_modified_file_renders_lines_in_order() {
             assert_eq!(hunks[0].rows[1].kind, DiffLineKind::Removed);
             assert_eq!(hunks[0].rows[2].kind, DiffLineKind::Added);
             assert_eq!(hunks[0].rows[3].kind, DiffLineKind::Added);
+            // R1: stats tally walks all rows once at plan-build time.
+            // 1 removed line + 2 added lines = (2, 1).
+            assert_eq!(*added, 2);
+            assert_eq!(*removed, 1);
         }
         other => panic!("expected Hunked, got {other:?}"),
     }

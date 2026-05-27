@@ -34,6 +34,12 @@ pub enum FilePlan {
         path: String,
         header: FileHeader,
         hunks: Vec<HunkPlan>,
+        /// Total `+` rows across all hunks (post no-newline-collapse).
+        /// Renders next to the path as `+N` in green.
+        added: u32,
+        /// Total `-` rows across all hunks (post no-newline-collapse).
+        /// Renders next to the path as `-N` in red.
+        removed: u32,
     },
     /// `large == true && expanded == false`: header + collapse notice, hunk
     /// bodies suppressed.
@@ -130,7 +136,7 @@ fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
                     hunk_count: d.hunks.len(),
                 }
             } else {
-                let hunks = d
+                let hunks: Vec<HunkPlan> = d
                     .hunks
                     .iter()
                     .map(|h| {
@@ -214,14 +220,38 @@ fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
                         }
                     })
                     .collect();
+                // Sum +N / -N once at file scope so the header strip can
+                // render `+37 -12` in green/red. Cheaper than per-render
+                // recompute and the data plan is the right home for it.
+                let (added, removed) = sum_added_removed(&hunks);
                 FilePlan::Hunked {
                     path,
                     header,
                     hunks,
+                    added,
+                    removed,
                 }
             }
         }
     }
+}
+
+/// Walk every row in every hunk and tally Added / Removed counts. Context
+/// and NoNewlineHint rows don't count toward either side. Used by the
+/// header strip to display insertion/deletion chips.
+fn sum_added_removed(hunks: &[HunkPlan]) -> (u32, u32) {
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for h in hunks {
+        for r in &h.rows {
+            match r.kind {
+                DiffLineKind::Added => added = added.saturating_add(1),
+                DiffLineKind::Removed => removed = removed.saturating_add(1),
+                _ => {}
+            }
+        }
+    }
+    (added, removed)
 }
 
 /// Compute syntax-highlighted tokens for one row's content. Skips the

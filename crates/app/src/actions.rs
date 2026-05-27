@@ -283,6 +283,10 @@ actions!(
         /// Expand a collapsed (large) diff in the DiffView. Wired to the
         /// click on the "expand" affordance row.
         ExpandDiff,
+        /// Retry a failed diff load. Wired to the Retry button on the
+        /// failed-state row; reads stored path / staged / untracked flags
+        /// from `DiffViewState::Failed`.
+        RetryDiff,
         /// Open the commit dialog modal (step 14 binds Cmd+K).
         OpenCommitDialog,
         /// Submit the active commit dialog. Routed via dialog button click;

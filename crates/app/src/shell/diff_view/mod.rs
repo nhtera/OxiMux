@@ -23,7 +23,7 @@ pub mod render;
 pub mod syntax;
 pub mod word_diff;
 
-use crate::actions::ExpandDiff;
+use crate::actions::{ExpandDiff, RetryDiff};
 use crate::shell::diff_view::paint::render_plan;
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
 use gpui::{
@@ -42,6 +42,9 @@ pub enum DiffViewState {
     Loading {
         path: PathBuf,
         staged: bool,
+        /// Carried so retry-on-failure can re-route through the untracked
+        /// codepath (`diff_for_untracked`) when the original load did.
+        untracked: bool,
     },
     Ready {
         path: PathBuf,
@@ -52,6 +55,7 @@ pub enum DiffViewState {
     Failed {
         path: PathBuf,
         staged: bool,
+        untracked: bool,
         error: String,
     },
 }
@@ -112,6 +116,7 @@ impl DiffView {
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
+            untracked,
         };
         let repo = self.repo.clone();
         let path_for_fetch = path.clone();
@@ -144,11 +149,28 @@ impl DiffView {
                 return;
             };
             let _ = this.update(cx, |view, cx| {
-                view.apply_load_result(path, staged, result);
+                view.apply_load_result(path, staged, untracked, result);
                 cx.notify();
             });
         });
         self._load_task = Some(task);
+    }
+
+    /// Re-run the most recent load. No-op unless the current state is
+    /// `Failed` (so retry-while-Ready doesn't spam refresh). Caller is
+    /// the `RetryDiff` action handler.
+    pub fn retry(&mut self, cx: &mut Context<Self>) {
+        let DiffViewState::Failed {
+            path,
+            staged,
+            untracked,
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        let (path, staged, untracked) = (path.clone(), *staged, *untracked);
+        self.load(path, staged, untracked, cx);
     }
 
     /// Toggle a large-diff file from collapsed → expanded. Invoked by the
@@ -163,6 +185,7 @@ impl DiffView {
         &mut self,
         path: PathBuf,
         staged: bool,
+        untracked: bool,
         result: Result<Vec<FileDiff>, String>,
     ) {
         match result {
@@ -178,6 +201,7 @@ impl DiffView {
                 self.state = DiffViewState::Failed {
                     path,
                     staged,
+                    untracked,
                     error,
                 };
             }
@@ -186,6 +210,11 @@ impl DiffView {
 
     fn on_expand_diff(&mut self, _: &ExpandDiff, _window: &mut Window, cx: &mut Context<Self>) {
         self.expand();
+        cx.notify();
+    }
+
+    fn on_retry_diff(&mut self, _: &RetryDiff, _window: &mut Window, cx: &mut Context<Self>) {
+        self.retry(cx);
         cx.notify();
     }
 }
@@ -206,6 +235,7 @@ impl Render for DiffView {
             return div()
                 .track_focus(&self.focus_handle)
                 .on_action(cx.listener(Self::on_expand_diff))
+                .on_action(cx.listener(Self::on_retry_diff))
                 .into_any_element();
         }
 
@@ -220,7 +250,7 @@ impl Render for DiffView {
                 loading_state(&path.display().to_string(), &rctx).into_any_element()
             }
             DiffViewState::Failed { path, error, .. } => {
-                failed_state(&path.display().to_string(), error, &rctx).into_any_element()
+                failed_state(&path.display().to_string(), error, &rctx, cx).into_any_element()
             }
             DiffViewState::Ready {
                 diffs, expanded, ..
@@ -248,6 +278,7 @@ impl Render for DiffView {
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_expand_diff))
+            .on_action(cx.listener(Self::on_retry_diff))
             .flex()
             .flex_col()
             .h_full()
@@ -264,8 +295,52 @@ fn loading_state(path: &str, rctx: &RenderCtx<'_>) -> impl IntoElement {
     centered(format!("Loading diff for {path}…"), rctx)
 }
 
-fn failed_state(path: &str, error: &str, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    centered(format!("Failed to load {path}: {error}"), rctx)
+fn failed_state(
+    path: &str,
+    error: &str,
+    rctx: &RenderCtx<'_>,
+    cx: &mut Context<DiffView>,
+) -> impl IntoElement {
+    let pad = px(rctx.density.pad_panel);
+    let text_size = px(rctx.typography.t_body_sm);
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(8.0))
+        .h_full()
+        .w_full()
+        .p(pad)
+        .text_size(text_size)
+        .text_color(rctx.theme.fg_subtle)
+        .child(
+            div()
+                .text_color(rctx.theme.status_error)
+                .child(format!("Failed to load {path}")),
+        )
+        .child(div().child(error.to_string()))
+        .child(
+            // Retry button — clickable row that dispatches `RetryDiff`.
+            // The action handler reads path/staged/untracked off the
+            // current `Failed` state and re-runs the load with the same
+            // routing the original call used.
+            div()
+                .id("diff-view-retry")
+                .px(px(12.0))
+                .py(px(6.0))
+                .text_color(rctx.theme.status_info)
+                .border_1()
+                .border_color(rctx.theme.border_inactive)
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(rctx.theme.bg_panel_alt))
+                .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
+                    view.retry(cx);
+                    cx.notify();
+                }))
+                .child("Retry"),
+        )
 }
 
 fn centered(msg: String, rctx: &RenderCtx<'_>) -> impl IntoElement {

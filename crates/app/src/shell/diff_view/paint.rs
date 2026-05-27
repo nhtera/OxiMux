@@ -11,9 +11,10 @@ use crate::shell::diff_view::render::{FilePlan, HunkPlan, LinePlan, RenderCtx};
 use crate::shell::diff_view::syntax::HiToken;
 use crate::shell::diff_view::word_diff::{TokenSpan, WordOp};
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Rgba,
-    Styled, div, px,
+    ClickEvent, ClipboardItem, Context, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Rgba, StatefulInteractiveElement as _, Styled, div, px,
 };
+use gpui_component::{Icon, Sizable as _, tooltip::Tooltip};
 use oximux_core::DiffLineKind;
 
 /// Render the plan into an element. Called from `DiffView::render`.
@@ -57,11 +58,16 @@ fn render_file_plan(
             path,
             header,
             hunks,
+            added,
+            removed,
         } => {
             let mut col = block
-                .child(file_header_strip(
-                    format!("{path}  ·  {}", header.label),
+                .child(interactive_file_header(
+                    path.clone(),
+                    header.label.clone(),
+                    Some((*added, *removed)),
                     rctx,
+                    cx,
                 ))
                 .child(hunks_body(hunks, rctx));
             col = col.font(rctx.typography.mono_font());
@@ -108,17 +114,120 @@ fn render_file_plan(
     }
 }
 
+/// Header strip for non-Hunked variants (Binary, Collapsed, ModeOnly).
+/// No stats chip — those file types don't carry per-row +/-.
 fn file_header_strip(text: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
     div()
         .flex()
         .items_center()
         .h(px(rctx.density.h_tab))
         .px(px(rctx.density.pad_panel))
-        .bg(rctx.theme.bg_panel_alt)
+        .bg(rctx.theme.bg_panel)
+        .border_b_1()
+        .border_color(rctx.theme.border_inactive)
         .text_size(px(rctx.typography.t_label_caps))
         .font_weight(rctx.typography.w_semibold)
         .text_color(rctx.theme.fg_base)
         .child(text)
+}
+
+/// Interactive header strip for `FilePlan::Hunked`. Click anywhere on the
+/// bar copies the file path to the clipboard. Hover state telegraphs the
+/// affordance — no hover, no obvious clickability.
+///
+/// Layout, left to right:
+///   `<path>` `· <status label>` `<+added>` `<-removed>`
+///
+/// The `+N` / `-N` chips use `git.added` / `git.deleted` theme colors so
+/// they read as actual diff stats, not generic ok/err semantic colors.
+fn interactive_file_header(
+    path: String,
+    label: String,
+    stats: Option<(u32, u32)>,
+    rctx: &RenderCtx<'_>,
+    cx: &mut Context<DiffView>,
+) -> impl IntoElement {
+    // The `id` is required for `hover()` to track state across frames.
+    // Use the path as the seed — diff views never show the same path twice
+    // in one render tree, so collisions are impossible.
+    let id = gpui::ElementId::Name(format!("diff-header-{path}").into());
+    let copy_path = path.clone();
+    let bg = rctx.theme.bg_panel;
+    // No dedicated hover-bg token in the theme — step up to `bg_panel_alt`
+    // so the strip lifts off the body by exactly one shade, mirroring how
+    // tabs / row hovers behave elsewhere in the app.
+    let hover_bg = rctx.theme.bg_panel_alt;
+    let tooltip_text: gpui::SharedString = "Click to copy path".into();
+    let mut row = div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(rctx.density.h_tab))
+        .px(px(rctx.density.pad_panel))
+        .bg(bg)
+        .border_b_1()
+        .border_color(rctx.theme.border_inactive)
+        .text_size(px(rctx.typography.t_label_caps))
+        .font_weight(rctx.typography.w_semibold)
+        .text_color(rctx.theme.fg_base)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+        }))
+        .child(div().child(path))
+        .child(
+            div()
+                .text_color(rctx.theme.fg_muted)
+                .text_size(px(rctx.typography.t_body_sm))
+                .child(format!("· {label}")),
+        );
+    if let Some((added, removed)) = stats {
+        row = row.child(stats_chips(added, removed, rctx));
+    }
+    // Trailing slot: a copy glyph that reinforces "the whole row is a copy
+    // affordance". It's a passive icon — the click handler lives on the
+    // row, not on the icon, so users can click anywhere on the bar and
+    // still get the copy. Using `div().flex_1()` as a spacer pushes the
+    // icon all the way right.
+    row = row
+        .child(div().flex_1())
+        .child(
+            div()
+                .child(
+                    Icon::default()
+                        .path("icons/copy.svg")
+                        .xsmall()
+                        .text_color(rctx.theme.fg_subtle),
+                ),
+        );
+    row
+}
+
+/// Render the `+N -N` chip cluster. Stats of zero on one side still show
+/// (`+0` is informational — confirms there are no additions, just removals
+/// or vice versa) to avoid the header reflowing when stats change.
+fn stats_chips(added: u32, removed: u32, rctx: &RenderCtx<'_>) -> impl IntoElement {
+    let added_color = rctx.theme.git.added;
+    let removed_color = rctx.theme.git.deleted;
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(6.0))
+        .text_size(px(rctx.typography.t_body_sm))
+        .child(
+            div()
+                .text_color(added_color)
+                .child(format!("+{added}")),
+        )
+        .child(
+            div()
+                .text_color(removed_color)
+                .child(format!("-{removed}")),
+        )
 }
 
 fn hunks_body(hunks: &[HunkPlan], rctx: &RenderCtx<'_>) -> impl IntoElement {
@@ -199,13 +308,17 @@ fn hunk_header(
     rctx: &RenderCtx<'_>,
     strip: Option<gpui::Hsla>,
 ) -> impl IntoElement {
+    // Neutral `fg_subtle` text — the previous `status_warn` (orange)
+    // collided with the indicator strip's "mixed hunk" orange, making
+    // the `@@` marker look like it belonged to the strip. Muted gray
+    // reads as metadata, which is what it is.
     div()
         .flex()
         .items_center()
         .h(px(rctx.density.h_row))
         .bg(rctx.theme.bg_panel_alt)
         .text_size(px(rctx.typography.t_body_sm))
-        .text_color(rctx.theme.status_warn)
+        .text_color(rctx.theme.fg_subtle)
         .child(strip_cell(strip, rctx.density.h_row))
         .child(div().px(px(rctx.density.pad_panel)).child(header))
 }
