@@ -18,10 +18,14 @@
 //! builder. This file holds state, actions, async wiring, and the root
 //! container.
 
+pub mod paint;
 pub mod render;
+pub mod syntax;
+pub mod word_diff;
 
 use crate::actions::ExpandDiff;
-use crate::shell::diff_view::render::{RenderCtx, build_render_plan, render_plan};
+use crate::shell::diff_view::paint::render_plan;
+use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
     StatefulInteractiveElement as _, Styled, Task, Window, div, px,

@@ -125,6 +125,18 @@ ignore = "0.4"
 notify-debouncer-full = "0.4"
 # Temp dirs for file-tree backend unit tests (dev-dep on the editor crate).
 tempfile = "3"
+# Phase 10 — word-level diff inside the diff viewer. `similar` produces
+# `TextDiff::from_words` op streams that drive per-token coloring inside
+# modified-modified line pairs. Pure Rust, no `unicode-bidi` transitive
+# (the `bytes` feature is the default and keeps the dep slim).
+similar = "2.6"
+# Phase 10.1 — syntax highlighting inside the diff body. `default-fancy`
+# selects the pure-Rust `fancy-regex` engine instead of `onig` (the C
+# Oniguruma binding) — avoids a `.a` link on macOS, smaller bundle, no
+# extra build deps. Bundled syntaxes cover Rust/TS/Markdown/TOML/JSON
+# out of the box. Loaded lazily via `LazyLock` so workspace open isn't
+# blocked on the ~30 ms first-call set-load.
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 
 [profile.dev]
 opt-level = 0

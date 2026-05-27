@@ -230,7 +230,10 @@ fn hunk_header_omits_suffix_separator_when_suffix_empty() {
 }
 
 #[test]
-fn no_newline_hint_kind_passes_through() {
+fn no_newline_hint_after_removal_is_stripped() {
+    // Standalone NoNewlineHint rows convey only "file lacks trailing
+    // newline" — they're not content. The renderer drops them so the
+    // body reads like the actual line-by-line change.
     let h = hunk(
         (1, 1),
         (1, 1),
@@ -244,7 +247,181 @@ fn no_newline_hint_kind_passes_through() {
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
     };
-    assert_eq!(hunks[0].rows[1].kind, DiffLineKind::NoNewlineHint);
+    assert_eq!(hunks[0].rows.len(), 1);
+    assert_eq!(hunks[0].rows[0].kind, DiffLineKind::Removed);
+}
+
+#[test]
+fn collapse_no_newline_only_flip_becomes_context() {
+    // Pattern git emits when a 1-line file gains content after itself —
+    // "test" (no newline) → "test\n\nsss" (no newline). Both lines'
+    // bytes are identical; the deletion + re-addition exists only because
+    // the old line gained a trailing newline. Render as a single context
+    // row so the user reads it as "line 1 unchanged, lines 2-3 added".
+    let h = hunk(
+        (1, 1),
+        (1, 3),
+        "",
+        vec![
+            line(DiffLineKind::Removed, "test"),
+            line(DiffLineKind::NoNewlineHint, " No newline at end of file"),
+            line(DiffLineKind::Added, "test"),
+            line(DiffLineKind::Added, ""),
+            line(DiffLineKind::Added, "sss"),
+            line(DiffLineKind::NoNewlineHint, " No newline at end of file"),
+        ],
+    );
+    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false);
+    let FilePlan::Hunked { hunks, .. } = &plan[0] else {
+        panic!("expected hunked");
+    };
+    let rows = &hunks[0].rows;
+    assert_eq!(rows.len(), 3, "trio + two adds collapse to 3 rows");
+    assert_eq!(rows[0].kind, DiffLineKind::Context);
+    assert_eq!(rows[0].content, "test");
+    assert_eq!(rows[0].old_line, Some(1));
+    assert_eq!(rows[0].new_line, Some(1));
+    assert_eq!(rows[1].kind, DiffLineKind::Added);
+    assert_eq!(rows[1].new_line, Some(2));
+    assert_eq!(rows[2].kind, DiffLineKind::Added);
+    assert_eq!(rows[2].new_line, Some(3));
+}
+
+#[test]
+fn collapse_does_not_swallow_real_content_changes() {
+    // Removed("foo") + NoNewlineHint + Added("bar") — contents differ,
+    // so this is a genuine line edit at a no-newline boundary. Keep both
+    // sides; only strip the noise NoNewlineHint between them.
+    let h = hunk(
+        (1, 1),
+        (1, 1),
+        "",
+        vec![
+            line(DiffLineKind::Removed, "foo"),
+            line(DiffLineKind::NoNewlineHint, " No newline at end of file"),
+            line(DiffLineKind::Added, "bar"),
+            line(DiffLineKind::NoNewlineHint, " No newline at end of file"),
+        ],
+    );
+    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false);
+    let FilePlan::Hunked { hunks, .. } = &plan[0] else {
+        panic!("expected hunked");
+    };
+    let rows = &hunks[0].rows;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].kind, DiffLineKind::Removed);
+    assert_eq!(rows[0].content, "foo");
+    assert_eq!(rows[1].kind, DiffLineKind::Added);
+    assert_eq!(rows[1].content, "bar");
+}
+
+#[test]
+fn paired_modified_lines_get_word_spans() {
+    // 1:1 Removed/Added pair where one token differs (`x` → `y`). After
+    // build_render_plan, both paired rows carry word-level spans; tokens
+    // that match between sides drop back to Same so only the changed
+    // word pops bright.
+    let h = hunk(
+        (1, 1),
+        (1, 1),
+        "",
+        vec![
+            line(DiffLineKind::Removed, "let x = 1;"),
+            line(DiffLineKind::Added, "let y = 1;"),
+        ],
+    );
+    let plan = build_render_plan(
+        &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
+        false,
+    );
+    let FilePlan::Hunked { hunks, .. } = &plan[0] else {
+        panic!("expected hunked");
+    };
+    let removed_row = &hunks[0].rows[0];
+    let added_row = &hunks[0].rows[1];
+    assert!(removed_row.spans.is_some(), "paired removed row carries spans");
+    assert!(added_row.spans.is_some(), "paired added row carries spans");
+}
+
+#[test]
+fn rust_file_rows_carry_syntax_tokens() {
+    // build_render_plan detects language from file path and populates
+    // `tokens` per row via syntect. Rust keywords like `let` should land
+    // on a distinct color from string literals — exact values are theme-
+    // dependent so we only assert the rows carry *some* tokens.
+    let h = hunk(
+        (1, 1),
+        (1, 1),
+        "",
+        vec![line(DiffLineKind::Added, r#"let x = "hello";"#)],
+    );
+    let plan = build_render_plan(
+        &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
+        false,
+    );
+    let FilePlan::Hunked { hunks, .. } = &plan[0] else {
+        panic!("expected hunked");
+    };
+    let row = &hunks[0].rows[0];
+    assert!(
+        !row.tokens.is_empty(),
+        "rust row should carry syntax tokens for keyword/string"
+    );
+    assert!(row.tokens.first().is_some_and(|t| t.start == 0));
+    assert!(
+        row.tokens.last().is_some_and(|t| t.end == row.content.len()),
+        "tokens should cover the whole row content"
+    );
+}
+
+#[test]
+fn unknown_extension_rows_have_no_syntax_tokens() {
+    // Extension-less or unrecognized file → no language → tokens empty.
+    // Renderer reads the empty vec as "fall back to mono color".
+    let h = hunk(
+        (1, 1),
+        (1, 1),
+        "",
+        vec![line(DiffLineKind::Added, "just some plain text")],
+    );
+    let plan = build_render_plan(
+        &[file("LICENSE", DiffStatus::Modified, vec![h], false)],
+        false,
+    );
+    let FilePlan::Hunked { hunks, .. } = &plan[0] else {
+        panic!("expected hunked");
+    };
+    assert!(
+        hunks[0].rows[0].tokens.is_empty(),
+        "unknown-language row should have no tokens"
+    );
+}
+
+#[test]
+fn unpaired_lines_have_no_word_spans() {
+    // 1 Removed vs 2 Added — pair-up policy refuses unequal runs. Both
+    // sides keep `spans = None` and the renderer paints them with the
+    // whole-line tint instead.
+    let h = hunk(
+        (1, 1),
+        (1, 2),
+        "",
+        vec![
+            line(DiffLineKind::Removed, "let x = 1;"),
+            line(DiffLineKind::Added, "let y = 1;"),
+            line(DiffLineKind::Added, "let z = 2;"),
+        ],
+    );
+    let plan = build_render_plan(
+        &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
+        false,
+    );
+    let FilePlan::Hunked { hunks, .. } = &plan[0] else {
+        panic!("expected hunked");
+    };
+    for row in &hunks[0].rows {
+        assert!(row.spans.is_none(), "unpaired row should not carry spans");
+    }
 }
 
 #[test]

@@ -1,18 +1,17 @@
-//! Pure data plan + render helpers for the DiffView. Splitting the data plan
-//! (`build_render_plan`) from `IntoElement` construction lets tests assert on
-//! the plan without spinning up GPUI.
+//! Pure data plan for the DiffView. Splitting the plan-building from the
+//! `IntoElement` construction (see sibling `paint.rs`) lets tests assert
+//! on the plan without spinning up GPUI and keeps each side under the
+//! file-size soft cap.
 //!
-//! `build_render_plan` walks `&[FileDiff]` and produces a `RenderPlan`
-//! summarising what each file contributes — collapsed marker, hunks, special
-//! body (binary, mode-only, rename header). The IntoElement renderer in
-//! `mod.rs` consumes the plan and only deals with layout + colors.
+//! `build_render_plan` walks `&[FileDiff]` and produces a `Vec<FilePlan>`
+//! summarising what each file contributes — collapsed marker, hunks,
+//! special body (binary, mode-only, rename header). Word-level diff
+//! pairings live alongside each `LinePlan` row so the renderer can paint
+//! only the changed tokens.
 
-use crate::shell::diff_view::DiffView;
-use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled,
-    div, px,
-};
-use oximux_core::{DiffLineKind, DiffStatus, FileDiff};
+use crate::shell::diff_view::syntax::{HiToken, Language, detect_language, highlight_line};
+use crate::shell::diff_view::word_diff::{TokenSpan, diff_words, pair_runs};
+use oximux_core::{DiffLine, DiffLineKind, DiffStatus, FileDiff};
 use oximux_settings::{Density, Theme, Typography};
 
 /// Bundle of styling threaded through the render layer. Same trick as
@@ -87,6 +86,17 @@ pub struct LinePlan {
     /// 1-based new-side line number, or `None` for deletions / hunk-marker
     /// rows. Drives the right gutter cell.
     pub new_line: Option<u32>,
+    /// Word-level diff spans for paired Removed/Added rows. `Some` only when
+    /// this row is half of a 1:1 pair; the renderer paints each span with
+    /// its own color so only the changed words pop bright. `None` falls back
+    /// to the whole-line tint. See `word_diff::pair_runs` for pair-up rules.
+    pub spans: Option<Vec<TokenSpan>>,
+    /// Syntect-driven syntax tokens for this row's content. Empty when the
+    /// file's language is `Unknown` or the row is blank. The renderer paints
+    /// each token in its own color so keywords/strings/comments read at a
+    /// glance. Word-diff spans take precedence on Removed/Added paired rows
+    /// — see `paint::line_row` for the merge policy.
+    pub tokens: Vec<HiToken>,
 }
 
 /// Build the pure render plan.
@@ -96,6 +106,7 @@ pub fn build_render_plan(diffs: &[FileDiff], expanded: bool) -> Vec<FilePlan> {
 
 fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
     let path = d.path.display().to_string();
+    let lang = detect_language(d.path.as_path());
     let header = FileHeader {
         label: format_status_label(&d.status),
     };
@@ -129,8 +140,13 @@ fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
                         // NoNewlineHint carries no positional info.
                         let mut old_n = h.old_start.saturating_sub(1);
                         let mut new_n = h.new_start.saturating_sub(1);
-                        let rows: Vec<LinePlan> = h
-                            .lines
+                        // Pre-collapse the no-newline-EOF pattern git emits
+                        // when a file's trailing-newline state flips. Without
+                        // this the same content line shows once as deletion
+                        // and again as addition, which reads as "the line
+                        // changed" even though the bytes are identical.
+                        let collapsed = collapse_no_newline_eof(&h.lines);
+                        let mut rows: Vec<LinePlan> = collapsed
                             .iter()
                             .map(|l| {
                                 let (old_line, new_line) = match l.kind {
@@ -149,14 +165,31 @@ fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
                                     }
                                     DiffLineKind::NoNewlineHint => (None, None),
                                 };
+                                let tokens = tokens_for_row(&l.content, l.kind, lang);
                                 LinePlan {
                                     kind: l.kind,
                                     content: l.content.clone(),
                                     old_line,
                                     new_line,
+                                    spans: None,
+                                    tokens,
                                 }
                             })
                             .collect();
+                        // Second pass: compute word-level spans for paired
+                        // Removed↔Added rows. Only 1:1 adjacent runs pair —
+                        // see `word_diff::pair_runs`. Unpaired rows keep
+                        // `spans = None` and render with the existing
+                        // whole-line tint.
+                        let kinds: Vec<DiffLineKind> = rows.iter().map(|r| r.kind).collect();
+                        for pairing in pair_runs(&kinds) {
+                            let (old_spans, new_spans) = diff_words(
+                                &rows[pairing.old_row].content,
+                                &rows[pairing.new_row].content,
+                            );
+                            rows[pairing.old_row].spans = Some(old_spans);
+                            rows[pairing.new_row].spans = Some(new_spans);
+                        }
                         // Suppress the `@@` header when one side of the
                         // hunk carries no information — the user can already
                         // tell from the "Added" / "Deleted" status label
@@ -191,6 +224,66 @@ fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
     }
 }
 
+/// Compute syntax-highlighted tokens for one row's content. Skips the
+/// no-newline marker (it isn't real source) and respects the language
+/// stub — Unknown languages yield an empty vec, which the renderer reads
+/// as "fall back to mono color".
+fn tokens_for_row(content: &str, kind: DiffLineKind, lang: Language) -> Vec<HiToken> {
+    if matches!(kind, DiffLineKind::NoNewlineHint) {
+        return Vec::new();
+    }
+    highlight_line(content, lang)
+}
+
+/// Smooth over git's `\ No newline at end of file` quirk.
+///
+/// When a file's trailing-newline state flips (or new lines are appended to
+/// a file that lacks a trailing newline), `git diff` represents the last
+/// pre-existing line as a deletion *and* re-addition with a `\ No newline`
+/// hint sitting between them — even though the bytes themselves are
+/// unchanged. The user reads that as "the line changed". This pass:
+///
+///   1. Collapses every `Removed(X), NoNewlineHint, Added(X)` trio (where
+///      the content matches) into a single `Context(X)` row.
+///   2. Strips any remaining standalone `NoNewlineHint` rows. The
+///      no-newline state is conveyed by the absence of trailing-newline
+///      content, not by a body row, so the visual stays clean.
+///
+/// Real content edits at a no-newline boundary still render as removal
+/// + addition because contents differ — only the no-op flip is collapsed.
+pub fn collapse_no_newline_eof(lines: &[DiffLine]) -> Vec<DiffLine> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        // Detect the three-row pattern first so we don't strip the
+        // NoNewlineHint that belongs to it in the next branch.
+        if i + 2 < lines.len() {
+            let a = &lines[i];
+            let b = &lines[i + 1];
+            let c = &lines[i + 2];
+            if matches!(a.kind, DiffLineKind::Removed)
+                && matches!(b.kind, DiffLineKind::NoNewlineHint)
+                && matches!(c.kind, DiffLineKind::Added)
+                && a.content == c.content
+            {
+                out.push(DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: a.content.clone(),
+                });
+                i += 3;
+                continue;
+            }
+        }
+        if matches!(lines[i].kind, DiffLineKind::NoNewlineHint) {
+            i += 1;
+            continue;
+        }
+        out.push(lines[i].clone());
+        i += 1;
+    }
+    out
+}
+
 fn format_status_label(s: &DiffStatus) -> String {
     match s {
         DiffStatus::Added => "Added".to_string(),
@@ -207,282 +300,4 @@ fn format_status_label(s: &DiffStatus) -> String {
         }
         DiffStatus::Binary => "Binary".to_string(),
     }
-}
-
-/// Render the plan into an element. Called from `DiffView::render`.
-pub fn render_plan(
-    plan: &[FilePlan],
-    rctx: &RenderCtx<'_>,
-    cx: &mut Context<DiffView>,
-) -> impl IntoElement {
-    // The body's height MUST be its intrinsic content height, not
-    // `h_full()`. The parent in `DiffView::render` wraps this element
-    // in an `overflow_y_scroll` container which can only detect
-    // overflow when its child reports a height larger than the viewport.
-    // Setting `h_full()` here makes the body claim exactly the viewport
-    // height and the scroll affordance never fires — long diffs clip
-    // silently. Empty / placeholder paths still get `h_full` because
-    // they want to center vertically inside the available viewport.
-    if plan.is_empty() {
-        return div()
-            .flex()
-            .flex_col()
-            .h_full()
-            .w_full()
-            .child(placeholder("No diff".to_string(), rctx))
-            .into_any_element();
-    }
-    let mut col = div().flex().flex_col().w_full();
-    for fp in plan {
-        col = col.child(render_file_plan(fp, rctx, cx));
-    }
-    col.into_any_element()
-}
-
-fn render_file_plan(
-    fp: &FilePlan,
-    rctx: &RenderCtx<'_>,
-    cx: &mut Context<DiffView>,
-) -> impl IntoElement {
-    let block = div().flex().flex_col();
-    match fp {
-        FilePlan::Hunked {
-            path,
-            header,
-            hunks,
-        } => {
-            let mut col = block
-                .child(file_header_strip(
-                    format!("{path}  ·  {}", header.label),
-                    rctx,
-                ))
-                .child(hunks_body(hunks, rctx));
-            col = col.font(rctx.typography.mono_font());
-            col
-        }
-        FilePlan::Collapsed {
-            path,
-            header,
-            total_lines,
-            hunk_count,
-        } => {
-            let label =
-                format!("Large diff: {hunk_count} hunks, {total_lines} lines — click to expand");
-            block
-                .child(file_header_strip(
-                    format!("{path}  ·  {}", header.label),
-                    rctx,
-                ))
-                .child(expand_row(label, rctx, cx))
-        }
-        FilePlan::Binary { path, header } => block
-            .child(file_header_strip(
-                format!("{path}  ·  {}", header.label),
-                rctx,
-            ))
-            .child(body_placeholder(
-                "Binary file (body suppressed)".to_string(),
-                rctx,
-            )),
-        FilePlan::ModeOnly {
-            path,
-            header,
-            old_mode,
-            new_mode,
-        } => {
-            let msg = format!("Mode change only: {old_mode:o} → {new_mode:o}");
-            block
-                .child(file_header_strip(
-                    format!("{path}  ·  {}", header.label),
-                    rctx,
-                ))
-                .child(body_placeholder(msg, rctx))
-        }
-    }
-}
-
-fn file_header_strip(text: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .h(px(rctx.density.h_tab))
-        .px(px(rctx.density.pad_panel))
-        .bg(rctx.theme.bg_panel_alt)
-        .text_size(px(rctx.typography.t_label_caps))
-        .font_weight(rctx.typography.w_semibold)
-        .text_color(rctx.theme.fg_base)
-        .child(text)
-}
-
-fn hunks_body(hunks: &[HunkPlan], rctx: &RenderCtx<'_>) -> impl IntoElement {
-    // Gutter width auto-fits the largest line number across all hunks so
-    // the divider between gutter and content stays aligned across the
-    // whole file (no per-hunk shift when one hunk ends at line 9 and the
-    // next starts at line 1004).
-    let max_line: u32 = hunks
-        .iter()
-        .flat_map(|h| h.rows.iter())
-        .map(|r| r.old_line.unwrap_or(0).max(r.new_line.unwrap_or(0)))
-        .max()
-        .unwrap_or(0);
-    let gutter_digits = digit_count(max_line);
-
-    let mut col = div().flex().flex_col();
-    for h in hunks {
-        if !h.suppress_header {
-            col = col.child(hunk_header(h.header.clone(), rctx));
-        }
-        for r in &h.rows {
-            col = col.child(line_row(r, rctx, gutter_digits));
-        }
-    }
-    col
-}
-
-fn digit_count(n: u32) -> usize {
-    // Minimum gutter cell width of 2 digits keeps narrow files (≤ 9 lines)
-    // from looking cramped against the divider.
-    n.checked_ilog10().map(|d| d as usize + 1).unwrap_or(0).max(2)
-}
-
-fn hunk_header(header: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .h(px(rctx.density.h_row))
-        .px(px(rctx.density.pad_panel))
-        .bg(rctx.theme.bg_panel_alt)
-        .text_size(px(rctx.typography.t_body_sm))
-        .text_color(rctx.theme.status_warn)
-        .child(header)
-}
-
-fn line_row(
-    line: &LinePlan,
-    rctx: &RenderCtx<'_>,
-    gutter_digits: usize,
-) -> impl IntoElement {
-    let (prefix, fg, row_bg) = match line.kind {
-        DiffLineKind::Context => (' ', rctx.theme.fg_muted, None),
-        DiffLineKind::Added => (
-            '+',
-            rctx.theme.status_ok,
-            // Faded green background telegraphs the added range stronger
-            // than the `+` glyph alone. `a = 0.22` reads as clearly green
-            // against the charcoal cockpit theme without bleaching the
-            // foreground text.
-            Some(gpui::Hsla {
-                a: 0.22,
-                ..rctx.theme.git.added
-            }),
-        ),
-        DiffLineKind::Removed => (
-            '-',
-            rctx.theme.status_error,
-            Some(gpui::Hsla {
-                a: 0.22,
-                ..rctx.theme.git.deleted
-            }),
-        ),
-        DiffLineKind::NoNewlineHint => ('\\', rctx.theme.fg_subtle, None),
-    };
-    // Each gutter cell packs `<number><sign>` so the eye lands on the
-    // number first and the sign second — matches the convention used by
-    // GitLens / GitHub / VS Code. The sign is rendered per-cell rather
-    // than per-row so a removal in the old cell still reads as removed
-    // even when the row also has an addition mirror.
-    let old_cell = pack_gutter_cell(line.old_line, line.kind, /*is_new_side=*/ false, gutter_digits);
-    let new_cell = pack_gutter_cell(line.new_line, line.kind, /*is_new_side=*/ true, gutter_digits);
-    let gutter = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(4.0))
-        .pl(px(rctx.density.pad_panel))
-        .pr(px(rctx.density.pad_panel))
-        .text_size(px(rctx.typography.t_body_sm))
-        .text_color(rctx.theme.fg_subtle)
-        .child(div().child(old_cell))
-        .child(div().child(new_cell));
-    let mut row = div()
-        .flex()
-        .items_center()
-        .h(px(rctx.density.h_row))
-        .text_size(px(rctx.typography.t_body_sm))
-        .text_color(fg);
-    if let Some(bg) = row_bg {
-        row = row.bg(bg);
-    }
-    row.child(gutter)
-        .child(
-            div()
-                .flex_1()
-                .pr(px(rctx.density.pad_panel))
-                .child(format!("{prefix} {}", line.content)),
-        )
-}
-
-/// Build one gutter cell as `<right-aligned number><sign>`. The sign
-/// column is always 1 char wide, so cells align regardless of whether
-/// they carry a sign or not.
-fn pack_gutter_cell(
-    line_no: Option<u32>,
-    kind: DiffLineKind,
-    is_new_side: bool,
-    digits: usize,
-) -> String {
-    let n = match line_no {
-        Some(n) => format!("{n:>width$}", width = digits),
-        None => " ".repeat(digits),
-    };
-    let sign = match (kind, is_new_side, line_no.is_some()) {
-        (DiffLineKind::Added, true, true) => '+',
-        (DiffLineKind::Removed, false, true) => '-',
-        _ => ' ',
-    };
-    format!("{n}{sign}")
-}
-
-fn expand_row(label: String, rctx: &RenderCtx<'_>, cx: &mut Context<DiffView>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .h(px(rctx.density.h_row))
-        .px(px(rctx.density.pad_panel))
-        .bg(rctx.theme.bg_panel)
-        .text_size(px(rctx.typography.t_body_sm))
-        .text_color(rctx.theme.status_info)
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |view, _: &MouseDownEvent, _window, cx| {
-                view.expand();
-                cx.notify();
-            }),
-        )
-        .child(label)
-}
-
-fn body_placeholder(msg: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .h(px(rctx.density.h_tab))
-        .px(px(rctx.density.pad_panel))
-        .text_size(px(rctx.typography.t_body_sm))
-        .text_color(rctx.theme.fg_subtle)
-        .child(msg)
-}
-
-fn placeholder(msg: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .h_full()
-        .p(px(rctx.density.pad_panel))
-        .text_size(px(rctx.typography.t_body_sm))
-        .text_color(rctx.theme.fg_subtle)
-        .child(msg)
 }
