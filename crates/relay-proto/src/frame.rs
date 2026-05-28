@@ -217,6 +217,11 @@ mod tests {
             },
             Request::ListPtys,
             Request::Shutdown,
+            Request::Notify {
+                pty_id: "pty-1".into(),
+                title: "Claude".into(),
+                body: "waiting for input".into(),
+            },
         ];
         for (i, v) in variants.into_iter().enumerate() {
             round_trip(Frame::Request {
@@ -280,6 +285,11 @@ mod tests {
         round_trip(Frame::Notification(Notification::Exit {
             pty_id: "p".into(),
             code: None,
+        }));
+        round_trip(Frame::Notification(Notification::Attention {
+            pty_id: "p".into(),
+            title: "Codex".into(),
+            body: "needs approval".into(),
         }));
     }
 

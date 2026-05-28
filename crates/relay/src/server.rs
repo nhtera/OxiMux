@@ -428,6 +428,14 @@ async fn handle_request(
                 Err(e) => err_from(&e),
             }
         }
+        Request::Notify {
+            pty_id,
+            title,
+            body,
+        } => match registry.notify(&pty_id, title, body) {
+            Ok(()) => Response::Ok,
+            Err(e) => err_from(&e),
+        },
         Request::ListPtys => Response::PtyList(registry.list()),
         Request::Stats => Response::StatsOk(registry.stats()),
         Request::Shutdown => {

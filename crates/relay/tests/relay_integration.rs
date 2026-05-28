@@ -262,6 +262,76 @@ async fn attach_replays_buffered_output_then_streams_live() {
 }
 
 #[tokio::test]
+async fn notify_fans_out_attention_to_subscribers() {
+    // `oximux notify` → Request::Notify → the daemon fans a
+    // Notification::Attention to every subscriber of that PTY. The
+    // spawning session is auto-attached, so client A is a subscriber.
+    let relay = boot_relay().await;
+    let (mut a, mut a_buf) = connect_and_hello(&relay).await;
+    let pty_id = match req(
+        &mut a,
+        &mut a_buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id } => pty_id,
+        other => panic!("spawn: {other:?}"),
+    };
+
+    // Send Notify directly (not via `req`) so we can observe BOTH the Ok
+    // response and the Attention notification regardless of wire order —
+    // `req` would discard the notification while scanning for the response.
+    write_frame(
+        &mut a,
+        &Frame::Request {
+            request_id: 3,
+            request: Request::Notify {
+                pty_id: pty_id.clone(),
+                title: "Claude".into(),
+                body: "needs you".into(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got_ok = false;
+    let mut got_attention = false;
+    while (!got_ok || !got_attention) && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), read_frame(&mut a, &mut a_buf)).await
+        {
+            Ok(Ok(Frame::Response {
+                request_id: 3,
+                response: Response::Ok,
+            })) => got_ok = true,
+            Ok(Ok(Frame::Notification(Notification::Attention {
+                pty_id: p,
+                title,
+                body,
+            }))) => {
+                assert_eq!(p, pty_id, "attention for wrong pty");
+                assert_eq!(title, "Claude");
+                assert_eq!(body, "needs you");
+                got_attention = true;
+            }
+            // Skip the shell's startup Output / anything else.
+            _ => {}
+        }
+    }
+    assert!(got_ok, "Notify did not return Ok");
+    assert!(got_attention, "subscriber never received Attention fan-out");
+}
+
+#[tokio::test]
 async fn bad_token_rejected_with_auth_failed() {
     let relay = boot_relay().await;
     let mut stream = UnixStream::connect(&relay.socket).await.unwrap();

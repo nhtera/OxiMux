@@ -231,7 +231,9 @@ async fn reader_loop(
 
 fn fan_to_subscriber(subscribers: &PtySubscribers, notif: Notification) {
     let pty_id = match &notif {
-        Notification::Output { pty_id, .. } | Notification::Exit { pty_id, .. } => pty_id.clone(),
+        Notification::Output { pty_id, .. }
+        | Notification::Exit { pty_id, .. }
+        | Notification::Attention { pty_id, .. } => pty_id.clone(),
     };
     if let Some(entry) = subscribers.get(&pty_id) {
         if entry.value().send(notif).is_err() {

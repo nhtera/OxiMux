@@ -113,6 +113,10 @@ impl PtyRegistry {
             .shell
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/zsh".into());
+        // Mint the PTY id up front so it can be injected into the child's
+        // environment as OXIMUX_PTY_ID — the `oximux notify` CLI reads it to
+        // tell the daemon which pane to raise attention on.
+        let pty_id = Uuid::new_v4().to_string();
         let mut command = CommandBuilder::new(&shell);
         command.cwd(&args.cwd);
         // Terminal identity defaults. The daemon is spawned detached, so it
@@ -126,6 +130,9 @@ impl PtyRegistry {
         // Host-terminal identity: tools and AI agents detect the emulator
         // via TERM_PROGRAM to toggle features (clickable links, keybinds).
         command.env("TERM_PROGRAM", "oximux");
+        // Pane handle for `oximux notify` (set before the caller loop so an
+        // explicit override still wins, though callers shouldn't set it).
+        command.env("OXIMUX_PTY_ID", &pty_id);
         for (k, v) in &args.env {
             command.env(k, v);
         }
@@ -140,7 +147,6 @@ impl PtyRegistry {
         let reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
 
-        let pty_id = Uuid::new_v4().to_string();
         let ring = Arc::new(Mutex::new(RingBuffer::new(REPLAY_BUFFER_BYTES)));
         let subscribers: Arc<Mutex<Vec<Sender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
         let child_exited = Arc::new(AtomicBool::new(false));
@@ -232,6 +238,26 @@ impl PtyRegistry {
         entry
             .bytes_in
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Fan out an explicit attention notification to every subscriber of
+    /// `pty_id` — driven by `Request::Notify` (the `oximux notify` CLI). The
+    /// owning client maps the `Attention` notification to a pane attention
+    /// signal (ring + tab dot).
+    pub fn notify(&self, pty_id: &str, title: String, body: String) -> Result<(), RegistryError> {
+        let entry = self
+            .entries
+            .get(pty_id)
+            .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
+        fan_out(
+            &entry.subscribers,
+            Notification::Attention {
+                pty_id: pty_id.to_owned(),
+                title,
+                body,
+            },
+        );
         Ok(())
     }
 

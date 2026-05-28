@@ -7,7 +7,7 @@ use crate::error::ErrCode;
 // major builds can't even reach the handshake; this constant is the
 // failsafe for the case where an old client somehow finds a newer
 // daemon's socket (dev environments).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -76,6 +76,16 @@ pub enum Request {
     ListPtys,
     Stats,
     Shutdown,
+    /// Explicit attention request for a PTY — sent by the `oximux notify`
+    /// CLI (which agent hooks / scripts invoke). The daemon fans out a
+    /// `Notification::Attention` to that PTY's subscribers so the owning
+    /// pane raises its attention signal. Appended last to keep existing
+    /// bincode variant indices stable.
+    Notify {
+        pty_id: String,
+        title: String,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,4 +111,13 @@ pub enum Response {
 pub enum Notification {
     Output { pty_id: String, bytes: Vec<u8> },
     Exit { pty_id: String, code: Option<i32> },
+    /// Explicit attention raised via `Request::Notify`. The client maps
+    /// this to a pane attention signal (ring + tab dot). `title`/`body`
+    /// are carried for a future OS-banner surface; today the client only
+    /// uses it to flag attention.
+    Attention {
+        pty_id: String,
+        title: String,
+        body: String,
+    },
 }

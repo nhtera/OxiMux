@@ -171,6 +171,13 @@ impl RelayBackend {
                         push_event(&queues, id, TerminalEvent::Exit { id, code });
                         return;
                     }
+                    // Explicit `oximux notify` → raise the same pane attention
+                    // as a bell. (title/body are carried on the wire for a
+                    // future OS-banner surface; not consumed here yet.)
+                    Notification::Attention { .. } => {
+                        push_event(&queues, id, TerminalEvent::Bell { id });
+                        continue;
+                    }
                 };
                 push_event(&queues, id, event);
             }

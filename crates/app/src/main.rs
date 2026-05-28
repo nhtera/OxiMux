@@ -35,7 +35,7 @@ use oximux_app::workspace_root::WorkspaceRoot;
 use oximux_editor::SaveFile;
 use oximux_git::Repository;
 use oximux_pty::TerminalBackend;
-use oximux_relay_client::RelayBackend;
+use oximux_relay_client::{RelayBackend, RelayClient};
 use oximux_storage::Db;
 use tracing_subscriber::EnvFilter;
 
@@ -76,6 +76,15 @@ fn main() {
     if std::env::args().any(|a| a == "--file-tree-spike") {
         run_file_tree_spike();
         return;
+    }
+
+    // `oximux notify [--title T] [--body B]` — explicit attention signal for
+    // the current pane, invoked by agent hooks (Claude Code `Stop`, Codex
+    // `notify`) or scripts. Reads OXIMUX_PTY_ID from the env (injected by the
+    // daemon at spawn), connects to the relay, and asks it to ring that pane.
+    // Short-circuits the GUI/db boot entirely.
+    if std::env::args().nth(1).as_deref() == Some("notify") {
+        std::process::exit(run_notify_cli(&rt));
     }
 
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
@@ -555,6 +564,72 @@ fn open_db_or_exit() -> Db {
             std::process::exit(1);
         }
     }
+}
+
+/// `oximux notify` CLI entry. Resolves the relay socket/token the same way
+/// the supervisor does, connects, and sends `Request::Notify` for the pane
+/// named by `OXIMUX_PTY_ID`. Returns a process exit code (0 = ok).
+fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
+    let mut title = String::new();
+    let mut body = String::new();
+    let mut args = std::env::args().skip(2);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--title" => title = args.next().unwrap_or_default(),
+            "--body" => body = args.next().unwrap_or_default(),
+            _ => {}
+        }
+    }
+    let pty_id = match std::env::var("OXIMUX_PTY_ID") {
+        Ok(id) if !id.is_empty() => id,
+        _ => {
+            eprintln!("oximux notify: OXIMUX_PTY_ID not set (run inside an OxiMux terminal)");
+            return 1;
+        }
+    };
+    let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
+        eprintln!("oximux notify: cannot resolve application data directory");
+        return 1;
+    };
+    let supervisor = RelaySupervisor::new(
+        data_dir.join(APP_DATA_SUBDIR),
+        home.join("Library/Logs").join(APP_DATA_SUBDIR),
+    );
+    let socket = supervisor.socket_path();
+    let token = match std::fs::read_to_string(supervisor.token_path()) {
+        Ok(t) => t.trim().to_owned(),
+        Err(err) => {
+            eprintln!("oximux notify: relay not reachable ({err})");
+            return 1;
+        }
+    };
+    rt.block_on(async move {
+        let client = match RelayClient::connect(&socket, &token).await {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("oximux notify: connect failed: {err}");
+                return 1;
+            }
+        };
+        match client
+            .request(oximux_relay_proto::Request::Notify {
+                pty_id,
+                title,
+                body,
+            })
+            .await
+        {
+            Ok(oximux_relay_proto::Response::Ok) => 0,
+            Ok(other) => {
+                eprintln!("oximux notify: unexpected response: {other:?}");
+                1
+            }
+            Err(err) => {
+                eprintln!("oximux notify: request failed: {err}");
+                1
+            }
+        }
+    })
 }
 
 // Best-effort: bring up the relay daemon and install the shared
