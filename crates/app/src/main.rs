@@ -252,7 +252,31 @@ fn main() {
         // `open_workspace_window` factory, so each gets an independent
         // `WorkspaceRoot` and the quit / close paths treat them uniformly.
         install_app_lifecycle(cx, repo.clone(), app_state.clone());
-        open_workspace_window(cx, repo, app_state);
+
+        // Reopen the windows that were open at the last quit. An empty /
+        // absent manifest (fresh install, or data from before multi-window)
+        // takes the legacy single-window path: one "main" window bootstrapped
+        // to the most-recent project.
+        let manifest =
+            oximux_app::project_panes_factory::load_windows_manifest(app_state.settings_repo());
+        if manifest.windows.is_empty() {
+            open_workspace_window(cx, repo, app_state);
+        } else {
+            // Reserve every restored id up front so a later Cmd+N can't re-mint
+            // one and alias a restored window's persisted rows.
+            for entry in &manifest.windows {
+                oximux_app::window_registry::note_restored_id(cx, &entry.window_id);
+            }
+            for entry in manifest.windows {
+                open_workspace_window_with(
+                    cx,
+                    repo.clone(),
+                    app_state.clone(),
+                    entry.window_id,
+                    entry.project_id,
+                );
+            }
+        }
     });
 }
 
@@ -299,30 +323,43 @@ fn workspace_window_options(cx: &mut gpui::App, cascade: usize) -> WindowOptions
     }
 }
 
-/// Open one workspace window: build its `WorkspaceRoot`, restore its active
-/// project, and register it so the app-level quit / close observers can reach
-/// it. Reused for the first window and every `NewWindow` action.
+/// Open a fresh workspace window: mint a new persist id ("main" for the
+/// first, "w{n}" after) and bootstrap the most-recent project. Used for the
+/// first window on a clean boot and every `NewWindow` action.
 fn open_workspace_window(
     cx: &mut gpui::App,
     repo: Option<Repository>,
     app_state: oximux_app::state::AppState,
 ) {
+    let persist_id = oximux_app::window_registry::next_persist_id(cx);
+    open_workspace_window_with(cx, repo, app_state, persist_id, None);
+}
+
+/// Open one workspace window under an explicit persist id, register it, and
+/// activate a project. `restore_project = Some(id)` activates that specific
+/// project (multi-window restore at boot); `None` bootstraps the most-recent
+/// project (fresh window). Registering lets the app-level quit / close
+/// observers reach this window.
+fn open_workspace_window_with(
+    cx: &mut gpui::App,
+    repo: Option<Repository>,
+    app_state: oximux_app::state::AppState,
+    window_id: String,
+    restore_project: Option<String>,
+) {
     let cascade = oximux_app::window_registry::remaining(cx);
     let options = workspace_window_options(cx, cascade);
-    // Mint the persistence id BEFORE the window opens so it can key this
-    // window's layout / buffer / relay-id rows. The first window is "main"
-    // (legacy single-window key); later windows get "w{n}".
-    let persist_id = oximux_app::window_registry::next_persist_id(cx);
     let _ = cx.open_window(options, move |window, cx| {
-        // Clone persist_id so both WorkspaceRoot::new and register() can use it.
-        let window_id_for_root = persist_id.clone();
         let workspace =
-            cx.new(|cx| WorkspaceRoot::new(repo, app_state, window_id_for_root, window, cx));
-        // Restore last-active project so the sidebar isn't empty after relaunch.
-        workspace.update(cx, |root, cx| root.bootstrap_active_project(window, cx));
+            cx.new(|cx| WorkspaceRoot::new(repo, app_state, window_id.clone(), window, cx));
+        // Restore the window's project so the sidebar isn't empty after relaunch.
+        workspace.update(cx, |root, cx| match restore_project.as_deref() {
+            Some(project_id) => root.restore_active_project(project_id, window, cx),
+            None => root.bootstrap_active_project(window, cx),
+        });
         // Track this window so quit-save + last-window-close gating find it.
-        let window_id = window.window_handle().window_id();
-        oximux_app::window_registry::register(cx, window_id, persist_id, workspace.clone());
+        let gpui_window_id = window.window_handle().window_id();
+        oximux_app::window_registry::register(cx, gpui_window_id, window_id, workspace.clone());
         // Wrap in gpui-component's `Root` (hosts tooltip / dialog /
         // notification overlays). On macOS its window_border shadow is 0, so
         // it's a transparent pass-through — purely additive.
@@ -360,44 +397,27 @@ fn install_app_lifecycle(
     cx.on_app_quit(move |cx| {
         oximux_app::shell::terminal_view::APP_QUITTING
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        for (_persist_id, workspace) in window_registry::all_windows(cx) {
-            let root = workspace.read(cx);
-            root.capture_all_layouts(cx);
-            root.capture_all_pane_buffers(cx);
-            root.capture_all_pane_relay_ids(cx);
-        }
+        window_registry::capture_session(cx);
         async {}
     })
     .detach();
 
-    // Window close. Closing the LAST window quits the app — and saves
-    // synchronously, keeping PTYs alive (belt-and-braces for the race where
-    // on_app_quit is skipped, e.g. red-traffic-light close followed by a
-    // Ctrl+C in the launching terminal). Closing a NON-last window dismisses
-    // just that window: dropping its registry entry tears down its
-    // `WorkspaceRoot` (and SIGTERMs only its own PTYs, because APP_QUITTING
-    // stays clear), leaving the other windows untouched.
+    // Window close. Closing the LAST window quits the app — and saves the
+    // whole session + manifest synchronously, keeping PTYs alive (belt-and-
+    // braces for the race where on_app_quit is skipped, e.g. red-traffic-light
+    // close followed by a Ctrl+C in the launching terminal). The last window
+    // is intentionally NOT removed from the registry first, so capture_session
+    // still sees it (on_app_quit re-runs the capture idempotently). Closing a
+    // NON-last window dismisses just that window: dropping its registry entry
+    // tears down its `WorkspaceRoot` and SIGTERMs only its own PTYs (because
+    // APP_QUITTING stays clear), leaving the other windows untouched.
     cx.on_window_closed(move |cx, window_id| {
-        let Some(removed) = window_registry::remove(cx, window_id) else {
-            return;
-        };
-        let is_last = window_registry::remaining(cx) == 0;
-        if is_last {
+        if window_registry::remaining(cx) <= 1 {
             oximux_app::shell::terminal_view::APP_QUITTING
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            {
-                let root = removed.workspace.read(cx);
-                root.capture_all_layouts(cx);
-                root.capture_all_pane_buffers(cx);
-                root.capture_all_pane_relay_ids(cx);
-            }
-            // Release the last strong handle, then exit. APP_QUITTING is
-            // already set, so teardown leaves the relay PTYs alive.
-            drop(removed);
+            window_registry::capture_session(cx);
             cx.quit();
-        } else {
-            // Dismiss just this window: dropping the strong handle here is
-            // what SIGTERMs this window's PTYs (APP_QUITTING is clear).
+        } else if let Some(removed) = window_registry::remove(cx, window_id) {
             drop(removed);
         }
     })

@@ -25,7 +25,7 @@ use oximux_storage::{PaneBufferRepo, SettingsRepo};
 use crate::notifier::Notifier;
 use crate::persisted_terminals::{
     PersistedAgentTab, PersistedSubPane, PersistedTab, PersistedTabKind, PersistedTabs,
-    legacy_settings_key, settings_key,
+    WINDOWS_MANIFEST_KEY, WindowsManifest, legacy_settings_key, settings_key,
 };
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
@@ -663,5 +663,35 @@ pub(crate) fn save_persisted_tabs(
     };
     if let Err(err) = repo.set(&key, &json) {
         tracing::warn!(?err, project_id, window_id, "save_persisted_tabs: settings.set failed");
+    }
+}
+
+/// Read the open-windows manifest. Returns an empty manifest (→ legacy
+/// single-window boot) when the key is absent or fails to parse. `pub` so
+/// the binary crate's boot path can decide how many windows to reopen.
+pub fn load_windows_manifest(repo: &SettingsRepo) -> WindowsManifest {
+    match repo.get(WINDOWS_MANIFEST_KEY) {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_else(|err| {
+            tracing::warn!(?err, "load_windows_manifest: parse failed; ignoring");
+            WindowsManifest::default()
+        }),
+        Ok(None) => WindowsManifest::default(),
+        Err(err) => {
+            tracing::warn!(?err, "load_windows_manifest: settings.get failed");
+            WindowsManifest::default()
+        }
+    }
+}
+
+/// Persist the open-windows manifest (called from the quit / last-window
+/// capture path). `pub` so the lib-level session-capture helper can save it.
+pub fn save_windows_manifest(repo: &SettingsRepo, manifest: &WindowsManifest) {
+    match serde_json::to_string(manifest) {
+        Ok(json) => {
+            if let Err(err) = repo.set(WINDOWS_MANIFEST_KEY, &json) {
+                tracing::warn!(?err, "save_windows_manifest: settings.set failed");
+            }
+        }
+        Err(err) => tracing::warn!(?err, "save_windows_manifest: serialize failed"),
     }
 }

@@ -213,6 +213,33 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Boot-time helper for multi-window restore: activate the SPECIFIC
+    /// project this window had open at the last quit (looked up in the
+    /// recents snapshot by id). No-op when the project is no longer in
+    /// recents (e.g. deleted) — the window opens on the welcome view.
+    /// Public so the bin's `main.rs` can call it per restored window.
+    pub fn restore_active_project(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(project) = self
+            .app_state
+            .recent_projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+        {
+            self.set_active_project(project, window, cx);
+        } else {
+            tracing::info!(
+                project_id,
+                "restore_active_project: project not in recents; opening welcome view"
+            );
+        }
+    }
+
     /// Re-pull `app_state.recent_projects` from the DB. Called after a new
     /// project is inserted (add-project dialog) or an existing one is
     /// touched (picker) so the in-memory snapshot stays in sync with the

@@ -60,6 +60,18 @@ impl WindowRegistry {
             format!("w{n}")
         }
     }
+
+    /// Advance the mint counter past an id restored from the manifest, so a
+    /// later `mint_persist_id` (a fresh Cmd+N window) never re-issues an id
+    /// already in use — which would alias another window's persisted rows.
+    /// `"main"` reserves slot 0; `"w{n}"` reserves through `n`.
+    fn note_restored(&mut self, id: &str) {
+        if id == PRIMARY_WINDOW_ID {
+            self.minted = self.minted.max(1);
+        } else if let Some(n) = id.strip_prefix('w').and_then(|s| s.parse::<u64>().ok()) {
+            self.minted = self.minted.max(n + 1);
+        }
+    }
 }
 
 fn ensure_global(cx: &mut App) {
@@ -127,6 +139,46 @@ pub fn remaining(cx: &App) -> usize {
         .unwrap_or(0)
 }
 
+/// Reserve an id restored from the manifest so a later `next_persist_id`
+/// (Cmd+N) can't re-issue it. Call once per restored window id at boot,
+/// BEFORE opening the windows.
+pub fn note_restored_id(cx: &mut App, id: &str) {
+    ensure_global(cx);
+    cx.global_mut::<WindowRegistry>().note_restored(id);
+}
+
+/// Capture every tracked window's session state (layout + scrollback +
+/// relay ids) and write the open-windows manifest, so the next launch
+/// reopens the same windows on the same projects. Called from the app-quit
+/// and last-window-close hooks. No-op when no windows are tracked (so a
+/// stray late call can't wipe a manifest written moments earlier).
+pub fn capture_session(cx: &mut App) {
+    let windows = all_windows(cx);
+    if windows.is_empty() {
+        return;
+    }
+    let mut manifest = crate::persisted_terminals::WindowsManifest::default();
+    let mut settings_repo: Option<oximux_storage::SettingsRepo> = None;
+    for (persist_id, workspace) in &windows {
+        let root = workspace.read(cx);
+        root.capture_all_layouts(cx);
+        root.capture_all_pane_buffers(cx);
+        root.capture_all_pane_relay_ids(cx);
+        manifest
+            .windows
+            .push(crate::persisted_terminals::PersistedWindow {
+                window_id: persist_id.clone(),
+                project_id: root.active_project_id(),
+            });
+        if settings_repo.is_none() {
+            settings_repo = Some(root.settings_repo().clone());
+        }
+    }
+    if let Some(repo) = settings_repo {
+        crate::project_panes_factory::save_windows_manifest(&repo, &manifest);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +192,32 @@ mod tests {
         assert_eq!(reg.mint_persist_id(), PRIMARY_WINDOW_ID);
         assert_eq!(reg.mint_persist_id(), "w1");
         assert_eq!(reg.mint_persist_id(), "w2");
+    }
+
+    #[test]
+    fn note_restored_advances_counter_so_new_windows_dont_alias() {
+        // After restoring windows from a manifest, a fresh Cmd+N window must
+        // never re-mint an id already in use — that would alias another
+        // window's persisted rows. note_restored bumps the counter past every
+        // restored id.
+        let mut reg = WindowRegistry::default();
+        for id in ["main", "w1", "w2"] {
+            reg.note_restored(id);
+        }
+        assert_eq!(reg.mint_persist_id(), "w3");
+
+        // Gaps are tolerated: the counter clears the highest seen index, and
+        // "main" is never re-minted once any window exists.
+        let mut reg = WindowRegistry::default();
+        for id in ["w1", "w3"] {
+            reg.note_restored(id);
+        }
+        assert_eq!(reg.mint_persist_id(), "w4");
+
+        // Unrecognized ids are ignored (no panic, no counter change).
+        let mut reg = WindowRegistry::default();
+        reg.note_restored("garbage");
+        assert_eq!(reg.mint_persist_id(), PRIMARY_WINDOW_ID);
     }
 
     #[test]

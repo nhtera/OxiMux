@@ -40,6 +40,29 @@ pub fn legacy_settings_key(project_id: &str) -> String {
     format!("{KEY_PREFIX}{project_id}")
 }
 
+/// Settings key for the open-windows manifest (the set of windows that were
+/// open at the last quit, so boot can reopen them all).
+pub const WINDOWS_MANIFEST_KEY: &str = "open_windows";
+
+/// The set of windows open at the last quit. Persisted under
+/// [`WINDOWS_MANIFEST_KEY`] so the next launch reopens each window under its
+/// stable `window_id`, restoring that window's project + per-window layout.
+/// An absent / empty manifest means "single-window legacy boot" — open one
+/// window keyed `"main"` and bootstrap the most-recent project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WindowsManifest {
+    pub windows: Vec<PersistedWindow>,
+}
+
+/// One window's restore record: its stable persist id + the project that was
+/// active in it at quit (`None` = no project, e.g. the welcome screen).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWindow {
+    pub window_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedTabs {
     pub tabs: Vec<PersistedTab>,

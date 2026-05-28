@@ -602,6 +602,21 @@ impl WorkspaceRoot {
         }
     }
 
+    /// The id of the project currently active in this window, if any. Read
+    /// by the open-windows manifest writer so the next launch can reopen
+    /// this window onto the same project.
+    pub(crate) fn active_project_id(&self) -> Option<String> {
+        self.active_project.as_ref().map(|p| p.id.clone())
+    }
+
+    /// Borrow this window's `SettingsRepo` (shared app-wide via the same DB).
+    /// The lib-level session-capture helper uses it to persist the
+    /// open-windows manifest without the binary crate reaching into
+    /// `AppState`'s private fields.
+    pub(crate) fn settings_repo(&self) -> &oximux_storage::SettingsRepo {
+        &self.app_state.settings_repo
+    }
+
     /// Spawn the chosen agent in a new tab inside the active pane group.
     /// Runs the start_session → backend_for → terminal_session_id →
     /// subscribe_status chain, then hands the assembled handles to

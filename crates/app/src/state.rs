@@ -68,6 +68,13 @@ impl AppState {
     pub fn pane_relay_id_repo(&self) -> &PaneRelayIdRepo {
         &self.pane_relay_id_repo
     }
+
+    /// Accessor for the binary crate's boot path, which reads the
+    /// open-windows manifest to decide how many windows to reopen.
+    /// Internal callers use the field directly.
+    pub fn settings_repo(&self) -> &SettingsRepo {
+        &self.settings_repo
+    }
 }
 
 /// Load recent projects + their workspaces, then mark every alive-at-
