@@ -25,7 +25,18 @@ use crate::shell::pane_tree::{Axis, PaneTree};
 
 const KEY_PREFIX: &str = "terminal_tabs:";
 
-pub fn settings_key(project_id: &str) -> String {
+/// Build the settings key for per-window tab persistence. Format:
+/// `terminal_tabs:<project_id>:<window_id>`. The window_id scopes saves
+/// so two app windows on the same project don't clobber each other.
+pub fn settings_key(project_id: &str, window_id: &str) -> String {
+    format!("{KEY_PREFIX}{project_id}:{window_id}")
+}
+
+/// Legacy (pre-V005) settings key. Format: `terminal_tabs:<project_id>`.
+/// Used as a fallback read when `window_id == "main"` and the new-format
+/// key returns `None` — preserves single-window users' tab layout across
+/// the upgrade without data loss.
+pub fn legacy_settings_key(project_id: &str) -> String {
     format!("{KEY_PREFIX}{project_id}")
 }
 
@@ -293,7 +304,13 @@ mod tests {
 
     #[test]
     fn settings_key_format() {
-        assert_eq!(settings_key("proj_abc"), "terminal_tabs:proj_abc");
+        assert_eq!(settings_key("proj_abc", "main"), "terminal_tabs:proj_abc:main");
+        assert_eq!(settings_key("proj_abc", "w1"), "terminal_tabs:proj_abc:w1");
+    }
+
+    #[test]
+    fn legacy_settings_key_format() {
+        assert_eq!(legacy_settings_key("proj_abc"), "terminal_tabs:proj_abc");
     }
 
     #[test]

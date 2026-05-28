@@ -314,7 +314,10 @@ fn open_workspace_window(
     // (legacy single-window key); later windows get "w{n}".
     let persist_id = oximux_app::window_registry::next_persist_id(cx);
     let _ = cx.open_window(options, move |window, cx| {
-        let workspace = cx.new(|cx| WorkspaceRoot::new(repo, app_state, window, cx));
+        // Clone persist_id so both WorkspaceRoot::new and register() can use it.
+        let window_id_for_root = persist_id.clone();
+        let workspace =
+            cx.new(|cx| WorkspaceRoot::new(repo, app_state, window_id_for_root, window, cx));
         // Restore last-active project so the sidebar isn't empty after relaunch.
         workspace.update(cx, |root, cx| root.bootstrap_active_project(window, cx));
         // Track this window so quit-save + last-window-close gating find it.

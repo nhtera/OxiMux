@@ -41,7 +41,10 @@ pub struct Migration {
 /// (per-pane mapping to relay-side PTY ids for cross-restart attach,
 /// Phase 5 step 5). V004 extends `pane_buffers` with `sub_pane_ordinal`
 /// so multi-sub-pane terminal tabs (Cmd+D splits, F3.4) keep one
-/// scrollback per leaf. Future migrations append; never reorder, never
+/// scrollback per leaf. V005 adds `window_id` to both `pane_buffers`
+/// and `pane_relay_ids` primary keys so two app windows sharing a
+/// project never clobber each other's saved state; legacy rows default
+/// to window_id='main'. Future migrations append; never reorder, never
 /// rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -63,6 +66,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "pane_buffers_sub_pane",
         sql: include_str!("../migrations/V004__pane_buffers_sub_pane.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "per_window_persistence",
+        sql: include_str!("../migrations/V005__per_window_persistence.sql"),
     },
 ];
 

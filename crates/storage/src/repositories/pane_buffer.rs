@@ -30,12 +30,15 @@ impl PaneBufferRepo {
         Self { db }
     }
 
-    /// Upsert one sub-pane's bytes at the given `(ordinal,
+    /// Upsert one sub-pane's bytes at the given `(window_id, ordinal,
     /// sub_pane_ordinal)`. Single-sub-pane tabs always pass `0` for
     /// `sub_pane_ordinal` so legacy single-pane behavior is unchanged.
+    /// `window_id` scopes the row to one app window; use `"main"` for
+    /// the first/only window to match the V005 migration default.
     pub fn set(
         &self,
         project_id: &str,
+        window_id: &str,
         ordinal: u32,
         sub_pane_ordinal: u32,
         bytes: &[u8],
@@ -44,32 +47,33 @@ impl PaneBufferRepo {
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO pane_buffers \
-                    (project_id, ordinal, sub_pane_ordinal, bytes, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(project_id, ordinal, sub_pane_ordinal) DO UPDATE SET \
+                    (project_id, window_id, ordinal, sub_pane_ordinal, bytes, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(project_id, window_id, ordinal, sub_pane_ordinal) DO UPDATE SET \
                     bytes = excluded.bytes, updated_at = excluded.updated_at",
-                params![project_id, ordinal, sub_pane_ordinal, bytes, ts],
+                params![project_id, window_id, ordinal, sub_pane_ordinal, bytes, ts],
             )
             .map(|_| ())
         })?;
         Ok(())
     }
 
-    /// Fetch every buffer for a project, ordered by `(ordinal,
-    /// sub_pane_ordinal)` ascending. Returns triples of `(tab_ordinal,
-    /// sub_pane_ordinal, bytes)` so the restore path can dispatch
-    /// scrollback into the right sub-pane via a HashMap lookup.
+    /// Fetch every buffer for a project scoped to `window_id`, ordered
+    /// by `(ordinal, sub_pane_ordinal)` ascending. Returns triples of
+    /// `(tab_ordinal, sub_pane_ordinal, bytes)` so the restore path can
+    /// dispatch scrollback into the right sub-pane via a HashMap lookup.
     pub fn get_all_for_project(
         &self,
         project_id: &str,
+        window_id: &str,
     ) -> Result<Vec<(u32, u32, Vec<u8>)>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT ordinal, sub_pane_ordinal, bytes FROM pane_buffers \
-                 WHERE project_id = ?1 \
+                 WHERE project_id = ?1 AND window_id = ?2 \
                  ORDER BY ordinal ASC, sub_pane_ordinal ASC",
             )?;
-            let rows = stmt.query_map([project_id], |row| {
+            let rows = stmt.query_map(params![project_id, window_id], |row| {
                 Ok((
                     row.get::<_, u32>(0)?,
                     row.get::<_, u32>(1)?,
@@ -85,14 +89,15 @@ impl PaneBufferRepo {
         Ok(rows)
     }
 
-    /// Delete every buffer for a project. Called before re-writing the
-    /// snapshot on capture so a shrunken-pane layout doesn't leave
-    /// orphaned rows behind.
-    pub fn delete_for_project(&self, project_id: &str) -> Result<(), StorageError> {
+    /// Delete every buffer for a project scoped to `window_id`. Called
+    /// before re-writing the snapshot on capture so a shrunken-pane
+    /// layout doesn't leave orphaned rows behind. Other windows' rows
+    /// for the same project are not affected.
+    pub fn delete_for_project(&self, project_id: &str, window_id: &str) -> Result<(), StorageError> {
         self.db.with_conn(|c| {
             c.execute(
-                "DELETE FROM pane_buffers WHERE project_id = ?1",
-                params![project_id],
+                "DELETE FROM pane_buffers WHERE project_id = ?1 AND window_id = ?2",
+                params![project_id, window_id],
             )
             .map(|_| ())
         })?;

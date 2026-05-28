@@ -240,6 +240,9 @@ impl WorkspaceRoot {
         // Capture the outgoing project's pane scrollback before swapping so
         // a project-switch-then-quit-other-window flow doesn't lose data.
         // No-op when no project was previously active.
+        // Clone window_id BEFORE any mutable borrows of self so closure
+        // captures and borrow checker are both satisfied.
+        let window_id = self.window_id.clone();
         if let Some(outgoing) = self.active_project.as_ref().map(|p| p.id.clone())
             && outgoing != project.id
             && let Some(panes) = self.project_panes_by_project.get(&outgoing).cloned()
@@ -248,6 +251,7 @@ impl WorkspaceRoot {
             panes.read(cx).capture_pane_buffers(
                 &repo,
                 &outgoing,
+                &window_id,
                 crate::project_panes_factory::PANE_BUFFER_MAX_BYTES,
                 cx,
             );
@@ -256,7 +260,7 @@ impl WorkspaceRoot {
                 let relay_repo = self.app_state.pane_relay_id_repo.clone();
                 panes
                     .read(cx)
-                    .capture_pane_relay_ids(&relay_repo, &outgoing, &session_id, cx);
+                    .capture_pane_relay_ids(&relay_repo, &outgoing, &window_id, &session_id, cx);
             }
         }
         self.active_project = Some(project.clone());
@@ -270,15 +274,20 @@ impl WorkspaceRoot {
             let typography = self.typography.clone();
             let cli_runtime = self.cli_runtime.clone();
             let notifier = self.notifier.clone();
-            let snapshot = load_persisted_tabs(&self.app_state.settings_repo, &project.id);
+            let snapshot = load_persisted_tabs(
+                &self.app_state.settings_repo,
+                &project.id,
+                &window_id,
+            );
             let pane_buffers = crate::project_panes_factory::load_pane_buffers(
                 &self.app_state.pane_buffer_repo,
                 &project.id,
+                &window_id,
             );
             let pane_relay_ids = self
                 .app_state
                 .pane_relay_id_repo
-                .get_all_for_project(&project.id)
+                .get_all_for_project(&project.id, &window_id)
                 .unwrap_or_else(|err| {
                     tracing::warn!(?err, project_id = %project.id, "load pane_relay_ids failed");
                     Vec::new()
@@ -302,12 +311,13 @@ impl WorkspaceRoot {
                 window,
                 cx,
             );
-            // Install the save sink keyed to this project.
+            // Install the save sink keyed to this project and window.
             let settings_repo = self.app_state.settings_repo.clone();
             let project_id = project.id.clone();
+            let window_id_for_cb = window_id.clone();
             let save_cb: crate::shell::project_panes::SaveCallback =
                 std::sync::Arc::new(move |snap| {
-                    save_persisted_tabs(&settings_repo, &project_id, &snap);
+                    save_persisted_tabs(&settings_repo, &project_id, &window_id_for_cb, &snap);
                 });
             panes.update(cx, |p, _| p.set_save_callback(save_cb));
             self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));

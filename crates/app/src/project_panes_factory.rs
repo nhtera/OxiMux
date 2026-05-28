@@ -25,7 +25,7 @@ use oximux_storage::{PaneBufferRepo, SettingsRepo};
 use crate::notifier::Notifier;
 use crate::persisted_terminals::{
     PersistedAgentTab, PersistedSubPane, PersistedTab, PersistedTabKind, PersistedTabs,
-    settings_key,
+    legacy_settings_key, settings_key,
 };
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
@@ -581,14 +581,40 @@ fn build_terminal_view_for_tab(
     )
 }
 
-pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Option<PersistedTabs> {
-    let key = settings_key(project_id);
-    let raw = match repo.get(&key) {
-        Ok(v) => v?,
+pub(crate) fn load_persisted_tabs(
+    repo: &SettingsRepo,
+    project_id: &str,
+    window_id: &str,
+) -> Option<PersistedTabs> {
+    // Try the per-window key first.
+    let key = settings_key(project_id, window_id);
+    let raw_opt = match repo.get(&key) {
+        Ok(v) => v,
         Err(err) => {
-            tracing::warn!(?err, project_id, "load_persisted_tabs: settings.get failed");
+            tracing::warn!(?err, project_id, window_id, "load_persisted_tabs: settings.get failed");
             return None;
         }
+    };
+    // For the first window, fall back to the legacy (pre-V005) key so
+    // existing single-window users' tab layouts survive the upgrade.
+    let raw = match raw_opt {
+        Some(r) => r,
+        None if window_id == "main" => {
+            let legacy_key = legacy_settings_key(project_id);
+            match repo.get(&legacy_key) {
+                Ok(Some(r)) => r,
+                Ok(None) => return None,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        project_id,
+                        "load_persisted_tabs: legacy settings.get failed"
+                    );
+                    return None;
+                }
+            }
+        }
+        None => return None,
     };
     match serde_json::from_str::<PersistedTabs>(&raw) {
         Ok(snap) => Some(snap),
@@ -596,6 +622,7 @@ pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Opti
             tracing::warn!(
                 ?err,
                 project_id,
+                window_id,
                 "load_persisted_tabs: parse failed; ignoring"
             );
             None
@@ -603,29 +630,38 @@ pub(crate) fn load_persisted_tabs(repo: &SettingsRepo, project_id: &str) -> Opti
     }
 }
 
-pub(crate) fn load_pane_buffers(repo: &PaneBufferRepo, project_id: &str) -> PaneBuffersMap {
-    match repo.get_all_for_project(project_id) {
+pub(crate) fn load_pane_buffers(
+    repo: &PaneBufferRepo,
+    project_id: &str,
+    window_id: &str,
+) -> PaneBuffersMap {
+    match repo.get_all_for_project(project_id, window_id) {
         Ok(rows) => rows
             .into_iter()
             .map(|(ord, sub_ord, bytes)| ((ord, sub_ord), bytes))
             .collect(),
         Err(err) => {
-            tracing::warn!(?err, project_id, "load_pane_buffers: get failed");
+            tracing::warn!(?err, project_id, window_id, "load_pane_buffers: get failed");
             HashMap::new()
         }
     }
 }
 
-pub(crate) fn save_persisted_tabs(repo: &SettingsRepo, project_id: &str, snap: &PersistedTabs) {
-    let key = settings_key(project_id);
+pub(crate) fn save_persisted_tabs(
+    repo: &SettingsRepo,
+    project_id: &str,
+    window_id: &str,
+    snap: &PersistedTabs,
+) {
+    let key = settings_key(project_id, window_id);
     let json = match serde_json::to_string(snap) {
         Ok(j) => j,
         Err(err) => {
-            tracing::warn!(?err, project_id, "save_persisted_tabs: serialize failed");
+            tracing::warn!(?err, project_id, window_id, "save_persisted_tabs: serialize failed");
             return;
         }
     };
     if let Err(err) = repo.set(&key, &json) {
-        tracing::warn!(?err, project_id, "save_persisted_tabs: settings.set failed");
+        tracing::warn!(?err, project_id, window_id, "save_persisted_tabs: settings.set failed");
     }
 }

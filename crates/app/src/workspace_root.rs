@@ -141,12 +141,18 @@ pub struct WorkspaceRoot {
     /// Render root tracks this so action dispatch reaches the workspace
     /// even when no pane is focused (sidebar toggle, command palette).
     pub(crate) focus_handle: FocusHandle,
+    /// Per-window persistence key. Scopes pane scrollback, relay PTY ids,
+    /// and tab layout blobs so two windows on the same project don't clobber
+    /// each other. The first window uses "main" (matching the V005 migration
+    /// default for legacy single-window rows); later windows use "w{n}".
+    pub(crate) window_id: String,
 }
 
 impl WorkspaceRoot {
     pub fn new(
         repo: Option<Repository>,
         app_state: AppState,
+        window_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -377,6 +383,7 @@ impl WorkspaceRoot {
             row_menu,
             add_project_dialog,
             focus_handle,
+            window_id,
         }
     }
 
@@ -552,10 +559,12 @@ impl WorkspaceRoot {
     /// state restored on next launch reflects the user's final view.
     pub fn capture_all_pane_buffers(&self, cx: &gpui::App) {
         let repo = self.app_state.pane_buffer_repo.clone();
+        let window_id = &self.window_id;
         for (project_id, panes) in &self.project_panes_by_project {
             panes.read(cx).capture_pane_buffers(
                 &repo,
                 project_id,
+                window_id,
                 crate::project_panes_factory::PANE_BUFFER_MAX_BYTES,
                 cx,
             );
@@ -585,10 +594,11 @@ impl WorkspaceRoot {
             return;
         };
         let repo = self.app_state.pane_relay_id_repo.clone();
+        let window_id = &self.window_id;
         for (project_id, panes) in &self.project_panes_by_project {
             panes
                 .read(cx)
-                .capture_pane_relay_ids(&repo, project_id, &session_id, cx);
+                .capture_pane_relay_ids(&repo, project_id, window_id, &session_id, cx);
         }
     }
 

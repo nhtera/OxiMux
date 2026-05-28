@@ -1183,11 +1183,12 @@ impl ProjectPanes {
         &self,
         repo: &PaneBufferRepo,
         project_id: &str,
+        window_id: &str,
         max_bytes_per_pane: usize,
         cx: &App,
     ) {
-        if let Err(err) = repo.delete_for_project(project_id) {
-            tracing::warn!(?err, project_id, "pane_buffers: delete_for_project failed");
+        if let Err(err) = repo.delete_for_project(project_id, window_id) {
+            tracing::warn!(?err, project_id, window_id, "pane_buffers: delete_for_project failed");
             return;
         }
         let mut ordinal: u32 = 0;
@@ -1217,11 +1218,13 @@ impl ProjectPanes {
                     if bytes.is_empty() {
                         continue;
                     }
-                    if let Err(err) = repo.set(project_id, ordinal, sub_pane_ordinal as u32, &bytes)
+                    if let Err(err) =
+                        repo.set(project_id, window_id, ordinal, sub_pane_ordinal as u32, &bytes)
                     {
                         tracing::warn!(
                             ?err,
                             project_id,
+                            window_id,
                             ordinal,
                             sub_pane_ordinal,
                             "pane_buffers: set failed"
@@ -1240,13 +1243,15 @@ impl ProjectPanes {
         &self,
         repo: &PaneRelayIdRepo,
         project_id: &str,
+        window_id: &str,
         relay_session_id: &str,
         cx: &App,
     ) {
-        if let Err(err) = repo.delete_for_project(project_id) {
+        if let Err(err) = repo.delete_for_project(project_id, window_id) {
             tracing::warn!(
                 ?err,
                 project_id,
+                window_id,
                 "pane_relay_ids: delete_for_project failed"
             );
             return;
@@ -1268,9 +1273,10 @@ impl ProjectPanes {
                     continue;
                 };
                 if let Some(pty_id) = view.read(cx).external_id()
-                    && let Err(err) = repo.set(project_id, ordinal, &pty_id, relay_session_id)
+                    && let Err(err) =
+                        repo.set(project_id, window_id, ordinal, &pty_id, relay_session_id)
                 {
-                    tracing::warn!(?err, project_id, ordinal, "pane_relay_ids: set failed");
+                    tracing::warn!(?err, project_id, window_id, ordinal, "pane_relay_ids: set failed");
                 }
                 ordinal += 1;
             }
