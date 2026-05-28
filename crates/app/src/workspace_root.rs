@@ -47,12 +47,13 @@ use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    ActivateGroupTab, CloseGroup, CloseTab, DismissOverlay, OpenAddProjectDialog,
-    OpenCommandPalette, OpenCommitDialog, OpenFileFromContextMenu, OpenFileTreeContextMenuAt,
-    OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
-    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
-    SelectSearchTab, SelectSourceControlTab, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft,
-    SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    ActivateGroupTab, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
+    OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenFileFromContextMenu,
+    OpenFileTreeContextMenuAt, OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker,
+    OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate, RequestOpenAdapterPicker,
+    SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitDown,
+    SplitGroupAt, SplitHorizontal, SplitLeft, SplitRight, SplitUp, SplitVertical,
+    ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -735,6 +736,212 @@ impl WorkspaceRoot {
         self.left_rail_open
     }
 
+    // -----------------------------------------------------------------------
+    // Cross-window tear-off (Slice C)
+    // -----------------------------------------------------------------------
+
+    /// Handler for the "Move Tab to New Window" context-menu action.
+    ///
+    /// Ordering contract (relay client enforces single subscriber per PTY):
+    ///   1. Collect the tab's relay external_id while the view is still alive.
+    ///   2. Call `detach` on each terminal leaf so the relay session is released
+    ///      WITHOUT killing the daemon PTY.
+    ///   3. `take_tab` removes the tab from the source group. The now-detached
+    ///      `TerminalView` drops harmlessly (its `Drop` → `close` is a no-op
+    ///      after `detach`).
+    ///   4. Push a `PendingTearOff` for the minted destination window id.
+    ///   5. Spawn an async task that opens the destination window. The window
+    ///      build closure calls `consume_pending_tearoff` and then
+    ///      `mount_pending_tearoff` to attach the PTY and mount a fresh
+    ///      `TerminalView` in the new window's context.
+    ///
+    /// Rollback: if `attach_pty_existing` fails in the destination window, the
+    /// PTY is orphaned in the daemon (alive but with no subscriber). We log
+    /// loudly and do NOT silently swallow it. A future enhancement could
+    /// re-attach to the source window; for v1 the orphan is a daemon-level
+    /// concern (the relay's idle-gc eventually reaps it).
+    pub(crate) fn handle_move_tab_to_new_window(
+        &mut self,
+        group_id_raw: u64,
+        tab_idx_raw: u32,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        let group_id = crate::shell::pane_tree::PaneGroupId(group_id_raw);
+        let tab_idx = tab_idx_raw as usize;
+
+        // 1. Borrow the group to collect external_id(s) and tab metadata.
+        //    All reads happen while the tab is still alive.
+        let (external_ids, label, color, custom_title) = {
+            let panes_ref = panes.read(cx);
+            let Some(group) = panes_ref.group(group_id) else {
+                return;
+            };
+            let group_ref = group.read(cx);
+            let Some(tab) = group_ref.tabs().get(tab_idx) else {
+                return;
+            };
+            let label = tab
+                .custom_title
+                .clone()
+                .unwrap_or_else(|| tab.label.clone());
+            let color = tab.color;
+            let custom_title = tab.custom_title.clone();
+            // Collect external_ids from every live terminal leaf.
+            let ids: Vec<String> = match &tab.content {
+                crate::shell::pane_content::PaneContent::Terminal(tree) => tree
+                    .iter_live()
+                    .filter_map(|(_, view)| view.read(cx).external_id())
+                    .collect(),
+                _ => return, // not a terminal tab — bail silently
+            };
+            if ids.is_empty() {
+                tracing::warn!(
+                    group_id = group_id_raw,
+                    tab_idx,
+                    "move-tab: no relay external_id on this tab; tear-off skipped"
+                );
+                return;
+            }
+            (ids, label, color, custom_title)
+        };
+
+        // 2. Detach BEFORE take_tab so the subscription is released
+        //    while the TerminalView is still alive.
+        {
+            let panes_ref = panes.read(cx);
+            let Some(group) = panes_ref.group(group_id) else {
+                return;
+            };
+            let group_ref = group.read(cx);
+            if let Some(tab) = group_ref.tabs().get(tab_idx) {
+                if let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content {
+                    for (_, view) in tree.iter_live() {
+                        view.read(cx).detach();
+                    }
+                }
+            }
+        }
+
+        // 3. Remove the tab from the source group. The detached TerminalViews
+        //    drop here; their Drop → close is now a no-op.
+        panes.update(cx, |p, cx| {
+            if let Some(group) = p.group(group_id) {
+                group.update(cx, |g, cx| {
+                    let _ = g.take_tab(tab_idx, cx);
+                });
+            }
+        });
+
+        // 4. Mint a destination persist id and push the pending entry.
+        let dest_window_id = crate::window_registry::next_persist_id(cx);
+        let leaves: Vec<crate::window_registry::PendingLeaf> = external_ids
+            .into_iter()
+            .map(|id| crate::window_registry::PendingLeaf { external_id: id })
+            .collect();
+        let app_state = self.app_state.clone();
+        let project_id = self.active_project_id();
+        let pending = crate::window_registry::PendingTearOff {
+            dest_window_id: dest_window_id.clone(),
+            leaves,
+            label,
+            color,
+            custom_title,
+        };
+        crate::window_registry::push_pending_tearoff(pending);
+
+        // 5. Open the destination window asynchronously so we're out of the
+        //    current borrow stack. The window build closure (in window_factory)
+        //    consumes the pending entry and calls `mount_pending_tearoff`.
+        cx.spawn_in(window, async move |_root, cx| {
+            let _ = cx.update(|_window, cx| {
+                crate::window_factory::open_workspace_window_with(
+                    cx,
+                    None, // repo resolved from project_id in window_factory
+                    app_state,
+                    dest_window_id,
+                    project_id,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// Called by the destination window's build closure (via
+    /// `window_factory::open_workspace_window_with`) when a pending tear-off
+    /// entry is found for this window's id.
+    ///
+    /// For each relay PTY leaf in the entry: attach the existing relay PTY,
+    /// mount a fresh `TerminalView`, and push it as a tab into the active
+    /// pane group. The tab inherits the label, color, and custom title from
+    /// the source window.
+    ///
+    /// On failure (e.g. `attach_pty_existing` returns `None`): logs a loud
+    /// warning. The PTY is orphaned in the relay daemon and will be reaped by
+    /// the daemon's idle-gc. No silent swallowing.
+    pub fn mount_pending_tearoff(
+        &mut self,
+        tearoff: crate::window_registry::PendingTearOff,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            tracing::warn!(
+                dest_window_id = %tearoff.dest_window_id,
+                "mount_pending_tearoff: no active project panes; PTY orphaned in relay"
+            );
+            return;
+        };
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+
+        for leaf in &tearoff.leaves {
+            let Some((backend, session_id)) =
+                crate::shell::terminal_view::attach_pty_existing(&leaf.external_id)
+            else {
+                tracing::warn!(
+                    external_id = %leaf.external_id,
+                    dest_window_id = %tearoff.dest_window_id,
+                    "mount_pending_tearoff: attach_pty_existing failed; PTY orphaned in relay"
+                );
+                continue;
+            };
+
+            // Mount a fresh TerminalView in this window's entity context.
+            // Entity<TerminalView> cannot cross windows — a new one is
+            // required in the destination window context.
+            let view = cx.new(|cx| {
+                crate::shell::terminal_view::TerminalView::mount(
+                    backend, session_id, theme, density, typography.clone(), window, cx,
+                )
+            });
+
+            let label_str = tearoff.label.to_string();
+            let color_for_tab = tearoff.color;
+            let custom_title_for_tab = tearoff.custom_title.clone();
+            panes.update(cx, |p, cx| {
+                if let Some(group) = p.active_group() {
+                    group.update(cx, |g, cx| {
+                        // Use the restore helper to append the tab (wires
+                        // the observer that drives group re-renders on
+                        // TerminalView notifications).
+                        g.push_restored_terminal_tab(label_str.clone(), view.clone(), cx);
+                        // Apply color + custom title onto the freshly-appended tab.
+                        let last_idx = g.tabs().len().saturating_sub(1);
+                        g.set_tab_color(last_idx, color_for_tab, cx);
+                        if custom_title_for_tab.is_some() {
+                            g.set_tab_title(last_idx, custom_title_for_tab.clone(), cx);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
     /// Route a directional split to the active project's pane groups.
     /// New sibling spawns one Terminal tab + steals focus.
     fn split_active_pane_group(
@@ -1150,6 +1357,31 @@ impl Render for WorkspaceRoot {
                         }
                         _ => crate::shell::tab_context_menu::TabContextKind::Terminal,
                     };
+                    // Tear-off is available only for single-leaf relay-backed
+                    // terminal tabs. Multi-leaf split terminals are excluded
+                    // (v1 scope: each leaf would need independent detach+mount
+                    // in the destination). Editor and diff tabs are excluded
+                    // because their content is window-bound.
+                    let can_tear_off = group_ref
+                        .tabs()
+                        .get(tab_idx)
+                        .map(|tab| {
+                            if let crate::shell::pane_content::PaneContent::Terminal(tree) =
+                                &tab.content
+                            {
+                                // Single leaf only — multi-pane split excluded.
+                                if tree.live_count() != 1 {
+                                    return false;
+                                }
+                                // Relay-backed only — in-process fallback has no external id.
+                                tree.active_view()
+                                    .map(|v| v.read(cx).external_id().is_some())
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
                     let weak = group.downgrade();
                     let x = action.x;
                     let y = action.y;
@@ -1158,7 +1390,8 @@ impl Render for WorkspaceRoot {
                     this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                     this.tab_context_menu.update(cx, |m, cx| {
                         m.open(
-                            x, y, weak, group_id, tab_idx, tab_count, tab_kind, is_pinned, cx,
+                            x, y, weak, group_id, tab_idx, tab_count, tab_kind, is_pinned,
+                            can_tear_off, cx,
                         )
                     });
                 }),
@@ -1399,6 +1632,11 @@ impl Render for WorkspaceRoot {
                     };
                     let group = group.clone();
                     group.update(cx, |g, cx| g.toggle_pin(tab_idx, cx));
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &MoveTabToNewWindow, window, cx| {
+                    this.handle_move_tab_to_new_window(action.group_id, action.tab_idx, window, cx);
                 },
             ))
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {

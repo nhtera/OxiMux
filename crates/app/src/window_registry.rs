@@ -16,9 +16,86 @@
 //! additional windows get minted ids (`"w1"`, `"w2"`, …) so per-window layout
 //! / buffer / relay-id rows never collide.
 
-use gpui::{App, Entity, Global, WindowId};
+use std::sync::{Arc, Mutex};
 
+use gpui::{App, Entity, Global, SharedString, WindowId};
+
+use crate::shell::pane_group::TabColor;
 use crate::workspace_root::WorkspaceRoot;
+
+// ---------------------------------------------------------------------------
+// Pending tear-off mailbox
+// ---------------------------------------------------------------------------
+
+/// Per-leaf relay PTY identifier + display metadata for a torn-off tab.
+/// Captured by the source window handler; consumed by the destination
+/// window on first build. The `external_id` is the relay daemon's PTY id
+/// that survives the source-window detach.
+#[derive(Clone, Debug)]
+pub struct PendingLeaf {
+    pub external_id: String,
+}
+
+/// One pending tab tear-off: a destination window id, one or more relay
+/// PTY leaves, and the tab's display state. The window-opener parameters
+/// (repo / app_state / project) are NOT stored here — the source handler
+/// passes them directly to `open_workspace_window_with`; this struct only
+/// carries what the destination needs to reconstruct the tab.
+///
+/// The source handler: detaches every leaf PTY, takes the tab from its
+/// group, mints `dest_window_id` via `next_persist_id`, pushes this struct,
+/// then uses `cx.spawn_in` to open the destination window. The new window's
+/// build closure calls `consume_pending_tearoff` to retrieve and mount the
+/// tab from the relay PTY.
+#[derive(Clone)]
+pub struct PendingTearOff {
+    /// Destination persist id — matches the id passed to
+    /// `open_workspace_window_with`.
+    pub dest_window_id: String,
+    /// Relay PTY leaves in DFS order. v1 scope: always a single leaf
+    /// (multi-leaf split trees are ineligible for tear-off and the menu
+    /// item is disabled for them — see `TabContextMenu::open`).
+    pub leaves: Vec<PendingLeaf>,
+    /// Display label (e.g. "Terminal 3"). Used as the tab chip label in
+    /// the destination window.
+    pub label: SharedString,
+    /// Optional user-assigned color tag.
+    pub color: Option<TabColor>,
+    /// Optional user-assigned custom title.
+    pub custom_title: Option<SharedString>,
+}
+
+/// Process-global pending tear-off mailbox. Lazily initialised on first push.
+/// `Arc<Mutex<_>>` so both the GPUI-thread writer and the GPUI-thread reader
+/// share a single allocation without needing to thread through a context.
+static PENDING_TEAROFFS: std::sync::OnceLock<Arc<Mutex<Vec<PendingTearOff>>>> =
+    std::sync::OnceLock::new();
+
+fn pending_store() -> Arc<Mutex<Vec<PendingTearOff>>> {
+    PENDING_TEAROFFS
+        .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+        .clone()
+}
+
+/// Push a pending tear-off entry. Called by the source-window handler just
+/// before `open_workspace_window_with` opens the destination window.
+pub fn push_pending_tearoff(entry: PendingTearOff) {
+    if let Ok(mut store) = pending_store().lock() {
+        store.push(entry);
+    } else {
+        tracing::error!("pending tearoff store mutex poisoned; tear-off dropped");
+    }
+}
+
+/// Remove and return the pending tear-off whose `dest_window_id` matches
+/// `window_id`. Returns `None` when no entry is waiting (fresh window,
+/// restore path, or prior consume already cleared the entry).
+pub fn consume_pending_tearoff(window_id: &str) -> Option<PendingTearOff> {
+    let store = pending_store();
+    let mut guard = store.lock().ok()?;
+    let pos = guard.iter().position(|e| e.dest_window_id == window_id)?;
+    Some(guard.remove(pos))
+}
 
 /// Persistence id assigned to the first window. Matches the legacy
 /// single-window key and the migration default, so existing single-window
@@ -232,5 +309,66 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "minted ids must be unique");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Pending tear-off mailbox tests — pure logic, no GPUI context needed.
+    // ---------------------------------------------------------------------------
+
+    fn make_tearoff(dest: &str, external_id: &str) -> PendingTearOff {
+        PendingTearOff {
+            dest_window_id: dest.to_string(),
+            leaves: vec![PendingLeaf {
+                external_id: external_id.to_string(),
+            }],
+            label: SharedString::from(format!("Terminal for {dest}")),
+            color: None,
+            custom_title: None,
+        }
+    }
+
+    #[test]
+    fn pending_tearoff_push_and_consume_by_window_id() {
+        // Push two entries with distinct destination ids; verify each is
+        // retrieved by its own id and the store is left empty.
+        let entry_a = make_tearoff("w10", "pty-aaa");
+        let entry_b = make_tearoff("w11", "pty-bbb");
+        push_pending_tearoff(entry_a);
+        push_pending_tearoff(entry_b);
+
+        let got_b = consume_pending_tearoff("w11");
+        assert!(got_b.is_some(), "w11 entry should be present");
+        let got_b = got_b.unwrap();
+        assert_eq!(got_b.dest_window_id, "w11");
+        assert_eq!(got_b.leaves[0].external_id, "pty-bbb");
+
+        let got_a = consume_pending_tearoff("w10");
+        assert!(got_a.is_some(), "w10 entry should be present");
+        let got_a = got_a.unwrap();
+        assert_eq!(got_a.dest_window_id, "w10");
+        assert_eq!(got_a.leaves[0].external_id, "pty-aaa");
+
+        // Both consumed; further calls return None.
+        assert!(consume_pending_tearoff("w10").is_none());
+        assert!(consume_pending_tearoff("w11").is_none());
+    }
+
+    #[test]
+    fn pending_tearoff_consume_unknown_returns_none() {
+        // Consuming an id that was never pushed is a no-op (returns None,
+        // does not panic).
+        let result = consume_pending_tearoff("w_nonexistent_9999");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pending_tearoff_consume_is_destructive() {
+        // A second consume of the same id returns None — the entry is gone.
+        let entry = make_tearoff("w20", "pty-once");
+        push_pending_tearoff(entry);
+        let first = consume_pending_tearoff("w20");
+        assert!(first.is_some());
+        let second = consume_pending_tearoff("w20");
+        assert!(second.is_none(), "second consume must return None");
     }
 }

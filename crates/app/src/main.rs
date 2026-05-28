@@ -31,7 +31,7 @@ use oximux_app::assets::CompositeAssets;
 use oximux_app::relay_supervisor::{RelaySupervisor, SupervisorError};
 use oximux_app::shell::terminal_view::install_shared_backend;
 use oximux_app::state;
-use oximux_app::workspace_root::WorkspaceRoot;
+use oximux_app::window_factory::{open_workspace_window, open_workspace_window_with};
 use oximux_editor::SaveFile;
 use oximux_git::Repository;
 use oximux_pty::TerminalBackend;
@@ -277,94 +277,6 @@ fn main() {
                 );
             }
         }
-    });
-}
-
-/// Build the `WindowOptions` for a workspace window. `cascade` offsets the
-/// frame by a fixed step per already-open window so a second window doesn't
-/// land exactly on top of the first.
-fn workspace_window_options(cx: &mut gpui::App, cascade: usize) -> WindowOptions {
-    // First-launch window bounds: fill the primary display's *visible* area
-    // (the screen rect minus the menu bar at top and the dock at the edge).
-    // Wrapping `NSScreen.visibleFrame` opens the app spacious by default —
-    // equivalent to the work-area-sized initial window IDE-class desktop apps
-    // ship — without committing to a true `Maximized`/`Fullscreen` state (so
-    // the green traffic light still toggles a user-sized "zoom" frame). When
-    // no display is reported, fall back to a centered 1400×900 frame.
-    let mut bounds = cx
-        .primary_display()
-        .map(|display| display.visible_bounds())
-        .unwrap_or_else(|| {
-            let fallback = size(px(1400.0), px(900.0));
-            Bounds::centered(None, fallback, cx)
-        });
-    // Cascade additional windows down-right so a stack of windows stays
-    // individually grabbable instead of perfectly overlapping.
-    if cascade > 0 {
-        let step = px(32.0 * cascade as f32);
-        bounds.origin.x = bounds.origin.x + step;
-        bounds.origin.y = bounds.origin.y + step;
-    }
-
-    // Transparent unified titlebar: macOS draws traffic-light glyphs into the
-    // app chrome at `point(12, 8)`, visually aligned with the wordmark text in
-    // the 32-px chrome row. The glyph origin sits a touch above the row's
-    // geometric center because the text renderer parks glyph mass slightly
-    // high. On non-macOS, `traffic_light_position` is a no-op.
-    WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        window_min_size: Some(size(px(720.0), px(480.0))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("OxiMux".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(12.), px(8.))),
-        }),
-        ..Default::default()
-    }
-}
-
-/// Open a fresh workspace window: mint a new persist id ("main" for the
-/// first, "w{n}" after) and bootstrap the most-recent project. Used for the
-/// first window on a clean boot and every `NewWindow` action.
-fn open_workspace_window(
-    cx: &mut gpui::App,
-    repo: Option<Repository>,
-    app_state: oximux_app::state::AppState,
-) {
-    let persist_id = oximux_app::window_registry::next_persist_id(cx);
-    open_workspace_window_with(cx, repo, app_state, persist_id, None);
-}
-
-/// Open one workspace window under an explicit persist id, register it, and
-/// activate a project. `restore_project = Some(id)` activates that specific
-/// project (multi-window restore at boot); `None` bootstraps the most-recent
-/// project (fresh window). Registering lets the app-level quit / close
-/// observers reach this window.
-fn open_workspace_window_with(
-    cx: &mut gpui::App,
-    repo: Option<Repository>,
-    app_state: oximux_app::state::AppState,
-    window_id: String,
-    restore_project: Option<String>,
-) {
-    let cascade = oximux_app::window_registry::remaining(cx);
-    let options = workspace_window_options(cx, cascade);
-    let _ = cx.open_window(options, move |window, cx| {
-        let workspace =
-            cx.new(|cx| WorkspaceRoot::new(repo, app_state, window_id.clone(), window, cx));
-        // Restore the window's project so the sidebar isn't empty after relaunch.
-        workspace.update(cx, |root, cx| match restore_project.as_deref() {
-            Some(project_id) => root.restore_active_project(project_id, window, cx),
-            None => root.bootstrap_active_project(window, cx),
-        });
-        // Track this window so quit-save + last-window-close gating find it.
-        let gpui_window_id = window.window_handle().window_id();
-        oximux_app::window_registry::register(cx, gpui_window_id, window_id, workspace.clone());
-        // Wrap in gpui-component's `Root` (hosts tooltip / dialog /
-        // notification overlays). On macOS its window_border shadow is 0, so
-        // it's a transparent pass-through — purely additive.
-        let view: AnyView = workspace.into();
-        cx.new(|cx| gpui_component::Root::new(view, window, cx))
     });
 }
 

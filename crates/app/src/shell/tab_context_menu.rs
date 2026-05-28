@@ -15,7 +15,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{RequestRenameTabAt, SplitGroupAt, TogglePinTabAt};
+use crate::actions::{MoveTabToNewWindow, RequestRenameTabAt, SplitGroupAt, TogglePinTabAt};
 use crate::shell::pane_group::{PaneGroup, TabColor};
 use crate::shell::pane_tree::PaneGroupId;
 
@@ -70,6 +70,12 @@ struct TabContextTarget {
     /// the live flag from the PaneGroup at dispatch time so a stale
     /// snapshot here never produces a wrong flip.
     is_pinned: bool,
+    /// Whether this tab can be torn off into a new window. `true` only
+    /// for single-leaf terminal tabs backed by a relay PTY (has an
+    /// external id). Multi-leaf split tabs and non-terminal tabs are
+    /// excluded: split tabs require a more complex cross-window handoff;
+    /// editor/diff tabs hold window-bound entities that cannot move.
+    can_tear_off: bool,
 }
 
 pub struct TabContextMenu {
@@ -113,6 +119,7 @@ impl TabContextMenu {
         tab_count: usize,
         kind: TabContextKind,
         is_pinned: bool,
+        can_tear_off: bool,
         cx: &mut Context<Self>,
     ) {
         self.x_px = x_px;
@@ -124,6 +131,7 @@ impl TabContextMenu {
             tab_count,
             kind,
             is_pinned,
+            can_tear_off,
         });
         self.open = true;
         cx.notify();
@@ -290,6 +298,32 @@ impl Render for TabContextMenu {
                 );
             }),
         ));
+
+        // "Move Tab to New Window" — only when the tab can be torn off
+        // (single-leaf relay-backed terminal). Hidden for editor/diff tabs
+        // and for multi-leaf sub-pane terminals.
+        if target.can_tear_off {
+            let move_group_id = target.group_id.0;
+            let move_tab_idx = target.tab_idx;
+            card = card.child(menu_row(
+                "tab-ctx-move-to-new-window",
+                "Move Tab to New Window",
+                true,
+                theme,
+                density,
+                typography.clone(),
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.close(cx);
+                    window.dispatch_action(
+                        Box::new(MoveTabToNewWindow {
+                            group_id: move_group_id,
+                            tab_idx: move_tab_idx as u32,
+                        }),
+                        cx,
+                    );
+                }),
+            ));
+        }
 
         card = card.child(div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive));
 

@@ -12,5 +12,6 @@ pub mod project_panes_factory;
 pub mod relay_supervisor;
 pub mod shell;
 pub mod state;
+pub mod window_factory;
 pub mod window_registry;
 pub mod workspace_root;

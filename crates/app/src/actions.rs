@@ -106,6 +106,23 @@ pub struct TogglePinTabAt {
     pub tab_idx: u32,
 }
 
+/// Payload action fired by the tab right-click "Move Tab to New Window"
+/// row (terminal tabs backed by a relay PTY only). The source window
+/// handler detaches the relay session(s), removes the tab, pushes a
+/// `PendingTearOff` into the process-global mailbox keyed by the minted
+/// destination `window_id`, then dispatches this action to the app-level
+/// handler in `main.rs` which opens the new window. The destination window
+/// build routine consumes the pending entry and mounts the tab there.
+///
+/// Non-terminal tabs and terminal tabs whose backend has no external relay
+/// id (in-process fallback) render this item disabled/hidden.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct MoveTabToNewWindow {
+    pub group_id: u64,
+    pub tab_idx: u32,
+}
+
 /// Payload action fired by a file-tree row's right-click. Carries the
 /// cursor coords + the right-clicked path + a directory flag so the
 /// shared `FileTreeContextMenu` can render the right item set (files

@@ -556,6 +556,29 @@ impl TerminalView {
         self.with_backend(|be| be.external_id_of(id))
     }
 
+    /// Detach the relay session so the daemon PTY survives without an active
+    /// subscriber. Used by the cross-window tear-off handoff: the source window
+    /// calls this BEFORE the destination attaches, satisfying the required
+    /// detach-then-attach ordering (the relay client multiplexes a single
+    /// output subscription per PTY id, so both attachments must never coexist).
+    ///
+    /// After detach the local session record is removed from the backend; the
+    /// view's `Drop` → `close` call becomes a no-op, leaving the daemon PTY
+    /// alive for the destination window's `attach_pty_existing`.
+    ///
+    /// The in-process portable PTY backend has no relay to detach from, so it
+    /// falls back to `close` — tearing off an in-process terminal effectively
+    /// closes it. That case is excluded at the menu level (`can_tear_off` is
+    /// only `true` when `external_id()` is `Some`).
+    pub fn detach(&self) {
+        let id = self.session_id;
+        self.with_backend(|be| {
+            if let Err(err) = be.detach(id) {
+                tracing::warn!(?err, session_id = ?id, "terminal detach failed");
+            }
+        });
+    }
+
     /// OS pid of the shell child the backend spawned for this session.
     /// `None` for remote/relay backends and for already-exited shells.
     /// Sub-pane split path uses this to query the current shell CWD
