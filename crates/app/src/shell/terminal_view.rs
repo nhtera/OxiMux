@@ -1,23 +1,24 @@
-//! TerminalView — single-pane PTY render (Phase 1 step 4 + polish + step 5).
+//! TerminalView — single-pane PTY render.
 //!
 //! Owns a `PortablePtyBackend` and one session. A background polling task
 //! ticks every `POLL_INTERVAL_MS`, drains the event queue, copies the latest
-//! `TerminalSnapshot` onto the view, and calls `cx.notify()`. Render walks
-//! `snapshot.cells`, groups consecutive same-styled cells into runs, and
-//! emits one styled `div` per run inside one row `div` per line.
+//! `TerminalSnapshot` onto the view, and calls `cx.notify()`.
 //!
-//! Polish slice added color (per-run fg+bg against the charcoal theme),
-//! cursor (cell under `snapshot.cursor` forced to `inverse` so the block
-//! cursor renders for free), and resize.
-//!
-//! Step 5 moves resize math out of this module. The view no longer measures
-//! the window itself — the parent (`MainPane`) computes each leaf's slice
-//! of the visible area, divides by cell metrics, and calls
-//! `set_target_grid(cols, rows)`. The view stages that target and applies
-//! it on the next `maybe_resize` tick. This lets one window host an
-//! arbitrary tree of splits without each leaf double-counting chrome.
+//! Rendering goes through a single `gpui::canvas` paint closure (see
+//! `terminal_canvas::paint_grid`): backgrounds as quads, one `shape_line`
+//! per row with `force_width` locking glyphs to the cell grid, cursor +
+//! selection overlays. The closure also measures the canvas's real bounds
+//! to size the PTY — it records the fitting `(cols, rows)` in the shared
+//! `canvas_grid` cell and calls `window.refresh()` when that changes; the
+//! next `render` reads it back into `target_grid` and `maybe_resize`
+//! applies it. Driving the grid from the actual painted bounds (rather
+//! than a viewport-minus-chrome estimate) is what keeps full-screen TUIs
+//! from rendering their absolute-positioned UI at the wrong width, and it
+//! makes split sub-panes size their PTY to their own slice for free.
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -33,8 +34,9 @@ use oximux_pty::{
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::Search;
+use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::key_input::keystroke_to_bytes;
-use crate::shell::terminal_canvas::{PaintParams, paint_grid};
+use crate::shell::terminal_canvas::{PaintParams, grid_dims_for, paint_grid};
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 
@@ -241,6 +243,14 @@ pub struct TerminalView {
     /// (post-dormancy).
     _poll_task: Option<Task<()>>,
     _blink_task: Task<()>,
+    /// Desired grid size derived from the canvas's real painted bounds.
+    /// The canvas paint closure writes this `(cols, rows)` each frame and
+    /// calls `window.refresh()` when it changes; `render`'s top reads it
+    /// back into `target_grid` so `maybe_resize` applies it. Shared via
+    /// `Rc<Cell<_>>` (not entity state) so the paint closure never has to
+    /// re-borrow this entity mid-paint — sizing the PTY from the actual
+    /// bounds is what keeps full-screen TUIs from rendering scrambled.
+    canvas_grid: Rc<Cell<(u16, u16)>>,
     /// Active text selection in cell coordinates: `(start_row, start_col,
     /// end_row, end_col)`. End is inclusive on both axes. `None` = no
     /// selection. Today this is set only by Cmd+A (select-all) since
@@ -319,6 +329,7 @@ impl TerminalView {
             dormant_cwd: None,
             _poll_task: Some(poll_task),
             _blink_task: blink_task,
+            canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
             selection: None,
         }
     }
@@ -399,6 +410,7 @@ impl TerminalView {
             dormant_cwd: Some(cwd),
             _poll_task: None,
             _blink_task: blink_task,
+            canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
             selection: None,
         }
     }
@@ -488,13 +500,6 @@ impl TerminalView {
                 }
             }
         })
-    }
-
-    /// Stage a new target grid for the next resize tick. Called by the
-    /// parent layout (`MainPane`) per render with the leaf's slice of the
-    /// visible area, already divided by cell metrics.
-    pub fn set_target_grid(&mut self, cols: u16, rows: u16) {
-        self.target_grid = (cols, rows);
     }
 
     /// Lock the shared backend briefly and run `f` against the trait. The
@@ -845,6 +850,20 @@ impl TerminalView {
             self.snapshot = snapshot;
         }
     }
+
+    /// Pull the canvas-derived grid size into `target_grid` so the next
+    /// `maybe_resize` applies it. Called at the top of `render`. The
+    /// canvas paint closure (which runs in the paint phase, after render)
+    /// is what WRITES `canvas_grid` from the real painted bounds and
+    /// schedules a repaint via `window.refresh()` when it changes — so by
+    /// the time this read runs on the following frame, `canvas_grid`
+    /// holds the size that exactly matches the cells we paint. This is
+    /// the single source of truth for grid size; it replaced the old
+    /// `viewport − hardcoded_chrome` estimate that drifted and made
+    /// full-screen TUIs render their absolute-positioned UI scrambled.
+    fn pull_canvas_grid(&mut self) {
+        self.target_grid = self.canvas_grid.get();
+    }
 }
 
 impl Drop for TerminalView {
@@ -896,6 +915,10 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Adopt the grid size the canvas measured from its real bounds
+        // last paint, then apply it. `maybe_resize` resizes the PTY +
+        // refetches the snapshot only when the size actually changed.
+        self.pull_canvas_grid();
         self.maybe_resize();
 
         // Cursor visibility rules:
@@ -1017,11 +1040,35 @@ impl Render for TerminalView {
         // `paint_quad` + `shape_line` calls directly — no flex layout
         // round-trip per cell. The outer div keeps its existing role as
         // the focus owner, action target, and click-to-focus surface.
+        //
+        // The paint closure ALSO drives the PTY resize: it derives
+        // (cols, rows) from the canvas's real `bounds` and records them in
+        // the shared `canvas_grid` cell, then asks for a repaint via
+        // `window.refresh()` when the size changed. The next `render`
+        // reads `canvas_grid` back into `target_grid` and resizes the PTY.
+        //
+        // Recording into an `Rc<Cell<_>>` (instead of calling
+        // `entity.update` here) keeps the paint phase free of any re-borrow
+        // of this entity — `window.refresh()` is documented as safe to
+        // call while drawing (it no-ops if already mid-draw and otherwise
+        // marks the window dirty for the next frame).
+        let dims_typography = self.typography.clone();
+        let canvas_grid = Rc::clone(&self.canvas_grid);
         let grid_canvas = canvas(
             // Prepaint: no per-paint state to capture; return unit.
             |_bounds, _window, _cx| (),
             move |bounds, _: (), window, cx| {
-                paint_grid(bounds, paint_params, window, cx);
+                let metrics = CellMetrics::measure(&dims_typography, window);
+                let dims = grid_dims_for(bounds, &metrics, paint_params.pad);
+                if canvas_grid.get() != dims {
+                    canvas_grid.set(dims);
+                    // Schedule a frame so `render` applies the new size +
+                    // refetches the reflowed snapshot. Needed because an
+                    // idle terminal emits no PTY output to trigger a
+                    // repaint on its own.
+                    window.refresh();
+                }
+                paint_grid(bounds, &paint_params, window, cx);
             },
         )
         .size_full();

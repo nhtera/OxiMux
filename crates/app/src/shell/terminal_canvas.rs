@@ -82,9 +82,24 @@ pub struct PaintParams {
     pub selection: Option<(usize, usize, usize, usize)>,
 }
 
+/// Compute the `(cols, rows)` that fit in a canvas of `bounds`, given the
+/// live cell metrics and the configured padding. Shared by the resize
+/// path (so the PTY is told exactly the grid we paint) and any future
+/// hit-testing. `pad` is subtracted on both axes because the grid origin
+/// is inset by `pad` (see `paint_grid`).
+pub fn grid_dims_for(bounds: Bounds<Pixels>, metrics: &CellMetrics, pad: f32) -> (u16, u16) {
+    let inner_w = (f32::from(bounds.size.width) - pad * 2.0).max(metrics.cell_width);
+    let inner_h = (f32::from(bounds.size.height) - pad * 2.0).max(metrics.line_height);
+    (
+        metrics.cols_in(inner_w).max(1),
+        metrics.rows_in(inner_h).max(1),
+    )
+}
+
 /// Paint the grid into `bounds`. Designed to be called from the paint
-/// closure of `gpui::canvas`.
-pub fn paint_grid(bounds: Bounds<Pixels>, p: PaintParams, window: &mut Window, cx: &mut App) {
+/// closure of `gpui::canvas`. Borrows `PaintParams` so the caller can
+/// reuse it (e.g. to compute resize dims) before/after painting.
+pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, cx: &mut App) {
     // Live metrics so font/typography changes propagate next paint.
     // `CellMetrics::measure` shapes the `'m'` advance — adequate for
     // monospace; box-drawing fonts ship narrower glyphs for the same

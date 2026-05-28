@@ -26,7 +26,6 @@ use crate::actions::{
     ActivateGroupTab, OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker,
 };
 use crate::shell::agent_status_badge::render_dot;
-use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::file_drag::FilePathDragPayload;
 use crate::shell::pane_tree::PaneGroupId;
@@ -39,16 +38,6 @@ const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
 /// "..." Pane Actions button width — matches the `+` neighbor so the
 /// trailing button cluster stays balanced.
 const ELLIPSIS_BUTTON_WIDTH_PX: f32 = 28.0;
-/// Workspace chrome height — the constant vertical band above and
-/// below the center body that `dispatch_active_grid` must subtract
-/// when budgeting terminal grid rows. Composition:
-///   - top chrome row (`h_top_bar = 32`)
-///   - workspace tab-strip row (also `h_top_bar = 32`, rendered when
-///     any pane group has tabs — see `workspace_root.rs`)
-///   - bottom status bar (`h_status_bar = 24`)
-/// Total: 32 + 32 + 24 = 88. Plus the per-pane-group inline strip
-/// (`TAB_STRIP_HEIGHT_PX = 28`) is subtracted separately below.
-const CHROME_H_PX: f32 = 32.0 + 32.0 + 24.0;
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -74,7 +63,9 @@ impl Render for PaneGroup {
         let typography = self.typography.clone();
         let is_empty = self.tabs.is_empty();
 
-        dispatch_active_grid(self, window, cx);
+        // PTY grid sizing is driven per-TerminalView from its canvas
+        // bounds now (see the note on the former `dispatch_active_grid`),
+        // so there's no workspace-level grid dispatch here anymore.
 
         let group_entity = entity.clone();
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
@@ -463,35 +454,15 @@ fn build_tab_strip_from_headers(
     row.into_any_element()
 }
 
-/// Forward grid target to the active terminal tab so its PTY resizes
-/// when the window resizes or chrome width changes. No-op for editor /
-/// empty tabs. Mirrors the old `MainPane::dispatch_grids` budget math.
-fn dispatch_active_grid(group: &PaneGroup, window: &Window, cx: &mut Context<PaneGroup>) {
-    let Some(tab) = group.active_tab() else {
-        return;
-    };
-    let PaneContent::Terminal(tree) = &tab.content else {
-        return;
-    };
-    let Some(view) = tree.active_view() else {
-        return;
-    };
-    let metrics = CellMetrics::measure(&group.typography, window);
-    let v = window.viewport_size();
-    let pad = group.density.pad_panel;
-    let w = (f32::from(v.width) - group.chrome_w_px() - pad * 2.0).max(metrics.cell_width);
-    // Strip lives inline above each leaf body; subtract its height in
-    // addition to CHROME_H_PX (top bar + status bar). When sub-panes
-    // are present, each sub-pane gets its own portion via flex layout —
-    // the per-sub-pane TerminalView's own resize listener handles the
-    // fine-grained fitting after we set the parent target.
-    let h = (f32::from(v.height) - CHROME_H_PX - TAB_STRIP_HEIGHT_PX - pad * 2.0)
-        .max(metrics.line_height);
-    let cols = metrics.cols_in(w);
-    let rows = metrics.rows_in(h);
-    let view = view.clone();
-    view.update(cx, |v, _| v.set_target_grid(cols, rows));
-}
+// NOTE: PTY grid sizing moved INTO each `TerminalView`'s canvas paint
+// closure (`sync_grid_to_canvas`), which derives (cols, rows) from the
+// canvas's real bounds. That removed the old `dispatch_active_grid`
+// estimate (viewport − hardcoded chrome), which drifted whenever the
+// assumed chrome height/width didn't match the live layout and caused
+// full-screen TUIs to render their absolute-positioned UI for the wrong
+// column count (scrambled output). The canvas-bounds path also fixes
+// split sub-panes for free — each sub-pane sizes its PTY to its own
+// slice rather than inheriting a full-width estimate.
 
 /// Recursively render a `TerminalSplitTree` into a flex layout. Single-
 /// pane trees collapse to just the sub-pane view; split nodes become

@@ -436,6 +436,12 @@ impl PaneGroup {
             .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == path))
     }
 
+    /// Retained for the sidebar-width tracking plumbing (`set_chrome_width`
+    /// still fires a repaint when a side panel toggles). Grid sizing no
+    /// longer reads it — that moved to each TerminalView's canvas-bounds
+    /// resize — so the getter is currently unused but kept for symmetry
+    /// with the setter and any future chrome-aware layout.
+    #[allow(dead_code)]
     pub(crate) fn chrome_w_px(&self) -> f32 {
         self.chrome_w_px
     }
