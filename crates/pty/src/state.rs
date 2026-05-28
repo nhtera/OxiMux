@@ -14,7 +14,10 @@
 //! directly. Indices 0..=15 collapse onto `NamedColor16`; everything else
 //! flows through `Indexed` for the renderer's 256-palette lookup.
 
-use alacritty_terminal::event::VoidListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
@@ -42,10 +45,30 @@ impl Dimensions for SizeInfo {
     }
 }
 
+/// Captures the one alacritty event we care about: `Bell`. alacritty calls
+/// `send_event` synchronously from inside `parser.advance`, so we can't push
+/// onto a channel here without plumbing one through; instead we flip a shared
+/// atomic that the backend reads via `take_bell()` right after `advance`.
+#[derive(Clone)]
+pub struct BellListener {
+    bell: Arc<AtomicBool>,
+}
+
+impl EventListener for BellListener {
+    fn send_event(&self, event: Event) {
+        if matches!(event, Event::Bell) {
+            self.bell.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub struct TerminalState {
-    term: Term<VoidListener>,
+    term: Term<BellListener>,
     parser: Processor,
     size: SizeInfo,
+    /// Shared with the `Term`'s `BellListener`; set on BEL, cleared by
+    /// `take_bell()`.
+    bell: Arc<AtomicBool>,
 }
 
 impl TerminalState {
@@ -61,17 +84,32 @@ impl TerminalState {
             scrolling_history: scrollback,
             ..Config::default()
         };
-        let term = Term::new(config, &size, VoidListener);
+        let bell = Arc::new(AtomicBool::new(false));
+        let term = Term::new(
+            config,
+            &size,
+            BellListener {
+                bell: Arc::clone(&bell),
+            },
+        );
         Self {
             term,
             parser: Processor::new(),
             size,
+            bell,
         }
     }
 
     /// Feed PTY bytes through the ANSI parser into the grid.
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Consume the pending-bell flag: returns `true` (and resets to `false`)
+    /// if the child rang the bell since the last call. Called by the backend
+    /// right after `advance` so a BEL in the chunk becomes a `TerminalEvent::Bell`.
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::AcqRel)
     }
 
     /// True when the shell has requested DECSET 2004 (bracketed paste).
@@ -87,7 +125,7 @@ impl TerminalState {
     /// grid for persistence. Exposed (rather than wrapping every
     /// `serialize_*` call as a method) so the serializer module stays a
     /// pure function over `Term` and is unit-testable on its own.
-    pub fn term_for_test(&self) -> &Term<VoidListener> {
+    pub fn term_for_test(&self) -> &Term<BellListener> {
         &self.term
     }
 
@@ -280,6 +318,22 @@ mod tests {
             !state.is_bracketed_paste(),
             "DECRST 2004 should disable again"
         );
+    }
+
+    #[test]
+    fn bell_flag_set_on_bel_and_cleared_by_take() {
+        let mut state = TerminalState::new(80, 24, 100);
+        assert!(!state.take_bell(), "fresh state has no pending bell");
+        // BEL (0x07) anywhere in the stream rings the bell.
+        state.advance(b"a\x07b");
+        assert!(state.take_bell(), "BEL should set the pending-bell flag");
+        assert!(
+            !state.take_bell(),
+            "take_bell must clear the flag (one bell, one signal)"
+        );
+        // Plain output does not ring.
+        state.advance(b"hello");
+        assert!(!state.take_bell(), "no BEL → no bell");
     }
 
     #[test]

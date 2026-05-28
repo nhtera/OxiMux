@@ -235,6 +235,11 @@ pub struct TerminalView {
     /// `mount`. When `false`, the blink task skips `cx.notify()` so unfocused
     /// panes don't burn a repaint every 530 ms.
     focused: bool,
+    /// Set when an UNFOCUSED pane raises a signal — today a terminal BEL
+    /// (`TerminalEvent::Bell`); later also agent WaitingForInput/NeedsApproval
+    /// and `oximux notify`. Drives the blue attention ring overlay; cleared
+    /// when the pane gains focus (`on_focus`).
+    attention: bool,
     /// Per-pane search overlay state. See `terminal_search_state.rs` for
     /// the state machine + key dispatch. The view owns I/O (grid fetch +
     /// `cx.notify`) and delegates everything else.
@@ -302,6 +307,9 @@ impl TerminalView {
         cx.on_focus(&focus_handle, window, |view, _, cx| {
             view.focused = true;
             view.cursor_visible = true;
+            // Focusing the pane means the user is now looking — clear any
+            // pending attention ring.
+            view.attention = false;
             cx.notify();
         })
         .detach();
@@ -334,6 +342,7 @@ impl TerminalView {
             // Multiple panes constructed in the same effect run will each see
             // their focus() call land, last one wins, on_blur clears the rest.
             focused: false,
+            attention: false,
             search: SearchState::new(),
             title: None,
             dormant_cwd: None,
@@ -387,6 +396,7 @@ impl TerminalView {
         cx.on_focus(&focus_handle, window, |view, window, cx| {
             view.focused = true;
             view.cursor_visible = true;
+            view.attention = false;
             view.respawn_if_dormant(window, cx);
             cx.notify();
         })
@@ -415,6 +425,7 @@ impl TerminalView {
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
             focused: false,
+            attention: false,
             search: SearchState::new(),
             title: None,
             dormant_cwd: Some(cwd),
@@ -806,6 +817,7 @@ impl TerminalView {
         // and avoids pinning the cursor visible on a dead session.
         let mut needs_snapshot = false;
         let mut had_output = false;
+        let mut got_bell = false;
         let mut latest_title: Option<String> = None;
         for ev in &events {
             match ev {
@@ -817,8 +829,14 @@ impl TerminalView {
                 TerminalEvent::TitleChange { title, .. } => {
                     latest_title = Some(title.clone());
                 }
+                // A BEL while this pane is NOT focused raises attention. A bell
+                // in the pane you're already looking at is just noise.
+                TerminalEvent::Bell { .. } if !self.focused => got_bell = true,
                 _ => {}
             }
+        }
+        if got_bell {
+            self.attention = true;
         }
         let session_id = self.session_id;
         if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
@@ -1137,6 +1155,20 @@ impl Render for TerminalView {
         }
         if let Some(badge) = dormant_badge {
             root = root.child(badge);
+        }
+        // Attention ring: a blue inset stroke when an unfocused pane has
+        // signalled (terminal BEL today; agent-waiting / `oximux notify`
+        // later). Absolute inset_0 so it overlays without shifting the grid
+        // layout, and gated on `!pane_focused` so it vanishes the instant the
+        // user looks at the pane (belt-and-braces with the on_focus clear).
+        if self.attention && !pane_focused {
+            root = root.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .border_2()
+                    .border_color(theme.status_info),
+            );
         }
         root
     }

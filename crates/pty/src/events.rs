@@ -33,6 +33,12 @@ pub enum TerminalEvent {
         id: TerminalSessionId,
         title: String,
     },
+    /// Terminal bell (BEL, 0x07) emitted by the child. Surfaced so the UI
+    /// can raise an attention signal (pane ring / tab badge / OS banner)
+    /// on the owning pane — a curses app or shell `\a` means "look here".
+    Bell {
+        id: TerminalSessionId,
+    },
 }
 
 impl TerminalEvent {
@@ -44,7 +50,8 @@ impl TerminalEvent {
             TerminalEvent::Output { id, .. }
             | TerminalEvent::Exit { id, .. }
             | TerminalEvent::Resize { id, .. }
-            | TerminalEvent::TitleChange { id, .. } => *id,
+            | TerminalEvent::TitleChange { id, .. }
+            | TerminalEvent::Bell { id } => *id,
         }
     }
 }

@@ -153,8 +153,17 @@ impl RelayBackend {
             while let Some(n) = notif_rx.recv().await {
                 let event = match n {
                     Notification::Output { bytes, .. } => {
-                        if let Ok(mut s) = state.lock() {
-                            s.advance(&bytes);
+                        let bell = match state.lock() {
+                            Ok(mut s) => {
+                                s.advance(&bytes);
+                                s.take_bell()
+                            }
+                            Err(_) => false,
+                        };
+                        // BEL → attention signal for the owning pane, queued
+                        // ahead of this chunk's Output (same chunk; order moot).
+                        if bell {
+                            push_event(&queues, id, TerminalEvent::Bell { id });
                         }
                         TerminalEvent::Output { id, bytes }
                     }

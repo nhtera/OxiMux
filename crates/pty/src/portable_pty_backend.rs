@@ -495,9 +495,13 @@ fn watch_session(
             Ok(0) => break,
             Ok(n) => {
                 let bytes_slice = &buf[..n];
-                if let Ok(mut s) = state.lock() {
-                    s.advance(bytes_slice);
-                }
+                let bell = match state.lock() {
+                    Ok(mut s) => {
+                        s.advance(bytes_slice);
+                        s.take_bell()
+                    }
+                    Err(_) => false,
+                };
                 // Snoop for the most recent OSC 7 in this chunk. Last
                 // win — if the shell printed several (rare), we want
                 // the freshest cwd.
@@ -510,6 +514,10 @@ fn watch_session(
                 }
                 let bytes = bytes_slice.to_vec();
                 if tx.send(TerminalEvent::Output { id, bytes }).is_err() {
+                    return;
+                }
+                // BEL in this chunk → an attention signal for the owning pane.
+                if bell && tx.send(TerminalEvent::Bell { id }).is_err() {
                     return;
                 }
             }

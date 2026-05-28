@@ -25,7 +25,7 @@
 //! alt-screen state, mouse-tracking modes, hyperlinks, dotted/dashed
 //! underline variants, and exact cursor position are NOT round-tripped.
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::Term;
@@ -77,7 +77,7 @@ pub struct SerializeOptions {
 
 /// Serialize a term into ANSI bytes. Pure function; safe to call off the
 /// UI thread.
-pub fn serialize_term(term: &Term<VoidListener>, opts: SerializeOptions) -> Vec<u8> {
+pub fn serialize_term<L: EventListener>(term: &Term<L>, opts: SerializeOptions) -> Vec<u8> {
     let cols = term.columns();
     let rows = term.screen_lines();
     let history = term.grid().history_size();
@@ -120,7 +120,7 @@ pub fn serialize_term(term: &Term<VoidListener>, opts: SerializeOptions) -> Vec<
 /// True when any cell in the row carries a printable glyph (not blank /
 /// not the unwritten-cell sentinel). Used to find the last content row so
 /// trailing blank rows are dropped from the capture.
-fn row_has_content(term: &Term<VoidListener>, line_idx: i32, cols: usize) -> bool {
+fn row_has_content<L: EventListener>(term: &Term<L>, line_idx: i32, cols: usize) -> bool {
     let row = &term.grid()[Line(line_idx)];
     (0..cols).any(|c| {
         let ch = row[Column(c)].c;
@@ -136,7 +136,10 @@ fn row_has_content(term: &Term<VoidListener>, line_idx: i32, cols: usize) -> boo
 ///
 /// The `max_bytes` budget covers the total returned blob — the body is
 /// capped to `max_bytes - CAPTURE_HEADER_LEN` so the header always fits.
-pub fn serialize_term_capped_with_dims(term: &Term<VoidListener>, max_bytes: usize) -> Vec<u8> {
+pub fn serialize_term_capped_with_dims<L: EventListener>(
+    term: &Term<L>,
+    max_bytes: usize,
+) -> Vec<u8> {
     let cols = term.columns() as u16;
     let rows = term.screen_lines() as u16;
     let body_budget = max_bytes.saturating_sub(CAPTURE_HEADER_LEN);
@@ -151,7 +154,7 @@ pub fn serialize_term_capped_with_dims(term: &Term<VoidListener>, max_bytes: usi
 /// Serialize with an automatic binary-search cap on `scrollback` so the
 /// final byte length fits under `max_bytes`. The visible grid is always
 /// emitted regardless of the cap.
-pub fn serialize_term_capped(term: &Term<VoidListener>, max_bytes: usize) -> Vec<u8> {
+pub fn serialize_term_capped<L: EventListener>(term: &Term<L>, max_bytes: usize) -> Vec<u8> {
     let history = term.grid().history_size();
     let full = serialize_term(
         term,
@@ -182,10 +185,10 @@ pub fn serialize_term_capped(term: &Term<VoidListener>, max_bytes: usize) -> Vec
     best
 }
 
-fn emit_row(
+fn emit_row<L: EventListener>(
     out: &mut Vec<u8>,
     current: &mut SgrState,
-    term: &Term<VoidListener>,
+    term: &Term<L>,
     line_idx: i32,
     cols: usize,
 ) {
