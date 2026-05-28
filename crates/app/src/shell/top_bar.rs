@@ -148,15 +148,15 @@ fn right_chrome_cluster(
     theme: Theme,
 ) -> impl IntoElement {
     // When the right sidebar is open this cluster sits inside its own
-    // `right_header` strip and should span the full strip width so the
-    // activity-tabs + toggle group can anchor at the far right of the
-    // right column (= near the boundary with the sidebar body's right
-    // edge). When the sidebar is closed the cluster is appended to
-    // `center_header`; the preceding `flex_1` spacer there already
-    // shoves it to the right edge, so `flex_shrink_0` keeps it intact.
+    // `right_header` strip and spans the full strip width. Activity
+    // tabs dock at the LEADING (left) edge of the right column — the
+    // boundary with the center column — and a flex_1 spacer pushes
+    // the close toggle to the trailing edge. When the sidebar is
+    // closed the cluster is appended to `center_header` after the
+    // center spacer; `flex_shrink_0` keeps it intact at the right.
     //
     // Child order:
-    //   open  → [flex_1 spacer, activity tabs, toggle] (right-docked)
+    //   open   → [activity tabs, flex_1 spacer, toggle] (tabs leading-docked)
     //   closed → [activity tabs, toggle]                (compact, no spacer)
     let zone_base = div().flex().flex_row().items_center().h_full();
     let mut zone = if right_open {
@@ -164,14 +164,13 @@ fn right_chrome_cluster(
     } else {
         zone_base.flex_shrink_0()
     };
-    if right_open {
-        // Push the activity-tabs + toggle group to the right edge of
-        // the right column so the icons sit next to the close toggle
-        // instead of leaving an awkward gap at the column's leading edge.
-        zone = zone.child(div().flex_1().h_full());
-    }
     if let Some(tabs) = right_tabs {
         zone = zone.child(tabs);
+    }
+    if right_open {
+        // Push the close toggle to the trailing edge while keeping
+        // the activity tabs anchored at the column's leading edge.
+        zone = zone.child(div().flex_1().h_full());
     }
     // The "..." pane-actions button used to live here; it now ships
     // inside the hoisted tab strip itself so it stays adjacent to the
