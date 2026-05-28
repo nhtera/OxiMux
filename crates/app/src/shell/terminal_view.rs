@@ -857,6 +857,14 @@ impl TerminalView {
         self.title.as_deref()
     }
 
+    /// True when this pane has a pending attention signal (an unfocused-pane
+    /// BEL today). Read by the tab strip so a bell in a BACKGROUND tab lights
+    /// that tab — the pane ring alone is invisible when the pane isn't shown.
+    /// Cleared when the pane gains focus.
+    pub fn attention(&self) -> bool {
+        self.attention
+    }
+
     fn maybe_resize(&mut self) {
         if self.target_grid == self.last_resize {
             return;

@@ -168,6 +168,7 @@ pub fn build_tab_strip_for(
             label: t.custom_title.clone().unwrap_or_else(|| t.label.clone()),
             kind_marker: kind_marker(&t.kind),
             agent_status: agent_status_for(&t.kind),
+            attention: attention_for(&t.content, cx),
             color: t.color,
             pinned: t.pinned,
         })
@@ -200,6 +201,10 @@ struct PaneGroupTabHeader {
     label: SharedString,
     kind_marker: PaneTabKindMarker,
     agent_status: Option<oximux_core::AgentStatus>,
+    /// True when a terminal in this tab has a pending attention signal
+    /// (unfocused-pane bell). Lights the tab chip so a background bell is
+    /// visible even when its pane isn't shown.
+    attention: bool,
     /// User-picked color tag, rendered as a 2px left-edge bar on the
     /// chip. `None` = no color (default chrome).
     color: Option<super::TabColor>,
@@ -233,6 +238,18 @@ fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus>
         Some(status_rx.borrow().clone())
     } else {
         None
+    }
+}
+
+/// True when any sub-pane terminal in this tab has a pending attention
+/// signal (an unfocused-pane bell). Lights the tab chip so a bell in a
+/// BACKGROUND tab is visible — the pane ring alone shows nothing when the
+/// pane isn't on screen. Editor/Diff tabs never signal attention.
+fn attention_for(content: &crate::shell::pane_content::PaneContent, cx: &App) -> bool {
+    use crate::shell::pane_content::PaneContent;
+    match content {
+        PaneContent::Terminal(tree) => tree.iter_live().any(|(_, v)| v.read(cx).attention()),
+        _ => false,
     }
 }
 
@@ -390,6 +407,7 @@ fn build_tab_strip_from_headers(
             header.label.clone(),
             header.kind_marker,
             header.agent_status.as_ref(),
+            header.attention,
             tab_idx == active,
             drag_edge,
             header.color,
@@ -739,6 +757,7 @@ fn render_tab_chip(
     label: SharedString,
     marker: PaneTabKindMarker,
     agent_status: Option<&oximux_core::AgentStatus>,
+    attention: bool,
     is_active: bool,
     drag_edge: Option<TabInsertSide>,
     color_tag: Option<super::TabColor>,
@@ -785,6 +804,18 @@ fn render_tab_chip(
         let dot_id =
             SharedString::from(format!("pane-group-agent-status-dot-{entity_id_raw}-{ix}"));
         render_dot(dot_id, status, theme).into_any_element()
+    });
+
+    // Bell attention: a small blue dot when a terminal in this tab rang the
+    // bell while unfocused. Suppressed on the active tab (you're looking at
+    // it; the pane ring covers the focused case). Makes a background bell
+    // visible on the strip.
+    let attention_dot: Option<AnyElement> = (attention && !is_active).then(|| {
+        div()
+            .size(px(6.))
+            .rounded_full()
+            .bg(theme.status_info)
+            .into_any_element()
     });
 
     let drag_payload = TabDragPayload {
@@ -1015,6 +1046,7 @@ fn render_tab_chip(
                 .text_color(icon_color),
         )
         .when_some(agent_dot, |s, dot| s.child(dot))
+        .when_some(attention_dot, |s, dot| s.child(dot))
         .child(div().child(label))
         .child(if is_pinned {
             pin_indicator(entity_id_raw, ix, theme).into_any_element()
