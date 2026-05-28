@@ -295,6 +295,12 @@ fn main() {
             // STALE layout and the user's session-recent tabs vanish.
             let workspace_for_quit = workspace.clone();
             cx.on_app_quit(move |cx| {
+                // Flag shutdown BEFORE any view teardown so
+                // `TerminalView::drop` leaves relay PTYs alive in the
+                // daemon for next-launch reattach (live-session restore)
+                // instead of SIGTERM-ing the running children.
+                oximux_app::shell::terminal_view::APP_QUITTING
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let root = workspace_for_quit.read(cx);
                 root.capture_all_layouts(cx);
                 root.capture_all_pane_buffers(cx);
@@ -312,6 +318,8 @@ fn main() {
             // on_app_quit runs the redundant-but-cheap save.
             let workspace_for_window_close = workspace.clone();
             cx.on_window_closed(move |cx, _window_id| {
+                oximux_app::shell::terminal_view::APP_QUITTING
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let root = workspace_for_window_close.read(cx);
                 root.capture_all_layouts(cx);
                 root.capture_all_pane_buffers(cx);
@@ -363,6 +371,10 @@ fn install_signal_watchdog(cx: &mut gpui::App) {
     cx.spawn(async move |cx| {
         loop {
             if SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+                // Same as the quit/window-close hooks: preserve relay
+                // PTYs across the SIGINT/SIGTERM shutdown so reattach
+                // works on the next launch.
+                oximux_app::shell::terminal_view::APP_QUITTING.store(true, Ordering::SeqCst);
                 let _ = cx.update(|cx| cx.quit());
                 break;
             }

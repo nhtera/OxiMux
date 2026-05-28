@@ -27,7 +27,9 @@ else
 fi
 
 echo "==> Building oximux ($PROFILE)"
-cargo build -p oximux-app --bin oximux "${CARGO_FLAGS[@]}"
+# `${CARGO_FLAGS[@]+...}` guards the expansion so an empty array (debug
+# profile) doesn't trip `set -u` ("unbound variable") on bash < 4.4.
+cargo build -p oximux-app --bin oximux ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 
 APP_DIR="dist/OxiMux.app"
 echo "==> Assembling $APP_DIR"

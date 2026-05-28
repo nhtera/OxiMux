@@ -107,15 +107,22 @@ impl RelayBackend {
         let resp = self.request(Request::Attach {
             pty_id: relay_pty_id.to_owned(),
         })?;
-        let replay = match resp {
-            Response::AttachOk { replay } => replay,
+        let (replay, cols, rows) = match resp {
+            Response::AttachOk { replay, cols, rows } => (replay, cols, rows),
             Response::Err { code, message } => bail!("attach: {code:?} — {message}"),
             other => bail!("unexpected attach response: {other:?}"),
         };
-        // Default grid size; caller can resize via TerminalBackend::resize
-        // once it knows the actual pane dimensions.
-        let cols = 80;
-        let rows = 24;
+        // Build the local emulator at the daemon PTY's CURRENT dims, NOT a
+        // hardcoded default. The replay bytes were produced by a process
+        // drawing into a grid of this exact size — absolute-position CSI
+        // sequences only land correctly when the receiving grid matches.
+        // Replaying into the wrong size (then reflowing on the first
+        // pane-driven resize) is what scrambled restored full-screen TUIs.
+        // When the pane later resizes, `TerminalBackend::resize` resizes
+        // the REAL daemon PTY, the live process repaints via SIGWINCH, and
+        // those bytes arrive on the live stream — no static reflow.
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, SCROLLBACK_ROWS)));
         state.lock().expect("state poisoned").advance(&replay);
 

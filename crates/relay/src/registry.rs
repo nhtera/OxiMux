@@ -115,6 +115,17 @@ impl PtyRegistry {
             .unwrap_or_else(|| "/bin/zsh".into());
         let mut command = CommandBuilder::new(&shell);
         command.cwd(&args.cwd);
+        // Terminal identity defaults. The daemon is spawned detached, so it
+        // has no TERM in its own environment; without this the shell child
+        // inherits none and curses/TUI apps degrade ("clear: TERM
+        // environment variable not set", broken vim/pager/Claude Code
+        // rendering). The emulator speaks xterm-256color with truecolor.
+        // Set BEFORE the caller loop so an explicit caller TERM still wins.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        // Host-terminal identity: tools and AI agents detect the emulator
+        // via TERM_PROGRAM to toggle features (clickable links, keybinds).
+        command.env("TERM_PROGRAM", "oximux");
         for (k, v) in &args.env {
             command.env(k, v);
         }
@@ -178,11 +189,17 @@ impl PtyRegistry {
         Ok(pty_id)
     }
 
+    /// Attach a subscriber and return `(replay, cols, rows)` — the
+    /// buffered raw output plus the PTY's CURRENT grid dimensions. The
+    /// client must build its local emulator at exactly `(cols, rows)`
+    /// before replaying, so absolute-position bytes land in the right
+    /// cells and a later resize lets the live process repaint cleanly
+    /// instead of reflowing scrambled content.
     pub fn attach(
         &self,
         pty_id: &str,
         sub: Sender<Notification>,
-    ) -> Result<Vec<u8>, RegistryError> {
+    ) -> Result<(Vec<u8>, u16, u16), RegistryError> {
         let entry = self
             .entries
             .get(pty_id)
@@ -199,7 +216,9 @@ impl PtyRegistry {
         subs.push(sub);
         drop(subs);
         drop(ring);
-        Ok(replay)
+        let cols = *entry.cols.lock().expect("cols poisoned");
+        let rows = *entry.rows.lock().expect("rows poisoned");
+        Ok((replay, cols, rows))
     }
 
     pub fn write(&self, pty_id: &str, bytes: &[u8]) -> Result<(), RegistryError> {

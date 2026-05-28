@@ -55,6 +55,16 @@ const BLINK_INTERVAL_MS: u64 = 530;
 pub const DEFAULT_COLS: u16 = 100;
 pub const DEFAULT_ROWS: u16 = 32;
 
+/// Set true while the app is shutting down (see the quit/window-close/
+/// signal handlers in `main.rs`). `TerminalView::drop` reads it: when
+/// set, it leaves the backend session ALIVE instead of closing it. The
+/// relay daemon outlives the GUI, so a live PTY left running can be
+/// reattached on the next launch — that's what restores a still-running
+/// Claude Code / shell session byte-for-byte (raw replay + live repaint)
+/// rather than the lossy fresh-spawn path. Tab-close and project-switch
+/// run with this clear, so those Drops still tear the PTY down normally.
+pub static APP_QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Spawn a local-shell PTY at `cwd` and wrap its backend in the shared-Arc
 /// form `TerminalView::mount` expects. Centralizes the three previously-
 /// duplicated spawn sites (workspace bootstrap, tab-strip new-tab,
@@ -887,6 +897,18 @@ impl Drop for TerminalView {
     /// Mutex poisoning is treated as best-effort: log + skip rather than
     /// panic inside Drop (a panic in Drop aborts the process).
     fn drop(&mut self) {
+        // App-quit path: leave the backend session alive. The relay
+        // daemon survives the GUI process, so a still-running PTY can be
+        // reattached on next launch and its live screen replayed byte-
+        // for-byte. Closing here would SIGTERM the child (e.g. a running
+        // agent) and downgrade restore to the lossy fresh-spawn path.
+        // This branch only matters for graceful quit (where GPUI drops
+        // every view); tab-close / project-switch keep the normal
+        // teardown below. In-process portable PTYs die with the process
+        // regardless, so skipping their close on quit is harmless.
+        if APP_QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let id = self.session_id;
         let backend = self.backend.clone();
         std::thread::spawn(move || match backend.lock() {

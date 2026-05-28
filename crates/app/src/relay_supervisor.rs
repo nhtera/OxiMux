@@ -35,9 +35,15 @@ pub enum SupervisorError {
     Other(#[from] anyhow::Error),
 }
 
-const SOCKET_FILENAME: &str = "relay-v1.sock";
-const TOKEN_FILENAME: &str = "relay-v1.token";
-const PID_FILENAME: &str = "relay-v1.pid";
+// Bumped to v2 alongside `PROTOCOL_VERSION` when `AttachOk` gained the
+// grid-dimension fields. The bincode wire format isn't self-describing,
+// so a fresh client must NOT reuse an old (v1) daemon — its `AttachOk`
+// would lack cols/rows and reattach decode would fail permanently. A
+// new socket name guarantees the new client spawns a new daemon; any
+// stale v1 daemon idles out on its own socket.
+const SOCKET_FILENAME: &str = "relay-v2.sock";
+const TOKEN_FILENAME: &str = "relay-v2.token";
+const PID_FILENAME: &str = "relay-v2.pid";
 
 const HANDSHAKE_QUICK_TIMEOUT: Duration = Duration::from_millis(500);
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -426,9 +432,9 @@ mod tests {
     #[test]
     fn supervisor_paths_under_runtime_dir() {
         let s = RelaySupervisor::new(PathBuf::from("/tmp/runtime"), PathBuf::from("/tmp/logs"));
-        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v1.sock"));
-        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v1.token"));
-        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v1.pid"));
+        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v2.sock"));
+        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v2.token"));
+        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v2.pid"));
         assert_eq!(s.log_path(), PathBuf::from("/tmp/logs/relay.log"));
     }
 

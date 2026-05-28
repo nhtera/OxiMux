@@ -7,7 +7,7 @@ use crate::error::ErrCode;
 // major builds can't even reach the handshake; this constant is the
 // failsafe for the case where an old client somehow finds a newer
 // daemon's socket (dev environments).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -82,7 +82,14 @@ pub enum Request {
 pub enum Response {
     HelloAck(HelloAck),
     SpawnOk { pty_id: String },
-    AttachOk { replay: Vec<u8> },
+    // `cols`/`rows` are the PTY's current grid dimensions on the daemon.
+    // The client MUST build its local emulator at exactly these dims
+    // before replaying `replay`, otherwise raw bytes captured for a
+    // wide grid land in the wrong cells (absolute-position CSI clipping)
+    // and a later resize reflows them into scrambled output. With the
+    // dims, replay reconstructs the screen byte-for-byte, and the live
+    // process repaints on the next resize via SIGWINCH.
+    AttachOk { replay: Vec<u8>, cols: u16, rows: u16 },
     Ok,
     Pty(PtyDescriptor),
     PtyList(Vec<PtyDescriptor>),

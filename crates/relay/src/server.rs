@@ -408,7 +408,7 @@ async fn handle_request(
             Err(e) => err_from(&e),
         },
         Request::Attach { pty_id } => match registry.attach(&pty_id, notif_tx.clone()) {
-            Ok(replay) => Response::AttachOk { replay },
+            Ok((replay, cols, rows)) => Response::AttachOk { replay, cols, rows },
             Err(e) => err_from(&e),
         },
         Request::Write { pty_id, bytes } => match registry.write(&pty_id, &bytes) {

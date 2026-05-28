@@ -127,6 +127,13 @@ impl TerminalBackend for PortablePtyBackend {
         let mut command = CommandBuilder::new(&cfg.shell);
         command.args(&cfg.args);
         command.cwd(&cfg.cwd);
+        // Terminal identity defaults so curses/TUI apps (clear, less, vim,
+        // Claude Code) find a terminfo entry and get truecolor. Set before
+        // the caller loop so an explicit caller-provided TERM still wins.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        // Host-terminal identity so tools/agents can detect the emulator.
+        command.env("TERM_PROGRAM", "oximux");
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
@@ -232,6 +239,13 @@ impl TerminalBackend for PortablePtyBackend {
         let mut command = CommandBuilder::new(&cfg.shell);
         command.args(&cfg.args);
         command.cwd(&cfg.cwd);
+        // Terminal identity defaults so curses/TUI apps (clear, less, vim,
+        // Claude Code) find a terminfo entry and get truecolor. Set before
+        // the caller loop so an explicit caller-provided TERM still wins.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        // Host-terminal identity so tools/agents can detect the emulator.
+        command.env("TERM_PROGRAM", "oximux");
         for (k, v) in &cfg.env {
             command.env(k, v);
         }

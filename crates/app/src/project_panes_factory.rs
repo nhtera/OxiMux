@@ -204,10 +204,14 @@ pub(crate) fn build_project_panes(
                     window,
                     cx,
                 ) {
-                    let bytes = pane_buffers.remove(&(ordinal, 0)).unwrap_or_default();
-                    if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
-                        view.read(cx).prefill_grid(&bytes);
-                    }
+                    // Content restore comes ONLY from a live daemon reattach
+                    // (handled inside `build_terminal_view_for_tab`). When no
+                    // live PTY exists, the tab opens a clean fresh shell — we
+                    // do NOT replay a serialized grid here. Grid replay had to
+                    // reflow to the new pane size and scrambled full-screen
+                    // TUIs; the reference app likewise prunes local scrollback
+                    // and leans entirely on the daemon's raw-byte reattach.
+                    let _ = pane_buffers.remove(&(ordinal, 0));
                     panes_entity.update(cx, |p, cx| {
                         p.push_restored_terminal_tab(tab.label.clone(), view, cx);
                     });
@@ -333,10 +337,9 @@ fn restore_multi_group(
                         window,
                         cx,
                     ) {
-                        let bytes = pane_buffers.remove(&(ordinal, 0)).unwrap_or_default();
-                        if !bytes.is_empty() && !attach_hints.contains_key(&ordinal) {
-                            view.read(cx).prefill_grid(&bytes);
-                        }
+                        // See the single-group path: content restore is the
+                        // daemon reattach only; no lossy serialized-grid replay.
+                        let _ = pane_buffers.remove(&(ordinal, 0));
                         panes_entity.update(cx, |p, cx| {
                             p.push_restored_terminal_tab_in(group_id, tab.label.clone(), view, cx);
                         });

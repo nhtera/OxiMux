@@ -218,7 +218,20 @@ async fn attach_replays_buffered_output_then_streams_live() {
     )
     .await;
     let replay = match resp {
-        Response::AttachOk { replay } => replay,
+        Response::AttachOk { replay, cols, rows } => {
+            // Attach must echo the PTY's live grid dims so a reattaching
+            // client rebuilds its emulator at the exact captured size
+            // before replaying — replaying into a mismatched grid (then
+            // reflowing on the first pane resize) is what scrambled
+            // restored full-screen TUIs. The PTY was spawned at 80x24
+            // and never resized, so those dims must come back here.
+            assert_eq!(
+                (cols, rows),
+                (80, 24),
+                "attach must report the PTY's current grid size"
+            );
+            replay
+        }
         other => panic!("attach: {other:?}"),
     };
     assert!(

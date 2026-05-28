@@ -238,6 +238,8 @@ mod tests {
             },
             Response::AttachOk {
                 replay: vec![1, 2, 3],
+                cols: 80,
+                rows: 24,
             },
             Response::Ok,
             Response::Pty(PtyDescriptor {
