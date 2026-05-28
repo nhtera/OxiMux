@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Render, Styled, Task, Window, div, px,
+    MouseButton, MouseDownEvent, ParentElement, Render, Styled, Task, Window, canvas, div, px,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -33,9 +33,8 @@ use oximux_pty::{
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::Search;
-use crate::shell::cell_metrics::LINE_HEIGHT_EXTRA;
 use crate::shell::key_input::keystroke_to_bytes;
-use crate::shell::terminal_row::build_row;
+use crate::shell::terminal_canvas::{PaintParams, paint_grid};
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 
@@ -242,6 +241,13 @@ pub struct TerminalView {
     /// (post-dormancy).
     _poll_task: Option<Task<()>>,
     _blink_task: Task<()>,
+    /// Active text selection in cell coordinates: `(start_row, start_col,
+    /// end_row, end_col)`. End is inclusive on both axes. `None` = no
+    /// selection. Today this is set only by Cmd+A (select-all) since
+    /// the canvas paint doesn't yet expose pixel-to-cell hit testing for
+    /// drag-select; that ships in a follow-up slice. Cmd+C copies the
+    /// extracted text when set, then clears it.
+    selection: Option<(usize, usize, usize, usize)>,
 }
 
 impl TerminalView {
@@ -313,6 +319,7 @@ impl TerminalView {
             dormant_cwd: None,
             _poll_task: Some(poll_task),
             _blink_task: blink_task,
+            selection: None,
         }
     }
 
@@ -392,6 +399,7 @@ impl TerminalView {
             dormant_cwd: Some(cwd),
             _poll_task: None,
             _blink_task: blink_task,
+            selection: None,
         }
     }
 
@@ -583,16 +591,21 @@ impl TerminalView {
         let ks = &event.keystroke;
 
         // Cmd combos are app-level — `keystroke_to_bytes` already swallows
-        // them. We intercept the two terminal-specific ones here, where the
-        // view has access to `App` (clipboard) and to the backend (session-
+        // them. We intercept the terminal-specific ones here where the view
+        // has access to `App` (clipboard) and to the backend (session-
         // specific bracketed-paste state).
         //
-        // Cmd+C → SIGINT (0x03) is a placeholder until mouse text selection
-        // lands. Matches Terminal.app / iTerm2 fallback when nothing is
-        // selected. Once selection exists, branch on selection-empty.
+        // Cmd+A: select all visible cells (no PTY mode equivalent, this is
+        //   a pure renderer-side affordance for "copy a chunk of output").
+        // Cmd+C: copy the active selection if any; otherwise fall through
+        //   to SIGINT (0x03). The fallback matches Terminal.app / iTerm2
+        //   behavior when no selection is set.
+        // Cmd+V: paste with bracketed-paste wrapping when the shell has
+        //   DECSET 2004 on; otherwise straight paste.
         //
-        // Shift is excluded so `Cmd+Shift+C` (often "copy as plain text" or
-        // "interrupt" in other terminals) doesn't silently send SIGINT here.
+        // Shift is excluded so `Cmd+Shift+C` (often "copy as plain text"
+        // or other variants in different terminals) doesn't silently
+        // intercept the SIGINT fallback here.
         if ks.modifiers.platform
             && !ks.modifiers.control
             && !ks.modifiers.alt
@@ -604,11 +617,49 @@ impl TerminalView {
                     return;
                 }
                 "c" => {
+                    if let Some(sel) = self.selection.take() {
+                        let text = extract_selection_text(&self.snapshot, sel);
+                        if !text.is_empty() {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        }
+                        cx.notify();
+                        return;
+                    }
                     self.send_bytes(b"\x03", cx);
+                    return;
+                }
+                "a" => {
+                    // Select every visible cell. End col is the widest
+                    // populated row's last col — saturating at 0 so an
+                    // empty snapshot doesn't underflow.
+                    let rows = self.snapshot.cells.len();
+                    if rows == 0 {
+                        return;
+                    }
+                    let end_row = rows - 1;
+                    let end_col = self
+                        .snapshot
+                        .cells
+                        .iter()
+                        .map(|r| r.len())
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_sub(1);
+                    self.selection = Some((0, 0, end_row, end_col));
+                    cx.notify();
                     return;
                 }
                 _ => {}
             }
+        }
+
+        // Any non-handled keystroke clears the selection so typing in the
+        // shell resumes immediately. Without this, the previous Cmd+A
+        // highlight would linger and the user would think the keystrokes
+        // are still being captured by some selection mode.
+        if self.selection.is_some() {
+            self.selection = None;
+            cx.notify();
         }
 
         let bytes = keystroke_to_bytes(ks);
@@ -869,13 +920,7 @@ impl Render for TerminalView {
             (usize::MAX, usize::MAX)
         };
         let theme = self.theme;
-        // Source line-height from `cell_metrics::LINE_HEIGHT_EXTRA` so this
-        // never drifts from `MainPane`'s grid math. Tight ratio (≈ 1.21×)
-        // sits inside Menlo's em-square at 14 pt and keeps half-block
-        // glyphs (▀ ▄) tiling — the Claude Code mascot is the canonical
-        // regression case.
-        let line_height = px(self.typography.t_body_lg + LINE_HEIGHT_EXTRA);
-        let pad = px(self.density.pad_panel);
+        let pad = self.density.pad_panel;
         let focus_handle = self.focus_handle.clone();
 
         // Match buckets per visible row. History_len was captured at scan
@@ -885,24 +930,20 @@ impl Render for TerminalView {
         let visible_rows = self.snapshot.cells.len();
         let buckets = self.search.render_buckets(visible_rows);
 
-        let rows: Vec<gpui::Div> = self
-            .snapshot
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(row_idx, row)| {
-                let match_cols = buckets.get(row_idx).map(|v| v.as_slice());
-                build_row(
-                    row,
-                    row_idx,
-                    cursor,
-                    match_cols,
-                    &theme,
-                    line_height,
-                    pane_focused,
-                )
-            })
-            .collect();
+        // Build owned paint params (`FnOnce + 'static` requires no
+        // borrows). Clone is cheap: snapshot is a Vec<Vec<Cell>> already
+        // sized to the visible grid, buckets are tiny per-row vecs of
+        // MatchHit (Copy), theme/typography/cursor are POD-sized.
+        let paint_params = PaintParams {
+            snapshot: self.snapshot.clone(),
+            theme,
+            typography: self.typography.clone(),
+            cursor,
+            buckets,
+            pane_focused,
+            pad,
+            selection: self.selection,
+        };
 
         let overlay = if self.search.active {
             let badge = self.search.count_badge();
@@ -970,6 +1011,21 @@ impl Render for TerminalView {
         // backend live + `cx.notify()` re-renders.
         let dormant_badge = self.is_dormant().then(|| build_dormant_badge(&theme));
 
+        // The grid is painted into a canvas child filling the pane body.
+        // `canvas(prepaint, paint)` defers everything to a single paint
+        // closure: we measure cell metrics, group runs, and emit
+        // `paint_quad` + `shape_line` calls directly — no flex layout
+        // round-trip per cell. The outer div keeps its existing role as
+        // the focus owner, action target, and click-to-focus surface.
+        let grid_canvas = canvas(
+            // Prepaint: no per-paint state to capture; return unit.
+            |_bounds, _window, _cx| (),
+            move |bounds, _: (), window, cx| {
+                paint_grid(bounds, paint_params, window, cx);
+            },
+        )
+        .size_full();
+
         let mut root = div()
             .id("oximux-terminal-view")
             .track_focus(&focus_handle)
@@ -977,21 +1033,20 @@ impl Render for TerminalView {
             .flex_col()
             .h_full()
             .w_full()
-            // Anchor for the absolute-positioned dormant badge below.
-            // Already set the search-overlay sibling positions itself
-            // via its own container, so adding `relative()` here is
-            // safe — the rows stay in flex flow.
+            // Anchor for absolute-positioned overlays (dormant badge,
+            // search overlay) — the canvas child stays in flex flow.
             .relative()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
             // `.font(...)` over `.font_family(...)` so the configured
             // fallback chain (SF Mono → Menlo → Monaco) takes effect when
             // the primary face (Geist Mono) isn't installed. `font_family`
-            // takes a single literal name and never cascades.
+            // takes a single literal name and never cascades. The canvas
+            // paint reads typography directly, but keeping the font on
+            // the root is the right default for any non-canvas children
+            // (overlays, error banners) that may inherit it later.
             .font(self.typography.mono_font())
             .text_size(px(self.typography.t_body_lg))
-            .px(pad)
-            .py(pad)
             .on_action(cx.listener(Self::on_search))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1007,7 +1062,7 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
             }))
-            .children(rows);
+            .child(grid_canvas);
         if let Some(o) = overlay {
             root = root.child(o);
         }
@@ -1016,6 +1071,60 @@ impl Render for TerminalView {
         }
         root
     }
+}
+
+/// Extract the text covered by a cell-coordinate selection from the
+/// current snapshot. End coords are inclusive. Each row is right-trimmed
+/// of trailing whitespace then joined with `\n` — matching the
+/// Terminal.app / iTerm2 "copy preserves visual newlines but not visual
+/// padding" convention. Out-of-range coordinates clamp silently to grid.
+fn extract_selection_text(
+    snapshot: &TerminalSnapshot,
+    (start_row, start_col, end_row, end_col): (usize, usize, usize, usize),
+) -> String {
+    let rows = &snapshot.cells;
+    if rows.is_empty() {
+        return String::new();
+    }
+    let last_row = rows.len() - 1;
+    let r0 = start_row.min(last_row);
+    let r1 = end_row.min(last_row);
+    let mut out = String::with_capacity((r1 - r0 + 1) * 80);
+    for (row_idx, row) in rows.iter().enumerate().skip(r0).take(r1 - r0 + 1) {
+        // Column window depends on row position within the rectangle.
+        // For the single-row case (r0 == r1), use the start..=end col
+        // range; for multi-row, the first row runs start_col..=end of
+        // row, intermediate rows run 0..=end of row, last row runs
+        // 0..=end_col.
+        let last_col_in_row = row.len().saturating_sub(1);
+        let (c0, c1) = if r0 == r1 {
+            (start_col.min(last_col_in_row), end_col.min(last_col_in_row))
+        } else if row_idx == r0 {
+            (start_col.min(last_col_in_row), last_col_in_row)
+        } else if row_idx == r1 {
+            (0, end_col.min(last_col_in_row))
+        } else {
+            (0, last_col_in_row)
+        };
+        if c1 < c0 {
+            out.push('\n');
+            continue;
+        }
+        let mut line = String::with_capacity(c1 - c0 + 1);
+        for cell in &row[c0..=c1] {
+            let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+            line.push(ch);
+        }
+        // Right-trim trailing spaces — matches user intuition that a
+        // selected line ending in blank padding shouldn't paste 80 spaces.
+        let trimmed = line.trim_end();
+        out.push_str(trimmed);
+        // Emit `\n` between rows in the rect, but not after the last row.
+        if row_idx < r1 {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// F3.4 slice 3: tiny corner chip indicating a restored-dormant sub-pane.
@@ -1040,4 +1149,80 @@ fn build_dormant_badge(theme: &Theme) -> gpui::Div {
         // the dormancy contract: the shell isn't running yet; first
         // focus or keystroke wakes it at the saved cwd.
         .child("↻ restored — click to wake")
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use oximux_pty::{Cell, CellColor};
+
+    fn cell(ch: char) -> Cell {
+        Cell {
+            ch,
+            fg: CellColor::Default,
+            bg: CellColor::Default,
+            inverse: false,
+            dim: false,
+        }
+    }
+
+    fn snap(rows: &[&str]) -> TerminalSnapshot {
+        let cells: Vec<Vec<Cell>> = rows
+            .iter()
+            .map(|row| row.chars().map(cell).collect::<Vec<_>>())
+            .collect();
+        let cols = cells.iter().map(|r| r.len()).max().unwrap_or(0) as u16;
+        let rows_n = cells.len() as u16;
+        TerminalSnapshot {
+            cols,
+            rows: rows_n,
+            cursor: (0, 0),
+            cells,
+        }
+    }
+
+    #[test]
+    fn extract_single_row_substring() {
+        let s = snap(&["hello world"]);
+        let txt = extract_selection_text(&s, (0, 0, 0, 4));
+        assert_eq!(txt, "hello");
+    }
+
+    #[test]
+    fn extract_full_grid_joins_with_newlines() {
+        let s = snap(&["foo", "bar"]);
+        let txt = extract_selection_text(&s, (0, 0, 1, 2));
+        assert_eq!(txt, "foo\nbar");
+    }
+
+    #[test]
+    fn extract_right_trims_trailing_spaces() {
+        let s = snap(&["hi   ", "ok"]);
+        let txt = extract_selection_text(&s, (0, 0, 1, 4));
+        assert_eq!(txt, "hi\nok");
+    }
+
+    #[test]
+    fn extract_empty_snapshot_returns_empty_string() {
+        let s = snap(&[]);
+        let txt = extract_selection_text(&s, (0, 0, 5, 5));
+        assert_eq!(txt, "");
+    }
+
+    #[test]
+    fn extract_clamps_out_of_range_indices() {
+        let s = snap(&["abc"]);
+        // Asking for end_row=10 on a 1-row snapshot should clamp to row 0.
+        let txt = extract_selection_text(&s, (0, 0, 10, 10));
+        assert_eq!(txt, "abc");
+    }
+
+    #[test]
+    fn extract_middle_row_uses_full_width() {
+        let s = snap(&["aa", "bbbb", "cc"]);
+        // Multi-row select: first row clips start col, middle row is
+        // full width, last row clips end col.
+        let txt = extract_selection_text(&s, (0, 1, 2, 0));
+        assert_eq!(txt, "a\nbbbb\nc");
+    }
 }
