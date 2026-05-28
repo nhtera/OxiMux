@@ -1,21 +1,29 @@
 //! Serialize an `alacritty_terminal::Term` grid (+ optional scrollback) into
 //! ANSI bytes that can be replayed into a fresh `vte::ansi::Processor` to
-//! reconstruct the visible state. Used by the per-pane scrollback persistence
-//! (Phase 4 step 16) so plain terminals restore with their prior output
-//! intact after an app restart.
+//! reconstruct prior output after an app restart (per-pane scrollback
+//! persistence).
 //!
 //! Output shape (top-down, one row per terminal row):
 //! - SGR resets between cells whose attributes differ from the running state.
 //! - Cells written as UTF-8 (`cell.c`). WIDE_CHAR_SPACER cells are skipped
 //!   because the preceding WIDE_CHAR cell already advanced the cursor by 2.
-//! - `\r\n` between rows (no trailing newline).
-//! - Final `ESC [ row ; col H` (CUP, 1-based) placing the cursor where it
-//!   was at capture time.
+//! - **Trailing blanks are trimmed** from each row, and **trailing empty
+//!   rows are dropped** entirely. This is load-bearing for restore: the
+//!   replay target is resized to fit the live pane, and `Term::resize`
+//!   reflows the content. Emitting full-width-padded rows (the old
+//!   behavior) made every line carry `cols` chars, so on a width change
+//!   the padding wrapped into blank lines and pushed content around —
+//!   the "scrambled prompt / scattered output" restore bug. Trimmed,
+//!   short logical lines reflow cleanly at any width.
+//! - `\r\n` between emitted rows (no trailing newline).
+//! - **No final cursor-position (CUP) sequence.** Restored content is
+//!   historical scrollback; the freshly-spawned shell prints its own
+//!   prompt and owns the cursor from there. A captured absolute CUP would
+//!   only fight the reflow and re-introduce misplacement.
 //!
 //! Fidelity is "looks the same in normal usage" — bracketed-paste mode,
-//! alt-screen state, mouse-tracking modes, hyperlinks, and dotted/dashed
-//! underline variants are NOT round-tripped. Matches the xterm.js
-//! `serializeAddon` limitations.
+//! alt-screen state, mouse-tracking modes, hyperlinks, dotted/dashed
+//! underline variants, and exact cursor position are NOT round-tripped.
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
@@ -85,8 +93,20 @@ pub fn serialize_term(term: &Term<VoidListener>, opts: SerializeOptions) -> Vec<
     let start_line = -(scrollback as i32);
     let end_line = rows as i32;
 
+    // Drop trailing empty rows: find the last line with any visible
+    // content and stop there. The lower portion of a full-screen grid is
+    // usually blank; emitting it as a tall stack of `\r\n` would reflow
+    // into blank lines and shove restored content around on resize.
+    let Some(last_content) = (start_line..end_line)
+        .rev()
+        .find(|&li| row_has_content(term, li, cols))
+    else {
+        // Nothing on screen — just the SGR baseline.
+        return out;
+    };
+
     let mut first_row = true;
-    for line_idx in start_line..end_line {
+    for line_idx in start_line..=last_content {
         if !first_row {
             out.extend_from_slice(b"\r\n");
         }
@@ -94,14 +114,18 @@ pub fn serialize_term(term: &Term<VoidListener>, opts: SerializeOptions) -> Vec<
         emit_row(&mut out, &mut current, term, line_idx, cols);
     }
 
-    // Final cursor position. alacritty cursor.point.line is relative to the
-    // visible top, so it's already 0..rows. Always positive on the way out.
-    let cursor = term.grid().cursor.point;
-    let cursor_row_1based = (cursor.line.0.max(0) as usize + 1).min(rows.max(1));
-    let cursor_col_1based = (cursor.column.0 + 1).min(cols.max(1));
-    out.extend_from_slice(format!("\x1b[{cursor_row_1based};{cursor_col_1based}H").as_bytes());
-
     out
+}
+
+/// True when any cell in the row carries a printable glyph (not blank /
+/// not the unwritten-cell sentinel). Used to find the last content row so
+/// trailing blank rows are dropped from the capture.
+fn row_has_content(term: &Term<VoidListener>, line_idx: i32, cols: usize) -> bool {
+    let row = &term.grid()[Line(line_idx)];
+    (0..cols).any(|c| {
+        let ch = row[Column(c)].c;
+        ch != ' ' && ch != '\0'
+    })
 }
 
 /// Serialize a term with a dimension header prepended so the consumer
@@ -166,7 +190,19 @@ fn emit_row(
     cols: usize,
 ) {
     let row = &term.grid()[Line(line_idx)];
-    for col_idx in 0..cols {
+    // Trim trailing blanks: emit only through the last cell that carries a
+    // printable glyph. Leading + interior spacing (e.g. the column gaps in
+    // `ls` output) is preserved — only the run of blank padding at the
+    // right edge is dropped, so the replayed line is its natural length
+    // and reflows without spilling into wrapped blank rows.
+    let end = match (0..cols).rev().find(|&c| {
+        let ch = row[Column(c)].c;
+        ch != ' ' && ch != '\0'
+    }) {
+        Some(last_sig) => last_sig + 1,
+        None => 0,
+    };
+    for col_idx in 0..end {
         let cell = &row[Column(col_idx)];
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             // The preceding WIDE_CHAR cell emitted a 2-column char; skip
@@ -438,14 +474,55 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_preserves_cursor_position() {
-        // Move cursor to row 3 col 5 (1-based) → (2, 4) 0-based.
-        let original = replay_into_new_term(b"\x1b[3;5H", 20, 10);
+    fn positioned_content_survives_roundtrip() {
+        // Exact cursor position is intentionally NOT round-tripped — the
+        // restored scrollback hands the cursor to the freshly-spawned
+        // shell. But content WRITTEN at an absolute position must land on
+        // the same row/col after replay. Move to row 3 col 5 (1-based)
+        // and write 'Z'.
+        let original = replay_into_new_term(b"\x1b[3;5HZ", 20, 10);
         let bytes = serialize_term(original.term_for_test(), SerializeOptions::default());
         let restored = replay_into_new_term(&bytes, 20, 10);
         let mut snap = crate::snapshot::TerminalSnapshot::default();
         restored.fill_snapshot(&mut snap);
-        assert_eq!(snap.cursor, (2, 4));
+        // 'Z' was at row 2 col 4 (0-based); it must survive there.
+        assert_eq!(snap.cells[2][4].ch, 'Z');
+    }
+
+    #[test]
+    fn trailing_blank_rows_and_padding_are_dropped() {
+        // The restore-scramble fix: content padded to full width + empty
+        // lower rows must NOT be emitted, so the capture stays compact and
+        // reflows cleanly. Two short lines in a wide, tall grid.
+        let original = replay_into_new_term(b"hi\r\nbye\r\n", 80, 24);
+        let bytes = serialize_term(original.term_for_test(), SerializeOptions::default());
+        // No full-width padding: the body is just the two trimmed lines.
+        // (SGR baseline + "hi" + CRLF + "bye" — well under 20 bytes.)
+        assert!(
+            bytes.len() < 20,
+            "expected compact output, got {} bytes: {:?}",
+            bytes.len(),
+            String::from_utf8_lossy(&bytes),
+        );
+        // And it still round-trips the visible content.
+        let restored = replay_into_new_term(&bytes, 80, 24);
+        let mut snap = crate::snapshot::TerminalSnapshot::default();
+        restored.fill_snapshot(&mut snap);
+        assert_eq!(snap.cells[0].iter().map(|c| c.ch).collect::<String>().trim_end(), "hi");
+        assert_eq!(snap.cells[1].iter().map(|c| c.ch).collect::<String>().trim_end(), "bye");
+    }
+
+    #[test]
+    fn interior_spacing_is_preserved() {
+        // `ls`-style column gaps are interior whitespace, not trailing —
+        // they must survive so multi-column output stays aligned.
+        let original = replay_into_new_term(b"a    b    c", 80, 5);
+        let bytes = serialize_term(original.term_for_test(), SerializeOptions::default());
+        let restored = replay_into_new_term(&bytes, 80, 5);
+        let mut snap = crate::snapshot::TerminalSnapshot::default();
+        restored.fill_snapshot(&mut snap);
+        let row0: String = snap.cells[0].iter().map(|c| c.ch).collect();
+        assert_eq!(row0.trim_end(), "a    b    c");
     }
 
     #[test]
@@ -538,8 +615,8 @@ mod tests {
     fn empty_grid_serializes_without_panicking() {
         let original = TerminalState::new(80, 24, 100);
         let bytes = serialize_term(original.term_for_test(), SerializeOptions::default());
-        // Should be at least the SGR 0 prefix + one CUP.
-        assert!(bytes.starts_with(b"\x1b[0m"));
-        assert!(bytes.ends_with(b"H"));
+        // An all-blank grid emits just the SGR-0 baseline — no content
+        // rows, no trailing cursor-move.
+        assert_eq!(bytes, b"\x1b[0m");
     }
 }
