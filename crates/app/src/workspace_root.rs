@@ -47,12 +47,12 @@ use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    ActivateGroupTab, CloseGroup, DismissOverlay, OpenAddProjectDialog, OpenCommandPalette,
-    OpenCommitDialog, OpenFileFromContextMenu, OpenFileTreeContextMenuAt, OpenPaneActions,
-    OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate,
-    RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
-    SelectSourceControlTab, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft, SplitRight,
-    SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    ActivateGroupTab, CloseGroup, CloseTab, DismissOverlay, OpenAddProjectDialog,
+    OpenCommandPalette, OpenCommitDialog, OpenFileFromContextMenu, OpenFileTreeContextMenuAt,
+    OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
+    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
+    SelectSearchTab, SelectSourceControlTab, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft,
+    SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -1396,6 +1396,26 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|this, _: &CloseGroup, window, cx| {
                 this.close_active_pane_group(window, cx);
+            }))
+            // Fallback CloseTab handler. The primary listener lives on each
+            // `PaneGroup`'s root div, but on the FIRST FRAME after a new tab
+            // is created (e.g. opening a file from the explorer) the new
+            // view's focus_handle isn't yet in the rendered dispatch tree —
+            // `window.focus_node_id_in_rendered_frame` falls back to root,
+            // skipping the PaneGroup's listener. Routing Cmd+W through the
+            // active group from the root anchor closes the race. When the
+            // dispatch tree IS in the right state the PaneGroup listener
+            // catches CloseTab first and stops propagation, so this
+            // fallback only fires when actually needed (no double-close).
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                panes.update(cx, |p, cx| {
+                    if let Some(group) = p.active_group() {
+                        group.update(cx, |g, cx| g.on_close_tab(&CloseTab, window, cx));
+                    }
+                });
             }))
             .on_action(cx.listener(|this, action: &SplitGroupAt, window, cx| {
                 // Tab right-click "Split X" → target a SPECIFIC group
