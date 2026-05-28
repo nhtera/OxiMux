@@ -331,7 +331,17 @@ impl TerminalBackend for PortablePtyBackend {
         session
             .state
             .lock()
-            .map(|s| crate::grid_serializer::serialize_term_capped(s.term_for_test(), max_bytes))
+            .map(|s| {
+                // Use the with-dims variant so the consumer can resize
+                // a fresh Term to match the captured grid BEFORE replay.
+                // Without this, an 80-col capture replayed into a 200-col
+                // Term (or vice versa) emits scrambled output because
+                // absolute-position CSI sequences land in the wrong cells.
+                crate::grid_serializer::serialize_term_capped_with_dims(
+                    s.term_for_test(),
+                    max_bytes,
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -341,7 +351,26 @@ impl TerminalBackend for PortablePtyBackend {
             .get(&id)
             .with_context(|| format!("unknown session {id:?}"))?;
         if let Ok(mut state) = session.state.lock() {
-            state.advance(bytes);
+            // New-format captures carry their grid dims as a 9-byte
+            // header; resize the dormant Term to match BEFORE feeding
+            // the body so absolute-position CSI sequences land in the
+            // right cells. Legacy (pre-header) blobs replay against the
+            // current grid as before.
+            if let Some((cols, rows, payload)) =
+                crate::grid_serializer::parse_capture_header(bytes)
+            {
+                // Defensive clamp: caps match the rest of the codebase
+                // (DEFAULT_COLS/ROWS pattern in app/src/shell/terminal_view.rs
+                // is 100×32; we accept up to 1024×512 for ultrawide users)
+                // and prevent a corrupted header from triggering a huge
+                // allocation inside alacritty's grid.
+                let cols = cols.clamp(1, 1024);
+                let rows = rows.clamp(1, 512);
+                state.resize(cols, rows);
+                state.advance(payload);
+            } else {
+                state.advance(bytes);
+            }
         }
         Ok(())
     }

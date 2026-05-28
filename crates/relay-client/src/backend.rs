@@ -309,7 +309,13 @@ impl TerminalBackend for RelayBackend {
         session
             .state
             .lock()
-            .map(|s| oximux_pty::serialize_term_capped(s.term_for_test(), max_bytes))
+            .map(|s| {
+                // Dim-aware capture: prepend the OXBF header so a
+                // matching prefill_grid can resize the receiver to the
+                // captured dimensions before replay. Without this, an
+                // 80-col capture replayed into a 200-col Term scrambles.
+                oximux_pty::serialize_term_capped_with_dims(s.term_for_test(), max_bytes)
+            })
             .unwrap_or_default()
     }
 
@@ -319,7 +325,17 @@ impl TerminalBackend for RelayBackend {
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
         if let Ok(mut state) = session.state.lock() {
-            state.advance(bytes);
+            // Match the portable backend: parse the dim header if
+            // present, resize the dormant Term to match, then advance
+            // the body. Legacy blobs (no header) replay as before.
+            if let Some((cols, rows, payload)) = oximux_pty::parse_capture_header(bytes) {
+                let cols = cols.clamp(1, 1024);
+                let rows = rows.clamp(1, 512);
+                state.resize(cols, rows);
+                state.advance(payload);
+            } else {
+                state.advance(bytes);
+            }
         }
         Ok(())
     }

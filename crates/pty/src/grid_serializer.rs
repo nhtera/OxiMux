@@ -24,6 +24,41 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
+/// Capture-blob header identifying a payload that begins with the grid
+/// dimensions used to produce it. Prevents the "replay 200-col bytes into
+/// an 80-col Term" scramble seen on workspace restore when the new pane
+/// happens to be sized differently from the captured one. Versioned by
+/// the trailing `\x01` so future format tweaks can be detected without
+/// disambiguation against random binary content.
+pub const CAPTURE_HEADER_MAGIC: &[u8; 5] = b"OXBF\x01";
+
+/// Total header length: 4-byte tag + 1-byte version + cols(u16 LE) +
+/// rows(u16 LE) = 9 bytes.
+pub const CAPTURE_HEADER_LEN: usize = 9;
+
+/// Build the 9-byte header for a serialized capture. Public so backends
+/// outside the in-process portable-pty path (e.g. the relay) can emit
+/// the same envelope when they capture state from a remote grid.
+pub fn build_capture_header(cols: u16, rows: u16) -> [u8; CAPTURE_HEADER_LEN] {
+    let mut buf = [0u8; CAPTURE_HEADER_LEN];
+    buf[..5].copy_from_slice(CAPTURE_HEADER_MAGIC);
+    buf[5..7].copy_from_slice(&cols.to_le_bytes());
+    buf[7..9].copy_from_slice(&rows.to_le_bytes());
+    buf
+}
+
+/// Detect + parse the capture header. Returns the saved `(cols, rows)`
+/// and the remaining payload slice on success; `None` for legacy blobs
+/// (caller treats them as plain ANSI without resizing).
+pub fn parse_capture_header(bytes: &[u8]) -> Option<(u16, u16, &[u8])> {
+    if bytes.len() < CAPTURE_HEADER_LEN || &bytes[..5] != CAPTURE_HEADER_MAGIC {
+        return None;
+    }
+    let cols = u16::from_le_bytes([bytes[5], bytes[6]]);
+    let rows = u16::from_le_bytes([bytes[7], bytes[8]]);
+    Some((cols, rows, &bytes[CAPTURE_HEADER_LEN..]))
+}
+
 /// Options controlling how much state the serializer emits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SerializeOptions {
@@ -66,6 +101,26 @@ pub fn serialize_term(term: &Term<VoidListener>, opts: SerializeOptions) -> Vec<
     let cursor_col_1based = (cursor.column.0 + 1).min(cols.max(1));
     out.extend_from_slice(format!("\x1b[{cursor_row_1based};{cursor_col_1based}H").as_bytes());
 
+    out
+}
+
+/// Serialize a term with a dimension header prepended so the consumer
+/// can resize a fresh Term to match BEFORE replaying the body. This is
+/// the format used by the in-process persistence path; it's what fixes
+/// the "scrambled prompt after workspace restore" symptom when the new
+/// pane is sized differently from the captured one.
+///
+/// The `max_bytes` budget covers the total returned blob — the body is
+/// capped to `max_bytes - CAPTURE_HEADER_LEN` so the header always fits.
+pub fn serialize_term_capped_with_dims(term: &Term<VoidListener>, max_bytes: usize) -> Vec<u8> {
+    let cols = term.columns() as u16;
+    let rows = term.screen_lines() as u16;
+    let body_budget = max_bytes.saturating_sub(CAPTURE_HEADER_LEN);
+    let body = serialize_term_capped(term, body_budget);
+    let header = build_capture_header(cols, rows);
+    let mut out = Vec::with_capacity(CAPTURE_HEADER_LEN + body.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&body);
     out
 }
 
@@ -418,6 +473,65 @@ mod tests {
             bytes.len(),
             small_cap,
         );
+    }
+
+    #[test]
+    fn capture_header_round_trips_dims() {
+        let header = build_capture_header(120, 40);
+        let (cols, rows, payload) = parse_capture_header(&header).expect("magic present");
+        assert_eq!(cols, 120);
+        assert_eq!(rows, 40);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn capture_header_rejects_unmagic_blob() {
+        // Legacy (pre-header) blobs start with `\x1b[0m` from
+        // `serialize_term`; the parser must report None so the caller
+        // falls back to direct advance.
+        let legacy = b"\x1b[0mhello";
+        assert!(parse_capture_header(legacy).is_none());
+    }
+
+    #[test]
+    fn capture_header_rejects_short_input() {
+        assert!(parse_capture_header(b"OX").is_none());
+        assert!(parse_capture_header(b"OXBF").is_none());
+    }
+
+    #[test]
+    fn serialize_with_dims_emits_parseable_header() {
+        // Build a non-trivial term so the body is non-empty and we
+        // verify the dims-prefix sits in front of the SGR baseline.
+        let original = replay_into_new_term(b"abc", 80, 24);
+        let bytes = serialize_term_capped_with_dims(original.term_for_test(), 1024);
+        let (cols, rows, payload) = parse_capture_header(&bytes).expect("header present");
+        assert_eq!((cols, rows), (80, 24));
+        // Payload should start with the SGR-0 baseline that
+        // `serialize_term` always emits first.
+        assert!(payload.starts_with(b"\x1b[0m"));
+    }
+
+    #[test]
+    fn dim_aware_capture_replays_into_matching_term_preserves_content() {
+        // The fix's smoke test: capture a 120-wide term containing
+        // content at column 100 (would land off-screen in an 80-col
+        // replay) and verify the dim-aware path round-trips correctly
+        // when the consumer resizes to match the header first.
+        let mut original = replay_into_new_term(b"", 120, 10);
+        // Park the cursor at row 1 col 100 (1-based CUP) and write "X".
+        original.advance(b"\x1b[1;100HX");
+        let bytes = serialize_term_capped_with_dims(original.term_for_test(), 4096);
+        let (cols, rows, payload) = parse_capture_header(&bytes).expect("header");
+        assert_eq!((cols, rows), (120, 10));
+        // Consumer side: spawn a Term at the saved dims and replay.
+        let restored = replay_into_new_term(payload, cols, rows);
+        let mut snap = crate::snapshot::TerminalSnapshot::default();
+        restored.fill_snapshot(&mut snap);
+        // The 'X' must land at row 0 col 99 (0-based) — same as in the
+        // original. Without the dim-aware capture, replaying into an
+        // 80-col Term would clip the position and produce scramble.
+        assert_eq!(snap.cells[0][99].ch, 'X');
     }
 
     #[test]
