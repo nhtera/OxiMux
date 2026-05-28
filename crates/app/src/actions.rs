@@ -247,6 +247,11 @@ actions!(
         FocusPrevPane,
         /// Open a new terminal tab inside the focused pane.
         NewTab,
+        /// Open a new top-level workspace window (Cmd+N). Handled by a
+        /// global app-level listener in `main.rs` since it needs `&mut App`
+        /// to call `open_window`; each window owns an independent
+        /// `WorkspaceRoot` + project panes.
+        NewWindow,
         /// Close the active tab in the focused pane. Cascades to `ClosePane`
         /// when it was the last tab so cmd-w does the right thing in both
         /// the multi-tab and single-tab case.

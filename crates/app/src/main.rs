@@ -20,7 +20,7 @@ use gpui::{
 };
 use oximux_app::actions::{
     CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
-    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NextTab, OpenCommandPalette,
+    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewWindow, NextTab, OpenCommandPalette,
     OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, Search,
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitSubPaneDown,
     SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
@@ -187,6 +187,10 @@ fn main() {
             // reference editor's "zoom pane" binding.
             KeyBinding::new("cmd-shift-enter", ToggleZoomSubPane, None),
             KeyBinding::new("cmd-t", NewTab, None),
+            // cmd-n opens a new top-level window (each with its own
+            // WorkspaceRoot). Mirrors the terminal-app convention where
+            // cmd-t is a new tab and cmd-n is a new window.
+            KeyBinding::new("cmd-n", NewWindow, None),
             // macOS strips `shift` from the runtime keystroke and remaps the
             // key to the shifted character (`]`→`}`, `[`→`{`). Binding strings
             // must use the post-shift character — `cmd-shift-]` would never
@@ -241,115 +245,168 @@ fn main() {
         ]);
         cx.activate(true);
 
-        // First-launch window bounds: fill the primary display's *visible*
-        // area (the screen rect minus the menu bar at top and dock at the
-        // edge). Wrapping `NSScreen.visibleFrame` here makes the app open
-        // spacious by default — equivalent to the work-area-sized initial
-        // window that other IDE-class desktop apps ship — without committing
-        // to a true `Maximized`/`Fullscreen` state (so the green traffic
-        // light still toggles a user-sized "zoom" frame). On every other
-        // platform / when no display is reported, fall back to a centered
-        // 1400×900 windowed bounds. Persisted bounds (TODO: Phase 4 step 16)
-        // will win over both once wired.
-        let bounds = cx
-            .primary_display()
-            .map(|display| display.visible_bounds())
-            .unwrap_or_else(|| {
-                let fallback = size(px(1400.0), px(900.0));
-                Bounds::centered(None, fallback, cx)
-            });
-
-        // Transparent unified titlebar: macOS draws traffic-light glyphs
-        // into the app chrome at `point(12, 8)` — visually aligned with
-        // the wordmark text in the 32-px chrome row. Y origin tuned
-        // empirically; GPUI's text renderer parks glyph mass slightly
-        // above the line-box center, so the traffic-light glyph
-        // origin sits a touch above the chrome row's geometric center
-        // (y=16) to put glyph centers on the same horizontal line.
-        // On non-macOS, `traffic_light_position` is a no-op (system
-        // titlebar still drawn).
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(720.0), px(480.0))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("OxiMux".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(12.), px(8.))),
-            }),
-            ..Default::default()
-        };
-
-        let repo_for_window = repo.clone();
-        let app_state_for_window = app_state.clone();
-        let _ = cx.open_window(options, move |window, cx| {
-            // Wrap the workspace in gpui-component's `Root`. `Root` hosts the
-            // tooltip / sheet / dialog / notification overlays, which is what
-            // makes `Button::tooltip(...)` (and any other component tooltip)
-            // actually paint. On macOS its `window_border` shadow size is 0,
-            // so it's a transparent pass-through — purely additive.
-            let workspace =
-                cx.new(|cx| WorkspaceRoot::new(repo_for_window, app_state_for_window, window, cx));
-            // Restore last-active project so the sidebar isn't empty after
-            // relaunch. Helper reads recents (ORDER BY last_opened_at DESC).
-            workspace.update(cx, |root, cx| root.bootstrap_active_project(window, cx));
-            // Capture every open project's pane scrollback to `pane_buffers`
-            // on app quit. The on_app_quit closure runs synchronously inside
-            // GPUI's grace window (default 100 ms); BLOB writes for ~10
-            // panes fit comfortably. Restore on next launch reads these
-            // same rows in `set_active_project` (Phase 4 step 16).
-            //
-            // `capture_all_layouts` must fire too — otherwise the per-project
-            // PersistedTabs blob never sees tab creations / closures / group
-            // splits made during the session, so the next launch reads the
-            // STALE layout and the user's session-recent tabs vanish.
-            let workspace_for_quit = workspace.clone();
-            cx.on_app_quit(move |cx| {
-                // Flag shutdown BEFORE any view teardown so
-                // `TerminalView::drop` leaves relay PTYs alive in the
-                // daemon for next-launch reattach (live-session restore)
-                // instead of SIGTERM-ing the running children.
-                oximux_app::shell::terminal_view::APP_QUITTING
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                let root = workspace_for_quit.read(cx);
-                root.capture_all_layouts(cx);
-                root.capture_all_pane_buffers(cx);
-                root.capture_all_pane_relay_ids(cx);
-                async {}
-            })
-            .detach();
-            // Window-close → save + quit. Without this, clicking the red
-            // traffic light closes the window but leaves the app alive in
-            // the dock; a follow-up Ctrl+C in the launching terminal then
-            // kills the process via SIGINT without firing on_app_quit, so
-            // any session-recent state would be lost. Save synchronously
-            // here as belt-and-braces (covers the race where on_app_quit
-            // is skipped) AND issue cx.quit() so the app fully exits and
-            // on_app_quit runs the redundant-but-cheap save.
-            let workspace_for_window_close = workspace.clone();
-            cx.on_window_closed(move |cx, _window_id| {
-                oximux_app::shell::terminal_view::APP_QUITTING
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                let root = workspace_for_window_close.read(cx);
-                root.capture_all_layouts(cx);
-                root.capture_all_pane_buffers(cx);
-                root.capture_all_pane_relay_ids(cx);
-                cx.quit();
-            })
-            .detach();
-            // SIGINT / SIGTERM handler. The signal can arrive in two
-            // ways: (1) user runs `cargo run` and Ctrl+Cs the terminal,
-            // SIGINT cascades to the child OxiMux process; (2) launchd /
-            // killall sends SIGTERM. Cocoa's terminate flow never gets a
-            // chance, so on_app_quit observers don't fire. Install a
-            // signal handler that flips an atomic flag, then a tiny
-            // background task polls the flag and triggers cx.quit() from
-            // inside the GPUI event loop — that goes through the normal
-            // shutdown path and on_app_quit DOES fire, persisting state.
-            install_signal_watchdog(cx);
-            let view: AnyView = workspace.into();
-            cx.new(|cx| gpui_component::Root::new(view, window, cx))
-        });
+        // Register the once-per-process lifecycle observers (quit-save,
+        // last-window-close → quit, SIGINT/SIGTERM watchdog) plus the New
+        // Window action handler, then open the first workspace window. Every
+        // subsequent window is opened by that same handler through the shared
+        // `open_workspace_window` factory, so each gets an independent
+        // `WorkspaceRoot` and the quit / close paths treat them uniformly.
+        install_app_lifecycle(cx, repo.clone(), app_state.clone());
+        open_workspace_window(cx, repo, app_state);
     });
+}
+
+/// Build the `WindowOptions` for a workspace window. `cascade` offsets the
+/// frame by a fixed step per already-open window so a second window doesn't
+/// land exactly on top of the first.
+fn workspace_window_options(cx: &mut gpui::App, cascade: usize) -> WindowOptions {
+    // First-launch window bounds: fill the primary display's *visible* area
+    // (the screen rect minus the menu bar at top and the dock at the edge).
+    // Wrapping `NSScreen.visibleFrame` opens the app spacious by default —
+    // equivalent to the work-area-sized initial window IDE-class desktop apps
+    // ship — without committing to a true `Maximized`/`Fullscreen` state (so
+    // the green traffic light still toggles a user-sized "zoom" frame). When
+    // no display is reported, fall back to a centered 1400×900 frame.
+    let mut bounds = cx
+        .primary_display()
+        .map(|display| display.visible_bounds())
+        .unwrap_or_else(|| {
+            let fallback = size(px(1400.0), px(900.0));
+            Bounds::centered(None, fallback, cx)
+        });
+    // Cascade additional windows down-right so a stack of windows stays
+    // individually grabbable instead of perfectly overlapping.
+    if cascade > 0 {
+        let step = px(32.0 * cascade as f32);
+        bounds.origin.x = bounds.origin.x + step;
+        bounds.origin.y = bounds.origin.y + step;
+    }
+
+    // Transparent unified titlebar: macOS draws traffic-light glyphs into the
+    // app chrome at `point(12, 8)`, visually aligned with the wordmark text in
+    // the 32-px chrome row. The glyph origin sits a touch above the row's
+    // geometric center because the text renderer parks glyph mass slightly
+    // high. On non-macOS, `traffic_light_position` is a no-op.
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(720.0), px(480.0))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("OxiMux".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(12.), px(8.))),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Open one workspace window: build its `WorkspaceRoot`, restore its active
+/// project, and register it so the app-level quit / close observers can reach
+/// it. Reused for the first window and every `NewWindow` action.
+fn open_workspace_window(
+    cx: &mut gpui::App,
+    repo: Option<Repository>,
+    app_state: oximux_app::state::AppState,
+) {
+    let cascade = oximux_app::window_registry::remaining(cx);
+    let options = workspace_window_options(cx, cascade);
+    // Mint the persistence id BEFORE the window opens so it can key this
+    // window's layout / buffer / relay-id rows. The first window is "main"
+    // (legacy single-window key); later windows get "w{n}".
+    let persist_id = oximux_app::window_registry::next_persist_id(cx);
+    let _ = cx.open_window(options, move |window, cx| {
+        let workspace = cx.new(|cx| WorkspaceRoot::new(repo, app_state, window, cx));
+        // Restore last-active project so the sidebar isn't empty after relaunch.
+        workspace.update(cx, |root, cx| root.bootstrap_active_project(window, cx));
+        // Track this window so quit-save + last-window-close gating find it.
+        let window_id = window.window_handle().window_id();
+        oximux_app::window_registry::register(cx, window_id, persist_id, workspace.clone());
+        // Wrap in gpui-component's `Root` (hosts tooltip / dialog /
+        // notification overlays). On macOS its window_border shadow is 0, so
+        // it's a transparent pass-through — purely additive.
+        let view: AnyView = workspace.into();
+        cx.new(|cx| gpui_component::Root::new(view, window, cx))
+    });
+}
+
+/// Register the once-per-process app lifecycle observers + the New Window
+/// action handler. Splitting these out of the per-window `open_window` closure
+/// is what makes multi-window correct: a SINGLE quit observer iterates every
+/// tracked window, and a SINGLE window-closed observer decides "last window →
+/// quit the app" vs. "dismiss just this window".
+fn install_app_lifecycle(
+    cx: &mut gpui::App,
+    repo: Option<Repository>,
+    app_state: oximux_app::state::AppState,
+) {
+    use oximux_app::window_registry;
+
+    // Cmd+N → open another independent workspace window. Handled globally
+    // (not on `WorkspaceRoot`) because opening a window needs `&mut App`.
+    {
+        let repo = repo.clone();
+        let app_state = app_state.clone();
+        cx.on_action::<NewWindow>(move |_, cx| {
+            open_workspace_window(cx, repo.clone(), app_state.clone());
+        });
+    }
+
+    // App quit (Cmd+Q / menu): flag shutdown BEFORE any view teardown so
+    // `TerminalView::drop` leaves relay PTYs alive in the daemon for
+    // next-launch reattach, then capture EVERY open window's layout +
+    // scrollback + relay ids. Runs synchronously inside GPUI's grace window.
+    cx.on_app_quit(move |cx| {
+        oximux_app::shell::terminal_view::APP_QUITTING
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for (_persist_id, workspace) in window_registry::all_windows(cx) {
+            let root = workspace.read(cx);
+            root.capture_all_layouts(cx);
+            root.capture_all_pane_buffers(cx);
+            root.capture_all_pane_relay_ids(cx);
+        }
+        async {}
+    })
+    .detach();
+
+    // Window close. Closing the LAST window quits the app — and saves
+    // synchronously, keeping PTYs alive (belt-and-braces for the race where
+    // on_app_quit is skipped, e.g. red-traffic-light close followed by a
+    // Ctrl+C in the launching terminal). Closing a NON-last window dismisses
+    // just that window: dropping its registry entry tears down its
+    // `WorkspaceRoot` (and SIGTERMs only its own PTYs, because APP_QUITTING
+    // stays clear), leaving the other windows untouched.
+    cx.on_window_closed(move |cx, window_id| {
+        let Some(removed) = window_registry::remove(cx, window_id) else {
+            return;
+        };
+        let is_last = window_registry::remaining(cx) == 0;
+        if is_last {
+            oximux_app::shell::terminal_view::APP_QUITTING
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            {
+                let root = removed.workspace.read(cx);
+                root.capture_all_layouts(cx);
+                root.capture_all_pane_buffers(cx);
+                root.capture_all_pane_relay_ids(cx);
+            }
+            // Release the last strong handle, then exit. APP_QUITTING is
+            // already set, so teardown leaves the relay PTYs alive.
+            drop(removed);
+            cx.quit();
+        } else {
+            // Dismiss just this window: dropping the strong handle here is
+            // what SIGTERMs this window's PTYs (APP_QUITTING is clear).
+            drop(removed);
+        }
+    })
+    .detach();
+
+    // SIGINT / SIGTERM handler. The signal can arrive two ways: (1) `cargo
+    // run` then Ctrl+C in the launching terminal cascades SIGINT to the child;
+    // (2) launchd / killall sends SIGTERM. Cocoa's terminate flow never gets a
+    // chance, so on_app_quit observers don't fire. The handler flips an atomic
+    // flag; a tiny background task polls it and triggers cx.quit() from inside
+    // the GPUI event loop, which DOES run on_app_quit and persists state.
+    install_signal_watchdog(cx);
 }
 
 /// Flag flipped by the SIGINT/SIGTERM handler. Read by the watchdog
