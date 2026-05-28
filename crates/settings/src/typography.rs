@@ -77,9 +77,9 @@ impl Typography {
             // Ligatures off: terminals must show literal byte sequences.
             // `->` should be two characters, not `→`; `==` two equals, not
             // `⩵`. Menlo doesn't ligature anyway, but locking this in keeps
-            // behavior correct if the user later swaps to JetBrains Mono,
-            // Fira Code, etc. Zed does the same in their terminal element
-            // (`terminal_element.rs:903–955`).
+            // behavior correct if the user later swaps to a ligature font
+            // (JetBrains Mono, Fira Code, etc.) — terminals disable
+            // ligatures so glyph cells stay 1:1 with character cells.
             features: FontFeatures::disable_ligatures(),
             fallbacks: Some(FontFallbacks::from_fonts(
                 self.mono_fallbacks.iter().map(|s| s.to_string()).collect(),

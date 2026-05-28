@@ -1,7 +1,7 @@
 //! LSP base-protocol framing — `Content-Length: N\r\n\r\n` followed by an
 //! N-byte UTF-8 JSON body.
 //!
-//! Helix and Zed both hand-roll this. The protocol is small enough that a
+//! Hand-rolled on purpose: the protocol is small enough that a
 //! tower-/async-lsp shim costs more than it saves, especially given the
 //! `lsp-types 0.97` pin we share with `gpui-component`.
 

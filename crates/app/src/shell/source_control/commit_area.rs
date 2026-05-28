@@ -242,7 +242,7 @@ impl CommitArea {
         // Variant switch: a `.primary()` button retains its bright fill even
         // when disabled, which reads as "active" to the eye. Fall back to
         // `.secondary()` when disabled so the button matches the dimmed
-        // visual treatment users expect (e.g. the reference UX's gray disabled-Commit
+        // visual treatment users expect (a gray disabled-Commit
         // state). Enabled state keeps `.primary()` so the affirmative action
         // still pops.
         let mut primary = DropdownButton::new("sc-commit-split")

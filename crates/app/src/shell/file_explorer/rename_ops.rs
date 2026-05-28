@@ -1,12 +1,12 @@
 //! Inline rename for the file explorer.
 //!
-//! Matches the the reference UX UX shown in the design reference: the file row
+//! Matches the UX shown in the design reference: the file row
 //! transforms into an editable input field in-place. Enter commits,
 //! Escape cancels, clicking another row cancels. Stem (basename
 //! without extension) is pre-selected via `SelectAll` action dispatch
 //! — gpui-component's `InputState` doesn't expose a public selection
 //! range setter, so we get "whole filename selected" rather than
-//! the reference UX's stem-only selection. Close enough: typing still replaces
+//! strict stem-only selection. Close enough: typing still replaces
 //! everything, and the user can arrow-key to keep the extension.
 //!
 //! Driven by `WorkspaceRoot::start_inline_file_rename` (Explorer
@@ -65,8 +65,7 @@ impl FileExplorer {
         // Stem length for selection — `file_stem` returns "test" for
         // "test.txt", ".gitignore" for ".gitignore" (Path treats a
         // leading-dot name as all-stem), and "file.tar" for
-        // "file.tar.gz". Matches the reference UX's "select the part before the
-        // last dot" behavior.
+        // "file.tar.gz". Selects the part before the last dot.
         let stem_chars: u32 = path
             .file_stem()
             .map(|s| s.to_string_lossy().chars().count() as u32)
@@ -109,7 +108,7 @@ impl FileExplorer {
         // Dispatch the selection action against the now-focused input.
         // With cursor at the stem boundary, `SelectToStartOfLine`
         // extends the selection backward to column 0 — exactly the
-        // stem (matches the reference UX's "test" highlighted in "test.txt").
+        // stem (e.g. "test" highlighted in "test.txt").
         // Files without an extension get `SelectAll` so the whole
         // name highlights (the user almost certainly wants to retype
         // the whole thing).

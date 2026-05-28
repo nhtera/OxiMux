@@ -4,7 +4,7 @@
 //!
 //! Binary splits: every `split_leaf` wraps the target in a fresh `Split`
 //! node, halving the target's slice between old and new. Matches the default
-//! split semantics in the reference terminal / iTerm. Rebalancing or equal-N-way splits are
+//! split semantics in common terminal emulators. Rebalancing or equal-N-way splits are
 //! a separate concern (an explicit "balance" action could flatten + equalize
 //! a same-axis cascade if/when the UX demands it).
 

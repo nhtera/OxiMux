@@ -381,7 +381,7 @@ impl WorkspaceRoot {
                 // repaint that can land focus on a freshly-mounted
                 // sub-element of the sidebar (FileExplorer, etc.)
                 // instead of the user's last-active terminal/editor.
-                // Mirrors the reference UX's "open project → cursor in last
+                // Mirrors the "open project → cursor in last
                 // working terminal" behavior; also keeps the chrome
                 // toggle buttons routable since their actions need a
                 // focused element inside the workspace_root subtree.

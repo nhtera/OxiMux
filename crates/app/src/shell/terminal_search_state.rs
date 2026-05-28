@@ -112,8 +112,8 @@ impl SearchState {
     /// Re-scan the grid for the current query under the current `options`.
     /// Empty-query short-circuit keeps the host from over-fetching. Resets
     /// `current_index` to the first match so the user sees a highlighted
-    /// "current" on every query mutation (— find-as-you-type
-    /// lands you on the first hit immediately).
+    /// "current" on every query mutation (find-as-you-type lands you on
+    /// the first hit immediately).
     pub fn rerun(&mut self, grid: &[Vec<Cell>], visible_rows: usize) {
         if self.query.is_empty() {
             self.matches.clear();
@@ -175,7 +175,7 @@ impl SearchState {
     }
 
     /// Format the count badge for the overlay: empty when no query, else
-    /// `i of N` (VS Code-style; `- of 0` when no matches).
+    /// `i of N` (`- of 0` when no matches).
     pub fn count_badge(&self) -> String {
         if self.query.is_empty() {
             return String::new();

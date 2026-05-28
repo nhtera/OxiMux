@@ -23,13 +23,12 @@
 //! of `text_system().shape_line(text, size, runs, force_width)`. Passing
 //! `Some(cell_width)` makes the layout engine advance every glyph by
 //! exactly `cell_width` regardless of the font's natural metric — the
-//! same trick crate-reorg-terminal/element.rs and zed-industries/zed's terminal_element
-//! both use to keep monospace cells crisp.
+//! standard trick GPU terminal renderers use to keep monospace cells
+//! crisp.
 //!
 //! Background quads use `floor()` for the left edge and `ceil()` for the
-//! width — this is the standard sub-pixel-gap fix borrowed from crate-reorg's
-//! `LayoutRect::paint`. Without it, adjacent same-color cells render with
-//! visible hairline seams on HiDPI displays.
+//! width — the standard sub-pixel-gap fix. Without it, adjacent same-color
+//! cells render with visible hairline seams on HiDPI displays.
 
 use gpui::{
     App, Bounds, Hsla, Pixels, SharedString, Size, TextAlign, TextRun, Window, fill, point, px,
@@ -41,15 +40,15 @@ use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::terminal_palette::{ColorRole, resolve};
 use crate::shell::terminal_search_state::{MatchHit, MatchKind};
 
-/// Multiplier on fg alpha when SGR 2 ("faint") is set. Sits between
-/// the reference terminal 0.69 / Alacritty 0.66 / Kitty 0.75 — picked to land in the
-/// middle so dim text (zsh autosuggest, fish, prompt paths) reads the
-/// way users expect across terminals.
+/// Multiplier on fg alpha when SGR 2 ("faint") is set. 0.7 lands in the
+/// middle of the ~0.66–0.75 faint-text opacity range common across
+/// mainstream terminals, so dim text (zsh autosuggest, fish, prompt
+/// paths) reads the way users expect.
 const DIM_FG_ALPHA: f32 = 0.7;
 
 /// Multiplier on fg alpha for cells in an unfocused pane. Replaces the
 /// older translucent-veil approach with the "lighter text on same bg"
-/// treatment the reference terminal / iTerm2 use — the focused pane reads as the active
+/// treatment common terminals use — the focused pane reads as the active
 /// one without any extra chrome.
 const UNFOCUSED_FG_ALPHA: f32 = 0.4;
 
@@ -179,8 +178,8 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
 
         // ── Background pass ────────────────────────────────────────────
         // `floor` on x and `ceil` on width: prevents sub-pixel seams
-        // between adjacent same-color cells on HiDPI displays. Same
-        // pattern crate-reorg-terminal/element.rs uses in `LayoutRect::paint`.
+        // between adjacent same-color cells on HiDPI displays — the
+        // standard quad-snapping pattern for GPU terminal renderers.
         let mut col: usize = 0;
         for run in &runs {
             let n_cells = run.text.chars().count();

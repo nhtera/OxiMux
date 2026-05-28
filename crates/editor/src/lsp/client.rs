@@ -45,7 +45,7 @@ use tokio::{
 
 use super::transport::{buffered, encode_frame, read_frame};
 
-/// 5-second cap on every awaited LSP request. Helix and early editors
+/// 5-second cap on every awaited LSP request. Early LSP editors
 /// skipped `$/cancelRequest` and relied on the timeout instead — see
 /// `phase-05-step-01-editor-lsp-spike-plan.md` OQ3.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

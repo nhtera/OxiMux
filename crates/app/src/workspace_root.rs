@@ -398,7 +398,7 @@ impl WorkspaceRoot {
     }
 
     /// Route the Explorer context-menu Rename action into the FileExplorer's
-    /// inline-rename flow. Matches the reference UX: the row turns into an editable
+    /// inline-rename flow. The row turns into an editable
     /// Input in-place (no modal). FileExplorer owns the actual fs op +
     /// post-rename refresh; this handler just kicks the state transition.
     pub(crate) fn start_inline_file_rename(
@@ -892,7 +892,7 @@ impl Render for WorkspaceRoot {
         };
 
         // Tab strip row height matches the chrome row (h_top_bar) for
-        // VS Code-style visual symmetry — two equal-height rows stacked.
+        // visual symmetry — two equal-height rows stacked.
         // Chips inside still render at their natural 28px height
         // (`TAB_STRIP_HEIGHT_PX`); `items_center` on the outer row
         // gives them top/bottom breathing room inside the 36px band.
@@ -1421,8 +1421,8 @@ impl Render for WorkspaceRoot {
                 // Tab right-click "Split X" → target a SPECIFIC group
                 // (the right-clicked one), not the focused one. We
                 // first activate that group so the split lands on it,
-                // then perform the directional split. Matches the reference UX's
-                // per-tab Split menu behavior.
+                // then perform the directional split. Matches the
+                // per-tab Split menu behavior of the design reference.
                 let Some(panes) = this.active_project_panes() else {
                     return;
                 };

@@ -125,8 +125,8 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_focus_prev_sub_pane))
             .on_action(cx.listener(PaneGroup::on_toggle_zoom_sub_pane))
             // Modifier-up listener — commits the MRU switch when the
-            // user releases Ctrl. Mirrors the upstream zed/sidebar
-            // thread-switcher pattern. We commit when `ctrl` flips OFF
+            // user releases Ctrl. Standard hold-modifier switcher
+            // pattern. We commit when `ctrl` flips OFF
             // and a switcher is currently open; everything else is a
             // no-op so other modifier transitions don't disturb state.
             .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, window, cx| {
@@ -279,8 +279,8 @@ fn build_tab_strip_from_headers(
     // Visible insertion slot the drag would land on. `Before` → slot is
     // at target_visible_idx; `After` → slot is at target_visible_idx + 1.
     // Both adjacent chips paint a single edge each so the user reads ONE
-    // continuous 2px bar between them (the reference UX pattern from
-    // resolveTabIndicatorEdges).
+    // continuous 2px bar between them (adjacent-edge tab-indicator
+    // pattern).
     let insertion_slot = drag_hover.map(|h| match h.side {
         TabInsertSide::Before => h.target_visible_idx,
         TabInsertSide::After => h.target_visible_idx + 1,

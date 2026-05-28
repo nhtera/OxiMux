@@ -228,7 +228,7 @@ pub fn paint_row(
 
     // Label vs editable input. The label keeps its italic-dim styling
     // for ignored entries; the input uses the gpui-component default
-    // styling so it visually pops as "editable" the way the reference UX's does.
+    // styling so it visually pops as "editable".
     let name_cell: gpui::AnyElement = if let Some(state) = rename_input {
         div()
             .flex_1()

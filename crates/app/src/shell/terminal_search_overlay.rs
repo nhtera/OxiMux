@@ -1,4 +1,4 @@
-//! VS Code-style search overlay layout.
+//! Editor-style find-overlay layout.
 //!
 //! Pure layout function. The host (`TerminalView`) constructs a [`Params`]
 //! struct holding the data slice (`query`, `badge`, `options`) plus six
@@ -7,8 +7,8 @@
 //! keeps the `pub` surface of the view minimal — same host-owns-I/O pattern
 //! as `terminal_search_state.rs`.
 //!
-//! Visual style mirrors VS Code's find widget: flat text toggles with a
-//! thin underline for the active state (no fill, no chunky pill). The
+//! Visual style mirrors a typical editor find widget: flat text toggles
+//! with a thin underline for the active state (no fill, no chunky pill). The
 //! chevron + close use `gpui_component::Button` for icon-glyph parity with
 //! the rest of the UI.
 //!
@@ -142,7 +142,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
                         .when(query_empty, |this| this.italic())
                         .child(query_text)
                         .child(
-                            // VS Code-style caret. `caret_on` syncs with
+                            // Editor-style caret. `caret_on` syncs with
                             // the terminal's 530ms blink_task — no second
                             // timer. Zero-width when off so layout doesn't
                             // twitch every 530ms.
@@ -227,7 +227,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         )
 }
 
-/// One flat VS Code-style toggle. Text + (optional) 1 px underline. No
+/// One flat editor-style toggle. Text + (optional) 1 px underline. No
 /// padding box, no background — the underline alone signals "armed". Hover
 /// lifts text from `fg_muted` to `fg_base` so the toggle still feels
 /// interactive without the visual weight of a button. `tooltip` shows on

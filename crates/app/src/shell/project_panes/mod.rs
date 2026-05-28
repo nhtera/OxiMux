@@ -89,7 +89,7 @@ pub struct ProjectPanes {
     hovered_drop_target: Option<TabDragHoveredTarget>,
     /// Workspace-global counter for default terminal labels. Bumped on
     /// every shell spawn (initial group, split-spawn, +-new-tab) so
-    /// labels stay unique across panes — matches the reference UX's numbering.
+    /// labels stay unique across panes (global, not per-group).
     next_terminal_n: u64,
 }
 

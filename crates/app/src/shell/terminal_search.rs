@@ -31,7 +31,7 @@ pub struct MatchRange {
     pub col_end: usize,
 }
 
-/// VS Code-style search toggles. All default to `false`, which preserves the
+/// Editor-style search toggles. All default to `false`, which preserves the
 /// original "case-insensitive plain substring" behavior of the find overlay.
 ///
 /// - `case_sensitive` — when true, both row and needle keep their original

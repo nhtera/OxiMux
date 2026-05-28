@@ -2,7 +2,7 @@
 //!
 //! A `TerminalSplitTree` lets one terminal tab hold MULTIPLE PTYs in a
 //! split layout — `Cmd+D` carves a column, `Cmd+Shift+D` carves a row.
-//! Matches iTerm / the reference terminal / the reference editor's sub-pane model.
+//! Matches the sub-pane model of common terminals and the reference editor.
 //!
 //! Layout state lives in the `PaneTree<usize>` whose leaves index into
 //! the `panes` vector. Closing a sub-pane sets its slot to `None` and

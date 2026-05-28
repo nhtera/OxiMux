@@ -172,7 +172,7 @@ impl Render for TabContextMenu {
             .rounded(px(density.r_card))
             .shadow_lg();
 
-        // Four-direction split actions — match the reference UX's per-tab context menu.
+        // Four-direction split actions — per-tab context-menu splits.
         // Each row dispatches `SplitGroupAt` carrying the right-clicked
         // group id so the split lands on this group regardless of focus.
         let splits: [(&'static str, &'static str, &'static str, u8, bool); 4] = [

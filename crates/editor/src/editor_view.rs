@@ -187,8 +187,8 @@ impl EditorView {
     /// Open the file at `path` and pick the right rendering mode by
     /// sniffing the file bytes. Read failures degrade to an empty Binary
     /// placeholder with a `tracing::warn` — the editor still renders so
-    /// the user can see that something opened (matches the reference UX's behavior of
-    /// always opening a tab on click).
+    /// the user can see that something opened (always open a tab on
+    /// click, even when the file can't be rendered).
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         // Mirror window-focus events into `self.focused`. Register BEFORE
@@ -499,8 +499,8 @@ impl Render for EditorView {
 }
 
 /// Centered image preview. GPUI's `img(PathBuf)` reads + decodes the file
-/// itself, so no base64 round-trip is needed (unlike the reference UX, which has to
-/// stream image bytes from its relay process to the renderer).
+/// itself, so no base64 round-trip is needed (unlike browser-renderer
+/// stacks that must stream image bytes from a separate process).
 ///
 /// `max_w`/`max_h` keep oversize images from blowing out the layout — the
 /// `img` element does object-fit: contain by default, so aspect ratio is

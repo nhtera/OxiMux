@@ -9,8 +9,8 @@
 //!
 //! Cost: one `resolve_font` + one `advance('m')` per `PaneGroup` render.
 //! Both are cached inside GPUI's text system (LRU on `Font`), so steady-
-//! state cost is a hash lookup. Measured live in Zed's terminal pipeline
-//! the same way (`crates/terminal_view/src/terminal_element.rs:974–979`).
+//! state cost is a hash lookup — the standard way GPU terminal pipelines
+//! measure the monospace cell advance.
 
 use gpui::{Pixels, Window, px};
 use oximux_settings::Typography;
@@ -60,9 +60,8 @@ impl CellMetrics {
 
     /// Columns that fit in `width` px. Uses `next_up().floor()` instead of
     /// plain `floor()` so a width that's exactly `N * cell_width` doesn't
-    /// drop to `N-1` due to f32 round-off — borrowed from Zed's
-    /// `TerminalBounds::num_columns` (terminal.rs:220–223), which has 20
-    /// regression tests for this exact class of bug.
+    /// drop to `N-1` due to f32 round-off — the standard column-count
+    /// rounding fix for this class of off-by-one bug.
     pub fn cols_in(&self, width: f32) -> u16 {
         ((width / self.cell_width).next_up().floor() as i32).max(0) as u16
     }

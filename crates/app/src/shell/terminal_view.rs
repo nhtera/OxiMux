@@ -45,8 +45,8 @@ use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 /// idle.
 const POLL_INTERVAL_MS: u64 = 16;
 
-/// Cursor blink half-period. 530 ms matches Terminal.app's default and the
-/// XTerm `cursorBlink` resource. One toggle per period — full blink cycle is
+/// Cursor blink half-period. 530 ms matches the common terminal default and
+/// the XTerm `cursorBlink` resource. One toggle per period — full blink cycle is
 /// 1.06 s.
 const BLINK_INTERVAL_MS: u64 = 530;
 
@@ -624,7 +624,7 @@ impl TerminalView {
         // Cmd+A: select all visible cells (no PTY mode equivalent, this is
         //   a pure renderer-side affordance for "copy a chunk of output").
         // Cmd+C: copy the active selection if any; otherwise fall through
-        //   to SIGINT (0x03). The fallback matches Terminal.app / iTerm2
+        //   to SIGINT (0x03). The fallback matches common terminal
         //   behavior when no selection is set.
         // Cmd+V: paste with bracketed-paste wrapping when the shell has
         //   DECSET 2004 on; otherwise straight paste.
@@ -1185,7 +1185,7 @@ impl Render for TerminalView {
 /// Extract the text covered by a cell-coordinate selection from the
 /// current snapshot. End coords are inclusive. Each row is right-trimmed
 /// of trailing whitespace then joined with `\n` — matching the
-/// Terminal.app / iTerm2 "copy preserves visual newlines but not visual
+/// common terminal "copy preserves visual newlines but not visual
 /// padding" convention. Out-of-range coordinates clamp silently to grid.
 fn extract_selection_text(
     snapshot: &TerminalSnapshot,

@@ -72,7 +72,7 @@ fn unstaged_only_unmodified_in_index_modified_in_worktree() {
 
 #[test]
 fn partial_stage_modified_modified_appears_in_both_staged_and_unstaged() {
-    // Classic VSCode / Magit convention: a partially-staged file shows up
+    // Standard partial-staging convention: a partially-staged file shows up
     // under BOTH section headers because both sides have real diff content.
     let files = vec![fs("a.txt", IndexStatus::Modified, WorktreeStatus::Modified)];
     let s = partition_files(&files);

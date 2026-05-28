@@ -151,7 +151,7 @@ pub struct PaneGroup {
     focus_handle: FocusHandle,
     /// Monotonic counter for default terminal labels. `ProjectPanes`
     /// overrides this via `set_next_terminal_n` before each spawn so the
-    /// numbering is global across panes (the reference UX-style), not per-group.
+    /// numbering is global across panes, not per-group.
     next_terminal_n: u64,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
@@ -1272,7 +1272,7 @@ impl PaneGroup {
     /// Ctrl+Tab while Ctrl is held — advance the MRU switcher cursor
     /// through a FROZEN MRU snapshot. The first press captures the
     /// snapshot and lands cursor on row 1 (the most-recent prior tab,
-    /// matching JetBrains "jump back"). Subsequent presses advance
+    /// the standard "jump back" behavior). Subsequent presses advance
     /// cursor through the list, wrapping at the end.
     ///
     /// The tab is NOT activated here — the commit happens at

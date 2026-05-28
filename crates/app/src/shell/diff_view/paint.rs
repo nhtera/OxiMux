@@ -355,7 +355,7 @@ fn line_row(
     };
     // Each gutter cell packs `<number><sign>` so the eye lands on the
     // number first and the sign second — matches the convention used by
-    // GitLens / GitHub / VS Code. The sign is rendered per-cell rather
+    // common diff viewers. The sign is rendered per-cell rather
     // than per-row so a removal in the old cell still reads as removed
     // even when the row also has an addition mirror.
     let old_cell = pack_gutter_cell(line.old_line, line.kind, /*is_new_side=*/ false, gutter_digits);

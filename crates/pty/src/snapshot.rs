@@ -45,7 +45,7 @@ pub enum CellColor {
 
 /// One visible cell. `inverse` mirrors the SGR 7 / DECSCNM bit — render swaps
 /// fg/bg when true. `dim` mirrors SGR 2 — render multiplies fg alpha by ~0.7
-/// (the reference terminal 0.69 / Alacritty 0.66 / Kitty 0.75; we sit in the middle). Other
+/// (the middle of the ~0.66–0.75 faint-text range common across terminals). Other
 /// SGR attributes (bold/italic/underline) live on `Cell` only when the
 /// renderer needs them; right now we only carry the bits the renderer uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

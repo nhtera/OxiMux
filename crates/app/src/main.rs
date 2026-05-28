@@ -158,7 +158,7 @@ fn main() {
         }
         cx.bind_keys([
             // cmd-d / cmd-shift-d trigger SUB-PANE splits inside the
-            // focused terminal tab (matches iTerm / the reference terminal / the
+            // focused terminal tab (matches common terminals and the
             // reference editor). Tab-GROUP splits remain accessible via
             // tab right-click → "Split X" and the Pane Actions "..." menu.
             KeyBinding::new("cmd-d", SplitSubPaneRight, None),
@@ -190,7 +190,7 @@ fn main() {
             // macOS strips `shift` from the runtime keystroke and remaps the
             // key to the shifted character (`]`→`}`, `[`→`{`). Binding strings
             // must use the post-shift character — `cmd-shift-]` would never
-            // match. Mirrors Zed's own `pane::ActivateNextItem` binding.
+            // match. Same remap the reference editor's next-tab binding uses.
             KeyBinding::new("cmd-}", NextTab, None),
             KeyBinding::new("cmd-{", PrevTab, None),
             // MRU cycle — ctrl-tab is the cross-platform standard for

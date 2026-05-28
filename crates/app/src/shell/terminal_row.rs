@@ -40,7 +40,7 @@ pub fn build_row(
     // line_height tuned to Menlo's em-square (~17 px at 14 pt) so the
     // padding collapses; Claude Code's mascot is the canonical regression
     // case and should now render with the same pixel resolution as
-    // the reference terminal / Terminal.app / VS Code.
+    // mainstream GPU-accelerated terminals.
     let mut row_div = div()
         .flex()
         .flex_row()
@@ -138,21 +138,21 @@ fn group_runs(
 }
 
 /// Multiplier applied to fg alpha when the cell carries `Flags::DIM`
-/// (SGR 2 / "faint"). Sits between the reference terminal's 0.69, Alacritty's 0.66, and
-/// Kitty's 0.75 — picked to land in the middle so shell prompts that
-/// rely on dim text (zsh autosuggestions, fish, oh-my-zsh paths) read
-/// the way users expect across terminals.
+/// (SGR 2 / "faint"). 0.7 lands in the middle of the ~0.66–0.75 faint-text
+/// opacity range common across mainstream terminals, so shell prompts that
+/// rely on dim text (zsh autosuggestions, fish, oh-my-zsh paths) read the
+/// way users expect.
 const DIM_FG_ALPHA: f32 = 0.7;
 
 /// Multiplier applied to fg alpha when the *pane* isn't focused. This
 /// replaces the old absolute black overlay (22 % alpha veil) with the
-/// "just lighter text" treatment the reference terminal / the reference cockpit / iTerm2 use: the bg
+/// "just lighter text" treatment common multiplexers use: the bg
 /// stays unchanged so split borders read as crisp, and inactive text
 /// fades back so the focused pane's content reads as the active one
 /// without any additional chrome.
 ///
-/// 0.4 sits roughly where the reference terminal's inactive text reads — pronounced
-/// enough that the eye lands on the focused pane immediately at a glance.
+/// 0.4 is pronounced enough that the eye lands on the focused pane
+/// immediately at a glance.
 /// Earlier 0.55 attempt was too subtle on charcoal bg (~#0E0F11): even
 /// reduced alpha left high enough luminance that focus state was
 /// ambiguous from a step back.
@@ -161,8 +161,8 @@ const UNFOCUSED_FG_ALPHA: f32 = 0.4;
 /// Multiplier applied to the cursor-cell bg (the inverted color) when the
 /// pane isn't focused. Renders a "ghost" cursor block — visible enough that
 /// the user knows where the shell's caret is in the inactive pane, faint
-/// enough to read as inactive. Matches Zedra's 0.3 opacity for unfocused
-/// cursors (crate-reorg-terminal/src/element.rs:1021).
+/// enough to read as inactive. 0.3 is a common opacity for unfocused
+/// cursors.
 const UNFOCUSED_CURSOR_ALPHA: f32 = 0.3;
 
 /// Resolve fg + bg as concrete Hsla, then swap if `inverse`. Swapping at the
