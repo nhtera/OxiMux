@@ -95,6 +95,28 @@ fn chrome_strip(theme: Theme, density: Density) -> Div {
         .bg(theme.bg_panel)
         .border_b_1()
         .border_color(theme.border_inactive)
+        // Double-click on the chrome row → toggle window Zoom (the green
+        // traffic-light action). With `appears_transparent: true` we paint
+        // our own bar over the macOS title bar, which can suppress the
+        // OS-level double-click-to-zoom hit-test on some setups. Wiring it
+        // explicitly here guarantees parity with native-titlebar IDEs that
+        // expand to fill the work area on a chrome double-click.
+        //
+        // Single clicks are ignored — `click_count == 2` gates the zoom so
+        // ordinary drag-window and child-element clicks still work. Child
+        // interactive elements (toggle buttons, tab strips, etc.) do not
+        // call `cx.stop_propagation()`, so a double-click landing on them
+        // would also trigger Zoom; that's an acceptable trade-off (the
+        // child's own action self-cancels under two presses) and avoids a
+        // brittle hit-test exclusion list.
+        .on_mouse_down(
+            MouseButton::Left,
+            |event: &MouseDownEvent, window: &mut Window, _cx: &mut gpui::App| {
+                if event.click_count == 2 {
+                    window.zoom_window();
+                }
+            },
+        )
 }
 
 fn left_chrome_cluster(left_open: bool, theme: Theme, typography: &Typography) -> impl IntoElement {

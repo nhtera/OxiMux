@@ -232,8 +232,23 @@ fn main() {
         ]);
         cx.activate(true);
 
-        let window_size = size(px(1400.0), px(900.0));
-        let bounds = Bounds::centered(None, window_size, cx);
+        // First-launch window bounds: fill the primary display's *visible*
+        // area (the screen rect minus the menu bar at top and dock at the
+        // edge). Wrapping `NSScreen.visibleFrame` here makes the app open
+        // spacious by default — equivalent to the work-area-sized initial
+        // window that other IDE-class desktop apps ship — without committing
+        // to a true `Maximized`/`Fullscreen` state (so the green traffic
+        // light still toggles a user-sized "zoom" frame). On every other
+        // platform / when no display is reported, fall back to a centered
+        // 1400×900 windowed bounds. Persisted bounds (TODO: Phase 4 step 16)
+        // will win over both once wired.
+        let bounds = cx
+            .primary_display()
+            .map(|display| display.visible_bounds())
+            .unwrap_or_else(|| {
+                let fallback = size(px(1400.0), px(900.0));
+                Bounds::centered(None, fallback, cx)
+            });
 
         // Transparent unified titlebar: macOS draws traffic-light glyphs
         // into the app chrome at `point(12, 8)` — visually aligned with
