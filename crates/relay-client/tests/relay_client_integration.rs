@@ -114,6 +114,64 @@ fn spawn_write_observe_output_then_exit() {
 }
 
 #[test]
+fn detach_keeps_pty_alive_for_reattach() {
+    // Tear-off invariant (Phase 3 Slice C): detaching ONE attachment must not
+    // kill the daemon PTY — a second attachment (the destination window) keeps
+    // driving the same live shell. Contrast with `close`, which kills it.
+    let mut fx = boot_fixture();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        cwd: PathBuf::from("/tmp"),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    // Window A spawns + auto-attaches.
+    let id_a = fx.backend.spawn(cfg).expect("spawn");
+    let external_id = fx
+        .backend
+        .external_id_of(id_a)
+        .expect("relay pty id for spawned session");
+
+    // Real tear-off order: the tab leaves window A FIRST (detach, not close —
+    // releases A's attachment but keeps the daemon PTY alive), THEN the
+    // destination attaches. The two are never attached on the same client at
+    // once, because the client multiplexes one output subscription per pty_id.
+    fx.backend.detach(id_a).expect("detach");
+
+    // `close` on the just-detached session is a no-op (session already gone),
+    // which is exactly why the source view's Drop → close doesn't kill the PTY.
+    fx.backend.close(id_a).expect("close after detach is a no-op");
+
+    // Window B attaches to the SAME daemon PTY (the tear-off destination).
+    let id_b = fx
+        .backend
+        .attach_existing(&external_id)
+        .expect("attach_existing after detach — PTY must still be alive");
+
+    // B drives the live shell → proves the PTY survived the detach.
+    fx.backend
+        .write(id_b, b"echo SURVIVED_DETACH\nexit\n")
+        .expect("write via B");
+    let events = drain_until(&mut fx.backend, Duration::from_secs(5), |e| {
+        matches!(e, TerminalEvent::Exit { .. })
+    });
+    let mut combined = Vec::new();
+    for ev in events {
+        if let TerminalEvent::Output { bytes, .. } = ev {
+            combined.extend(bytes);
+        }
+    }
+    let text = String::from_utf8_lossy(&combined);
+    assert!(
+        text.contains("SURVIVED_DETACH"),
+        "PTY died after detach; B saw: {text:?}"
+    );
+
+    fx.backend.close(id_b).expect("close B idempotent");
+}
+
+#[test]
 fn snapshot_mirrors_remote_state() {
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {

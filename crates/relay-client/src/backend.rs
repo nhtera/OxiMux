@@ -499,6 +499,59 @@ impl TerminalBackend for RelayBackend {
         });
         Ok(())
     }
+
+    fn detach(&mut self, id: TerminalSessionId) -> Result<()> {
+        // Mirror `close`'s local teardown, but tell the daemon to DETACH this
+        // attachment instead of killing the PTY — the tab is moving to another
+        // window, which re-attaches by `relay_pty_id`. Because the local
+        // session is removed here, the source `TerminalView`'s eventual
+        // `Drop` → `close(id)` finds nothing and is a no-op, so the daemon PTY
+        // survives the move.
+        let session = match self.sessions.lock().expect("sessions poisoned").remove(&id) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        // Supersede the pump (generation guard) so it stops advancing the
+        // now-detached `TerminalState` — the destination window mounts a fresh
+        // session + pump against the same PTY.
+        session.generation.fetch_add(1, Ordering::Release);
+        self.event_queues
+            .lock()
+            .expect("event queues poisoned")
+            .remove(&id);
+        self.client.unsubscribe_pty(&session.relay_pty_id);
+        // Release this attachment in the daemon. Detach (not Close) keeps the
+        // PTY alive; it also drops this attachment from the daemon's
+        // smallest-screen-wins `min`, so the surviving / destination window
+        // drives the real size. Deferred to a detached task for the same
+        // reason as `close` (don't block the GPUI thread on the round-trip).
+        let client = self.client.clone();
+        let pty_id = session.relay_pty_id.clone();
+        let attachment_id = session.attachment_id;
+        self.handle.spawn(async move {
+            match client
+                .request(Request::Detach {
+                    pty_id: pty_id.clone(),
+                    attachment_id,
+                })
+                .await
+            {
+                Ok(Response::Ok) => {}
+                // PtyNotFound is benign — the PTY was already reaped.
+                Ok(Response::Err {
+                    code: oximux_relay_proto::ErrCode::PtyNotFound,
+                    ..
+                }) => {}
+                Ok(other) => {
+                    tracing::warn!(?pty_id, ?other, "relay detach: unexpected response");
+                }
+                Err(err) => {
+                    tracing::warn!(?pty_id, ?err, "relay detach: request failed");
+                }
+            }
+        });
+        Ok(())
+    }
 }
 
 fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {

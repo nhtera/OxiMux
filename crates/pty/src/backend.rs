@@ -204,4 +204,18 @@ pub trait TerminalBackend: Send + 'static {
 
     /// Tear down a session. Idempotent — safe to call on an already-closed id.
     fn close(&mut self, id: TerminalSessionId) -> Result<()>;
+
+    /// Release this session's attachment to a relay-owned PTY WITHOUT
+    /// killing the PTY, so the SAME daemon PTY can be re-attached elsewhere
+    /// — e.g. a tab torn off into another window via `attach_existing`. After
+    /// detach the local session is gone, so a later `close(id)` is a no-op
+    /// and the daemon PTY survives.
+    ///
+    /// Default impl falls back to `close`: backends without a detachable
+    /// remote (the in-process portable PTY, whose child dies with the
+    /// process) have nothing to preserve, so a "move" there degrades to a
+    /// normal teardown. Only relay-backed backends override.
+    fn detach(&mut self, id: TerminalSessionId) -> Result<()> {
+        self.close(id)
+    }
 }
