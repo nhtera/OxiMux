@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,12 +23,20 @@ use crate::ring_buffer::RingBuffer;
 pub const SUBSCRIBER_QUEUE: usize = 1024;
 
 // 1 MiB per PTY — the plan's "Locked decisions" section, larger than
-// the reference UX's 100 KiB because TUIs (`cc`, `vim`, full-screen pagers) can
-// repaint dense screens that need more headroom for byte-for-byte
-// replay to look correct.
+// the ~100 KiB common in lighter multiplexers because TUIs (`cc`, `vim`,
+// full-screen pagers) can repaint dense screens that need more headroom
+// for byte-for-byte replay to look correct.
 pub const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+
+// After an effective PTY resize, re-assert the same size a couple of
+// times shortly after (a resize-confirm nudge). Some TUIs miss the first
+// SIGWINCH if it lands mid-redraw; a cheap re-send nudges them to
+// repaint at the new geometry. Each resend is superseded by a newer
+// resize via `Entry::resize_seq`, so a stale resend can't clobber a
+// fresher size.
+const RESIZE_RESEND_DELAYS_MS: [u64; 2] = [40, 120];
 
 // Error returned by registry operations. Keep small and convert into
 // `oximux_relay_proto::ErrCode` in the server layer.
@@ -59,11 +68,25 @@ pub struct SpawnArgs {
 struct Entry {
     pty_id: String,
     cwd: PathBuf,
+    // EFFECTIVE grid size currently applied to the master fd — the
+    // element-wise `min` across `attachments`. `attach`/`list` return
+    // these so a new attacher builds its emulator at the live size.
     cols: Mutex<u16>,
     rows: Mutex<u16>,
+    // Per-attachment requested sizes. The effective PTY size is the
+    // element-wise `min` over these ("smallest screen wins"): the PTY
+    // can't be wider/taller than the smallest viewer or that viewer
+    // would clip. Empty after every attachment detaches — the PTY then
+    // retains its last effective size until a new attach arrives.
+    attachments: Mutex<HashMap<u64, (u16, u16)>>,
+    // Bumped on every EFFECTIVE resize. A deferred "resend confirm" task
+    // captures the value at arm time and only re-applies its size while
+    // the seq is unchanged, so a newer resize supersedes a stale resend.
+    resize_seq: AtomicU64,
     // Kept alive so we can call `resize()` on the master fd. The
-    // reader has its own cloned fd.
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    // reader has its own cloned fd. `Arc` so the resend-confirm task can
+    // share the handle without holding the registry entry.
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     ring: Arc<Mutex<RingBuffer>>,
@@ -83,6 +106,9 @@ struct Entry {
 
 pub struct PtyRegistry {
     entries: DashMap<String, Arc<Entry>>,
+    // Process-wide monotonic source of attachment ids. Unique across all
+    // PTYs (simpler than a per-entry counter; the id space is u64).
+    next_attachment_id: AtomicU64,
 }
 
 impl Default for PtyRegistry {
@@ -95,6 +121,7 @@ impl PtyRegistry {
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            next_attachment_id: AtomicU64::new(1),
         }
     }
 
@@ -180,7 +207,11 @@ impl PtyRegistry {
             cwd: args.cwd,
             cols: Mutex::new(args.cols),
             rows: Mutex::new(args.rows),
-            master: Mutex::new(pair.master),
+            // No attachments yet — the spawning session auto-attaches via
+            // the server's `attach` call immediately after this returns.
+            attachments: Mutex::new(HashMap::new()),
+            resize_seq: AtomicU64::new(0),
+            master: Arc::new(Mutex::new(pair.master)),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             ring,
@@ -195,17 +226,23 @@ impl PtyRegistry {
         Ok(pty_id)
     }
 
-    /// Attach a subscriber and return `(replay, cols, rows)` — the
-    /// buffered raw output plus the PTY's CURRENT grid dimensions. The
-    /// client must build its local emulator at exactly `(cols, rows)`
-    /// before replaying, so absolute-position bytes land in the right
-    /// cells and a later resize lets the live process repaint cleanly
-    /// instead of reflowing scrambled content.
+    /// Attach a subscriber and return `(replay, cols, rows, attachment_id)`
+    /// — the buffered raw output, the PTY's CURRENT (effective) grid
+    /// dimensions, and a fresh per-attachment handle. The client must
+    /// build its local emulator at exactly `(cols, rows)` before
+    /// replaying, so absolute-position bytes land in the right cells and
+    /// a later resize lets the live process repaint cleanly instead of
+    /// reflowing scrambled content.
+    ///
+    /// The new attachment is registered at the CURRENT effective size, so
+    /// the `min` (and therefore the PTY) is unchanged by the attach
+    /// itself — it can only ever shrink once this attachment sends a
+    /// smaller `resize`.
     pub fn attach(
         &self,
         pty_id: &str,
         sub: Sender<Notification>,
-    ) -> Result<(Vec<u8>, u16, u16), RegistryError> {
+    ) -> Result<(Vec<u8>, u16, u16, u64), RegistryError> {
         let entry = self
             .entries
             .get(pty_id)
@@ -224,7 +261,13 @@ impl PtyRegistry {
         drop(ring);
         let cols = *entry.cols.lock().expect("cols poisoned");
         let rows = *entry.rows.lock().expect("rows poisoned");
-        Ok((replay, cols, rows))
+        let attachment_id = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
+        entry
+            .attachments
+            .lock()
+            .expect("attachments poisoned")
+            .insert(attachment_id, (cols, rows));
+        Ok((replay, cols, rows, attachment_id))
     }
 
     pub fn write(&self, pty_id: &str, bytes: &[u8]) -> Result<(), RegistryError> {
@@ -261,24 +304,51 @@ impl PtyRegistry {
         Ok(())
     }
 
-    pub fn resize(&self, pty_id: &str, cols: u16, rows: u16) -> Result<(), RegistryError> {
+    /// Record `attachment_id`'s requested size and re-apply the effective
+    /// (`min`) PTY size. "Smallest screen wins": the PTY is driven at the
+    /// element-wise minimum across all attachments so no viewer clips.
+    /// `master.resize` is only called when the effective size actually
+    /// changes, keeping the hot resize path cheap.
+    pub fn resize(
+        &self,
+        pty_id: &str,
+        attachment_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RegistryError> {
         let entry = self
             .entries
             .get(pty_id)
-            .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
+            .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?
+            .clone();
         entry
-            .master
+            .attachments
             .lock()
-            .expect("master poisoned")
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("pty resize")?;
-        *entry.cols.lock().expect("cols poisoned") = cols;
-        *entry.rows.lock().expect("rows poisoned") = rows;
+            .expect("attachments poisoned")
+            .insert(attachment_id, (cols, rows));
+        apply_effective_size(&entry)
+    }
+
+    /// Drop one attachment without killing the PTY. Recomputes the
+    /// effective size so the PTY can grow back to the remaining
+    /// attachments; with none left it retains its last size (the idle GC
+    /// reaps a fully-detached PTY after the timeout). No-op if the
+    /// attachment was already gone.
+    pub fn detach(&self, pty_id: &str, attachment_id: u64) -> Result<(), RegistryError> {
+        let entry = self
+            .entries
+            .get(pty_id)
+            .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?
+            .clone();
+        let removed = entry
+            .attachments
+            .lock()
+            .expect("attachments poisoned")
+            .remove(&attachment_id)
+            .is_some();
+        if removed {
+            apply_effective_size(&entry)?;
+        }
         Ok(())
     }
 
@@ -338,6 +408,87 @@ impl PtyRegistry {
             })
             .collect()
     }
+}
+
+/// Recompute the effective PTY size as the element-wise `min` over the
+/// entry's attachments and apply it to the master fd — but only when it
+/// differs from the size currently applied, so the common "nothing
+/// changed" case is a cheap compare with no syscall. With no attachments
+/// left the PTY retains its last size (early return). On an effective
+/// change, arms a deferred "resend confirm".
+///
+/// Lock discipline: `attachments` is released before `cols`/`rows`/
+/// `master` are taken. Concurrent resizes from different attachments
+/// therefore serialize on the `cols`/`rows` mutexes and converge on the
+/// true `min` (each writes its own value into the shared map before
+/// calling this), so a transiently-stale read self-corrects on the next
+/// call rather than deadlocking.
+fn apply_effective_size(entry: &Arc<Entry>) -> Result<(), RegistryError> {
+    let (min_cols, min_rows) = {
+        let atts = entry.attachments.lock().expect("attachments poisoned");
+        if atts.is_empty() {
+            return Ok(());
+        }
+        let min_cols = atts.values().map(|(c, _)| *c).min().unwrap_or(1).max(1);
+        let min_rows = atts.values().map(|(_, r)| *r).min().unwrap_or(1).max(1);
+        (min_cols, min_rows)
+    };
+
+    let mut cur_cols = entry.cols.lock().expect("cols poisoned");
+    let mut cur_rows = entry.rows.lock().expect("rows poisoned");
+    if *cur_cols == min_cols && *cur_rows == min_rows {
+        return Ok(());
+    }
+    entry
+        .master
+        .lock()
+        .expect("master poisoned")
+        .resize(PtySize {
+            rows: min_rows,
+            cols: min_cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("pty resize")?;
+    *cur_cols = min_cols;
+    *cur_rows = min_rows;
+    drop(cur_cols);
+    drop(cur_rows);
+
+    let seq = entry.resize_seq.fetch_add(1, Ordering::AcqRel) + 1;
+    arm_resize_resend(entry, min_cols, min_rows, seq);
+    Ok(())
+}
+
+/// Spawn a detached task that re-applies `(cols, rows)` a couple of times
+/// after short delays — a nudge for TUIs that miss the first SIGWINCH.
+/// Each resend re-checks `resize_seq`: a newer effective resize bumps the
+/// seq and supersedes any in-flight resend, so a stale resend can't
+/// clobber a fresher size. No-op outside a tokio runtime (direct unit
+/// tests), where the resend is unnecessary.
+fn arm_resize_resend(entry: &Arc<Entry>, cols: u16, rows: u16, seq: u64) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let entry = Arc::clone(entry);
+    handle.spawn(async move {
+        for delay_ms in RESIZE_RESEND_DELAYS_MS {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            if entry.resize_seq.load(Ordering::Acquire) != seq {
+                return; // superseded by a newer resize
+            }
+            let _ = entry
+                .master
+                .lock()
+                .expect("master poisoned")
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+        }
+    });
 }
 
 fn send_sigterm(pid: Option<u32>) {

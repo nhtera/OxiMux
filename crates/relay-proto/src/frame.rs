@@ -208,6 +208,7 @@ mod tests {
             },
             Request::Resize {
                 pty_id: "pty-1".into(),
+                attachment_id: 7,
                 cols: 120,
                 rows: 40,
             },
@@ -221,6 +222,10 @@ mod tests {
                 pty_id: "pty-1".into(),
                 title: "Claude".into(),
                 body: "waiting for input".into(),
+            },
+            Request::Detach {
+                pty_id: "pty-1".into(),
+                attachment_id: 7,
             },
         ];
         for (i, v) in variants.into_iter().enumerate() {
@@ -240,11 +245,13 @@ mod tests {
             }),
             Response::SpawnOk {
                 pty_id: "pty-1".into(),
+                attachment_id: 3,
             },
             Response::AttachOk {
                 replay: vec![1, 2, 3],
                 cols: 80,
                 rows: 24,
+                attachment_id: 5,
             },
             Response::Ok,
             Response::Pty(PtyDescriptor {

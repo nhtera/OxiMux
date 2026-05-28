@@ -140,7 +140,7 @@ async fn hello_handshake_then_echo_command() {
     )
     .await;
     let pty_id = match resp {
-        Response::SpawnOk { pty_id } => pty_id,
+        Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("spawn failed: {other:?}"),
     };
     // sh started without a command echoes nothing until we feed input.
@@ -186,7 +186,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
     )
     .await
     {
-        Response::SpawnOk { pty_id } => pty_id,
+        Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("spawn: {other:?}"),
     };
     let resp = req(
@@ -218,7 +218,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
     )
     .await;
     let replay = match resp {
-        Response::AttachOk { replay, cols, rows } => {
+        Response::AttachOk { replay, cols, rows, .. } => {
             // Attach must echo the PTY's live grid dims so a reattaching
             // client rebuilds its emulator at the exact captured size
             // before replaying — replaying into a mismatched grid (then
@@ -282,7 +282,7 @@ async fn notify_fans_out_attention_to_subscribers() {
     )
     .await
     {
-        Response::SpawnOk { pty_id } => pty_id,
+        Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("spawn: {other:?}"),
     };
 
@@ -447,7 +447,7 @@ async fn shutdown_refused_while_ptys_alive() {
     )
     .await
     {
-        Response::SpawnOk { pty_id } => pty_id,
+        Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("{other:?}"),
     };
     let resp = req(&mut s, &mut buf, 3, Request::Shutdown).await;
@@ -478,7 +478,7 @@ async fn stats_endpoint_returns_per_pty_counters() {
     )
     .await
     {
-        Response::SpawnOk { pty_id } => pty_id,
+        Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("{other:?}"),
     };
     let written = b"echo STATS_PROBE\n";
@@ -578,6 +578,125 @@ async fn pid_file_is_written_and_removed_on_clean_exit() {
     );
 }
 
+// "Smallest screen wins": with two attachments, the PTY is driven at
+// the element-wise `min` of their requested sizes; shrinking the smaller
+// shrinks the PTY, and detaching it grows the PTY back to the remaining
+// attachment. The effective size is observed via `ListPtys` (which
+// reports the PTY's current grid dims).
+#[tokio::test]
+async fn multi_attach_min_size_and_detach_grows_back() {
+    let relay = boot_relay().await;
+
+    // Client A spawns at 80x24 and is auto-attached at that size.
+    let (mut a, mut a_buf) = connect_and_hello(&relay).await;
+    let (pty_id, _aid_a) = match req(
+        &mut a,
+        &mut a_buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk {
+            pty_id,
+            attachment_id,
+        } => (pty_id, attachment_id),
+        other => panic!("spawn: {other:?}"),
+    };
+
+    let effective = |descs: Vec<oximux_relay_proto::PtyDescriptor>| -> (u16, u16) {
+        let d = descs
+            .into_iter()
+            .find(|d| d.pty_id == pty_id)
+            .expect("pty listed");
+        (d.cols, d.rows)
+    };
+
+    // One attachment → its own size, no change vs single-client today.
+    let listed = match req(&mut a, &mut a_buf, 3, Request::ListPtys).await {
+        Response::PtyList(v) => v,
+        other => panic!("list: {other:?}"),
+    };
+    assert_eq!(effective(listed), (80, 24), "single attachment owns the size");
+
+    // Client B attaches — it adopts the current size, so `min` is
+    // unchanged by the attach itself.
+    let (mut b, mut b_buf) = connect_and_hello(&relay).await;
+    let aid_b = match req(
+        &mut b,
+        &mut b_buf,
+        2,
+        Request::Attach {
+            pty_id: pty_id.clone(),
+        },
+    )
+    .await
+    {
+        Response::AttachOk {
+            cols,
+            rows,
+            attachment_id,
+            ..
+        } => {
+            assert_eq!((cols, rows), (80, 24), "attach reports current size");
+            attachment_id
+        }
+        other => panic!("attach: {other:?}"),
+    };
+
+    // B shrinks to 40x10 → effective size = element-wise min.
+    let resp = req(
+        &mut b,
+        &mut b_buf,
+        3,
+        Request::Resize {
+            pty_id: pty_id.clone(),
+            attachment_id: aid_b,
+            cols: 40,
+            rows: 10,
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok), "resize got {resp:?}");
+    let listed = match req(&mut a, &mut a_buf, 4, Request::ListPtys).await {
+        Response::PtyList(v) => v,
+        other => panic!("list: {other:?}"),
+    };
+    assert_eq!(
+        effective(listed),
+        (40, 10),
+        "smallest attachment wins the effective size"
+    );
+
+    // B detaches → PTY grows back to A's 80x24.
+    let resp = req(
+        &mut b,
+        &mut b_buf,
+        4,
+        Request::Detach {
+            pty_id: pty_id.clone(),
+            attachment_id: aid_b,
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok), "detach got {resp:?}");
+    let listed = match req(&mut a, &mut a_buf, 5, Request::ListPtys).await {
+        Response::PtyList(v) => v,
+        other => panic!("list: {other:?}"),
+    };
+    assert_eq!(
+        effective(listed),
+        (80, 24),
+        "detaching the smaller attachment grows the PTY back"
+    );
+}
+
 #[tokio::test]
 async fn close_request_removes_pty_from_list() {
     let relay = boot_relay().await;
@@ -596,7 +715,7 @@ async fn close_request_removes_pty_from_list() {
     )
     .await
     {
-        Response::SpawnOk { pty_id } => pty_id,
+        Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("{other:?}"),
     };
     let listed = match req(&mut s, &mut buf, 3, Request::ListPtys).await {

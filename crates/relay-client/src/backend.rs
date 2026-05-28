@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -29,9 +30,20 @@ type SessionEventQueues = Arc<Mutex<HashMap<TerminalSessionId, VecDeque<Terminal
 
 struct Session {
     relay_pty_id: String,
+    // Daemon-minted handle for THIS attachment. Sent back on every
+    // `Resize`/`Detach` so the daemon updates the right attachment's
+    // requested size in its "smallest screen wins" `min` computation.
+    attachment_id: u64,
     state: Arc<Mutex<TerminalState>>,
     cols: u16,
     rows: u16,
+    // Reconnect guard: a monotonic attach-generation. The pump captures
+    // the value at spawn time and stops touching `state`/emitting events once
+    // it no longer matches — so a superseded pump (a future reconnect /
+    // multi-window re-attach, or this session's own teardown) can't
+    // double-drive the shared `TerminalState`. Bumped in `close` so the
+    // pump stops draining into an orphaned state during teardown.
+    generation: Arc<AtomicU64>,
     _pump: JoinHandle<()>,
 }
 
@@ -107,8 +119,13 @@ impl RelayBackend {
         let resp = self.request(Request::Attach {
             pty_id: relay_pty_id.to_owned(),
         })?;
-        let (replay, cols, rows) = match resp {
-            Response::AttachOk { replay, cols, rows } => (replay, cols, rows),
+        let (replay, cols, rows, attachment_id) = match resp {
+            Response::AttachOk {
+                replay,
+                cols,
+                rows,
+                attachment_id,
+            } => (replay, cols, rows, attachment_id),
             Response::Err { code, message } => bail!("attach: {code:?} — {message}"),
             other => bail!("unexpected attach response: {other:?}"),
         };
@@ -127,15 +144,18 @@ impl RelayBackend {
         state.lock().expect("state poisoned").advance(&replay);
 
         let id = self.mint_id();
+        let generation = Arc::new(AtomicU64::new(1));
         let notif_rx = self.client.subscribe_pty(relay_pty_id);
-        let pump = self.spawn_pump(id, Arc::clone(&state), notif_rx);
+        let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
         self.sessions.lock().expect("sessions poisoned").insert(
             id,
             Session {
                 relay_pty_id: relay_pty_id.to_owned(),
+                attachment_id,
                 state,
                 cols,
                 rows,
+                generation,
                 _pump: pump,
             },
         );
@@ -146,42 +166,71 @@ impl RelayBackend {
         &self,
         id: TerminalSessionId,
         state: Arc<Mutex<TerminalState>>,
+        generation: Arc<AtomicU64>,
+        my_generation: u64,
         mut notif_rx: UnboundedReceiver<Notification>,
     ) -> JoinHandle<()> {
         let queues = Arc::clone(&self.event_queues);
         self.handle.spawn(async move {
             while let Some(n) = notif_rx.recv().await {
-                let event = match n {
-                    Notification::Output { bytes, .. } => {
-                        let bell = match state.lock() {
-                            Ok(mut s) => {
-                                s.advance(&bytes);
-                                s.take_bell()
-                            }
-                            Err(_) => false,
-                        };
-                        // BEL → attention signal for the owning pane, queued
-                        // ahead of this chunk's Output (same chunk; order moot).
-                        if bell {
-                            push_event(&queues, id, TerminalEvent::Bell { id });
-                        }
-                        TerminalEvent::Output { id, bytes }
-                    }
-                    Notification::Exit { code, .. } => {
-                        push_event(&queues, id, TerminalEvent::Exit { id, code });
-                        return;
-                    }
-                    // Explicit `oximux notify` → raise the same pane attention
-                    // as a bell. (title/body are carried on the wire for a
-                    // future OS-banner surface; not consumed here yet.)
-                    Notification::Attention { .. } => {
-                        push_event(&queues, id, TerminalEvent::Bell { id });
-                        continue;
-                    }
-                };
-                push_event(&queues, id, event);
+                if apply_relay_notification(&state, &queues, id, &generation, my_generation, n)
+                    .is_break()
+                {
+                    return;
+                }
             }
         })
+    }
+}
+
+/// Apply one relay notification to the local terminal state + event
+/// queue, honoring the reconnect generation guard. Returns
+/// `ControlFlow::Break` when the pump must stop — either the session was
+/// superseded (`generation` moved past `my_generation`) or the PTY
+/// exited. Extracted from the pump loop so the guard is unit-testable
+/// without standing up a tokio task.
+fn apply_relay_notification(
+    state: &Arc<Mutex<TerminalState>>,
+    queues: &SessionEventQueues,
+    id: TerminalSessionId,
+    generation: &AtomicU64,
+    my_generation: u64,
+    n: Notification,
+) -> ControlFlow<()> {
+    // Generation guard: a superseded pump must not touch the shared
+    // `TerminalState` or emit events. Checked BEFORE any `advance` so a
+    // stale pump performs zero advances after being superseded.
+    if generation.load(Ordering::Acquire) != my_generation {
+        return ControlFlow::Break(());
+    }
+    match n {
+        Notification::Output { bytes, .. } => {
+            let bell = match state.lock() {
+                Ok(mut s) => {
+                    s.advance(&bytes);
+                    s.take_bell()
+                }
+                Err(_) => false,
+            };
+            // BEL → attention signal for the owning pane, queued ahead of
+            // this chunk's Output (same chunk; order moot).
+            if bell {
+                push_event(queues, id, TerminalEvent::Bell { id });
+            }
+            push_event(queues, id, TerminalEvent::Output { id, bytes });
+            ControlFlow::Continue(())
+        }
+        Notification::Exit { code, .. } => {
+            push_event(queues, id, TerminalEvent::Exit { id, code });
+            ControlFlow::Break(())
+        }
+        // Explicit `oximux notify` → raise the same pane attention as a
+        // bell. (title/body are carried on the wire for a future OS-banner
+        // surface; not consumed here yet.)
+        Notification::Attention { .. } => {
+            push_event(queues, id, TerminalEvent::Bell { id });
+            ControlFlow::Continue(())
+        }
     }
 }
 
@@ -220,8 +269,11 @@ impl TerminalBackend for RelayBackend {
             shell: Some(cfg.shell),
             env: cfg.env,
         })?;
-        let relay_pty_id = match resp {
-            Response::SpawnOk { pty_id } => pty_id,
+        let (relay_pty_id, attachment_id) = match resp {
+            Response::SpawnOk {
+                pty_id,
+                attachment_id,
+            } => (pty_id, attachment_id),
             Response::Err { code, message } => bail!("spawn: {code:?} — {message}"),
             other => bail!("unexpected spawn response: {other:?}"),
         };
@@ -232,15 +284,18 @@ impl TerminalBackend for RelayBackend {
             SCROLLBACK_ROWS,
         )));
         let id = self.mint_id();
+        let generation = Arc::new(AtomicU64::new(1));
         let notif_rx = self.client.subscribe_pty(&relay_pty_id);
-        let pump = self.spawn_pump(id, Arc::clone(&state), notif_rx);
+        let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
         self.sessions.lock().expect("sessions poisoned").insert(
             id,
             Session {
                 relay_pty_id,
+                attachment_id,
                 state,
                 cols: cfg.cols,
                 rows: cfg.rows,
+                generation,
                 _pump: pump,
             },
         );
@@ -265,8 +320,19 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn resize(&mut self, id: TerminalSessionId, cols: u16, rows: u16) -> Result<()> {
-        let pty_id = self.relay_pty_id_of(id)?;
-        let resp = self.request(Request::Resize { pty_id, cols, rows })?;
+        let (pty_id, attachment_id) = {
+            let sessions = self.sessions.lock().expect("sessions poisoned");
+            let s = sessions
+                .get(&id)
+                .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
+            (s.relay_pty_id.clone(), s.attachment_id)
+        };
+        let resp = self.request(Request::Resize {
+            pty_id,
+            attachment_id,
+            cols,
+            rows,
+        })?;
         match resp {
             Response::Ok => {
                 let mut sessions = self.sessions.lock().expect("sessions poisoned");
@@ -388,6 +454,10 @@ impl TerminalBackend for RelayBackend {
             Some(s) => s,
             None => return Ok(()),
         };
+        // Supersede the pump (generation guard): once bumped, the pump
+        // stops advancing the now-orphaned `TerminalState` instead of
+        // draining any still-buffered Output during teardown.
+        session.generation.fetch_add(1, Ordering::Release);
         self.event_queues
             .lock()
             .expect("event queues poisoned")
@@ -434,5 +504,66 @@ impl TerminalBackend for RelayBackend {
 fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {
     if let Ok(mut map) = queues.lock() {
         map.entry(id).or_default().push_back(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queue_len(queues: &SessionEventQueues, id: TerminalSessionId) -> usize {
+        queues
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|q| q.len())
+            .unwrap_or(0)
+    }
+
+    // The reconnect generation guard: once a pump is superseded (the
+    // shared generation moves past the value it captured), it must stop
+    // touching the terminal state AND stop emitting events — zero
+    // advances after supersession via a monotonic attach-generation guard.
+    #[test]
+    fn generation_guard_stops_superseded_pump() {
+        let id = TerminalSessionId(1);
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let generation = AtomicU64::new(1);
+
+        // Matching generation → applies and emits an Output event.
+        let flow = apply_relay_notification(
+            &state,
+            &queues,
+            id,
+            &generation,
+            1,
+            Notification::Output {
+                pty_id: "p".into(),
+                bytes: b"hi".to_vec(),
+            },
+        );
+        assert!(flow.is_continue(), "live pump keeps going");
+        assert_eq!(queue_len(&queues, id), 1, "live pump emits Output");
+
+        // A newer attach bumps the generation, superseding this pump.
+        generation.store(2, Ordering::Release);
+        let flow = apply_relay_notification(
+            &state,
+            &queues,
+            id,
+            &generation,
+            1,
+            Notification::Output {
+                pty_id: "p".into(),
+                bytes: b"XX".to_vec(),
+            },
+        );
+        assert!(flow.is_break(), "superseded pump must stop");
+        assert_eq!(
+            queue_len(&queues, id),
+            1,
+            "superseded pump performs zero advance + emits nothing"
+        );
     }
 }

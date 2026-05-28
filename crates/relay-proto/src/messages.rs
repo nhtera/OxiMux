@@ -7,7 +7,13 @@ use crate::error::ErrCode;
 // major builds can't even reach the handshake; this constant is the
 // failsafe for the case where an old client somehow finds a newer
 // daemon's socket (dev environments).
-pub const PROTOCOL_VERSION: u32 = 3;
+//
+// v4: multi-client attach — `attachment_id` added to `AttachOk`/`SpawnOk`
+// (so each attachment is individually addressable) and to `Resize` (the
+// daemon recomputes the effective PTY size as the element-wise `min`
+// across attachments, "smallest screen wins"); `Request::Detach` lets one
+// attachment drop out without killing the PTY.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -66,6 +72,11 @@ pub enum Request {
     },
     Resize {
         pty_id: String,
+        // Which attachment is requesting this size. The daemon stores it
+        // per-attachment and drives the PTY at the element-wise `min`
+        // across all live attachments ("smallest screen wins"). Obtained
+        // from `AttachOk`/`SpawnOk`.
+        attachment_id: u64,
         cols: u16,
         rows: u16,
     },
@@ -86,12 +97,26 @@ pub enum Request {
         title: String,
         body: String,
     },
+    /// Drop one attachment from a PTY WITHOUT killing it. The daemon
+    /// removes the attachment's size from the `min` computation (so the
+    /// PTY can grow back to the remaining attachments) and stops fanning
+    /// notifications to it. The PTY stays alive for any other
+    /// attachments; with none left it retains its last size and is reaped
+    /// only by the idle GC. Distinct from `Close`, which kills the PTY.
+    /// Appended last to keep existing bincode variant indices stable.
+    Detach {
+        pty_id: String,
+        attachment_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     HelloAck(HelloAck),
-    SpawnOk { pty_id: String },
+    // `attachment_id` identifies the spawning session's auto-attachment
+    // (Spawn auto-attaches the caller). The client stores it so its
+    // `Resize`/`Detach` for this PTY address the right attachment.
+    SpawnOk { pty_id: String, attachment_id: u64 },
     // `cols`/`rows` are the PTY's current grid dimensions on the daemon.
     // The client MUST build its local emulator at exactly these dims
     // before replaying `replay`, otherwise raw bytes captured for a
@@ -99,7 +124,15 @@ pub enum Response {
     // and a later resize reflows them into scrambled output. With the
     // dims, replay reconstructs the screen byte-for-byte, and the live
     // process repaints on the next resize via SIGWINCH.
-    AttachOk { replay: Vec<u8>, cols: u16, rows: u16 },
+    AttachOk {
+        replay: Vec<u8>,
+        cols: u16,
+        rows: u16,
+        // Per-attachment handle minted by the daemon. The client stores
+        // it and sends it back on `Resize`/`Detach` so the daemon knows
+        // which attachment's requested size to update.
+        attachment_id: u64,
+    },
     Ok,
     Pty(PtyDescriptor),
     PtyList(Vec<PtyDescriptor>),

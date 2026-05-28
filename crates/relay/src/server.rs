@@ -400,22 +400,47 @@ async fn handle_request(
                 // Auto-attach the spawning session so Output frames
                 // start flowing without a separate Attach round trip
                 // (matches user mental model: "I asked for this PTY,
-                // I want to hear from it"). The replay buffer is
-                // empty at this point so we discard the Vec.
-                let _ = registry.attach(&pty_id, notif_tx.clone());
-                Response::SpawnOk { pty_id }
+                // I want to hear from it"). The replay buffer is empty at
+                // this point so we discard the Vec; we DO return the
+                // `attachment_id` so the caller can address its own
+                // attachment on later `Resize`/`Detach`.
+                let attachment_id = registry
+                    .attach(&pty_id, notif_tx.clone())
+                    .map(|(_, _, _, aid)| aid)
+                    .unwrap_or(0);
+                Response::SpawnOk {
+                    pty_id,
+                    attachment_id,
+                }
             }
             Err(e) => err_from(&e),
         },
         Request::Attach { pty_id } => match registry.attach(&pty_id, notif_tx.clone()) {
-            Ok((replay, cols, rows)) => Response::AttachOk { replay, cols, rows },
+            Ok((replay, cols, rows, attachment_id)) => Response::AttachOk {
+                replay,
+                cols,
+                rows,
+                attachment_id,
+            },
             Err(e) => err_from(&e),
         },
         Request::Write { pty_id, bytes } => match registry.write(&pty_id, &bytes) {
             Ok(()) => Response::Ok,
             Err(e) => err_from(&e),
         },
-        Request::Resize { pty_id, cols, rows } => match registry.resize(&pty_id, cols, rows) {
+        Request::Resize {
+            pty_id,
+            attachment_id,
+            cols,
+            rows,
+        } => match registry.resize(&pty_id, attachment_id, cols, rows) {
+            Ok(()) => Response::Ok,
+            Err(e) => err_from(&e),
+        },
+        Request::Detach {
+            pty_id,
+            attachment_id,
+        } => match registry.detach(&pty_id, attachment_id) {
             Ok(()) => Response::Ok,
             Err(e) => err_from(&e),
         },
