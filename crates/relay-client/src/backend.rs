@@ -354,22 +354,41 @@ impl TerminalBackend for RelayBackend {
             .expect("event queues poisoned")
             .remove(&id);
         self.client.unsubscribe_pty(&session.relay_pty_id);
-        let resp = self
-            .request(Request::Close {
-                pty_id: session.relay_pty_id.clone(),
+        // Defer the synchronous relay Close round-trip to a detached
+        // tokio task so the outer `Arc<Mutex<Box<dyn TerminalBackend>>>`
+        // lock (held by `TerminalView::drop`'s spawned thread while
+        // calling `close`) releases immediately. The next GPUI render
+        // frame's `maybe_resize` re-acquires that mutex; without this
+        // defer it blocks the main thread for the full `grace_ms`
+        // window plus network RTT — visible as a "slow tab close".
+        // Local state (sessions map, event_queues, unsubscribe) is
+        // already cleaned up above; the remote request is the only
+        // slow part left. Spawning on the tokio handle (not a raw OS
+        // thread) keeps the request inside the existing runtime so
+        // `block_on` semantics aren't needed.
+        let client = self.client.clone();
+        let pty_id = session.relay_pty_id.clone();
+        self.handle.spawn(async move {
+            match client.request(Request::Close {
+                pty_id: pty_id.clone(),
                 grace_ms: 500,
-            })
-            .map_err(|e| anyhow!(e))?;
-        match resp {
-            Response::Ok => Ok(()),
-            // PtyNotFound on close is benign — the relay already
-            // reaped it (e.g., from the child exiting first).
-            Response::Err {
-                code: oximux_relay_proto::ErrCode::PtyNotFound,
-                ..
-            } => Ok(()),
-            other => Err(anyhow!("close: {other:?}")),
-        }
+            }).await {
+                Ok(Response::Ok) => {}
+                // PtyNotFound on close is benign — the relay already
+                // reaped it (e.g., from the child exiting first).
+                Ok(Response::Err {
+                    code: oximux_relay_proto::ErrCode::PtyNotFound,
+                    ..
+                }) => {}
+                Ok(other) => {
+                    tracing::warn!(?pty_id, ?other, "relay close: unexpected response");
+                }
+                Err(err) => {
+                    tracing::warn!(?pty_id, ?err, "relay close: request failed");
+                }
+            }
+        });
+        Ok(())
     }
 }
 

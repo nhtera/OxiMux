@@ -405,19 +405,32 @@ impl TerminalBackend for PortablePtyBackend {
         let kill_fn = move || {
             let _ = killer.kill();
         };
-        // Drop master BEFORE polling the watcher: closes the pty fd, which
+        // Drop master BEFORE the grace dance: closes the pty fd, which
         // unblocks the watcher's read() and lets it observe EOF + reap the
         // child. SIGTERM gives the agent a chance to exit cleanly first;
         // master-drop ensures even a stubborn agent's read loop unblocks.
         drop(session.master.take());
+        // Defer the watcher join + SIGTERM/SIGKILL grace loop to a
+        // detached thread. The caller (`TerminalView::drop`) holds the
+        // shared `Arc<Mutex<Box<dyn TerminalBackend>>>` lock while
+        // invoking `close`; without this defer, the lock stays held
+        // through `close_with_grace`'s polling loop (up to CANCEL_GRACE,
+        // currently 5s). The very next GPUI render frame after tab
+        // close calls `maybe_resize` → `with_backend` → re-acquires that
+        // mutex, blocking the main thread until grace completes —
+        // visible to the user as a "slow tab close". Spawning here lets
+        // the outer lock release as soon as we return; the watcher
+        // handle + closures are all Send so the move is safe.
         if let Some(handle) = session.watcher.take() {
-            close_with_grace(
-                JoinHandleWatcher(handle),
-                term_fn,
-                kill_fn,
-                CANCEL_GRACE,
-                KILL_POLL_INTERVAL,
-            );
+            std::thread::spawn(move || {
+                close_with_grace(
+                    JoinHandleWatcher(handle),
+                    term_fn,
+                    kill_fn,
+                    CANCEL_GRACE,
+                    KILL_POLL_INTERVAL,
+                );
+            });
         }
         Ok(())
     }
