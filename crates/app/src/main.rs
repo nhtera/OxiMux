@@ -378,7 +378,7 @@ fn install_signal_watchdog(cx: &mut gpui::App) {
                 // PTYs across the SIGINT/SIGTERM shutdown so reattach
                 // works on the next launch.
                 oximux_app::shell::terminal_view::APP_QUITTING.store(true, Ordering::SeqCst);
-                let _ = cx.update(|cx| cx.quit());
+                cx.update(|cx| cx.quit());
                 break;
             }
             cx.background_executor()

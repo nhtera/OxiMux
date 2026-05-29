@@ -49,6 +49,7 @@ pub struct RenameTabDialog {
 }
 
 impl RenameTabDialog {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         title: SharedString,
         initial_value: SharedString,

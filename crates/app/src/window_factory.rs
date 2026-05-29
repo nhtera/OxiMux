@@ -27,8 +27,8 @@ pub fn workspace_window_options(cx: &mut App, cascade: usize) -> WindowOptions {
         });
     if cascade > 0 {
         let step = px(32.0 * cascade as f32);
-        bounds.origin.x = bounds.origin.x + step;
-        bounds.origin.y = bounds.origin.y + step;
+        bounds.origin.x += step;
+        bounds.origin.y += step;
     }
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),

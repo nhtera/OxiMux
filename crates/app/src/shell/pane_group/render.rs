@@ -504,10 +504,10 @@ fn render_sub_pane_tree(
     theme: Theme,
 ) -> AnyElement {
     // Zoom fast path: bypass tree traversal entirely.
-    if let Some(idx) = tree.zoomed() {
-        if let Some(view) = tree.get(idx) {
-            return view.clone().into_any_element();
-        }
+    if let Some(idx) = tree.zoomed()
+        && let Some(view) = tree.get(idx)
+    {
+        return view.clone().into_any_element();
     }
     build_sub_pane_node(tree.tree(), tree, group, theme, &[])
         .unwrap_or_else(|| div().size_full().into_any_element())
@@ -859,7 +859,6 @@ pub(crate) fn filter_droppable_files(paths: &[std::path::PathBuf]) -> Vec<std::p
     paths.iter().filter(|p| p.is_file()).cloned().collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn render_tab_chip(
     entity_id_raw: u64,

@@ -621,18 +621,18 @@ impl PaneGroup {
             .iter()
             .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == &path))
         {
-            if let Some(visible_target) = insert_at_visible_idx {
-                if let Some(from) = self.visible_position_of(idx) {
-                    // `move_tab` removes `from` first then inserts at the
-                    // post-remove index. When `visible_target > from`, the
-                    // remove step shifts the destination left by one — so
-                    // adjust before clamping. Mirrors the same dance in
-                    // the chip-level TabDragPayload drop handler.
-                    let raw_to = visible_target.min(self.tab_order.len());
-                    let to = if raw_to > from { raw_to - 1 } else { raw_to };
-                    let bounded = to.min(self.tab_order.len().saturating_sub(1));
-                    self.move_tab(from, bounded);
-                }
+            if let Some(visible_target) = insert_at_visible_idx
+                && let Some(from) = self.visible_position_of(idx)
+            {
+                // `move_tab` removes `from` first then inserts at the
+                // post-remove index. When `visible_target > from`, the
+                // remove step shifts the destination left by one — so
+                // adjust before clamping. Mirrors the same dance in
+                // the chip-level TabDragPayload drop handler.
+                let raw_to = visible_target.min(self.tab_order.len());
+                let to = if raw_to > from { raw_to - 1 } else { raw_to };
+                let bounded = to.min(self.tab_order.len().saturating_sub(1));
+                self.move_tab(from, bounded);
             }
             // Route through `set_active` so `bump_mru` + `focus_active`
             // + `pin_tab_strip_to_end` + `cx.notify` all fire — same as
@@ -1357,31 +1357,31 @@ impl PaneGroup {
         // doesn't auto-track mouse-driven focus changes. Editor/diff tabs
         // (non-Terminal) skip straight to the group-tab close.
         let active_idx = self.active;
-        if let Some(active_tab) = self.tabs.get_mut(active_idx) {
-            if let PaneContent::Terminal(tree) = &mut active_tab.content {
-                let focused_idx = tree
-                    .iter_live()
-                    .find(|(_, v)| v.read(cx).focused())
-                    .map(|(i, _)| i);
-                if let Some(idx) = focused_idx {
-                    tree.set_active(idx);
+        if let Some(active_tab) = self.tabs.get_mut(active_idx)
+            && let PaneContent::Terminal(tree) = &mut active_tab.content
+        {
+            let focused_idx = tree
+                .iter_live()
+                .find(|(_, v)| v.read(cx).focused())
+                .map(|(i, _)| i);
+            if let Some(idx) = focused_idx {
+                tree.set_active(idx);
+            }
+            // 1. close a per-pane tab when the focused leaf has >1.
+            if tree.close_active_tab() {
+                if let Some(view) = tree.active_view() {
+                    view.read(cx).focus_handle(cx).focus(window, cx);
                 }
-                // 1. close a per-pane tab when the focused leaf has >1.
-                if tree.close_active_tab() {
-                    if let Some(view) = tree.active_view() {
-                        view.read(cx).focus_handle(cx).focus(window, cx);
-                    }
-                    cx.notify();
-                    return;
+                cx.notify();
+                return;
+            }
+            // 2. close the focused leaf when the tab is split.
+            if tree.live_count() > 1 && tree.close_active() {
+                if let Some(view) = tree.active_view() {
+                    view.read(cx).focus_handle(cx).focus(window, cx);
                 }
-                // 2. close the focused leaf when the tab is split.
-                if tree.live_count() > 1 && tree.close_active() {
-                    if let Some(view) = tree.active_view() {
-                        view.read(cx).focus_handle(cx).focus(window, cx);
-                    }
-                    cx.notify();
-                    return;
-                }
+                cx.notify();
+                return;
             }
         }
         self.close_tab(active_idx, window, cx);

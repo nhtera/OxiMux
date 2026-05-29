@@ -37,14 +37,9 @@ pub struct OpenPaneActionsAt {
 /// fallback — both `derive(Default)` and dispatcher tests rely on it.
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = oximux, no_json)]
+#[derive(Default)]
 pub struct RequestOpenAdapterPicker {
     pub x: Option<f32>,
-}
-
-impl Default for RequestOpenAdapterPicker {
-    fn default() -> Self {
-        Self { x: None }
-    }
 }
 
 /// Payload action fired by a tab chip's right-click. Carries the cursor

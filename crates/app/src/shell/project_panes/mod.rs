@@ -163,10 +163,10 @@ impl ProjectPanes {
             let g = group.read(cx);
             highest = highest.max(g.next_terminal_n_peek().saturating_sub(1));
             for (_, tab) in g.visible_tabs() {
-                if let Some(rest) = tab.label.strip_prefix("Terminal ") {
-                    if let Ok(parsed) = rest.parse::<u64>() {
-                        highest = highest.max(parsed);
-                    }
+                if let Some(rest) = tab.label.strip_prefix("Terminal ")
+                    && let Ok(parsed) = rest.parse::<u64>()
+                {
+                    highest = highest.max(parsed);
                 }
             }
         }

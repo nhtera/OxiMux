@@ -817,11 +817,11 @@ impl WorkspaceRoot {
                 return;
             };
             let group_ref = group.read(cx);
-            if let Some(tab) = group_ref.tabs().get(tab_idx) {
-                if let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content {
-                    for (_, view) in tree.iter_live() {
-                        view.read(cx).detach();
-                    }
+            if let Some(tab) = group_ref.tabs().get(tab_idx)
+                && let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content
+            {
+                for (_, view) in tree.iter_live() {
+                    view.read(cx).detach();
                 }
             }
         }
