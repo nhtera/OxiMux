@@ -1383,20 +1383,13 @@ impl Render for WorkspaceRoot {
                             if let crate::shell::pane_content::PaneContent::Terminal(tree) =
                                 &tab.content
                             {
-                                // Single leaf only — multi-pane split excluded.
-                                if tree.live_count() != 1 {
-                                    return false;
-                                }
-                                // Single per-pane tab only — tearing off a
-                                // multi-tab leaf would move just the active
-                                // tab and destroy the background tabs' PTYs.
-                                if tree.active_leaf().map(|l| l.len()).unwrap_or(0) != 1 {
-                                    return false;
-                                }
-                                // Relay-backed only — in-process fallback has no external id.
-                                tree.active_view()
+                                // Relay-backed only — the in-process fallback
+                                // backend has no external id.
+                                let active_has_external_id = tree
+                                    .active_view()
                                     .map(|v| v.read(cx).external_id().is_some())
-                                    .unwrap_or(false)
+                                    .unwrap_or(false);
+                                tab_can_tear_off(tree, active_has_external_id)
                             } else {
                                 false
                             }
@@ -1849,4 +1842,28 @@ impl Render for WorkspaceRoot {
             // children (last child = topmost z-layer in GPUI).
             .child(self.palette.clone())
     }
+}
+
+/// Whether a terminal tab is eligible for cross-window tear-off.
+///
+/// Tear-off moves a single relay-backed daemon PTY to a new window. It is
+/// blocked when the tab is anything other than one relay-backed terminal:
+///   - multi-leaf split (`live_count != 1`) — each leaf would need an
+///     independent detach + remount in the destination (out of scope here),
+///   - multi-tab leaf (`active_leaf().len() != 1`) — the collect path follows
+///     only each leaf's ACTIVE view, so moving a multi-tab leaf would orphan
+///     the background tabs' PTYs in the daemon, and
+///   - no relay session (`active_has_external_id == false`) — the in-process
+///     fallback backend has no external id to reattach in the new window.
+///
+/// `active_has_external_id` is read from the active view by the caller (which
+/// holds the `cx`). Split out so the eligibility contract is unit-testable
+/// without driving the full context-menu open path.
+pub(crate) fn tab_can_tear_off(
+    tree: &crate::shell::pane_group::sub_pane::TerminalSplitTree,
+    active_has_external_id: bool,
+) -> bool {
+    tree.live_count() == 1
+        && tree.active_leaf().map(|l| l.len()).unwrap_or(0) == 1
+        && active_has_external_id
 }

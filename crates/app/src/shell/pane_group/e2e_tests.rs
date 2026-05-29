@@ -321,3 +321,87 @@ async fn from_persisted_rebuilds_split_with_multi_tab_leaf(cx: &mut TestAppConte
         })
         .expect("window update ok");
 }
+
+// ── tear-off eligibility blocks multi-tab leaves and multi-leaf splits ─────
+//
+// Cross-window tear-off moves exactly ONE relay-backed PTY, and the source
+// collect path follows only each leaf's ACTIVE view. So a multi-tab leaf or
+// a multi-leaf split MUST report ineligible — otherwise tearing one off
+// would orphan the background/other-leaf PTYs in the daemon (a data-loss
+// edge). This pins `tab_can_tear_off` against that regression. Views are
+// dormant (in-process fallback), so the relay-backed condition is supplied
+// explicitly via the bool argument.
+#[gpui::test]
+async fn tear_off_eligibility_blocks_multi_tab_and_multi_leaf(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+
+    window
+        .update(cx, |_group, win, cx| {
+            let build = |win: &mut Window,
+                         cx: &mut Context<PaneGroup>|
+             -> (Entity<TerminalView>, Subscription) {
+                let (backend, session_id) =
+                    spawn_local_pty_dormant(80, 24).expect("dormant spawn (PTY fallback)");
+                let ids = SurfaceIds::restored("/w".to_string(), String::new(), String::new());
+                let view = cx.new(|cx| {
+                    TerminalView::mount_dormant(
+                        backend,
+                        session_id,
+                        ids,
+                        PathBuf::from("/tmp"),
+                        &[],
+                        Theme::default(),
+                        Density::default(),
+                        Typography::default(),
+                        win,
+                        cx,
+                    )
+                });
+                let observer = cx.observe(&view, |_t, _v, cx| cx.notify());
+                (view, observer)
+            };
+
+            // Single leaf, single tab: eligible IFF relay-backed.
+            let single = TerminalSplitTree::from_persisted(
+                &PersistedTree::Leaf,
+                vec![(vec![build(win, cx)], 0)],
+                0,
+            );
+            assert!(
+                crate::workspace_root::tab_can_tear_off(&single, true),
+                "single relay-backed leaf is eligible"
+            );
+            assert!(
+                !crate::workspace_root::tab_can_tear_off(&single, false),
+                "in-process tab (no external id) is ineligible"
+            );
+
+            // Single leaf, TWO per-pane tabs: blocked — moving it would orphan
+            // the background tab's PTY.
+            let multi_tab = TerminalSplitTree::from_persisted(
+                &PersistedTree::Leaf,
+                vec![(vec![build(win, cx), build(win, cx)], 0)],
+                0,
+            );
+            assert!(
+                !crate::workspace_root::tab_can_tear_off(&multi_tab, true),
+                "multi-tab leaf must be ineligible"
+            );
+
+            // TWO leaves (split): blocked — multi-leaf tear-off is out of scope.
+            let split = TerminalSplitTree::from_persisted(
+                &PersistedTree::Split {
+                    axis: PersistedAxis::Horizontal,
+                    children: vec![PersistedTree::Leaf, PersistedTree::Leaf],
+                    weights: vec![0.5, 0.5],
+                },
+                vec![(vec![build(win, cx)], 0), (vec![build(win, cx)], 0)],
+                0,
+            );
+            assert!(
+                !crate::workspace_root::tab_can_tear_off(&split, true),
+                "multi-leaf split must be ineligible"
+            );
+        })
+        .expect("window update ok");
+}
