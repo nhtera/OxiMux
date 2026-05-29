@@ -15,24 +15,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    AnyView, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point,
-    px, size,
+    AnyView, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
-use oximux_app::actions::{
-    CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
-    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewTabInPane, NewWindow, NextTab,
-    OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
-    PrevTab, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitSubPaneDown,
-    SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
-};
-// SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular
-// crate dependency: oximux-app → oximux-editor → oximux-app would be a cycle.
+// The global keymap lives in `oximux_app::keymap` so the binary and the
+// headless keymap tests install the identical bindings. `NewWindow` is the
+// one action `main` still references directly (its window-level handler).
+use oximux_app::actions::NewWindow;
 use oximux_app::assets::CompositeAssets;
 use oximux_app::relay_supervisor::{RelaySupervisor, SupervisorError};
 use oximux_app::shell::terminal_view::install_shared_backend;
 use oximux_app::state;
 use oximux_app::window_factory::{open_workspace_window, open_workspace_window_with};
-use oximux_editor::SaveFile;
 use oximux_git::Repository;
 use oximux_pty::TerminalBackend;
 use oximux_relay_client::{RelayBackend, RelayClient};
@@ -156,95 +149,7 @@ fn main() {
             component_theme.colors.input = palette.border_inactive;
             component_theme.colors.ring = palette.focus_ring;
         }
-        cx.bind_keys([
-            // cmd-d / cmd-shift-d trigger SUB-PANE splits inside the
-            // focused terminal tab (matches common terminals and the
-            // reference editor). Tab-GROUP splits remain accessible via
-            // tab right-click → "Split X" and the Pane Actions "..." menu.
-            KeyBinding::new("cmd-d", SplitSubPaneRight, None),
-            KeyBinding::new("cmd-shift-d", SplitSubPaneDown, None),
-            // cmd-w closes the active sub-pane when the focused tab has
-            // multiple sub-panes; otherwise it closes the whole tab.
-            // Disambiguation lives in `PaneGroup::on_close_tab`.
-            KeyBinding::new("cmd-w", CloseTab, None),
-            // cmd-shift-w closes the focused PANE GROUP (no-op when only
-            // one group exists). Sub-pane / tab close stays on cmd-w
-            // above so the muscle-memory split is consistent with the
-            // reference editor's group-vs-tab tier.
-            KeyBinding::new("cmd-shift-w", CloseGroup, None),
-            // cmd-[ / cmd-] cycle sub-pane focus within the active tab.
-            // Tab navigation lives on cmd-{ / cmd-} below.
-            KeyBinding::new("cmd-]", FocusNextSubPane, None),
-            KeyBinding::new("cmd-[", FocusPrevSubPane, None),
-            // cmd-shift-] / cmd-shift-[ cycle GROUP focus across the
-            // pane-group tree's in-order traversal. macOS shifts the
-            // key to `}` / `{` post-modifier, matching the cmd-} / cmd-{
-            // remap explanation below.
-            KeyBinding::new("cmd-shift-}", FocusNextPane, None),
-            KeyBinding::new("cmd-shift-{", FocusPrevPane, None),
-            // cmd-shift-enter zooms (maximizes) the focused sub-pane; a
-            // second press restores the prior layout. Matches the
-            // reference editor's "zoom pane" binding.
-            KeyBinding::new("cmd-shift-enter", ToggleZoomSubPane, None),
-            KeyBinding::new("cmd-t", NewTab, None),
-            // cmd-shift-t adds a tab to the active SPLIT pane's own strip
-            // (per-pane tabs), as opposed to cmd-t's workspace-level tab.
-            KeyBinding::new("cmd-shift-t", NewTabInPane, None),
-            // cmd-n opens a new top-level window (each with its own
-            // WorkspaceRoot). Mirrors the terminal-app convention where
-            // cmd-t is a new tab and cmd-n is a new window.
-            KeyBinding::new("cmd-n", NewWindow, None),
-            // macOS strips `shift` from the runtime keystroke and remaps the
-            // key to the shifted character (`]`→`}`, `[`→`{`). Binding strings
-            // must use the post-shift character — `cmd-shift-]` would never
-            // match. Same remap the reference editor's next-tab binding uses.
-            KeyBinding::new("cmd-}", NextTab, None),
-            KeyBinding::new("cmd-{", PrevTab, None),
-            // MRU cycle — ctrl-tab is the cross-platform standard for
-            // "switch to last tab" (cmd-tab is reserved by macOS for
-            // app switching).
-            KeyBinding::new("ctrl-tab", MruNext, None),
-            KeyBinding::new("ctrl-shift-tab", MruPrev, None),
-            // cmd-f opens the per-pane scrollback search overlay. Handled
-            // on the focused TerminalView's root div — when no pane is
-            // focused (no editor exists yet in v1), the action no-ops.
-            KeyBinding::new("cmd-f", Search, None),
-            // Sidebar keybinds. cmd-shift-g rebound from OpenGitPanel
-            // to SelectSourceControlTab — same destination, new routing path.
-            KeyBinding::new("cmd-b", ToggleLeftSidebar, None),
-            KeyBinding::new("cmd-l", ToggleRightSidebar, None),
-            KeyBinding::new("cmd-shift-e", SelectExplorerTab, None),
-            KeyBinding::new("cmd-shift-f", SelectSearchTab, None),
-            KeyBinding::new("cmd-shift-g", SelectSourceControlTab, None),
-            // `cmd-shift-t` previously routed to `SelectFilesTab`, but the
-            // Files tab is hidden from `visible_tabs` (see
-            // shell/right_sidebar/tab.rs) so that binding was dropped. The
-            // key now drives `NewTabInPane` (above). If the Files tab
-            // reappears, pick a DIFFERENT shortcut — `cmd-shift-t` is taken.
-            // The `SelectFilesTab` action itself stays in `actions.rs` so
-            // test code and any programmatic dispatch path remain intact.
-            // cmd-k opens the commit dialog (Phase 04 attaches the handler).
-            KeyBinding::new("cmd-k", OpenCommitDialog, None),
-            // Command palette (Phase 05 shell). cmd-k stays bound to the
-            // commit dialog, so the palette uses cmd-shift-p instead.
-            KeyBinding::new("cmd-p", OpenQuickOpen, None),
-            KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
-            // cmd-o opens the project picker (Phase 04 step 5).
-            KeyBinding::new("cmd-o", OpenProjectPicker, None),
-            // cmd-shift-n opens the workspace create dialog (Phase 04 step 6).
-            KeyBinding::new("cmd-shift-n", OpenWorkspaceCreate, None),
-            // Cmd-shift-a spawns a new agent tab using the first available
-            // built-in adapter. Throwaway stopgap until step 10 ships the
-            // inline-popover adapter picker on the `+` button.
-            KeyBinding::new("cmd-shift-a", NewAgent, None),
-            // cmd-s saves the active editor buffer. Handled by EditorView's
-            // root div via `.on_action`; no-op when no editor is focused.
-            KeyBinding::new("cmd-s", SaveFile, None),
-            // Escape dismisses any open transient overlay (pane actions
-            // menu, tab context menu, adapter picker). Handled at the
-            // WorkspaceRoot level; other components ignore the action.
-            KeyBinding::new("escape", DismissOverlay, None),
-        ]);
+        cx.bind_keys(oximux_app::keymap::default_key_bindings());
         cx.activate(true);
 
         // Register the once-per-process lifecycle observers (quit-save,

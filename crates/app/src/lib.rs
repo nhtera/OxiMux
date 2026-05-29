@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod assets;
+pub mod keymap;
 pub mod notifier;
 pub mod persisted_terminals;
 pub mod project_panes_factory;
