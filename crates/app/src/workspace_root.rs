@@ -1387,6 +1387,12 @@ impl Render for WorkspaceRoot {
                                 if tree.live_count() != 1 {
                                     return false;
                                 }
+                                // Single per-pane tab only — tearing off a
+                                // multi-tab leaf would move just the active
+                                // tab and destroy the background tabs' PTYs.
+                                if tree.active_leaf().map(|l| l.len()).unwrap_or(0) != 1 {
+                                    return false;
+                                }
                                 // Relay-backed only — in-process fallback has no external id.
                                 tree.active_view()
                                     .map(|v| v.read(cx).external_id().is_some())

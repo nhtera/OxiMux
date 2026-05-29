@@ -487,7 +487,10 @@ fn restore_agent_tab(
 /// Whether a terminal tab needs the full sub-pane tree restore path
 /// (dormant-spawn per leaf/tab) rather than the single-view fast path:
 /// it has more than one split leaf, OR any leaf carries a multi-tab
-/// per-pane strip.
+/// per-pane strip. The one-leaf/one-tab case correctly returns `false`
+/// and takes the fast path, which still recovers that leaf's persisted
+/// surface/tab ids via `single_leaf_ids` (reads `sub_panes.first()`) and
+/// can relay-reattach the surviving PTY.
 fn needs_tree_restore(tab: &PersistedTab) -> bool {
     tab.sub_panes.len() > 1 || tab.sub_panes.iter().any(|sp| sp.tabs.len() > 1)
 }
@@ -575,10 +578,10 @@ fn build_multi_sub_pane_tree(
 /// Validate + materialize a persisted cwd. Falls back to `project_cwd`
 /// when the saved cwd is missing, blank, or no longer exists on disk.
 /// Avoids spawning a shell into a stale directory.
-fn resolve_cwd(cwd: Option<&str>, project_cwd: &PathBuf) -> PathBuf {
+fn resolve_cwd(cwd: Option<&str>, project_cwd: &std::path::Path) -> PathBuf {
     match cwd.map(PathBuf::from) {
         Some(p) if p.is_dir() => p,
-        _ => project_cwd.clone(),
+        _ => project_cwd.to_path_buf(),
     }
 }
 

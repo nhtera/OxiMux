@@ -249,7 +249,9 @@ fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus>
 fn attention_for(content: &crate::shell::pane_content::PaneContent, cx: &App) -> bool {
     use crate::shell::pane_content::PaneContent;
     match content {
-        PaneContent::Terminal(tree) => tree.iter_live().any(|(_, v)| v.read(cx).attention()),
+        // iter_all_views (not iter_live) so a bell from a BACKGROUND
+        // per-pane tab still lights the workspace tab chip.
+        PaneContent::Terminal(tree) => tree.iter_all_views().any(|(_, _, v)| v.read(cx).attention()),
         _ => false,
     }
 }

@@ -1269,6 +1269,13 @@ impl ProjectPanes {
                 let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content else {
                     continue;
                 };
+                // One relay id per group tab (the active leaf's active
+                // view), keyed by tab ordinal. Split leaves and background
+                // per-pane tabs aren't individually keyed here — those tabs
+                // restore via the dormant tree path (no relay reattach), and
+                // any background PTYs left alive on quit are reaped by the
+                // daemon's idle-gc. Per-tab relay reattach would need an
+                // (ordinal, sub_pane, tab) key — a future enhancement.
                 let Some(view) = tree.active_view() else {
                     continue;
                 };

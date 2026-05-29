@@ -22,6 +22,11 @@ use crate::persisted_terminals::{PersistedTree, restore_tree};
 use crate::shell::pane_tree::{Axis, PaneTree, SplitInsert};
 use crate::shell::terminal_view::TerminalView;
 
+/// Restore-side per-leaf spec: each leaf's ordered `(view, observer)`
+/// tabs plus its active tab index, in DFS leaf order. Handed to
+/// [`TerminalSplitTree::from_persisted`].
+pub type RestoredLeaves = Vec<(Vec<(Entity<TerminalView>, Subscription)>, usize)>;
+
 /// One terminal inside a leaf's tab strip. The `Subscription` keeps the
 /// owning `PaneGroup` re-rendering on this view's notifications.
 pub struct LeafTab {
@@ -174,7 +179,7 @@ impl TerminalSplitTree {
     /// `leaves.len()` must equal `count_leaves(tree_proto)`; debug-asserted.
     pub fn from_persisted(
         tree_proto: &PersistedTree,
-        leaves: Vec<(Vec<(Entity<TerminalView>, Subscription)>, usize)>,
+        leaves: RestoredLeaves,
         active_dfs_pos: usize,
     ) -> Self {
         let mut next_slot: usize = 0;

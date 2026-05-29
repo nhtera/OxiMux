@@ -883,8 +883,10 @@ impl PaneGroup {
         // Drop the prior cx's observer (would point at the source group's
         // entity) and re-subscribe under this group so notify() fires
         // here on inner-view changes. For terminal tabs we re-attach to
-        // the ACTIVE sub-pane only — splits inside the moved tab keep
-        // working because their inner observers stay alive in the tree.
+        // the ACTIVE leaf's active view only. Background leaves / per-pane
+        // tabs in a moved tab still repaint on focus (their inner
+        // observers fire the source group); live cross-group repaint of a
+        // non-active moved sub-tab is a known v1 limit.
         tab._observer = match &tab.content {
             PaneContent::Terminal(tree) => tree
                 .active_view()
