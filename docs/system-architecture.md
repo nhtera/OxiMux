@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-05-23  
-**Phase**: 5 — relay hardening done; editor+LSP steps 1-5 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI + pane-as-editor-host)
+**Updated**: 2026-05-29  
+**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete
 
 ---
 
@@ -10,9 +10,11 @@
 ```
 ┌─────────────────────────────────────────────────────┐
 │  GPUI UI layer  (crates/app)                        │
+│  WindowRegistry (global) — one WorkspaceRoot / window│
 │  WorkspaceRoot → MainPane (grid of pane leaves)     │
-│                   each leaf: PaneContent::Terminal  │
-│                            | PaneContent::Editor    │
+│                   each leaf: LeafTabs (per-pane tabs)│
+│                     each tab: PaneContent::Terminal  │
+│                             | PaneContent::Editor    │
 │                → RightSidebar (tab-switched panel)  │
 │                   Explorer tab: FileExplorer (uniform_list, lazy, git badges)│
 │                   Files tab:    FileTreeView (always visible; no repo gate)  │
@@ -392,6 +394,84 @@ RightSidebar (Files tab — always visible, no repo gate)
 
 ---
 
+## Multi-window architecture (mux-P3)
+
+```
+WindowRegistry (GPUI global, app-lifetime)
+  ├── windows: Vec<RegisteredWindow>
+  │     each: window_id (GPUI WindowId) + persist_id ("main" | "w{n}") + Entity<WorkspaceRoot>
+  │
+  ├── mint_persist_id() → "main" (first) | "w2", "w3", … (subsequent)
+  │
+  └── pending_tearoffs: Vec<PendingTearOff>
+        pushed by source window before calling open_workspace_window_with;
+        consumed by destination window's WorkspaceRoot::new
+```
+
+**Window lifecycle:**
+- `NewWindow` (Cmd+N) → `open_workspace_window(cx, repo, app_state)` → mints id → `open_workspace_window_with`
+- Last-window close → `cx.quit()`; non-last close dismisses only that window (single quit observer guards)
+- Boot: `capture_session` manifest → `open_workspace_window_with` per persisted window_id
+
+**Cross-window tear-off (`MoveTabToNewWindow`):**
+```
+source WorkspaceRoot
+  1. TerminalBackend::detach(pty_id)   ← releases relay attachment; PTY stays alive
+  2. removes tab from its group
+  3. pushes PendingTearOff { dest_window_id, relay_id, … }
+  4. open_workspace_window_with(cx, …, dest_window_id)
+
+destination WorkspaceRoot::new
+  consume_pending_tearoff(dest_window_id)
+  → attach_pty_existing(relay_id)     ← re-mounts PTY in new window
+```
+
+Relay multiplexes one subscriber per `pty_id`; detach source before attach destination is the mandatory ordering.
+
+**Per-window persistence (V005):**
+
+`pane_buffers` and `pane_relay_ids` now include `window_id` in their primary keys (`DEFAULT 'main'` for existing rows). Settings layout capture/restore thread the window id; each window captures/restores its own pane tree independently.
+
+---
+
+## Per-pane tabs — LeafTabs (mux-P4)
+
+```
+TerminalSplitTree
+  └── panes: Vec<Option<LeafTabs>>      ← one LeafTabs per split leaf
+
+LeafTabs
+  ├── tabs: Vec<(Entity<TerminalView>, Observer)>
+  ├── active: usize
+  └── compact chip strip rendered when len > 1 or freshly split
+        chip click → switch active tab
+        '+' button / NewTabInPane (Cmd+Shift+T) → append new shell tab
+```
+
+**Cmd+W cascade:** per-pane tab → leaf → group tab (innermost wins).
+
+**Persistence:** `PersistedSubPane.tabs` (Vec of persisted tab blobs); serde-default for existing single-tab leaves; no SQL migration required.
+
+**Known v1 limits:** per-pane-tab relay reattach deferred (multi-tab leaves restore dormant); agent CLI PTYs not yet threaded with context env; cross-group multi-tab-drag repaint deferred.
+
+---
+
+## Shell context env — SurfaceIds (mux-P4)
+
+Every spawned terminal receives an `OXIMUX_*` env block minted at spawn time:
+
+| Variable | Value |
+|---|---|
+| `OXIMUX_WORKSPACE_ID` | project root path |
+| `OXIMUX_SURFACE_ID` | UUID minted per pane leaf |
+| `OXIMUX_TAB_ID` | UUID minted per tab within leaf |
+| `OXIMUX_SOCKET_PATH` | relay Unix socket path |
+| `OXIMUX_PTY_ID` | injected by relay daemon at fork |
+
+`SurfaceIds` (`shell/context_env.rs`) builds the env list. Ids persist in the per-pane layout blob (serde-default) and are re-injected on dormant respawn. Agent CLI PTYs excluded until a follow-on.
+
+---
+
 ## Key architectural constraints
 
 | Constraint | Enforcement |
@@ -417,3 +497,6 @@ RightSidebar (Files tab — always visible, no repo gate)
 | SQLite persistence / session restore | Phase 4 |
 | Multi-agent dashboard | Phase 7 |
 | embeddable terminal library terminal backend | v2 (ADR in brief.md) |
+| Per-pane-tab relay reattach on restore | follow-on (multi-tab leaves restore dormant for now) |
+| Agent CLI PTYs with OXIMUX_* context env | follow-on |
+| Cross-group multi-tab-drag repaint | follow-on |

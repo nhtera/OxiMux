@@ -1,6 +1,6 @@
 # OxiMux — Development Roadmap
 
-**Updated**: 2026-05-23  
+**Updated**: 2026-05-29  
 **Gate rule**: each phase ships only after ≥7 consecutive daily-driver days with zero panics (ADR-003). Tests-passing alone is not sufficient.
 
 ---
@@ -72,6 +72,34 @@ Goal: run agent CLIs inside an OxiMux pane, with status detection (waiting / nee
 - Steps 13-14: process hygiene (SIGTERM-grace-SIGKILL), config wiring (`AdapterConfig` enum)
 
 Blocked on: Phase 2 dogfood gate clearing (runtime steps can proceed in parallel).
+
+---
+
+## Multiplexer enhancements plan — code complete 2026-05-29
+
+Plan: `plans/260528-2153-terminal-multiplexer-enhancements/`  
+All four phases code complete; runtime GPUI smoke pending.
+
+| Phase | Capability | Status |
+|---|---|---|
+| mux-P1 | Agent attention & notifications (bell → attention ring, tab chip) | code complete |
+| mux-P2 | Multi-client attach & reconnect hardening | code complete |
+| mux-P3 | Multi-window & tear-off tab | code complete (runtime smoke pending) |
+| mux-P4 | Per-pane tabs & context env | code complete (runtime smoke pending) |
+
+**mux-P3 (Phase 3) shipped:**
+- `WindowRegistry` GPUI global + stable persist ids (`"main"` / `"w{n}"`)
+- `open_workspace_window` / `open_workspace_window_with` factory (`window_factory.rs`)
+- `NewWindow` action (Cmd+N); last-window-close quits, non-last dismisses
+- Storage migration V005: `window_id` column added to `pane_buffers` + `pane_relay_ids` (backward compatible `DEFAULT 'main'`)
+- Boot reopens every persisted window; `capture_session` writes open-windows manifest
+- `MoveTabToNewWindow` tear-off: relay detach + `attach_pty_existing` on destination; PTY stays alive
+
+**mux-P4 (Phase 4) shipped:**
+- `LeafTabs` per-leaf tab container in `TerminalSplitTree`; compact chip strip renders when leaf has > 1 tab
+- `NewTabInPane` action (Cmd+Shift+T); Cmd+W cascades per-pane tab → leaf → group
+- `SurfaceIds` context env (`context_env.rs`): `OXIMUX_WORKSPACE_ID`, `OXIMUX_SURFACE_ID`, `OXIMUX_TAB_ID`, `OXIMUX_SOCKET_PATH` injected into every spawned shell
+- Per-pane-tab relay reattach + agent CLI context-env threading deferred
 
 ---
 

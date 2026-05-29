@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-05-23  
-**Phase**: 5 — relay hardening done; editor steps 1-5 shipped (save round-trip + LSP lifecycle + file tree backend + file tree UI + pane-as-editor-host)  
-**Tests**: 510+ passed (editor crate: 28 tests — 21 prior + 7 file_tree integration; app crate: +8 file_tree_view unit tests)
+**Updated**: 2026-05-29  
+**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete  
+**Tests**: 375 app lib tests + storage/relay/relay-client/pty, 0 failures
 
 ---
 
@@ -32,13 +32,21 @@ src/
 ├── main.rs                 boots tokio runtime; opens Repository at cwd (Option);
 │                           registers keybindings; opens GPUI window
 ├── lib.rs                  re-exports for integration tests
-├── actions.rs              all GPUI Action structs (SplitHorizontal, Search, etc.)
+├── actions.rs              all GPUI Action structs (SplitHorizontal, Search, NewWindow,
+│                           MoveTabToNewWindow, NewTabInPane, etc.)
 ├── assets.rs              CompositeAssets — local SVGs (git-branch) + gpui-component bundle
 ├── workspace_root.rs       WorkspaceRoot entity — top-level layout host
 │                           right_sidebar: Option<Entity<RightSidebar>>
 │                           left_rail: Entity<LeftRail>; left_rail_open: bool (Cmd+B)
 │                           palette: Entity<PaletteModal> (Cmd+P / Cmd+Shift+P)
 │                           poll_state mirrored from RightSidebar for status bar
+├── window_registry.rs      WindowRegistry GPUI global — holds RegisteredWindow list (strong
+│                           Entity<WorkspaceRoot> + stable persist_id per window); mints
+│                           "main"/"w{n}" ids; PendingTearOff queue for cross-window tear-off;
+│                           note_restored / remove helpers for app lifecycle
+├── window_factory.rs       open_workspace_window (fresh window, persist_id "main" or minted)
+│                           open_workspace_window_with (with optional PendingTearOff payload);
+│                           registers window in WindowRegistry; last-window quit gate
 └── shell/
     ├── mod.rs
     ├── top_bar.rs          40px chrome: 56px traffic-light gutter + L/R panel toggles + wordmark
@@ -80,6 +88,11 @@ src/
     ├── file_tree_context_menu.rs Right-click overlay for Files-tab rows. WorkspaceRoot owns one shared entity (mirrors
     │                       tab_context_menu pattern). Open / Open to the Side dispatch OpenFileFromContextMenu →
     │                       routes through the same open_file_in_group / split_and_open_file as the file-drag flow.
+    ├── context_env.rs      SurfaceIds struct; builds OXIMUX_* env var list for every spawned shell:
+│                       OXIMUX_WORKSPACE_ID (project root path), OXIMUX_SURFACE_ID,
+│                       OXIMUX_TAB_ID (minted UUIDs), OXIMUX_SOCKET_PATH; ids persisted
+│                       in per-pane layout blob (serde-default; no SQL migration);
+│                       restored stably and re-injected on dormant respawn
     ├── file_explorer/      FileExplorer entity; virtualized git-aware file tree (uniform_list, lazy load, git status badges)
     │   ├── mod.rs          FileExplorer entity; state machine; window-activation refresh trigger
     │   ├── tree_state.rs   flat-row build, expand toggle, should_include filter
@@ -115,6 +128,15 @@ src/
     ├── stash_panel/
     │   ├── mod.rs          StashPanel entity; refresh/apply/pop/request_drop
     │   └── list_render.rs  pure row label helper
+    ├── pane_group/
+    │   ├── mod.rs          pane group tree entity
+    │   ├── sub_pane.rs     TerminalSplitTree; each split leaf is a LeafTabs tab container;
+    │   │                   compact chip strip (chips + '+') renders when leaf has > 1 tab;
+    │   │                   PersistedSubPane.tabs persists tab list (serde-default, backward compatible)
+    │   ├── render.rs       rendering helpers
+    │   ├── file_drag.rs    FilePathDragPayload for file-drop into panes
+    │   ├── tab_drag.rs     tab drag payload + state
+    │   └── tab_drag_zones.rs drop-zone hit detection
     └── worktree_panel/
         ├── mod.rs          WorktreePanel entity; refresh/submit_create/pending_remove
         └── list_render.rs  pure label/suggest-path helpers
@@ -254,6 +276,7 @@ src/
 | `repositories/pane_session.rs` | `PaneSessionRepo`: insert / get_by_id / list_for_workspace (oldest-first restore) / update_grid_position / delete |
 | `repositories/settings.rs` | `SettingsRepo`: get / set (upsert) / delete; caller enforces ≤ 64 KiB |
 | `migrations/V001__init.sql` | 5 tables (projects, workspaces, agent_sessions [+ exit_code, status_detail for AgentStatus payloads], pane_sessions [ON DELETE SET NULL on agent FK], settings) + 3 FK-support indexes |
+| `migrations/V005__per_window_persistence.sql` | Adds `window_id TEXT NOT NULL DEFAULT 'main'` to `pane_buffers` and `pane_relay_ids`; rebuilds PKs to include `window_id`; backward compatible with existing rows |
 
 `r2d2` deliberately **not** adopted in v1 — single `Arc<Mutex<Connection>>` over WAL is sufficient for the single-writer model. Read-pool split (write conn + N readers) is the documented upgrade path if profiling shows contention.
 

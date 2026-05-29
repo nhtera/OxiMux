@@ -4,6 +4,51 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-29 — Multiplexer enhancements Phase 4 — Per-pane tabs & context env
+
+**Status**: code complete; 375 app lib tests + storage/relay/relay-client/pty, 0 failures; runtime smoke pending  
+**Commits**: `9e36a2a`, `585d200`, `3c6cc06`, `c002af9`, `c8b33be`, `7b9bb85`, `2919c42`  
+**Touches**: `crates/app/src/shell/context_env.rs` (NEW), `crates/app/src/shell/pane_group/sub_pane.rs`
+
+#### feat(app): per-pane tab strips (LeafTabs)
+
+- Each split leaf in `TerminalSplitTree` is now a `LeafTabs` tab container; a compact chip strip (chips + '+' button) renders when a leaf has > 1 tab or is freshly split
+- `NewTabInPane` action (Cmd+Shift+T) and '+' button add a new shell to the focused pane; chip clicks switch the active tab
+- Cmd+W cascades: per-pane tab → leaf → group tab
+- `PersistedSubPane.tabs` persists the tab list (serde-default; backward compatible, no SQL migration)
+
+#### feat(app): shell context env (`SurfaceIds`)
+
+- Every spawned terminal carries `OXIMUX_WORKSPACE_ID` (project root path), `OXIMUX_SURFACE_ID`, `OXIMUX_TAB_ID` (minted UUIDs), `OXIMUX_SOCKET_PATH`, plus the daemon-injected `OXIMUX_PTY_ID`
+- New module `crates/app/src/shell/context_env.rs` (`SurfaceIds` struct); ids persist in the per-pane layout blob and are re-injected on dormant respawn
+- Agent CLI PTYs not yet threaded with context env; per-pane-tab relay reattach + cross-group multi-tab-drag repaint deferred to a follow-on
+
+---
+
+### 2026-05-29 — Multiplexer enhancements Phase 3 — Multi-window & tear-off tab
+
+**Status**: code complete; 375 app lib tests + storage/relay/relay-client/pty, 0 failures; runtime smoke pending  
+**Commits**: `4cae319`, `e88d00b`, `1d02cf4`, `fdb1ee7`, `fdad549`  
+**Touches**: `crates/app/src/window_registry.rs` (NEW), `crates/app/src/window_factory.rs` (NEW), `crates/storage` (V005 migration)
+
+#### feat(app): multi-window support (`WindowRegistry` + `open_workspace_window`)
+
+- App-level `WindowRegistry` GPUI global holds a strong `Entity<WorkspaceRoot>` per window with stable persist ids (`"main"` / `"w{n}"`)
+- `NewWindow` action (Cmd+N) opens a new workspace window via the reusable `open_workspace_window` factory (`window_factory.rs`)
+- App lifecycle: single quit observer; last-window close calls `cx.quit()`; non-last close dismisses only that window
+
+#### feat(storage): per-window persistence (V005 migration)
+
+- Migration V005 adds `window_id` column to `pane_buffers` and `pane_relay_ids` (PK rebuilt; `DEFAULT 'main'` for backward compatibility)
+- Settings layout key and capture/restore thread a per-window id; `capture_session` writes an open-windows manifest; boot reopens every persisted window
+
+#### feat(app): cross-window tear-off (`MoveTabToNewWindow`)
+
+- `MoveTabToNewWindow` action + context-menu item moves a group tab into a new window
+- `TerminalBackend::detach` releases a relay attachment without killing the PTY (detach source first, then attach destination — relay client multiplexes one subscriber per `pty_id`); destination re-mounts via `attach_pty_existing`
+
+---
+
 ### 2026-05-23 — Phase 5 / Step 05 — Pane as editor host (workspace wiring)
 
 **Status**: complete  
