@@ -70,12 +70,23 @@ src/
     ├── main_area.rs        thin dispatcher → welcome_view::view
     ├── status_bar.rs       left | center git zone | right metric strip (N TTY | N agents | N panes)
     │                       pure helpers: tty_label / agent_label / pane_label / metric_color
-    ├── terminal_view.rs    TerminalView GPUI entity; poll task; blink; focus
-    ├── terminal_row.rs     build_row / group_runs / effective_colors
+    ├── terminal_view.rs    TerminalView GPUI entity; poll task; blink; focus;
+    │                       last_completed_command_output (P8 mark bracket → snapshot
+    │                       rows_text band); send-to-agent action handlers dispatch
+    │                       SendTextToActiveAgent payload up to WorkspaceRoot
+    ├── terminal_canvas.rs  paint_grid (bg quads → selection → shape_line → box-drawing
+    │                       vector pass → cursor); group_runs replaces box-drawing chars
+    │                       with space so the font glyph never paints; per-row force_width
+    │                       hedge for rows mixing narrow + CJK wide
+    ├── terminal_row.rs     legacy row builder; canvas path is primary
     ├── terminal_palette.rs CellColor → Hsla resolver (charcoal + xterm-256)
     ├── terminal_search.rs  find_matches / visible_match_ranges (pure)
     ├── terminal_search_state.rs SearchState struct
     ├── terminal_search_overlay.rs overlay render
+    ├── box_drawing/        U+2500–U+257F vector rendering (segments lookup +
+    │                       PathBuilder stroke paint); replaces the font face for
+    │                       continuous TUI borders, gap-free at cell joins;
+    │                       diagonals U+2571–U+2573 fall through to the font
     ├── key_input.rs        Keystroke → PTY bytes (xterm escapes, C0, Alt-prefix)
     ├── cell_metrics.rs     character cell size constants
     ├── file_tree_view.rs   FileTreeView GPUI entity (step 4); subscribes to Entity<FileTree> from oximux-editor;
@@ -253,9 +264,10 @@ src/
 |---|---|
 | `backend.rs` | `TerminalBackend` trait: spawn/write/resize/snapshot/search_grid |
 | `portable_pty_backend.rs` | PTY via portable-pty; bounded sync_channel(256); watcher thread per session |
-| `state.rs` | `TerminalState`: alacritty_terminal + vte processor; 5000-row scrollback |
-| `snapshot.rs` | `TerminalSnapshot`: cells grid + cursor position |
-| `events.rs` | `TerminalEvent` enum: Output/Exit/Resize/TitleChange |
+| `state.rs` | `TerminalState`: alacritty_terminal + vte processor; user-tunable scrollback (default 5000) |
+| `snapshot.rs` | `TerminalSnapshot`: cells grid + cursor; grid-text extractors `rows_text` / `get_content` / `last_n_non_empty_lines`; `abs_line_to_screen_row` maps OSC 133/633 mark lines into the visible viewport |
+| `events.rs` | `TerminalEvent` enum: Output/Exit/Resize/TitleChange/Bell/CwdChanged/CommandMark/Progress/Clipboard/PtyReply |
+| `osc7.rs` | `OscScanner`: OSC 7 (cwd) + OSC 133/633 (command marks) + OSC 9;4 (progress) sequence extractor — events alacritty doesn't expose |
 | `close_grace.rs` | `term_step` SIGTERM-to-process-group + `close_with_grace(WatcherHandle, term_fn, kill_fn, GRACE, POLL)` orchestrator (5 s SIGTERM grace → SIGKILL fallback) |
 
 ---

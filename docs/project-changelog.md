@@ -4,6 +4,38 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-05-30 — Terminal emulator richness — Phases 1–12
+
+**Status**: code complete; 1161 workspace tests pass; clippy `-D warnings` clean  
+**Commits**: `3b08487` (P1–P3), `b4e084f` (P4–P6), `c58fca6` (P7), `e7f316f` (P8), `2b11d2f` (P9), `1f6ef9f` (P10), `86acc23` (P11), `8b5ddc7` (P12 slices 1+1.5)  
+**Plan**: `plans/260529-2042-terminal-emulator-richness/`
+
+Closes the emulator-quality gap with the three reference GPUI terminals
+(gpui-terminal, crate-reorg, zed-industries/zed) that share OxiMux's
+`alacritty_terminal` + `portable-pty` backend.
+
+#### Sprint A — base feels real
+- **P1 SGR text attributes** — bold/italic/underline/strikethrough/dim now propagate from alacritty to the canvas paint via per-cell flags + per-run font weight/style overrides.
+- **P2 mouse selection + gestures** — `point_to_cell` + drag-anchor selection; Cmd+C copy; double/triple click word/line; Shift-click extends.
+- **P3 live scrollback** — render-side `display_offset` driven from snapshot; wheel scroll, scrolled-up chip, snap-to-bottom on send.
+
+#### Sprint B — TUI tools work
+- **P4 input encoder** — app-cursor / app-keypad modes, xterm modifier params, Alt-prefix; tested via headless E2E that drives the real keymap.
+- **P5 mouse reporting** — SGR/UTF-8/X10 mouse encoding for vim/htop/tmux; respects motion modes and modifiers.
+- **P6 cursor shapes** — DECSCUSR Block/Bar/Underline; live-reload-tunable blink interval; unfocused-pane dim ghost cursor.
+
+#### Sprint C — cockpit value
+- **P7 hyperlinks + path-to-editor** — OSC 8 explicit + plain-text URL/file:line detection; Cmd-click opens via editor host's new `open(path, line, col)`.
+- **P8 shell integration** — OSC 7 cwd updates; OSC 133/633 prompt+command marks with green/red gutter badges; OSC 52 clipboard write (gated by setting); OSC 9;4 progress capture; ColorRequest replies; DSR cursor-position replies.
+- **P9 terminal settings** — `terminal.toml` in `~/Library/Application Support/dev.nhtera.oximux/` with FSEvents-backed live reload (debounced; filtered to the settings file to skip sqlite WAL churn); knobs for scrollback, scroll multiplier, blink, dim/unfocused alphas, OSC 52 toggle, option-as-meta, bell style.
+
+#### Tier-3 — depth + north-star
+- **P10 CJK wide-character layout** — `Cell.wide` / `wide_spacer` flags; canvas advances columns by 2 for wide cells; per-row `force_width` hedge keeps mono crispness on rows with no wide chars.
+- **P11 box-drawing vector rendering** — U+2500–U+257F stroked via PathBuilder; horizontal merge collapses same-color same-weight runs into one continuous stroke (no inter-cell seams); diagonals U+2571–U+2573 fall through to the font face.
+- **P12 inline agent** — slices 1+1.5 shipped: grid-text extractors on `TerminalSnapshot` + Cmd+Shift+I / Cmd+Shift+O actions to send selection / last completed command output to the active agent's input buffer. Slices 2 (display-only backend) and 3 (block_below_cursor) deferred pending dogfood signal.
+
+---
+
 ### 2026-05-29 — Multiplexer enhancements Phase 4 — Per-pane tabs & context env
 
 **Status**: code complete; 375 app lib tests + storage/relay/relay-client/pty, 0 failures; runtime smoke pending  

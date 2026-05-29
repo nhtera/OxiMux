@@ -1,6 +1,6 @@
 # OxiMux — Development Roadmap
 
-**Updated**: 2026-05-29  
+**Updated**: 2026-05-30  
 **Gate rule**: each phase ships only after ≥7 consecutive daily-driver days with zero panics (ADR-003). Tests-passing alone is not sufficient.
 
 ---
@@ -100,6 +100,30 @@ All four phases code complete; runtime GPUI smoke pending.
 - `NewTabInPane` action (Cmd+Shift+T); Cmd+W cascades per-pane tab → leaf → group
 - `SurfaceIds` context env (`context_env.rs`): `OXIMUX_WORKSPACE_ID`, `OXIMUX_SURFACE_ID`, `OXIMUX_TAB_ID`, `OXIMUX_SOCKET_PATH` injected into every spawned shell
 - Per-pane-tab relay reattach + agent CLI context-env threading deferred
+
+---
+
+## Terminal emulator richness plan — code complete 2026-05-30
+
+Plan: `plans/260529-2042-terminal-emulator-richness/`  
+Closes the emulator-quality gap with the three GPUI reference terminals (all share OxiMux's `alacritty_terminal` + `portable-pty` backend). 11 of 12 phases fully complete; P12 ships slices 1+1.5 and defers 2+3.
+
+| Phase | Capability | Status |
+|---|---|---|
+| trm-P1 | SGR text attributes (bold/italic/underline/strikethrough/dim) | code complete |
+| trm-P2 | Mouse selection + gestures (double/triple/Shift-extend) | code complete |
+| trm-P3 | Live scrollback scrolling (display_offset, snap-to-bottom) | code complete |
+| trm-P4 | Input encoder (app-cursor/keypad, xterm modifiers, Alt-prefix) | code complete |
+| trm-P5 | Mouse reporting to TUIs (SGR/UTF-8/X10) | code complete |
+| trm-P6 | Cursor shapes + visibility (DECSCUSR, blink, focus dim) | code complete |
+| trm-P7 | Hyperlinks + path-to-editor open (OSC 8 + plain-text detection) | code complete |
+| trm-P8 | Shell integration + OSC extensions (7/52/133/633/9;4 + DSR replies) | code complete |
+| trm-P9 | Terminal settings surface (terminal.toml + live-reload watcher) | code complete |
+| trm-P10 | CJK wide-character layout (wide + wide_spacer + per-row force_width) | code complete |
+| trm-P11 | Box-drawing vector rendering (PathBuilder strokes, gap-free merges) | code complete |
+| trm-P12 | Inline agent terminal (extraction helpers + send-to-active-agent) | partial (slices 1+1.5; 2+3 deferred) |
+
+**Keybinds added**: Cmd+Shift+I sends terminal selection to active agent's input buffer; Cmd+Shift+O sends last completed command's output (bracketed by P8 marks).
 
 ---
 
