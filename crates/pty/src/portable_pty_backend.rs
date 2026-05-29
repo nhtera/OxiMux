@@ -150,7 +150,7 @@ impl TerminalBackend for PortablePtyBackend {
         let state = Arc::new(Mutex::new(TerminalState::new(
             cfg.cols,
             cfg.rows,
-            SCROLLBACK_ROWS,
+            cfg.scrollback,
         )));
         let cwd_hint: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let tx = self.event_tx.clone();

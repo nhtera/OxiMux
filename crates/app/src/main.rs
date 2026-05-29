@@ -149,6 +149,9 @@ fn main() {
             component_theme.colors.input = palette.border_inactive;
             component_theme.colors.ring = palette.focus_ring;
         }
+        // Load user terminal settings into a global + start the live-reload
+        // watcher BEFORE any window opens so the first pane reads real values.
+        oximux_app::terminal_settings::install(cx);
         cx.bind_keys(oximux_app::keymap::default_key_bindings());
         cx.activate(true);
 

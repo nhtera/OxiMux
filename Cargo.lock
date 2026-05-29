@@ -4456,6 +4456,7 @@ dependencies = [
  "gpui_platform",
  "libc",
  "mac-notification-sys",
+ "notify-debouncer-full",
  "oximux-agents",
  "oximux-core",
  "oximux-editor",

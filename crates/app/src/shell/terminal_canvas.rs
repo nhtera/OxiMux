@@ -41,22 +41,26 @@ use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::terminal_palette::{ColorRole, resolve};
 use crate::shell::terminal_search_state::{MatchHit, MatchKind};
 
-/// Multiplier on fg alpha when SGR 2 ("faint") is set. 0.7 lands in the
-/// middle of the ~0.66–0.75 faint-text opacity range common across
-/// mainstream terminals, so dim text (zsh autosuggest, fish, prompt
-/// paths) reads the way users expect.
-const DIM_FG_ALPHA: f32 = 0.7;
+/// Alpha multipliers from `TerminalSettings`, passed in per paint so they
+/// live-reload. `dim` = SGR-2 faint text; `unfocused` = lighter text in an
+/// inactive pane; `unfocused_cursor` = the faint ghost cursor block there.
+/// `Default` reproduces the prior constants (0.7 / 0.4 / 0.3).
+#[derive(Clone, Copy)]
+pub struct Alphas {
+    pub dim: f32,
+    pub unfocused: f32,
+    pub unfocused_cursor: f32,
+}
 
-/// Multiplier on fg alpha for cells in an unfocused pane. Replaces the
-/// older translucent-veil approach with the "lighter text on same bg"
-/// treatment common terminals use — the focused pane reads as the active
-/// one without any extra chrome.
-const UNFOCUSED_FG_ALPHA: f32 = 0.4;
-
-/// Multiplier on the inverted cursor-cell bg when its pane is unfocused.
-/// Renders a faint ghost block so the user can still see where the
-/// shell's caret sits in the inactive pane.
-const UNFOCUSED_CURSOR_ALPHA: f32 = 0.3;
+impl Default for Alphas {
+    fn default() -> Self {
+        Self {
+            dim: 0.7,
+            unfocused: 0.4,
+            unfocused_cursor: 0.3,
+        }
+    }
+}
 
 /// Owned inputs for the canvas paint closure. `TerminalView::render`
 /// builds one of these per frame and moves it into the closure so the
@@ -91,6 +95,9 @@ pub struct PaintParams {
     /// thin bar in the left padding gutter of each prompt row — green for a
     /// zero exit, red for non-zero. Empty unless the shell emits OSC 133/633.
     pub command_badges: Vec<(usize, bool)>,
+    /// Live alpha multipliers (dim / unfocused / unfocused-cursor) from
+    /// `TerminalSettings`.
+    pub alphas: Alphas,
 }
 
 /// Compute the `(cols, rows)` that fit in a canvas of `bounds`, given the
@@ -218,7 +225,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         let mut col: usize = 0;
         for run in &runs {
             let n_cells = run.text.chars().count();
-            let (_fg, bg) = effective_colors(run, p.pane_focused, &p.theme);
+            let (_fg, bg) = effective_colors(run, p.pane_focused, &p.theme, p.alphas);
             // Match highlight overrides bg unless the cursor is also on
             // this run (cursor inverse wins — keeps the cursor visible
             // on a matched cell).
@@ -279,7 +286,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         let mut text = String::with_capacity(row.len());
         let mut text_runs: Vec<TextRun> = Vec::with_capacity(runs.len());
         for run in &runs {
-            let (fg, bg) = effective_colors(run, p.pane_focused, &p.theme);
+            let (fg, bg) = effective_colors(run, p.pane_focused, &p.theme, p.alphas);
             // Current-match fg uses theme.match_fg for legibility against
             // the bright amber match_bg_current. Inverse cells (incl. the
             // cursor) already have the inverted color from effective_colors;
@@ -353,7 +360,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             let x_left = (origin.x + cell_w * p.cursor.1 as f32).floor();
             let mut color = p.theme.fg_base;
             if !p.pane_focused {
-                color.a *= UNFOCUSED_CURSOR_ALPHA;
+                color.a *= p.alphas.unfocused_cursor;
             }
             let thickness = px(2.0);
             let rect = if p.cursor_shape == CursorShapeKind::Bar {
@@ -502,18 +509,18 @@ fn group_runs(
 /// Cursor cells get only `UNFOCUSED_CURSOR_ALPHA` on the inverted bg
 /// — not the foreground multiplier, which would double-fade the glyph
 /// inside the ghost block to invisibility.
-fn effective_colors(run: &Run, pane_focused: bool, theme: &Theme) -> (Hsla, Hsla) {
+fn effective_colors(run: &Run, pane_focused: bool, theme: &Theme, alphas: Alphas) -> (Hsla, Hsla) {
     let fg = resolve(run.fg, ColorRole::Fg, theme);
     let bg = resolve(run.bg, ColorRole::Bg, theme);
     let (mut fg, mut bg) = if run.inverse { (bg, fg) } else { (fg, bg) };
     if run.dim {
-        fg.a *= DIM_FG_ALPHA;
+        fg.a *= alphas.dim;
     }
     if !pane_focused {
         if run.is_cursor {
-            bg.a *= UNFOCUSED_CURSOR_ALPHA;
+            bg.a *= alphas.unfocused_cursor;
         } else {
-            fg.a *= UNFOCUSED_FG_ALPHA;
+            fg.a *= alphas.unfocused;
         }
     }
     (fg, bg)
@@ -620,8 +627,8 @@ mod tests {
             match_kind: None,
             ..Run::default()
         };
-        let (fg_focused, _) = effective_colors(&run, true, &theme);
-        let (fg_unfocused, _) = effective_colors(&run, false, &theme);
+        let (fg_focused, _) = effective_colors(&run, true, &theme, Alphas::default());
+        let (fg_unfocused, _) = effective_colors(&run, false, &theme, Alphas::default());
         assert!(fg_unfocused.a < fg_focused.a);
     }
 
@@ -638,7 +645,7 @@ mod tests {
             match_kind: None,
             ..Run::default()
         };
-        let (fg, bg) = effective_colors(&run, true, &theme);
+        let (fg, bg) = effective_colors(&run, true, &theme, Alphas::default());
         // After swap, fg becomes the canvas bg and bg becomes the text fg.
         assert_eq!(fg, theme.bg_base);
         assert_eq!(bg, theme.fg_base);

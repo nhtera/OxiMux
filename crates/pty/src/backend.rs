@@ -61,6 +61,9 @@ pub struct SpawnConfig {
     pub env: Vec<(String, String)>,
     pub cols: u16,
     pub rows: u16,
+    /// Off-screen rows to retain. Sourced from `TerminalSettings` at spawn so
+    /// the scrollback depth is user-tunable; defaults to the prior constant.
+    pub scrollback: usize,
 }
 
 impl Default for SpawnConfig {
@@ -72,6 +75,7 @@ impl Default for SpawnConfig {
             env: Vec::new(),
             cols: 80,
             rows: 24,
+            scrollback: 5000,
         }
     }
 }

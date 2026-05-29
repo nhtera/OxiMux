@@ -34,6 +34,18 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: InputMode) -> Vec<u8> {
         return apply_alt(ks, vec![byte]);
     }
 
+    // Alt + printable key uses the UNSHIFTED key label, not `key_char`. On
+    // macOS, Option composes platform characters (Option+A → `å`) into
+    // `key_char`; if we forwarded that as the Meta payload the shell would
+    // see `ESC å` (3 bytes) and no readline Alt binding would fire — bindings
+    // are registered against `ESC a` (the ASCII letter). When the caller
+    // wants the composed character instead (the "Option-as-Meta = off"
+    // setting), it strips `alt` before invoking us so this branch is skipped
+    // and the `key_char` path below runs.
+    if ks.modifiers.alt && !ks.key.is_empty() && is_printable_key(&ks.key) {
+        return apply_alt(ks, ks.key.as_bytes().to_vec());
+    }
+
     // Printable character. Prefer key_char (post-IME, shift-aware) over key.
     if let Some(s) = ks.key_char.as_deref().filter(|s| !s.is_empty()) {
         return apply_alt(ks, s.as_bytes().to_vec());
@@ -326,6 +338,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(keystroke_to_bytes(&ks("a", Some("a"), m), off()), b"\x1ba");
+    }
+
+    #[test]
+    fn alt_with_composed_key_char_uses_unshifted_key_label() {
+        // macOS Option+A delivers `key = "a"`, `key_char = "å"` (composed).
+        // Meta semantics: shells expect ESC + the ASCII byte of the key, NOT
+        // ESC + composed UTF-8. So bytes must be `\x1b a`, not `\x1b å`.
+        let m = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keystroke_to_bytes(&ks("a", Some("å"), m), off()),
+            b"\x1ba",
+            "Alt + composed key_char should still send ESC + unshifted ASCII"
+        );
     }
 
     #[test]

@@ -170,6 +170,7 @@ impl AgentRuntime for CliRuntime {
             env,
             cols: cfg.cols,
             rows: cfg.rows,
+            scrollback: 5000,
         };
 
         // Spawn PTY + stdin_seed inside spawn_blocking — openpty + fork on

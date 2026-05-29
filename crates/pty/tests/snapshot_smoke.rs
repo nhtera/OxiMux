@@ -26,6 +26,7 @@ fn snapshot_contains_echoed_marker() {
         env: Vec::new(),
         cols: 80,
         rows: 24,
+        scrollback: 5000,
     };
 
     let id = backend.spawn(cfg).expect("spawn shell");

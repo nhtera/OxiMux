@@ -32,7 +32,7 @@ use oximux_pty::{
     CommandMarkKind, PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent,
     TerminalSessionId, TerminalSnapshot,
 };
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{BellStyle, Density, TerminalSettings, Theme, Typography};
 
 use crate::actions::Search;
 use crate::shell::cell_metrics::CellMetrics;
@@ -41,7 +41,9 @@ use crate::shell::key_input::keystroke_to_bytes;
 use crate::shell::mouse_report::{MouseAction, MouseBtn, encode_button, encode_scroll, mod_bits};
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_links::{LinkMatch, LinkTarget, detect_at};
-use crate::shell::terminal_canvas::{PaintParams, grid_dims_for, paint_grid, point_to_cell};
+use crate::shell::terminal_canvas::{
+    Alphas, PaintParams, grid_dims_for, paint_grid, point_to_cell,
+};
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 
@@ -50,15 +52,33 @@ use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 /// idle.
 const POLL_INTERVAL_MS: u64 = 16;
 
-/// Cursor blink half-period. 530 ms matches the common terminal default and
-/// the XTerm `cursorBlink` resource. One toggle per period — full blink cycle is
-/// 1.06 s.
-const BLINK_INTERVAL_MS: u64 = 530;
-
 /// Default grid size on spawn. Parent-driven resize takes over on the first
 /// render.
 pub const DEFAULT_COLS: u16 = 100;
 pub const DEFAULT_ROWS: u16 = 32;
+
+/// Read the live terminal settings global, falling back to defaults when it
+/// isn't installed (headless tests, early startup before `set_global`).
+pub fn terminal_settings(cx: &App) -> TerminalSettings {
+    cx.try_global::<TerminalSettings>().copied().unwrap_or_default()
+}
+
+/// Process-wide mirror of `TerminalSettings::scrollback_lines`. The PTY spawn
+/// helpers are `cx`-less free functions, so they read scrollback here instead
+/// of threading the global through every call site. The settings loader and
+/// the live-reload watcher (both of which hold `cx`) keep it in sync.
+static SPAWN_SCROLLBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(5000);
+
+/// Update the spawn-scrollback mirror from settings. Called once at startup and
+/// on every settings reload.
+pub fn set_spawn_scrollback(lines: usize) {
+    SPAWN_SCROLLBACK.store(lines, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn spawn_scrollback() -> usize {
+    SPAWN_SCROLLBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Set true while the app is shutting down (see the quit/window-close/
 /// signal handlers in `main.rs`). `TerminalView::drop` reads it: when
@@ -150,6 +170,7 @@ pub fn spawn_local_pty(
             env: env.clone(),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
+            scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
         let mut guard = shared.lock().expect("shared backend poisoned");
@@ -178,6 +199,7 @@ fn spawn_fallback_portable(
         env,
         cols: DEFAULT_COLS,
         rows: DEFAULT_ROWS,
+        scrollback: spawn_scrollback(),
         ..SpawnConfig::default()
     };
     let session_id = match backend.spawn(cfg) {
@@ -567,6 +589,7 @@ impl TerminalView {
             env: self.ids.env(),
             cols: self.target_grid.0.max(DEFAULT_COLS),
             rows: self.target_grid.1.max(DEFAULT_ROWS),
+            scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
         let session_id = self.session_id;
@@ -605,24 +628,34 @@ impl TerminalView {
         })
     }
 
-    /// 530 ms cursor blink. Independent of the PTY poll so a chatty TUI
-    /// doesn't bury the toggle and an idle shell still pulses. The toggle
-    /// always runs (state stays truthful across focus changes); `cx.notify()`
-    /// is gated on `view.focused` so unfocused panes contribute zero repaints
-    /// per second instead of ~1.9 Hz.
+    /// Cursor blink. Independent of the PTY poll so a chatty TUI doesn't bury
+    /// the toggle and an idle shell still pulses. Period + on/off come from
+    /// `TerminalSettings` live (next tick picks up an edit). When blink is off
+    /// the cursor is pinned visible. The toggle always runs (state stays
+    /// truthful across focus changes); `cx.notify()` is gated on `view.focused`
+    /// so unfocused panes contribute zero repaints per second.
     fn start_blink_task(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
-                else {
+                let Ok((executor, interval)) = this.read_with(cx, |_, cx| {
+                    (
+                        cx.background_executor().clone(),
+                        terminal_settings(cx).blink_interval_ms,
+                    )
+                }) else {
                     return;
                 };
-                executor
-                    .timer(Duration::from_millis(BLINK_INTERVAL_MS))
-                    .await;
+                executor.timer(Duration::from_millis(interval)).await;
                 if this
                     .update(cx, |view, cx| {
-                        view.cursor_visible = !view.cursor_visible;
+                        let blink = terminal_settings(cx).cursor_blink;
+                        if blink {
+                            view.cursor_visible = !view.cursor_visible;
+                        } else if !view.cursor_visible {
+                            // Blink turned off mid-cycle on the hidden phase —
+                            // restore a steady cursor.
+                            view.cursor_visible = true;
+                        }
                         if view.focused {
                             cx.notify();
                         }
@@ -978,7 +1011,8 @@ impl TerminalView {
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
         let metrics = CellMetrics::measure(&self.typography, window);
         let dy = f32::from(ev.delta.pixel_delta(px(metrics.line_height)).y);
-        let lines = (dy / metrics.line_height).round() as i32;
+        let mult = terminal_settings(cx).scroll_multiplier;
+        let lines = (dy / metrics.line_height * mult).round() as i32;
         if lines == 0 {
             return;
         }
@@ -1107,7 +1141,16 @@ impl TerminalView {
         // toggle it dynamically, so fetch per keystroke rather than caching.
         let session_id = self.session_id;
         let mode = self.with_backend(|be| be.input_mode(session_id));
-        let bytes = keystroke_to_bytes(ks, mode);
+        // When Option-as-Meta is OFF, strip the Alt modifier so the encoder
+        // emits the composed platform character (e.g. `å`) instead of an
+        // ESC-prefixed Meta sequence. ON (default) keeps the Meta behavior.
+        let bytes = if terminal_settings(cx).option_as_meta || !ks.modifiers.alt {
+            keystroke_to_bytes(ks, mode)
+        } else {
+            let mut stripped = ks.clone();
+            stripped.modifiers.alt = false;
+            keystroke_to_bytes(&stripped, mode)
+        };
         self.send_bytes(&bytes, cx);
     }
 
@@ -1161,6 +1204,7 @@ impl TerminalView {
             env: self.ids.env(),
             cols: self.target_grid.0.max(DEFAULT_COLS),
             rows: self.target_grid.1.max(DEFAULT_ROWS),
+            scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
         let session_id = self.session_id;
@@ -1233,6 +1277,7 @@ impl TerminalView {
         if events.is_empty() {
             return;
         }
+        let settings = terminal_settings(cx);
         // Resnapshot on `Output` (new bytes landed in the grid) AND `Resize`
         // (Term::resize reflowed existing rows + may have shrunk row count).
         // Skipping `Resize` here was the cause of the post-split clipping
@@ -1256,9 +1301,14 @@ impl TerminalView {
                 TerminalEvent::TitleChange { title, .. } => {
                     latest_title = Some(title.clone());
                 }
-                // A BEL while this pane is NOT focused raises attention. A bell
-                // in the pane you're already looking at is just noise.
-                TerminalEvent::Bell { .. } if !self.focused => got_bell = true,
+                // A BEL while this pane is NOT focused raises attention (unless
+                // the bell is disabled). A bell in the pane you're already
+                // looking at is just noise.
+                TerminalEvent::Bell { .. }
+                    if !self.focused && settings.bell != BellStyle::Off =>
+                {
+                    got_bell = true
+                }
                 // OSC 52: the child asked to set the system clipboard. Keep the
                 // last in the batch; written once below.
                 TerminalEvent::Clipboard { text, .. } => clipboard_text = Some(text.clone()),
@@ -1298,12 +1348,14 @@ impl TerminalView {
         if let Some(title) = latest_title {
             self.title = Some(title);
         }
-        if let Some(text) = clipboard_text {
+        if let Some(text) = clipboard_text
+            && settings.osc52_clipboard
+        {
             // SECURITY: OSC 52 lets terminal OUTPUT set the system clipboard.
             // For remote/relay panes that means a remote process can silently
             // overwrite your clipboard (injection surface on the next paste).
-            // This follows alacritty's permissive default (copy allowed); a
-            // user-facing allow-list will gate it. No remote-vs-local guard yet.
+            // The `osc52_clipboard` setting is the allow-list gate; there is no
+            // separate remote-vs-local distinction yet.
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         }
         for bytes in pty_replies {
@@ -1519,6 +1571,14 @@ impl Render for TerminalView {
             .search
             .render_buckets(visible_rows, self.snapshot.display_offset);
 
+        // Live render-time knobs from settings (alpha multipliers).
+        let s = terminal_settings(cx);
+        let alphas = Alphas {
+            dim: s.dim_alpha,
+            unfocused: s.unfocused_alpha,
+            unfocused_cursor: s.unfocused_cursor_alpha,
+        };
+
         // Build owned paint params (`FnOnce + 'static` requires no
         // borrows). Clone is cheap: snapshot is a Vec<Vec<Cell>> already
         // sized to the visible grid, buckets are tiny per-row vecs of
@@ -1535,6 +1595,7 @@ impl Render for TerminalView {
             hovered_link: self.hovered_link,
             selection: self.selection,
             command_badges: self.visible_command_badges(),
+            alphas,
         };
 
         let overlay = if self.search.active {

@@ -140,6 +140,10 @@ impl RelayBackend {
         // those bytes arrive on the live stream — no static reflow.
         let cols = cols.max(1);
         let rows = rows.max(1);
+        // NOTE: attach uses the const scrollback (not the user's
+        // `scrollback_lines` setting) by design — the replay buffer must hold
+        // the daemon's full retained output and the receiver grid has to be
+        // sized to fit it, regardless of what the user picked for fresh spawns.
         let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, SCROLLBACK_ROWS)));
         {
             let mut s = state.lock().expect("state poisoned");
@@ -291,7 +295,7 @@ impl TerminalBackend for RelayBackend {
         let state = Arc::new(Mutex::new(TerminalState::new(
             cfg.cols,
             cfg.rows,
-            SCROLLBACK_ROWS,
+            cfg.scrollback,
         )));
         let id = self.mint_id();
         let generation = Arc::new(AtomicU64::new(1));

@@ -26,6 +26,7 @@ fn spawn_echo_drains_marker_and_exit() {
         env: Vec::new(),
         cols: 80,
         rows: 24,
+        scrollback: 5000,
     };
 
     let id = backend.spawn(cfg).expect("spawn shell");
@@ -129,6 +130,7 @@ fn spawn_dormant_prefill_then_promote_to_live() {
                 env: Vec::new(),
                 cols: 80,
                 rows: 24,
+                scrollback: 5000,
             },
         )
         .expect("promote_to_live on dormant session");
@@ -178,6 +180,7 @@ fn promote_to_live_rejects_already_live_session() {
         env: Vec::new(),
         cols: 80,
         rows: 24,
+        scrollback: 5000,
     };
     let id = backend.spawn(cfg.clone()).expect("spawn live shell");
     let err = backend
@@ -209,6 +212,7 @@ fn osc7_emission_populates_cwd_hint() {
         env: Vec::new(),
         cols: 80,
         rows: 24,
+        scrollback: 5000,
     };
     let id = backend.spawn(cfg).expect("spawn shell");
 
@@ -264,6 +268,7 @@ fn cwd_hint_is_none_before_first_osc7() {
         env: Vec::new(),
         cols: 80,
         rows: 24,
+        scrollback: 5000,
     };
     let id2 = backend.spawn(cfg).expect("spawn");
     // Drain output to ensure the watcher ran.
