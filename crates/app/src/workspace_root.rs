@@ -51,9 +51,9 @@ use crate::actions::{
     OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker,
     OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate, RequestOpenAdapterPicker,
-    SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab, SplitDown,
-    SplitGroupAt, SplitHorizontal, SplitLeft, SplitRight, SplitUp, SplitVertical,
-    ToggleLeftSidebar, ToggleRightSidebar,
+    SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab,
+    SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft, SplitRight,
+    SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -1216,6 +1216,32 @@ impl Render for WorkspaceRoot {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
             }))
+            .on_action(cx.listener(
+                |this, action: &SendTextToActiveAgent, _window, cx| {
+                    // Resolve the routing target on the spot: the active
+                    // project's first agent session, preferring the
+                    // currently-focused tab. No-op when nothing is open.
+                    let Some(panes) = this.active_project_panes() else {
+                        tracing::debug!("send-to-agent: no active project");
+                        return;
+                    };
+                    let Some(session_id) = panes.read(cx).target_agent_session(cx) else {
+                        tracing::debug!("send-to-agent: no agent session available");
+                        return;
+                    };
+                    let runtime = this.cli_runtime.clone();
+                    let text = action.text.clone();
+                    // CLI runtime call is async (writes to the agent's PTY
+                    // off-thread). Detach — UI doesn't block on the write
+                    // and Drop-on-error just surfaces in the trace log.
+                    cx.background_spawn(async move {
+                        if let Err(err) = runtime.send_message(session_id, &text).await {
+                            tracing::warn!(?session_id, %err, "send-to-agent failed");
+                        }
+                    })
+                    .detach();
+                },
+            ))
             .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
                 // Mutex with every other full-window overlay (close-then-open).
                 this.close_modal_overlays(cx);

@@ -34,7 +34,9 @@ use oximux_pty::{
 };
 use oximux_settings::{BellStyle, Density, TerminalSettings, Theme, Typography};
 
-use crate::actions::Search;
+use crate::actions::{
+    Search, SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SendTextToActiveAgent,
+};
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::key_input::keystroke_to_bytes;
@@ -758,6 +760,88 @@ impl TerminalView {
         self.search.open();
         self.rerun_search();
         cx.notify();
+    }
+
+    /// Cmd-Shift-I: extract the active selection's text and dispatch a
+    /// `SendTextToActiveAgent` payload action up the tree. `WorkspaceRoot`
+    /// resolves the destination agent and writes the bytes via the CLI
+    /// runtime. No-op (with a debug trace) when the pane has no selection.
+    fn on_send_selection_to_agent(
+        &mut self,
+        _: &SendTerminalSelectionToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sel) = self.selection else {
+            tracing::debug!("send-to-agent: no selection");
+            return;
+        };
+        let text = extract_selection_text(&self.snapshot, sel);
+        if text.is_empty() {
+            return;
+        }
+        window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+    }
+
+    /// Cmd-Shift-O: extract the most-recent COMPLETED command's output
+    /// from the visible viewport — bracketed by the last two
+    /// `PromptStart` marks — and dispatch it. Requires at least two
+    /// prompt marks (one before, one after the command). Falls back to
+    /// a debug trace when shell-integration marks aren't present.
+    fn on_send_last_command_output_to_agent(
+        &mut self,
+        _: &SendLastCommandOutputToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = self.last_completed_command_output() else {
+            tracing::debug!("send-output-to-agent: no completed command in scope");
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+    }
+
+    /// Plain text of the most-recently COMPLETED command's output,
+    /// bracketed by the last two `PromptStart` marks. Returns `None`
+    /// when fewer than two marks are present (e.g. shell-integration
+    /// not wired) or when both marks lie above the visible viewport.
+    ///
+    /// The output band is `[prev_prompt.line + 1, last_prompt.line - 1]`
+    /// in absolute history coords; both ends clamp into the snapshot's
+    /// visible rows via `abs_line_to_screen_row`. Output that scrolled
+    /// off the top is silently truncated to what's still on screen — a
+    /// known limitation of the v1 viewport-only extractor.
+    fn last_completed_command_output(&self) -> Option<String> {
+        let n = self.command_marks.len();
+        if n < 2 {
+            return None;
+        }
+        let prev = &self.command_marks[n - 2];
+        let last = &self.command_marks[n - 1];
+        // Output band is exclusive of both prompt lines themselves.
+        let band_start = prev.line.saturating_add(1);
+        let band_end = last.line.saturating_sub(1);
+        if band_end < band_start {
+            return None;
+        }
+        // Clamp the band into the visible viewport. If the band is
+        // entirely above or below the viewport, nothing to extract.
+        let rows = self.snapshot.cells.len();
+        if rows == 0 {
+            return None;
+        }
+        let base = self.snapshot.history_len as i64 - self.snapshot.display_offset as i64;
+        let raw_start = band_start as i64 - base;
+        let raw_end = band_end as i64 - base;
+        if raw_end < 0 || raw_start >= rows as i64 {
+            return None;
+        }
+        let screen_start = raw_start.max(0) as usize;
+        let screen_end = raw_end.min((rows - 1) as i64) as usize;
+        Some(self.snapshot.rows_text(screen_start, screen_end))
     }
 
     fn rerun_search(&mut self) {
@@ -1729,6 +1813,8 @@ impl Render for TerminalView {
             .font(self.typography.mono_font())
             .text_size(px(self.typography.t_body_lg))
             .on_action(cx.listener(Self::on_search))
+            .on_action(cx.listener(Self::on_send_selection_to_agent))
+            .on_action(cx.listener(Self::on_send_last_command_output_to_agent))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {

@@ -10,7 +10,8 @@ use crate::actions::{
     CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
     FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewTabInPane, NewWindow, NextTab,
     OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
-    PrevTab, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitSubPaneDown,
+    PrevTab, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
+    SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitSubPaneDown,
     SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
 };
 
@@ -70,6 +71,12 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-n", OpenWorkspaceCreate, None),
         // cmd-shift-a spawns a new agent tab using the first built-in adapter.
         KeyBinding::new("cmd-shift-a", NewAgent, None),
+        // cmd-shift-i sends the focused terminal's selection to the
+        // active agent's input buffer (no trailing newline, so the user
+        // reviews + hits Enter). cmd-shift-o sends the last completed
+        // command's output (bracketed by P8 shell-integration marks).
+        KeyBinding::new("cmd-shift-i", SendTerminalSelectionToAgent, None),
+        KeyBinding::new("cmd-shift-o", SendLastCommandOutputToAgent, None),
         // cmd-s saves the active editor buffer; no-op when no editor focused.
         KeyBinding::new("cmd-s", SaveFile, None),
         // Escape dismisses any open transient overlay (handled at WorkspaceRoot).

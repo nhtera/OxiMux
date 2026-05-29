@@ -203,6 +203,27 @@ impl ProjectPanes {
         self.groups.values().map(|g| g.read(cx).agent_count()).sum()
     }
 
+    /// Pick a target agent session for "send to active agent" actions.
+    /// Preference order: (1) the active group's active tab when it's an
+    /// agent (most-direct routing for the common "terminal + agent side
+    /// by side" layout); (2) any group's active tab that's an agent; (3)
+    /// any agent tab anywhere. Returns `None` when no agent is open.
+    pub fn target_agent_session(&self, cx: &App) -> Option<AgentSessionId> {
+        if let Some(active) = self.active_group()
+            && let Some(id) = active.read(cx).active_agent_session()
+        {
+            return Some(id);
+        }
+        for group in self.groups.values() {
+            if let Some(id) = group.read(cx).active_agent_session() {
+                return Some(id);
+            }
+        }
+        self.groups
+            .values()
+            .find_map(|g| g.read(cx).first_agent_session())
+    }
+
     pub fn tab_count(&self, cx: &App) -> usize {
         self.groups.values().map(|g| g.read(cx).tab_count()).sum()
     }

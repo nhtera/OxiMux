@@ -418,6 +418,28 @@ impl PaneGroup {
             .count()
     }
 
+    /// The active tab's agent session id, if the active tab is an agent.
+    /// Used by "send to active agent" actions to route directly to the
+    /// agent in the focused tab — the most common layout has terminal +
+    /// agent side by side, so the active tab IS the routing target.
+    pub fn active_agent_session(&self) -> Option<AgentSessionId> {
+        match &self.active_tab()?.kind {
+            PaneGroupTabKind::Agent { session_id, .. } => Some(*session_id),
+            _ => None,
+        }
+    }
+
+    /// First agent session id found anywhere in this group's tab list,
+    /// regardless of active state. Fallback target when no active agent
+    /// tab is available (e.g. terminal in active tab, agent in a
+    /// background tab of the same group).
+    pub fn first_agent_session(&self) -> Option<AgentSessionId> {
+        self.tabs.iter().find_map(|t| match &t.kind {
+            PaneGroupTabKind::Agent { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+    }
+
     /// Count of TTY-backed tabs (terminals + agents) in this group.
     /// Excludes editor tabs.
     pub fn tty_count(&self) -> usize {

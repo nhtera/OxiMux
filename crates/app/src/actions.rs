@@ -213,6 +213,18 @@ pub struct FileTreeDelete {
     pub path: String,
 }
 
+/// Payload action carrying text from the focused terminal up to the
+/// workspace so it can resolve "the active agent session" and stream
+/// the bytes through its CLI runtime. Bubbles from `TerminalView` up
+/// to `WorkspaceRoot`. The text is sent verbatim (no trailing newline)
+/// so the agent's input buffer holds it ready for the user to review
+/// and press Enter.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct SendTextToActiveAgent {
+    pub text: String,
+}
+
 actions!(
     oximux,
     [
@@ -347,5 +359,15 @@ actions!(
         /// from URL / Remote project). Browse is wired; the other two
         /// are disabled "Coming soon" stubs for v1.
         OpenAddProjectDialog,
+        /// Send the focused terminal's active selection to the active
+        /// agent session's input buffer. No-op when no selection or no
+        /// agent is open. Bound to Cmd+Shift+I ("Insert into agent").
+        SendTerminalSelectionToAgent,
+        /// Send the most-recent completed command's output (bracketed by
+        /// P8 OSC 133/633 marks) to the active agent's input buffer.
+        /// Requires shell-integration marks to be emitted; falls back
+        /// to a no-op if fewer than two prompt marks are present. Bound
+        /// to Cmd+Shift+O ("Output to agent").
+        SendLastCommandOutputToAgent,
     ]
 );
