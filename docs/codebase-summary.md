@@ -262,8 +262,8 @@ src/
 
 | File | Role |
 |---|---|
-| `backend.rs` | `TerminalBackend` trait: spawn/write/resize/snapshot/search_grid |
-| `portable_pty_backend.rs` | PTY via portable-pty; bounded sync_channel(256); watcher thread per session |
+| `backend.rs` | `TerminalBackend` trait: spawn/write/resize/snapshot/search_grid; dormant lifecycle (`spawn_dormant` / `promote_to_live` / `prefill_grid`); display-only `write_output(id, bytes)` streams external producer bytes into a dormant session's grid without a PTY child |
+| `portable_pty_backend.rs` | PTY via portable-pty; bounded sync_channel(256); watcher thread per session; `write_output` override accepts dormant sessions only (refuses live to avoid racing the watcher on the parser mutex) |
 | `state.rs` | `TerminalState`: alacritty_terminal + vte processor; user-tunable scrollback (default 5000) |
 | `snapshot.rs` | `TerminalSnapshot`: cells grid + cursor; grid-text extractors `rows_text` / `get_content` / `last_n_non_empty_lines`; `abs_line_to_screen_row` maps OSC 133/633 mark lines into the visible viewport |
 | `events.rs` | `TerminalEvent` enum: Output/Exit/Resize/TitleChange/Bell/CwdChanged/CommandMark/Progress/Clipboard/PtyReply |

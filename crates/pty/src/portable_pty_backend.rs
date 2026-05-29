@@ -426,6 +426,29 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(())
     }
 
+    fn write_output(&mut self, id: TerminalSessionId, bytes: &[u8]) -> Result<()> {
+        let session = self
+            .sessions
+            .get(&id)
+            .with_context(|| format!("unknown session {id:?}"))?;
+        // Display-only invariant: the producer of these bytes must be
+        // the sole writer to the grid. A live PTY session has a watcher
+        // thread feeding the same parser concurrently — accepting
+        // write_output there would race the watcher and scramble cells.
+        if !session.is_dormant() {
+            return Err(anyhow::anyhow!(
+                "session {id:?} has a live PTY child; use write() instead"
+            ));
+        }
+        if let Ok(mut state) = session.state.lock() {
+            // Unlike prefill_grid (which clears collected title/bell/color
+            // events as historical), write_output preserves them so the
+            // live renderer surfaces them like a normal session would.
+            state.advance(bytes);
+        }
+        Ok(())
+    }
+
     fn search_grid(&self, id: TerminalSessionId) -> Vec<Vec<Cell>> {
         let Some(session) = self.sessions.get(&id) else {
             return Vec::new();

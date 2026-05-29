@@ -121,9 +121,11 @@ Closes the emulator-quality gap with the three GPUI reference terminals (all sha
 | trm-P9 | Terminal settings surface (terminal.toml + live-reload watcher) | code complete |
 | trm-P10 | CJK wide-character layout (wide + wide_spacer + per-row force_width) | code complete |
 | trm-P11 | Box-drawing vector rendering (PathBuilder strokes, gap-free merges) | code complete |
-| trm-P12 | Inline agent terminal (extraction helpers + send-to-active-agent) | partial (slices 1+1.5; 2+3 deferred) |
+| trm-P12 | Inline agent terminal (extraction + send-to-agent + display-only backend) | partial (slices 1+1.5+2; slice 3 deferred) |
 
 **Keybinds added**: Cmd+Shift+I sends terminal selection to active agent's input buffer; Cmd+Shift+O sends last completed command's output (bracketed by P8 marks).
+
+**Display-only backend seam (slice 2)**: `TerminalBackend::write_output(id, bytes)` lets an external producer stream bytes into a `spawn_dormant` session's grid without a PTY child. Live sessions are rejected to avoid racing the watcher thread on the parser mutex. No app-layer consumer wired yet — slice 3 (`block_below_cursor`) is the natural next consumer.
 
 ---
 

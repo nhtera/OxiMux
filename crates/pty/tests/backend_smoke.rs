@@ -190,6 +190,64 @@ fn promote_to_live_rejects_already_live_session() {
     backend.close(id).expect("close");
 }
 
+/// Display-only seam: register a dormant session, stream bytes through
+/// `write_output`, and verify they land in the grid emulator visible
+/// via `snapshot`. The grid mirrors what an external producer (an
+/// agent CLI / replayer) wrote without going through a PTY child.
+#[test]
+fn write_output_on_dormant_session_lands_in_grid() {
+    const AGENT_MARKER: &str = "OXIMUX_AGENT_STREAM";
+    let mut backend = PortablePtyBackend::new();
+    let id = backend
+        .spawn_dormant(80, 24)
+        .expect("dormant session registers");
+
+    let chunk = format!("{AGENT_MARKER}\r\n");
+    backend
+        .write_output(id, chunk.as_bytes())
+        .expect("write_output on dormant session");
+
+    let snap = backend.snapshot(id).expect("snapshot dormant session");
+    let snapshot_text: String = snap
+        .cells
+        .iter()
+        .flat_map(|row| row.iter().map(|c| c.ch))
+        .collect();
+    assert!(
+        snapshot_text.contains(AGENT_MARKER),
+        "write_output bytes missing from dormant snapshot: {snapshot_text:?}"
+    );
+
+    backend.close(id).expect("close session");
+}
+
+/// Display-only invariant: `write_output` must refuse a session that
+/// has a live PTY child, otherwise the producer would race the watcher
+/// thread feeding the same parser concurrently and scramble cells.
+#[test]
+fn write_output_rejects_live_session() {
+    let mut backend = PortablePtyBackend::new();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        cwd: PathBuf::from("/"),
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+        scrollback: 5000,
+    };
+    let id = backend.spawn(cfg).expect("spawn live shell");
+    let err = backend
+        .write_output(id, b"agent bytes")
+        .expect_err("write_output on live session must error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("live PTY child") || msg.contains("write()"),
+        "expected live/PTY hint in error message; got: {msg}"
+    );
+    backend.close(id).expect("close session");
+}
+
 /// F4.7: spawn a shell that prints an OSC 7 file:// URI, drain output,
 /// and confirm `cwd_hint` returns the path the shell emitted. Catches
 /// regressions in:

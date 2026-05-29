@@ -225,6 +225,25 @@ pub trait TerminalBackend: Send + 'static {
         Ok(())
     }
 
+    /// Stream bytes produced by an external source (an agent CLI, a
+    /// replayer, a fixture) into a session's grid emulator without going
+    /// through a PTY child. Intended for "display-only" sessions
+    /// registered via `spawn_dormant` that are never promoted — the
+    /// caller acts as the byte producer and the renderer picks up the
+    /// new state via the next `snapshot`. Distinct from `prefill_grid`,
+    /// which is a one-shot capture-format restore that clears any
+    /// title/bell/color side-effect events as historical; `write_output`
+    /// preserves them so the live UI surfaces them normally.
+    ///
+    /// Default impl returns an error. Backends that support display-only
+    /// dormant sessions override; backends that don't (replay / fixture /
+    /// relay-bound) opt out by leaving the default.
+    fn write_output(&mut self, _id: TerminalSessionId, _bytes: &[u8]) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "this backend does not support write_output"
+        ))
+    }
+
     /// Drain accumulated events without blocking. Returns empty when idle.
     fn drain_events(&mut self) -> Vec<TerminalEvent>;
 

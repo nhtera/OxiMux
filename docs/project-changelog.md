@@ -4,10 +4,10 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-05-30 — Terminal emulator richness — Phases 1–12
+### 2026-05-30 — Terminal emulator richness — Phases 1–12 (slice 2 added)
 
-**Status**: code complete; 1161 workspace tests pass; clippy `-D warnings` clean  
-**Commits**: `3b08487` (P1–P3), `b4e084f` (P4–P6), `c58fca6` (P7), `e7f316f` (P8), `2b11d2f` (P9), `1f6ef9f` (P10), `86acc23` (P11), `8b5ddc7` (P12 slices 1+1.5)  
+**Status**: code complete; 1163 workspace tests pass; clippy `-D warnings` clean  
+**Commits**: `3b08487` (P1–P3), `b4e084f` (P4–P6), `c58fca6` (P7), `e7f316f` (P8), `2b11d2f` (P9), `1f6ef9f` (P10), `86acc23` (P11), `8b5ddc7` (P12 slices 1+1.5), pending (P12 slice 2)  
 **Plan**: `plans/260529-2042-terminal-emulator-richness/`
 
 Closes the emulator-quality gap with the three reference GPUI terminals
@@ -32,7 +32,10 @@ Closes the emulator-quality gap with the three reference GPUI terminals
 #### Tier-3 — depth + north-star
 - **P10 CJK wide-character layout** — `Cell.wide` / `wide_spacer` flags; canvas advances columns by 2 for wide cells; per-row `force_width` hedge keeps mono crispness on rows with no wide chars.
 - **P11 box-drawing vector rendering** — U+2500–U+257F stroked via PathBuilder; horizontal merge collapses same-color same-weight runs into one continuous stroke (no inter-cell seams); diagonals U+2571–U+2573 fall through to the font face.
-- **P12 inline agent** — slices 1+1.5 shipped: grid-text extractors on `TerminalSnapshot` + Cmd+Shift+I / Cmd+Shift+O actions to send selection / last completed command output to the active agent's input buffer. Slices 2 (display-only backend) and 3 (block_below_cursor) deferred pending dogfood signal.
+- **P12 inline agent** — slices 1+1.5+2 shipped:
+  - 1 + 1.5: grid-text extractors on `TerminalSnapshot` + Cmd+Shift+I / Cmd+Shift+O actions to send selection / last completed command output to the active agent's input buffer.
+  - 2: `TerminalBackend::write_output(id, bytes)` seam so an external producer (an agent CLI, a replayer) can stream bytes into a `spawn_dormant` session's grid emulator without a PTY child. Portable backend override refuses live sessions (concurrency safety against the watcher thread). Same `state.advance` path the live PTY uses, so the rendered result is byte-for-byte identical.
+  - Slice 3 (`block_below_cursor` element + scroll-math accounting) deferred pending dogfood signal.
 
 ---
 
