@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -185,22 +185,53 @@ impl TerminalState {
         out
     }
 
-    /// Populate `snap` with the current visible grid + cursor.
-    /// Allocates one `Vec<Cell>` per row; cheap at 24-200 rows.
+    /// Scroll the displayed viewport by `delta` lines (positive = back into
+    /// history, negative = toward the live tail). Render-side only: the grid
+    /// and PTY are untouched, so this never resizes or writes to the child.
+    /// alacritty clamps the offset to the available history, so an
+    /// over-scroll past the top/bottom is a no-op.
+    pub fn scroll_lines(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    /// Jump the viewport back to the live tail (display offset 0). Called on
+    /// keyboard input so typing always snaps to the prompt.
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Populate `snap` with the currently *displayed* grid + cursor, honoring
+    /// the scrollback offset. Allocates one `Vec<Cell>` per row; cheap at
+    /// 24-200 rows.
+    ///
+    /// When the user has scrolled up (`display_offset > 0`), screen row `r`
+    /// shows grid line `r - offset` — negative lines index into history, the
+    /// same range `fill_search_grid` walks. With `offset == 0` this is byte-
+    /// identical to the pre-scroll behavior (every screen row maps to its own
+    /// active-area line), so existing snapshot expectations are preserved.
     pub fn fill_snapshot(&self, snap: &mut TerminalSnapshot) {
         snap.cols = self.size.cols as u16;
         snap.rows = self.size.rows as u16;
 
+        let offset = self.term.grid().display_offset() as i32;
+        snap.display_offset = offset as usize;
+
+        // The cursor lives in active-area coords (line ≥ 0); in the displayed
+        // viewport it shifts DOWN by the scroll offset. When it falls outside
+        // the visible rows (scrolled into history), emit the off-grid sentinel
+        // so the renderer suppresses it instead of clamping it to an edge.
         let cursor_point = self.term.grid().cursor.point;
-        snap.cursor = (
-            cursor_point.line.0.max(0) as u16,
-            cursor_point.column.0 as u16,
-        );
+        let cursor_row = cursor_point.line.0 + offset;
+        snap.cursor = if cursor_row >= 0 && (cursor_row as usize) < self.size.rows {
+            (cursor_row as u16, cursor_point.column.0 as u16)
+        } else {
+            (u16::MAX, u16::MAX)
+        };
 
         snap.cells.clear();
         snap.cells.reserve(self.size.rows);
-        for line_idx in 0..self.size.rows as i32 {
-            let row = &self.term.grid()[Line(line_idx)];
+        for screen_row in 0..self.size.rows as i32 {
+            let row = &self.term.grid()[Line(screen_row - offset)];
             let mut row_cells = Vec::with_capacity(self.size.cols);
             for col_idx in 0..self.size.cols {
                 let cell = &row[Column(col_idx)];
@@ -218,6 +249,13 @@ fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
         bg: map_color(cell.bg),
         inverse: cell.flags.contains(Flags::INVERSE),
         dim: cell.flags.contains(Flags::DIM),
+        bold: cell.flags.contains(Flags::BOLD),
+        italic: cell.flags.contains(Flags::ITALIC),
+        // `ALL_UNDERLINES` covers single/double/curly/dotted/dashed — the
+        // renderer collapses them to one underline style.
+        underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+        strikethrough: cell.flags.contains(Flags::STRIKEOUT),
+        hidden: cell.flags.contains(Flags::HIDDEN),
     }
 }
 
@@ -427,6 +465,30 @@ mod tests {
     }
 
     #[test]
+    fn scroll_back_reports_offset_and_shifts_view() {
+        // 3 visible rows; print 6 lines so several scroll into history.
+        let mut state = TerminalState::new(20, 3, 100);
+        state.advance(b"L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6");
+        let bottom = fresh_snapshot(&state);
+        assert_eq!(bottom.display_offset, 0, "fresh view is pinned to the tail");
+        let bottom_top = row_text(&bottom, 0);
+
+        // Scroll up two lines into history.
+        state.scroll_lines(2);
+        let scrolled = fresh_snapshot(&state);
+        assert_eq!(scrolled.display_offset, 2);
+        assert_ne!(
+            row_text(&scrolled, 0),
+            bottom_top,
+            "scrolling up should reveal an earlier line at the top"
+        );
+
+        // Snapping to bottom resumes the live tail.
+        state.scroll_to_bottom();
+        assert_eq!(fresh_snapshot(&state).display_offset, 0);
+    }
+
+    #[test]
     fn fill_search_grid_covers_at_least_visible_rows() {
         // On a fresh state alacritty currently reports `history_size() == 0`,
         // so the grid is exactly `rows`. Asserting `>=` keeps the test robust
@@ -469,6 +531,27 @@ mod tests {
             first_non_default_fg(&snap),
             Some(CellColor::Named(NamedColor16::Red))
         );
+    }
+
+    #[test]
+    fn sgr_attributes_flow_through_snapshot() {
+        // 1=bold 3=italic 4=underline 9=strikethrough 8=hidden. SGR sequences
+        // don't advance the cursor, so each glyph lands on the next column:
+        // col0=B col1=I col2=U col3=S col4=H. SGR 0 between resets so a flag
+        // never bleeds into the following cell.
+        let mut state = TerminalState::new(80, 24, 100);
+        state.advance(b"\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[4mU\x1b[0m\x1b[9mS\x1b[0m\x1b[8mH");
+        let snap = fresh_snapshot(&state);
+        assert!(snap.cells[0][0].bold, "B (SGR 1) should be bold");
+        assert!(snap.cells[0][1].italic, "I (SGR 3) should be italic");
+        assert!(snap.cells[0][2].underline, "U (SGR 4) should be underline");
+        assert!(
+            snap.cells[0][3].strikethrough,
+            "S (SGR 9) should be strikethrough"
+        );
+        assert!(snap.cells[0][4].hidden, "H (SGR 8) should be hidden");
+        // Resets actually cleared: the bold 'B' cell carries no other attr.
+        assert!(!snap.cells[0][0].italic && !snap.cells[0][0].underline);
     }
 
     #[test]

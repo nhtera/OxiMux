@@ -117,6 +117,21 @@ pub trait TerminalBackend: Send + 'static {
     /// Resize the PTY when the rendering area changes.
     fn resize(&mut self, id: TerminalSessionId, cols: u16, rows: u16) -> Result<()>;
 
+    /// Scroll the displayed viewport by `delta` lines (positive = back into
+    /// scrollback, negative = toward the live tail). Render-side only — the
+    /// grid and PTY are untouched, so each attached client scrolls
+    /// independently. Default impl is a no-op for backends without a local
+    /// grid (fixture / replay).
+    fn scroll(&mut self, _id: TerminalSessionId, _delta: i32) -> Result<()> {
+        Ok(())
+    }
+
+    /// Snap the displayed viewport back to the live tail (offset 0). Default
+    /// impl is a no-op for grid-less backends.
+    fn scroll_to_bottom(&mut self, _id: TerminalSessionId) -> Result<()> {
+        Ok(())
+    }
+
     /// A renderable snapshot of the session's current state. Step 1-2 ships
     /// an empty snapshot — step 3 wires `alacritty_terminal` to produce
     /// real rows and a cursor position.

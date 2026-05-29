@@ -217,8 +217,7 @@ mod tests {
                 ch,
                 fg: CellColor::Default,
                 bg: CellColor::Default,
-                inverse: false,
-                dim: false,
+                ..Cell::default()
             })
             .collect()
     }

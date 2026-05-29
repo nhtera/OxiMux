@@ -313,6 +313,28 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(())
     }
 
+    fn scroll(&mut self, id: TerminalSessionId, delta: i32) -> Result<()> {
+        let session = self
+            .sessions
+            .get(&id)
+            .with_context(|| format!("unknown session {id:?}"))?;
+        if let Ok(mut state) = session.state.lock() {
+            state.scroll_lines(delta);
+        }
+        Ok(())
+    }
+
+    fn scroll_to_bottom(&mut self, id: TerminalSessionId) -> Result<()> {
+        let session = self
+            .sessions
+            .get(&id)
+            .with_context(|| format!("unknown session {id:?}"))?;
+        if let Ok(mut state) = session.state.lock() {
+            state.scroll_to_bottom();
+        }
+        Ok(())
+    }
+
     fn snapshot(&self, id: TerminalSessionId) -> Result<TerminalSnapshot> {
         let session = self
             .sessions

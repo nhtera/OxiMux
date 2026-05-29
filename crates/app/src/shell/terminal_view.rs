@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Render, Styled, Task, Window, canvas, div, px,
+    App, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollWheelEvent, Styled, Task, Window, canvas, div, px,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -37,7 +38,7 @@ use crate::actions::Search;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::key_input::keystroke_to_bytes;
-use crate::shell::terminal_canvas::{PaintParams, grid_dims_for, paint_grid};
+use crate::shell::terminal_canvas::{PaintParams, grid_dims_for, paint_grid, point_to_cell};
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 
@@ -218,6 +219,24 @@ pub fn spawn_local_pty_dormant(cols: u16, rows: u16) -> Option<(SharedBackend, T
     Some((Arc::new(Mutex::new(boxed)), session_id))
 }
 
+/// Mouse-selection granularity, chosen from the mouse-down click count.
+/// `Char` = free cell drag, `Word` = double-click (whitespace/word-char
+/// bounds), `Line` = triple-click (full visual row).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectKind {
+    Char,
+    Word,
+    Line,
+}
+
+/// In-flight drag: the cell where the press began plus its granularity.
+/// `selection` (the painted rect) is recomputed from `anchor` → current
+/// cell on every move. Cleared on mouse-up.
+struct SelectDrag {
+    anchor: (usize, usize),
+    kind: SelectKind,
+}
+
 pub struct TerminalView {
     /// `Arc<Mutex<Box<dyn TerminalBackend>>>` — shared with whoever spawned
     /// the session. For local terminals the renderer is the only holder;
@@ -282,6 +301,15 @@ pub struct TerminalView {
     /// drag-select; that ships in a follow-up slice. Cmd+C copies the
     /// extracted text when set, then clears it.
     selection: Option<(usize, usize, usize, usize)>,
+    /// Canvas bounds (window coords) captured by the paint closure each
+    /// frame. Read by the mouse handlers to map a pixel position back to a
+    /// cell via `point_to_cell`. Shared via `Rc<Cell<_>>` for the same
+    /// reason as `canvas_grid`: the paint closure must not re-borrow the
+    /// entity mid-paint.
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// In-flight mouse drag-select, `None` when no button is held. See
+    /// [`SelectDrag`].
+    selecting: Option<SelectDrag>,
     /// Stable identity triple (workspace / surface / tab). Injected into
     /// the spawn env as `OXIMUX_*`, persisted alongside the pane layout,
     /// and re-injected verbatim when a dormant pane respawns its shell so
@@ -377,7 +405,9 @@ impl TerminalView {
             _poll_task: Some(poll_task),
             _blink_task: blink_task,
             canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
+            canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
+            selecting: None,
         }
     }
 
@@ -463,7 +493,9 @@ impl TerminalView {
             _poll_task: None,
             _blink_task: blink_task,
             canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
+            canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
+            selecting: None,
         }
     }
 
@@ -656,6 +688,105 @@ impl TerminalView {
         self.search.rerun(&grid, visible);
     }
 
+    /// Map a window-space pointer position to a `(row, col)` cell, clamped to
+    /// the live grid, using the bounds captured by the last paint.
+    fn cell_at(&self, pos: Point<Pixels>, window: &Window) -> (usize, usize) {
+        let metrics = CellMetrics::measure(&self.typography, window);
+        let bounds = self.canvas_bounds.get();
+        let (row, col) = point_to_cell(pos, bounds, &metrics, self.density.pad_panel);
+        let rows = self.snapshot.cells.len();
+        if rows == 0 {
+            return (0, 0);
+        }
+        let row = row.min(rows - 1);
+        let cols = self.snapshot.cells[row].len();
+        (row, col.min(cols.saturating_sub(1)))
+    }
+
+    /// Begin (or shift-extend) a mouse selection. Click count picks the
+    /// granularity: 1 = char (free drag), 2 = word, 3+ = line.
+    fn on_select_down(&mut self, ev: &MouseDownEvent, window: &mut Window) {
+        let cell = self.cell_at(ev.position, window);
+        let kind = match ev.click_count {
+            2 => SelectKind::Word,
+            n if n >= 3 => SelectKind::Line,
+            _ => SelectKind::Char,
+        };
+        if ev.modifiers.shift && let Some((sr, sc, _, _)) = self.selection {
+            // Extend from the existing selection's start.
+            self.selecting = Some(SelectDrag {
+                anchor: (sr, sc),
+                kind,
+            });
+        } else {
+            // Fresh selection. A plain char-click clears any prior highlight
+            // and waits for a drag before painting one (matches Terminal.app:
+            // a bare click positions focus, it does not select).
+            self.selection = None;
+            self.selecting = Some(SelectDrag { anchor: cell, kind });
+        }
+        // Word/line highlight immediately; a shift-extend updates now too.
+        // A plain char-click waits for the first drag move.
+        if kind != SelectKind::Char || ev.modifiers.shift {
+            self.apply_drag(cell);
+        }
+    }
+
+    /// Recompute `self.selection` from the active drag anchor to `current`.
+    fn apply_drag(&mut self, current: (usize, usize)) {
+        let Some(drag) = self.selecting.as_ref() else {
+            return;
+        };
+        let anchor = drag.anchor;
+        let kind = drag.kind;
+        let sel = match kind {
+            SelectKind::Char => order_points(anchor, current),
+            SelectKind::Word => {
+                // Union: earliest word-start → latest word-end in reading order.
+                let a = self.word_span(anchor);
+                let c = self.word_span(current);
+                let start = a.0.min(c.0);
+                let end = a.1.max(c.1);
+                (start.0, start.1, end.0, end.1)
+            }
+            SelectKind::Line => {
+                let r0 = anchor.0.min(current.0);
+                let r1 = anchor.0.max(current.0);
+                let last_col = (self.snapshot.cols as usize).saturating_sub(1);
+                (r0, 0, r1, last_col)
+            }
+        };
+        self.selection = Some(sel);
+    }
+
+    /// Inclusive (start, end) cell points of the word at `(row, col)`.
+    fn word_span(&self, (row, col): (usize, usize)) -> ((usize, usize), (usize, usize)) {
+        match self.snapshot.cells.get(row) {
+            Some(cells) => {
+                let (s, e) = word_range_at(cells, col);
+                ((row, s), (row, e))
+            }
+            None => ((row, col), (row, col)),
+        }
+    }
+
+    /// End an in-flight selection. Returns whether a repaint is needed. A
+    /// char drag that never left its origin cell leaves no highlight (so a
+    /// plain click does not paint a one-cell selection).
+    fn finish_select(&mut self) -> bool {
+        let Some(drag) = self.selecting.take() else {
+            return false;
+        };
+        if drag.kind == SelectKind::Char
+            && let Some((r0, c0, r1, c1)) = self.selection
+            && r0 == r1
+            && c0 == c1
+        {
+            self.selection = None;
+        }
+        true
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         match self.search.handle_key(event) {
             SearchKeyOutcome::Pass => {}
@@ -770,6 +901,10 @@ impl TerminalView {
             self.wake_dormant_inline(cx);
         }
         let session_id = self.session_id;
+        // Typing snaps the viewport back to the live tail so the user sees
+        // their input even if they had scrolled up into history. No-op when
+        // already at the bottom.
+        let _ = self.with_backend(|be| be.scroll_to_bottom(session_id));
         if let Err(err) = self.with_backend(|be| be.write(session_id, bytes)) {
             tracing::warn!(?err, "pty write failed");
             return;
@@ -1056,9 +1191,13 @@ impl Render for TerminalView {
         // Match buckets per visible row. History_len was captured at scan
         // time in `SearchState::rerun` — if PTY output has scrolled history
         // since the scan, highlights may drift one paint but self-correct
-        // on the next keystroke.
+        // on the next keystroke. `display_offset` shifts the visible window
+        // up into history while scrolled, so highlights track the rows the
+        // user is actually looking at rather than the live tail.
         let visible_rows = self.snapshot.cells.len();
-        let buckets = self.search.render_buckets(visible_rows);
+        let buckets = self
+            .search
+            .render_buckets(visible_rows, self.snapshot.display_offset);
 
         // Build owned paint params (`FnOnce + 'static` requires no
         // borrows). Clone is cheap: snapshot is a Vec<Vec<Cell>> already
@@ -1161,10 +1300,14 @@ impl Render for TerminalView {
         // marks the window dirty for the next frame).
         let dims_typography = self.typography.clone();
         let canvas_grid = Rc::clone(&self.canvas_grid);
+        let canvas_bounds = Rc::clone(&self.canvas_bounds);
         let grid_canvas = canvas(
             // Prepaint: no per-paint state to capture; return unit.
             |_bounds, _window, _cx| (),
             move |bounds, _: (), window, cx| {
+                // Record the painted bounds so mouse handlers can map a
+                // pixel position back to a cell on the next event.
+                canvas_bounds.set(bounds);
                 let metrics = CellMetrics::measure(&dims_typography, window);
                 let dims = grid_dims_for(bounds, &metrics, paint_params.pad);
                 if canvas_grid.get() != dims {
@@ -1204,8 +1347,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::on_search))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
+                    this.on_select_down(ev, window);
                     // Notify so `MainPane`'s observer can re-sync the focused
                     // PaneId and repaint the active-pane ring on the next
                     // frame. Without this, click-to-focus is invisible until
@@ -1213,6 +1357,38 @@ impl Render for TerminalView {
                     cx.notify();
                 }),
             )
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
+                if this.selecting.is_some() && ev.pressed_button == Some(MouseButton::Left) {
+                    let cell = this.cell_at(ev.position, window);
+                    this.apply_drag(cell);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, _window, cx| {
+                    if this.finish_select() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
+                // Normalize trackpad (pixel) and wheel (line) deltas to lines.
+                // alacritty `Scroll::Delta(+n)` scrolls UP into history, which
+                // matches a positive wheel-up delta. New PTY output while
+                // scrolled up keeps the offset (alacritty grows history under
+                // us) — we only snap back to the tail on key input.
+                let metrics = CellMetrics::measure(&this.typography, window);
+                let dy = f32::from(ev.delta.pixel_delta(px(metrics.line_height)).y);
+                let lines = (dy / metrics.line_height).round() as i32;
+                if lines != 0 {
+                    let id = this.session_id;
+                    if let Err(err) = this.with_backend(|be| be.scroll(id, lines)) {
+                        tracing::warn!(?err, "pty scroll failed");
+                    }
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
             }))
@@ -1222,6 +1398,12 @@ impl Render for TerminalView {
         }
         if let Some(badge) = dormant_badge {
             root = root.child(badge);
+        }
+        // Scrolled-up indicator: a faint chip while the viewport is off the
+        // live tail, so the user knows new output is landing below the fold
+        // and that any keystroke will snap back down.
+        if self.snapshot.display_offset > 0 {
+            root = root.child(build_scroll_indicator(&theme, self.snapshot.display_offset));
         }
         // Attention ring: a blue inset stroke when an unfocused pane has
         // signalled (terminal BEL today; agent-waiting / `oximux notify`
@@ -1239,6 +1421,43 @@ impl Render for TerminalView {
         }
         root
     }
+}
+
+/// Order two cell points into a normalized `(start_row, start_col, end_row,
+/// end_col)` rectangle in reading order. `extract_selection_text` and the
+/// canvas overlay both expect start ≤ end, so the drag handler normalizes
+/// here regardless of drag direction.
+fn order_points(a: (usize, usize), b: (usize, usize)) -> (usize, usize, usize, usize) {
+    if a <= b {
+        (a.0, a.1, b.0, b.1)
+    } else {
+        (b.0, b.1, a.0, a.1)
+    }
+}
+
+/// Inclusive column span of the word at `col`. A word is a run of
+/// alphanumeric or `_` cells; any other glyph (whitespace, punctuation,
+/// `\0` blanks) yields a single-cell span.
+fn word_range_at(row: &[oximux_pty::Cell], col: usize) -> (usize, usize) {
+    if col >= row.len() {
+        return (col, col);
+    }
+    let is_word = |i: usize| {
+        let ch = row[i].ch;
+        ch.is_alphanumeric() || ch == '_'
+    };
+    if !is_word(col) {
+        return (col, col);
+    }
+    let mut start = col;
+    while start > 0 && is_word(start - 1) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < row.len() && is_word(end + 1) {
+        end += 1;
+    }
+    (start, end)
 }
 
 /// Extract the text covered by a cell-coordinate selection from the
@@ -1319,6 +1538,26 @@ fn build_dormant_badge(theme: &Theme) -> gpui::Div {
         .child("↻ restored — click to wake")
 }
 
+/// Faint top-right chip shown while the viewport is scrolled up off the live
+/// tail (`display_offset > 0`). Informational only — any keystroke snaps the
+/// view back to the bottom (`send_bytes` → `scroll_to_bottom`).
+fn build_scroll_indicator(theme: &Theme, offset: usize) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(6.0))
+        .right(px(10.0))
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded(px(4.0))
+        .bg(theme.bg_overlay)
+        .text_color(theme.fg_muted)
+        .text_size(px(11.0))
+        .border_1()
+        .border_color(theme.border_inactive)
+        // `↑` = U+2191 Upwards Arrow.
+        .child(format!("↑ {offset} lines"))
+}
+
 #[cfg(test)]
 mod selection_tests {
     use super::*;
@@ -1329,8 +1568,7 @@ mod selection_tests {
             ch,
             fg: CellColor::Default,
             bg: CellColor::Default,
-            inverse: false,
-            dim: false,
+            ..Cell::default()
         }
     }
 
@@ -1346,7 +1584,29 @@ mod selection_tests {
             rows: rows_n,
             cursor: (0, 0),
             cells,
+            display_offset: 0,
         }
+    }
+
+    #[test]
+    fn word_range_selects_alphanumeric_run() {
+        let s = snap(&["foo bar_baz!"]);
+        let row = &s.cells[0];
+        // "foo" = cols 0..=2.
+        assert_eq!(word_range_at(row, 1), (0, 2));
+        // space at col 3 → single cell.
+        assert_eq!(word_range_at(row, 3), (3, 3));
+        // "bar_baz" = cols 4..=10 (underscore is a word char).
+        assert_eq!(word_range_at(row, 5), (4, 10));
+        // '!' at col 11 → single cell.
+        assert_eq!(word_range_at(row, 11), (11, 11));
+    }
+
+    #[test]
+    fn order_points_normalizes_reading_order() {
+        assert_eq!(order_points((1, 2), (3, 4)), (1, 2, 3, 4));
+        assert_eq!(order_points((3, 4), (1, 2)), (1, 2, 3, 4));
+        assert_eq!(order_points((0, 5), (0, 1)), (0, 1, 0, 5));
     }
 
     #[test]

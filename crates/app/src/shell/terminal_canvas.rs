@@ -31,7 +31,8 @@
 //! cells render with visible hairline seams on HiDPI displays.
 
 use gpui::{
-    App, Bounds, Hsla, Pixels, SharedString, Size, TextAlign, TextRun, Window, fill, point, px,
+    App, Bounds, FontStyle, FontWeight, Hsla, Pixels, Point, SharedString, Size, StrikethroughStyle,
+    TextAlign, TextRun, UnderlineStyle, Window, fill, point, px,
 };
 use oximux_pty::{Cell, CellColor, TerminalSnapshot};
 use oximux_settings::{Theme, Typography};
@@ -93,6 +94,26 @@ pub fn grid_dims_for(bounds: Bounds<Pixels>, metrics: &CellMetrics, pad: f32) ->
         metrics.cols_in(inner_w).max(1),
         metrics.rows_in(inner_h).max(1),
     )
+}
+
+/// Inverse of `paint_grid`'s origin math: map a window-space pixel `pos` to
+/// the `(row, col)` cell it falls in. `bounds` is the canvas's painted
+/// bounds (window coords), `pad` the same inset used at paint time. Clamps
+/// negative offsets to 0; callers clamp the high end against the live grid
+/// since this function has no knowledge of the snapshot's dimensions.
+pub fn point_to_cell(
+    pos: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    metrics: &CellMetrics,
+    pad: f32,
+) -> (usize, usize) {
+    let origin_x = f32::from(bounds.origin.x) + pad;
+    let origin_y = f32::from(bounds.origin.y) + pad;
+    let rel_x = (f32::from(pos.x) - origin_x).max(0.0);
+    let rel_y = (f32::from(pos.y) - origin_y).max(0.0);
+    let col = (rel_x / metrics.cell_width).floor() as usize;
+    let row = (rel_y / metrics.line_height).floor() as usize;
+    (row, col)
 }
 
 /// Paint the grid into `bounds`. Designed to be called from the paint
@@ -244,7 +265,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         let mut text = String::with_capacity(row.len());
         let mut text_runs: Vec<TextRun> = Vec::with_capacity(runs.len());
         for run in &runs {
-            let (fg, _bg) = effective_colors(run, p.pane_focused, &p.theme);
+            let (fg, bg) = effective_colors(run, p.pane_focused, &p.theme);
             // Current-match fg uses theme.match_fg for legibility against
             // the bright amber match_bg_current. Inverse cells (incl. the
             // cursor) already have the inverted color from effective_colors;
@@ -254,15 +275,39 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             } else {
                 fg
             };
+            // SGR 8 (hidden): paint the glyph in its own background so the
+            // text is invisible on screen but still extracted by selection.
+            let fg = if run.hidden { bg } else { fg };
+            // Per-run font: SGR 1 (bold) → heavier weight, SGR 3 (italic) →
+            // slanted. GPUI synthesizes a faux cut when the face lacks a real
+            // bold/oblique. force_width still clamps advance, so no drift.
+            let mut run_font = font.clone();
+            run_font.weight = if run.bold {
+                FontWeight::BOLD
+            } else {
+                FontWeight::NORMAL
+            };
+            run_font.style = if run.italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            };
             let byte_len = run.text.len();
             text.push_str(&run.text);
             text_runs.push(TextRun {
                 len: byte_len,
-                font: font.clone(),
+                font: run_font,
                 color: fg,
                 background_color: None,
-                underline: None,
-                strikethrough: None,
+                underline: run.underline.then_some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(fg),
+                    wavy: false,
+                }),
+                strikethrough: run.strikethrough.then_some(StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: Some(fg),
+                }),
             });
         }
         if text.is_empty() {
@@ -293,13 +338,18 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
 /// cursor-state, and match-state. Run boundary keys mirror the old
 /// flex-paint grouping in `terminal_row::group_runs` (deleted along
 /// with the row builder).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Run {
     text: String,
     fg: CellColor,
     bg: CellColor,
     inverse: bool,
     dim: bool,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    hidden: bool,
     /// True only when this run is exactly the cell under the cursor (not
     /// for SGR 7 inverse). Distinguishes the cursor's inverse from
     /// regular inverse so the unfocused-pane ghost cursor can dim ONLY
@@ -330,6 +380,11 @@ fn group_runs(
                     && last.bg == cell.bg
                     && last.inverse == inverse
                     && last.dim == cell.dim
+                    && last.bold == cell.bold
+                    && last.italic == cell.italic
+                    && last.underline == cell.underline
+                    && last.strikethrough == cell.strikethrough
+                    && last.hidden == cell.hidden
                     && last.is_cursor == is_cursor
                     && last.match_kind == match_kind =>
             {
@@ -341,6 +396,11 @@ fn group_runs(
                 bg: cell.bg,
                 inverse,
                 dim: cell.dim,
+                bold: cell.bold,
+                italic: cell.italic,
+                underline: cell.underline,
+                strikethrough: cell.strikethrough,
+                hidden: cell.hidden,
                 is_cursor,
                 match_kind,
             }),
@@ -387,8 +447,7 @@ mod tests {
             ch,
             fg,
             bg,
-            inverse: false,
-            dim: false,
+            ..Cell::default()
         }
     }
 
@@ -403,6 +462,47 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "hi");
         assert_eq!(runs[1].text, "!");
+    }
+
+    #[test]
+    fn point_to_cell_maps_pixels_to_grid() {
+        let metrics = CellMetrics {
+            cell_width: 8.0,
+            line_height: 16.0,
+        };
+        let bounds = Bounds {
+            origin: point(px(10.0), px(20.0)),
+            size: Size {
+                width: px(800.0),
+                height: px(600.0),
+            },
+        };
+        let pad = 4.0;
+        // Grid origin = (14, 24). A point 3 cells right + 2 rows down, mid-cell.
+        let pos = point(px(14.0 + 8.0 * 3.0 + 2.0), px(24.0 + 16.0 * 2.0 + 1.0));
+        assert_eq!(point_to_cell(pos, bounds, &metrics, pad), (2, 3));
+        // Anything left/above the grid origin clamps to (0, 0).
+        assert_eq!(
+            point_to_cell(point(px(0.0), px(0.0)), bounds, &metrics, pad),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn group_runs_splits_on_sgr_attribute_boundary() {
+        // Same colors, but the middle cell is bold → it must start its own run
+        // so the renderer can switch font weight at the boundary.
+        let mut bold_cell = cell('b', CellColor::Default, CellColor::Default);
+        bold_cell.bold = true;
+        let row = vec![
+            cell('a', CellColor::Default, CellColor::Default),
+            bold_cell,
+            cell('c', CellColor::Default, CellColor::Default),
+        ];
+        let runs = group_runs(&row, None, None);
+        assert_eq!(runs.len(), 3, "a bold cell between plain cells splits runs");
+        assert!(runs[1].bold);
+        assert_eq!(runs[1].text, "b");
     }
 
     #[test]
@@ -436,6 +536,7 @@ mod tests {
             dim: false,
             is_cursor: false,
             match_kind: None,
+            ..Run::default()
         };
         let (fg_focused, _) = effective_colors(&run, true, &theme);
         let (fg_unfocused, _) = effective_colors(&run, false, &theme);
@@ -453,6 +554,7 @@ mod tests {
             dim: false,
             is_cursor: true,
             match_kind: None,
+            ..Run::default()
         };
         let (fg, bg) = effective_colors(&run, true, &theme);
         // After swap, fg becomes the canvas bg and bg becomes the text fg.

@@ -262,16 +262,24 @@ impl SearchState {
     /// Returns an empty Vec when inactive or no matches — callers can pass
     /// the result to `build_row` per-row without an extra `if active`
     /// branch.
-    pub fn render_buckets(&self, visible_rows: usize) -> Vec<Vec<MatchHit>> {
+    pub fn render_buckets(
+        &self,
+        visible_rows: usize,
+        display_offset: usize,
+    ) -> Vec<Vec<MatchHit>> {
         if !self.active || self.matches.is_empty() {
             return Vec::new();
         }
+        // Top of the visible window in search-grid coordinates. At the live
+        // tail (`display_offset == 0`) this is `history_len`; scrolling up by
+        // N moves the window up N rows into history.
+        let window_top = self.history_len.saturating_sub(display_offset);
         let mut buckets: Vec<Vec<MatchHit>> = vec![Vec::new(); visible_rows];
         for (idx, m) in self.matches.iter().enumerate() {
-            if m.row < self.history_len {
+            if m.row < window_top {
                 continue;
             }
-            let visible_idx = m.row - self.history_len;
+            let visible_idx = m.row - window_top;
             if visible_idx >= visible_rows {
                 continue;
             }
@@ -287,5 +295,44 @@ impl SearchState {
             });
         }
         buckets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(row: usize) -> MatchRange {
+        MatchRange {
+            row,
+            col_start: 0,
+            col_end: 1,
+        }
+    }
+
+    #[test]
+    fn render_buckets_shifts_with_display_offset() {
+        // 10 history rows above a 5-row viewport. Match at search-grid row 12
+        // is on the live tail; row 8 is up in history.
+        let mut s = SearchState::new();
+        s.active = true;
+        s.history_len = 10;
+        s.current_index = Some(0);
+        s.matches = vec![hit(12), hit(8)];
+
+        // At the tail (offset 0): row 12 → visible row 2; the history match is
+        // above the window and dropped.
+        let tail = s.render_buckets(5, 0);
+        assert!(!tail[2].is_empty(), "tail match lands on visible row 2");
+        assert!(tail[0].is_empty() && tail[4].is_empty());
+
+        // Scrolled up 4 lines: window top = 6, so the history match at row 8
+        // becomes visible row 2, and the former tail match (row 12) scrolls
+        // off the bottom and is dropped.
+        let scrolled = s.render_buckets(5, 4);
+        assert!(
+            !scrolled[2].is_empty(),
+            "history match is visible at row 2 once scrolled up"
+        );
     }
 }

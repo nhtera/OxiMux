@@ -366,6 +366,28 @@ impl TerminalBackend for RelayBackend {
         Ok(snap)
     }
 
+    fn scroll(&mut self, id: TerminalSessionId, delta: i32) -> Result<()> {
+        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
+        if let Ok(mut state) = session.state.lock() {
+            state.scroll_lines(delta);
+        }
+        Ok(())
+    }
+
+    fn scroll_to_bottom(&mut self, id: TerminalSessionId) -> Result<()> {
+        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
+        if let Ok(mut state) = session.state.lock() {
+            state.scroll_to_bottom();
+        }
+        Ok(())
+    }
+
     fn bracketed_paste(&self, id: TerminalSessionId) -> Result<bool> {
         let sessions = self.sessions.lock().expect("sessions poisoned");
         let session = sessions

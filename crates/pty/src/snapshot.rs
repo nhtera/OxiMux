@@ -43,11 +43,12 @@ pub enum CellColor {
     Rgb(u8, u8, u8),
 }
 
-/// One visible cell. `inverse` mirrors the SGR 7 / DECSCNM bit — render swaps
-/// fg/bg when true. `dim` mirrors SGR 2 — render multiplies fg alpha by ~0.7
-/// (the middle of the ~0.66–0.75 faint-text range common across terminals). Other
-/// SGR attributes (bold/italic/underline) live on `Cell` only when the
-/// renderer needs them; right now we only carry the bits the renderer uses.
+/// One visible cell. SGR attributes the renderer acts on:
+/// `inverse` (SGR 7 / DECSCNM — render swaps fg/bg), `dim` (SGR 2 — fg alpha
+/// ×~0.7), `bold` (SGR 1 — heavier font weight), `italic` (SGR 3 — slanted),
+/// `underline` (SGR 4 — drawn line under the glyph), `strikethrough` (SGR 9 —
+/// line through the glyph), and `hidden` (SGR 8 — glyph painted in its own bg
+/// so it is invisible but still selectable/copyable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cell {
     pub ch: char,
@@ -55,6 +56,11 @@ pub struct Cell {
     pub bg: CellColor,
     pub inverse: bool,
     pub dim: bool,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub hidden: bool,
 }
 
 /// A frame-aligned snapshot. Cheap to clone (Vec<Row> small under 24x80).
@@ -64,6 +70,10 @@ pub struct TerminalSnapshot {
     pub rows: u16,
     pub cursor: (u16, u16),
     pub cells: Vec<Vec<Cell>>,
+    /// Lines scrolled back from the live tail. `0` = pinned to the bottom
+    /// (live). `> 0` = the user has scrolled up into history; drives the
+    /// "scrolled-up" indicator and tells callers the cursor may be hidden.
+    pub display_offset: usize,
 }
 
 impl TerminalSnapshot {
@@ -73,6 +83,7 @@ impl TerminalSnapshot {
             rows,
             cursor: (0, 0),
             cells: Vec::new(),
+            display_offset: 0,
         }
     }
 }
@@ -134,6 +145,7 @@ mod tests {
             bg: CellColor::Default,
             inverse: false,
             dim: false,
+            ..Cell::default()
         };
         let same = base;
         let diff_inverse = Cell {
