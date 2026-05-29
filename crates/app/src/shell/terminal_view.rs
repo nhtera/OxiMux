@@ -1979,6 +1979,12 @@ fn extract_selection_text(
         }
         let mut line = String::with_capacity(c1 - c0 + 1);
         for cell in &row[c0..=c1] {
+            // Wide-char spacers carry no real character — their column is
+            // already painted by the adjacent wide glyph. Skip them so copy
+            // yields one char per glyph instead of "char + space".
+            if cell.wide_spacer {
+                continue;
+            }
             let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
             line.push(ch);
         }
@@ -2118,6 +2124,30 @@ mod selection_tests {
         let s = snap(&[]);
         let txt = extract_selection_text(&s, (0, 0, 5, 5));
         assert_eq!(txt, "");
+    }
+
+    #[test]
+    fn extract_selection_collapses_wide_char_with_its_spacer() {
+        // A row holding `a`, then a wide `你` paired with its spacer, then
+        // `b`. The selection spans all four columns; the spacer must drop
+        // out so the copied text reads `a你b` (3 chars), not `a你 b`.
+        let mut wide = cell('你');
+        wide.wide = true;
+        let mut spacer = cell(' ');
+        spacer.wide_spacer = true;
+        let row = vec![cell('a'), wide, spacer, cell('b')];
+        let snapshot = TerminalSnapshot {
+            cols: 4,
+            rows: 1,
+            cursor: (0, 0),
+            cells: vec![row],
+            display_offset: 0,
+            cursor_shape: oximux_pty::CursorShapeKind::Block,
+            history_len: 0,
+            links: Vec::new(),
+        };
+        let txt = extract_selection_text(&snapshot, (0, 0, 0, 3));
+        assert_eq!(txt, "a你b");
     }
 
     #[test]

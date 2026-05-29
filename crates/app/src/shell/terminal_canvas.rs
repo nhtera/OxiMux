@@ -224,7 +224,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         // standard quad-snapping pattern for GPU terminal renderers.
         let mut col: usize = 0;
         for run in &runs {
-            let n_cells = run.text.chars().count();
+            let n_cells = run.cols;
             let (_fg, bg) = effective_colors(run, p.pane_focused, &p.theme, p.alphas);
             // Match highlight overrides bg unless the cursor is also on
             // this run (cursor inverse wins — keeps the cursor visible
@@ -280,9 +280,16 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
         }
 
         // ── Text pass ──────────────────────────────────────────────────
-        // One ShapedLine per row with `force_width = Some(cell_w)` so
-        // every glyph advance is exactly cell_w — no drift across the
-        // row regardless of font shaping. TextRuns carry per-cell color.
+        // Per-row `force_width`: when the row holds NO wide glyphs we keep
+        // the original `Some(cell_w)` so fallback faces (box-drawing,
+        // braille, symbol glyphs whose natural advance ≠ `cell_w`) can't
+        // accumulate drift across the row. When a wide glyph IS present we
+        // pass `None` so its natural 2-cell advance flows through —
+        // forcing it to `cell_w` would squish it and leave a gap in the
+        // spacer column. Spacers are dropped in `group_runs`, so the text
+        // length matches the column count.
+        let row_has_wide = row.iter().any(|c| c.wide);
+        let force_width = if row_has_wide { None } else { Some(cell_w) };
         let mut text = String::with_capacity(row.len());
         let mut text_runs: Vec<TextRun> = Vec::with_capacity(runs.len());
         for run in &runs {
@@ -301,7 +308,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             let fg = if run.hidden { bg } else { fg };
             // Per-run font: SGR 1 (bold) → heavier weight, SGR 3 (italic) →
             // slanted. GPUI synthesizes a faux cut when the face lacks a real
-            // bold/oblique. force_width still clamps advance, so no drift.
+            // bold/oblique.
             let mut run_font = font.clone();
             run_font.weight = if run.bold {
                 FontWeight::BOLD
@@ -338,7 +345,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             SharedString::from(text),
             font_size,
             &text_runs,
-            Some(cell_w),
+            force_width,
         );
         // Errors painting a single row are non-fatal — the rest of the
         // grid is still useful, and shaping errors usually mean a missing
@@ -445,6 +452,12 @@ struct Run {
     /// the cursor cell, not arbitrary inverse runs.
     is_cursor: bool,
     match_kind: Option<MatchKind>,
+    /// Total terminal columns this run spans. Narrow chars contribute 1,
+    /// double-width (CJK) chars contribute 2 — diverging from
+    /// `text.chars().count()` once a row mixes widths. The background and
+    /// selection passes use this to size their quads; spacer cells are
+    /// folded into the wide char's column count and contribute no chars.
+    cols: usize,
 }
 
 fn group_runs(
@@ -454,6 +467,13 @@ fn group_runs(
 ) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::with_capacity(row.len() / 4);
     for (col_idx, cell) in row.iter().enumerate() {
+        // Spacer cells hold no glyph of their own — the adjacent wide cell
+        // already owns this column. Drop them, but the cell that DID hold the
+        // wide glyph already contributed `cols += 2`, so the row's column
+        // accounting still totals correctly.
+        if cell.wide_spacer {
+            continue;
+        }
         let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
         let is_cursor = cursor_col == Some(col_idx);
         let inverse = cell.inverse || is_cursor;
@@ -463,6 +483,7 @@ fn group_runs(
                 .find(|hit| col_idx >= hit.col_start && col_idx < hit.col_end)
                 .map(|hit| hit.kind)
         });
+        let advance = if cell.wide { 2 } else { 1 };
         match runs.last_mut() {
             Some(last)
                 if last.fg == cell.fg
@@ -478,6 +499,7 @@ fn group_runs(
                     && last.match_kind == match_kind =>
             {
                 last.text.push(ch);
+                last.cols += advance;
             }
             _ => runs.push(Run {
                 text: ch.to_string(),
@@ -492,6 +514,7 @@ fn group_runs(
                 hidden: cell.hidden,
                 is_cursor,
                 match_kind,
+                cols: advance,
             }),
         }
     }
@@ -612,6 +635,30 @@ mod tests {
         let row = vec![cell('\0', CellColor::Default, CellColor::Default)];
         let runs = group_runs(&row, None, None);
         assert_eq!(runs[0].text, " ");
+    }
+
+    #[test]
+    fn group_runs_skips_wide_spacer_and_counts_two_columns() {
+        // Row: ASCII 'a', wide '你' (occupies cols 1 + 2), ASCII 'b'.
+        let mut wide_cell = cell('你', CellColor::Default, CellColor::Default);
+        wide_cell.wide = true;
+        let mut spacer = cell(' ', CellColor::Default, CellColor::Default);
+        spacer.wide_spacer = true;
+        let row = vec![
+            cell('a', CellColor::Default, CellColor::Default),
+            wide_cell,
+            spacer,
+            cell('b', CellColor::Default, CellColor::Default),
+        ];
+        let runs = group_runs(&row, None, None);
+        // All four cells share style → one merged run, but the spacer
+        // contributes no character. Total column span is 4 (1 + 2 + 1).
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "a你b", "spacer must NOT add a char");
+        assert_eq!(
+            runs[0].cols, 4,
+            "wide glyph contributes 2 cols, spacer absorbed"
+        );
     }
 
     #[test]

@@ -61,6 +61,15 @@ pub struct Cell {
     pub underline: bool,
     pub strikethrough: bool,
     pub hidden: bool,
+    /// True when this cell holds a double-width (CJK / wide-emoji) glyph.
+    /// The next column carries a `wide_spacer` cell; renderers paint this
+    /// glyph spanning both columns.
+    pub wide: bool,
+    /// True for the trailing (or leading) column occupied by an adjacent
+    /// wide glyph. The renderer skips this cell — its column is already
+    /// painted by the wide glyph — and selection text omits it so copy
+    /// yields one character, not "char + space".
+    pub wide_spacer: bool,
 }
 
 /// Cursor shape the app requested via DECSCUSR, decoupled from alacritty's

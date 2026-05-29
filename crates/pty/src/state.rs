@@ -474,6 +474,13 @@ fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
         underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
         strikethrough: cell.flags.contains(Flags::STRIKEOUT),
         hidden: cell.flags.contains(Flags::HIDDEN),
+        wide: cell.flags.contains(Flags::WIDE_CHAR),
+        // Both trailing (after a wide) and leading (when a wide would have
+        // wrapped past the right edge) spacers collapse to the same render
+        // signal: "skip me, the adjacent wide glyph owns this column."
+        wide_spacer: cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
     }
 }
 
@@ -936,6 +943,29 @@ mod tests {
             _ => None,
         });
         assert_eq!(p, Some((1, 75)));
+    }
+
+    #[test]
+    fn wide_char_marks_primary_and_spacer_cells() {
+        // `你` (U+4F60) is a double-width CJK glyph. alacritty stores the
+        // char in the first cell with the WIDE_CHAR flag and a placeholder in
+        // the next cell with WIDE_CHAR_SPACER. The map_cell mapper must
+        // surface both flags so the renderer can pair them.
+        let mut state = TerminalState::new(80, 24, 100);
+        state.advance("你x".as_bytes());
+        let snap = fresh_snapshot(&state);
+        let row0 = &snap.cells[0];
+        assert_eq!(row0[0].ch, '你', "wide glyph in column 0");
+        assert!(row0[0].wide, "WIDE_CHAR flag must surface as wide=true");
+        assert!(!row0[0].wide_spacer);
+        assert!(
+            row0[1].wide_spacer,
+            "column 1 is the WIDE_CHAR_SPACER for the adjacent wide glyph"
+        );
+        assert!(!row0[1].wide, "spacer is not itself wide");
+        assert_eq!(row0[2].ch, 'x', "narrow ascii after the wide glyph");
+        assert!(!row0[2].wide);
+        assert!(!row0[2].wide_spacer);
     }
 
     #[test]
