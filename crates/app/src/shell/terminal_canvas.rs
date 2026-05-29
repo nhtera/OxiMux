@@ -37,6 +37,7 @@ use gpui::{
 use oximux_pty::{Cell, CellColor, CursorShapeKind, TerminalSnapshot};
 use oximux_settings::{Theme, Typography};
 
+use crate::shell::box_drawing;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::terminal_palette::{ColorRole, resolve};
 use crate::shell::terminal_search_state::{MatchHit, MatchKind};
@@ -360,6 +361,24 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             cx,
         );
 
+        // ── Box-drawing vector pass ───────────────────────────────────
+        // Box chars are emitted as spaces above so the font glyph never
+        // paints — here the vector stroke fills the cells. Per-row early
+        // exit when no box char is present (the common case) keeps plain
+        // rows free of the extra pass.
+        paint_box_drawing_row(
+            row,
+            cursor_col,
+            row_y,
+            origin.x,
+            cell_w,
+            line_h,
+            p.pane_focused,
+            &p.theme,
+            p.alphas,
+            window,
+        );
+
         // Bar / underline cursor: a thin quad on TOP of the glyph (the block
         // shape already inverted the cell above). Dimmed in an unfocused pane.
         if cursor_here && matches!(p.cursor_shape, CursorShapeKind::Bar | CursorShapeKind::Underline)
@@ -474,7 +493,16 @@ fn group_runs(
         if cell.wide_spacer {
             continue;
         }
-        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+        // Box-drawing characters with a vector implementation are emitted
+        // into the text as spaces so the font glyph never paints; the
+        // post-text vector pass strokes them directly. Diagonals
+        // (U+2571..=U+2573) have no segment-model expression and fall
+        // through to the font face instead of rendering blank.
+        let ch = if cell.ch == '\0' || box_drawing::has_vector_impl(cell.ch) {
+            ' '
+        } else {
+            cell.ch
+        };
         let is_cursor = cursor_col == Some(col_idx);
         let inverse = cell.inverse || is_cursor;
         let match_kind = match_cols.and_then(|ranges| {
@@ -547,6 +575,167 @@ fn effective_colors(run: &Run, pane_focused: bool, theme: &Theme, alphas: Alphas
         }
     }
     (fg, bg)
+}
+
+/// Per-row vector pass for box-drawing characters. Bails out cheaply when
+/// the row has none. Two sub-passes: (1) merge consecutive cells with the
+/// same horizontal weight + same effective fg into ONE continuous stroke
+/// (no inter-cell seams); (2) every other box-drawing cell paints
+/// individually with a 1-px edge overlap. The cursor cell, when on a box
+/// char, is drawn in the inverted color so it reads against the cursor
+/// block.
+#[allow(clippy::too_many_arguments)]
+fn paint_box_drawing_row(
+    row: &[Cell],
+    cursor_col: Option<usize>,
+    row_y: Pixels,
+    origin_x: Pixels,
+    cell_w: Pixels,
+    line_h: Pixels,
+    pane_focused: bool,
+    theme: &Theme,
+    alphas: Alphas,
+    window: &mut Window,
+) {
+    // Map non-spacer cells to their starting column, mirroring `group_runs`'s
+    // wide-cell accounting so positions stay grid-aligned in mixed CJK rows.
+    let mut positions: Vec<(usize, &Cell)> = Vec::with_capacity(row.len());
+    let mut col: usize = 0;
+    for cell in row {
+        if cell.wide_spacer {
+            continue;
+        }
+        positions.push((col, cell));
+        col += if cell.wide { 2 } else { 1 };
+    }
+
+    // Cheap presence gate — plain text rows pay only this scan. Use the
+    // vector-impl predicate (not the wider box-drawing range) so a row of
+    // only diagonals doesn't pay for an empty pass.
+    if !positions
+        .iter()
+        .any(|(_, c)| box_drawing::has_vector_impl(c.ch))
+    {
+        return;
+    }
+
+    let cy = row_y + line_h / 2.0;
+    // `Vec<bool>` keyed by column index is cheaper than a `HashSet` here
+    // because the column count is small (≤ a few hundred) and lookups are
+    // O(1) by indexing. The cell list ends at the last non-spacer column.
+    let max_col = positions.last().map(|(c, _)| *c).unwrap_or(0);
+    let mut processed_horizontal: Vec<bool> = vec![false; max_col + 1];
+
+    // ── Pass 1: horizontal merge ──────────────────────────────────────
+    let mut i = 0;
+    while i < positions.len() {
+        let (col_idx, cell) = positions[i];
+        let ch = cell.ch;
+        let Some(weight) = box_drawing::get_horizontal_weight(ch) else {
+            i += 1;
+            continue;
+        };
+        let is_cursor_here = cursor_col == Some(col_idx);
+        // SGR 8 hidden — text path renders glyph in its own bg (invisible);
+        // the vector pass mirrors this by skipping entirely, regardless of
+        // inverse or cursor state.
+        if cell.hidden {
+            i += 1;
+            continue;
+        }
+        let color = effective_fg_for_cell(cell, is_cursor_here, pane_focused, theme, alphas);
+        let start_col = col_idx;
+        let mut end_col = col_idx;
+        let mut j = i + 1;
+        // Greedily extend the span over neighbouring cells that share
+        // weight, color, and are not hidden — the join becomes ONE stroke.
+        while j < positions.len() {
+            let (next_col, next_cell) = positions[j];
+            if next_col != end_col + 1 {
+                break;
+            }
+            if box_drawing::get_horizontal_weight(next_cell.ch) != Some(weight) {
+                break;
+            }
+            if next_cell.hidden {
+                break;
+            }
+            let next_is_cursor = cursor_col == Some(next_col);
+            let next_color =
+                effective_fg_for_cell(next_cell, next_is_cursor, pane_focused, theme, alphas);
+            if next_color != color {
+                break;
+            }
+            end_col = next_col;
+            j += 1;
+        }
+        let start_x = origin_x + cell_w * start_col as f32;
+        let end_x = origin_x + cell_w * (end_col + 1) as f32;
+        box_drawing::draw_horizontal_span(start_x, end_x, cy, weight, cell_w, color, window);
+        for c in start_col..=end_col {
+            if c < processed_horizontal.len() {
+                processed_horizontal[c] = true;
+            }
+        }
+        i = j;
+    }
+
+    // ── Pass 2: vertical / standalone components ──────────────────────
+    for &(col_idx, cell) in &positions {
+        let ch = cell.ch;
+        // Skip diagonals — they have no segment-model expression and the
+        // group_runs replacement also left their font glyph intact.
+        if !box_drawing::has_vector_impl(ch) {
+            continue;
+        }
+        if cell.hidden {
+            continue;
+        }
+        let is_cursor_here = cursor_col == Some(col_idx);
+        let color = effective_fg_for_cell(cell, is_cursor_here, pane_focused, theme, alphas);
+        let bounds = Bounds {
+            origin: point(origin_x + cell_w * col_idx as f32, row_y),
+            size: Size {
+                width: cell_w,
+                height: line_h,
+            },
+        };
+        let already_h = processed_horizontal
+            .get(col_idx)
+            .copied()
+            .unwrap_or(false);
+        if already_h {
+            // Horizontal already painted by the merge — only the vertical
+            // axis of a T-junction / cross remains.
+            box_drawing::draw_vertical_components(ch, bounds, color, cell_w, window);
+        } else {
+            box_drawing::draw_box_character(ch, bounds, color, cell_w, window);
+        }
+    }
+}
+
+/// Per-cell effective fg, mirroring `effective_colors` but without the run
+/// abstraction. Used by the box-drawing pass which iterates cells directly
+/// — the vector stroke is the "glyph", so it inherits the same fg the text
+/// path would have computed for that cell.
+fn effective_fg_for_cell(
+    cell: &Cell,
+    is_cursor: bool,
+    pane_focused: bool,
+    theme: &Theme,
+    alphas: Alphas,
+) -> Hsla {
+    let fg = resolve(cell.fg, ColorRole::Fg, theme);
+    let bg = resolve(cell.bg, ColorRole::Bg, theme);
+    let inverse = cell.inverse || is_cursor;
+    let mut fg = if inverse { bg } else { fg };
+    if cell.dim {
+        fg.a *= alphas.dim;
+    }
+    if !pane_focused && !is_cursor {
+        fg.a *= alphas.unfocused;
+    }
+    fg
 }
 
 #[cfg(test)]
@@ -635,6 +824,60 @@ mod tests {
         let row = vec![cell('\0', CellColor::Default, CellColor::Default)];
         let runs = group_runs(&row, None, None);
         assert_eq!(runs[0].text, " ");
+    }
+
+    #[test]
+    fn group_runs_replaces_box_drawing_with_space() {
+        // U+2500..=U+257F with a vector implementation must be emitted as
+        // ' ' so the font glyph never paints — the post-text vector pass
+        // strokes them directly. Column accounting is unchanged. Cells
+        // with the same style as their neighbours still merge into one run.
+        let row = vec![
+            cell('a', CellColor::Default, CellColor::Default),
+            cell('\u{2500}', CellColor::Default, CellColor::Default), // ─
+            cell('\u{253C}', CellColor::Default, CellColor::Default), // ┼
+            cell('b', CellColor::Default, CellColor::Default),
+        ];
+        let runs = group_runs(&row, None, None);
+        assert_eq!(runs.len(), 1, "same-style cells merge across the row");
+        assert_eq!(runs[0].text, "a  b", "box chars become spaces in shaped text");
+        assert_eq!(runs[0].cols, 4);
+    }
+
+    #[test]
+    fn group_runs_keeps_diagonals_as_font_glyphs() {
+        // Diagonals (U+2571..=U+2573) are inside the box-drawing block but
+        // have no vector implementation. They must NOT be replaced with a
+        // space — otherwise they would render blank (vector pass returns
+        // false, no font glyph, nothing visible).
+        let row = vec![
+            cell('\u{2571}', CellColor::Default, CellColor::Default), // ╱
+            cell('\u{2572}', CellColor::Default, CellColor::Default), // ╲
+        ];
+        let runs = group_runs(&row, None, None);
+        assert_eq!(runs[0].text, "\u{2571}\u{2572}");
+    }
+
+    #[test]
+    fn group_runs_splits_styled_box_drawing() {
+        // A box char on a styled run still gets the space substitution and
+        // still splits the run on its style boundary — the vector pass
+        // paints it in the styled fg, so the boundary must be preserved.
+        let mut red_box = cell(
+            '\u{2500}',
+            CellColor::Named(NamedColor16::Red),
+            CellColor::Default,
+        );
+        red_box.bold = false; // explicit for clarity
+        let row = vec![
+            cell('a', CellColor::Default, CellColor::Default),
+            red_box,
+            cell('b', CellColor::Default, CellColor::Default),
+        ];
+        let runs = group_runs(&row, None, None);
+        assert_eq!(runs.len(), 3, "differently styled box char splits runs");
+        assert_eq!(runs[1].text, " ", "styled box char is still replaced");
+        assert_eq!(runs[1].fg, CellColor::Named(NamedColor16::Red));
     }
 
     #[test]

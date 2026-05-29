@@ -8,6 +8,7 @@ pub mod add_project_dialog;
 pub mod agent_status_badge;
 pub mod agent_status_task;
 pub mod agent_tab_label;
+pub mod box_drawing;
 pub mod cell_metrics;
 pub mod command_palette;
 pub mod commit_dialog;
