@@ -34,7 +34,7 @@ use gpui::{
     App, Bounds, FontStyle, FontWeight, Hsla, Pixels, Point, SharedString, Size, StrikethroughStyle,
     TextAlign, TextRun, UnderlineStyle, Window, fill, point, px,
 };
-use oximux_pty::{Cell, CellColor, TerminalSnapshot};
+use oximux_pty::{Cell, CellColor, CursorShapeKind, TerminalSnapshot};
 use oximux_settings::{Theme, Typography};
 
 use crate::shell::cell_metrics::CellMetrics;
@@ -69,6 +69,10 @@ pub struct PaintParams {
     /// suppress the cursor (off-blink phase) — out-of-grid indices fall
     /// through the per-row branch silently.
     pub cursor: (usize, usize),
+    /// Shape to draw the cursor in. `Block` inverts the cell (existing
+    /// path); `Bar`/`Underline` draw a thin overlay quad without inverting
+    /// the glyph; `Hidden` draws nothing.
+    pub cursor_shape: CursorShapeKind,
     /// Per-visible-row match highlights from the search overlay. `len`
     /// equals `snapshot.cells.len()`; rows without matches hold an
     /// empty vec.
@@ -185,7 +189,10 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
 
     for (row_idx, row) in p.snapshot.cells.iter().enumerate() {
         let row_y = origin.y + line_h * row_idx as f32;
-        let cursor_col = if p.cursor.0 == row_idx {
+        let cursor_here = p.cursor.0 == row_idx;
+        // Only the block shape inverts the cell; bar/underline paint an
+        // overlay after the text, and hidden draws nothing.
+        let cursor_col = if cursor_here && p.cursor_shape == CursorShapeKind::Block {
             Some(p.cursor.1)
         } else {
             None
@@ -331,6 +338,36 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             window,
             cx,
         );
+
+        // Bar / underline cursor: a thin quad on TOP of the glyph (the block
+        // shape already inverted the cell above). Dimmed in an unfocused pane.
+        if cursor_here && matches!(p.cursor_shape, CursorShapeKind::Bar | CursorShapeKind::Underline)
+        {
+            let x_left = (origin.x + cell_w * p.cursor.1 as f32).floor();
+            let mut color = p.theme.fg_base;
+            if !p.pane_focused {
+                color.a *= UNFOCUSED_CURSOR_ALPHA;
+            }
+            let thickness = px(2.0);
+            let rect = if p.cursor_shape == CursorShapeKind::Bar {
+                Bounds {
+                    origin: point(x_left, row_y),
+                    size: Size {
+                        width: thickness,
+                        height: line_h,
+                    },
+                }
+            } else {
+                Bounds {
+                    origin: point(x_left, row_y + line_h - thickness),
+                    size: Size {
+                        width: cell_w,
+                        height: thickness,
+                    },
+                }
+            };
+            window.paint_quad(fill(rect, color));
+        }
     }
 }
 

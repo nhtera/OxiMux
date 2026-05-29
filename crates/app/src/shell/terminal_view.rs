@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use gpui::{
     App, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, Styled, Task, Window, canvas, div, px,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollWheelEvent, Styled, Task, Window, canvas, div, px,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -38,6 +38,7 @@ use crate::actions::Search;
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::key_input::keystroke_to_bytes;
+use crate::shell::mouse_report::{MouseAction, MouseBtn, encode_button, encode_scroll, mod_bits};
 use crate::shell::terminal_canvas::{PaintParams, grid_dims_for, paint_grid, point_to_cell};
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
@@ -787,6 +788,83 @@ impl TerminalView {
         true
     }
 
+    /// Forward a mouse event to the child when the app has enabled mouse
+    /// reporting and Shift is NOT held (Shift is the escape hatch for local
+    /// selection over a mouse-mode app). Returns `true` when it consumed the
+    /// event, so the caller skips local selection.
+    fn report_mouse(
+        &mut self,
+        button: MouseButton,
+        pos: Point<Pixels>,
+        modifiers: &Modifiers,
+        action: MouseAction,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if modifiers.shift {
+            return false;
+        }
+        let id = self.session_id;
+        let mode = self.with_backend(|be| be.mouse_mode(id));
+        if !mode.any_reporting() {
+            return false;
+        }
+        let Some(btn) = map_btn(button) else {
+            return false;
+        };
+        let cell = self.cell_at(pos, window);
+        let mods = mod_bits(modifiers.shift, modifiers.alt, modifiers.control);
+        match encode_button(action, btn, cell, mods, &mode) {
+            Some(bytes) => {
+                self.send_bytes(&bytes, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Wheel handling, in priority order: forward to a mouse-reporting app;
+    /// else translate to arrow keys on the alt-screen (less/man); else scroll
+    /// local scrollback (Phase 3).
+    fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        let metrics = CellMetrics::measure(&self.typography, window);
+        let dy = f32::from(ev.delta.pixel_delta(px(metrics.line_height)).y);
+        let lines = (dy / metrics.line_height).round() as i32;
+        if lines == 0 {
+            return;
+        }
+        let id = self.session_id;
+        let mode = self.with_backend(|be| be.mouse_mode(id));
+        let up = lines > 0;
+        let count = lines.unsigned_abs() as usize;
+
+        if mode.any_reporting() {
+            let cell = self.cell_at(ev.position, window);
+            let mods = mod_bits(ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
+            if let Some(bytes) = encode_scroll(up, cell, mods, &mode) {
+                self.send_bytes(&bytes.repeat(count), cx);
+                return;
+            }
+        }
+
+        if mode.alt_screen && mode.alternate_scroll {
+            let app_cursor = self.with_backend(|be| be.input_mode(id)).app_cursor;
+            let arrow: &[u8] = match (up, app_cursor) {
+                (true, false) => b"\x1b[A",
+                (true, true) => b"\x1bOA",
+                (false, false) => b"\x1b[B",
+                (false, true) => b"\x1bOB",
+            };
+            self.send_bytes(&arrow.repeat(count), cx);
+            return;
+        }
+
+        if let Err(err) = self.with_backend(|be| be.scroll(id, lines)) {
+            tracing::warn!(?err, "pty scroll failed");
+        }
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         match self.search.handle_key(event) {
             SearchKeyOutcome::Pass => {}
@@ -876,7 +954,11 @@ impl TerminalView {
             cx.notify();
         }
 
-        let bytes = keystroke_to_bytes(ks);
+        // Read DECCKM (app-cursor) live so cursor keys pick CSI vs SS3; apps
+        // toggle it dynamically, so fetch per keystroke rather than caching.
+        let session_id = self.session_id;
+        let mode = self.with_backend(|be| be.input_mode(session_id));
+        let bytes = keystroke_to_bytes(ks, mode);
         self.send_bytes(&bytes, cx);
     }
 
@@ -1208,6 +1290,7 @@ impl Render for TerminalView {
             theme,
             typography: self.typography.clone(),
             cursor,
+            cursor_shape: self.snapshot.cursor_shape,
             buckets,
             pane_focused,
             pad,
@@ -1349,7 +1432,18 @@ impl Render for TerminalView {
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
-                    this.on_select_down(ev, window);
+                    // A mouse-reporting app (no Shift) gets the click forwarded
+                    // instead of starting a local selection.
+                    if !this.report_mouse(
+                        ev.button,
+                        ev.position,
+                        &ev.modifiers,
+                        MouseAction::Press,
+                        window,
+                        cx,
+                    ) {
+                        this.on_select_down(ev, window);
+                    }
                     // Notify so `MainPane`'s observer can re-sync the focused
                     // PaneId and repaint the active-pane ring on the next
                     // frame. Without this, click-to-focus is invisible until
@@ -1358,7 +1452,22 @@ impl Render for TerminalView {
                 }),
             )
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
-                if this.selecting.is_some() && ev.pressed_button == Some(MouseButton::Left) {
+                let Some(button) = ev.pressed_button else {
+                    return;
+                };
+                // Forward drags to a mouse-reporting app; otherwise extend the
+                // local selection.
+                if this.report_mouse(
+                    button,
+                    ev.position,
+                    &ev.modifiers,
+                    MouseAction::Drag,
+                    window,
+                    cx,
+                ) {
+                    return;
+                }
+                if this.selecting.is_some() && button == MouseButton::Left {
                     let cell = this.cell_at(ev.position, window);
                     this.apply_drag(cell);
                     cx.notify();
@@ -1366,28 +1475,80 @@ impl Render for TerminalView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _window, cx| {
+                cx.listener(move |this, ev: &MouseUpEvent, window, cx| {
+                    if this.report_mouse(
+                        ev.button,
+                        ev.position,
+                        &ev.modifiers,
+                        MouseAction::Release,
+                        window,
+                        cx,
+                    ) {
+                        return;
+                    }
                     if this.finish_select() {
                         cx.notify();
                     }
                 }),
             )
+            // Middle / right buttons only matter for mouse-reporting apps
+            // (right-click menus in vim/tmux, middle-click paste). There is no
+            // local-selection fallback for them, so they just forward when the
+            // app is reporting and are otherwise ignored.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    this.report_mouse(
+                        ev.button,
+                        ev.position,
+                        &ev.modifiers,
+                        MouseAction::Press,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseUpEvent, window, cx| {
+                    this.report_mouse(
+                        ev.button,
+                        ev.position,
+                        &ev.modifiers,
+                        MouseAction::Release,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    this.report_mouse(
+                        ev.button,
+                        ev.position,
+                        &ev.modifiers,
+                        MouseAction::Press,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, ev: &MouseUpEvent, window, cx| {
+                    this.report_mouse(
+                        ev.button,
+                        ev.position,
+                        &ev.modifiers,
+                        MouseAction::Release,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
-                // Normalize trackpad (pixel) and wheel (line) deltas to lines.
-                // alacritty `Scroll::Delta(+n)` scrolls UP into history, which
-                // matches a positive wheel-up delta. New PTY output while
-                // scrolled up keeps the offset (alacritty grows history under
-                // us) — we only snap back to the tail on key input.
-                let metrics = CellMetrics::measure(&this.typography, window);
-                let dy = f32::from(ev.delta.pixel_delta(px(metrics.line_height)).y);
-                let lines = (dy / metrics.line_height).round() as i32;
-                if lines != 0 {
-                    let id = this.session_id;
-                    if let Err(err) = this.with_backend(|be| be.scroll(id, lines)) {
-                        tracing::warn!(?err, "pty scroll failed");
-                    }
-                    cx.notify();
-                }
+                this.on_wheel(ev, window, cx);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx);
@@ -1420,6 +1581,17 @@ impl Render for TerminalView {
             );
         }
         root
+    }
+}
+
+/// Map a GPUI mouse button to a reportable terminal button. Returns `None`
+/// for buttons the mouse protocol doesn't encode (back/forward/etc.).
+fn map_btn(button: MouseButton) -> Option<MouseBtn> {
+    match button {
+        MouseButton::Left => Some(MouseBtn::Left),
+        MouseButton::Middle => Some(MouseBtn::Middle),
+        MouseButton::Right => Some(MouseBtn::Right),
+        _ => None,
     }
 }
 
@@ -1585,6 +1757,7 @@ mod selection_tests {
             cursor: (0, 0),
             cells,
             display_offset: 0,
+            cursor_shape: oximux_pty::CursorShapeKind::Block,
         }
     }
 

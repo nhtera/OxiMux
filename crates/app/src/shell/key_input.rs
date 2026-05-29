@@ -11,18 +11,20 @@
 //! which belong to app-level actions, not the shell).
 
 use gpui::Keystroke;
+use oximux_pty::InputMode;
 
 /// Translate a single Keystroke to the bytes that should be written to the
-/// PTY. Returns an empty `Vec` when the key should not reach the shell
-/// (anything with Cmd/Super pressed — those are reserved for app actions).
-pub fn keystroke_to_bytes(ks: &Keystroke) -> Vec<u8> {
+/// PTY. `mode` carries DECCKM (app-cursor) so cursor keys pick CSI vs SS3.
+/// Returns an empty `Vec` when the key should not reach the shell (anything
+/// with Cmd/Super pressed — those are reserved for app actions).
+pub fn keystroke_to_bytes(ks: &Keystroke, mode: InputMode) -> Vec<u8> {
     // Cmd / Super combos are app-level (copy/paste/quit/etc.). Never forward.
     if ks.modifiers.platform {
         return Vec::new();
     }
 
-    if let Some(special) = special_key(&ks.key) {
-        return apply_alt(ks, special.to_vec());
+    if let Some(seq) = classify(&ks.key) {
+        return encode_special(seq, ks, mode);
     }
 
     // Ctrl + single ASCII letter → C0 control byte (Ctrl-A == 0x01, etc.).
@@ -44,39 +46,101 @@ pub fn keystroke_to_bytes(ks: &Keystroke) -> Vec<u8> {
     Vec::new()
 }
 
-/// xterm escape sequences for the named keys. None means "not special;
-/// fall through to printable handling".
-fn special_key(key: &str) -> Option<&'static [u8]> {
-    match key {
-        "enter" => Some(b"\r"),
-        "tab" => Some(b"\t"),
-        "backspace" => Some(b"\x7f"),
-        "escape" => Some(b"\x1b"),
-        "space" => Some(b" "),
-        "left" => Some(b"\x1b[D"),
-        "right" => Some(b"\x1b[C"),
-        "up" => Some(b"\x1b[A"),
-        "down" => Some(b"\x1b[B"),
-        "home" => Some(b"\x1b[H"),
-        "end" => Some(b"\x1b[F"),
-        "pageup" => Some(b"\x1b[5~"),
-        "pagedown" => Some(b"\x1b[6~"),
-        "delete" => Some(b"\x1b[3~"),
-        "insert" => Some(b"\x1b[2~"),
-        "f1" => Some(b"\x1bOP"),
-        "f2" => Some(b"\x1bOQ"),
-        "f3" => Some(b"\x1bOR"),
-        "f4" => Some(b"\x1bOS"),
-        "f5" => Some(b"\x1b[15~"),
-        "f6" => Some(b"\x1b[17~"),
-        "f7" => Some(b"\x1b[18~"),
-        "f8" => Some(b"\x1b[19~"),
-        "f9" => Some(b"\x1b[20~"),
-        "f10" => Some(b"\x1b[21~"),
-        "f11" => Some(b"\x1b[23~"),
-        "f12" => Some(b"\x1b[24~"),
-        _ => None,
+/// Shape of a named navigation key for escape-sequence encoding.
+enum KeySeq {
+    /// Cursor-style with a final byte: A/B/C/D (arrows), H/F (Home/End).
+    /// Unmodified → `ESC [ <final>`; app-cursor (DECCKM) → `ESC O <final>`;
+    /// with any modifier → `ESC [ 1 ; <mod> <final>`.
+    Cursor(u8),
+    /// SS3-anchored key (F1-F4: P/Q/R/S). Unmodified → `ESC O <final>`
+    /// ALWAYS (terminfo `kf1=\EOP`; DECCKM does not apply to function keys);
+    /// with any modifier → `ESC [ 1 ; <mod> <final>`.
+    Ss3(u8),
+    /// Tilde-terminated with a numeric parameter (PageUp/Down, Insert,
+    /// Delete, F5-F12). Unmodified → `ESC [ <n> ~`; modified →
+    /// `ESC [ <n> ; <mod> ~`.
+    Tilde(u8),
+    /// Fixed bytes with no modifier encoding (enter, tab, escape, space).
+    /// Alt still ESC-prefixes these (Meta convention).
+    Raw(&'static [u8]),
+}
+
+/// Classify a named key. `None` falls through to printable handling.
+fn classify(key: &str) -> Option<KeySeq> {
+    Some(match key {
+        "up" => KeySeq::Cursor(b'A'),
+        "down" => KeySeq::Cursor(b'B'),
+        "right" => KeySeq::Cursor(b'C'),
+        "left" => KeySeq::Cursor(b'D'),
+        "home" => KeySeq::Cursor(b'H'),
+        "end" => KeySeq::Cursor(b'F'),
+        "f1" => KeySeq::Ss3(b'P'),
+        "f2" => KeySeq::Ss3(b'Q'),
+        "f3" => KeySeq::Ss3(b'R'),
+        "f4" => KeySeq::Ss3(b'S'),
+        "enter" => KeySeq::Raw(b"\r"),
+        "tab" => KeySeq::Raw(b"\t"),
+        "backspace" => KeySeq::Raw(b"\x7f"),
+        "escape" => KeySeq::Raw(b"\x1b"),
+        "space" => KeySeq::Raw(b" "),
+        "pageup" => KeySeq::Tilde(5),
+        "pagedown" => KeySeq::Tilde(6),
+        "insert" => KeySeq::Tilde(2),
+        "delete" => KeySeq::Tilde(3),
+        "f5" => KeySeq::Tilde(15),
+        "f6" => KeySeq::Tilde(17),
+        "f7" => KeySeq::Tilde(18),
+        "f8" => KeySeq::Tilde(19),
+        "f9" => KeySeq::Tilde(20),
+        "f10" => KeySeq::Tilde(21),
+        "f11" => KeySeq::Tilde(23),
+        "f12" => KeySeq::Tilde(24),
+        _ => return None,
+    })
+}
+
+/// Encode a classified key into PTY bytes, honoring app-cursor mode and the
+/// xterm modifier parameter.
+fn encode_special(seq: KeySeq, ks: &Keystroke, mode: InputMode) -> Vec<u8> {
+    match seq {
+        KeySeq::Raw(bytes) => apply_alt(ks, bytes.to_vec()),
+        KeySeq::Cursor(final_byte) => {
+            if let Some(p) = modifier_param(ks) {
+                let mut v = format!("\x1b[1;{p}").into_bytes();
+                v.push(final_byte);
+                v
+            } else if mode.app_cursor {
+                vec![0x1b, b'O', final_byte]
+            } else {
+                vec![0x1b, b'[', final_byte]
+            }
+        }
+        KeySeq::Ss3(final_byte) => {
+            if let Some(p) = modifier_param(ks) {
+                let mut v = format!("\x1b[1;{p}").into_bytes();
+                v.push(final_byte);
+                v
+            } else {
+                vec![0x1b, b'O', final_byte]
+            }
+        }
+        KeySeq::Tilde(n) => match modifier_param(ks) {
+            Some(p) => format!("\x1b[{n};{p}~").into_bytes(),
+            None => format!("\x1b[{n}~").into_bytes(),
+        },
     }
+}
+
+/// xterm modifier parameter: `1 + shift + 2·alt + 4·ctrl`. `None` when no
+/// modifier is held, so the caller emits the unmodified sequence. Alt is
+/// folded in here for navigation keys (so Alt+Left → `ESC [ 1 ; 3 D`) rather
+/// than ESC-prefixed; printable keys keep the Meta ESC-prefix via `apply_alt`.
+fn modifier_param(ks: &Keystroke) -> Option<u8> {
+    let m = &ks.modifiers;
+    if !(m.shift || m.alt || m.control) {
+        return None;
+    }
+    Some(1 + m.shift as u8 + 2 * m.alt as u8 + 4 * m.control as u8)
 }
 
 /// Ctrl-A..Z maps to bytes 0x01..0x1A. Ctrl-` is 0x00, Ctrl-[ is 0x1B,
@@ -129,14 +193,18 @@ mod tests {
         }
     }
 
+    fn off() -> InputMode {
+        InputMode::default()
+    }
+
     #[test]
     fn printable_chars() {
         assert_eq!(
-            keystroke_to_bytes(&ks("a", Some("a"), Modifiers::default())),
+            keystroke_to_bytes(&ks("a", Some("a"), Modifiers::default()), off()),
             b"a"
         );
         assert_eq!(
-            keystroke_to_bytes(&ks("A", Some("A"), Modifiers::default())),
+            keystroke_to_bytes(&ks("A", Some("A"), Modifiers::default()), off()),
             b"A"
         );
     }
@@ -144,11 +212,11 @@ mod tests {
     #[test]
     fn enter_and_backspace() {
         assert_eq!(
-            keystroke_to_bytes(&ks("enter", None, Modifiers::default())),
+            keystroke_to_bytes(&ks("enter", None, Modifiers::default()), off()),
             b"\r"
         );
         assert_eq!(
-            keystroke_to_bytes(&ks("backspace", None, Modifiers::default())),
+            keystroke_to_bytes(&ks("backspace", None, Modifiers::default()), off()),
             b"\x7f"
         );
     }
@@ -156,13 +224,90 @@ mod tests {
     #[test]
     fn arrow_keys() {
         assert_eq!(
-            keystroke_to_bytes(&ks("up", None, Modifiers::default())),
+            keystroke_to_bytes(&ks("up", None, Modifiers::default()), off()),
             b"\x1b[A"
         );
         assert_eq!(
-            keystroke_to_bytes(&ks("right", None, Modifiers::default())),
+            keystroke_to_bytes(&ks("right", None, Modifiers::default()), off()),
             b"\x1b[C"
         );
+    }
+
+    #[test]
+    fn app_cursor_mode_uses_ss3() {
+        let app = InputMode { app_cursor: true };
+        // DECCKM on, no modifiers → SS3 form.
+        assert_eq!(
+            keystroke_to_bytes(&ks("up", None, Modifiers::default()), app),
+            b"\x1bOA"
+        );
+        // Off → CSI form (regression guard).
+        assert_eq!(
+            keystroke_to_bytes(&ks("up", None, Modifiers::default()), off()),
+            b"\x1b[A"
+        );
+    }
+
+    #[test]
+    fn ctrl_arrow_encodes_modifier_param() {
+        let m = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        // Ctrl+Right → CSI 1;5C, and the modifier form wins over app-cursor.
+        assert_eq!(
+            keystroke_to_bytes(&ks("right", None, m), off()),
+            b"\x1b[1;5C"
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("right", None, m), InputMode { app_cursor: true }),
+            b"\x1b[1;5C"
+        );
+    }
+
+    #[test]
+    fn shift_up_encodes_modifier_param() {
+        let m = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(keystroke_to_bytes(&ks("up", None, m), off()), b"\x1b[1;2A");
+    }
+
+    #[test]
+    fn modified_tilde_key_encodes_param() {
+        let m = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        // Ctrl+PageUp → ESC[5;5~; unmodified stays ESC[5~.
+        assert_eq!(
+            keystroke_to_bytes(&ks("pageup", None, m), off()),
+            b"\x1b[5;5~"
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("pageup", None, Modifiers::default()), off()),
+            b"\x1b[5~"
+        );
+    }
+
+    #[test]
+    fn f1_uses_ss3_unmodified_and_csi_when_modified() {
+        // F1-F4 are SS3 unmodified (terminfo kf1=\EOP) regardless of DECCKM.
+        assert_eq!(
+            keystroke_to_bytes(&ks("f1", None, Modifiers::default()), off()),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f1", None, Modifiers::default()), InputMode { app_cursor: true }),
+            b"\x1bOP"
+        );
+        // Shift+F1 → CSI 1;2P.
+        let m = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(keystroke_to_bytes(&ks("f1", None, m), off()), b"\x1b[1;2P");
     }
 
     #[test]
@@ -171,7 +316,7 @@ mod tests {
             control: true,
             ..Default::default()
         };
-        assert_eq!(keystroke_to_bytes(&ks("c", Some("c"), m)), b"\x03");
+        assert_eq!(keystroke_to_bytes(&ks("c", Some("c"), m), off()), b"\x03");
     }
 
     #[test]
@@ -180,7 +325,7 @@ mod tests {
             alt: true,
             ..Default::default()
         };
-        assert_eq!(keystroke_to_bytes(&ks("a", Some("a"), m)), b"\x1ba");
+        assert_eq!(keystroke_to_bytes(&ks("a", Some("a"), m), off()), b"\x1ba");
     }
 
     #[test]
@@ -189,6 +334,9 @@ mod tests {
             platform: true,
             ..Default::default()
         };
-        assert_eq!(keystroke_to_bytes(&ks("c", Some("c"), m)), Vec::<u8>::new());
+        assert_eq!(
+            keystroke_to_bytes(&ks("c", Some("c"), m), off()),
+            Vec::<u8>::new()
+        );
     }
 }

@@ -347,6 +347,20 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(snap)
     }
 
+    fn input_mode(&self, id: TerminalSessionId) -> crate::InputMode {
+        self.sessions
+            .get(&id)
+            .and_then(|s| s.state.lock().ok().map(|st| st.input_mode()))
+            .unwrap_or_default()
+    }
+
+    fn mouse_mode(&self, id: TerminalSessionId) -> crate::MouseMode {
+        self.sessions
+            .get(&id)
+            .and_then(|s| s.state.lock().ok().map(|st| st.mouse_mode()))
+            .unwrap_or_default()
+    }
+
     fn bracketed_paste(&self, id: TerminalSessionId) -> Result<bool> {
         let session = self
             .sessions

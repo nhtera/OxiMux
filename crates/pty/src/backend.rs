@@ -14,6 +14,43 @@ use crate::snapshot::{Cell, TerminalSnapshot};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TerminalSessionId(pub u64);
 
+/// Input-relevant terminal modes the keystroke encoder needs. Mirrors the
+/// alacritty `TermMode` bits but lives in this crate so the app layer never
+/// depends on vte/alacritty. `app_cursor` (DECCKM) switches cursor/Home/End
+/// from CSI (`ESC [ A`) to SS3 (`ESC O A`) form — full-screen apps (vim,
+/// less) set it and expect SS3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputMode {
+    pub app_cursor: bool,
+}
+
+/// Mouse-reporting modes an app has enabled, mirrored from alacritty
+/// `TermMode` into this crate so the app layer never depends on vte. Drives
+/// whether the renderer forwards mouse events to the child (vim, lazygit,
+/// htop) instead of using them for local selection / scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseMode {
+    /// Report button press/release (1000).
+    pub report_click: bool,
+    /// Report motion while a button is held (1002).
+    pub report_drag: bool,
+    /// Report any motion (1003).
+    pub report_motion: bool,
+    /// Encode reports in SGR form (1006) rather than the legacy X10 form.
+    pub sgr: bool,
+    /// Translate wheel to arrow keys on the alt-screen (1007).
+    pub alternate_scroll: bool,
+    /// The alt-screen is active (1049).
+    pub alt_screen: bool,
+}
+
+impl MouseMode {
+    /// True when the app wants any mouse events forwarded.
+    pub fn any_reporting(&self) -> bool {
+        self.report_click || self.report_drag || self.report_motion
+    }
+}
+
 /// What to spawn. The caller picks shell + cwd + env + initial size; the
 /// backend is responsible for honoring all four exactly.
 #[derive(Debug, Clone)]
@@ -136,6 +173,19 @@ pub trait TerminalBackend: Send + 'static {
     /// an empty snapshot — step 3 wires `alacritty_terminal` to produce
     /// real rows and a cursor position.
     fn snapshot(&self, id: TerminalSessionId) -> Result<TerminalSnapshot>;
+
+    /// Input-relevant terminal modes (DECCKM today) read live so the
+    /// keystroke encoder can emit the right cursor-key form. Default returns
+    /// the all-off mode so fixture / replay backends don't have to care.
+    fn input_mode(&self, _id: TerminalSessionId) -> InputMode {
+        InputMode::default()
+    }
+
+    /// Mouse-reporting modes the app has enabled. Default all-off so the
+    /// renderer keeps mouse events for local selection / scrollback.
+    fn mouse_mode(&self, _id: TerminalSessionId) -> MouseMode {
+        MouseMode::default()
+    }
 
     /// True when the session has DECSET 2004 (bracketed paste) enabled.
     /// Callers use this to decide whether pasted clipboard text should be

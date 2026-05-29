@@ -18,12 +18,12 @@ pub mod portable_pty_backend;
 pub mod snapshot;
 pub mod state;
 
-pub use backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
+pub use backend::{InputMode, MouseMode, SpawnConfig, TerminalBackend, TerminalSessionId};
 pub use events::TerminalEvent;
 pub use grid_serializer::{
     CAPTURE_HEADER_LEN, CAPTURE_HEADER_MAGIC, SerializeOptions, build_capture_header,
     parse_capture_header, serialize_term, serialize_term_capped, serialize_term_capped_with_dims,
 };
 pub use portable_pty_backend::PortablePtyBackend;
-pub use snapshot::{Cell, CellColor, NamedColor16, TerminalSnapshot};
+pub use snapshot::{Cell, CellColor, CursorShapeKind, NamedColor16, TerminalSnapshot};
 pub use state::TerminalState;

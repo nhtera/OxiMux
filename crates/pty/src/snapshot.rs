@@ -63,6 +63,18 @@ pub struct Cell {
     pub hidden: bool,
 }
 
+/// Cursor shape the app requested via DECSCUSR, decoupled from alacritty's
+/// `CursorShape` so the app crate never depends on vte. `Hidden` covers both
+/// `CursorShape::Hidden` and DECTCEM-off; the renderer draws nothing for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShapeKind {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+    Hidden,
+}
+
 /// A frame-aligned snapshot. Cheap to clone (Vec<Row> small under 24x80).
 #[derive(Debug, Clone, Default)]
 pub struct TerminalSnapshot {
@@ -74,6 +86,8 @@ pub struct TerminalSnapshot {
     /// (live). `> 0` = the user has scrolled up into history; drives the
     /// "scrolled-up" indicator and tells callers the cursor may be hidden.
     pub display_offset: usize,
+    /// Shape the app asked the cursor to take (DECSCUSR / DECTCEM).
+    pub cursor_shape: CursorShapeKind,
 }
 
 impl TerminalSnapshot {
@@ -84,6 +98,7 @@ impl TerminalSnapshot {
             cursor: (0, 0),
             cells: Vec::new(),
             display_offset: 0,
+            cursor_shape: CursorShapeKind::Block,
         }
     }
 }

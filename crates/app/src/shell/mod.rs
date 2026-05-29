@@ -22,6 +22,7 @@ pub mod git_panel;
 pub mod key_input;
 pub mod left_rail;
 pub mod main_area;
+pub mod mouse_report;
 pub mod openable_text_file;
 pub mod pane_actions;
 pub mod pane_content;

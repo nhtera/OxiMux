@@ -22,7 +22,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor};
 
 use crate::snapshot::{Cell, CellColor, NamedColor16, TerminalSnapshot};
 
@@ -110,6 +110,44 @@ impl TerminalState {
     /// right after `advance` so a BEL in the chunk becomes a `TerminalEvent::Bell`.
     pub fn take_bell(&self) -> bool {
         self.bell.swap(false, Ordering::AcqRel)
+    }
+
+    /// Input-relevant terminal modes for the keystroke encoder. Reads
+    /// `TermMode::APP_CURSOR` (DECCKM) live so cursor keys switch to SS3 form
+    /// while a full-screen app owns the screen.
+    pub fn input_mode(&self) -> crate::InputMode {
+        crate::InputMode {
+            app_cursor: self.term.mode().contains(TermMode::APP_CURSOR),
+        }
+    }
+
+    /// Cursor shape the app requested (DECSCUSR), mapped off alacritty's
+    /// renderable cursor. `Hidden` covers both an explicit hidden shape and
+    /// DECTCEM-off so the renderer has a single "draw nothing" signal.
+    fn cursor_shape(&self) -> crate::CursorShapeKind {
+        use crate::CursorShapeKind;
+        match self.term.renderable_content().cursor.shape {
+            CursorShape::Block => CursorShapeKind::Block,
+            CursorShape::Beam => CursorShapeKind::Bar,
+            CursorShape::Underline => CursorShapeKind::Underline,
+            CursorShape::Hidden => CursorShapeKind::Hidden,
+            // HollowBlock (and any future variant) → solid block.
+            _ => CursorShapeKind::Block,
+        }
+    }
+
+    /// Mouse-reporting modes the app has enabled, read live so the renderer
+    /// can decide per-event whether to forward the mouse to the child.
+    pub fn mouse_mode(&self) -> crate::MouseMode {
+        let m = self.term.mode();
+        crate::MouseMode {
+            report_click: m.contains(TermMode::MOUSE_REPORT_CLICK),
+            report_drag: m.contains(TermMode::MOUSE_DRAG),
+            report_motion: m.contains(TermMode::MOUSE_MOTION),
+            sgr: m.contains(TermMode::SGR_MOUSE),
+            alternate_scroll: m.contains(TermMode::ALTERNATE_SCROLL),
+            alt_screen: m.contains(TermMode::ALT_SCREEN),
+        }
     }
 
     /// True when the shell has requested DECSET 2004 (bracketed paste).
@@ -215,6 +253,7 @@ impl TerminalState {
 
         let offset = self.term.grid().display_offset() as i32;
         snap.display_offset = offset as usize;
+        snap.cursor_shape = self.cursor_shape();
 
         // The cursor lives in active-area coords (line ≥ 0); in the displayed
         // viewport it shifts DOWN by the scroll offset. When it falls outside
@@ -462,6 +501,25 @@ mod tests {
         state.advance(b"\x1b[30;1HY");
         let snap = fresh_snapshot(&state);
         assert_eq!(snap.cursor, (29, 1));
+    }
+
+    #[test]
+    fn cursor_shape_tracks_decscusr_and_dectcem() {
+        use crate::CursorShapeKind;
+        let mut state = TerminalState::new(20, 3, 100);
+        assert_eq!(fresh_snapshot(&state).cursor_shape, CursorShapeKind::Block);
+        // DECSCUSR 5 = blinking bar (alacritty Beam).
+        state.advance(b"\x1b[5 q");
+        assert_eq!(fresh_snapshot(&state).cursor_shape, CursorShapeKind::Bar);
+        // DECSCUSR 3 = blinking underline.
+        state.advance(b"\x1b[3 q");
+        assert_eq!(
+            fresh_snapshot(&state).cursor_shape,
+            CursorShapeKind::Underline
+        );
+        // DECTCEM hide → Hidden regardless of shape.
+        state.advance(b"\x1b[?25l");
+        assert_eq!(fresh_snapshot(&state).cursor_shape, CursorShapeKind::Hidden);
     }
 
     #[test]

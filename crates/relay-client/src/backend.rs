@@ -366,6 +366,22 @@ impl TerminalBackend for RelayBackend {
         Ok(snap)
     }
 
+    fn input_mode(&self, id: TerminalSessionId) -> oximux_pty::InputMode {
+        let sessions = self.sessions.lock().expect("sessions poisoned");
+        sessions
+            .get(&id)
+            .and_then(|s| s.state.lock().ok().map(|st| st.input_mode()))
+            .unwrap_or_default()
+    }
+
+    fn mouse_mode(&self, id: TerminalSessionId) -> oximux_pty::MouseMode {
+        let sessions = self.sessions.lock().expect("sessions poisoned");
+        sessions
+            .get(&id)
+            .and_then(|s| s.state.lock().ok().map(|st| st.mouse_mode()))
+            .unwrap_or_default()
+    }
+
     fn scroll(&mut self, id: TerminalSessionId, delta: i32) -> Result<()> {
         let sessions = self.sessions.lock().expect("sessions poisoned");
         let session = sessions
