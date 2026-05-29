@@ -923,3 +923,58 @@ async fn close_request_removes_pty_from_list() {
         "pty still listed"
     );
 }
+
+// Spawn.env must reach the child process environment. The daemon forwards
+// every (key, value) pair from the Spawn request into the shell child
+// (registry.rs spawn loop, after the TERM/COLORTERM defaults). This is the
+// ONLY end-to-end check that the per-pane identity vars set by the app
+// actually land in the shell — every other test here spawns with an empty
+// env. The child echoes the two vars back; the markers can only appear in
+// the EXPANDED output because the typed command references the variable
+// NAMES (not the values), so the echoed input line never contains them and
+// a substring match is unambiguous.
+#[tokio::test]
+async fn spawn_env_reaches_child_process() {
+    let relay = boot_relay().await;
+    let (mut s, mut buf) = connect_and_hello(&relay).await;
+    let pty_id = match req(
+        &mut s,
+        &mut buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            env: vec![
+                ("OXIMUX_WORKSPACE_ID".into(), "WS_ENV_MARKER_42".into()),
+                ("OXIMUX_SURFACE_ID".into(), "SURF_ENV_MARKER_7".into()),
+            ],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn: {other:?}"),
+    };
+
+    let resp = req(
+        &mut s,
+        &mut buf,
+        3,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: b"echo \"$OXIMUX_WORKSPACE_ID|$OXIMUX_SURFACE_ID\"\nexit\n".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok), "write got {resp:?}");
+
+    let (out, exit) = collect_output(&mut s, &mut buf, &pty_id, Duration::from_secs(5)).await;
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("WS_ENV_MARKER_42|SURF_ENV_MARKER_7"),
+        "child env missing injected vars; got {text:?}"
+    );
+    assert!(exit.is_some(), "expected Exit notification");
+}

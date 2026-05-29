@@ -113,6 +113,51 @@ fn spawn_write_observe_output_then_exit() {
     fx.backend.close(id).expect("close idempotent");
 }
 
+// Context-env round-trip through the FULL client path: `SpawnConfig.env`
+// → wire → daemon → child environment. The sibling daemon-protocol test
+// proves the daemon honors the env; this proves the env survives
+// `SpawnConfig` serialization through `RelayBackend` (the exact API the
+// app drives when it injects the per-pane identity vars). Same reasoning
+// as that test: the markers can only appear in the expanded echo output,
+// never in the typed command (which references the variable NAMES), so a
+// substring match is unambiguous.
+#[test]
+fn spawn_config_env_reaches_child_via_backend() {
+    let mut fx = boot_fixture();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        cwd: PathBuf::from("/tmp"),
+        cols: 80,
+        rows: 24,
+        env: vec![
+            ("OXIMUX_WORKSPACE_ID".into(), "WS_CLIENT_MARKER_5".into()),
+            ("OXIMUX_TAB_ID".into(), "TAB_CLIENT_MARKER_9".into()),
+        ],
+        ..SpawnConfig::default()
+    };
+    let id = fx.backend.spawn(cfg).expect("spawn");
+    fx.backend
+        .write(id, b"echo \"$OXIMUX_WORKSPACE_ID|$OXIMUX_TAB_ID\"\nexit\n")
+        .expect("write");
+
+    let events = drain_until(&mut fx.backend, Duration::from_secs(5), |e| {
+        matches!(e, TerminalEvent::Exit { .. })
+    });
+    let mut combined = Vec::new();
+    for ev in events {
+        if let TerminalEvent::Output { bytes, .. } = ev {
+            combined.extend(bytes);
+        }
+    }
+    let text = String::from_utf8_lossy(&combined);
+    assert!(
+        text.contains("WS_CLIENT_MARKER_5|TAB_CLIENT_MARKER_9"),
+        "SpawnConfig.env didn't reach child; got {text:?}"
+    );
+
+    fx.backend.close(id).expect("close idempotent");
+}
+
 #[test]
 fn detach_keeps_pty_alive_for_reattach() {
     // Tear-off invariant (Phase 3 Slice C): detaching ONE attachment must not

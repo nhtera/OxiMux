@@ -748,3 +748,114 @@ pub fn save_windows_manifest(repo: &SettingsRepo, manifest: &WindowsManifest) {
         Err(err) => tracing::warn!(?err, "save_windows_manifest: serialize failed"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pure-logic coverage for the restore-factory decision helpers. These
+    //! gate the boot-time restore path: which terminal tabs need the full
+    //! sub-pane tree rebuild vs the single-view fast path, how a stale cwd
+    //! is resolved, and how a single-leaf tab's identity triple is
+    //! recovered (or minted when the blob predates context env). No GPUI
+    //! context is needed — the functions are deterministic over plain data.
+    use super::*;
+    use crate::persisted_terminals::{PersistedLeafTab, PersistedSubPane};
+    use std::path::Path;
+
+    fn leaf_sub_pane(surface: &str, tab: &str) -> PersistedSubPane {
+        PersistedSubPane {
+            surface_id: surface.into(),
+            tab_id: tab.into(),
+            ..PersistedSubPane::default()
+        }
+    }
+
+    #[test]
+    fn needs_tree_restore_false_for_single_leaf_single_tab() {
+        // One leaf, one implicit tab → fast single-view path, no rebuild.
+        let tab = PersistedTab {
+            sub_panes: vec![leaf_sub_pane("s0", "t0")],
+            ..PersistedTab::default()
+        };
+        assert!(!needs_tree_restore(&tab));
+    }
+
+    #[test]
+    fn needs_tree_restore_true_for_multiple_leaves() {
+        let tab = PersistedTab {
+            sub_panes: vec![leaf_sub_pane("s0", "t0"), leaf_sub_pane("s1", "t1")],
+            ..PersistedTab::default()
+        };
+        assert!(needs_tree_restore(&tab));
+    }
+
+    #[test]
+    fn needs_tree_restore_true_for_single_leaf_multi_tab_strip() {
+        // One leaf, but its per-pane tab strip holds 2 terminals. The fast
+        // single-view path would silently drop the second tab, so the
+        // restorer MUST take the full tree path here.
+        let mut sp = leaf_sub_pane("s0", "t0");
+        sp.tabs = vec![
+            PersistedLeafTab {
+                cwd: None,
+                surface_id: "s0".into(),
+                tab_id: "t0".into(),
+            },
+            PersistedLeafTab {
+                cwd: None,
+                surface_id: "s1".into(),
+                tab_id: "t1".into(),
+            },
+        ];
+        let tab = PersistedTab {
+            sub_panes: vec![sp],
+            ..PersistedTab::default()
+        };
+        assert!(needs_tree_restore(&tab));
+    }
+
+    #[test]
+    fn resolve_cwd_keeps_existing_dir() {
+        // The crate manifest dir is guaranteed to exist on disk.
+        let real = env!("CARGO_MANIFEST_DIR");
+        assert_eq!(
+            resolve_cwd(Some(real), Path::new("/tmp")),
+            PathBuf::from(real)
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_falls_back_when_missing_or_absent() {
+        let project = Path::new("/tmp");
+        // A path that no longer exists → fall back to the project cwd
+        // rather than spawning a shell into a stale directory.
+        assert_eq!(
+            resolve_cwd(Some("/no/such/dir/oximux-xyz-123"), project),
+            project.to_path_buf()
+        );
+        // No captured cwd → project cwd.
+        assert_eq!(resolve_cwd(None, project), project.to_path_buf());
+    }
+
+    #[test]
+    fn single_leaf_ids_preserves_persisted_ids() {
+        let tab = PersistedTab {
+            sub_panes: vec![leaf_sub_pane("surf-keep", "tab-keep")],
+            ..PersistedTab::default()
+        };
+        let ids = single_leaf_ids(&tab, Path::new("/proj/root"));
+        assert_eq!(ids.workspace_id, "/proj/root");
+        assert_eq!(ids.surface_id, "surf-keep");
+        assert_eq!(ids.tab_id, "tab-keep");
+    }
+
+    #[test]
+    fn single_leaf_ids_mints_when_absent() {
+        // Legacy blob with no sub-panes → ids minted fresh, never empty,
+        // so every restored terminal still has a stable identity going on.
+        let tab = PersistedTab::default();
+        let ids = single_leaf_ids(&tab, Path::new("/proj/root"));
+        assert_eq!(ids.workspace_id, "/proj/root");
+        assert!(!ids.surface_id.is_empty(), "surface id must be minted");
+        assert!(!ids.tab_id.is_empty(), "tab id must be minted");
+    }
+}

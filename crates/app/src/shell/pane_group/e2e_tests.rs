@@ -16,9 +16,10 @@
 //! backend is not installed. Keeping the tab count small (≤ 3 shells) caps
 //! CI resource use.
 
+use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
-use gpui::TestAppContext;
+use gpui::{AppContext, Context, Entity, Subscription, TestAppContext, Window};
 use tempfile::TempDir;
 
 use oximux_agents::CliRuntime;
@@ -26,8 +27,12 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{CloseTab, SplitSubPaneRight};
 use crate::notifier::null::NullNotifier;
+use crate::persisted_terminals::{PersistedAxis, PersistedTree};
+use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
+use crate::shell::pane_group::sub_pane::TerminalSplitTree;
+use crate::shell::terminal_view::{TerminalView, spawn_local_pty_dormant};
 
 /// Convenience: boot a `PaneGroup` entity inside a GPUI test window.
 /// Returns `(window, temp_dir)`. `temp_dir` must stay alive for the
@@ -217,4 +222,91 @@ async fn split_sub_pane_right_creates_second_live_pane(cx: &mut TestAppContext) 
             "split must produce exactly 2 live sub-panes"
         );
     });
+}
+
+// ── from_persisted rebuilds a split with a multi-tab leaf ──────────────────
+//
+// The boot-time restore primitive: given a persisted tree shape + per-leaf
+// tab lists, `TerminalSplitTree::from_persisted` must rebuild the exact
+// structure — a 2-leaf split where leaf 0 carries a 2-tab per-pane strip
+// (active = the second tab) and leaf 1 is single-tab. This is the seam
+// `build_multi_sub_pane_tree` drives on every multi-sub-pane restore; the
+// fast single-view path would collapse leaf 0's strip to one tab, so the
+// per-leaf tab count + active index + the round-tripped surface/tab ids are
+// the contract worth pinning. Views are spawned DORMANT (grid emulator, no
+// PTY child) exactly as the restore path does, so the test stays cheap.
+#[gpui::test]
+async fn from_persisted_rebuilds_split_with_multi_tab_leaf(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+
+    window
+        .update(cx, |_group, win, cx| {
+            // Build one dormant terminal view carrying a restored identity.
+            let build = |surface: &str,
+                         tab: &str,
+                         win: &mut Window,
+                         cx: &mut Context<PaneGroup>|
+             -> (Entity<TerminalView>, Subscription) {
+                let (backend, session_id) =
+                    spawn_local_pty_dormant(80, 24).expect("dormant spawn (PTY fallback)");
+                let ids = SurfaceIds::restored(
+                    "/proj/root".to_string(),
+                    surface.to_string(),
+                    tab.to_string(),
+                );
+                let view = cx.new(|cx| {
+                    TerminalView::mount_dormant(
+                        backend,
+                        session_id,
+                        ids,
+                        PathBuf::from("/tmp"),
+                        &[],
+                        Theme::default(),
+                        Density::default(),
+                        Typography::default(),
+                        win,
+                        cx,
+                    )
+                });
+                let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+                (view, observer)
+            };
+
+            // Leaf 0: two-tab strip, active = second tab. Leaf 1: single tab.
+            let leaves = vec![
+                (
+                    vec![
+                        build("s0-0", "t0-0", win, cx),
+                        build("s0-1", "t0-1", win, cx),
+                    ],
+                    1usize,
+                ),
+                (vec![build("s1-0", "t1-0", win, cx)], 0usize),
+            ];
+
+            let proto = PersistedTree::Split {
+                axis: PersistedAxis::Horizontal,
+                children: vec![PersistedTree::Leaf, PersistedTree::Leaf],
+                weights: vec![0.5, 0.5],
+            };
+            let tree = TerminalSplitTree::from_persisted(&proto, leaves, 0);
+
+            // Structure: two live leaves.
+            assert_eq!(tree.live_count(), 2, "split must restore 2 live leaves");
+
+            // Leaf 0 keeps its full 2-tab strip + restored active index.
+            let leaf0 = tree.leaf(0).expect("leaf 0 present");
+            assert_eq!(leaf0.len(), 2, "leaf 0 must keep both per-pane tabs");
+            assert_eq!(leaf0.active(), 1, "leaf 0 active tab index preserved");
+
+            // Leaf 1 is single-tab.
+            let leaf1 = tree.leaf(1).expect("leaf 1 present");
+            assert_eq!(leaf1.len(), 1, "leaf 1 must be single-tab");
+
+            // Identity round-trips onto the rebuilt views (leaf 0, tab 1).
+            let v01 = leaf0.tabs()[1].view().read(cx);
+            assert_eq!(v01.surface_id(), "s0-1", "surface id must round-trip");
+            assert_eq!(v01.tab_id(), "t0-1", "tab id must round-trip");
+        })
+        .expect("window update ok");
 }
