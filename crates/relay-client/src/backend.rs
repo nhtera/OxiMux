@@ -141,7 +141,13 @@ impl RelayBackend {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, SCROLLBACK_ROWS)));
-        state.lock().expect("state poisoned").advance(&replay);
+        {
+            let mut s = state.lock().expect("state poisoned");
+            s.advance(&replay);
+            // Replay is historical: drop title/clipboard/bell/color events it
+            // fired so they don't leak into the first live frame.
+            s.clear_collected();
+        }
 
         let id = self.mint_id();
         let generation = Arc::new(AtomicU64::new(1));
@@ -205,17 +211,21 @@ fn apply_relay_notification(
     }
     match n {
         Notification::Output { bytes, .. } => {
-            let bell = match state.lock() {
-                Ok(mut s) => {
-                    s.advance(&bytes);
-                    s.take_bell()
-                }
-                Err(_) => false,
+            // Collect derived events (bell, command marks, progress, title,
+            // clipboard, device/color replies) in the same locked pass that
+            // advances the grid, then queue them AHEAD of this chunk's Output
+            // so attention (bell) lands before the bytes that raised it.
+            let derived = match state.lock() {
+                Ok(mut s) => s.advance_collecting(id, &bytes),
+                Err(_) => Vec::new(),
             };
-            // BEL → attention signal for the owning pane, queued ahead of
-            // this chunk's Output (same chunk; order moot).
-            if bell {
-                push_event(queues, id, TerminalEvent::Bell { id });
+            for ev in derived {
+                // The daemon owns cwd over the relay; drop OSC 7 here rather
+                // than threading a cwd cache the relay backend doesn't keep.
+                if matches!(ev, TerminalEvent::CwdChanged { .. }) {
+                    continue;
+                }
+                push_event(queues, id, ev);
             }
             push_event(queues, id, TerminalEvent::Output { id, bytes });
             ControlFlow::Continue(())
@@ -463,6 +473,7 @@ impl TerminalBackend for RelayBackend {
             } else {
                 state.advance(bytes);
             }
+            state.clear_collected();
         }
         Ok(())
     }

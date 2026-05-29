@@ -29,8 +29,8 @@ use gpui::{
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
-    PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId,
-    TerminalSnapshot,
+    CommandMarkKind, PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent,
+    TerminalSessionId, TerminalSnapshot,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -240,6 +240,18 @@ struct SelectDrag {
     kind: SelectKind,
 }
 
+/// Cap on retained shell-integration command marks — only recent prompts get
+/// a gutter badge, and the oldest age out of the scrollback anyway.
+const MAX_COMMAND_MARKS: usize = 256;
+
+/// A shell-integration command mark anchored to an absolute history line.
+/// `exit` is `None` while the command runs and `Some(code)` once it finishes.
+#[derive(Clone, Copy)]
+struct CommandMark {
+    line: u64,
+    exit: Option<i32>,
+}
+
 pub struct TerminalView {
     /// `Arc<Mutex<Box<dyn TerminalBackend>>>` — shared with whoever spawned
     /// the session. For local terminals the renderer is the only holder;
@@ -321,6 +333,15 @@ pub struct TerminalView {
     /// held, so the canvas can underline it. Cleared when the pointer leaves a
     /// link or Cmd is released.
     hovered_link: Option<(usize, usize, usize)>,
+    /// Shell-integration command marks (OSC 133/633), newest last. Each holds
+    /// the absolute history line of its prompt and the exit code once the
+    /// command finishes — the canvas paints a gutter badge (red on non-zero).
+    /// Bounded to the most recent `MAX_COMMAND_MARKS`.
+    command_marks: Vec<CommandMark>,
+    /// Latest OSC 9;4 progress `(state, value)` the child reported, if any.
+    /// Surfaced for a future progress affordance; an error/warning state also
+    /// raises pane attention when unfocused.
+    progress: Option<(u8, u8)>,
     /// Stable identity triple (workspace / surface / tab). Injected into
     /// the spawn env as `OXIMUX_*`, persisted alongside the pane layout,
     /// and re-injected verbatim when a dormant pane respawns its shell so
@@ -427,6 +448,8 @@ impl TerminalView {
             selecting: None,
             opener: None,
             hovered_link: None,
+            command_marks: Vec::new(),
+            progress: None,
         }
     }
 
@@ -517,6 +540,8 @@ impl TerminalView {
             selecting: None,
             opener: None,
             hovered_link: None,
+            command_marks: Vec::new(),
+            progress: None,
         }
     }
 
@@ -1219,6 +1244,8 @@ impl TerminalView {
         let mut had_output = false;
         let mut got_bell = false;
         let mut latest_title: Option<String> = None;
+        let mut clipboard_text: Option<String> = None;
+        let mut pty_replies: Vec<Vec<u8>> = Vec::new();
         for ev in &events {
             match ev {
                 TerminalEvent::Output { .. } => {
@@ -1232,6 +1259,28 @@ impl TerminalView {
                 // A BEL while this pane is NOT focused raises attention. A bell
                 // in the pane you're already looking at is just noise.
                 TerminalEvent::Bell { .. } if !self.focused => got_bell = true,
+                // OSC 52: the child asked to set the system clipboard. Keep the
+                // last in the batch; written once below.
+                TerminalEvent::Clipboard { text, .. } => clipboard_text = Some(text.clone()),
+                // Device/color query replies (DSR, DA, OSC 11) — write back to
+                // the PTY after the loop so probing tools don't stall.
+                TerminalEvent::PtyReply { bytes, .. } => pty_replies.push(bytes.clone()),
+                // Shell-integration command marks drive the prompt gutter badge.
+                TerminalEvent::CommandMark {
+                    kind, exit, line, ..
+                } => self.apply_command_mark(*kind, *exit, *line),
+                // OSC 9;4 progress. state 0 clears; error/warning raises
+                // attention on an unfocused pane like a bell.
+                TerminalEvent::Progress { state, value, .. } => {
+                    self.progress = if *state == 0 {
+                        None
+                    } else {
+                        Some((*state, *value))
+                    };
+                    if matches!(*state, 2 | 4) && !self.focused {
+                        got_bell = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1249,13 +1298,76 @@ impl TerminalView {
         if let Some(title) = latest_title {
             self.title = Some(title);
         }
+        if let Some(text) = clipboard_text {
+            // SECURITY: OSC 52 lets terminal OUTPUT set the system clipboard.
+            // For remote/relay panes that means a remote process can silently
+            // overwrite your clipboard (injection surface on the next paste).
+            // This follows alacritty's permissive default (copy allowed); a
+            // user-facing allow-list will gate it. No remote-vs-local guard yet.
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+        for bytes in pty_replies {
+            if let Err(err) = self.with_backend(|be| be.write(session_id, &bytes)) {
+                tracing::warn!(?err, "pty reply write failed");
+            }
+        }
         cx.notify();
+    }
+
+    /// Fold a shell-integration command mark into the gutter-badge list. A
+    /// prompt-start opens a new mark at its anchor line; a command-end attaches
+    /// the exit code to the most recent open mark. Intermediate phases
+    /// (B/C / output-start) carry no badge of their own.
+    fn apply_command_mark(&mut self, kind: CommandMarkKind, exit: Option<i32>, line: u64) {
+        match kind {
+            CommandMarkKind::PromptStart => {
+                self.command_marks.push(CommandMark { line, exit: None });
+                if self.command_marks.len() > MAX_COMMAND_MARKS {
+                    let overflow = self.command_marks.len() - MAX_COMMAND_MARKS;
+                    self.command_marks.drain(0..overflow);
+                }
+            }
+            CommandMarkKind::CommandEnd => {
+                if let Some(last) = self.command_marks.last_mut() {
+                    last.exit = exit;
+                }
+            }
+            CommandMarkKind::CommandStart | CommandMarkKind::OutputStart => {}
+        }
+    }
+
+    /// Command-mark badges for the rows currently visible: `(screen_row,
+    /// is_error)`. Maps each mark's absolute history line through the live
+    /// snapshot's `history_len`/`display_offset`, dropping marks scrolled out
+    /// of view. Only finished commands (a known exit code) get a badge.
+    fn visible_command_badges(&self) -> Vec<(usize, bool)> {
+        let rows = self.snapshot.rows as i64;
+        if rows == 0 {
+            return Vec::new();
+        }
+        let base = self.snapshot.history_len as i64 - self.snapshot.display_offset as i64;
+        let mut out = Vec::new();
+        for mark in &self.command_marks {
+            let Some(exit) = mark.exit else { continue };
+            let screen_row = mark.line as i64 - base;
+            if (0..rows).contains(&screen_row) {
+                out.push((screen_row as usize, exit != 0));
+            }
+        }
+        out
     }
 
     /// Latest OSC 2 title the shell emitted, if any. Exposed for future use
     /// by the workspace tab strip.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Latest OSC 9;4 progress `(state, value)` the child reported, if any.
+    /// `state`: 1 set, 2 error, 3 indeterminate, 4 warning; `value` is 0..=100.
+    /// Exposed for a future progress affordance on the tab strip.
+    pub fn progress(&self) -> Option<(u8, u8)> {
+        self.progress
     }
 
     /// True when this pane has a pending attention signal (an unfocused-pane
@@ -1422,6 +1534,7 @@ impl Render for TerminalView {
             pad,
             hovered_link: self.hovered_link,
             selection: self.selection,
+            command_badges: self.visible_command_badges(),
         };
 
         let overlay = if self.search.active {
@@ -1892,6 +2005,7 @@ mod selection_tests {
             cells,
             display_offset: 0,
             cursor_shape: oximux_pty::CursorShapeKind::Block,
+            history_len: 0,
             links: Vec::new(),
         }
     }

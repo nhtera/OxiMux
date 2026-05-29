@@ -87,6 +87,10 @@ pub struct PaintParams {
     /// theme.selection bg overlay BEHIND text but ON TOP of cell bg so
     /// the user can still read the underlying styled content through it.
     pub selection: Option<(usize, usize, usize, usize)>,
+    /// Shell-integration command-mark badges as `(screen_row, is_error)`. A
+    /// thin bar in the left padding gutter of each prompt row — green for a
+    /// zero exit, red for non-zero. Empty unless the shell emits OSC 133/633.
+    pub command_badges: Vec<(usize, bool)>,
 }
 
 /// Compute the `(cols, rows)` that fit in a canvas of `bounds`, given the
@@ -388,6 +392,26 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
                 },
             };
             window.paint_quad(fill(rect, p.theme.fg_base));
+        }
+
+        // Shell-integration command-mark badge: a thin bar in the left padding
+        // gutter of the prompt row. Green for a zero exit, red otherwise.
+        for &(badge_row, is_error) in &p.command_badges {
+            if badge_row == row_idx {
+                let color = if is_error {
+                    p.theme.status_error
+                } else {
+                    p.theme.status_ok
+                };
+                let rect = Bounds {
+                    origin: point(bounds.origin.x + px(2.0), row_y),
+                    size: Size {
+                        width: px(2.0),
+                        height: line_h,
+                    },
+                };
+                window.paint_quad(fill(rect, color));
+            }
         }
     }
 }

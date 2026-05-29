@@ -1,8 +1,13 @@
-//! OSC 7 `file://` URI scanner — used to track each PTY's current working
-//! directory cheaply.
+//! Out-of-band OSC scanner — runs alongside alacritty's parser to pick up
+//! the OSC sequences alacritty does NOT surface as events: OSC 7 (cwd),
+//! OSC 133/633 (shell-integration command marks), and OSC 9;4 (progress).
 //!
-//! Shells configured with an OSC 7 hook (most modern zsh / bash setups via
-//! `precmd` or `PROMPT_COMMAND`) emit:
+//! Everything alacritty already decodes (OSC 0/2 title, OSC 52 clipboard,
+//! OSC 4/10/11/12 color queries, device reports) is captured via the `Term`
+//! event listener in `state.rs` instead — decoding those twice would
+//! double-handle (two clipboard writes, two color replies).
+//!
+//! Shells with an OSC 7 hook (`precmd` / `PROMPT_COMMAND`) emit:
 //!
 //!   ESC ] 7 ; file://hostname/url-encoded-path BEL
 //!     or
@@ -16,17 +21,34 @@
 //! - Streaming: chunks can split an OSC mid-sequence (the kernel hands us
 //!   ~4 KiB at a time; OSC payloads can be ~256 bytes). The state machine
 //!   carries across `feed` calls.
-//! - We only care about OSC 7 — every other OSC payload (titles, hyperlinks,
-//!   palette tweaks) is discarded after collection.
+//! - Only the OSC numbers we handle emit a hit; every other payload (titles,
+//!   hyperlinks, palette tweaks) is discarded after collection.
 //! - Runaway protection: an OSC payload that grows past `MAX_OSC_BYTES`
 //!   without a terminator is dropped and the scanner resets to Normal.
 //!   The shell is broken; we don't want to leak memory chasing it.
 
 use std::path::PathBuf;
 
+use crate::events::CommandMarkKind;
+
 /// Hard cap on a single OSC payload buffer. RFC has no real limit but
 /// 4 KiB is several orders of magnitude over any realistic OSC 7 path.
 const MAX_OSC_BYTES: usize = 4096;
+
+/// A decoded OSC sequence the scanner cares about. Anything else is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OscHit {
+    /// OSC 7 — resolved absolute working directory.
+    Cwd(PathBuf),
+    /// OSC 133 / 633 — shell-integration command phase + optional exit code.
+    CommandMark {
+        kind: CommandMarkKind,
+        exit: Option<i32>,
+    },
+    /// OSC 9;4 — progress. `state`: 0 clear, 1 set, 2 error, 3 indeterminate,
+    /// 4 warning. `value` is a 0..=100 percentage.
+    Progress { state: u8, value: u8 },
+}
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -44,31 +66,31 @@ enum OscState {
     InOscAfterEsc(Vec<u8>),
 }
 
-/// Stateful scanner: feed bytes via [`Osc7Scanner::feed`]; whenever an
-/// OSC 7 payload completes, the callback receives the parsed absolute path.
-/// Bytes that aren't OSC 7 (or are corrupt) are silently discarded — the
-/// scanner never panics on malformed input.
+/// Stateful scanner: feed bytes via [`OscScanner::feed`]; whenever a handled
+/// OSC payload completes, the callback receives an [`OscHit`]. Bytes that
+/// aren't a handled OSC (or are corrupt) are silently discarded — the scanner
+/// never panics on malformed input.
 #[derive(Default)]
-pub struct Osc7Scanner {
+pub struct OscScanner {
     state: OscState,
 }
 
-impl Osc7Scanner {
+impl OscScanner {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Feed a chunk; for every OSC 7 file:// payload that completes inside
-    /// or across this chunk, `on_cwd` is called with the resolved absolute
-    /// path. Non-OSC-7 traffic costs ~1 ns per byte (single match + byte
-    /// compare) — cheap enough to run on every PTY read.
-    pub fn feed<F: FnMut(PathBuf)>(&mut self, bytes: &[u8], mut on_cwd: F) {
+    /// Feed a chunk; for every handled OSC payload that completes inside or
+    /// across this chunk, `on_hit` is called. Non-handled traffic costs ~1 ns
+    /// per byte (single match + byte compare) — cheap enough to run on every
+    /// PTY read.
+    pub fn feed<F: FnMut(OscHit)>(&mut self, bytes: &[u8], mut on_hit: F) {
         for &b in bytes {
-            self.step(b, &mut on_cwd);
+            self.step(b, &mut on_hit);
         }
     }
 
-    fn step<F: FnMut(PathBuf)>(&mut self, b: u8, on_cwd: &mut F) {
+    fn step<F: FnMut(OscHit)>(&mut self, b: u8, on_hit: &mut F) {
         // Take ownership of current state so we can move owned `Vec`s
         // around without borrow conflicts.
         let prev = std::mem::take(&mut self.state);
@@ -87,7 +109,7 @@ impl Osc7Scanner {
             },
             OscState::InOsc(mut buf) => match b {
                 BEL => {
-                    Self::dispatch(&buf, on_cwd);
+                    Self::dispatch(&buf, on_hit);
                     OscState::Normal
                 }
                 ESC => OscState::InOscAfterEsc(buf),
@@ -103,13 +125,13 @@ impl Osc7Scanner {
             },
             OscState::InOscAfterEsc(buf) => match b {
                 b'\\' => {
-                    Self::dispatch(&buf, on_cwd);
+                    Self::dispatch(&buf, on_hit);
                     OscState::Normal
                 }
                 ESC => {
                     // Two ESCs back-to-back inside OSC — flush whatever we
                     // have, then re-arm for a potential new escape.
-                    Self::dispatch(&buf, on_cwd);
+                    Self::dispatch(&buf, on_hit);
                     OscState::AfterEsc
                 }
                 _ => {
@@ -122,18 +144,79 @@ impl Osc7Scanner {
         };
     }
 
-    fn dispatch<F: FnMut(PathBuf)>(buf: &[u8], on_cwd: &mut F) {
-        // OSC 7 payload starts with `7;` then the URI.
-        let Some(rest) = buf.strip_prefix(b"7;") else {
+    fn dispatch<F: FnMut(OscHit)>(buf: &[u8], on_hit: &mut F) {
+        // Split off the OSC number prefix (`<num>;<rest>`).
+        let Some(semi) = buf.iter().position(|&b| b == b';') else {
             return;
         };
-        let Ok(s) = std::str::from_utf8(rest) else {
-            return;
-        };
-        if let Some(path) = parse_file_uri(s) {
-            on_cwd(path);
+        let (num, rest) = (&buf[..semi], &buf[semi + 1..]);
+        match num {
+            // OSC 7 — `file://host/path` working directory.
+            b"7" => {
+                if let Ok(s) = std::str::from_utf8(rest)
+                    && let Some(path) = parse_file_uri(s)
+                {
+                    on_hit(OscHit::Cwd(path));
+                }
+            }
+            // OSC 133 (FinalTerm) / OSC 633 (VS Code) command marks share the
+            // A/B/C/D phase tags; 633's extra E/F/P fields parse to None.
+            b"133" | b"633" => {
+                if let Some(hit) = parse_command_mark(rest) {
+                    on_hit(hit);
+                }
+            }
+            // OSC 9 is overloaded; only `9;4;state;value` (progress) is ours.
+            // OSC 9;<text> desktop notifications are left to a future surface.
+            b"9" => {
+                if let Some(hit) = parse_progress(rest) {
+                    on_hit(hit);
+                }
+            }
+            _ => {}
         }
     }
+}
+
+/// Parse the payload AFTER the `133;`/`633;` prefix into a command mark.
+/// `A`→PromptStart, `B`→CommandStart, `C`→OutputStart, `D[;exit]`→CommandEnd.
+/// Unknown tags (VS Code's `E`/`F`/`P`) return `None`.
+fn parse_command_mark(rest: &[u8]) -> Option<OscHit> {
+    let mut parts = rest.split(|&b| b == b';');
+    let kind = match parts.next()? {
+        b"A" => CommandMarkKind::PromptStart,
+        b"B" => CommandMarkKind::CommandStart,
+        b"C" => CommandMarkKind::OutputStart,
+        b"D" => CommandMarkKind::CommandEnd,
+        _ => return None,
+    };
+    // Exit code only meaningful on `D`; some shells append it as `D;<code>`.
+    let exit = if kind == CommandMarkKind::CommandEnd {
+        parts
+            .next()
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    } else {
+        None
+    };
+    Some(OscHit::CommandMark { kind, exit })
+}
+
+/// Parse the payload AFTER the `9;` prefix. Only `4;state;value` (progress)
+/// is handled; `state`/`value` default to 0 when absent or non-numeric.
+fn parse_progress(rest: &[u8]) -> Option<OscHit> {
+    let mut parts = rest.split(|&b| b == b';');
+    if parts.next()? != b"4" {
+        return None;
+    }
+    let parse_u8 = |p: Option<&[u8]>| -> u8 {
+        p.and_then(|s| std::str::from_utf8(s).ok())
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            .unwrap_or(0)
+    };
+    let state = parse_u8(parts.next());
+    let value = parse_u8(parts.next()).min(100);
+    Some(OscHit::Progress { state, value })
 }
 
 /// Parse a `file://hostname/path` or `file:///path` URI into an absolute
@@ -187,10 +270,21 @@ mod tests {
     use std::path::PathBuf;
 
     fn collect(bytes: &[u8]) -> Vec<PathBuf> {
-        let mut scanner = Osc7Scanner::new();
+        let mut scanner = OscScanner::new();
         let mut paths = Vec::new();
-        scanner.feed(bytes, |p| paths.push(p));
+        scanner.feed(bytes, |h| {
+            if let OscHit::Cwd(p) = h {
+                paths.push(p);
+            }
+        });
         paths
+    }
+
+    fn collect_hits(bytes: &[u8]) -> Vec<OscHit> {
+        let mut scanner = OscScanner::new();
+        let mut hits = Vec::new();
+        scanner.feed(bytes, |h| hits.push(h));
+        hits
     }
 
     #[test]
@@ -248,25 +342,117 @@ mod tests {
 
     #[test]
     fn osc7_split_across_chunks_still_emits() {
-        let mut scanner = Osc7Scanner::new();
+        let mut scanner = OscScanner::new();
         let mut paths: Vec<PathBuf> = Vec::new();
+        let push_cwd = |s: &mut OscScanner, b: &[u8], v: &mut Vec<PathBuf>| {
+            s.feed(b, |h| {
+                if let OscHit::Cwd(p) = h {
+                    v.push(p)
+                }
+            })
+        };
         // Chunk 1: ESC ] 7 ; file:///abs
-        scanner.feed(b"\x1b]7;file:///abs", |p| paths.push(p));
+        push_cwd(&mut scanner, b"\x1b]7;file:///abs", &mut paths);
         assert!(paths.is_empty(), "no terminator yet");
         // Chunk 2: /path BEL
-        scanner.feed(b"/path\x07", |p| paths.push(p));
+        push_cwd(&mut scanner, b"/path\x07", &mut paths);
         assert_eq!(paths, vec![PathBuf::from("/abs/path")]);
     }
 
     #[test]
     fn st_split_across_chunks_still_emits() {
         // ESC \\ as ST split exactly at the ESC byte boundary.
-        let mut scanner = Osc7Scanner::new();
+        let mut scanner = OscScanner::new();
         let mut paths: Vec<PathBuf> = Vec::new();
-        scanner.feed(b"\x1b]7;file:///x\x1b", |p| paths.push(p));
+        let push_cwd = |s: &mut OscScanner, b: &[u8], v: &mut Vec<PathBuf>| {
+            s.feed(b, |h| {
+                if let OscHit::Cwd(p) = h {
+                    v.push(p)
+                }
+            })
+        };
+        push_cwd(&mut scanner, b"\x1b]7;file:///x\x1b", &mut paths);
         assert!(paths.is_empty(), "ST not completed");
-        scanner.feed(b"\\rest", |p| paths.push(p));
+        push_cwd(&mut scanner, b"\\rest", &mut paths);
         assert_eq!(paths, vec![PathBuf::from("/x")]);
+    }
+
+    #[test]
+    fn osc133_prompt_and_command_end_decode() {
+        // FinalTerm prompt mark, then a non-zero command exit.
+        let hits = collect_hits(b"\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(
+            hits,
+            vec![
+                OscHit::CommandMark {
+                    kind: CommandMarkKind::PromptStart,
+                    exit: None,
+                },
+                OscHit::CommandMark {
+                    kind: CommandMarkKind::CommandEnd,
+                    exit: Some(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn osc133_command_end_without_exit_is_none() {
+        let hits = collect_hits(b"\x1b]133;D\x1b\\");
+        assert_eq!(
+            hits,
+            vec![OscHit::CommandMark {
+                kind: CommandMarkKind::CommandEnd,
+                exit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn osc633_shares_command_mark_semantics() {
+        // VS Code uses 633; A/B/C/D map the same, E (command line) is ignored.
+        let hits = collect_hits(b"\x1b]633;A\x07\x1b]633;E;ls -la\x07\x1b]633;D;0\x07");
+        assert_eq!(
+            hits,
+            vec![
+                OscHit::CommandMark {
+                    kind: CommandMarkKind::PromptStart,
+                    exit: None,
+                },
+                OscHit::CommandMark {
+                    kind: CommandMarkKind::CommandEnd,
+                    exit: Some(0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn osc9_4_progress_decodes_state_and_value() {
+        let hits = collect_hits(b"\x1b]9;4;1;42\x07");
+        assert_eq!(hits, vec![OscHit::Progress { state: 1, value: 42 }]);
+    }
+
+    #[test]
+    fn osc9_4_progress_clamps_value_and_defaults_missing() {
+        // Over-100 clamps; a bare `9;4` (clear) defaults both to 0.
+        assert_eq!(
+            collect_hits(b"\x1b]9;4;1;250\x07"),
+            vec![OscHit::Progress {
+                state: 1,
+                value: 100
+            }]
+        );
+        assert_eq!(
+            collect_hits(b"\x1b]9;4\x07"),
+            vec![OscHit::Progress { state: 0, value: 0 }]
+        );
+    }
+
+    #[test]
+    fn osc9_non_progress_is_ignored() {
+        // OSC 9;<text> desktop notification — not progress, no hit.
+        assert!(collect_hits(b"\x1b]9;build done\x07").is_empty());
     }
 
     #[test]

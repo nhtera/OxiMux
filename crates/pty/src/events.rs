@@ -3,7 +3,24 @@
 //! Backends accumulate these internally (bounded by the channel capacity)
 //! and the UI drains them once per frame via `drain_events`.
 
+use std::path::PathBuf;
+
 use crate::backend::TerminalSessionId;
+
+/// Shell-integration command-mark phases (OSC 133 / 633). The renderer uses
+/// `PromptStart` to anchor an exit-code badge on the prompt row and
+/// `CommandEnd` to attach the exit code to the most recent prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandMarkKind {
+    /// OSC 133;A — a fresh prompt is about to render.
+    PromptStart,
+    /// OSC 133;B — end of prompt / start of the typed command line.
+    CommandStart,
+    /// OSC 133;C — command output begins (pre-exec).
+    OutputStart,
+    /// OSC 133;D[;exit] — the command finished; `exit` carries the code.
+    CommandEnd,
+}
 
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
@@ -37,6 +54,42 @@ pub enum TerminalEvent {
     /// can raise an attention signal (pane ring / tab badge / OS banner)
     /// on the owning pane — a curses app or shell `\a` means "look here".
     Bell { id: TerminalSessionId },
+    /// OSC 7 working-directory change. Backends that track cwd (the
+    /// in-process PTY) fold this into their cwd cache; others ignore it.
+    CwdChanged {
+        id: TerminalSessionId,
+        path: PathBuf,
+    },
+    /// OSC 133/633 shell-integration command mark. `line` is the absolute
+    /// history line (history_size + cursor row) the mark was anchored at, so
+    /// the renderer can place a gutter badge that scrolls with the content.
+    CommandMark {
+        id: TerminalSessionId,
+        kind: CommandMarkKind,
+        exit: Option<i32>,
+        line: u64,
+    },
+    /// OSC 9;4 progress report. `state`: 0 clear, 1 set, 2 error, 3
+    /// indeterminate, 4 warning. `value` is a 0..=100 percentage.
+    Progress {
+        id: TerminalSessionId,
+        state: u8,
+        value: u8,
+    },
+    /// OSC 52 clipboard-set: the child asked to put `text` on the system
+    /// clipboard. The UI gates + writes it (alacritty pre-decodes base64).
+    Clipboard {
+        id: TerminalSessionId,
+        text: String,
+    },
+    /// Bytes the emulator must write back to the PTY in response to a query
+    /// (device status / attributes / cursor position, OSC color reply). The
+    /// app drains these and calls `write` so in-process and relay backends
+    /// reply through the same path.
+    PtyReply {
+        id: TerminalSessionId,
+        bytes: Vec<u8>,
+    },
 }
 
 impl TerminalEvent {
@@ -49,7 +102,12 @@ impl TerminalEvent {
             | TerminalEvent::Exit { id, .. }
             | TerminalEvent::Resize { id, .. }
             | TerminalEvent::TitleChange { id, .. }
-            | TerminalEvent::Bell { id } => *id,
+            | TerminalEvent::Bell { id }
+            | TerminalEvent::CwdChanged { id, .. }
+            | TerminalEvent::CommandMark { id, .. }
+            | TerminalEvent::Progress { id, .. }
+            | TerminalEvent::Clipboard { id, .. }
+            | TerminalEvent::PtyReply { id, .. } => *id,
         }
     }
 }

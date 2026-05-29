@@ -27,7 +27,6 @@ use std::time::Duration;
 use crate::backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 use crate::close_grace::{JoinHandleWatcher, close_with_grace, term_step};
 use crate::events::TerminalEvent;
-use crate::osc7::Osc7Scanner;
 use crate::snapshot::{Cell, TerminalSnapshot};
 use crate::state::TerminalState;
 
@@ -420,6 +419,9 @@ impl TerminalBackend for PortablePtyBackend {
             } else {
                 state.advance(bytes);
             }
+            // Replay is historical: drop any title/clipboard/bell/color events
+            // it fired so they don't leak into the live session's first frame.
+            state.clear_collected();
         }
         Ok(())
     }
@@ -522,37 +524,38 @@ fn watch_session(
     cwd_hint: Arc<Mutex<Option<PathBuf>>>,
 ) {
     let mut buf = [0u8; READ_BUFFER_BYTES];
-    // F4.7: scanner persists across reads — OSC 7 sequences can span
-    // chunk boundaries. Allocated once per session lifetime.
-    let mut osc7 = Osc7Scanner::new();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let bytes_slice = &buf[..n];
-                let bell = match state.lock() {
-                    Ok(mut s) => {
-                        s.advance(bytes_slice);
-                        s.take_bell()
-                    }
-                    Err(_) => false,
+                // Drive the grid + collect derived events (bell, cwd, command
+                // marks, progress, title, clipboard, device replies) in one
+                // locked pass. The OSC scanner now lives in `TerminalState`.
+                let derived = match state.lock() {
+                    Ok(mut s) => s.advance_collecting(id, bytes_slice),
+                    Err(_) => Vec::new(),
                 };
-                // Snoop for the most recent OSC 7 in this chunk. Last
-                // win — if the shell printed several (rare), we want
-                // the freshest cwd.
-                let mut latest: Option<PathBuf> = None;
-                osc7.feed(bytes_slice, |p| latest = Some(p));
-                if let Some(path) = latest
-                    && let Ok(mut slot) = cwd_hint.lock()
-                {
-                    *slot = Some(path);
+                // Forward derived events BEFORE the Output chunk so attention
+                // (bell) lands ahead of the bytes that raised it. OSC 7 cwd is
+                // absorbed locally into the cheap cwd cache rather than the
+                // event stream — `cwd_hint()` is the lookup surface.
+                for ev in derived {
+                    match ev {
+                        TerminalEvent::CwdChanged { path, .. } => {
+                            if let Ok(mut slot) = cwd_hint.lock() {
+                                *slot = Some(path);
+                            }
+                        }
+                        other => {
+                            if tx.send(other).is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
                 let bytes = bytes_slice.to_vec();
                 if tx.send(TerminalEvent::Output { id, bytes }).is_err() {
-                    return;
-                }
-                // BEL in this chunk → an attention signal for the owning pane.
-                if bell && tx.send(TerminalEvent::Bell { id }).is_err() {
                     return;
                 }
             }

@@ -14,17 +14,26 @@
 //! directly. Indices 0..=15 collapse onto `NamedColor16`; everything else
 //! flows through `Indexed` for the renderer's 256-palette lookup.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb,
+};
 
+use crate::backend::TerminalSessionId;
+use crate::events::TerminalEvent;
+use crate::osc7::{OscHit, OscScanner};
 use crate::snapshot::{Cell, CellColor, HyperlinkSpan, NamedColor16, TerminalSnapshot};
+
+/// Cap on the event sink so a misbehaving stream (or a huge replay) can't grow
+/// it without bound between drains. Realistic streams emit a handful per frame.
+const MAX_SINK_EVENTS: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 struct SizeInfo {
@@ -45,30 +54,72 @@ impl Dimensions for SizeInfo {
     }
 }
 
-/// Captures the one alacritty event we care about: `Bell`. alacritty calls
-/// `send_event` synchronously from inside `parser.advance`, so we can't push
-/// onto a channel here without plumbing one through; instead we flip a shared
-/// atomic that the backend reads via `take_bell()` right after `advance`.
-#[derive(Clone)]
-pub struct BellListener {
-    bell: Arc<AtomicBool>,
+/// One queued non-bell event from alacritty's parser. alacritty calls
+/// `send_event` synchronously from inside `parser.advance`, so the listener
+/// can't reach the PTY writer or the backend channel — it parks events here
+/// for `advance_collecting` to drain right after `advance`.
+enum SinkEvent {
+    /// OSC 0/2 window title.
+    Title(String),
+    /// OSC 52 clipboard-set (alacritty already base64-decoded the payload).
+    Clipboard(String),
+    /// OSC 4/10/11/12 color query — `reply` formats the resolved color into
+    /// the escape sequence the child expects written back.
+    ColorQuery {
+        index: usize,
+        reply: Arc<dyn Fn(Rgb) -> String + Send + Sync>,
+    },
+    /// Device report / cursor-position reply (DSR, DA, …) to write back.
+    PtyWrite(Vec<u8>),
 }
 
-impl EventListener for BellListener {
+/// Captures the alacritty events we forward. `Bell` flips a cheap atomic
+/// (read via `take_bell()`); the rest park in a bounded queue drained by
+/// `advance_collecting()`.
+#[derive(Clone)]
+pub struct TermEventSink {
+    bell: Arc<AtomicBool>,
+    sink: Arc<Mutex<Vec<SinkEvent>>>,
+}
+
+impl TermEventSink {
+    fn push(&self, ev: SinkEvent) {
+        if let Ok(mut q) = self.sink.lock()
+            && q.len() < MAX_SINK_EVENTS
+        {
+            q.push(ev);
+        }
+    }
+}
+
+impl EventListener for TermEventSink {
     fn send_event(&self, event: Event) {
-        if matches!(event, Event::Bell) {
-            self.bell.store(true, Ordering::Release);
+        match event {
+            Event::Bell => self.bell.store(true, Ordering::Release),
+            Event::Title(title) => self.push(SinkEvent::Title(title)),
+            // Only the system clipboard (`c`); selection (`p`/`s`) has no
+            // distinct buffer on macOS, so writing it would clobber the copy.
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                self.push(SinkEvent::Clipboard(text))
+            }
+            Event::ColorRequest(index, reply) => self.push(SinkEvent::ColorQuery { index, reply }),
+            Event::PtyWrite(text) => self.push(SinkEvent::PtyWrite(text.into_bytes())),
+            _ => {}
         }
     }
 }
 
 pub struct TerminalState {
-    term: Term<BellListener>,
+    term: Term<TermEventSink>,
     parser: Processor,
     size: SizeInfo,
-    /// Shared with the `Term`'s `BellListener`; set on BEL, cleared by
-    /// `take_bell()`.
+    /// Out-of-band scanner for the OSCs alacritty drops (cwd, command marks,
+    /// progress). Persists across reads — sequences span chunk boundaries.
+    scanner: OscScanner,
+    /// Shared with the `Term`'s sink; set on BEL, cleared by `take_bell()`.
     bell: Arc<AtomicBool>,
+    /// Shared with the `Term`'s sink; drained by `advance_collecting()`.
+    sink: Arc<Mutex<Vec<SinkEvent>>>,
 }
 
 impl TerminalState {
@@ -85,24 +136,110 @@ impl TerminalState {
             ..Config::default()
         };
         let bell = Arc::new(AtomicBool::new(false));
+        let sink: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let term = Term::new(
             config,
             &size,
-            BellListener {
+            TermEventSink {
                 bell: Arc::clone(&bell),
+                sink: Arc::clone(&sink),
             },
         );
         Self {
             term,
             parser: Processor::new(),
             size,
+            scanner: OscScanner::new(),
             bell,
+            sink,
         }
     }
 
     /// Feed PTY bytes through the ANSI parser into the grid.
+    ///
+    /// Pure: used by replay/prefill and tests. It still fires the event sink
+    /// (the listener is wired to the `Term`), so callers that DON'T want those
+    /// events — replay — must follow with [`clear_collected`].
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Feed live PTY bytes and return everything that warrants a backend
+    /// `TerminalEvent`: bell, OSC 7 cwd, OSC 133/633 command marks, OSC 9;4
+    /// progress, OSC 0/2 title, OSC 52 clipboard, and device/color replies the
+    /// child expects written back to the PTY. Backends call this on the read
+    /// path; `advance` stays pure for replay.
+    pub fn advance_collecting(&mut self, id: TerminalSessionId, bytes: &[u8]) -> Vec<TerminalEvent> {
+        let mut out = Vec::new();
+        // Out-of-band OSC scan FIRST; the command-mark anchor is read from the
+        // grid AFTER advance so it reflects where the cursor lands.
+        let mut hits: Vec<OscHit> = Vec::new();
+        self.scanner.feed(bytes, |h| hits.push(h));
+
+        self.parser.advance(&mut self.term, bytes);
+
+        if self.take_bell() {
+            out.push(TerminalEvent::Bell { id });
+        }
+
+        if !hits.is_empty() {
+            // Absolute history line: stable while scrollback hasn't capped
+            // (new lines push content up, history_size grows in step), so a
+            // gutter badge tracks its command as the view scrolls.
+            let history = self.term.grid().history_size() as u64;
+            let cursor_line = self.term.grid().cursor.point.line.0.max(0) as u64;
+            let line = history + cursor_line;
+            for hit in hits {
+                match hit {
+                    OscHit::Cwd(path) => out.push(TerminalEvent::CwdChanged { id, path }),
+                    OscHit::CommandMark { kind, exit } => {
+                        out.push(TerminalEvent::CommandMark {
+                            id,
+                            kind,
+                            exit,
+                            line,
+                        })
+                    }
+                    OscHit::Progress { state, value } => {
+                        out.push(TerminalEvent::Progress { id, state, value })
+                    }
+                }
+            }
+        }
+
+        let drained: Vec<SinkEvent> = self
+            .sink
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default();
+        for ev in drained {
+            match ev {
+                SinkEvent::Title(title) => out.push(TerminalEvent::TitleChange { id, title }),
+                SinkEvent::Clipboard(text) => out.push(TerminalEvent::Clipboard { id, text }),
+                SinkEvent::PtyWrite(bytes) => out.push(TerminalEvent::PtyReply { id, bytes }),
+                SinkEvent::ColorQuery { index, reply } => {
+                    // Honor any color the app SET (OSC 4/10/11); else answer
+                    // from a dark default palette so probes detect dark mode.
+                    let rgb = self.term.colors()[index].unwrap_or_else(|| default_palette_rgb(index));
+                    out.push(TerminalEvent::PtyReply {
+                        id,
+                        bytes: reply(rgb).into_bytes(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Discard events accumulated by `advance` during a replay — a restored
+    /// buffer must not re-fire the original session's clipboard writes, title
+    /// changes, bell, or color replies into the live UI.
+    pub fn clear_collected(&mut self) {
+        self.bell.store(false, Ordering::Release);
+        if let Ok(mut q) = self.sink.lock() {
+            q.clear();
+        }
+        self.scanner = OscScanner::new();
     }
 
     /// Consume the pending-bell flag: returns `true` (and resets to `false`)
@@ -163,7 +300,7 @@ impl TerminalState {
     /// grid for persistence. Exposed (rather than wrapping every
     /// `serialize_*` call as a method) so the serializer module stays a
     /// pure function over `Term` and is unit-testable on its own.
-    pub fn term_for_test(&self) -> &Term<BellListener> {
+    pub fn term_for_test(&self) -> &Term<TermEventSink> {
         &self.term
     }
 
@@ -253,6 +390,7 @@ impl TerminalState {
 
         let offset = self.term.grid().display_offset() as i32;
         snap.display_offset = offset as usize;
+        snap.history_len = self.term.grid().history_size();
         snap.cursor_shape = self.cursor_shape();
 
         // The cursor lives in active-area coords (line ≥ 0); in the displayed
@@ -337,6 +475,67 @@ fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
         strikethrough: cell.flags.contains(Flags::STRIKEOUT),
         hidden: cell.flags.contains(Flags::HIDDEN),
     }
+}
+
+/// Default color for an OSC color query when the app hasn't SET that slot.
+/// Background is intentionally dark so tools (fzf, codex, vim) querying OSC 11
+/// detect a dark theme; the 0..255 palette uses the standard xterm map.
+fn default_palette_rgb(index: usize) -> Rgb {
+    const FG: Rgb = Rgb {
+        r: 0xcd,
+        g: 0xd6,
+        b: 0xe4,
+    };
+    const BG: Rgb = Rgb {
+        r: 0x12,
+        g: 0x14,
+        b: 0x18,
+    };
+    match index {
+        i if i == NamedColor::Foreground as usize => FG,
+        i if i == NamedColor::Background as usize => BG,
+        i if i == NamedColor::Cursor as usize => FG,
+        0..=15 => ansi16_rgb(index as u8),
+        16..=231 => {
+            // 6×6×6 color cube. Each axis level 0 → 0, else 55 + 40·level.
+            let i = index as u8 - 16;
+            let level = |c: u8| if c == 0 { 0 } else { 55 + c * 40 };
+            Rgb {
+                r: level(i / 36),
+                g: level((i / 6) % 6),
+                b: level(i % 6),
+            }
+        }
+        232..=255 => {
+            // 24-step grayscale ramp.
+            let v = 8 + (index as u8 - 232) * 10;
+            Rgb { r: v, g: v, b: v }
+        }
+        _ => FG,
+    }
+}
+
+/// Standard xterm RGB for the 16 base ANSI colors (0..=15).
+fn ansi16_rgb(idx: u8) -> Rgb {
+    let (r, g, b) = match idx {
+        0 => (0x00, 0x00, 0x00),
+        1 => (0xcd, 0x00, 0x00),
+        2 => (0x00, 0xcd, 0x00),
+        3 => (0xcd, 0xcd, 0x00),
+        4 => (0x00, 0x00, 0xee),
+        5 => (0xcd, 0x00, 0xcd),
+        6 => (0x00, 0xcd, 0xcd),
+        7 => (0xe5, 0xe5, 0xe5),
+        8 => (0x7f, 0x7f, 0x7f),
+        9 => (0xff, 0x00, 0x00),
+        10 => (0x00, 0xff, 0x00),
+        11 => (0xff, 0xff, 0x00),
+        12 => (0x5c, 0x5c, 0xff),
+        13 => (0xff, 0x00, 0xff),
+        14 => (0x00, 0xff, 0xff),
+        _ => (0xff, 0xff, 0xff),
+    };
+    Rgb { r, g, b }
 }
 
 fn map_color(color: AnsiColor) -> CellColor {
@@ -676,5 +875,82 @@ mod tests {
         let snap = fresh_snapshot(&state);
         assert!(snap.cells[0][0].dim, "X (after SGR 2) should carry dim");
         assert!(!snap.cells[0][1].dim, "Y (after SGR 22) should clear dim");
+    }
+
+    const SID: TerminalSessionId = TerminalSessionId(1);
+
+    #[test]
+    fn advance_collecting_surfaces_osc52_clipboard() {
+        let mut state = TerminalState::new(80, 24, 100);
+        // OSC 52 ; c ; base64("hi") — alacritty decodes the base64 for us.
+        let events = state.advance_collecting(SID, b"\x1b]52;c;aGk=\x07");
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                TerminalEvent::Clipboard { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hi"], "OSC 52 c → clipboard set");
+    }
+
+    #[test]
+    fn advance_collecting_replies_to_bg_color_query() {
+        let mut state = TerminalState::new(80, 24, 100);
+        // OSC 11 ; ? — query the default background; expect an rgb: reply.
+        let events = state.advance_collecting(SID, b"\x1b]11;?\x07");
+        let reply = events.iter().find_map(|e| match e {
+            TerminalEvent::PtyReply { bytes, .. } => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        });
+        let reply = reply.expect("a PtyReply for the color query");
+        // Format is `ESC ] 11 ; rgb:RRRR/GGGG/BBBB <terminator>`; the default
+        // background is dark (each channel byte < 0x40) so probes read dark.
+        assert!(reply.starts_with("\x1b]11;rgb:"), "got: {reply:?}");
+        assert!(
+            reply.contains("rgb:1212/1414/1818"),
+            "dark default bg, got: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn advance_collecting_anchors_command_mark_at_cursor_line() {
+        let mut state = TerminalState::new(80, 24, 100);
+        // Push the cursor down two rows, then emit a prompt-start mark. With
+        // no scrollback yet the anchor is just the cursor's screen line.
+        state.advance(b"a\r\nb\r\n");
+        let events = state.advance_collecting(SID, b"\x1b]133;A\x07");
+        let mark = events.iter().find_map(|e| match e {
+            TerminalEvent::CommandMark { kind, line, .. } => Some((*kind, *line)),
+            _ => None,
+        });
+        assert_eq!(mark, Some((crate::CommandMarkKind::PromptStart, 2)));
+    }
+
+    #[test]
+    fn advance_collecting_surfaces_progress() {
+        let mut state = TerminalState::new(80, 24, 100);
+        let events = state.advance_collecting(SID, b"\x1b]9;4;1;75\x07");
+        let p = events.iter().find_map(|e| match e {
+            TerminalEvent::Progress { state, value, .. } => Some((*state, *value)),
+            _ => None,
+        });
+        assert_eq!(p, Some((1, 75)));
+    }
+
+    #[test]
+    fn clear_collected_drops_replayed_clipboard() {
+        let mut state = TerminalState::new(80, 24, 100);
+        // Simulate a replay that contained an OSC 52: `advance` fires the sink
+        // but `clear_collected` must discard it so it never reaches the UI.
+        state.advance(b"\x1b]52;c;c2VjcmV0\x07");
+        state.clear_collected();
+        let events = state.advance_collecting(SID, b"x");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::Clipboard { .. })),
+            "replayed clipboard must not leak after clear_collected"
+        );
     }
 }

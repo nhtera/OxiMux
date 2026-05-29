@@ -99,6 +99,10 @@ pub struct TerminalSnapshot {
     pub display_offset: usize,
     /// Shape the app asked the cursor to take (DECSCUSR / DECTCEM).
     pub cursor_shape: CursorShapeKind,
+    /// Current scrollback length (history rows) at snapshot time. With
+    /// `display_offset` this maps an absolute command-mark line to a screen
+    /// row: `screen_row = mark_line - history_len + display_offset`.
+    pub history_len: usize,
     /// OSC 8 explicit hyperlink spans on the visible rows. Empty on the common
     /// path (no app-emitted links); resolved before plain-text detection.
     pub links: Vec<HyperlinkSpan>,
@@ -113,6 +117,7 @@ impl TerminalSnapshot {
             cells: Vec::new(),
             display_offset: 0,
             cursor_shape: CursorShapeKind::Block,
+            history_len: 0,
             links: Vec::new(),
         }
     }
