@@ -93,7 +93,11 @@ impl PaneBufferRepo {
     /// before re-writing the snapshot on capture so a shrunken-pane
     /// layout doesn't leave orphaned rows behind. Other windows' rows
     /// for the same project are not affected.
-    pub fn delete_for_project(&self, project_id: &str, window_id: &str) -> Result<(), StorageError> {
+    pub fn delete_for_project(
+        &self,
+        project_id: &str,
+        window_id: &str,
+    ) -> Result<(), StorageError> {
         self.db.with_conn(|c| {
             c.execute(
                 "DELETE FROM pane_buffers WHERE project_id = ?1 AND window_id = ?2",

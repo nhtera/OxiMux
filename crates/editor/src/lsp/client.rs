@@ -192,16 +192,14 @@ impl LspClient {
     /// Accepts a pre-parsed `&Uri` (cached on `EditorView`) so the caller
     /// avoids re-encoding the path on every keystroke (H1 fix).
     pub fn did_change(&self, uri: &Uri, version: i32, text: String) -> Result<()> {
-        self.notify::<lsp_types::notification::DidChangeTextDocument>(
-            DidChangeTextDocumentParams {
-                text_document: VersionedTextDocumentIdentifier::new(uri.clone(), version),
-                content_changes: vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text,
-                }],
-            },
-        )
+        self.notify::<lsp_types::notification::DidChangeTextDocument>(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(uri.clone(), version),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }],
+        })
     }
 
     /// Issue a `textDocument/didSave` notification. Sends no text payload —
@@ -211,12 +209,10 @@ impl LspClient {
     /// Accepts a pre-parsed `&Uri` (cached on `EditorView`) to avoid
     /// redundant parse/allocation (H1 fix — consistent with `did_change`).
     pub fn did_save(&self, uri: &Uri) -> Result<()> {
-        self.notify::<lsp_types::notification::DidSaveTextDocument>(
-            DidSaveTextDocumentParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                text: None,
-            },
-        )
+        self.notify::<lsp_types::notification::DidSaveTextDocument>(DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            text: None,
+        })
     }
 
     /// Issue a `textDocument/didClose` notification. After this the server
@@ -225,11 +221,9 @@ impl LspClient {
     /// Accepts a pre-parsed `&Uri` (cached on `EditorView`) to avoid
     /// redundant parse/allocation (H1 fix — consistent with `did_change`).
     pub fn did_close(&self, uri: &Uri) -> Result<()> {
-        self.notify::<lsp_types::notification::DidCloseTextDocument>(
-            DidCloseTextDocumentParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-            },
-        )
+        self.notify::<lsp_types::notification::DidCloseTextDocument>(DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+        })
     }
 
     /// Request hover info at `position` for the file at `uri`. The
@@ -516,7 +510,6 @@ mod tests {
         );
         assert!(!s.contains(' '), "raw space leaked into URI: {s:?}");
     }
-
 }
 // LSP notification serialization tests live in
 // `crates/editor/tests/lsp_notification_serialization.rs` to keep this

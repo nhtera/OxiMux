@@ -218,7 +218,9 @@ async fn attach_replays_buffered_output_then_streams_live() {
     )
     .await;
     let replay = match resp {
-        Response::AttachOk { replay, cols, rows, .. } => {
+        Response::AttachOk {
+            replay, cols, rows, ..
+        } => {
             // Attach must echo the PTY's live grid dims so a reattaching
             // client rebuilds its emulator at the exact captured size
             // before replaying — replaying into a mismatched grid (then
@@ -623,7 +625,11 @@ async fn multi_attach_min_size_and_detach_grows_back() {
         Response::PtyList(v) => v,
         other => panic!("list: {other:?}"),
     };
-    assert_eq!(effective(listed), (80, 24), "single attachment owns the size");
+    assert_eq!(
+        effective(listed),
+        (80, 24),
+        "single attachment owns the size"
+    );
 
     // Client B attaches — it adopts the current size, so `min` is
     // unchanged by the attach itself.
@@ -867,8 +873,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
     )
     .await;
     assert!(matches!(resp, Response::Ok));
-    let (c_out, c_exit) =
-        collect_output(&mut c, &mut c_buf, &pty_id, Duration::from_secs(5)).await;
+    let (c_out, c_exit) = collect_output(&mut c, &mut c_buf, &pty_id, Duration::from_secs(5)).await;
     assert!(
         String::from_utf8_lossy(&c_out).contains("LIVE_AFTER_DETACH"),
         "live stream after reattach missed marker; got {:?}",

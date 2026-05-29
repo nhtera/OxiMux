@@ -116,7 +116,10 @@ pub enum Response {
     // `attachment_id` identifies the spawning session's auto-attachment
     // (Spawn auto-attaches the caller). The client stores it so its
     // `Resize`/`Detach` for this PTY address the right attachment.
-    SpawnOk { pty_id: String, attachment_id: u64 },
+    SpawnOk {
+        pty_id: String,
+        attachment_id: u64,
+    },
     // `cols`/`rows` are the PTY's current grid dimensions on the daemon.
     // The client MUST build its local emulator at exactly these dims
     // before replaying `replay`, otherwise raw bytes captured for a
@@ -137,13 +140,22 @@ pub enum Response {
     Pty(PtyDescriptor),
     PtyList(Vec<PtyDescriptor>),
     StatsOk(Vec<PtyStats>),
-    Err { code: ErrCode, message: String },
+    Err {
+        code: ErrCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Notification {
-    Output { pty_id: String, bytes: Vec<u8> },
-    Exit { pty_id: String, code: Option<i32> },
+    Output {
+        pty_id: String,
+        bytes: Vec<u8>,
+    },
+    Exit {
+        pty_id: String,
+        code: Option<i32>,
+    },
     /// Explicit attention raised via `Request::Notify`. The client maps
     /// this to a pane attention signal (ring + tab dot). `title`/`body`
     /// are carried for a future OS-banner surface; today the client only

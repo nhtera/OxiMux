@@ -128,7 +128,6 @@ impl LeafTabs {
         }
         true
     }
-
 }
 
 /// One terminal tab's sub-pane state. Always non-empty in a well-formed
@@ -311,7 +310,8 @@ impl TerminalSplitTree {
         new_observer: Subscription,
     ) -> usize {
         let new_idx = self.panes.len();
-        self.panes.push(Some(LeafTabs::single(new_view, new_observer)));
+        self.panes
+            .push(Some(LeafTabs::single(new_view, new_observer)));
         let inserted = self.tree.split_leaf_at(self.active, axis, new_idx, insert);
         debug_assert!(inserted, "active sub-pane idx not found in tree");
         self.active = new_idx;

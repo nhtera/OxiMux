@@ -55,11 +55,7 @@ pub trait TerminalBackend: Send + 'static {
     ///
     /// Default impl returns an error — only backends that implement
     /// dormancy override (currently the in-process portable-pty backend).
-    fn spawn_dormant(
-        &mut self,
-        _cols: u16,
-        _rows: u16,
-    ) -> Result<TerminalSessionId> {
+    fn spawn_dormant(&mut self, _cols: u16, _rows: u16) -> Result<TerminalSessionId> {
         Err(anyhow::anyhow!(
             "this backend does not support dormant sessions"
         ))
@@ -72,11 +68,7 @@ pub trait TerminalBackend: Send + 'static {
     ///
     /// Default impl returns an error — only backends that implement
     /// dormancy override.
-    fn promote_to_live(
-        &mut self,
-        _id: TerminalSessionId,
-        _cfg: SpawnConfig,
-    ) -> Result<()> {
+    fn promote_to_live(&mut self, _id: TerminalSessionId, _cfg: SpawnConfig) -> Result<()> {
         Err(anyhow::anyhow!(
             "this backend does not support promote_to_live"
         ))

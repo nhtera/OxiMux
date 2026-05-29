@@ -21,9 +21,8 @@ use gpui::{
 use oximux_app::actions::{
     CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
     FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewTabInPane, NewWindow, NextTab,
-    OpenCommandPalette,
-    OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, Search,
-    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitSubPaneDown,
+    OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
+    PrevTab, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitSubPaneDown,
     SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
 };
 // SaveFile is declared in oximux-editor (not oximux-app) to avoid a circular

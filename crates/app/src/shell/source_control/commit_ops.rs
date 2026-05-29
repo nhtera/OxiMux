@@ -65,8 +65,7 @@ pub fn run_commit(
     let trimmed = message.trim();
     if trimmed.is_empty() {
         area.in_flight.store(false, Ordering::SeqCst);
-        area.status =
-            CommitStatus::Failed("commit".to_string(), "Message is empty".to_string());
+        area.status = CommitStatus::Failed("commit".to_string(), "Message is empty".to_string());
         return;
     }
     let message = trimmed.to_string();
@@ -115,11 +114,7 @@ pub fn run_commit(
 
 /// Run a standalone remote op (push/pull/sync/fetch). Updates `status`
 /// to the matching in-flight variant and back to Idle/Failed on completion.
-pub fn run_remote(
-    area: &mut CommitArea,
-    verb: RemoteVerb,
-    cx: &mut Context<CommitArea>,
-) {
+pub fn run_remote(area: &mut CommitArea, verb: RemoteVerb, cx: &mut Context<CommitArea>) {
     if area.in_flight.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -143,8 +138,7 @@ pub fn run_remote(
             });
         }
         Err(_) => {
-            area.status =
-                CommitStatus::Failed(label.to_string(), "no tokio runtime".to_string());
+            area.status = CommitStatus::Failed(label.to_string(), "no tokio runtime".to_string());
             area.in_flight.store(false, Ordering::SeqCst);
             return;
         }

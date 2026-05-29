@@ -299,10 +299,7 @@ mod tests {
         // `/relative/path/../escape` is absolute (starts with `/`) — accept
         // it; the OS resolves `..` later. The point of this test is just
         // to document that we DON'T normalize and DON'T reject `..`.
-        assert_eq!(
-            paths,
-            vec![PathBuf::from("/relative/path/../escape")]
-        );
+        assert_eq!(paths, vec![PathBuf::from("/relative/path/../escape")]);
     }
 
     #[test]

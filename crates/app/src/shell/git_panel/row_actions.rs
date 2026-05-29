@@ -64,7 +64,11 @@ fn stage_button(id: String, path: PathBuf, cx: &mut Context<GitPanel>) -> AnyEle
     Button::new(gpui::SharedString::from(id))
         .ghost()
         .xsmall()
-        .icon(Icon::default().path("icons/plus.svg").size(px(ACTION_BTN_W)))
+        .icon(
+            Icon::default()
+                .path("icons/plus.svg")
+                .size(px(ACTION_BTN_W)),
+        )
         .tooltip("Stage file")
         .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
             panel.stage_path(path.clone(), cx);
@@ -76,7 +80,11 @@ fn unstage_button(id: String, path: PathBuf, cx: &mut Context<GitPanel>) -> AnyE
     Button::new(gpui::SharedString::from(id))
         .ghost()
         .xsmall()
-        .icon(Icon::default().path("icons/minus.svg").size(px(ACTION_BTN_W)))
+        .icon(
+            Icon::default()
+                .path("icons/minus.svg")
+                .size(px(ACTION_BTN_W)),
+        )
         .tooltip("Unstage file")
         .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
             panel.unstage_path(path.clone(), cx);

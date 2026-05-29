@@ -1188,7 +1188,12 @@ impl ProjectPanes {
         cx: &App,
     ) {
         if let Err(err) = repo.delete_for_project(project_id, window_id) {
-            tracing::warn!(?err, project_id, window_id, "pane_buffers: delete_for_project failed");
+            tracing::warn!(
+                ?err,
+                project_id,
+                window_id,
+                "pane_buffers: delete_for_project failed"
+            );
             return;
         }
         let mut ordinal: u32 = 0;
@@ -1218,9 +1223,13 @@ impl ProjectPanes {
                     if bytes.is_empty() {
                         continue;
                     }
-                    if let Err(err) =
-                        repo.set(project_id, window_id, ordinal, sub_pane_ordinal as u32, &bytes)
-                    {
+                    if let Err(err) = repo.set(
+                        project_id,
+                        window_id,
+                        ordinal,
+                        sub_pane_ordinal as u32,
+                        &bytes,
+                    ) {
                         tracing::warn!(
                             ?err,
                             project_id,
@@ -1283,7 +1292,13 @@ impl ProjectPanes {
                     && let Err(err) =
                         repo.set(project_id, window_id, ordinal, &pty_id, relay_session_id)
                 {
-                    tracing::warn!(?err, project_id, window_id, ordinal, "pane_relay_ids: set failed");
+                    tracing::warn!(
+                        ?err,
+                        project_id,
+                        window_id,
+                        ordinal,
+                        "pane_relay_ids: set failed"
+                    );
                 }
                 ordinal += 1;
             }

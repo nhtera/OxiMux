@@ -359,7 +359,10 @@ mod tests {
 
     #[test]
     fn settings_key_format() {
-        assert_eq!(settings_key("proj_abc", "main"), "terminal_tabs:proj_abc:main");
+        assert_eq!(
+            settings_key("proj_abc", "main"),
+            "terminal_tabs:proj_abc:main"
+        );
         assert_eq!(settings_key("proj_abc", "w1"), "terminal_tabs:proj_abc:w1");
     }
 

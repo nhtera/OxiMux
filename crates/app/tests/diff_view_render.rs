@@ -345,7 +345,10 @@ fn paired_modified_lines_get_word_spans() {
     };
     let removed_row = &hunks[0].rows[0];
     let added_row = &hunks[0].rows[1];
-    assert!(removed_row.spans.is_some(), "paired removed row carries spans");
+    assert!(
+        removed_row.spans.is_some(),
+        "paired removed row carries spans"
+    );
     assert!(added_row.spans.is_some(), "paired added row carries spans");
 }
 
@@ -375,7 +378,9 @@ fn rust_file_rows_carry_syntax_tokens() {
     );
     assert!(row.tokens.first().is_some_and(|t| t.start == 0));
     assert!(
-        row.tokens.last().is_some_and(|t| t.end == row.content.len()),
+        row.tokens
+            .last()
+            .is_some_and(|t| t.end == row.content.len()),
         "tokens should cover the whole row content"
     );
 }

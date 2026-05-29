@@ -38,8 +38,7 @@ pub type OnOpenFile = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + 'static>;
 /// Signature: `(path, staged, untracked, window, app)`. `untracked` is
 /// honored only when `staged == false` — a staged untracked file is a
 /// contradiction (staging promotes it to "added in index").
-pub type OnOpenDiff =
-    Arc<dyn Fn(PathBuf, bool, bool, &mut Window, &mut App) + 'static>;
+pub type OnOpenDiff = Arc<dyn Fn(PathBuf, bool, bool, &mut Window, &mut App) + 'static>;
 
 /// Active-file query callback. Invoked once per render to find the file
 /// currently open in the focused pane; the matching tree row is then

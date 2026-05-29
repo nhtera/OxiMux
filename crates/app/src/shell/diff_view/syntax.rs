@@ -194,13 +194,22 @@ mod tests {
 
     #[test]
     fn detect_language_known_extensions() {
-        assert_eq!(detect_language(&PathBuf::from("src/main.rs")), Language::Rust);
+        assert_eq!(
+            detect_language(&PathBuf::from("src/main.rs")),
+            Language::Rust
+        );
         assert_eq!(
             detect_language(&PathBuf::from("App.tsx")),
             Language::TypeScript
         );
-        assert_eq!(detect_language(&PathBuf::from("README.md")), Language::Markdown);
-        assert_eq!(detect_language(&PathBuf::from("Cargo.toml")), Language::Toml);
+        assert_eq!(
+            detect_language(&PathBuf::from("README.md")),
+            Language::Markdown
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("Cargo.toml")),
+            Language::Toml
+        );
         assert_eq!(
             detect_language(&PathBuf::from("package.json")),
             Language::Json
@@ -209,14 +218,23 @@ mod tests {
 
     #[test]
     fn detect_language_case_insensitive() {
-        assert_eq!(detect_language(&PathBuf::from("README.MD")), Language::Markdown);
+        assert_eq!(
+            detect_language(&PathBuf::from("README.MD")),
+            Language::Markdown
+        );
         assert_eq!(detect_language(&PathBuf::from("Foo.RS")), Language::Rust);
     }
 
     #[test]
     fn detect_language_unknown_for_extensionless() {
-        assert_eq!(detect_language(&PathBuf::from("Dockerfile")), Language::Unknown);
-        assert_eq!(detect_language(&PathBuf::from("Makefile")), Language::Unknown);
+        assert_eq!(
+            detect_language(&PathBuf::from("Dockerfile")),
+            Language::Unknown
+        );
+        assert_eq!(
+            detect_language(&PathBuf::from("Makefile")),
+            Language::Unknown
+        );
     }
 
     #[test]
@@ -260,7 +278,10 @@ mod tests {
         assert!(toks.last().is_some_and(|t| t.end == line.len()));
         // No gaps and no overlaps.
         for w in toks.windows(2) {
-            assert_eq!(w[0].end, w[1].start, "token ranges should not gap or overlap");
+            assert_eq!(
+                w[0].end, w[1].start,
+                "token ranges should not gap or overlap"
+            );
         }
     }
 

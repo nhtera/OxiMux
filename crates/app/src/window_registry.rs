@@ -174,11 +174,13 @@ pub fn register(
     workspace: Entity<WorkspaceRoot>,
 ) {
     ensure_global(cx);
-    cx.global_mut::<WindowRegistry>().windows.push(RegisteredWindow {
-        window_id,
-        persist_id,
-        workspace,
-    });
+    cx.global_mut::<WindowRegistry>()
+        .windows
+        .push(RegisteredWindow {
+            window_id,
+            persist_id,
+            workspace,
+        });
 }
 
 /// Strong `(persist_id, workspace)` clones for every tracked window. Cloned

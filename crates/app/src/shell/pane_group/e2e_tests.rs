@@ -73,13 +73,20 @@ async fn open_terminal_tab_increments_tab_count(cx: &mut TestAppContext) {
     let spawned = window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
         .expect("window update ok");
-    assert!(spawned.is_some(), "open_terminal_tab must succeed (PTY fallback)");
+    assert!(
+        spawned.is_some(),
+        "open_terminal_tab must succeed (PTY fallback)"
+    );
 
     cx.run_until_parked();
 
     cx.read(|app| {
         let group = window.read(app).expect("PaneGroup alive");
-        assert_eq!(group.tab_count(), 1, "tab_count should be 1 after open_terminal_tab");
+        assert_eq!(
+            group.tab_count(),
+            1,
+            "tab_count should be 1 after open_terminal_tab"
+        );
         let tab = group.active_tab().expect("active tab");
         assert!(
             matches!(tab.content, PaneContent::Terminal(_)),
@@ -210,7 +217,11 @@ async fn split_sub_pane_right_creates_second_live_pane(cx: &mut TestAppContext) 
 
     cx.read(|app| {
         let group = window.read(app).expect("PaneGroup alive");
-        assert_eq!(group.tab_count(), 1, "group tab count must remain 1 after split");
+        assert_eq!(
+            group.tab_count(),
+            1,
+            "group tab count must remain 1 after split"
+        );
 
         let tab = group.active_tab().expect("active tab");
         let PaneContent::Terminal(tree) = &tab.content else {

@@ -251,7 +251,9 @@ fn attention_for(content: &crate::shell::pane_content::PaneContent, cx: &App) ->
     match content {
         // iter_all_views (not iter_live) so a bell from a BACKGROUND
         // per-pane tab still lights the workspace tab chip.
-        PaneContent::Terminal(tree) => tree.iter_all_views().any(|(_, _, v)| v.read(cx).attention()),
+        PaneContent::Terminal(tree) => tree
+            .iter_all_views()
+            .any(|(_, _, v)| v.read(cx).attention()),
         _ => false,
     }
 }
@@ -651,13 +653,7 @@ fn render_leaf(
             .size_full()
             .overflow_hidden()
             .child(bar)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .child(view),
-            )
+            .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(view))
             .into_any_element(),
     )
 }

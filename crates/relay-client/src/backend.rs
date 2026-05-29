@@ -478,10 +478,13 @@ impl TerminalBackend for RelayBackend {
         let client = self.client.clone();
         let pty_id = session.relay_pty_id.clone();
         self.handle.spawn(async move {
-            match client.request(Request::Close {
-                pty_id: pty_id.clone(),
-                grace_ms: 500,
-            }).await {
+            match client
+                .request(Request::Close {
+                    pty_id: pty_id.clone(),
+                    grace_ms: 500,
+                })
+                .await
+            {
                 Ok(Response::Ok) => {}
                 // PtyNotFound on close is benign — the relay already
                 // reaped it (e.g., from the child exiting first).

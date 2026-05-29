@@ -106,13 +106,7 @@ impl DiffView {
     /// synthesize an "all-additions" diff — `git diff` returns nothing for
     /// untracked paths, which would leave the user staring at "No diff"
     /// when they clicked a new file row.
-    pub fn load(
-        &mut self,
-        path: PathBuf,
-        staged: bool,
-        untracked: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn load(&mut self, path: PathBuf, staged: bool, untracked: bool, cx: &mut Context<Self>) {
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,

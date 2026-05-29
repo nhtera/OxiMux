@@ -90,7 +90,10 @@ fn ignored_only_treats_repo_as_clean_with_upstream() {
     );
     let act = resolve_primary_action(&inputs);
     assert_eq!(act.kind, PrimaryActionKind::Commit);
-    assert!(act.disabled, "clean + ignored-only repo must disable primary");
+    assert!(
+        act.disabled,
+        "clean + ignored-only repo must disable primary"
+    );
 }
 
 #[test]
@@ -131,10 +134,7 @@ fn untracked_alone_still_triggers_stage_all() {
     // Untracked files (not Ignored) are legitimately unstaged — the
     // user does need to `git add` them. Resolver must NOT swallow them
     // alongside the Ignored filter.
-    let inputs = compute_inputs(
-        &[(IdxStatus::Untracked, WtStatus::Untracked)],
-        Some((0, 0)),
-    );
+    let inputs = compute_inputs(&[(IdxStatus::Untracked, WtStatus::Untracked)], Some((0, 0)));
     let act = resolve_primary_action(&inputs);
     assert_eq!(act.kind, PrimaryActionKind::Stage);
 }
@@ -146,10 +146,7 @@ fn staged_modification_resolves_to_commit_not_stage_all() {
     // to the Commit button — disabled here only because no commit message
     // has been entered yet — and never to Stage All. This is also the only
     // case that drives an index-Modified entry through the filter.
-    let inputs = compute_inputs(
-        &[(IdxStatus::Modified, WtStatus::Unmodified)],
-        Some((0, 0)),
-    );
+    let inputs = compute_inputs(&[(IdxStatus::Modified, WtStatus::Unmodified)], Some((0, 0)));
     let act = resolve_primary_action(&inputs);
     assert_eq!(act.kind, PrimaryActionKind::Commit);
     assert!(

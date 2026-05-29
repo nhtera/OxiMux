@@ -67,11 +67,7 @@ impl SurfaceIds {
     /// Rebuild ids from a persisted blob. Empty persisted ids (older
     /// snapshots that predate context env) get freshly minted so every
     /// restored terminal still has a stable identity going forward.
-    pub fn restored(
-        workspace_id: impl Into<String>,
-        surface_id: String,
-        tab_id: String,
-    ) -> Self {
+    pub fn restored(workspace_id: impl Into<String>, surface_id: String, tab_id: String) -> Self {
         Self {
             workspace_id: workspace_id.into(),
             surface_id: if surface_id.is_empty() {

@@ -80,12 +80,20 @@ fn project_delete_cascades_to_relay_ids() {
     let relay_repo = PaneRelayIdRepo::new(db.clone());
     relay_repo.set(&pid, "main", 0, "pty-x", "sess-1").unwrap();
     // Sanity.
-    assert_eq!(relay_repo.get_all_for_project(&pid, "main").unwrap().len(), 1);
+    assert_eq!(
+        relay_repo.get_all_for_project(&pid, "main").unwrap().len(),
+        1
+    );
 
     let project_repo = ProjectRepo::new(db);
     project_repo.delete(&pid).expect("delete project");
 
-    assert!(relay_repo.get_all_for_project(&pid, "main").unwrap().is_empty());
+    assert!(
+        relay_repo
+            .get_all_for_project(&pid, "main")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

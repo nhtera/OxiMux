@@ -193,17 +193,14 @@ fn interactive_file_header(
     // row, not on the icon, so users can click anywhere on the bar and
     // still get the copy. Using `div().flex_1()` as a spacer pushes the
     // icon all the way right.
-    row = row
-        .child(div().flex_1())
-        .child(
-            div()
-                .child(
-                    Icon::default()
-                        .path("icons/copy.svg")
-                        .xsmall()
-                        .text_color(rctx.theme.fg_subtle),
-                ),
-        );
+    row = row.child(div().flex_1()).child(
+        div().child(
+            Icon::default()
+                .path("icons/copy.svg")
+                .xsmall()
+                .text_color(rctx.theme.fg_subtle),
+        ),
+    );
     row
 }
 
@@ -218,16 +215,8 @@ fn stats_chips(added: u32, removed: u32, rctx: &RenderCtx<'_>) -> impl IntoEleme
         .flex_row()
         .gap(px(6.0))
         .text_size(px(rctx.typography.t_body_sm))
-        .child(
-            div()
-                .text_color(added_color)
-                .child(format!("+{added}")),
-        )
-        .child(
-            div()
-                .text_color(removed_color)
-                .child(format!("-{removed}")),
-        )
+        .child(div().text_color(added_color).child(format!("+{added}")))
+        .child(div().text_color(removed_color).child(format!("-{removed}")))
 }
 
 fn hunks_body(hunks: &[HunkPlan], rctx: &RenderCtx<'_>) -> impl IntoElement {
@@ -300,7 +289,10 @@ fn strip_cell(color: Option<gpui::Hsla>, h: f32) -> gpui::Div {
 fn digit_count(n: u32) -> usize {
     // Minimum gutter cell width of 2 digits keeps narrow files (≤ 9 lines)
     // from looking cramped against the divider.
-    n.checked_ilog10().map(|d| d as usize + 1).unwrap_or(0).max(2)
+    n.checked_ilog10()
+        .map(|d| d as usize + 1)
+        .unwrap_or(0)
+        .max(2)
 }
 
 fn hunk_header(
@@ -358,8 +350,18 @@ fn line_row(
     // common diff viewers. The sign is rendered per-cell rather
     // than per-row so a removal in the old cell still reads as removed
     // even when the row also has an addition mirror.
-    let old_cell = pack_gutter_cell(line.old_line, line.kind, /*is_new_side=*/ false, gutter_digits);
-    let new_cell = pack_gutter_cell(line.new_line, line.kind, /*is_new_side=*/ true, gutter_digits);
+    let old_cell = pack_gutter_cell(
+        line.old_line,
+        line.kind,
+        /*is_new_side=*/ false,
+        gutter_digits,
+    );
+    let new_cell = pack_gutter_cell(
+        line.new_line,
+        line.kind,
+        /*is_new_side=*/ true,
+        gutter_digits,
+    );
     let gutter = div()
         .flex()
         .flex_row()
@@ -524,11 +526,7 @@ fn pack_gutter_cell(
     format!("{n}{sign}")
 }
 
-fn expand_row(
-    label: String,
-    rctx: &RenderCtx<'_>,
-    cx: &mut Context<DiffView>,
-) -> impl IntoElement {
+fn expand_row(label: String, rctx: &RenderCtx<'_>, cx: &mut Context<DiffView>) -> impl IntoElement {
     div()
         .flex()
         .items_center()

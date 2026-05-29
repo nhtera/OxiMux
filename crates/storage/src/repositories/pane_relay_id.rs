@@ -50,7 +50,14 @@ impl PaneRelayIdRepo {
                     relay_pty_id = excluded.relay_pty_id, \
                     relay_session = excluded.relay_session, \
                     created_at = excluded.created_at",
-                params![project_id, window_id, ordinal, relay_pty_id, relay_session, ts],
+                params![
+                    project_id,
+                    window_id,
+                    ordinal,
+                    relay_pty_id,
+                    relay_session,
+                    ts
+                ],
             )
             .map(|_| ())
         })?;
@@ -90,7 +97,11 @@ impl PaneRelayIdRepo {
     /// Delete every row for a project scoped to `window_id`. Used by
     /// the reconciliation path to clear stale ids before writing a fresh
     /// snapshot. Other windows' rows for the same project are unaffected.
-    pub fn delete_for_project(&self, project_id: &str, window_id: &str) -> Result<(), StorageError> {
+    pub fn delete_for_project(
+        &self,
+        project_id: &str,
+        window_id: &str,
+    ) -> Result<(), StorageError> {
         self.db.with_conn(|c| {
             c.execute(
                 "DELETE FROM pane_relay_ids WHERE project_id = ?1 AND window_id = ?2",

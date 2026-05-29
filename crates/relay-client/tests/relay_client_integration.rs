@@ -186,7 +186,9 @@ fn detach_keeps_pty_alive_for_reattach() {
 
     // `close` on the just-detached session is a no-op (session already gone),
     // which is exactly why the source view's Drop → close doesn't kill the PTY.
-    fx.backend.close(id_a).expect("close after detach is a no-op");
+    fx.backend
+        .close(id_a)
+        .expect("close after detach is a no-op");
 
     // Window B attaches to the SAME daemon PTY (the tear-off destination).
     let id_b = fx

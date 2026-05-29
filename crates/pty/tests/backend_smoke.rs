@@ -269,9 +269,7 @@ fn cwd_hint_is_none_before_first_osc7() {
     // Drain output to ensure the watcher ran.
     let deadline = Instant::now() + TEST_TIMEOUT;
     let mut acc: Vec<u8> = Vec::new();
-    while Instant::now() < deadline
-        && !acc.windows(11).any(|w| w == b"no-osc7-here")
-    {
+    while Instant::now() < deadline && !acc.windows(11).any(|w| w == b"no-osc7-here") {
         for event in backend.drain_events() {
             if let TerminalEvent::Output { bytes, .. } = event {
                 acc.extend_from_slice(&bytes);

@@ -35,10 +35,10 @@ use crate::actions::{
 use crate::notifier::{Notifier, TabId};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
+use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::{Axis, SplitInsert};
-use crate::shell::context_env::SurfaceIds;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
 /// Discriminator for `PaneGroupTab` carrying any per-kind metadata.
@@ -560,7 +560,9 @@ impl PaneGroup {
         let density = self.density;
         let typography = self.typography.clone();
         let view = cx.new(|cx| {
-            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
+            TerminalView::mount(
+                backend, session_id, ids, theme, density, typography, window, cx,
+            )
         });
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         let n = self.next_terminal_n;
@@ -782,7 +784,9 @@ impl PaneGroup {
         // fresh identity for persistence/respawn parity with plain terminals.
         let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
         let view = cx.new(|cx| {
-            TerminalView::mount(backend, term_id, ids, theme, density, typography, window, cx)
+            TerminalView::mount(
+                backend, term_id, ids, theme, density, typography, window, cx,
+            )
         });
         let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
         let label = match label_override {
@@ -1305,7 +1309,9 @@ impl PaneGroup {
             return;
         };
         let view = cx.new(|cx| {
-            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
+            TerminalView::mount(
+                backend, session_id, ids, theme, density, typography, window, cx,
+            )
         });
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         tree.add_tab_to_active(view, observer);
@@ -1589,7 +1595,9 @@ impl PaneGroup {
             return;
         };
         let view = cx.new(|cx| {
-            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
+            TerminalView::mount(
+                backend, session_id, ids, theme, density, typography, window, cx,
+            )
         });
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         tree.split_active(axis, insert, view, observer);

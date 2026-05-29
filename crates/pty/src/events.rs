@@ -36,9 +36,7 @@ pub enum TerminalEvent {
     /// Terminal bell (BEL, 0x07) emitted by the child. Surfaced so the UI
     /// can raise an attention signal (pane ring / tab badge / OS banner)
     /// on the owning pane — a curses app or shell `\a` means "look here".
-    Bell {
-        id: TerminalSessionId,
-    },
+    Bell { id: TerminalSessionId },
 }
 
 impl TerminalEvent {

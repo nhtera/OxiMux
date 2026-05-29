@@ -279,10 +279,7 @@ impl SourceControlPanel {
             has_partially_staged_changes: has_partial,
             has_message: self.commit_area.read(cx).has_message(cx),
             has_unresolved_conflicts: has_conflict,
-            is_committing: matches!(
-                commit_status,
-                commit_area::CommitStatus::Committing
-            ),
+            is_committing: matches!(commit_status, commit_area::CommitStatus::Committing),
             is_remote_operation_active: in_flight_remote_kind.is_some(),
             upstream_status: upstream,
             in_flight_remote_op_kind: in_flight_remote_kind,

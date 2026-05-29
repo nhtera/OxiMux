@@ -148,7 +148,9 @@ impl Repository {
     /// `path` may be relative-to-workdir or absolute inside the workdir;
     /// resolution mirrors `diff_for_path`.
     pub async fn diff_for_untracked(&self, path: &Path) -> Result<Vec<FileDiff>> {
-        use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, LARGE_DIFF_LINE_THRESHOLD};
+        use oximux_core::{
+            DiffHunk, DiffLine, DiffLineKind, DiffStatus, LARGE_DIFF_LINE_THRESHOLD,
+        };
 
         let abs = if path.is_absolute() {
             path.to_path_buf()

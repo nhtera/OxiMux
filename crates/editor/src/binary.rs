@@ -46,7 +46,10 @@ pub fn is_binary_buffer(bytes: &[u8]) -> bool {
 /// loaded from disk. Animated formats (`apng`, `webp` animation) render as
 /// the first frame.
 pub fn image_mime_for_path(path: &Path) -> Option<&'static str> {
-    let ext = path.extension().and_then(|s| s.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())?
+        .to_ascii_lowercase();
     match ext.as_str() {
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
@@ -112,14 +115,26 @@ mod tests {
 
     #[test]
     fn png_extension_maps_to_image_mime() {
-        assert_eq!(image_mime_for_path(&PathBuf::from("logo.png")), Some("image/png"));
-        assert_eq!(image_mime_for_path(&PathBuf::from("LOGO.PNG")), Some("image/png"));
+        assert_eq!(
+            image_mime_for_path(&PathBuf::from("logo.png")),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_mime_for_path(&PathBuf::from("LOGO.PNG")),
+            Some("image/png")
+        );
     }
 
     #[test]
     fn jpeg_aliases_share_mime() {
-        assert_eq!(image_mime_for_path(&PathBuf::from("a.jpg")), Some("image/jpeg"));
-        assert_eq!(image_mime_for_path(&PathBuf::from("a.jpeg")), Some("image/jpeg"));
+        assert_eq!(
+            image_mime_for_path(&PathBuf::from("a.jpg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_mime_for_path(&PathBuf::from("a.jpeg")),
+            Some("image/jpeg")
+        );
     }
 
     #[test]

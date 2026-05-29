@@ -375,7 +375,9 @@ fn decide_content(
             return;
         };
         let current_text = t.state.read(cx).value().to_string();
-        if let Some(prop) = decide_change_propagation(&t.last_sent_text, &current_text, t.doc_version) {
+        if let Some(prop) =
+            decide_change_propagation(&t.last_sent_text, &current_text, t.doc_version)
+        {
             t.last_sent_text = prop.text.clone();
             t.dirty = true;
             t.doc_version = prop.new_version;
@@ -512,11 +514,7 @@ fn render_image_body(path: &Path) -> gpui::AnyElement {
         .items_center()
         .justify_center()
         .p(px(16.0))
-        .child(
-            img(path.to_path_buf())
-                .max_w(px(1024.0))
-                .max_h(px(1024.0)),
-        )
+        .child(img(path.to_path_buf()).max_w(px(1024.0)).max_h(px(1024.0)))
         .into_any_element()
 }
 
@@ -614,8 +612,8 @@ mod tests {
 
     #[test]
     fn decide_propagation_returns_some_on_edit() {
-        let prop = decide_change_propagation("hello", "hello world", 1)
-            .expect("edit must produce Some");
+        let prop =
+            decide_change_propagation("hello", "hello world", 1).expect("edit must produce Some");
         assert_eq!(prop.new_version, 2, "version must increment from 1 to 2");
         assert_eq!(prop.text, "hello world", "payload must be the new text");
     }

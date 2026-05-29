@@ -511,8 +511,22 @@ mod tests {
         let restored = replay_into_new_term(&bytes, 80, 24);
         let mut snap = crate::snapshot::TerminalSnapshot::default();
         restored.fill_snapshot(&mut snap);
-        assert_eq!(snap.cells[0].iter().map(|c| c.ch).collect::<String>().trim_end(), "hi");
-        assert_eq!(snap.cells[1].iter().map(|c| c.ch).collect::<String>().trim_end(), "bye");
+        assert_eq!(
+            snap.cells[0]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end(),
+            "hi"
+        );
+        assert_eq!(
+            snap.cells[1]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end(),
+            "bye"
+        );
     }
 
     #[test]

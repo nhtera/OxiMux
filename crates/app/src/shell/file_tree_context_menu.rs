@@ -94,13 +94,7 @@ impl FileTreeContextMenu {
 
     /// Open the smaller "empty area" menu rooted at the workspace
     /// root — only offers New File / New Folder.
-    pub fn open_background(
-        &mut self,
-        x_px: f32,
-        y_px: f32,
-        root: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn open_background(&mut self, x_px: f32, y_px: f32, root: PathBuf, cx: &mut Context<Self>) {
         self.x_px = x_px;
         self.y_px = y_px;
         self.target = Some(FileTreeContextTarget::Background { root });
@@ -143,7 +137,16 @@ impl Render for FileTreeContextMenu {
                 path,
                 project_root,
                 is_dir,
-            } => build_row_card(card_base, path, project_root, is_dir, theme, density, &typography, cx),
+            } => build_row_card(
+                card_base,
+                path,
+                project_root,
+                is_dir,
+                theme,
+                density,
+                &typography,
+                cx,
+            ),
             FileTreeContextTarget::Background { root } => {
                 build_background_card(card_base, root, theme, density, &typography, cx)
             }
@@ -242,7 +245,9 @@ fn build_row_card(
     let new_parent = if is_dir {
         path.clone()
     } else {
-        path.parent().map(PathBuf::from).unwrap_or_else(|| path.clone())
+        path.parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.clone())
     };
     let new_file_parent = new_parent.clone();
     card = card.child(menu_row(
@@ -458,10 +463,7 @@ fn relative_path_string(path: &std::path::Path, project_root: Option<&PathBuf>) 
         .as_ref()
         .and_then(|root| path.strip_prefix(root.as_path()).ok())
         .map(|p| p.to_string_lossy().into_owned())
-        .or_else(|| {
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        });
+        .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()));
     rel.filter(|s| !s.is_empty())
 }
 

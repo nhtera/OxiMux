@@ -285,9 +285,13 @@ impl WorkspaceRoot {
             let snap = crate::shell::terminal_view::relay_state_snapshot();
             if let Some(session_id) = snap.session_id {
                 let relay_repo = self.app_state.pane_relay_id_repo.clone();
-                panes
-                    .read(cx)
-                    .capture_pane_relay_ids(&relay_repo, &outgoing, &window_id, &session_id, cx);
+                panes.read(cx).capture_pane_relay_ids(
+                    &relay_repo,
+                    &outgoing,
+                    &window_id,
+                    &session_id,
+                    cx,
+                );
             }
         }
         self.active_project = Some(project.clone());
@@ -301,11 +305,8 @@ impl WorkspaceRoot {
             let typography = self.typography.clone();
             let cli_runtime = self.cli_runtime.clone();
             let notifier = self.notifier.clone();
-            let snapshot = load_persisted_tabs(
-                &self.app_state.settings_repo,
-                &project.id,
-                &window_id,
-            );
+            let snapshot =
+                load_persisted_tabs(&self.app_state.settings_repo, &project.id, &window_id);
             let pane_buffers = crate::project_panes_factory::load_pane_buffers(
                 &self.app_state.pane_buffer_repo,
                 &project.id,

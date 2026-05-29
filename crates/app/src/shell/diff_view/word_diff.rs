@@ -189,8 +189,20 @@ mod tests {
         let k = kind_seq(&['-', '+', ' ', '-', '+']);
         let p = pair_runs(&k);
         assert_eq!(p.len(), 2);
-        assert_eq!(p[0], Pairing { old_row: 0, new_row: 1 });
-        assert_eq!(p[1], Pairing { old_row: 3, new_row: 4 });
+        assert_eq!(
+            p[0],
+            Pairing {
+                old_row: 0,
+                new_row: 1
+            }
+        );
+        assert_eq!(
+            p[1],
+            Pairing {
+                old_row: 3,
+                new_row: 4
+            }
+        );
     }
 
     #[test]
@@ -198,8 +210,14 @@ mod tests {
         let (old, new) = diff_words("let x = 1;", "let y = 1;");
         // Old side should contain `x` as Delete; new side should contain
         // `y` as Insert. Both sides share the rest as Same.
-        assert!(old.iter().any(|s| s.text.contains('x') && matches!(s.op, WordOp::Delete)));
-        assert!(new.iter().any(|s| s.text.contains('y') && matches!(s.op, WordOp::Insert)));
+        assert!(
+            old.iter()
+                .any(|s| s.text.contains('x') && matches!(s.op, WordOp::Delete))
+        );
+        assert!(
+            new.iter()
+                .any(|s| s.text.contains('y') && matches!(s.op, WordOp::Insert))
+        );
         // No Insert tokens on the old side, no Delete tokens on the new.
         assert!(old.iter().all(|s| !matches!(s.op, WordOp::Insert)));
         assert!(new.iter().all(|s| !matches!(s.op, WordOp::Delete)));

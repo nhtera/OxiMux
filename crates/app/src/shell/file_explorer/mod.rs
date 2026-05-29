@@ -365,16 +365,8 @@ impl Render for FileExplorer {
                                 Some(p) if p == &path => rename_input.clone(),
                                 _ => None,
                             };
-                            paint_row(
-                                plan,
-                                &pctx,
-                                path,
-                                is_dir,
-                                is_loading,
-                                row_rename_input,
-                                cx,
-                            )
-                            .into_any_element()
+                            paint_row(plan, &pctx, path, is_dir, is_loading, row_rename_input, cx)
+                                .into_any_element()
                         })
                         .collect::<Vec<AnyElement>>()
                 },

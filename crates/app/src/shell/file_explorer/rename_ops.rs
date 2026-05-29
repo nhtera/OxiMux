@@ -52,14 +52,8 @@ impl FileExplorer {
     /// If a different rename is already in flight, that one is dropped
     /// without committing — matches macOS Finder's "second Rename
     /// supersedes first" behavior.
-    pub fn start_rename(
-        &mut self,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(original_name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
-        else {
+    pub fn start_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(original_name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             return;
         };
         // Stem length for selection — `file_stem` returns "test" for
@@ -99,12 +93,15 @@ impl FileExplorer {
         // handler — but subscribing to the event is more robust (the
         // event carries focus-context, doesn't double-fire on IME
         // commits, and doesn't depend on key bubbling).
-        let press_enter_sub =
-            cx.subscribe_in(&input, window, |me, _input, event: &InputEvent, window, cx| {
+        let press_enter_sub = cx.subscribe_in(
+            &input,
+            window,
+            |me, _input, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = event {
                     me.commit_rename(window, cx);
                 }
-            });
+            },
+        );
         // Dispatch the selection action against the now-focused input.
         // With cursor at the stem boundary, `SelectToStartOfLine`
         // extends the selection backward to column 0 — exactly the
@@ -113,10 +110,7 @@ impl FileExplorer {
         // name highlights (the user almost certainly wants to retype
         // the whole thing).
         if has_extension && stem_chars > 0 {
-            window.dispatch_action(
-                Box::new(gpui_component::input::SelectToStartOfLine),
-                cx,
-            );
+            window.dispatch_action(Box::new(gpui_component::input::SelectToStartOfLine), cx);
         } else {
             window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
         }

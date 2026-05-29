@@ -152,10 +152,7 @@ impl CommitArea {
     /// Apply a completed op result to the status surface. Called from the
     /// commit-ops completion task; pub(super) so the helper module can
     /// reach it without re-exposing the field.
-    pub(super) fn apply_result(
-        &mut self,
-        result: Result<&'static str, (&'static str, String)>,
-    ) {
+    pub(super) fn apply_result(&mut self, result: Result<&'static str, (&'static str, String)>) {
         match result {
             Ok(_label) => {
                 self.status = CommitStatus::Idle;
@@ -164,9 +161,7 @@ impl CommitArea {
                 // leave the message in place after commit; the user clears
                 // manually.
             }
-            Err((label, error)) => {
-                self.status = CommitStatus::Failed(label.to_string(), error)
-            }
+            Err((label, error)) => self.status = CommitStatus::Failed(label.to_string(), error),
         }
     }
 
@@ -255,9 +250,10 @@ impl CommitArea {
         } else {
             primary.primary()
         };
-        let primary = primary.dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _cx| {
-            build_commit_menu(menu, window, &action_view, &action_for_menu)
-        });
+        let primary =
+            primary.dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _cx| {
+                build_commit_menu(menu, window, &action_view, &action_for_menu)
+            });
 
         div()
             .flex()
@@ -312,61 +308,57 @@ fn build_commit_menu(
         .item(
             PopupMenuItem::new("Commit & Push")
                 .disabled(!can_commit)
-                .on_click(window.listener_for(&view_commit_push, move |area, _, _, cx| {
-                    area.commit_and_push(cx);
-                    cx.notify();
-                })),
+                .on_click(
+                    window.listener_for(&view_commit_push, move |area, _, _, cx| {
+                        area.commit_and_push(cx);
+                        cx.notify();
+                    }),
+                ),
         )
         .item(
             PopupMenuItem::new("Commit & Sync")
                 .disabled(!can_commit)
-                .on_click(window.listener_for(&view_commit_sync, move |area, _, _, cx| {
-                    area.commit_and_sync(cx);
-                    cx.notify();
-                })),
+                .on_click(
+                    window.listener_for(&view_commit_sync, move |area, _, _, cx| {
+                        area.commit_and_sync(cx);
+                        cx.notify();
+                    }),
+                ),
         )
         .separator()
-        .item(
-            PopupMenuItem::new("Push").on_click(window.listener_for(
-                &view_push,
-                move |area, _, _, cx| {
-                    area.push(cx);
-                    cx.notify();
-                },
-            )),
-        )
+        .item(PopupMenuItem::new("Push").on_click(window.listener_for(
+            &view_push,
+            move |area, _, _, cx| {
+                area.push(cx);
+                cx.notify();
+            },
+        )))
         // PR-creation items stay disabled until Phase 06c lands the GitHub
         // adapter. Showing them keeps the menu shape stable across versions
         // so the user's muscle memory doesn't change post-upgrade.
         .item(PopupMenuItem::new("Create PR").disabled(true))
         .item(PopupMenuItem::new("Push & Create PR").disabled(true))
-        .item(
-            PopupMenuItem::new("Pull").on_click(window.listener_for(
-                &view_pull,
-                move |area, _, _, cx| {
-                    area.pull(cx);
-                    cx.notify();
-                },
-            )),
-        )
-        .item(
-            PopupMenuItem::new("Sync").on_click(window.listener_for(
-                &view_sync,
-                move |area, _, _, cx| {
-                    area.sync(cx);
-                    cx.notify();
-                },
-            )),
-        )
-        .item(
-            PopupMenuItem::new("Fetch").on_click(window.listener_for(
-                &view_fetch,
-                move |area, _, _, cx| {
-                    area.fetch(cx);
-                    cx.notify();
-                },
-            )),
-        )
+        .item(PopupMenuItem::new("Pull").on_click(window.listener_for(
+            &view_pull,
+            move |area, _, _, cx| {
+                area.pull(cx);
+                cx.notify();
+            },
+        )))
+        .item(PopupMenuItem::new("Sync").on_click(window.listener_for(
+            &view_sync,
+            move |area, _, _, cx| {
+                area.sync(cx);
+                cx.notify();
+            },
+        )))
+        .item(PopupMenuItem::new("Fetch").on_click(window.listener_for(
+            &view_fetch,
+            move |area, _, _, cx| {
+                area.fetch(cx);
+                cx.notify();
+            },
+        )))
 }
 
 fn primary_icon_for(kind: PrimaryActionKind) -> Option<IconName> {
@@ -395,10 +387,7 @@ fn render_status_row(
             theme.status_error,
             // Title-case the verb so "Push failed: …" reads naturally;
             // labels are always short ASCII so the manual capitalize is fine.
-            format!(
-                "{} failed: {error}",
-                title_case_first(label)
-            ),
+            format!("{} failed: {error}", title_case_first(label)),
         ),
     };
     div()

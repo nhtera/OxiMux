@@ -381,7 +381,13 @@ fn row(
                 // deleted on disk — the sidebar mini-diff already shows
                 // the `-` block for those.
                 if click_should_open_editor && let Some(cb) = panel.on_open.clone() {
-                    (cb)(click_path.clone(), click_staged, click_untracked, window, cx);
+                    (cb)(
+                        click_path.clone(),
+                        click_staged,
+                        click_untracked,
+                        window,
+                        cx,
+                    );
                 }
                 cx.notify();
             }),

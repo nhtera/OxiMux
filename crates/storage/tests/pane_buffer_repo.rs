@@ -17,8 +17,10 @@ fn set_then_get_round_trips_bytes_in_ordinal_order() {
     let repo = PaneBufferRepo::new(db);
     // Insert out of order; reader should still get them sorted by
     // (ordinal, sub_pane_ordinal).
-    repo.set(&pid, "main", 1, 0, b"second tab pane bytes").unwrap();
-    repo.set(&pid, "main", 0, 0, b"first tab pane bytes").unwrap();
+    repo.set(&pid, "main", 1, 0, b"second tab pane bytes")
+        .unwrap();
+    repo.set(&pid, "main", 0, 0, b"first tab pane bytes")
+        .unwrap();
     let rows = repo.get_all_for_project(&pid, "main").unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], (0, 0, b"first tab pane bytes".to_vec()));

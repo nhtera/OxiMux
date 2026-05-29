@@ -370,8 +370,7 @@ impl TerminalBackend for PortablePtyBackend {
             // the body so absolute-position CSI sequences land in the
             // right cells. Legacy (pre-header) blobs replay against the
             // current grid as before.
-            if let Some((cols, rows, payload)) =
-                crate::grid_serializer::parse_capture_header(bytes)
+            if let Some((cols, rows, payload)) = crate::grid_serializer::parse_capture_header(bytes)
             {
                 // Defensive clamp: caps match the rest of the codebase
                 // (DEFAULT_COLS/ROWS pattern in app/src/shell/terminal_view.rs

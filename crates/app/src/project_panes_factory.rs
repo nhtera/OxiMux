@@ -27,10 +27,10 @@ use crate::persisted_terminals::{
     PersistedAgentTab, PersistedTab, PersistedTabKind, PersistedTabs, WINDOWS_MANIFEST_KEY,
     WindowsManifest, legacy_settings_key, settings_key,
 };
+use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
-use crate::shell::context_env::SurfaceIds;
 use crate::shell::terminal_view::{
     TerminalView, attach_pty_existing, spawn_local_pty, spawn_local_pty_dormant,
 };
@@ -627,11 +627,11 @@ fn build_terminal_view_for_tab(
     } else {
         spawn_local_pty(cwd, ids.env())?
     };
-    Some(
-        cx.new(|cx| {
-            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
-        }),
-    )
+    Some(cx.new(|cx| {
+        TerminalView::mount(
+            backend, session_id, ids, theme, density, typography, window, cx,
+        )
+    }))
 }
 
 pub(crate) fn load_persisted_tabs(
@@ -644,7 +644,12 @@ pub(crate) fn load_persisted_tabs(
     let raw_opt = match repo.get(&key) {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(?err, project_id, window_id, "load_persisted_tabs: settings.get failed");
+            tracing::warn!(
+                ?err,
+                project_id,
+                window_id,
+                "load_persisted_tabs: settings.get failed"
+            );
             return None;
         }
     };
@@ -710,12 +715,22 @@ pub(crate) fn save_persisted_tabs(
     let json = match serde_json::to_string(snap) {
         Ok(j) => j,
         Err(err) => {
-            tracing::warn!(?err, project_id, window_id, "save_persisted_tabs: serialize failed");
+            tracing::warn!(
+                ?err,
+                project_id,
+                window_id,
+                "save_persisted_tabs: serialize failed"
+            );
             return;
         }
     };
     if let Err(err) = repo.set(&key, &json) {
-        tracing::warn!(?err, project_id, window_id, "save_persisted_tabs: settings.set failed");
+        tracing::warn!(
+            ?err,
+            project_id,
+            window_id,
+            "save_persisted_tabs: settings.set failed"
+        );
     }
 }
 

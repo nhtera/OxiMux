@@ -134,7 +134,19 @@ pub fn paint_row(
     // we need to intercept the keystroke whether the input has focus or
     // not — gpui-component's InputState propagates Escape after handling
     // it, so the event still bubbles up to us.
-    let mut row = div().id(row_id).flex().items_center().gap_2().w_full().h(px(26.0)).mx(px(4.0)).pl(px(indent_px)).pr(px(8.0)).rounded(px(4.0)).text_size(px(ctx.typography.t_body_sm)).text_color(fg);
+    let mut row = div()
+        .id(row_id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .h(px(26.0))
+        .mx(px(4.0))
+        .pl(px(indent_px))
+        .pr(px(8.0))
+        .rounded(px(4.0))
+        .text_size(px(ctx.typography.t_body_sm))
+        .text_color(fg);
     if !is_renaming {
         row = row
             .when(plan.selected, |s| s.bg(selection_bg))
@@ -211,18 +223,12 @@ pub fn paint_row(
                     me.cancel_rename(cx);
                 }
             }))
-            .on_mouse_down(
-                MouseButton::Left,
-                |_ev: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                },
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                |_ev: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                },
-            );
+            .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
     }
     row = row.child(chevron_el).child(node_icon_el);
 

@@ -140,16 +140,20 @@ fn build_overflow_menu(
     // (i.e. when there are ignored entries). The overflow stays focused
     // on workspace-level external opens.
     menu.min_w(px(200.0))
-        .item(PopupMenuItem::new("Open in VS Code").on_click(move |_, _window, cx| {
-            cx.dispatch_action(&crate::actions::OpenInVSCode {
-                path: root_vs_code.to_string_lossy().into_owned(),
-            });
-        }))
-        .item(PopupMenuItem::new("Open in Finder").on_click(move |_, _window, cx| {
-            cx.dispatch_action(&crate::actions::OpenInFinder {
-                path: root_finder.to_string_lossy().into_owned(),
-            });
-        }))
+        .item(
+            PopupMenuItem::new("Open in VS Code").on_click(move |_, _window, cx| {
+                cx.dispatch_action(&crate::actions::OpenInVSCode {
+                    path: root_vs_code.to_string_lossy().into_owned(),
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Open in Finder").on_click(move |_, _window, cx| {
+                cx.dispatch_action(&crate::actions::OpenInFinder {
+                    path: root_finder.to_string_lossy().into_owned(),
+                });
+            }),
+        )
 }
 
 fn action_button(

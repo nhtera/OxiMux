@@ -1410,8 +1410,16 @@ impl Render for WorkspaceRoot {
                     this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                     this.tab_context_menu.update(cx, |m, cx| {
                         m.open(
-                            x, y, weak, group_id, tab_idx, tab_count, tab_kind, is_pinned,
-                            can_tear_off, cx,
+                            x,
+                            y,
+                            weak,
+                            group_id,
+                            tab_idx,
+                            tab_count,
+                            tab_kind,
+                            is_pinned,
+                            can_tear_off,
+                            cx,
                         )
                     });
                 }),
@@ -1447,8 +1455,8 @@ impl Render for WorkspaceRoot {
                         .update(cx, |m, cx| m.open_background(action.x, action.y, root, cx));
                 },
             ))
-            .on_action(cx.listener(
-                |this, action: &crate::actions::FindInFolder, window, cx| {
+            .on_action(
+                cx.listener(|this, action: &crate::actions::FindInFolder, window, cx| {
                     // Switch right sidebar to Search and seed its include
                     // glob with `<rel>/**`. Resolution: prefer relative-to-
                     // workspace-root; fall back to the file name.
@@ -1458,7 +1466,10 @@ impl Render for WorkspaceRoot {
                         .as_ref()
                         .map(|p| std::path::PathBuf::from(&p.root_path))
                         .and_then(|root| {
-                            target.strip_prefix(root.as_path()).ok().map(|r| r.to_path_buf())
+                            target
+                                .strip_prefix(root.as_path())
+                                .ok()
+                                .map(|r| r.to_path_buf())
                         })
                         .map(|rel| {
                             let s = rel.to_string_lossy().into_owned();
@@ -1470,8 +1481,8 @@ impl Render for WorkspaceRoot {
                         })
                         .unwrap_or_else(|| String::from("**"));
                     this.seed_search_include_and_switch(glob, window, cx);
-                },
-            ))
+                }),
+            )
             .on_action(cx.listener(
                 |_this, action: &crate::actions::OpenInVSCode, _window, _cx| {
                     // `code <path>` requires the VS Code shell integration
@@ -1654,11 +1665,11 @@ impl Render for WorkspaceRoot {
                     group.update(cx, |g, cx| g.toggle_pin(tab_idx, cx));
                 },
             ))
-            .on_action(cx.listener(
-                |this, action: &MoveTabToNewWindow, window, cx| {
+            .on_action(
+                cx.listener(|this, action: &MoveTabToNewWindow, window, cx| {
                     this.handle_move_tab_to_new_window(action.group_id, action.tab_idx, window, cx);
-                },
-            ))
+                }),
+            )
             .on_action(cx.listener(|this, _: &SplitHorizontal, window, cx| {
                 this.split_active_pane_group(Axis::Horizontal, SplitInsert::After, window, cx);
             }))
