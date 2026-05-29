@@ -1338,29 +1338,38 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Cmd+W disambiguation: if the active tab's sub-pane tree has
-        // MORE THAN ONE live sub-pane, close just the FOCUSED sub-pane
-        // (re-resolved here for the same reason as split — `tree.active`
-        // doesn't auto-track mouse-driven focus changes). Otherwise
-        // fall through to closing the whole tab.
+        // Cmd+W cascade for terminal tabs (most-granular first):
+        //   1. focused leaf has >1 per-pane tab → close just that tab
+        //   2. tab is split into >1 leaf → close the focused leaf
+        //   3. otherwise → close the whole workspace (group) tab
+        // The focused leaf is re-resolved here because `tree.active`
+        // doesn't auto-track mouse-driven focus changes. Editor/diff tabs
+        // (non-Terminal) skip straight to the group-tab close.
         let active_idx = self.active;
         if let Some(active_tab) = self.tabs.get_mut(active_idx) {
             if let PaneContent::Terminal(tree) = &mut active_tab.content {
-                if tree.live_count() > 1 {
-                    let focused_idx = tree
-                        .iter_live()
-                        .find(|(_, v)| v.read(cx).focused())
-                        .map(|(i, _)| i);
-                    if let Some(idx) = focused_idx {
-                        tree.set_active(idx);
+                let focused_idx = tree
+                    .iter_live()
+                    .find(|(_, v)| v.read(cx).focused())
+                    .map(|(i, _)| i);
+                if let Some(idx) = focused_idx {
+                    tree.set_active(idx);
+                }
+                // 1. close a per-pane tab when the focused leaf has >1.
+                if tree.close_active_tab() {
+                    if let Some(view) = tree.active_view() {
+                        view.read(cx).focus_handle(cx).focus(window, cx);
                     }
-                    if tree.close_active() {
-                        if let Some(view) = tree.active_view() {
-                            view.read(cx).focus_handle(cx).focus(window, cx);
-                        }
-                        cx.notify();
-                        return;
+                    cx.notify();
+                    return;
+                }
+                // 2. close the focused leaf when the tab is split.
+                if tree.live_count() > 1 && tree.close_active() {
+                    if let Some(view) = tree.active_view() {
+                        view.read(cx).focus_handle(cx).focus(window, cx);
                     }
+                    cx.notify();
+                    return;
                 }
             }
         }

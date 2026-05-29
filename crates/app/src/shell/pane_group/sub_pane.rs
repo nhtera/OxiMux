@@ -109,18 +109,6 @@ impl LeafTabs {
         true
     }
 
-    /// Cycle the active tab forward/backward, wrapping. No-op with <2 tabs.
-    fn cycle(&mut self, forward: bool) {
-        let n = self.tabs.len();
-        if n < 2 {
-            return;
-        }
-        self.active = if forward {
-            (self.active + 1) % n
-        } else {
-            (self.active + n - 1) % n
-        };
-    }
 }
 
 /// One terminal tab's sub-pane state. Always non-empty in a well-formed
@@ -329,14 +317,6 @@ impl TerminalSplitTree {
         if let Some(Some(leaf)) = self.panes.get_mut(leaf_idx) {
             leaf.set_active(tab_idx);
             self.active = leaf_idx;
-        }
-    }
-
-    /// Cycle the active leaf's tab forward/backward. No-op when the
-    /// active leaf has fewer than two tabs.
-    pub fn cycle_tab_in_active(&mut self, forward: bool) {
-        if let Some(Some(leaf)) = self.panes.get_mut(self.active) {
-            leaf.cycle(forward);
         }
     }
 
