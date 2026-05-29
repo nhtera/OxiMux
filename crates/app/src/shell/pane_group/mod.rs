@@ -35,6 +35,7 @@ use crate::shell::agent_tab_label;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::{Axis, SplitInsert};
+use crate::shell::context_env::SurfaceIds;
 use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
 
 /// Discriminator for `PaneGroupTab` carrying any per-kind metadata.
@@ -550,12 +551,13 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let (backend, session_id) = spawn_local_pty(self.cwd.clone())?;
+        let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
+        let (backend, session_id) = spawn_local_pty(self.cwd.clone(), ids.env())?;
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
         let view = cx.new(|cx| {
-            TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
+            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
         });
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         let n = self.next_terminal_n;
@@ -772,8 +774,12 @@ impl PaneGroup {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
+        // Agent PTYs are spawned by the CLI runtime, not via spawn_local_pty,
+        // so their shell env isn't threaded here in v1; the view still gets a
+        // fresh identity for persistence/respawn parity with plain terminals.
+        let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
         let view = cx.new(|cx| {
-            TerminalView::mount(backend, term_id, theme, density, typography, window, cx)
+            TerminalView::mount(backend, term_id, ids, theme, density, typography, window, cx)
         });
         let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
         let label = match label_override {
@@ -1462,11 +1468,14 @@ impl PaneGroup {
                 })
             })
             .unwrap_or(fallback_cwd);
-        let Some((backend, session_id)) = spawn_local_pty(inherited_cwd) else {
+        // workspace_id stays the project root even though the new sub-pane
+        // spawns at the inherited (possibly cd'd) cwd.
+        let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
+        let Some((backend, session_id)) = spawn_local_pty(inherited_cwd, ids.env()) else {
             return;
         };
         let view = cx.new(|cx| {
-            TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
+            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
         });
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         tree.split_active(axis, insert, view, observer);

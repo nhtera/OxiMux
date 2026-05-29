@@ -12,6 +12,7 @@ pub mod cell_metrics;
 pub mod command_palette;
 pub mod commit_dialog;
 pub mod confirm_dialog;
+pub mod context_env;
 pub mod cwd_resolver;
 pub mod diff_view;
 pub mod file_explorer;

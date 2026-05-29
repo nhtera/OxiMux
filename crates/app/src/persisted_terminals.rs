@@ -167,6 +167,15 @@ pub struct PersistedSubPane {
     /// PTY's local process id.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Stable `OXIMUX_SURFACE_ID` of this leaf. Empty for pre-existing
+    /// blobs → restore mints a fresh one. Round-tripping it keeps the
+    /// surface id identical across an app quit -> reattach.
+    #[serde(default)]
+    pub surface_id: String,
+    /// Stable `OXIMUX_TAB_ID` of the terminal in this leaf. Empty for
+    /// older blobs → restore mints a fresh one.
+    #[serde(default)]
+    pub tab_id: String,
 }
 
 /// Tab kind tag persisted alongside `PersistedTab`. The agent variant
@@ -671,11 +680,16 @@ mod tests {
         tab.sub_panes = vec![
             PersistedSubPane {
                 cwd: Some("/tmp/a".into()),
+                ..Default::default()
             },
             PersistedSubPane {
                 cwd: Some("/tmp/b".into()),
+                ..Default::default()
             },
-            PersistedSubPane { cwd: None },
+            PersistedSubPane {
+                cwd: None,
+                ..Default::default()
+            },
         ];
         tab.active_sub_pane = 2; // bottom-right leaf in DFS order
         let blob = PersistedTabs {
@@ -720,6 +734,29 @@ mod tests {
         let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
         assert!(parsed.tabs[0].sub_panes.is_empty());
         assert_eq!(parsed.tabs[0].active_sub_pane, 0);
+    }
+
+    #[test]
+    fn sub_pane_surface_and_tab_ids_round_trip() {
+        let sp = PersistedSubPane {
+            cwd: Some("/tmp/x".into()),
+            surface_id: "surf-42".into(),
+            tab_id: "tab-7".into(),
+        };
+        let back: PersistedSubPane = serde_json::from_str(&serde_json::to_string(&sp).unwrap())
+            .expect("sub-pane round-trips");
+        assert_eq!(back.surface_id, "surf-42");
+        assert_eq!(back.tab_id, "tab-7");
+    }
+
+    #[test]
+    fn pre_context_env_sub_pane_defaults_ids_empty() {
+        // A sub-pane blob from before context env (only `cwd`) must parse
+        // with empty ids so the restorer can mint fresh ones.
+        let legacy = r#"{"cwd":"/tmp/x"}"#;
+        let parsed: PersistedSubPane = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.surface_id.is_empty());
+        assert!(parsed.tab_id.is_empty());
     }
 
     #[test]

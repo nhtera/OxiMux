@@ -35,6 +35,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::Search;
 use crate::shell::cell_metrics::CellMetrics;
+use crate::shell::context_env::SurfaceIds;
 use crate::shell::key_input::keystroke_to_bytes;
 use crate::shell::terminal_canvas::{PaintParams, grid_dims_for, paint_grid};
 use crate::shell::terminal_search_overlay;
@@ -134,11 +135,15 @@ pub fn external_id_for_session(id: TerminalSessionId) -> Option<String> {
     shared.lock().ok()?.external_id_of(id)
 }
 
-pub fn spawn_local_pty(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessionId)> {
+pub fn spawn_local_pty(
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+) -> Option<(SharedBackend, TerminalSessionId)> {
     // Relay-backed path: one shared backend across the whole app.
     if let Some(shared) = SHARED_BACKEND.get() {
         let cfg = SpawnConfig {
             cwd: cwd.clone(),
+            env: env.clone(),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             ..SpawnConfig::default()
@@ -156,13 +161,17 @@ pub fn spawn_local_pty(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessionId
             }
         }
     }
-    spawn_fallback_portable(cwd)
+    spawn_fallback_portable(cwd, env)
 }
 
-fn spawn_fallback_portable(cwd: PathBuf) -> Option<(SharedBackend, TerminalSessionId)> {
+fn spawn_fallback_portable(
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
         cwd,
+        env,
         cols: DEFAULT_COLS,
         rows: DEFAULT_ROWS,
         ..SpawnConfig::default()
@@ -273,16 +282,34 @@ pub struct TerminalView {
     /// drag-select; that ships in a follow-up slice. Cmd+C copies the
     /// extracted text when set, then clears it.
     selection: Option<(usize, usize, usize, usize)>,
+    /// Stable identity triple (workspace / surface / tab). Injected into
+    /// the spawn env as `OXIMUX_*`, persisted alongside the pane layout,
+    /// and re-injected verbatim when a dormant pane respawns its shell so
+    /// the ids survive an app quit -> reattach for the same surface.
+    ids: SurfaceIds,
 }
 
 impl TerminalView {
+    /// Stable surface (leaf) id — read by the persistence layer to round-
+    /// trip `OXIMUX_SURFACE_ID` across restarts.
+    pub fn surface_id(&self) -> &str {
+        &self.ids.surface_id
+    }
+
+    /// Stable terminal id — read by the persistence layer to round-trip
+    /// `OXIMUX_TAB_ID` across restarts.
+    pub fn tab_id(&self) -> &str {
+        &self.ids.tab_id
+    }
     /// Build a view around an already-spawned backend + session. The spawn
     /// is done outside `cx.new` because the entity builder closure is
     /// infallible; this keeps spawn errors at the caller where they can be
     /// logged + fall back to a placeholder.
+    #[allow(clippy::too_many_arguments)]
     pub fn mount(
         backend: SharedBackend,
         session_id: TerminalSessionId,
+        ids: SurfaceIds,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -329,6 +356,7 @@ impl TerminalView {
         Self {
             backend,
             session_id,
+            ids,
             snapshot,
             theme,
             density,
@@ -364,9 +392,11 @@ impl TerminalView {
     /// the caller checks that result before invoking `cx.new`. Keeping
     /// the spawn outside this constructor lets `cx.new` stay
     /// infallible (its builder closure isn't allowed to fail).
+    #[allow(clippy::too_many_arguments)]
     pub fn mount_dormant(
         backend: SharedBackend,
         session_id: TerminalSessionId,
+        ids: SurfaceIds,
         cwd: PathBuf,
         prefill_bytes: &[u8],
         theme: Theme,
@@ -416,6 +446,7 @@ impl TerminalView {
         Self {
             backend,
             session_id,
+            ids,
             snapshot,
             theme,
             density,
@@ -453,6 +484,9 @@ impl TerminalView {
         };
         let cfg = SpawnConfig {
             cwd,
+            // Re-inject the SAME context ids so a respawned shell keeps
+            // its OXIMUX_SURFACE_ID / TAB_ID across the dormant cycle.
+            env: self.ids.env(),
             cols: self.target_grid.0.max(DEFAULT_COLS),
             rows: self.target_grid.1.max(DEFAULT_ROWS),
             ..SpawnConfig::default()
@@ -757,6 +791,8 @@ impl TerminalView {
         };
         let cfg = SpawnConfig {
             cwd,
+            // Re-inject the SAME context ids on the inline wake path too.
+            env: self.ids.env(),
             cols: self.target_grid.0.max(DEFAULT_COLS),
             rows: self.target_grid.1.max(DEFAULT_ROWS),
             ..SpawnConfig::default()

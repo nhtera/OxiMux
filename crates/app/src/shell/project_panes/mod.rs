@@ -1359,18 +1359,27 @@ fn snapshot_sub_pane_tree(
         // Prefer the OSC 7 hint (F4.7) before paying for `proc_pidinfo`
         // on every leaf. Snapshotting a workspace with many sub-panes
         // becomes O(N) syscalls otherwise; with the cache it's O(N)
-        // mutex reads.
-        let cwd = tree
-            .get(*slot)
-            .and_then(|slot_view| {
+        // mutex reads. The same read pulls the stable surface/tab ids so
+        // they round-trip across restart.
+        let (cwd, surface_id, tab_id) = match tree.get(*slot) {
+            Some(slot_view) => {
                 let view = slot_view.read(cx);
-                view.cwd_hint().or_else(|| {
-                    view.os_pid()
-                        .and_then(crate::shell::cwd_resolver::cwd_of_pid)
-                })
-            })
-            .map(|p| p.display().to_string());
-        sub_panes.push(PersistedSubPane { cwd });
+                let cwd = view
+                    .cwd_hint()
+                    .or_else(|| {
+                        view.os_pid()
+                            .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+                    })
+                    .map(|p| p.display().to_string());
+                (cwd, view.surface_id().to_string(), view.tab_id().to_string())
+            }
+            None => (None, String::new(), String::new()),
+        };
+        sub_panes.push(PersistedSubPane {
+            cwd,
+            surface_id,
+            tab_id,
+        });
     }
     let active_dfs_pos = leaves
         .iter()

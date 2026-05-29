@@ -898,6 +898,12 @@ impl WorkspaceRoot {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
+        // The torn-off PTY survives in the daemon, so its shell keeps the
+        // original OXIMUX_* env it was spawned with. The destination view
+        // gets a fresh identity under THIS window's workspace for future
+        // persistence/respawn (carrying the source ids across windows is a
+        // follow-up).
+        let workspace_id = panes.read(cx).cwd().to_string_lossy().into_owned();
 
         for leaf in &tearoff.leaves {
             let Some((backend, session_id)) =
@@ -914,9 +920,17 @@ impl WorkspaceRoot {
             // Mount a fresh TerminalView in this window's entity context.
             // Entity<TerminalView> cannot cross windows — a new one is
             // required in the destination window context.
+            let ids = crate::shell::context_env::SurfaceIds::fresh(workspace_id.clone());
             let view = cx.new(|cx| {
                 crate::shell::terminal_view::TerminalView::mount(
-                    backend, session_id, theme, density, typography.clone(), window, cx,
+                    backend,
+                    session_id,
+                    ids,
+                    theme,
+                    density,
+                    typography.clone(),
+                    window,
+                    cx,
                 )
             });
 

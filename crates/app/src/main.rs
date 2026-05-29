@@ -688,6 +688,11 @@ fn boot_relay_supervisor(
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
     install_shared_backend(shared);
+    // Record the daemon socket so spawned shells can advertise it via
+    // OXIMUX_SOCKET_PATH (lets `oximux notify` / agents dial the daemon).
+    oximux_app::shell::context_env::set_relay_socket_path(
+        supervisor.socket_path().to_string_lossy().into_owned(),
+    );
     tracing::info!("relay supervisor up; PTYs will route through the daemon");
 }
 

@@ -30,6 +30,7 @@ use crate::persisted_terminals::{
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
+use crate::shell::context_env::SurfaceIds;
 use crate::shell::terminal_view::{
     TerminalView, attach_pty_existing, spawn_local_pty, spawn_local_pty_dormant,
 };
@@ -198,6 +199,7 @@ pub(crate) fn build_project_panes(
                     cwd.clone(),
                     &attach_hints,
                     ordinal,
+                    single_leaf_ids(tab, &cwd),
                     theme,
                     density,
                     typography.clone(),
@@ -331,6 +333,7 @@ fn restore_multi_group(
                         cwd.clone(),
                         &attach_hints,
                         ordinal,
+                        single_leaf_ids(tab, &cwd),
                         theme,
                         density,
                         typography.clone(),
@@ -513,10 +516,16 @@ fn build_multi_sub_pane_tree(
             return None;
         };
         let leaf_cwd_for_view = leaf_cwd.clone();
+        let ids = SurfaceIds::restored(
+            project_cwd.to_string_lossy().into_owned(),
+            sp.surface_id.clone(),
+            sp.tab_id.clone(),
+        );
         let view = cx.new(|cx| {
             TerminalView::mount_dormant(
                 backend,
                 session_id,
+                ids,
                 leaf_cwd_for_view,
                 &prefill_bytes,
                 theme,
@@ -556,11 +565,24 @@ fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
     }
 }
 
+/// Rebuild the identity triple for a single-leaf terminal tab from its
+/// first persisted sub-pane (the only leaf). Empty/absent ids are minted
+/// fresh inside `SurfaceIds::restored`.
+fn single_leaf_ids(tab: &PersistedTab, cwd: &std::path::Path) -> SurfaceIds {
+    let sp = tab.sub_panes.first();
+    SurfaceIds::restored(
+        cwd.to_string_lossy().into_owned(),
+        sp.map(|s| s.surface_id.clone()).unwrap_or_default(),
+        sp.map(|s| s.tab_id.clone()).unwrap_or_default(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_terminal_view_for_tab(
     cwd: PathBuf,
     attach_hints: &AttachHints,
     ordinal: u32,
+    ids: SurfaceIds,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -570,13 +592,15 @@ fn build_terminal_view_for_tab(
     let (backend, session_id) = if let Some(relay_pty_id) = attach_hints.get(&ordinal)
         && let Some(result) = attach_pty_existing(relay_pty_id)
     {
+        // Reattach to a surviving daemon PTY: the live shell already
+        // carries its original OXIMUX_* env, so no env is injected here.
         result
     } else {
-        spawn_local_pty(cwd)?
+        spawn_local_pty(cwd, ids.env())?
     };
     Some(
         cx.new(|cx| {
-            TerminalView::mount(backend, session_id, theme, density, typography, window, cx)
+            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
         }),
     )
 }
