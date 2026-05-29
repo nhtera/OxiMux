@@ -25,7 +25,7 @@ use std::time::Duration;
 use gpui::{
     App, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ScrollWheelEvent, Styled, Task, Window, canvas, div, px,
+    Point, Render, ScrollWheelEvent, Styled, Task, WeakEntity, Window, canvas, div, px,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -39,6 +39,8 @@ use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::key_input::keystroke_to_bytes;
 use crate::shell::mouse_report::{MouseAction, MouseBtn, encode_button, encode_scroll, mod_bits};
+use crate::shell::pane_group::PaneGroup;
+use crate::shell::terminal_links::{LinkMatch, LinkTarget, detect_at};
 use crate::shell::terminal_canvas::{PaintParams, grid_dims_for, paint_grid, point_to_cell};
 use crate::shell::terminal_search_overlay;
 use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
@@ -311,6 +313,14 @@ pub struct TerminalView {
     /// In-flight mouse drag-select, `None` when no button is held. See
     /// [`SelectDrag`].
     selecting: Option<SelectDrag>,
+    /// Host pane group, used to open an editor tab when the user Cmd-clicks a
+    /// `path:line:col` link. Weak so the terminal never keeps the group alive.
+    /// `None` until `set_opener` runs (e.g. headless test mounts).
+    opener: Option<WeakEntity<PaneGroup>>,
+    /// `(row, col_start, col_end)` of the link under the pointer while Cmd is
+    /// held, so the canvas can underline it. Cleared when the pointer leaves a
+    /// link or Cmd is released.
+    hovered_link: Option<(usize, usize, usize)>,
     /// Stable identity triple (workspace / surface / tab). Injected into
     /// the spawn env as `OXIMUX_*`, persisted alongside the pane layout,
     /// and re-injected verbatim when a dormant pane respawns its shell so
@@ -329,6 +339,12 @@ impl TerminalView {
     /// `OXIMUX_TAB_ID` across restarts.
     pub fn tab_id(&self) -> &str {
         &self.ids.tab_id
+    }
+
+    /// Wire the host pane group so Cmd-click on a `path:line:col` link can
+    /// open it in an editor tab. Called by `PaneGroup` right after `mount`.
+    pub fn set_opener(&mut self, opener: WeakEntity<PaneGroup>) {
+        self.opener = Some(opener);
     }
     /// Build a view around an already-spawned backend + session. The spawn
     /// is done outside `cx.new` because the entity builder closure is
@@ -409,6 +425,8 @@ impl TerminalView {
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
             selecting: None,
+            opener: None,
+            hovered_link: None,
         }
     }
 
@@ -497,6 +515,8 @@ impl TerminalView {
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
             selecting: None,
+            opener: None,
+            hovered_link: None,
         }
     }
 
@@ -823,6 +843,110 @@ impl TerminalView {
         }
     }
 
+    /// Find a link at the given cell. OSC 8 explicit hyperlinks (carried on
+    /// the snapshot) take priority; otherwise plain-text detection runs over
+    /// the row's characters.
+    fn link_at(&self, row: usize, col: usize) -> Option<LinkMatch> {
+        if let Some(span) = self
+            .snapshot
+            .links
+            .iter()
+            .find(|l| l.row == row && col >= l.col_start && col <= l.col_end)
+        {
+            return Some(LinkMatch {
+                target: LinkTarget::Url(span.uri.clone()),
+                col_start: span.col_start,
+                col_end: span.col_end,
+            });
+        }
+        let cells = self.snapshot.cells.get(row)?;
+        let chars: Vec<char> = cells
+            .iter()
+            .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+            .collect();
+        detect_at(&chars, col)
+    }
+
+    /// Resolve a possibly-relative link path against the session's OSC 7 cwd,
+    /// falling back to the path as-is when no cwd is known.
+    fn resolve_path(&mut self, path: &std::path::Path) -> PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        let id = self.session_id;
+        match self.with_backend(|be| be.cwd_hint(id)) {
+            Some(cwd) => cwd.join(path),
+            None => path.to_path_buf(),
+        }
+    }
+
+    /// Open a detected link: URLs via the macOS system handler, paths via the
+    /// host pane group's editor (at the parsed line/col).
+    fn open_link(&mut self, target: LinkTarget, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Url(url) => {
+                if let Err(err) = std::process::Command::new("open").arg(&url).spawn() {
+                    tracing::warn!(?err, %url, "failed to open url");
+                }
+            }
+            LinkTarget::Path { path, line, col } => {
+                let resolved = self.resolve_path(&path);
+                if let Some(opener) = self.opener.clone() {
+                    let _ = opener.update(cx, |pg, cx| {
+                        pg.open_editor_at_position(resolved, line, col, window, cx);
+                    });
+                }
+            }
+        }
+    }
+
+    /// On Cmd+left-down over a link, open it and report consumption so the
+    /// click doesn't also start a selection.
+    fn try_open_link(
+        &mut self,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !ev.modifiers.platform {
+            return false;
+        }
+        let (row, col) = self.cell_at(ev.position, window);
+        let Some(hit) = self.link_at(row, col) else {
+            return false;
+        };
+        self.open_link(hit.target, window, cx);
+        true
+    }
+
+    /// Re-check the hovered link against the current snapshot after a refresh:
+    /// keep it (updating the span) if a link still sits at its start cell,
+    /// else drop it. Avoids underlining stale content after the grid changes
+    /// while also not flickering off a still-valid link during streaming output.
+    fn revalidate_hover(&mut self) {
+        if let Some((row, c0, _)) = self.hovered_link {
+            self.hovered_link = self
+                .link_at(row, c0)
+                .map(|hit| (row, hit.col_start, hit.col_end));
+        }
+    }
+
+    /// Update the Cmd-hover link underline. Called on mouse-move; clears the
+    /// highlight when Cmd isn't held or the pointer isn't over a link.
+    fn update_hover(&mut self, ev: &MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
+        let next = if ev.modifiers.platform {
+            let (row, col) = self.cell_at(ev.position, window);
+            self.link_at(row, col)
+                .map(|hit| (row, hit.col_start, hit.col_end))
+        } else {
+            None
+        };
+        if next != self.hovered_link {
+            self.hovered_link = next;
+            cx.notify();
+        }
+    }
+
     /// Wheel handling, in priority order: forward to a mouse-reporting app;
     /// else translate to arrow keys on the alt-screen (less/man); else scroll
     /// local scrollback (Phase 3).
@@ -1117,6 +1241,7 @@ impl TerminalView {
         let session_id = self.session_id;
         if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
             self.snapshot = snapshot;
+            self.revalidate_hover();
         }
         if had_output {
             self.cursor_visible = true;
@@ -1160,6 +1285,7 @@ impl TerminalView {
         // proceeds with up-to-date cell data this same frame.
         if let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
             self.snapshot = snapshot;
+            self.revalidate_hover();
         }
     }
 
@@ -1294,6 +1420,7 @@ impl Render for TerminalView {
             buckets,
             pane_focused,
             pad,
+            hovered_link: self.hovered_link,
             selection: self.selection,
         };
 
@@ -1432,6 +1559,11 @@ impl Render for TerminalView {
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
+                    // Cmd-click on a link opens it instead of selecting/reporting.
+                    if this.try_open_link(ev, window, cx) {
+                        cx.notify();
+                        return;
+                    }
                     // A mouse-reporting app (no Shift) gets the click forwarded
                     // instead of starting a local selection.
                     if !this.report_mouse(
@@ -1452,6 +1584,8 @@ impl Render for TerminalView {
                 }),
             )
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
+                // Cmd-hover link underline updates regardless of button state.
+                this.update_hover(ev, window, cx);
                 let Some(button) = ev.pressed_button else {
                     return;
                 };
@@ -1758,6 +1892,7 @@ mod selection_tests {
             cells,
             display_offset: 0,
             cursor_shape: oximux_pty::CursorShapeKind::Block,
+            links: Vec::new(),
         }
     }
 

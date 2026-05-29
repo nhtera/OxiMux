@@ -79,6 +79,9 @@ pub struct PaintParams {
     pub buckets: Vec<Vec<MatchHit>>,
     pub pane_focused: bool,
     pub pad: f32,
+    /// `(row, col_start, col_end)` of the link the pointer is hovering with
+    /// Cmd held — underlined so the user sees it's clickable. `None` = none.
+    pub hovered_link: Option<(usize, usize, usize)>,
     /// Active text selection in cell coordinates: `(start_row, start_col,
     /// end_row, end_col)`. End is inclusive on both axes. Painted as a
     /// theme.selection bg overlay BEHIND text but ON TOP of cell bg so
@@ -367,6 +370,24 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
                 }
             };
             window.paint_quad(fill(rect, color));
+        }
+
+        // Cmd-hover link underline: a 1px rule under the link's cells so the
+        // user sees the clickable span.
+        if let Some((link_row, c0, c1)) = p.hovered_link
+            && link_row == row_idx
+        {
+            let x_left = (origin.x + cell_w * c0 as f32).floor();
+            let width = (cell_w * (c1 + 1 - c0) as f32).ceil();
+            let thickness = px(1.0);
+            let rect = Bounds {
+                origin: point(x_left, row_y + line_h - thickness),
+                size: Size {
+                    width,
+                    height: thickness,
+                },
+            };
+            window.paint_quad(fill(rect, p.theme.fg_base));
         }
     }
 }

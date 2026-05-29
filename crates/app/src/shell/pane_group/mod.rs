@@ -564,6 +564,7 @@ impl PaneGroup {
                 backend, session_id, ids, theme, density, typography, window, cx,
             )
         });
+        Self::wire_opener(&view, cx);
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         let n = self.next_terminal_n;
         self.next_terminal_n += 1;
@@ -596,6 +597,47 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) -> usize {
         self.open_or_activate_editor_tab_at(path, None, window, cx)
+    }
+
+    /// Give a freshly-mounted terminal a weak handle back to this group so
+    /// Cmd-click on a `path:line:col` link can open it in an editor tab. An
+    /// associated fn (not `&self`) so it can run while a sub-pane tree is
+    /// borrowed mutably at the split/add call sites.
+    fn wire_opener(view: &gpui::Entity<TerminalView>, cx: &mut Context<Self>) {
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
+    }
+
+    /// Open `path` and move the editor cursor to the 1-based `line`/`col` as
+    /// shown in terminal output (e.g. a clicked `src/foo.rs:42:7`). Converts
+    /// to the editor's 0-based `Position`; the editor scrolls to it on the
+    /// next paint via its focus-on-activation path. A `None` line just opens
+    /// the file.
+    pub fn open_editor_at_position(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        col: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_or_activate_editor_tab(path.clone(), window, cx);
+        let Some(line) = line else {
+            return;
+        };
+        let editor = self.tabs.iter().find_map(|t| match &t.content {
+            PaneContent::Editor(v) if v.read(cx).file_path() == path.as_path() => Some(v.clone()),
+            _ => None,
+        });
+        if let Some(view) = editor
+            && let Some(state) = view.read(cx).state()
+        {
+            let position = gpui_component::input::Position {
+                line: line.saturating_sub(1),
+                character: col.unwrap_or(1).saturating_sub(1),
+            };
+            state.update(cx, |s, cx| s.set_cursor_position(position, window, cx));
+        }
     }
 
     /// Open `path` as an editor tab, optionally inserting it at a specific
@@ -788,6 +830,7 @@ impl PaneGroup {
                 backend, term_id, ids, theme, density, typography, window, cx,
             )
         });
+        Self::wire_opener(&view, cx);
         let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
         let label = match label_override {
             Some(s) => SharedString::from(s),
@@ -919,6 +962,9 @@ impl PaneGroup {
         view: gpui::Entity<TerminalView>,
         cx: &mut Context<Self>,
     ) {
+        // Restored terminals also need a link opener, else Cmd-click is dead
+        // after a session restore.
+        Self::wire_opener(&view, cx);
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         self.tabs.push(PaneGroupTab {
             label: SharedString::from(label),
@@ -950,6 +996,12 @@ impl PaneGroup {
         tree: TerminalSplitTree,
         cx: &mut Context<Self>,
     ) {
+        // Wire the link opener into every restored leaf view (collect first to
+        // drop the tree borrow before the per-view entity updates).
+        let views: Vec<_> = tree.iter_all_views().map(|(_, _, v)| v.clone()).collect();
+        for view in &views {
+            Self::wire_opener(view, cx);
+        }
         self.tabs.push(PaneGroupTab {
             label: SharedString::from(label),
             content: PaneContent::Terminal(tree),
@@ -1313,6 +1365,7 @@ impl PaneGroup {
                 backend, session_id, ids, theme, density, typography, window, cx,
             )
         });
+        Self::wire_opener(&view, cx);
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         tree.add_tab_to_active(view, observer);
         if let Some(active_view) = tree.active_view() {
@@ -1599,6 +1652,7 @@ impl PaneGroup {
                 backend, session_id, ids, theme, density, typography, window, cx,
             )
         });
+        Self::wire_opener(&view, cx);
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
         tree.split_active(axis, insert, view, observer);
         // Focus the just-spawned sub-pane so keyboard input lands there.

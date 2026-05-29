@@ -24,7 +24,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor};
 
-use crate::snapshot::{Cell, CellColor, NamedColor16, TerminalSnapshot};
+use crate::snapshot::{Cell, CellColor, HyperlinkSpan, NamedColor16, TerminalSnapshot};
 
 #[derive(Debug, Clone, Copy)]
 struct SizeInfo {
@@ -269,12 +269,53 @@ impl TerminalState {
 
         snap.cells.clear();
         snap.cells.reserve(self.size.rows);
+        snap.links.clear();
         for screen_row in 0..self.size.rows as i32 {
             let row = &self.term.grid()[Line(screen_row - offset)];
+            let visible_row = screen_row as usize;
             let mut row_cells = Vec::with_capacity(self.size.cols);
+            // OSC 8 run accumulator: (start_col, uri). Extends while the uri
+            // matches; closes on change/None/row-end. Empty on the common
+            // path (no app-emitted hyperlinks).
+            let mut link_run: Option<(usize, String)> = None;
             for col_idx in 0..self.size.cols {
                 let cell = &row[Column(col_idx)];
+                match cell.hyperlink() {
+                    Some(h) => {
+                        let uri = h.uri();
+                        let same = matches!(&link_run, Some((_, u)) if u == uri);
+                        if !same {
+                            if let Some((start, u)) = link_run.take() {
+                                snap.links.push(HyperlinkSpan {
+                                    row: visible_row,
+                                    col_start: start,
+                                    col_end: col_idx - 1,
+                                    uri: u,
+                                });
+                            }
+                            link_run = Some((col_idx, uri.to_string()));
+                        }
+                    }
+                    None => {
+                        if let Some((start, u)) = link_run.take() {
+                            snap.links.push(HyperlinkSpan {
+                                row: visible_row,
+                                col_start: start,
+                                col_end: col_idx - 1,
+                                uri: u,
+                            });
+                        }
+                    }
+                }
                 row_cells.push(map_cell(cell));
+            }
+            if let Some((start, u)) = link_run.take() {
+                snap.links.push(HyperlinkSpan {
+                    row: visible_row,
+                    col_start: start,
+                    col_end: self.size.cols - 1,
+                    uri: u,
+                });
             }
             snap.cells.push(row_cells);
         }
@@ -501,6 +542,20 @@ mod tests {
         state.advance(b"\x1b[30;1HY");
         let snap = fresh_snapshot(&state);
         assert_eq!(snap.cursor, (29, 1));
+    }
+
+    #[test]
+    fn osc8_hyperlink_span_captured() {
+        // OSC 8: ESC ] 8 ; params ; URI ST  text  ESC ] 8 ; ; ST
+        let mut state = TerminalState::new(40, 3, 100);
+        state.advance(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        let snap = fresh_snapshot(&state);
+        assert_eq!(snap.links.len(), 1, "one hyperlink span expected");
+        let span = &snap.links[0];
+        assert_eq!(span.row, 0);
+        assert_eq!(span.col_start, 0);
+        assert_eq!(span.col_end, 3, "\"link\" spans cols 0..=3");
+        assert_eq!(span.uri, "https://example.com");
     }
 
     #[test]

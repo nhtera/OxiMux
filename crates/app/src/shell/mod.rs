@@ -40,6 +40,7 @@ pub mod stash_panel;
 pub mod status_bar;
 pub mod tab_context_menu;
 pub mod terminal_canvas;
+pub mod terminal_links;
 pub mod terminal_palette;
 pub mod terminal_row;
 pub mod terminal_search;

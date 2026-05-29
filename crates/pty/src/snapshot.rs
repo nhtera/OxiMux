@@ -75,6 +75,17 @@ pub enum CursorShapeKind {
     Hidden,
 }
 
+/// An OSC 8 explicit hyperlink covering an inclusive `[col_start, col_end]`
+/// run on a visible `row`. The `uri` may differ from the displayed text, so
+/// these are resolved before plain-text link detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperlinkSpan {
+    pub row: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+    pub uri: String,
+}
+
 /// A frame-aligned snapshot. Cheap to clone (Vec<Row> small under 24x80).
 #[derive(Debug, Clone, Default)]
 pub struct TerminalSnapshot {
@@ -88,6 +99,9 @@ pub struct TerminalSnapshot {
     pub display_offset: usize,
     /// Shape the app asked the cursor to take (DECSCUSR / DECTCEM).
     pub cursor_shape: CursorShapeKind,
+    /// OSC 8 explicit hyperlink spans on the visible rows. Empty on the common
+    /// path (no app-emitted links); resolved before plain-text detection.
+    pub links: Vec<HyperlinkSpan>,
 }
 
 impl TerminalSnapshot {
@@ -99,6 +113,7 @@ impl TerminalSnapshot {
             cells: Vec::new(),
             display_offset: 0,
             cursor_shape: CursorShapeKind::Block,
+            links: Vec::new(),
         }
     }
 }
