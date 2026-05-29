@@ -873,4 +873,68 @@ mod tests {
         assert!(!ids.surface_id.is_empty(), "surface id must be minted");
         assert!(!ids.tab_id.is_empty(), "tab id must be minted");
     }
+
+    // ── compute_attach_hints: the reattach-reconciliation gate ─────────────
+    //
+    // On reload this decides, per persisted leaf, whether to REATTACH to a
+    // surviving daemon PTY or RESPAWN a fresh shell. A hint is emitted only
+    // when BOTH hold: the persisted relay session matches the current daemon
+    // session AND the daemon still lists that pty id. Either miss → respawn.
+
+    fn live_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn attach_hints_keeps_live_survivor_with_matching_session() {
+        let persisted = vec![(0u32, "pty-A".to_string(), "sess-1".to_string())];
+        let hints = compute_attach_hints(persisted, &live_set(&["pty-A"]), Some("sess-1"));
+        assert_eq!(hints.get(&0).map(String::as_str), Some("pty-A"));
+    }
+
+    #[test]
+    fn attach_hints_drops_dead_pty() {
+        // Session matches, but the daemon no longer lists this pty → respawn.
+        let persisted = vec![(0u32, "pty-A".to_string(), "sess-1".to_string())];
+        let hints = compute_attach_hints(persisted, &live_set(&[]), Some("sess-1"));
+        assert!(
+            hints.is_empty(),
+            "a dead pty must not yield a reattach hint"
+        );
+    }
+
+    #[test]
+    fn attach_hints_drops_stale_session() {
+        // The id is live but belongs to a DIFFERENT daemon session (the relay
+        // restarted): the match is coincidental, so respawn rather than bind
+        // to an unrelated process.
+        let persisted = vec![(0u32, "pty-A".to_string(), "old-sess".to_string())];
+        let hints = compute_attach_hints(persisted, &live_set(&["pty-A"]), Some("new-sess"));
+        assert!(hints.is_empty(), "a session mismatch must block reattach");
+    }
+
+    #[test]
+    fn attach_hints_empty_when_no_current_session() {
+        let persisted = vec![(0u32, "pty-A".to_string(), "sess-1".to_string())];
+        let hints = compute_attach_hints(persisted, &live_set(&["pty-A"]), None);
+        assert!(hints.is_empty(), "no current session → nothing to reattach");
+    }
+
+    #[test]
+    fn attach_hints_filters_mixed_set_to_live_survivors() {
+        let persisted = vec![
+            (0u32, "pty-A".to_string(), "sess-1".to_string()), // live + match → keep
+            (1u32, "pty-B".to_string(), "sess-1".to_string()), // dead → drop
+            (2u32, "pty-C".to_string(), "other".to_string()),  // wrong session → drop
+        ];
+        let hints = compute_attach_hints(persisted, &live_set(&["pty-A", "pty-C"]), Some("sess-1"));
+        assert_eq!(
+            hints.len(),
+            1,
+            "only the live + session-matched leaf survives"
+        );
+        assert_eq!(hints.get(&0).map(String::as_str), Some("pty-A"));
+        assert!(!hints.contains_key(&1), "dead pty-B dropped");
+        assert!(!hints.contains_key(&2), "wrong-session pty-C dropped");
+    }
 }
