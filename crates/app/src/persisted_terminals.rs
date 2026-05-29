@@ -164,16 +164,39 @@ pub struct PersistedTab {
 pub struct PersistedSubPane {
     /// Working directory at capture time. `None` → restore falls back
     /// to the project cwd. Resolved at snapshot via `cwd_of_pid` on the
-    /// PTY's local process id.
+    /// PTY's local process id. Mirrors the leaf's ACTIVE tab so a legacy
+    /// (pre-per-pane-tabs) reader still restores the visible terminal.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Stable `OXIMUX_SURFACE_ID` of this leaf. Empty for pre-existing
-    /// blobs → restore mints a fresh one. Round-tripping it keeps the
-    /// surface id identical across an app quit -> reattach.
+    /// Stable `OXIMUX_SURFACE_ID` of the leaf's active tab. Empty for
+    /// pre-existing blobs → restore mints a fresh one. Round-tripping it
+    /// keeps the surface id identical across an app quit -> reattach.
     #[serde(default)]
     pub surface_id: String,
-    /// Stable `OXIMUX_TAB_ID` of the terminal in this leaf. Empty for
-    /// older blobs → restore mints a fresh one.
+    /// Stable `OXIMUX_TAB_ID` of the leaf's active tab. Empty for older
+    /// blobs → restore mints a fresh one.
+    #[serde(default)]
+    pub tab_id: String,
+    /// Per-pane (per-leaf) tab strip: one entry per terminal in this
+    /// leaf. Empty for legacy / single-tab leaves — restore then falls
+    /// back to a one-tab leaf built from the `cwd`/`surface_id`/`tab_id`
+    /// fields above. When non-empty it is the source of truth.
+    #[serde(default)]
+    pub tabs: Vec<PersistedLeafTab>,
+    /// Active tab index within `tabs`. `0` for single-tab leaves.
+    #[serde(default)]
+    pub active_tab: usize,
+}
+
+/// One terminal tab inside a persisted leaf. Carries the per-tab cwd +
+/// stable surface/tab ids so each terminal in a split pane's strip is
+/// restored with its own identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PersistedLeafTab {
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub surface_id: String,
     #[serde(default)]
     pub tab_id: String,
 }
@@ -742,6 +765,7 @@ mod tests {
             cwd: Some("/tmp/x".into()),
             surface_id: "surf-42".into(),
             tab_id: "tab-7".into(),
+            ..Default::default()
         };
         let back: PersistedSubPane = serde_json::from_str(&serde_json::to_string(&sp).unwrap())
             .expect("sub-pane round-trips");
@@ -757,6 +781,38 @@ mod tests {
         let parsed: PersistedSubPane = serde_json::from_str(legacy).unwrap();
         assert!(parsed.surface_id.is_empty());
         assert!(parsed.tab_id.is_empty());
+        assert!(parsed.tabs.is_empty());
+        assert_eq!(parsed.active_tab, 0);
+    }
+
+    #[test]
+    fn multi_tab_leaf_round_trips() {
+        let sp = PersistedSubPane {
+            cwd: Some("/tmp/b".into()),
+            surface_id: "surf-b".into(),
+            tab_id: "tab-b".into(),
+            tabs: vec![
+                PersistedLeafTab {
+                    cwd: Some("/tmp/a".into()),
+                    surface_id: "surf-a".into(),
+                    tab_id: "tab-a".into(),
+                },
+                PersistedLeafTab {
+                    cwd: Some("/tmp/b".into()),
+                    surface_id: "surf-b".into(),
+                    tab_id: "tab-b".into(),
+                },
+            ],
+            active_tab: 1,
+        };
+        let back: PersistedSubPane =
+            serde_json::from_str(&serde_json::to_string(&sp).unwrap()).unwrap();
+        assert_eq!(back.tabs.len(), 2);
+        assert_eq!(back.active_tab, 1);
+        assert_eq!(back.tabs[0].tab_id, "tab-a");
+        assert_eq!(back.tabs[1].surface_id, "surf-b");
+        // Top-level fields mirror the active tab for legacy readers.
+        assert_eq!(back.tab_id, "tab-b");
     }
 
     #[test]

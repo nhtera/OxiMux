@@ -54,6 +54,21 @@ impl LeafTabs {
         }
     }
 
+    /// Build a leaf from a restored list of `(view, observer)` tabs with
+    /// the given active index (clamped). Used by the restore path to
+    /// rehydrate per-pane tab strips.
+    fn from_tabs(tabs: Vec<(Entity<TerminalView>, Subscription)>, active: usize) -> Self {
+        let tabs: Vec<LeafTab> = tabs
+            .into_iter()
+            .map(|(view, observer)| LeafTab {
+                view,
+                _observer: observer,
+            })
+            .collect();
+        let active = active.min(tabs.len().saturating_sub(1));
+        Self { tabs, active }
+    }
+
     /// Number of tabs in this leaf (always >= 1).
     pub fn len(&self) -> usize {
         self.tabs.len()
@@ -145,10 +160,10 @@ impl TerminalSplitTree {
     }
 
     /// Restore-side constructor. `tree_proto` carries the shape (axes +
-    /// weights); `leaves` is the per-leaf (view, observer) pair in DFS
-    /// visit order; `active_dfs_pos` is the active leaf's DFS position.
-    /// Each restored leaf starts with a single tab; multi-tab leaves are
-    /// rehydrated separately by the factory.
+    /// weights); `leaves` is the per-leaf tab list in DFS visit order —
+    /// each entry is `(tabs, active_tab)` where `tabs` is that leaf's
+    /// ordered `(view, observer)` pairs and `active_tab` its active index.
+    /// `active_dfs_pos` is the active LEAF's DFS position.
     ///
     /// The restorer walks `tree_proto` in DFS order and allocates slot
     /// ids `0..N` in the same order, so the i-th DFS leaf binds to
@@ -159,7 +174,7 @@ impl TerminalSplitTree {
     /// `leaves.len()` must equal `count_leaves(tree_proto)`; debug-asserted.
     pub fn from_persisted(
         tree_proto: &PersistedTree,
-        leaves: Vec<(Entity<TerminalView>, Subscription)>,
+        leaves: Vec<(Vec<(Entity<TerminalView>, Subscription)>, usize)>,
         active_dfs_pos: usize,
     ) -> Self {
         let mut next_slot: usize = 0;
@@ -174,8 +189,8 @@ impl TerminalSplitTree {
             "leaves count must match tree leaf count"
         );
         let mut panes: Vec<Option<LeafTabs>> = Vec::with_capacity(leaves.len());
-        for (view, obs) in leaves {
-            panes.push(Some(LeafTabs::single(view, obs)));
+        for (tabs, active_tab) in leaves {
+            panes.push(Some(LeafTabs::from_tabs(tabs, active_tab)));
         }
         let active = active_dfs_pos.min(panes.len().saturating_sub(1));
         Self {

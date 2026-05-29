@@ -24,8 +24,8 @@ use oximux_storage::{PaneBufferRepo, SettingsRepo};
 
 use crate::notifier::Notifier;
 use crate::persisted_terminals::{
-    PersistedAgentTab, PersistedSubPane, PersistedTab, PersistedTabKind, PersistedTabs,
-    WINDOWS_MANIFEST_KEY, WindowsManifest, legacy_settings_key, settings_key,
+    PersistedAgentTab, PersistedTab, PersistedTabKind, PersistedTabs, WINDOWS_MANIFEST_KEY,
+    WindowsManifest, legacy_settings_key, settings_key,
 };
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
@@ -174,7 +174,7 @@ pub(crate) fn build_project_panes(
                         window,
                         cx,
                     );
-                } else if tab.sub_panes.len() > 1 {
+                } else if needs_tree_restore(tab) {
                     // Multi-sub-pane restore — spawn one fresh PTY per
                     // leaf at the captured cwd (no relay attach). Every
                     // sub-pane gets its own scrollback bytes from the
@@ -304,7 +304,7 @@ fn restore_multi_group(
                             window,
                             cx,
                         );
-                    } else if tab.sub_panes.len() > 1 {
+                    } else if needs_tree_restore(tab) {
                         // Multi-sub-pane restore into a specific group.
                         // Same machinery as the single-group path; only
                         // the push API differs.
@@ -484,6 +484,14 @@ fn restore_agent_tab(
 /// scrollback bytes saved at `(tab_ordinal, sub_pane_ordinal)`. Returns
 /// `None` when at least one PTY spawn fails — the whole tab is dropped
 /// rather than leaving a partially-restored tree with phantom slots.
+/// Whether a terminal tab needs the full sub-pane tree restore path
+/// (dormant-spawn per leaf/tab) rather than the single-view fast path:
+/// it has more than one split leaf, OR any leaf carries a multi-tab
+/// per-pane strip.
+fn needs_tree_restore(tab: &PersistedTab) -> bool {
+    tab.sub_panes.len() > 1 || tab.sub_panes.iter().any(|sp| sp.tabs.len() > 1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_multi_sub_pane_tree(
     tab: &PersistedTab,
@@ -496,47 +504,66 @@ fn build_multi_sub_pane_tree(
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<TerminalSplitTree> {
-    let mut leaves: Vec<(Entity<TerminalView>, gpui::Subscription)> =
-        Vec::with_capacity(tab.sub_panes.len());
+    type LeafSpec = (Vec<(Entity<TerminalView>, gpui::Subscription)>, usize);
+    let mut leaves: Vec<LeafSpec> = Vec::with_capacity(tab.sub_panes.len());
     for (sub_pane_ordinal, sp) in tab.sub_panes.iter().enumerate() {
-        let leaf_cwd = resolve_sub_pane_cwd(sp, &project_cwd);
-        // F3.4 slice 2: spawn each sub-pane DORMANT (grid emulator with
-        // restored scrollback, no PTY child). The first focus-in /
-        // keystroke wakes it via `respawn_if_dormant`. The active
-        // sub-pane gets focused by the workspace restore orchestrator
-        // and wakes automatically on the first paint; non-active
-        // sub-panes stay dormant until the user clicks them.
-        let prefill_bytes = pane_buffers
+        // A leaf's tabs come from its explicit `tabs` list (per-pane tab
+        // strip), or — for legacy / single-tab leaves — a single tab built
+        // from the top-level cwd/surface_id/tab_id fields.
+        let leaf_tabs: Vec<(Option<String>, String, String)> = if sp.tabs.is_empty() {
+            vec![(sp.cwd.clone(), sp.surface_id.clone(), sp.tab_id.clone())]
+        } else {
+            sp.tabs
+                .iter()
+                .map(|t| (t.cwd.clone(), t.surface_id.clone(), t.tab_id.clone()))
+                .collect()
+        };
+        let active_tab = sp.active_tab.min(leaf_tabs.len().saturating_sub(1));
+        // Only the leaf's ACTIVE tab inherits the captured scrollback
+        // (buffers are keyed per leaf, not per per-pane tab — finer-grained
+        // scrollback capture is a follow-up); other tabs start empty.
+        let active_prefill = pane_buffers
             .remove(&(tab_ordinal, sub_pane_ordinal as u32))
             .unwrap_or_default();
-        // `cx.new` is infallible, so the fallible `spawn_local_pty_dormant`
-        // runs out here; on failure we drop the whole tab.
-        let Some((backend, session_id)) = spawn_local_pty_dormant(80, 24) else {
-            tracing::warn!(label = %tab.label, "sub-pane spawn_dormant failed; dropping tab");
-            return None;
-        };
-        let leaf_cwd_for_view = leaf_cwd.clone();
-        let ids = SurfaceIds::restored(
-            project_cwd.to_string_lossy().into_owned(),
-            sp.surface_id.clone(),
-            sp.tab_id.clone(),
-        );
-        let view = cx.new(|cx| {
-            TerminalView::mount_dormant(
-                backend,
-                session_id,
-                ids,
-                leaf_cwd_for_view,
-                &prefill_bytes,
-                theme,
-                density,
-                typography.clone(),
-                window,
-                cx,
-            )
-        });
-        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
-        leaves.push((view, observer));
+        let mut tab_views: Vec<(Entity<TerminalView>, gpui::Subscription)> =
+            Vec::with_capacity(leaf_tabs.len());
+        for (ti, (cwd_opt, surface_id, tab_id)) in leaf_tabs.into_iter().enumerate() {
+            let leaf_cwd = resolve_cwd(cwd_opt.as_deref(), &project_cwd);
+            // F3.4 slice 2: spawn each tab DORMANT (grid emulator, no PTY
+            // child). First focus-in/keystroke wakes it via respawn.
+            let Some((backend, session_id)) = spawn_local_pty_dormant(80, 24) else {
+                tracing::warn!(label = %tab.label, "sub-pane spawn_dormant failed; dropping tab");
+                return None;
+            };
+            let ids = SurfaceIds::restored(
+                project_cwd.to_string_lossy().into_owned(),
+                surface_id,
+                tab_id,
+            );
+            let empty: Vec<u8> = Vec::new();
+            let prefill: &[u8] = if ti == active_tab {
+                &active_prefill
+            } else {
+                &empty
+            };
+            let view = cx.new(|cx| {
+                TerminalView::mount_dormant(
+                    backend,
+                    session_id,
+                    ids,
+                    leaf_cwd,
+                    prefill,
+                    theme,
+                    density,
+                    typography.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+            tab_views.push((view, observer));
+        }
+        leaves.push((tab_views, active_tab));
     }
     Some(TerminalSplitTree::from_persisted(
         &tab.tree,
@@ -545,12 +572,11 @@ fn build_multi_sub_pane_tree(
     ))
 }
 
-/// Validate + materialize a sub-pane's persisted cwd. Falls back to
-/// `project_cwd` when the saved cwd is missing, blank, or no longer
-/// exists on disk. Avoids spawning a shell into a stale directory.
-fn resolve_sub_pane_cwd(sp: &PersistedSubPane, project_cwd: &PathBuf) -> PathBuf {
-    let candidate = sp.cwd.as_deref().map(PathBuf::from);
-    match candidate {
+/// Validate + materialize a persisted cwd. Falls back to `project_cwd`
+/// when the saved cwd is missing, blank, or no longer exists on disk.
+/// Avoids spawning a shell into a stale directory.
+fn resolve_cwd(cwd: Option<&str>, project_cwd: &PathBuf) -> PathBuf {
+    match cwd.map(PathBuf::from) {
         Some(p) if p.is_dir() => p,
         _ => project_cwd.clone(),
     }

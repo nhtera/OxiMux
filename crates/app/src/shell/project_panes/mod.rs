@@ -30,8 +30,8 @@ use oximux_storage::{PaneBufferRepo, PaneRelayIdRepo};
 
 use crate::notifier::{Notifier, TabId};
 use crate::persisted_terminals::{
-    PersistedAgentTab, PersistedGroup, PersistedSubPane, PersistedTab, PersistedTabKind,
-    PersistedTabs, PersistedTree, snapshot_tree,
+    PersistedAgentTab, PersistedGroup, PersistedLeafTab, PersistedSubPane, PersistedTab,
+    PersistedTabKind, PersistedTabs, PersistedTree, snapshot_tree,
 };
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::tab_drag_zones::Zone;
@@ -1356,29 +1356,52 @@ fn snapshot_sub_pane_tree(
     let leaves = tree.tree().in_order_leaves();
     let mut sub_panes: Vec<PersistedSubPane> = Vec::with_capacity(leaves.len());
     for slot in &leaves {
-        // Prefer the OSC 7 hint (F4.7) before paying for `proc_pidinfo`
-        // on every leaf. Snapshotting a workspace with many sub-panes
-        // becomes O(N) syscalls otherwise; with the cache it's O(N)
-        // mutex reads. The same read pulls the stable surface/tab ids so
-        // they round-trip across restart.
-        let (cwd, surface_id, tab_id) = match tree.get(*slot) {
-            Some(slot_view) => {
-                let view = slot_view.read(cx);
-                let cwd = view
-                    .cwd_hint()
-                    .or_else(|| {
-                        view.os_pid()
-                            .and_then(crate::shell::cwd_resolver::cwd_of_pid)
-                    })
-                    .map(|p| p.display().to_string());
-                (cwd, view.surface_id().to_string(), view.tab_id().to_string())
-            }
-            None => (None, String::new(), String::new()),
+        // Capture every per-pane tab in the leaf. Prefer the OSC 7 hint
+        // (F4.7) before paying for `proc_pidinfo` on each — snapshotting a
+        // workspace with many panes becomes O(N) syscalls otherwise. The
+        // same read pulls the stable surface/tab ids so they round-trip.
+        let tabs: Vec<PersistedLeafTab> = match tree.leaf(*slot) {
+            Some(leaf) => leaf
+                .tabs()
+                .iter()
+                .map(|lt| {
+                    let view = lt.view().read(cx);
+                    let cwd = view
+                        .cwd_hint()
+                        .or_else(|| {
+                            view.os_pid()
+                                .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+                        })
+                        .map(|p| p.display().to_string());
+                    PersistedLeafTab {
+                        cwd,
+                        surface_id: view.surface_id().to_string(),
+                        tab_id: view.tab_id().to_string(),
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let active_tab = tree.leaf(*slot).map(|l| l.active()).unwrap_or(0);
+        // Top-level fields mirror the ACTIVE tab so a legacy reader (or a
+        // single-tab leaf) restores the visible terminal.
+        let active = tabs.get(active_tab);
+        let cwd = active.and_then(|t| t.cwd.clone());
+        let surface_id = active.map(|t| t.surface_id.clone()).unwrap_or_default();
+        let tab_id = active.map(|t| t.tab_id.clone()).unwrap_or_default();
+        // Only emit the `tabs` list for genuine multi-tab leaves so
+        // single-tab leaves keep the compact legacy blob shape.
+        let (tabs, active_tab) = if tabs.len() > 1 {
+            (tabs, active_tab)
+        } else {
+            (Vec::new(), 0)
         };
         sub_panes.push(PersistedSubPane {
             cwd,
             surface_id,
             tab_id,
+            tabs,
+            active_tab,
         });
     }
     let active_dfs_pos = leaves
