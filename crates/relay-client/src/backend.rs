@@ -622,4 +622,132 @@ mod tests {
             "superseded pump performs zero advance + emits nothing"
         );
     }
+
+    // A live pump (matching generation) receiving a BEL byte must surface
+    // attention: a Bell event queued AHEAD of the Output chunk that carried
+    // it, so a background tab lights up. Order matters — the tab strip reads
+    // the Bell before painting the output.
+    #[test]
+    fn bell_byte_in_output_emits_bell_then_output() {
+        let id = TerminalSessionId(7);
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let generation = AtomicU64::new(1);
+
+        let flow = apply_relay_notification(
+            &state,
+            &queues,
+            id,
+            &generation,
+            1,
+            Notification::Output {
+                pty_id: "p".into(),
+                bytes: vec![0x07], // BEL
+            },
+        );
+        assert!(flow.is_continue(), "live pump keeps going after a bell");
+
+        let guard = queues.lock().unwrap();
+        let q = guard.get(&id).expect("events queued");
+        assert_eq!(q.len(), 2, "a BEL chunk emits Bell + Output");
+        assert!(matches!(q[0], TerminalEvent::Bell { .. }), "Bell first");
+        assert!(
+            matches!(q[1], TerminalEvent::Output { .. }),
+            "Output second"
+        );
+    }
+
+    // An Exit notification (matching generation) must emit an Exit event AND
+    // stop the pump — the PTY is gone, so there is nothing more to read.
+    #[test]
+    fn exit_notification_emits_exit_and_breaks() {
+        let id = TerminalSessionId(8);
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let generation = AtomicU64::new(1);
+
+        let flow = apply_relay_notification(
+            &state,
+            &queues,
+            id,
+            &generation,
+            1,
+            Notification::Exit {
+                pty_id: "p".into(),
+                code: Some(0),
+            },
+        );
+        assert!(flow.is_break(), "Exit stops the pump");
+        let guard = queues.lock().unwrap();
+        let q = guard.get(&id).expect("events queued");
+        assert_eq!(q.len(), 1);
+        assert!(
+            matches!(q[0], TerminalEvent::Exit { .. }),
+            "Exit event emitted"
+        );
+    }
+
+    // An explicit `oximux notify` Attention notification raises the same
+    // pane attention as a bell and keeps the pump running.
+    #[test]
+    fn attention_notification_emits_bell_and_continues() {
+        let id = TerminalSessionId(9);
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let generation = AtomicU64::new(1);
+
+        let flow = apply_relay_notification(
+            &state,
+            &queues,
+            id,
+            &generation,
+            1,
+            Notification::Attention {
+                pty_id: "p".into(),
+                title: "Claude".into(),
+                body: "needs you".into(),
+            },
+        );
+        assert!(flow.is_continue(), "Attention keeps the pump running");
+        let guard = queues.lock().unwrap();
+        let q = guard.get(&id).expect("events queued");
+        assert_eq!(q.len(), 1);
+        assert!(
+            matches!(q[0], TerminalEvent::Bell { .. }),
+            "Attention → Bell"
+        );
+    }
+
+    // The guard's core anti-scramble guarantee: a SUPERSEDED pump must not
+    // advance the shared `TerminalState`. Feed a BEL byte under a stale
+    // generation; because the guard breaks before `advance`, the bell flag
+    // is never set on the grid — `take_bell` stays false. This pins "zero
+    // advance after supersession" directly on the state, not just the event
+    // queue (a stale pump scribbling on the reattached grid is exactly what
+    // scrambled restored full-screen TUIs).
+    #[test]
+    fn superseded_pump_leaves_state_unadvanced() {
+        let id = TerminalSessionId(10);
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let generation = AtomicU64::new(2); // a newer attach already moved on
+
+        let flow = apply_relay_notification(
+            &state,
+            &queues,
+            id,
+            &generation,
+            1, // this pump captured the old generation
+            Notification::Output {
+                pty_id: "p".into(),
+                bytes: vec![0x07], // BEL — would set the bell flag IF advanced
+            },
+        );
+        assert!(flow.is_break(), "superseded pump stops");
+        assert_eq!(queue_len(&queues, id), 0, "no events from a stale pump");
+        assert!(
+            !state.lock().unwrap().take_bell(),
+            "stale pump must not advance the grid (BEL never reached state)"
+        );
+    }
 }
