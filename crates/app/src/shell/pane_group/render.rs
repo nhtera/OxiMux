@@ -19,7 +19,7 @@ use gpui::{
 };
 use oximux_settings::Theme;
 
-use super::sub_pane::TerminalSplitTree;
+use super::sub_pane::{LeafTabs, TerminalSplitTree};
 use super::tab_drag::{TabDragPayload, TabDragPreview};
 use super::{PaneGroup, PaneGroupTab, PaneGroupTabKind, TabDragHover, TabInsertSide};
 use crate::actions::{
@@ -113,6 +113,7 @@ impl Render for PaneGroup {
             .size_full()
             .relative()
             .on_action(cx.listener(PaneGroup::on_new_tab))
+            .on_action(cx.listener(PaneGroup::on_new_tab_in_pane))
             .on_action(cx.listener(PaneGroup::on_close_tab))
             .on_action(cx.listener(PaneGroup::on_next_tab))
             .on_action(cx.listener(PaneGroup::on_prev_tab))
@@ -522,7 +523,7 @@ fn build_sub_pane_node(
 ) -> Option<AnyElement> {
     use crate::shell::pane_tree::{Axis, PaneTree};
     match node {
-        PaneTree::Leaf(idx) => tree.get(*idx).map(|view| view.clone().into_any_element()),
+        PaneTree::Leaf(idx) => render_leaf(*idx, tree, group.clone(), theme),
         PaneTree::Split {
             axis,
             children,
@@ -617,6 +618,119 @@ fn build_sub_pane_node(
             Some(row.into_any_element())
         }
     }
+}
+
+/// Height of the compact per-pane (per-leaf) tab strip.
+const LEAF_TAB_BAR_HEIGHT_PX: f32 = 22.0;
+
+/// Render one split leaf. A leaf is a tab container; when it holds more
+/// than one tab — or the whole tab is split into multiple leaves — a
+/// compact per-pane tab strip is rendered above the active terminal so
+/// each pane region can carry its own set of terminals. The common
+/// single-leaf / single-tab case renders just the terminal (the
+/// workspace-level strip already covers it).
+fn render_leaf(
+    idx: usize,
+    tree: &TerminalSplitTree,
+    group: Entity<PaneGroup>,
+    theme: Theme,
+) -> Option<AnyElement> {
+    let leaf = tree.leaf(idx)?;
+    let view = leaf.active_view().clone();
+    let show_bar = tree.live_count() > 1 || leaf.len() > 1;
+    if !show_bar {
+        return Some(view.into_any_element());
+    }
+    let bar = render_leaf_tab_bar(idx, leaf, group, theme);
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .overflow_hidden()
+            .child(bar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .child(view),
+            )
+            .into_any_element(),
+    )
+}
+
+/// Compact tab strip for a single split leaf: one chip per terminal tab
+/// plus a trailing `+` that spawns another terminal into this pane.
+fn render_leaf_tab_bar(
+    leaf_idx: usize,
+    leaf: &LeafTabs,
+    group: Entity<PaneGroup>,
+    theme: Theme,
+) -> AnyElement {
+    let active = leaf.active();
+    let mut bar = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.0))
+        .h(px(LEAF_TAB_BAR_HEIGHT_PX))
+        .w_full()
+        .px(px(4.0))
+        .flex_shrink_0()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border_inactive);
+
+    for t in 0..leaf.len() {
+        let is_active = t == active;
+        let click_group = group.clone();
+        let chip = div()
+            .id(("leaf-tab", leaf_idx * 4096 + t))
+            .flex()
+            .items_center()
+            .px(px(7.0))
+            .h_full()
+            .text_size(px(10.0))
+            .border_t_2()
+            .border_color(if is_active {
+                theme.focus_ring
+            } else {
+                gpui::transparent_black()
+            })
+            .text_color(if is_active {
+                theme.fg_base
+            } else {
+                theme.fg_muted
+            })
+            .cursor_pointer()
+            .when(!is_active, |s| {
+                s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
+            })
+            .child(SharedString::from(format!("{}", t + 1)))
+            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                click_group.update(cx, |g, cx| g.set_active_leaf_tab(leaf_idx, t, window, cx));
+            });
+        bar = bar.child(chip);
+    }
+
+    let add_group = group.clone();
+    let plus = div()
+        .id(("leaf-tab-add", leaf_idx))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(6.0))
+        .h_full()
+        .text_size(px(12.0))
+        .text_color(theme.fg_subtle)
+        .cursor_pointer()
+        .hover(|s| s.text_color(theme.fg_base))
+        .child(SharedString::from("+"))
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            add_group.update(cx, |g, cx| g.add_tab_to_leaf(leaf_idx, window, cx));
+        });
+    bar.child(plus).into_any_element()
 }
 
 /// Hit-area padding around the visible 1 px stripe — matches the

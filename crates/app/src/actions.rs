@@ -262,8 +262,11 @@ actions!(
         FocusNextPane,
         /// Cycle focus to the previous pane in in-order traversal.
         FocusPrevPane,
-        /// Open a new terminal tab inside the focused pane.
+        /// Open a new terminal tab at the workspace (group) level.
         NewTab,
+        /// Open a new terminal tab INSIDE the active split pane (leaf),
+        /// adding it to that pane's own tab strip. Bound to Cmd+Shift+T.
+        NewTabInPane,
         /// Open a new top-level workspace window (Cmd+N). Handled by a
         /// global app-level listener in `main.rs` since it needs `&mut App`
         /// to call `open_window`; each window owns an independent

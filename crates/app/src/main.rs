@@ -20,7 +20,8 @@ use gpui::{
 };
 use oximux_app::actions::{
     CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
-    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewWindow, NextTab, OpenCommandPalette,
+    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewTabInPane, NewWindow, NextTab,
+    OpenCommandPalette,
     OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, Search,
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SplitSubPaneDown,
     SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
@@ -187,6 +188,9 @@ fn main() {
             // reference editor's "zoom pane" binding.
             KeyBinding::new("cmd-shift-enter", ToggleZoomSubPane, None),
             KeyBinding::new("cmd-t", NewTab, None),
+            // cmd-shift-t adds a tab to the active SPLIT pane's own strip
+            // (per-pane tabs), as opposed to cmd-t's workspace-level tab.
+            KeyBinding::new("cmd-shift-t", NewTabInPane, None),
             // cmd-n opens a new top-level window (each with its own
             // WorkspaceRoot). Mirrors the terminal-app convention where
             // cmd-t is a new tab and cmd-n is a new window.

@@ -1232,6 +1232,106 @@ impl PaneGroup {
         self.open_terminal_tab(window, cx);
     }
 
+    /// Cmd+Shift+T — add a terminal tab to the FOCUSED split pane's own
+    /// tab strip (per-pane tabs). When the active workspace tab isn't a
+    /// terminal, fall back to a workspace-level new terminal tab.
+    pub(crate) fn on_new_tab_in_pane(
+        &mut self,
+        _: &crate::actions::NewTabInPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolve the focused leaf (re-query focus like the split path
+        // does — `tree.active` doesn't auto-track mouse focus). Immutable
+        // borrow scoped so the mutable `add_tab_to_leaf` can follow.
+        let target = match self.tabs.get(self.active).map(|t| &t.content) {
+            Some(PaneContent::Terminal(tree)) => Some(
+                tree.iter_live()
+                    .find(|(_, v)| v.read(cx).focused())
+                    .map(|(i, _)| i)
+                    .unwrap_or_else(|| tree.active()),
+            ),
+            _ => None,
+        };
+        match target {
+            Some(leaf) => self.add_tab_to_leaf(leaf, window, cx),
+            None => {
+                self.open_terminal_tab(window, cx);
+            }
+        }
+    }
+
+    /// Spawn a fresh shell and append it as a tab inside `leaf_idx` of the
+    /// active terminal tab. Inherits the leaf's current cwd. Used by the
+    /// per-pane `+` button and `on_new_tab_in_pane`.
+    pub(crate) fn add_tab_to_leaf(
+        &mut self,
+        leaf_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fallback_cwd = self.cwd.clone();
+        let workspace_id = self.cwd.to_string_lossy().into_owned();
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let Some(active_tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let PaneContent::Terminal(tree) = &mut active_tab.content else {
+            return;
+        };
+        // Target the requested leaf so the tab lands there.
+        tree.set_active(leaf_idx);
+        // Inherit the leaf's active shell cwd (same three-tier lookup as
+        // sub-pane splits).
+        let inherited_cwd = tree
+            .active_view()
+            .and_then(|v| {
+                let view = v.read(cx);
+                view.cwd_hint().or_else(|| {
+                    view.os_pid()
+                        .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+                })
+            })
+            .unwrap_or(fallback_cwd);
+        let ids = SurfaceIds::fresh(workspace_id);
+        let Some((backend, session_id)) = spawn_local_pty(inherited_cwd, ids.env()) else {
+            return;
+        };
+        let view = cx.new(|cx| {
+            TerminalView::mount(backend, session_id, ids, theme, density, typography, window, cx)
+        });
+        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+        tree.add_tab_to_active(view, observer);
+        if let Some(active_view) = tree.active_view() {
+            active_view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Activate tab `tab_idx` inside leaf `leaf_idx` of the active
+    /// terminal tab and focus it. Wired to per-pane tab-chip clicks.
+    pub(crate) fn set_active_leaf_tab(
+        &mut self,
+        leaf_idx: usize,
+        tab_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let PaneContent::Terminal(tree) = &mut active_tab.content else {
+            return;
+        };
+        tree.set_active_tab(leaf_idx, tab_idx);
+        if let Some(view) = tree.active_view() {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn on_close_tab(
         &mut self,
         _: &CloseTab,
