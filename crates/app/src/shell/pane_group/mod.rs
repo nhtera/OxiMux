@@ -12,6 +12,9 @@ pub mod sub_pane;
 pub mod tab_drag;
 pub mod tab_drag_zones;
 
+#[cfg(test)]
+mod e2e_tests;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

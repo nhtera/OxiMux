@@ -697,6 +697,186 @@ async fn multi_attach_min_size_and_detach_grows_back() {
     );
 }
 
+// Two clients attached to the same PTY simultaneously: output written by
+// one must arrive on BOTH streams. This verifies that the daemon's fan-out
+// loop delivers Output notifications to every active subscriber, not only
+// the sender or only the first attachment.
+#[tokio::test]
+async fn two_simultaneous_subscribers_both_receive_output() {
+    let relay = boot_relay().await;
+
+    // Client A spawns. The daemon auto-attaches A.
+    let (mut a, mut a_buf) = connect_and_hello(&relay).await;
+    let pty_id = match req(
+        &mut a,
+        &mut a_buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn: {other:?}"),
+    };
+
+    // Client B attaches while A is still connected.
+    let (mut b, mut b_buf) = connect_and_hello(&relay).await;
+    match req(
+        &mut b,
+        &mut b_buf,
+        2,
+        Request::Attach {
+            pty_id: pty_id.clone(),
+        },
+    )
+    .await
+    {
+        Response::AttachOk { .. } => {}
+        other => panic!("attach: {other:?}"),
+    }
+
+    // Write a distinguishable marker via A. Both A and B must receive it
+    // as a live Output notification.
+    let resp = req(
+        &mut a,
+        &mut a_buf,
+        3,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: b"echo FANOUT_MARKER\nexit\n".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok), "write got {resp:?}");
+
+    let window = Duration::from_secs(5);
+    let (a_out, _a_exit) = collect_output(&mut a, &mut a_buf, &pty_id, window).await;
+    let (b_out, _b_exit) = collect_output(&mut b, &mut b_buf, &pty_id, window).await;
+
+    assert!(
+        String::from_utf8_lossy(&a_out).contains("FANOUT_MARKER"),
+        "writer (A) missed its own marker; got {:?}",
+        String::from_utf8_lossy(&a_out)
+    );
+    assert!(
+        String::from_utf8_lossy(&b_out).contains("FANOUT_MARKER"),
+        "passive subscriber (B) missed fan-out; got {:?}",
+        String::from_utf8_lossy(&b_out)
+    );
+}
+
+// Detach-then-reattach scrollback contract: A spawns + writes, then
+// explicitly detaches (not closes). The session must survive. A brand-new
+// client C — which never saw the original output — reattaches and must
+// receive the scrollback replay containing A's earlier output. Also verifies
+// that C can drive the live shell after reattach.
+#[tokio::test]
+async fn detach_then_fresh_client_reattach_gets_scrollback() {
+    let relay = boot_relay().await;
+
+    // Client A spawns and writes a unique marker.
+    let (mut a, mut a_buf) = connect_and_hello(&relay).await;
+    let (pty_id, aid_a) = match req(
+        &mut a,
+        &mut a_buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk {
+            pty_id,
+            attachment_id,
+        } => (pty_id, attachment_id),
+        other => panic!("spawn: {other:?}"),
+    };
+
+    let resp = req(
+        &mut a,
+        &mut a_buf,
+        3,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: b"echo PERSIST_DETACH_MARKER\n".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok));
+
+    // Give the shell time to echo + the reader thread to push bytes into
+    // the ring buffer before A detaches.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // A detaches (not closes) — the PTY must stay alive.
+    let resp = req(
+        &mut a,
+        &mut a_buf,
+        4,
+        Request::Detach {
+            pty_id: pty_id.clone(),
+            attachment_id: aid_a,
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok), "detach got {resp:?}");
+    drop(a);
+
+    // Client C — a completely new connection, never attached before.
+    let (mut c, mut c_buf) = connect_and_hello(&relay).await;
+    let replay = match req(
+        &mut c,
+        &mut c_buf,
+        2,
+        Request::Attach {
+            pty_id: pty_id.clone(),
+        },
+    )
+    .await
+    {
+        Response::AttachOk { replay, .. } => replay,
+        other => panic!("attach: {other:?}"),
+    };
+
+    assert!(
+        String::from_utf8_lossy(&replay).contains("PERSIST_DETACH_MARKER"),
+        "reattach replay missed the marker; got {:?}",
+        String::from_utf8_lossy(&replay)
+    );
+
+    // C can also drive the live shell (PTY is still running).
+    let resp = req(
+        &mut c,
+        &mut c_buf,
+        3,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: b"echo LIVE_AFTER_DETACH\nexit\n".to_vec(),
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok));
+    let (c_out, c_exit) =
+        collect_output(&mut c, &mut c_buf, &pty_id, Duration::from_secs(5)).await;
+    assert!(
+        String::from_utf8_lossy(&c_out).contains("LIVE_AFTER_DETACH"),
+        "live stream after reattach missed marker; got {:?}",
+        String::from_utf8_lossy(&c_out)
+    );
+    assert!(c_exit.is_some(), "expected Exit notification on C");
+}
+
 #[tokio::test]
 async fn close_request_removes_pty_from_list() {
     let relay = boot_relay().await;
