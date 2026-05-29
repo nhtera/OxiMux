@@ -217,14 +217,13 @@ fn main() {
             KeyBinding::new("cmd-shift-e", SelectExplorerTab, None),
             KeyBinding::new("cmd-shift-f", SelectSearchTab, None),
             KeyBinding::new("cmd-shift-g", SelectSourceControlTab, None),
-            // `cmd-shift-t` previously routed to `SelectFilesTab`. The Files
-            // tab is currently hidden from `visible_tabs` (see
-            // shell/right_sidebar/tab.rs) so dispatching would clamp to
-            // Explorer — the tooltip would advertise "Files" but the key
-            // would open Explorer. Rebind when Files reappears under its
-            // future label. The `SelectFilesTab` action itself stays in
-            // `actions.rs` so test code and any programmatic dispatch
-            // path remain intact.
+            // `cmd-shift-t` previously routed to `SelectFilesTab`, but the
+            // Files tab is hidden from `visible_tabs` (see
+            // shell/right_sidebar/tab.rs) so that binding was dropped. The
+            // key now drives `NewTabInPane` (above). If the Files tab
+            // reappears, pick a DIFFERENT shortcut — `cmd-shift-t` is taken.
+            // The `SelectFilesTab` action itself stays in `actions.rs` so
+            // test code and any programmatic dispatch path remain intact.
             // cmd-k opens the commit dialog (Phase 04 attaches the handler).
             KeyBinding::new("cmd-k", OpenCommitDialog, None),
             // Command palette (Phase 05 shell). cmd-k stays bound to the
