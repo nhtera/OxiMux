@@ -80,6 +80,33 @@ impl Repository {
             .await?;
         Ok(())
     }
+
+    /// Most-recently-visited local branches in MRU order, capped at `limit`.
+    ///
+    /// Parses HEAD's reflog (`git reflog show --pretty=%gs HEAD`) for
+    /// `checkout: moving from <X> to <Y>` entries, taking the destination
+    /// (`Y`) of each — that's the branch the user actually landed on.
+    /// Deduplicates so the same branch only appears once even if it was
+    /// visited multiple times. The current branch is always present in
+    /// position 0 of `list_branches`; this list deliberately includes it
+    /// (the most recent reflog entry IS the current branch) so callers
+    /// can render a "Recent" section without filtering separately.
+    ///
+    /// Empty reflog (fresh clone with no checkouts yet) returns an empty
+    /// vec. The command itself runs without timeout extension — reflog
+    /// reads are local and bounded.
+    pub async fn list_recent_branches(&self, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let out = GitCmd::new(self.workdir())
+            .args(["reflog", "show", "--pretty=%gs", "HEAD"])
+            .run()
+            .await?;
+        let text = String::from_utf8(out.stdout)
+            .map_err(|e| GitError::parse(format!("non-utf8 in `git reflog show`: {e}")))?;
+        Ok(parse_recent_branches(&text, limit))
+    }
 }
 
 /// Parse the output of our `git branch --list --format=...` invocation.
@@ -129,6 +156,57 @@ pub(crate) fn parse_branch_list(text: &str) -> Result<Vec<BranchInfo>> {
     Ok(out)
 }
 
+/// Extract destination branches from `git reflog show --pretty=%gs HEAD`
+/// output. Each line is a reflog subject; checkout entries look like
+/// `checkout: moving from <X> to <Y>`. We take `<Y>` and dedupe, capping
+/// at `limit`. Non-checkout entries (commits, resets, merges) are skipped.
+///
+/// Entries that move to a 40-char SHA (e.g. `git checkout abc1234...`)
+/// represent detached-HEAD visits and are filtered out — they aren't
+/// branch names the user would want to switch back to from a picker.
+pub(crate) fn parse_recent_branches(text: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut out = Vec::<String>::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(dest) = parse_checkout_destination(line) else {
+            continue;
+        };
+        if looks_like_sha(dest) {
+            continue;
+        }
+        if seen.insert(dest.to_string()) {
+            out.push(dest.to_string());
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Return the destination branch of a `checkout: moving from X to Y`
+/// reflog subject; `None` if the line doesn't match that shape.
+fn parse_checkout_destination(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("checkout: moving from ")?;
+    // Split on the LAST " to " — branch names can technically contain
+    // " to " (e.g. a feature branch named `migrate-to-typescript`),
+    // and the source side is what appears first.
+    let (_from, to) = rest.rsplit_once(" to ")?;
+    let dest = to.trim();
+    if dest.is_empty() { None } else { Some(dest) }
+}
+
+/// True when `s` looks like a git SHA (hex string of length 7..=40).
+/// Reflog destinations that match this are detached-HEAD checkouts, not
+/// branch switches, and shouldn't appear in the recent-branches list.
+fn looks_like_sha(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +250,79 @@ mod tests {
     fn parse_rejects_extra_fields() {
         let text = "main\t1\t\textra\n";
         assert!(parse_branch_list(text).is_err());
+    }
+
+    #[test]
+    fn recent_empty_reflog_returns_empty() {
+        assert!(parse_recent_branches("", 10).is_empty());
+    }
+
+    #[test]
+    fn recent_zero_limit_returns_empty() {
+        let text = "checkout: moving from main to feat\n";
+        assert!(parse_recent_branches(text, 0).is_empty());
+    }
+
+    #[test]
+    fn recent_extracts_destination_branches() {
+        // `git reflog show HEAD` emits newest-first; the input below
+        // reflects the user's most recent checkout sequence:
+        //   …earlier… → feat-b → main (newest)
+        let text = "checkout: moving from feat-b to main\n\
+                    commit: typo fix\n\
+                    checkout: moving from feat-a to feat-b\n\
+                    checkout: moving from main to feat-a\n";
+        let r = parse_recent_branches(text, 10);
+        assert_eq!(r, vec!["main", "feat-b", "feat-a"]);
+    }
+
+    #[test]
+    fn recent_dedup_preserves_most_recent_position() {
+        // User toggled main↔feat several times; reflog newest-first:
+        //   feat→main, main→feat, feat→main (oldest).
+        // After dedup: main (first seen at the newest entry), then feat.
+        let text = "checkout: moving from feat to main\n\
+                    checkout: moving from main to feat\n\
+                    checkout: moving from feat to main\n";
+        let r = parse_recent_branches(text, 10);
+        assert_eq!(r, vec!["main", "feat"]);
+    }
+
+    #[test]
+    fn recent_caps_at_limit() {
+        // Newest-first input; limit=2 → keep the two most recent distinct.
+        let text = "checkout: moving from c to d\n\
+                    checkout: moving from b to c\n\
+                    checkout: moving from a to b\n\
+                    checkout: moving from x to a\n";
+        let r = parse_recent_branches(text, 2);
+        assert_eq!(r, vec!["d", "c"]);
+    }
+
+    #[test]
+    fn recent_skips_detached_head_checkouts() {
+        let text = "checkout: moving from abc1234 to feat\n\
+                    checkout: moving from main to abc1234def5678aabb\n";
+        let r = parse_recent_branches(text, 10);
+        // The 40-hex destination dropped; `abc1234` (7 hex) is only a
+        // source and never enters the result list. Only `feat` survives.
+        assert_eq!(r, vec!["feat"]);
+    }
+
+    #[test]
+    fn recent_handles_branch_name_containing_to() {
+        // Branch name "migrate-to-typescript" — split on LAST " to ".
+        let text = "checkout: moving from main to migrate-to-typescript\n";
+        let r = parse_recent_branches(text, 10);
+        assert_eq!(r, vec!["migrate-to-typescript"]);
+    }
+
+    #[test]
+    fn recent_ignores_non_checkout_entries() {
+        let text = "commit: add feature\n\
+                    reset: moving to HEAD~3\n\
+                    merge feat: Merge made by 'ort'\n\
+                    pull: Fast-forward\n";
+        assert!(parse_recent_branches(text, 10).is_empty());
     }
 }
