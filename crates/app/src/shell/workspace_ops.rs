@@ -399,6 +399,8 @@ impl WorkspaceRoot {
                 });
                 let on_query =
                     crate::workspace_root::WorkspaceRoot::build_on_query_active_path_callback(weak);
+                let worktree_settings_repo =
+                    Some(this.app_state.worktree_settings_repo.clone());
                 this.right_sidebar = Some(cx.new(|cx| {
                     crate::shell::right_sidebar::RightSidebar::new(
                         repo,
@@ -407,6 +409,7 @@ impl WorkspaceRoot {
                         Some(on_open),
                         on_open_diff,
                         Some(on_query),
+                        worktree_settings_repo,
                         theme,
                         density,
                         typography,

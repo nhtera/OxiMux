@@ -29,7 +29,7 @@ pub use git_state::{
 };
 pub use pane_session::PaneSession;
 pub use project::Project;
-pub use workspace::{Workspace, WorktreeSettings};
+pub use workspace::{ViewMode, Workspace, WorktreeSettings};
 
 use serde::{Deserialize, Serialize};
 

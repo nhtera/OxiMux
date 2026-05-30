@@ -17,7 +17,7 @@ use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
-use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
+use oximux_core::{FileStatus, IndexStatus, ViewMode, WorktreeStatus};
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -134,6 +134,18 @@ pub struct RenderCtx<'a> {
     /// click silently, but a disabled button gives the user honest
     /// feedback for why it's not firing.
     pub discard_pending: bool,
+    /// Current section-rendering mode. `Flat` renders one row per file
+    /// in per-status sections; `Tree` groups files under their directory
+    /// ancestors via [`tree::build_tree`] and dispatches to
+    /// [`crate::shell::git_panel::tree_render`].
+    ///
+    /// [`tree::build_tree`]: crate::shell::source_control::tree::build_tree
+    pub view_mode: ViewMode,
+    /// Folder paths whose subtree is currently collapsed in Tree mode.
+    /// Ignored in Flat mode. Borrowed from `GitPanel::collapsed_dirs`
+    /// for the duration of one render pass; toggled by clicking a
+    /// folder row in the tree renderer.
+    pub collapsed_dirs: &'a HashSet<PathBuf>,
 }
 
 /// Map a `RowKind` to the matching `DiscardAllArea` for section-header
@@ -274,8 +286,39 @@ fn section(
         .pt(px(rctx.density.pad_panel))
         .child(header);
     if !is_collapsed {
-        for f in rows {
-            col = col.child(row(f, kind, rctx, cx));
+        match rctx.view_mode {
+            ViewMode::Flat => {
+                for f in rows {
+                    col = col.child(row(f, kind, rctx, cx));
+                }
+            }
+            ViewMode::Tree => {
+                // Borrowed-iterator path: `rows` is `&[&FileStatus]`, so
+                // `iter().copied()` produces `&FileStatus` without an
+                // owned intermediate Vec. The tree node itself owns its
+                // PathBuf children; the flatten pass returns
+                // RenderRow-by-value (no borrow into `rows`).
+                //
+                // TODO(perf): leaf-row lookup in `tree_render::leaf_row`
+                // does an O(N) linear scan over `rows` per leaf, total
+                // O(N²) per section. Pre-build a `HashMap<&Path,
+                // &FileStatus>` here if a future profile shows it.
+                let tree = crate::shell::source_control::tree::build_tree(
+                    rows.iter().copied(),
+                    crate::shell::git_panel::tree_render::section_for(kind),
+                );
+                let flat_rows = crate::shell::source_control::tree::flatten(
+                    &tree,
+                    rctx.collapsed_dirs,
+                );
+                for flat_row in flat_rows {
+                    col = col.child(
+                        crate::shell::git_panel::tree_render::render_tree_row(
+                            flat_row, rows, kind, rctx, cx,
+                        ),
+                    );
+                }
+            }
         }
     }
     col.into_any_element()

@@ -227,6 +227,7 @@ impl WorkspaceRoot {
             let on_open = Self::build_on_open_file_callback(weak_self.clone());
             let on_open_diff = Self::build_on_open_diff_callback(weak_self.clone(), r.clone());
             let on_query = Self::build_on_query_active_path_callback(weak_self.clone());
+            let worktree_settings_repo = Some(app_state.worktree_settings_repo.clone());
             cx.new(|cx| {
                 RightSidebar::new(
                     Some(r),
@@ -235,6 +236,7 @@ impl WorkspaceRoot {
                     Some(on_open),
                     Some(on_open_diff),
                     Some(on_query),
+                    worktree_settings_repo,
                     theme,
                     density,
                     typography.clone(),

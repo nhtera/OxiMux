@@ -22,6 +22,7 @@ pub mod graph;
 pub mod primary_action;
 pub mod scope;
 pub mod style;
+pub mod tree;
 
 use std::sync::Arc;
 
@@ -348,6 +349,12 @@ impl SourceControlPanel {
     }
 
     fn render_branch_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use oximux_core::ViewMode;
+        let view_mode = self.git_panel.read(cx).view_mode();
+        let (view_mode_icon, view_mode_tooltip) = match view_mode {
+            ViewMode::Flat => ("icons/list-tree.svg", "Switch to tree view"),
+            ViewMode::Tree => ("icons/list-collapse.svg", "Switch to flat view"),
+        };
         let theme = self.theme;
         let _ = (self.density, &self.typography);
         let (ahead, behind, branch) = self
@@ -384,7 +391,9 @@ impl SourceControlPanel {
         };
 
         // Right-aligned compact icon cluster.
-        // settings-2 / list-tree are placeholders (backend lands later); refresh
+        // settings-2 is still a placeholder (backend not yet wired);
+        // list-tree / list-collapse is the view-mode toggle (icon +
+        // tooltip swap built above from the current `view_mode`); refresh
         // is wired to the commit-graph reload.
         let actions = div()
             .ml_auto()
@@ -410,11 +419,13 @@ impl SourceControlPanel {
                     .xsmall()
                     .icon(
                         Icon::default()
-                            .path("icons/list-tree.svg")
+                            .path(view_mode_icon)
                             .size(px(sc_style::ICON)),
                     )
-                    .tooltip("Toggle tree view (coming soon)")
-                    .disabled(true),
+                    .tooltip(view_mode_tooltip)
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                        panel.git_panel.update(cx, |g, cx| g.cycle_view_mode(cx));
+                    })),
             )
             .child(
                 Button::new("sc-toolbar-refresh")

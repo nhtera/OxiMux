@@ -16,6 +16,7 @@ use gpui::{
 };
 use oximux_git::{PollState, Repository, StatusPoller};
 use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::WorktreeSettingsRepo;
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::file_explorer::FileExplorer;
@@ -84,6 +85,7 @@ impl RightSidebar {
         on_open_file: Option<OnOpenFile>,
         on_open_diff: Option<OnOpenDiff>,
         on_query_active_path: Option<OnQueryActivePath>,
+        worktree_settings_repo: Option<WorktreeSettingsRepo>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -131,6 +133,7 @@ impl RightSidebar {
                     density,
                     typography.clone(),
                     on_open_for_scm,
+                    worktree_settings_repo.clone(),
                     cx,
                 )
             });
@@ -272,6 +275,7 @@ impl RightSidebar {
                 density,
                 typography.clone(),
                 None, // test wiring: no host on_open
+                None, // test wiring: no per-worktree settings persistence
                 cx,
             )
         });

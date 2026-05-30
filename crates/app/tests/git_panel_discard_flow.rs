@@ -84,6 +84,7 @@ async fn discard_path_sets_pending_with_modified_copy(cx: &mut TestAppContext) {
             Density::default(),
             Typography::default(),
             None,
+            None,
             cx,
         )
     });
@@ -147,6 +148,7 @@ async fn confirmed_discard_restores_file_and_clears_flags(cx: &mut TestAppContex
             Theme::default(),
             Density::default(),
             Typography::default(),
+            None,
             None,
             cx,
         )
@@ -216,6 +218,7 @@ async fn discard_path_is_a_noop_while_request_is_pending(cx: &mut TestAppContext
             Density::default(),
             Typography::default(),
             None,
+            None,
             cx,
         )
     });
@@ -260,6 +263,7 @@ async fn clear_pending_discard_is_non_destructive(cx: &mut TestAppContext) {
             Theme::default(),
             Density::default(),
             Typography::default(),
+            None,
             None,
             cx,
         )

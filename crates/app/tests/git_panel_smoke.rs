@@ -54,6 +54,7 @@ async fn git_panel_constructs_and_renders_without_panic(cx: &mut TestAppContext)
             Density::default(),
             Typography::default(),
             None, // no host on_open callback in test wiring
+            None, // no per-worktree settings persistence in test wiring
             cx,
         )
     });

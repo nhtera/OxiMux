@@ -20,6 +20,7 @@ pub mod range_select;
 pub mod row_actions;
 pub mod row_renderer;
 pub mod selection;
+pub mod tree_render;
 
 pub use discard_ops::{DiscardRequest, DiscardRequested, DiscardScope};
 
@@ -33,9 +34,10 @@ use gpui::{
     Render, ScrollHandle, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 use gpui_component::scroll::ScrollableElement as _;
-use oximux_core::GitState;
+use oximux_core::{GitState, ViewMode};
 use oximux_git::{PollState, Repository};
 use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::WorktreeSettingsRepo;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::sync::watch;
@@ -133,6 +135,32 @@ pub struct GitPanel {
     ///
     /// [`bulk_action_bar`]: crate::shell::git_panel::bulk_action_bar
     pub(super) bulk_op_in_flight: bool,
+    /// Section-rendering mode. `Flat` (default) lists every file in
+    /// per-status sections; `Tree` groups files under their directory
+    /// ancestors. Toggled by the toolbar button via [`cycle_view_mode`];
+    /// per-worktree persistence rides through [`worktree_settings_repo`]
+    /// keyed by the repo's workdir path.
+    ///
+    /// `pub(super)` so `changed_files` can branch on it without exposing
+    /// a getter for every read.
+    ///
+    /// [`cycle_view_mode`]: Self::cycle_view_mode
+    /// [`worktree_settings_repo`]: Self::worktree_settings_repo
+    pub(super) view_mode: ViewMode,
+    /// Folder paths (relative to the worktree root) whose subtree is
+    /// hidden in Tree mode. Toggled by clicking a folder row; ignored
+    /// in Flat mode. Defaults to all-expanded for a fresh panel — folder
+    /// state is intentionally session-scoped (an app restart re-expands
+    /// everything; only `view_mode` itself survives).
+    ///
+    /// `pub(super)` so the tree-render path can read it without copying.
+    pub(super) collapsed_dirs: HashSet<PathBuf>,
+    /// Handle to the per-worktree settings repo. `Some` in production
+    /// wiring; `None` in test scaffolding that doesn't spin up a DB.
+    /// All reads/writes use the worktree's absolute path as the key so
+    /// the same panel re-opened in the same worktree gets the same
+    /// `view_mode` back.
+    worktree_settings_repo: Option<WorktreeSettingsRepo>,
 }
 
 // `DiscardRequest`, `DiscardScope`, `DiscardRequested`, and the
@@ -145,6 +173,10 @@ impl GitPanel {
     /// Build the panel. `state_rx` is `StatusPoller::subscribe()`; the caller
     /// owns the poller so the same receiver can fan out to sidebar / status
     /// bar consumers later.
+    ///
+    /// `worktree_settings_repo` is the per-worktree V006 settings repo;
+    /// `None` in test wiring keeps `view_mode` at the in-memory default
+    /// (`Flat`) and silently no-ops the persistence write on toggle.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Repository,
@@ -154,6 +186,7 @@ impl GitPanel {
         density: Density,
         typography: Typography,
         on_open: Option<OnOpenDiff>,
+        worktree_settings_repo: Option<WorktreeSettingsRepo>,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -162,6 +195,7 @@ impl GitPanel {
             PollState::Ready(s) => Some(s.clone()),
             _ => None,
         };
+        let view_mode = initial_view_mode(&repo, worktree_settings_repo.as_ref());
         let watch_task = Self::start_watch_task(state_rx, cx);
         Self {
             repo,
@@ -182,7 +216,44 @@ impl GitPanel {
             pending_discard: None,
             in_flight_discards: HashSet::new(),
             bulk_op_in_flight: false,
+            view_mode,
+            collapsed_dirs: HashSet::new(),
+            worktree_settings_repo,
         }
+    }
+
+    /// Current section-rendering mode. Read by the SCM toolbar to flip
+    /// the toggle button's icon + tooltip between Tree-affordance and
+    /// Flat-affordance copies.
+    pub fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    /// Flip Flat ↔ Tree and persist the new mode to the per-worktree
+    /// settings repo. Read-modify-write under the hood so we don't clobber
+    /// sibling fields (`base_ref`, `commit_draft`) on the same row.
+    /// Storage errors are logged at `warn!` — a missed write only loses
+    /// the preference for the next launch, never blocks the toggle.
+    pub fn cycle_view_mode(&mut self, cx: &mut Context<Self>) {
+        self.view_mode = self.view_mode.toggled();
+        if let Some(settings_repo) = self.worktree_settings_repo.clone() {
+            let key = self.repo.workdir().to_string_lossy().into_owned();
+            let mut current = settings_repo
+                .get(&key)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            current.view_mode_override = Some(self.view_mode.as_str().to_string());
+            if let Err(e) = settings_repo.upsert(&key, &current) {
+                tracing::warn!(
+                    target: "oximux_app::git_panel",
+                    error = %e,
+                    key = %key,
+                    "view_mode upsert failed; preference will reset on next launch"
+                );
+            }
+        }
+        cx.notify();
     }
 
     /// Update the changed-files filter. Pass the raw input value; empty /
@@ -200,6 +271,19 @@ impl GitPanel {
     pub(crate) fn toggle_section(&mut self, name: &'static str, cx: &mut Context<Self>) {
         if !self.collapsed_sections.remove(name) {
             self.collapsed_sections.insert(name);
+        }
+        cx.notify();
+    }
+
+    /// Toggle a Tree-mode folder's collapsed state. Called by
+    /// [`tree_render::folder_row`]'s click handler. Folder state is
+    /// session-scoped — never persisted, the next app launch always
+    /// starts with all folders expanded.
+    ///
+    /// [`tree_render::folder_row`]: crate::shell::git_panel::tree_render
+    pub(crate) fn toggle_collapsed_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.collapsed_dirs.remove(&path) {
+            self.collapsed_dirs.insert(path);
         }
         cx.notify();
     }
@@ -369,6 +453,8 @@ impl Render for GitPanel {
                     in_flight_discards: &self.in_flight_discards,
                     filter_active: !self.filter_query.trim().is_empty(),
                     discard_pending: self.pending_discard.is_some(),
+                    view_mode: self.view_mode,
+                    collapsed_dirs: &self.collapsed_dirs,
                 };
                 render_sections(&sections, &rctx, cx).into_any_element()
             }
@@ -456,6 +542,25 @@ fn placeholder_state(
         .text_size(px(sc_style::TEXT))
         .text_color(theme.fg_subtle)
         .child(msg.to_string())
+}
+
+/// Resolve the initial `ViewMode` for a fresh panel: per-worktree
+/// override wins, then fall back to the in-memory default (Flat). Storage
+/// errors and unknown strings both decode to `Flat` so a corrupted row
+/// can never panic the panel.
+fn initial_view_mode(repo: &Repository, settings_repo: Option<&WorktreeSettingsRepo>) -> ViewMode {
+    let Some(settings_repo) = settings_repo else {
+        return ViewMode::default();
+    };
+    let key = repo.workdir().to_string_lossy().into_owned();
+    settings_repo
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|s| s.view_mode_override)
+        .as_deref()
+        .map(ViewMode::from_str)
+        .unwrap_or_default()
 }
 
 /// Spawn a repo mutation on the current tokio runtime. Logs and no-ops if no
