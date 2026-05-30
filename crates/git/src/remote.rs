@@ -1,4 +1,6 @@
-//! Remote operations on `Repository`: push / pull / sync / publish_branch.
+//! Remote operations on `Repository`: push / pull / sync / publish_branch
+//! and the read-only `list_remote_branches` lookup that backs the
+//! BaseRef picker.
 //!
 //! Thin wrappers over the `git` CLI. Each method runs with `GIT_OPTIONAL_LOCKS=0`
 //! (inherited from `process::GitCmd`) so they don't fight the StatusPoller's
@@ -9,12 +11,21 @@
 use crate::error::{GitError, Result};
 use crate::process::GitCmd;
 use crate::repository::Repository;
-use std::time::Duration;
+use oximux_core::BranchInfo;
+use std::time::{Duration, Instant};
 
 /// Remote ops can talk to a network — give them more headroom than the 10 s
 /// default. Long enough to push/pull a moderate diff, short enough that a
 /// genuinely hung command surfaces as `Timeout` instead of wedging the UI.
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a `list_remote_branches` result stays warm. Picked to be
+/// short enough that a manual `git fetch` outside the app is reflected
+/// quickly, long enough that the BaseRef picker doesn't shell out on
+/// every keystroke during filtering. Callers that need fresh data
+/// (e.g. immediately after a programmatic `fetch`) pass
+/// `force_refresh = true` to bypass the cache.
+const REMOTE_BRANCH_CACHE_TTL: Duration = Duration::from_secs(5);
 
 impl Repository {
     /// `git push` against the configured upstream. Caller is responsible for
@@ -98,5 +109,132 @@ impl Repository {
             ));
         }
         Ok(name)
+    }
+
+    /// List remote-tracking branches across every configured remote
+    /// (`origin/main`, `upstream/release`, ...) in the form
+    /// `<remote>/<branch>`. Results are cached for
+    /// [`REMOTE_BRANCH_CACHE_TTL`]; pass `force_refresh = true` to
+    /// bypass the cache (e.g. after a programmatic `fetch`).
+    ///
+    /// `is_current` is always `false` and `upstream` is always `None` —
+    /// remote-tracking refs don't have their own upstream and are never
+    /// the working tree's current branch.
+    pub async fn list_remote_branches(&self, force_refresh: bool) -> Result<Vec<BranchInfo>> {
+        if !force_refresh
+            && let Some(cached) = self.cached_remote_branches()
+        {
+            return Ok(cached);
+        }
+        let fresh = self.fetch_remote_branch_list().await?;
+        self.store_remote_branches_cache(fresh.clone());
+        Ok(fresh)
+    }
+
+    fn cached_remote_branches(&self) -> Option<Vec<BranchInfo>> {
+        let guard = self.remote_branch_cache.read().ok()?;
+        let (recorded_at, branches) = guard.as_ref()?;
+        if recorded_at.elapsed() < REMOTE_BRANCH_CACHE_TTL {
+            Some(branches.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_remote_branches_cache(&self, branches: Vec<BranchInfo>) {
+        // Lock poisoning here is benign — the cache is best-effort. Drop
+        // the update rather than panicking the caller's task.
+        if let Ok(mut guard) = self.remote_branch_cache.write() {
+            *guard = Some((Instant::now(), branches));
+        }
+    }
+
+    async fn fetch_remote_branch_list(&self) -> Result<Vec<BranchInfo>> {
+        let out = GitCmd::new(self.workdir())
+            .args([
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/remotes/",
+            ])
+            .run()
+            .await?;
+        let text = String::from_utf8(out.stdout)
+            .map_err(|e| GitError::parse(format!("non-utf8 in `git for-each-ref`: {e}")))?;
+        Ok(parse_remote_branch_list(&text))
+    }
+}
+
+/// Parse the output of our `git for-each-ref refs/remotes/`
+/// invocation. Each non-empty line is a short refname like
+/// `origin/main`. Skips:
+/// - `<remote>/HEAD` aliases (they just point at the remote's default
+///   branch — already listed under its real name).
+/// - Bare remote names with no slash (some git versions emit these for
+///   unresolved HEADs).
+pub(crate) fn parse_remote_branch_list(text: &str) -> Vec<BranchInfo> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let name = raw.trim_end_matches(['\r', ' ']).trim_start();
+        if name.is_empty() {
+            continue;
+        }
+        if name.ends_with("/HEAD") || !name.contains('/') {
+            continue;
+        }
+        out.push(BranchInfo {
+            name: name.to_string(),
+            is_current: false,
+            upstream: None,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_skips_empty_and_head_aliases() {
+        let text = "\
+origin/main
+origin/HEAD
+origin/release
+upstream/main
+
+upstream/HEAD
+";
+        let branches = parse_remote_branch_list(text);
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["origin/main", "origin/release", "upstream/main"]);
+        // Every entry MUST be remote-tracking shape.
+        assert!(branches.iter().all(|b| !b.is_current));
+        assert!(branches.iter().all(|b| b.upstream.is_none()));
+    }
+
+    #[test]
+    fn parse_drops_bare_remote_names() {
+        // Defensive: some git versions emit a bare remote name for an
+        // unresolved HEAD. We never want to surface "origin" as a branch.
+        let text = "origin\norigin/main\n";
+        let branches = parse_remote_branch_list(text);
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["origin/main"]);
+    }
+
+    #[test]
+    fn parse_trims_trailing_whitespace() {
+        let text = "origin/main  \r\norigin/release\r\n";
+        let names: Vec<String> = parse_remote_branch_list(text)
+            .iter()
+            .map(|b| b.name.clone())
+            .collect();
+        assert_eq!(names, ["origin/main", "origin/release"]);
+    }
+
+    #[test]
+    fn parse_empty_input_yields_empty_vec() {
+        assert!(parse_remote_branch_list("").is_empty());
+        assert!(parse_remote_branch_list("\n\n\n").is_empty());
     }
 }

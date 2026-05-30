@@ -34,6 +34,7 @@ mod pane_session;
 mod project;
 mod settings;
 mod workspace;
+mod worktree_settings;
 
 pub use agent_session::AgentSessionRepo;
 pub use pane_buffer::PaneBufferRepo;
@@ -42,6 +43,7 @@ pub use pane_session::PaneSessionRepo;
 pub use project::ProjectRepo;
 pub use settings::SettingsRepo;
 pub use workspace::WorkspaceRepo;
+pub use worktree_settings::WorktreeSettingsRepo;
 
 /// RFC 3339 (UTC, nanosecond precision). SQLite stores it as TEXT and
 /// lexicographic ordering matches chronological ordering when every

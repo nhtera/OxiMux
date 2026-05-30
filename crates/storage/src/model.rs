@@ -7,7 +7,7 @@
 //! `rusqlite::Row`; storage already depends on core, so the conversion
 //! direction is the natural one.
 
-use oximux_core::{AgentSession, AgentStatus, PaneSession, Project, Workspace};
+use oximux_core::{AgentSession, AgentStatus, PaneSession, Project, Workspace, WorktreeSettings};
 use rusqlite::Row;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +177,37 @@ impl From<PaneSessionRow> for PaneSession {
             grid_position: r.grid_position,
             log_path: r.log_path,
             created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSettingsRow {
+    pub workspace_id: String,
+    pub base_ref: Option<String>,
+    pub commit_draft: Option<String>,
+    pub view_mode_override: Option<String>,
+    pub updated_at: String,
+}
+
+impl WorktreeSettingsRow {
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            workspace_id: row.get("workspace_id")?,
+            base_ref: row.get("base_ref")?,
+            commit_draft: row.get("commit_draft")?,
+            view_mode_override: row.get("view_mode_override")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
+}
+
+impl From<WorktreeSettingsRow> for WorktreeSettings {
+    fn from(r: WorktreeSettingsRow) -> Self {
+        Self {
+            base_ref: r.base_ref,
+            commit_draft: r.commit_draft,
+            view_mode_override: r.view_mode_override,
         }
     }
 }

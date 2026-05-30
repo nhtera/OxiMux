@@ -44,8 +44,10 @@ pub struct Migration {
 /// scrollback per leaf. V005 adds `window_id` to both `pane_buffers`
 /// and `pane_relay_ids` primary keys so two app windows sharing a
 /// project never clobber each other's saved state; legacy rows default
-/// to window_id='main'. Future migrations append; never reorder, never
-/// rewrite.
+/// to window_id='main'. V006 adds `worktree_settings` — one row per
+/// workspace holding SCM scratch state (base ref selection, in-flight
+/// commit draft, view-mode override) keyed by `workspace_id`. Future
+/// migrations append; never reorder, never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -71,6 +73,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "per_window_persistence",
         sql: include_str!("../migrations/V005__per_window_persistence.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "worktree_settings",
+        sql: include_str!("../migrations/V006__worktree_settings.sql"),
     },
 ];
 

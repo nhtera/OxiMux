@@ -1,6 +1,9 @@
 //! Branch operations on `Repository`: `list_branches`, `create_branch`,
-//! `switch_branch`. v1 = local branches only; remote branches are not listed
-//! or created.
+//! `switch_branch`, `delete_branch`. Local-only.
+//!
+//! Remote-tracking ref enumeration (`origin/main`, etc.) lives next to
+//! the network ops in [`crate::remote::Repository::list_remote_branches`]
+//! — same `BranchInfo` shape, separate cache, no fetch side effect.
 
 use crate::error::{GitError, Result};
 use crate::process::GitCmd;

@@ -41,6 +41,18 @@ pub struct Theme {
     pub status_info: Hsla,
     pub status_muted: Hsla,
 
+    // SCM diff/banner palette. Intentionally distinct from `status_warn`
+    // (which is a general-purpose hazard amber): `status_warning` is the
+    // softer banner amber used by the conflict / in-progress operation
+    // strips and reads as "ongoing state" rather than "alert". The
+    // `_added` / `_removed` pair is consumed by the file-row +N / -N
+    // diff counts and the diff-view gutter — kept off `git.added` /
+    // `git.deleted` so SCM text contrast can move independently of the
+    // muted file-explorer badge palette.
+    pub status_added: Hsla,
+    pub status_removed: Hsla,
+    pub status_warning: Hsla,
+
     /// Git status decoration palette — used by the workspace card status
     /// dot in the left rail and (later) the file explorer status badges.
     pub git: GitDecorations,
@@ -87,6 +99,13 @@ impl Theme {
             status_info: rgb(0x5B97C9).into(),
             status_muted: rgb(0x6B7177).into(),
 
+            // `status_removed` aliases `status_error` deliberately — one
+            // canonical red prevents palette sprawl when "deletion" and
+            // "destructive op" need to look identical.
+            status_added: rgb(0x64D26B).into(),
+            status_removed: rgb(0xD26464).into(),
+            status_warning: rgb(0xD2A864).into(),
+
             git: GitDecorations {
                 modified: rgb(0xD9A441).into(),
                 added: rgb(0x6FA86A).into(),
@@ -126,5 +145,31 @@ mod tests {
     fn git_decorations_ignored_matches_fg_subtle() {
         let t = Theme::charcoal();
         assert_eq!(t.git.ignored, t.fg_subtle);
+    }
+
+    #[test]
+    fn status_removed_aliases_status_error() {
+        // `status_removed` is intentionally the same red as
+        // `status_error` — one canonical destructive/danger color.
+        let t = Theme::charcoal();
+        assert_eq!(t.status_removed, t.status_error);
+    }
+
+    #[test]
+    fn status_added_distinct_from_git_added() {
+        // The SCM diff-count green is brighter than the muted
+        // file-explorer badge green; they must NOT collapse to the same
+        // token, or text contrast on the diff-count chips suffers.
+        let t = Theme::charcoal();
+        assert_ne!(t.status_added, t.git.added);
+    }
+
+    #[test]
+    fn status_warning_distinct_from_status_warn() {
+        // `status_warning` is the SCM banner amber (softer, "ongoing
+        // state"); `status_warn` is the general hazard amber. Must
+        // stay distinct so banner UI can tune contrast independently.
+        let t = Theme::charcoal();
+        assert_ne!(t.status_warning, t.status_warn);
     }
 }

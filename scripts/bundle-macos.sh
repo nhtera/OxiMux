@@ -4,13 +4,41 @@
 # Output: dist/OxiMux.app
 #
 # Usage:
-#   ./scripts/bundle-macos.sh         # release bundle (default)
-#   ./scripts/bundle-macos.sh debug   # debug bundle (faster build)
+#   ./scripts/bundle-macos.sh                 # release bundle (default)
+#   ./scripts/bundle-macos.sh debug           # debug bundle (faster build)
+#   ./scripts/bundle-macos.sh --debug-fast    # refresh binary only (~200 ms)
+#
+# --debug-fast: assumes an existing dist/OxiMux.app and a fresh
+# `cargo build -p oximux-app`. Copies target/debug/oximux into the
+# bundle without rebuilding the cargo target, regenerating Info.plist,
+# or recopying assets. Use it for the inner UI-iteration loop; rerun
+# the full bundle whenever Info.plist or assets change.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+APP_DIR="dist/OxiMux.app"
+
+# Fast path: refresh the bundled binary in place. Fail loudly if there
+# is no existing bundle to refresh — implicit `mkdir` would mask a
+# missing full-bundle step and surface as a launch failure later.
+if [[ "${1:-}" == "--debug-fast" ]]; then
+    if [[ ! -d "$APP_DIR" ]]; then
+        echo "error: --debug-fast requires an existing $APP_DIR." >&2
+        echo "       run ./scripts/bundle-macos.sh debug first." >&2
+        exit 2
+    fi
+    if [[ ! -f "target/debug/oximux" ]]; then
+        echo "error: --debug-fast expects target/debug/oximux." >&2
+        echo "       run cargo build -p oximux-app first." >&2
+        exit 2
+    fi
+    cp -f "target/debug/oximux" "$APP_DIR/Contents/MacOS/oximux"
+    echo "==> Refreshed $APP_DIR/Contents/MacOS/oximux from target/debug"
+    exit 0
+fi
 
 PROFILE="${1:-release}"
 if [[ "$PROFILE" != "release" && "$PROFILE" != "debug" ]]; then
@@ -31,7 +59,6 @@ echo "==> Building oximux ($PROFILE)"
 # profile) doesn't trip `set -u` ("unbound variable") on bash < 4.4.
 cargo build -p oximux-app --bin oximux ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 
-APP_DIR="dist/OxiMux.app"
 echo "==> Assembling $APP_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"

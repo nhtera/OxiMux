@@ -8,9 +8,10 @@ use crate::diff::parse_unified_diff;
 use crate::error::{GitError, Result};
 use crate::process::GitCmd;
 use crate::status;
-use oximux_core::{FileDiff, GitState};
+use oximux_core::{BranchInfo, FileDiff, GitState};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 /// Diff command timeout. Diffs on monorepos can be several MB and slower
 /// than the 10 s default; keep status calls fast while giving diff room.
@@ -27,9 +28,15 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(30);
 /// a no-op, so we drop the noise.
 const DIFF_BASE_ARGS: &[&str] = &["diff", "-p", "--no-color", "--no-ext-diff"];
 
+/// Cache slot for `list_remote_branches`. `Arc<RwLock<_>>` so cloned
+/// `Repository` handles share the same cache rather than each
+/// re-running `git for-each-ref` independently.
+pub(crate) type RemoteBranchCache = Arc<RwLock<Option<(Instant, Vec<BranchInfo>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct Repository {
     workdir: PathBuf,
+    pub(crate) remote_branch_cache: RemoteBranchCache,
 }
 
 impl Repository {
@@ -84,6 +91,7 @@ impl Repository {
         }
         Ok(Self {
             workdir: PathBuf::from(toplevel),
+            remote_branch_cache: Arc::new(RwLock::new(None)),
         })
     }
 

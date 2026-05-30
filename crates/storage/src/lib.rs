@@ -29,5 +29,5 @@ pub use error::StorageError;
 pub use migrations::{MIGRATIONS, Migration};
 pub use repositories::{
     AgentSessionRepo, PaneBufferRepo, PaneRelayIdRepo, PaneSessionRepo, ProjectRepo, SettingsRepo,
-    WorkspaceRepo,
+    WorkspaceRepo, WorktreeSettingsRepo,
 };
