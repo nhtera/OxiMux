@@ -11,12 +11,14 @@
 //! Step 3 adds the `file_tree` backend: headless GPUI entity emitting
 //! `FileTreeEvent` from an `ignore`-crate walker + `notify` watcher pair.
 
+pub mod autosave;
 pub mod binary;
 pub mod editor_view;
 pub mod file_tree;
 pub mod lsp;
 pub mod lsp_bridge;
 
+pub use autosave::{pause_autosave, resume_autosave};
 pub use binary::{image_mime_for_path, is_binary_buffer, is_previewable_image};
 pub use editor_view::{EditorView, SaveFile, language_for_path};
 pub use file_tree::{FileTree, FileTreeEvent, FileTreeNode, TreeNodeId};

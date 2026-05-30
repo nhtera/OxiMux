@@ -746,10 +746,17 @@ impl WorkspaceRoot {
             .into(),
             expected: slug.into(),
             on_confirm,
+            confirm_label: None,
+            on_cancel: None,
         };
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
+        // Drop any per-mount observer the SCM discard path installed
+        // before reusing the confirm_dialog slot. Without this, a stale
+        // observer would keep watching the workspace-delete dialog and
+        // race with the workspace-ops teardown path.
+        self._discard_dialog_observer = None;
         self.confirm_dialog =
             Some(cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx)));
         cx.notify();

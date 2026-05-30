@@ -17,7 +17,7 @@ use gpui_component::{
 use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Borrowed-slice sectioning of `GitState::files` into Staged / Unstaged /
 /// Untracked. A partially-staged file (non-`Unmodified` on both sides) appears
@@ -127,6 +127,10 @@ pub struct RenderCtx<'a> {
     /// state to emit "no changes ahead of {branch}" rather than the bare
     /// "No changes". `None` covers detached HEAD or pre-status states.
     pub branch: Option<&'a str>,
+    /// Paths whose `confirmed_discard_path` op is still on the tokio
+    /// runtime. Borrowed from `GitPanel::in_flight_discards`; row
+    /// renderer reads this to swap the revert icon for a spinner.
+    pub in_flight_discards: &'a HashSet<PathBuf>,
 }
 
 /// Top-level renderer. Builds the three sections in order; emits a single
@@ -350,10 +354,12 @@ fn row(
     // Hover-only action cluster (stage / unstage / discard). On hover the
     // status badge fades out and these icons fade in within the same column
     // via `group_hover`. The set varies by row kind — see `row_actions`.
+    let is_discarding = rctx.in_flight_discards.contains(&f.path);
     let action_cluster = crate::shell::git_panel::row_actions::action_cluster(
         f.path.clone(),
         kind.into(),
         gpui::SharedString::from(row_id.clone()),
+        is_discarding,
         cx,
     );
 

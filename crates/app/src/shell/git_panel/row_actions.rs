@@ -14,7 +14,7 @@ use crate::shell::git_panel::GitPanel;
 use crate::shell::git_panel::changed_files::RowKindForActions;
 use gpui::{AnyElement, ClickEvent, Context, IntoElement, ParentElement, Styled, div, px};
 use gpui_component::{
-    Icon, Sizable as _,
+    Disableable, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
 use std::path::PathBuf;
@@ -28,11 +28,14 @@ pub const ACTION_BTN_W: f32 = 16.0;
 /// the caller can hold the cluster across other `cx`-borrowing calls.
 ///
 /// `row_id` must match the parent row's `.group()` id — that's the hover
-/// scope `group_hover` reads.
+/// scope `group_hover` reads. `is_discarding` is `true` when the row's
+/// path is sitting in `GitPanel::in_flight_discards`; the discard
+/// button renders a spinner and ignores clicks until the op completes.
 pub fn action_cluster(
     path: PathBuf,
     kind: RowKindForActions,
     row_id: gpui::SharedString,
+    is_discarding: bool,
     cx: &mut Context<GitPanel>,
 ) -> AnyElement {
     let stage_id = format!("git-row-stage-{row_id}");
@@ -50,7 +53,7 @@ pub fn action_cluster(
             // right. Reading order pushes the safer action toward the
             // pointer's resting position so the eye lands there last.
             cluster = cluster
-                .child(discard_button(discard_id, path.clone(), cx))
+                .child(discard_button(discard_id, path.clone(), is_discarding, cx))
                 .child(stage_button(stage_id, path.clone(), cx));
         }
         RowKindForActions::Untracked => {
@@ -92,23 +95,44 @@ fn unstage_button(id: String, path: PathBuf, cx: &mut Context<GitPanel>) -> AnyE
         .into_any_element()
 }
 
-fn discard_button(id: String, path: PathBuf, cx: &mut Context<GitPanel>) -> AnyElement {
-    // Destructive action — fires `discard_path` which (Phase 01 v1) logs +
-    // schedules the op. Phase 01b lands the type-to-confirm modal so the
-    // worktree mutation can't happen by accident.
-    // `undo.svg` ships in the gpui-component asset bundle; `rotate-ccw` is
-    // a Lucide name that isn't bundled. Both glyphs read as "revert/restore".
-    Button::new(gpui::SharedString::from(id))
+fn discard_button(
+    id: String,
+    path: PathBuf,
+    is_discarding: bool,
+    cx: &mut Context<GitPanel>,
+) -> AnyElement {
+    // Destructive action — clicking emits a `DiscardRequested` event;
+    // the shell mounts a type-to-confirm modal before the worktree
+    // mutation actually runs (see `WorkspaceRoot::mount_discard_dialog`).
+    //
+    // `undo.svg` ships in the gpui-component asset bundle (Lucide
+    // `rotate-ccw` is not bundled). Both glyphs read as "revert /
+    // restore". `rotate.svg` plays the spinner role while the op is in
+    // flight — the icon swap is enough visual feedback; the row layout
+    // never shifts.
+    let icon_path = if is_discarding {
+        "icons/loader-circle.svg"
+    } else {
+        "icons/undo.svg"
+    };
+    let tooltip = if is_discarding {
+        "Discarding…"
+    } else {
+        "Discard changes"
+    };
+    let mut btn = Button::new(gpui::SharedString::from(id))
         .ghost()
         .xsmall()
-        .icon(
-            Icon::default()
-                .path("icons/undo.svg")
-                .size(px(ACTION_BTN_W)),
-        )
-        .tooltip("Discard changes")
-        .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+        .icon(Icon::default().path(icon_path).size(px(ACTION_BTN_W)))
+        .tooltip(tooltip);
+    if is_discarding {
+        // Swallow clicks while the op is in flight — re-clicking would
+        // queue a second confirm modal for the same path.
+        btn = btn.disabled(true);
+    } else {
+        btn = btn.on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
             panel.discard_path(path.clone(), cx);
-        }))
-        .into_any_element()
+        }));
+    }
+    btn.into_any_element()
 }

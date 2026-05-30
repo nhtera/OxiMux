@@ -60,8 +60,9 @@ use crate::shell::{
     adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
     add_project_dialog::AddProjectDialog,
     command_palette::{PaletteModal, entry::PaletteMode},
-    confirm_dialog::ConfirmDialog,
+    confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
+    git_panel::{DiscardRequested, GitPanel},
     left_rail::{LeftRail, row_menu::WorkspaceRowMenu},
     main_area,
     openable_text_file::is_openable_text_file,
@@ -78,6 +79,7 @@ use crate::shell::{
     workspace_dialog::{OnSubmit as OnWorkspaceSubmit, WorkspaceDialog},
     workspace_ops::build_add_project_dialog,
 };
+use std::rc::Rc;
 
 /// Approximate horizontal inset (CSS px) of the `+` button from its
 /// column's left edge. Used by the adapter picker's anchor calculation;
@@ -147,6 +149,19 @@ pub struct WorkspaceRoot {
     /// each other. The first window uses "main" (matching the V005 migration
     /// default for legacy single-window rows); later windows use "w{n}".
     pub(crate) window_id: String,
+    /// Long-lived subscription on `GitPanel::DiscardRequested`. Survives
+    /// the entire workspace lifetime; dropping it would mean the discard
+    /// modal silently stops appearing.
+    pub(crate) _discard_subscription: Option<Subscription>,
+    /// Per-mount observer on the active discard `ConfirmDialog`. Reset
+    /// each time a new dialog is mounted (the previous observer is
+    /// dropped along with its dialog). Watches `is_confirmed` /
+    /// `is_cancelled` to free the `confirm_dialog` slot. Any other
+    /// consumer of the shared `confirm_dialog` slot (e.g.
+    /// `workspace_ops::delete_workspace_with_confirm`) MUST clear this
+    /// field before reusing the slot, otherwise the stale observer
+    /// will race the new dialog's teardown.
+    pub(crate) _discard_dialog_observer: Option<Subscription>,
 }
 
 impl WorkspaceRoot {
@@ -356,6 +371,24 @@ impl WorkspaceRoot {
         // until that fires, this fallback keeps actions routable.
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+
+        // Subscribe to GitPanel's discard requests. When the user clicks
+        // the revert icon on a file row, the panel emits
+        // `DiscardRequested`; we mount a `ConfirmDialog` populated from
+        // the panel's `pending_discard` snapshot.
+        let discard_subscription = right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+            .map(|sc| sc.read(cx).git_panel.clone())
+            .map(|panel| {
+                cx.subscribe_in(
+                    &panel,
+                    window,
+                    |root, panel, _ev: &DiscardRequested, window, cx| {
+                        root.mount_discard_dialog(panel.clone(), window, cx);
+                    },
+                )
+            });
         Self {
             theme,
             density,
@@ -375,6 +408,8 @@ impl WorkspaceRoot {
             _project_panes_observer: project_panes_observer,
             _window_activation_observer: window_activation_observer,
             _click_router: click_router,
+            _discard_subscription: discard_subscription,
+            _discard_dialog_observer: None,
             app_state,
             project_picker,
             workspace_dialog,
@@ -506,6 +541,70 @@ impl WorkspaceRoot {
             });
             sidebar.select_tab(crate::shell::right_sidebar::tab::RightTab::Search, cx);
         });
+    }
+
+    /// Mount a `ConfirmDialog` for the SCM panel's pending discard
+    /// request. Builds the prompt copy from the panel's snapshot,
+    /// wires `on_confirm` to `confirmed_discard_path` and `on_cancel`
+    /// to `clear_pending_discard`, then installs an observer that
+    /// drops the dialog from the slot once the user confirms or
+    /// cancels.
+    fn mount_discard_dialog(
+        &mut self,
+        panel: Entity<GitPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = panel.read(cx).pending_discard().cloned() else {
+            return;
+        };
+
+        let on_confirm: ConfirmCallback = {
+            let panel = panel.clone();
+            let path = request.path.clone();
+            Rc::new(move |_window, cx| {
+                panel.update(cx, |p, cx| p.confirmed_discard_path(path.clone(), cx));
+            })
+        };
+        let on_cancel: ConfirmCallback = {
+            let panel = panel.clone();
+            Rc::new(move |_window, cx| {
+                panel.update(cx, |p, cx| p.clear_pending_discard(cx));
+            })
+        };
+
+        let prompt = ConfirmPrompt {
+            title: request.copy.title,
+            body: request.copy.body,
+            expected: request.expected,
+            on_confirm,
+            confirm_label: Some(request.copy.confirm_label),
+            on_cancel: Some(on_cancel),
+        };
+
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+
+        // Drop the dialog the moment the user resolves it. Replacing
+        // `_discard_dialog_observer` cancels any previous observer
+        // that's tied to a stale dialog.
+        self._discard_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.confirm_dialog = None;
+                    root._discard_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+
+        self.confirm_dialog = Some(dialog);
+        cx.notify();
     }
 
     /// Build the on-click callback handed to the SCM panel for diff
