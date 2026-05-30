@@ -192,7 +192,7 @@ pub(super) fn row(
     rctx: &RenderCtx<'_>,
     cx: &mut Context<GitPanel>,
 ) -> impl IntoElement {
-    let is_selected = rctx.selected == Some(f.path.as_path());
+    let is_selected = rctx.selected.contains(&f.path);
     let bg = if is_selected {
         rctx.theme.selection
     } else {
@@ -313,18 +313,31 @@ pub(super) fn row(
         .when(!is_selected, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |panel, _: &MouseDownEvent, window, cx| {
-                panel.set_selected(Some((click_path.clone(), click_staged)), cx);
-                if click_should_open_editor
-                    && let Some(cb) = panel.on_open.clone()
-                {
-                    (cb)(
-                        click_path.clone(),
-                        click_staged,
-                        click_untracked,
-                        window,
-                        cx,
-                    );
+            cx.listener(move |panel, ev: &MouseDownEvent, window, cx| {
+                // Cmd-click (macOS `platform`) toggles a row in/out of
+                // the selection — additive. Shift+Click replaces with
+                // the inclusive range from the anchor to this row.
+                // Bare click replaces with a single-row selection AND
+                // is the only modifier path that opens the diff tab —
+                // additive / range operations are about building a
+                // multi-row set, not navigating.
+                if ev.modifiers.platform {
+                    panel.toggle_selection(click_path.clone(), cx);
+                } else if ev.modifiers.shift {
+                    panel.extend_range_to(click_path.clone(), cx);
+                } else {
+                    panel.select_only(click_path.clone(), cx);
+                    if click_should_open_editor
+                        && let Some(cb) = panel.on_open.clone()
+                    {
+                        (cb)(
+                            click_path.clone(),
+                            click_staged,
+                            click_untracked,
+                            window,
+                            cx,
+                        );
+                    }
                 }
                 cx.notify();
             }),

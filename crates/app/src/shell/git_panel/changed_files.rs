@@ -19,7 +19,7 @@ use gpui_component::{
 use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Borrowed-slice sectioning of `GitState::files` into Staged / Unstaged /
 /// Untracked. A partially-staged file (non-`Unmodified` on both sides) appears
@@ -102,7 +102,12 @@ pub struct RenderCtx<'a> {
     pub theme: Theme,
     pub density: Density,
     pub typography: &'a Typography,
-    pub selected: Option<&'a Path>,
+    /// Multi-select path set. The row renderer paints the selection
+    /// background for every path that lands in this set; Phase 02's
+    /// single-row highlight was `Option<&Path>` and lit at most one row
+    /// at a time. Borrowed from `GitPanel::selected` for one render
+    /// pass.
+    pub selected: &'a HashSet<PathBuf>,
     /// Section titles currently collapsed. Borrowed from `GitPanel` for the
     /// duration of a single render pass — re-reading the entity from `cx`
     /// during render panics because GPUI already holds a mut borrow.

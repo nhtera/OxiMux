@@ -14,8 +14,10 @@
 
 pub mod changed_files;
 pub mod discard_confirm;
+pub mod range_select;
 pub mod row_actions;
 pub mod row_renderer;
+pub mod selection;
 
 use crate::actions::{RevertFile, StageFile, UnstageFile};
 use crate::shell::diff_view::DiffView;
@@ -39,23 +41,39 @@ use tokio::sync::watch;
 use crate::shell::file_tree_view::OnOpenDiff;
 
 pub struct GitPanel {
-    repo: Repository,
+    /// `pub(super)` so [`selection`] can clone the handle to spawn
+    /// vectorised stage / unstage ops in `bulk_stage_selected` /
+    /// `bulk_unstage_selected`. No other sibling submodule mutates the
+    /// field; the inner `RwLock` cache stays internal to `oximux-git`.
+    pub(super) repo: Repository,
     /// Last `Ready` payload observed on the watch channel. Cleared back to
     /// `None` on a fresh `Loading` or `Failed` transition so the render path
     /// can distinguish "no data yet" from "no changes".
-    git_state: Option<GitState>,
+    ///
+    /// `pub(super)` so [`selection::flat_visible_paths`] can recompute
+    /// the partition without taking a per-render snapshot.
+    pub(super) git_state: Option<GitState>,
     poll_state: PollState,
-    /// Currently-highlighted row. Stores both the path and the section it
-    /// came from (`staged` for the Staged section, `false` for Unstaged /
-    /// Untracked) so we know which side of the diff to fetch when routing
-    /// to `DiffView::load`.
-    selected: Option<(PathBuf, bool)>,
+    /// Multi-select path set. Bare click replaces with one entry,
+    /// Cmd-click toggles, Shift+Click replaces with the range from
+    /// [`last_clicked`] to the click target in flat render order.
+    /// Selection survives poll ticks because it's keyed by `PathBuf` —
+    /// see [`selection`] for the routing methods.
+    ///
+    /// [`last_clicked`]: Self::last_clicked
+    pub(super) selected: HashSet<PathBuf>,
+    /// Anchor for Shift+Click range expansion. Bare / Cmd-click updates
+    /// it; Shift+Click leaves it alone (so a second Shift+Click
+    /// re-anchors from the same starting row, matching Finder list
+    /// semantics). `None` only before the first row interaction or
+    /// after [`selection::GitPanel::clear_selection`].
+    pub(super) last_clicked: Option<PathBuf>,
     /// Held but no longer driven — kept on the struct so the
     /// constructor signature doesn't churn while the inline sidebar
     /// `DiffView` is dormant. Diffs now open as real editor tabs in
-    /// the main pane via `on_open: OnOpenDiff` (see `set_selected`
-    /// doc). A follow-up can drop the field + constructor arg + the
-    /// `DiffView` mount in `right_sidebar/mod.rs`.
+    /// the main pane via `on_open: OnOpenDiff`. A follow-up can drop
+    /// the field + constructor arg + the `DiffView` mount in
+    /// `right_sidebar/mod.rs`.
     #[allow(dead_code)]
     diff_view: Option<Entity<DiffView>>,
     focus_handle: FocusHandle,
@@ -65,10 +83,18 @@ pub struct GitPanel {
     /// Case-insensitive substring filter applied to `git_state.files` before
     /// partitioning. Empty string disables filtering. Owner: `SourceControlPanel`
     /// updates this via `set_filter` as the user types in the filter input.
-    filter_query: String,
+    ///
+    /// `pub(super)` so [`selection::flat_visible_paths`] can apply the
+    /// same filter when computing the Shift+Click range.
+    pub(super) filter_query: String,
     /// Section names (e.g. "STAGED CHANGES") whose body is currently hidden.
     /// Toggled by clicking the section header. Default: all expanded.
-    collapsed_sections: HashSet<&'static str>,
+    ///
+    /// `pub(super)` so [`selection::flat_visible_paths`] can exclude
+    /// collapsed-section paths from Shift+Click range computation —
+    /// otherwise a range spanning a collapsed section silently selects
+    /// invisible rows.
+    pub(super) collapsed_sections: HashSet<&'static str>,
     /// Scroll position for the static sections list. Wired through `track_scroll`
     /// on the inner overflow region and consumed by `vertical_scrollbar` so the
     /// thumb actually moves as the user scrolls.
@@ -146,7 +172,8 @@ impl GitPanel {
             repo,
             git_state,
             poll_state: initial,
-            selected: None,
+            selected: HashSet::new(),
+            last_clicked: None,
             diff_view,
             focus_handle,
             theme,
@@ -181,23 +208,6 @@ impl GitPanel {
         cx.notify();
     }
 
-    /// Update the highlighted row. Previously also routed the patch
-    /// fetch into the sibling sidebar `DiffView`; diffs now open as
-    /// real editor tabs in the main pane (via `on_open: OnOpenDiff`
-    /// dispatched from `changed_files::row`), so the inline view stays
-    /// in `Empty` state and we skip the fetch — no point spending git
-    /// I/O on a surface nobody mounts. The `diff_view` field is kept
-    /// on `Self` to avoid churning the constructor signature; future
-    /// cleanup can drop it once the field has no other callers.
-    pub(crate) fn set_selected(
-        &mut self,
-        selection: Option<(PathBuf, bool)>,
-        cx: &mut Context<Self>,
-    ) {
-        self.selected = selection;
-        cx.notify();
-    }
-
     fn start_watch_task(mut rx: watch::Receiver<PollState>, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
@@ -223,25 +233,38 @@ impl GitPanel {
         })
     }
 
+    /// `S` chord — stage every path in [`selected`]. Routes through the
+    /// same vectorised `repo.stage_paths` backend as the hover-action
+    /// single-path stage, so a 1-row selection is indistinguishable from
+    /// a hover stage. No-op when nothing is selected.
+    ///
+    /// [`selected`]: Self::selected
     fn on_stage_file(&mut self, _: &StageFile, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, _)) = self.selected.clone() else {
-            return;
-        };
-        self.stage_path(path, cx);
+        self.bulk_stage_selected(cx);
     }
 
+    /// `U` chord — symmetric unstage over the entire selection set.
     fn on_unstage_file(&mut self, _: &UnstageFile, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, _)) = self.selected.clone() else {
-            return;
-        };
-        self.unstage_path(path, cx);
+        self.bulk_unstage_selected(cx);
     }
 
+    /// `R` chord — keyboard / command-palette discard. Slice A keeps
+    /// the modal-driven single-row flow: acts only when exactly one
+    /// path is selected. Multi-row discard waits for Slice C's
+    /// `DiscardAllArea` routing, so we don't queue N modals on a chord.
     fn on_revert_file(&mut self, _: &RevertFile, _window: &mut Window, cx: &mut Context<Self>) {
-        // Keyboard / command-palette entrypoint. Goes through the same
-        // `discard_path` method that the hover-action button uses so any
-        // confirmation modal added later (Phase 01b) covers both paths.
-        let Some((path, _)) = self.selected.clone() else {
+        if self.selected.len() != 1 {
+            // Trace so a user wondering "why didn't R do anything?"
+            // can see the deferral in the logs. Surfaced as `debug` —
+            // not a warning; the chord wiring is intentional.
+            tracing::debug!(
+                target: "oximux_app::git_panel",
+                count = self.selected.len(),
+                "R chord skipped: multi-row discard lands in Slice C (DiscardAllArea)"
+            );
+            return;
+        }
+        let Some(path) = self.selected.iter().next().cloned() else {
             return;
         };
         self.discard_path(path, cx);
@@ -457,7 +480,7 @@ impl Render for GitPanel {
                     theme: self.theme,
                     density: self.density,
                     typography: &self.typography,
-                    selected: self.selected.as_ref().map(|(p, _)| p.as_path()),
+                    selected: &self.selected,
                     collapsed: &self.collapsed_sections,
                     branch: state.branch.as_deref(),
                     in_flight_discards: &self.in_flight_discards,
@@ -529,7 +552,10 @@ fn placeholder_state(
 /// runtime is entered (e.g. the gpui smoke test, or before step 14's shell
 /// integration boots the runtime). Caller passes a closure that returns a
 /// `Result<()>` future; only the error path is logged.
-fn spawn_repo_op<F, Fut>(repo: Repository, op: F, label: &'static str)
+///
+/// `pub(super)` so the [`selection`] submodule can spawn vectorised stage
+/// / unstage ops in `bulk_stage_selected` / `bulk_unstage_selected`.
+pub(super) fn spawn_repo_op<F, Fut>(repo: Repository, op: F, label: &'static str)
 where
     F: FnOnce(Repository) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = oximux_git::Result<()>> + Send + 'static,
