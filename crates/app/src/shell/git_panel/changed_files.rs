@@ -278,6 +278,15 @@ fn section(
                 .ml_auto()
                 .invisible()
                 .group_hover(header_id.clone(), |s| s.visible())
+                // Eat MouseDown inside the cluster so the parent header's
+                // MouseDown handler does NOT fire — without this, clicking
+                // a cluster button (Stage all / Discard all) would also
+                // toggle the section's collapsed state because GPUI fires
+                // `on_mouse_down` on the parent before the Button's
+                // `on_click` (MouseUp) lands.
+                .on_mouse_down(MouseButton::Left, |_ev, _win, cx| {
+                    cx.stop_propagation();
+                })
                 .child(c)
         }));
     let mut col = div()
@@ -299,6 +308,13 @@ fn section(
                 // PathBuf children; the flatten pass returns
                 // RenderRow-by-value (no borrow into `rows`).
                 //
+                // The tree handle is passed by reference into each
+                // tree-row render so folder hover-actions and modifier
+                // clicks can compute subtree leaves / sibling dirs at
+                // render time and capture them into 'static click
+                // handlers — `section_rows` itself is borrowed for the
+                // render pass and can't be moved into a listener.
+                //
                 // TODO(perf): leaf-row lookup in `tree_render::leaf_row`
                 // does an O(N) linear scan over `rows` per leaf, total
                 // O(N²) per section. Pre-build a `HashMap<&Path,
@@ -314,7 +330,7 @@ fn section(
                 for flat_row in flat_rows {
                     col = col.child(
                         crate::shell::git_panel::tree_render::render_tree_row(
-                            flat_row, rows, kind, rctx, cx,
+                            flat_row, &tree, rows, kind, rctx, cx,
                         ),
                     );
                 }

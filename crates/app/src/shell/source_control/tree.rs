@@ -96,6 +96,10 @@ pub struct RenderRow {
 /// slice) without an intermediate copy. Files are inserted at their full
 /// relative path; intermediate directories are created on demand. Folder
 /// rollup is computed bottom-up after the trie is full.
+///
+/// **Root-path contract:** the returned root node's `path` is always
+/// `PathBuf::new()` (the empty path). [`sibling_dirs`] relies on this
+/// to detect "the parent of a top-level dir is the tree root itself."
 pub fn build_tree<'a, I>(files: I, section: TreeSection) -> TreeNode
 where
     I: IntoIterator<Item = &'a FileStatus>,
@@ -231,6 +235,71 @@ fn count_leaves(node: &TreeNode) -> u32 {
         NodeKind::File => 1,
         NodeKind::Dir => node.children.values().map(count_leaves).sum(),
     }
+}
+
+/// Walk the subtree rooted at `dir_path` and collect every leaf path
+/// (relative to the worktree root) into a flat `Vec`. Returns an empty
+/// `Vec` when `dir_path` is not a known directory in the tree.
+///
+/// Used by the folder hover-action cluster (Stage all / Unstage all /
+/// Discard all in folder) and by Shift+click subtree multi-select.
+pub fn subtree_leaves(tree: &TreeNode, dir_path: &Path) -> Vec<PathBuf> {
+    let Some(dir_node) = find_dir(tree, dir_path) else {
+        return Vec::new();
+    };
+    let mut leaves = Vec::new();
+    collect_leaves(dir_node, &mut leaves);
+    leaves
+}
+
+fn collect_leaves(node: &TreeNode, out: &mut Vec<PathBuf>) {
+    match node.kind {
+        NodeKind::File => out.push(node.path.clone()),
+        NodeKind::Dir => {
+            for child in node.children.values() {
+                collect_leaves(child, out);
+            }
+        }
+    }
+}
+
+/// Find the immediate-sibling Dir paths of `dir_path` — every Dir under
+/// the same parent except `dir_path` itself. Returns an empty `Vec` for
+/// roots with no parent or when `dir_path` is not in the tree. Used by
+/// Cmd+click "collapse all siblings, keep this one open".
+pub fn sibling_dirs(tree: &TreeNode, dir_path: &Path) -> Vec<PathBuf> {
+    let parent_path = dir_path.parent().unwrap_or(Path::new(""));
+    // For root-level dirs (`dir_path` has no parent or its parent is the
+    // empty path), the "parent" is the tree root itself.
+    let parent_lookup = if parent_path.as_os_str().is_empty() {
+        Some(tree)
+    } else {
+        find_dir(tree, parent_path)
+    };
+    let Some(parent_node) = parent_lookup else {
+        return Vec::new();
+    };
+    parent_node
+        .children
+        .values()
+        .filter(|c| matches!(c.kind, NodeKind::Dir) && c.path != dir_path)
+        .map(|c| c.path.clone())
+        .collect()
+}
+
+fn find_dir<'a>(tree: &'a TreeNode, target: &Path) -> Option<&'a TreeNode> {
+    if target.as_os_str().is_empty() {
+        return Some(tree);
+    }
+    let mut current = tree;
+    for component in target.iter() {
+        let key = component.to_string_lossy().into_owned();
+        current = current.children.get(&key)?;
+        if matches!(current.kind, NodeKind::File) {
+            return None;
+        }
+    }
+    Some(current)
 }
 
 #[cfg(test)]
@@ -466,5 +535,110 @@ mod tests {
             tree.children.get("dir").unwrap().rollup_status,
             Some(NodeStatus::Conflict)
         );
+    }
+
+    #[test]
+    fn subtree_leaves_returns_every_leaf_under_dir() {
+        let files = vec![
+            modified("a/b/c/leaf1.rs"),
+            modified("a/b/leaf2.rs"),
+            modified("a/leaf3.rs"),
+            modified("z/other.rs"),
+        ];
+        let tree = build_tree(&files, TreeSection::Unstaged);
+        let mut leaves = subtree_leaves(&tree, Path::new("a"));
+        leaves.sort();
+        assert_eq!(
+            leaves,
+            vec![
+                PathBuf::from("a/b/c/leaf1.rs"),
+                PathBuf::from("a/b/leaf2.rs"),
+                PathBuf::from("a/leaf3.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn subtree_leaves_empty_for_unknown_dir() {
+        let files = vec![modified("a/x.rs")];
+        let tree = build_tree(&files, TreeSection::Unstaged);
+        assert!(subtree_leaves(&tree, Path::new("nope/missing")).is_empty());
+    }
+
+    #[test]
+    fn subtree_leaves_empty_when_target_is_a_file() {
+        let files = vec![modified("a/x.rs")];
+        let tree = build_tree(&files, TreeSection::Unstaged);
+        // Walking into a leaf path is invalid input — return empty
+        // rather than the leaf itself so callers don't get a wrong-shape
+        // result and re-stage a single file twice.
+        assert!(subtree_leaves(&tree, Path::new("a/x.rs")).is_empty());
+    }
+
+    #[test]
+    fn sibling_dirs_at_root_returns_every_other_top_level_dir() {
+        let files = vec![
+            modified("a/x.rs"),
+            modified("b/y.rs"),
+            modified("c/z.rs"),
+            // File at root is NOT a sibling Dir.
+            modified("readme.md"),
+        ];
+        let tree = build_tree(&files, TreeSection::Unstaged);
+        let mut siblings = sibling_dirs(&tree, Path::new("b"));
+        siblings.sort();
+        assert_eq!(siblings, vec![PathBuf::from("a"), PathBuf::from("c")]);
+    }
+
+    #[test]
+    fn sibling_dirs_nested_excludes_self_and_files() {
+        let files = vec![
+            modified("crates/app/file.rs"),
+            modified("crates/core/file.rs"),
+            modified("crates/git/file.rs"),
+        ];
+        let tree = build_tree(&files, TreeSection::Unstaged);
+        let mut siblings = sibling_dirs(&tree, Path::new("crates/core"));
+        siblings.sort();
+        assert_eq!(
+            siblings,
+            vec![PathBuf::from("crates/app"), PathBuf::from("crates/git")]
+        );
+    }
+
+    #[test]
+    fn sibling_dirs_empty_when_only_child() {
+        let files = vec![modified("solo/only.rs")];
+        let tree = build_tree(&files, TreeSection::Unstaged);
+        assert!(sibling_dirs(&tree, Path::new("solo")).is_empty());
+    }
+
+    #[test]
+    fn filtered_input_drops_non_matching_subtrees() {
+        // Filter walk is implicit: GitPanel already filters
+        // `state.files` before partitioning, so the tree we build
+        // sees only the matching subset. Subtrees containing no
+        // matches are absent entirely. This test simulates the
+        // post-filter slice (caller pre-filtered for "keep").
+        let all_files = [
+            modified("a/keep_me.rs"),
+            modified("a/keep_too.rs"),
+            modified("b/drop_me.rs"),
+            modified("c/drop_too.rs"),
+        ];
+        // Simulate filter for "keep" — only `a/*` survives.
+        let filtered: Vec<_> = all_files
+            .iter()
+            .filter(|f| f.path.to_string_lossy().contains("keep"))
+            .cloned()
+            .collect();
+        let tree = build_tree(&filtered, TreeSection::Unstaged);
+        // Folder `a` survives with its 2 matching leaves.
+        assert!(tree.children.contains_key("a"));
+        let a = tree.children.get("a").unwrap();
+        assert_eq!(a.children.len(), 2);
+        // Folders `b` and `c` are absent — no matching leaves.
+        assert!(!tree.children.contains_key("b"));
+        assert!(!tree.children.contains_key("c"));
     }
 }

@@ -73,6 +73,41 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// Replace the selection with `paths`. Used by Tree-mode Shift+click
+    /// on a folder row to pull every leaf in the subtree into selection
+    /// at once. No-op when `paths` is empty so a Shift+click on an
+    /// already-empty folder doesn't blow away an existing selection.
+    ///
+    /// The anchor (`last_clicked`) is intentionally NOT updated — this
+    /// is a wholesale replacement, not a range-extend, and picking the
+    /// "first" of an unordered subtree as the new anchor would make a
+    /// subsequent flat-row Shift+click range from a surprising lexical
+    /// leaf. Preserving the prior anchor mirrors Finder's "Shift+click
+    /// doesn't move the anchor" rule and keeps a follow-up range
+    /// predictable.
+    pub fn select_paths_replace(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.selected.clear();
+        self.selected.extend(paths);
+        cx.notify();
+    }
+
+    /// Add `paths` to `collapsed_dirs`. Used by Tree-mode Cmd+click on
+    /// a folder to collapse every sibling folder while leaving the
+    /// clicked one expanded (the caller passes the sibling list it
+    /// computed off the rendered tree). No-op for an empty list.
+    pub fn collapse_dirs(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        for p in paths {
+            self.collapsed_dirs.insert(p);
+        }
+        cx.notify();
+    }
+
     /// Drop the entire selection + anchor. Called from the bulk-op
     /// success path (Slice B) and a future BulkActionBar `× Clear`
     /// button.
