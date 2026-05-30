@@ -17,6 +17,7 @@
 
 pub mod commit_area;
 pub mod commit_ops;
+pub mod dropdown_items;
 pub mod filter;
 pub mod graph;
 pub mod primary_action;
@@ -43,6 +44,7 @@ use tokio::sync::watch;
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::GitPanel;
 use crate::shell::source_control::commit_area::CommitArea;
+use crate::shell::source_control::dropdown_items::DropdownInputs;
 use crate::shell::source_control::graph::CommitGraph;
 use crate::shell::source_control::primary_action::{
     PrimaryAction, PrimaryActionInputs, RemoteOpKind, UpstreamStatus, resolve_primary_action,
@@ -197,7 +199,11 @@ impl SourceControlPanel {
         })
     }
 
-    fn resolve_primary(&self, cx: &Context<Self>) -> PrimaryAction {
+    /// Build the inputs snapshot consumed by both the primary-action
+    /// resolver (single-verb split button) and the dropdown resolver
+    /// (full menu). Walks `git_state.files` once so both surfaces see the
+    /// same staged/unstaged/conflict counts.
+    fn build_primary_inputs(&self, cx: &Context<Self>) -> PrimaryActionInputs {
         let (staged_count, has_unstaged, has_partial, has_conflict, upstream) = self
             .git_state
             .as_ref()
@@ -256,11 +262,8 @@ impl SourceControlPanel {
             .unwrap_or((0, false, false, false, None));
 
         // Derive the in-flight remote op directly from the commit area's
-        // status. The legacy `self.in_flight_remote` mutex was intended for
-        // a callback-driven flow that never landed; deriving from the
-        // already-correct `CommitStatus` eliminates the two-sources-of-truth
-        // gap (the mutex was never written, so the primary button stayed
-        // enabled during dropdown-driven Push/Pull/Sync/Fetch).
+        // status (single source of truth; see `resolve_primary` for the
+        // historical mutex note).
         let commit_status = self.commit_area.read(cx).status.clone();
         let in_flight_remote_kind = match &commit_status {
             commit_area::CommitStatus::Pushing => Some(RemoteOpKind::Push),
@@ -269,12 +272,13 @@ impl SourceControlPanel {
             commit_area::CommitStatus::Fetching => Some(RemoteOpKind::Fetch),
             _ => None,
         };
-        // Sync the legacy mutex so the field stays consistent for any
-        // future caller; harmless if nothing else reads it.
+        // Sync the legacy mutex so any future caller sees a consistent
+        // value — harmless if nothing else reads it.
         if let Ok(mut g) = self.in_flight_remote.lock() {
             *g = in_flight_remote_kind;
         }
-        let inputs = PrimaryActionInputs {
+
+        PrimaryActionInputs {
             staged_count,
             has_unstaged_changes: has_unstaged,
             has_partially_staged_changes: has_partial,
@@ -284,8 +288,25 @@ impl SourceControlPanel {
             is_remote_operation_active: in_flight_remote_kind.is_some(),
             upstream_status: upstream,
             in_flight_remote_op_kind: in_flight_remote_kind,
-        };
-        resolve_primary_action(&inputs)
+        }
+    }
+
+    /// Build the dropdown-only inputs wrapper. The lease flag and
+    /// `base_ref` are stubbed here; they become real values once an
+    /// upstream-rewrite-detection query and a configurable base ref are
+    /// available on `Repository`. The PR-operation flag stays false
+    /// until a hosted-review backend exists.
+    fn build_dropdown_inputs(&self, cx: &Context<Self>) -> DropdownInputs {
+        DropdownInputs {
+            primary: self.build_primary_inputs(cx),
+            force_push_with_lease: false,
+            base_ref: None,
+            is_pr_operation_active: false,
+        }
+    }
+
+    fn resolve_primary(&self, cx: &Context<Self>) -> PrimaryAction {
+        resolve_primary_action(&self.build_primary_inputs(cx))
     }
 
     fn render_scope_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -511,16 +532,16 @@ impl Render for SourceControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let action = self.resolve_primary(cx);
+        let dropdown_inputs = self.build_dropdown_inputs(cx);
 
         // Snapshot per-section render outputs as `AnyElement` so we can drop
         // each borrow of `cx` before composing the final tree.
         let scope_tabs: AnyElement = self.render_scope_tabs(cx).into_any_element();
         let toolbar: AnyElement = self.render_branch_toolbar(cx).into_any_element();
         let filter_row: AnyElement = self.render_filter_row(cx).into_any_element();
-        let commit_area_render: AnyElement = self
-            .commit_area
-            .clone()
-            .update(cx, |a, cx| a.render(&action, cx).into_any_element());
+        let commit_area_render: AnyElement = self.commit_area.clone().update(cx, |a, cx| {
+            a.render(&action, dropdown_inputs, cx).into_any_element()
+        });
 
         // Filter wiring: helper `filter_files` is unit-tested in
         // `crates/app/tests/sc_filter.rs`; the changed-files list itself does

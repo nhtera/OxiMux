@@ -1,0 +1,462 @@
+//! Source Control dropdown menu — pure data resolver.
+//!
+//! Computes the dropdown menu rows (kind + label + tooltip + disabled
+//! state) from a single inputs snapshot. No GPUI imports — every
+//! input/output is plain data so the whole module is unit-testable from
+//! `cargo test --workspace` without a TestAppContext.
+//!
+//! Mirrors the state machine in `primary_action.rs` but emits the full
+//! menu rather than collapsing to a single verb. Stable row order keeps
+//! the menu shape consistent across releases so the user's muscle memory
+//! doesn't change post-upgrade.
+
+use crate::shell::source_control::primary_action::PrimaryActionInputs;
+
+/// One row of the dropdown — either an actionable item or a separator line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropdownEntry {
+    Item {
+        kind: DropdownActionKind,
+        label: String,
+        title: String,
+        disabled: bool,
+    },
+    Separator,
+}
+
+/// Distinct verbs the dropdown can dispatch. The render layer in
+/// `commit_area.rs` maps each kind to a method on `CommitArea`.
+///
+/// `ForcePush` reuses the same kind whether it appears in the Push or
+/// Sync slot — the slot only changes which menu position the user
+/// clicked, the backend action is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropdownActionKind {
+    Commit,
+    CommitPush,
+    CommitForcePush,
+    CommitSync,
+    Push,
+    ForcePush,
+    /// Disabled in v1; lands with the hosted-review adapter in v1.1.
+    CreatePr,
+    /// Disabled in v1; lands with the hosted-review adapter in v1.1.
+    PushBeforePr,
+    Pull,
+    Sync,
+    Rebase,
+    Fetch,
+    Publish,
+}
+
+/// Inputs to the resolver. Wraps `PrimaryActionInputs` (shared with the
+/// primary split-button) plus the dropdown-only flags.
+#[derive(Debug, Clone, Default)]
+pub struct DropdownInputs {
+    pub primary: PrimaryActionInputs,
+    /// True when the local branch has rewritten commits that the upstream
+    /// still has (rebase / amend / squash). Drives the Push / Sync /
+    /// Commit & Push label swap to Force Push.
+    pub force_push_with_lease: bool,
+    /// Configured base ref for the worktree (e.g. `origin/main`). Drives
+    /// the "Rebase from <base>" label; `None` disables the Rebase row.
+    pub base_ref: Option<String>,
+    /// True when a hosted-review-creation backend op is in flight. Disables
+    /// Create PR / Push before PR rows to prevent re-entry. Always false
+    /// in v1 — the hosted-review adapter ships in v1.1.
+    pub is_pr_operation_active: bool,
+}
+
+/// Build the dropdown menu rows for the given inputs.
+///
+/// Returns entries in the stable order:
+/// Commit · Commit & Push · Commit & Sync · ─ · Push · Create PR ·
+/// Push & Create PR · Pull · Sync · Rebase · Fetch · Publish.
+///
+/// Result is purely a function of `inputs` — calling twice with the same
+/// inputs yields equal `Vec`s. This invariant powers the unit tests below
+/// and means the render layer can `==` two resolutions to short-circuit a
+/// re-render if needed.
+pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
+    let p = &inputs.primary;
+    let upstream = p.upstream_status;
+    let ahead = upstream.map(|u| u.ahead).unwrap_or(0);
+    let behind = upstream.map(|u| u.behind).unwrap_or(0);
+    let has_upstream = upstream.map(|u| u.has_upstream).unwrap_or(false);
+    let has_staged = p.staged_count > 0;
+    let lease = inputs.force_push_with_lease;
+
+    // "Can the user commit right now?" — gates every Commit* row.
+    let can_commit_base = has_staged
+        && p.has_message
+        && !p.has_unresolved_conflicts
+        && !p.is_committing
+        && !p.is_remote_operation_active;
+
+    let mut out = Vec::with_capacity(12);
+
+    // 1. Commit
+    out.push(item(
+        DropdownActionKind::Commit,
+        "Commit".to_string(),
+        if can_commit_base {
+            "Commit staged changes".to_string()
+        } else {
+            commit_disabled_reason(p, has_staged).to_string()
+        },
+        !can_commit_base,
+    ));
+
+    // 2. Commit & Push (or Commit & Force Push when the upstream needs a
+    //    lease-aware rewrite). Stays as one row — label flip only.
+    let cp_kind = if lease {
+        DropdownActionKind::CommitForcePush
+    } else {
+        DropdownActionKind::CommitPush
+    };
+    let cp_label = if lease {
+        "Commit & Force Push".to_string()
+    } else {
+        "Commit & Push".to_string()
+    };
+    let cp_disabled = !can_commit_base || !has_upstream;
+    out.push(item(
+        cp_kind,
+        cp_label,
+        compound_tooltip(p, has_staged, has_upstream, "Commit and push", lease, cp_disabled),
+        cp_disabled,
+    ));
+
+    // 3. Commit & Sync
+    let cs_disabled = !can_commit_base || !has_upstream;
+    out.push(item(
+        DropdownActionKind::CommitSync,
+        "Commit & Sync".to_string(),
+        compound_tooltip(p, has_staged, has_upstream, "Commit, then pull and push", false, cs_disabled),
+        cs_disabled,
+    ));
+
+    out.push(DropdownEntry::Separator);
+
+    // 5. Push (or Force Push when lease). Gating is identical for both —
+    //    needs upstream + something ahead + no conflicts + no in-flight op.
+    let push_disabled = !has_upstream
+        || ahead == 0
+        || p.has_unresolved_conflicts
+        || p.is_committing
+        || p.is_remote_operation_active;
+    let push_kind = if lease {
+        DropdownActionKind::ForcePush
+    } else {
+        DropdownActionKind::Push
+    };
+    let push_label = if lease {
+        format!("Force Push{}", suffix_ahead(ahead))
+    } else {
+        format!("Push{}", suffix_ahead(ahead))
+    };
+    out.push(item(
+        push_kind,
+        push_label,
+        if push_disabled {
+            push_disabled_reason(p, has_upstream, ahead).to_string()
+        } else if lease {
+            format!("Force-push (with lease) {ahead} commit{}", plural(ahead))
+        } else {
+            format!("Push {ahead} commit{}", plural(ahead))
+        },
+        push_disabled,
+    ));
+
+    // 6. Create PR — disabled in v1; lands with the hosted-review adapter.
+    out.push(item(
+        DropdownActionKind::CreatePr,
+        "Create PR".to_string(),
+        "Lands in v1.1".to_string(),
+        true,
+    ));
+
+    // 7. Push before PR — disabled in v1; lands with the hosted-review adapter.
+    out.push(item(
+        DropdownActionKind::PushBeforePr,
+        "Push & Create PR".to_string(),
+        "Lands in v1.1".to_string(),
+        true,
+    ));
+
+    // 8. Pull
+    let pull_disabled = !has_upstream
+        || behind == 0
+        || p.has_unresolved_conflicts
+        || p.is_committing
+        || p.is_remote_operation_active;
+    out.push(item(
+        DropdownActionKind::Pull,
+        format!("Pull{}", suffix_behind(behind)),
+        if pull_disabled {
+            pull_disabled_reason(p, has_upstream, behind).to_string()
+        } else {
+            format!("Pull {behind} commit{}", plural(behind))
+        },
+        pull_disabled,
+    ));
+
+    // 9. Sync — replaced by a second Force Push row when lease is needed
+    //    (both Push and Sync would be unsafe; redirect both to force-push so
+    //    the user sees the dangerous-action variant regardless of which
+    //    slot they clicked).
+    if lease {
+        out.push(item(
+            DropdownActionKind::ForcePush,
+            format!("Force Push{}", suffix_ahead(ahead)),
+            if push_disabled {
+                push_disabled_reason(p, has_upstream, ahead).to_string()
+            } else {
+                format!("Force-push (with lease) {ahead} commit{}", plural(ahead))
+            },
+            push_disabled,
+        ));
+    } else {
+        let sync_disabled = !has_upstream
+            || (ahead == 0 && behind == 0)
+            || p.has_unresolved_conflicts
+            || p.is_committing
+            || p.is_remote_operation_active;
+        out.push(item(
+            DropdownActionKind::Sync,
+            format!("Sync{}", suffix_diverged(ahead, behind)),
+            if sync_disabled {
+                sync_disabled_reason(p, has_upstream, ahead, behind).to_string()
+            } else {
+                format!("Pull {behind}, push {ahead}")
+            },
+            sync_disabled,
+        ));
+    }
+
+    // 10. Rebase from <base>. Label adapts to the configured base ref;
+    //     missing base ref or a dirty worktree disable the row.
+    let rebase_label = match inputs.base_ref.as_deref() {
+        Some(base) => format!("Rebase from {base}"),
+        None => "Rebase from Base".to_string(),
+    };
+    let rebase_disabled = inputs.base_ref.is_none()
+        || p.has_unresolved_conflicts
+        || p.has_unstaged_changes
+        || p.is_committing
+        || p.is_remote_operation_active;
+    out.push(item(
+        DropdownActionKind::Rebase,
+        rebase_label,
+        if rebase_disabled {
+            rebase_disabled_reason(p, inputs.base_ref.as_deref()).to_string()
+        } else {
+            format!(
+                "Rebase current branch onto {}",
+                inputs.base_ref.as_deref().unwrap_or("")
+            )
+        },
+        rebase_disabled,
+    ));
+
+    // 11. Fetch — almost always enabled; only blocked by an in-flight
+    //     remote op. Fetch never mutates the working tree, so conflicts
+    //     and dirty index don't gate it.
+    let fetch_disabled = p.is_remote_operation_active || p.is_committing;
+    out.push(item(
+        DropdownActionKind::Fetch,
+        "Fetch".to_string(),
+        if fetch_disabled {
+            "Another operation is in progress".to_string()
+        } else {
+            "Fetch all remotes".to_string()
+        },
+        fetch_disabled,
+    ));
+
+    // 12. Publish — only meaningful when the branch lacks an upstream;
+    //     stays in the menu (disabled) when an upstream already exists so
+    //     the row order is stable across states.
+    let publish_disabled = has_upstream || p.is_committing || p.is_remote_operation_active;
+    out.push(item(
+        DropdownActionKind::Publish,
+        "Publish Branch".to_string(),
+        if has_upstream {
+            "Branch is already published".to_string()
+        } else if publish_disabled {
+            "An operation is already in progress".to_string()
+        } else {
+            "Publish this branch to origin".to_string()
+        },
+        publish_disabled,
+    ));
+
+    out
+}
+
+fn item(kind: DropdownActionKind, label: String, title: String, disabled: bool) -> DropdownEntry {
+    DropdownEntry::Item {
+        kind,
+        label,
+        title,
+        disabled,
+    }
+}
+
+// --- Disabled-reason helpers -------------------------------------------------
+//
+// Each helper returns the FIRST applicable reason in order of severity. The
+// resolver only calls these when the row is actually disabled, so an empty
+// string here would be a bug — but we still default to a generic fallback
+// rather than panic so a stale call site can't crash render.
+
+fn commit_disabled_reason(p: &PrimaryActionInputs, has_staged: bool) -> &'static str {
+    if p.is_committing {
+        "Commit in progress…"
+    } else if p.is_remote_operation_active {
+        "Remote operation in progress"
+    } else if p.has_unresolved_conflicts {
+        "Resolve conflicts before committing"
+    } else if !has_staged {
+        "Stage at least one file to commit"
+    } else if !p.has_message {
+        "Enter a commit message to commit"
+    } else {
+        "Cannot commit"
+    }
+}
+
+fn push_disabled_reason(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    ahead: u32,
+) -> &'static str {
+    if p.is_committing {
+        "Commit in progress…"
+    } else if p.is_remote_operation_active {
+        "Remote operation in progress"
+    } else if p.has_unresolved_conflicts {
+        "Resolve conflicts before pushing"
+    } else if !has_upstream {
+        "Publish the branch first"
+    } else if ahead == 0 {
+        "Nothing to push"
+    } else {
+        "Cannot push"
+    }
+}
+
+fn pull_disabled_reason(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    behind: u32,
+) -> &'static str {
+    if p.is_committing {
+        "Commit in progress…"
+    } else if p.is_remote_operation_active {
+        "Remote operation in progress"
+    } else if p.has_unresolved_conflicts {
+        "Resolve conflicts before pulling"
+    } else if !has_upstream {
+        "Publish the branch first"
+    } else if behind == 0 {
+        "Nothing to pull"
+    } else {
+        "Cannot pull"
+    }
+}
+
+fn sync_disabled_reason(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    ahead: u32,
+    behind: u32,
+) -> &'static str {
+    if p.is_committing {
+        "Commit in progress…"
+    } else if p.is_remote_operation_active {
+        "Remote operation in progress"
+    } else if p.has_unresolved_conflicts {
+        "Resolve conflicts before syncing"
+    } else if !has_upstream {
+        "Publish the branch first"
+    } else if ahead == 0 && behind == 0 {
+        "Branch is up to date"
+    } else {
+        "Cannot sync"
+    }
+}
+
+fn rebase_disabled_reason(
+    p: &PrimaryActionInputs,
+    base_ref: Option<&str>,
+) -> &'static str {
+    if p.is_committing {
+        "Commit in progress…"
+    } else if p.is_remote_operation_active {
+        "Remote operation in progress"
+    } else if p.has_unresolved_conflicts {
+        "Resolve conflicts before rebasing"
+    } else if p.has_unstaged_changes {
+        "Commit or stash changes before rebasing"
+    } else if base_ref.is_none() {
+        "Configure a base ref first"
+    } else {
+        "Cannot rebase"
+    }
+}
+
+/// Tooltip text shared by Commit & Push / Commit & Force Push / Commit & Sync.
+/// Returns the "what will happen" line when enabled, or the most relevant
+/// disabled reason when disabled.
+fn compound_tooltip(
+    p: &PrimaryActionInputs,
+    has_staged: bool,
+    has_upstream: bool,
+    verb: &str,
+    lease: bool,
+    disabled: bool,
+) -> String {
+    if disabled {
+        if !has_upstream {
+            return "Publish the branch first".to_string();
+        }
+        return commit_disabled_reason(p, has_staged).to_string();
+    }
+    if lease {
+        format!("{verb} (with lease)")
+    } else {
+        verb.to_string()
+    }
+}
+
+// --- Label suffix helpers ----------------------------------------------------
+
+fn suffix_ahead(ahead: u32) -> String {
+    if ahead > 0 {
+        format!(" ({ahead})")
+    } else {
+        String::new()
+    }
+}
+
+fn suffix_behind(behind: u32) -> String {
+    if behind > 0 {
+        format!(" ({behind})")
+    } else {
+        String::new()
+    }
+}
+
+fn suffix_diverged(ahead: u32, behind: u32) -> String {
+    if ahead > 0 && behind > 0 {
+        format!(" (↓{behind} ↑{ahead})")
+    } else {
+        String::new()
+    }
+}
+
+fn plural(n: u32) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+

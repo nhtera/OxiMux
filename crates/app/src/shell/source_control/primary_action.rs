@@ -51,6 +51,13 @@ pub struct UpstreamStatus {
 /// `upstream_status: None` represents "fetchUpstreamStatus has not resolved
 /// yet" — the resolver returns a disabled Commit so the button has a stable
 /// frame on first paint.
+///
+/// `force_push_with_lease` and `base_ref` are consumed by the dropdown
+/// resolver (`dropdown_items::resolve`) but not by the primary-button
+/// resolver (which only ever renders a single verb). They live here so the
+/// two resolvers share a single inputs struct — there's no behavioural
+/// difference for the primary, just an unused field on the dropdown's
+/// "additional inputs" struct wrapping this one.
 #[derive(Debug, Clone, Default)]
 pub struct PrimaryActionInputs {
     pub staged_count: usize,

@@ -23,6 +23,9 @@ use gpui_component::{
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::shell::source_control::dropdown_items::{
+    self, DropdownActionKind, DropdownEntry, DropdownInputs,
+};
 use crate::shell::source_control::primary_action::{PrimaryAction, PrimaryActionKind};
 use crate::shell::source_control::style as sc_style;
 
@@ -149,6 +152,43 @@ impl CommitArea {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Fetch, cx);
     }
 
+    /// Force-push (with lease). Stubbed: the backend lands alongside the
+    /// upstream-rewrite-detection feature; until then the user sees a
+    /// "Not yet implemented" message in the status row rather than the
+    /// menu item silently doing nothing.
+    pub fn force_push(&mut self, cx: &mut Context<Self>) {
+        self.status =
+            CommitStatus::Failed("force push".to_string(), "Not yet implemented".to_string());
+        cx.notify();
+    }
+
+    /// Commit-then-force-push convenience used by the dropdown's
+    /// "Commit & Force Push" item when an upstream rewrite is needed.
+    /// Stubbed for the same reason as `force_push`.
+    pub fn commit_and_force_push(&mut self, cx: &mut Context<Self>) {
+        self.status = CommitStatus::Failed(
+            "commit & force push".to_string(),
+            "Not yet implemented".to_string(),
+        );
+        cx.notify();
+    }
+
+    /// Rebase the current branch onto the configured base ref. Stubbed:
+    /// rebase backend wiring lands in a later phase; the dropdown row
+    /// exists now so the menu shape stays stable across versions.
+    pub fn rebase_from_base(&mut self, cx: &mut Context<Self>) {
+        self.status =
+            CommitStatus::Failed("rebase".to_string(), "Not yet implemented".to_string());
+        cx.notify();
+    }
+
+    /// Publish the current branch by pushing it with `-u origin <branch>`.
+    /// Currently routed through the `Publish` remote verb in `commit_ops`,
+    /// which uses the existing `Repository::publish_branch` backend.
+    pub fn publish(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Publish, cx);
+    }
+
     /// Apply a completed op result to the status surface. Called from the
     /// commit-ops completion task; pub(super) so the helper module can
     /// reach it without re-exposing the field.
@@ -165,7 +205,12 @@ impl CommitArea {
         }
     }
 
-    pub fn render(&self, action: &PrimaryAction, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render(
+        &self,
+        action: &PrimaryAction,
+        dropdown_inputs: DropdownInputs,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
@@ -223,12 +268,15 @@ impl CommitArea {
             inner_button = inner_button.icon(icon);
         }
 
-        // Chevron opens a dropdown with every available remote/commit verb.
-        // Today only "Commit" actually wires through to repo.commit; remote
-        // verbs are present for visual completeness and ship disabled until
-        // their backends land.
+        // Chevron opens a dropdown built from `dropdown_items::resolve`.
+        // Each row carries its own label / tooltip / disabled state; the
+        // render layer just walks the resolved Vec and emits one
+        // `PopupMenuItem` per `Item` + a separator line per `Separator`.
         let action_view = cx.entity();
-        let action_for_menu = action.clone();
+        // Resolve once up front so the menu builder closure doesn't need to
+        // re-resolve on each open (and so the resolution sees the same
+        // inputs as the rest of this render call).
+        let resolved_entries = dropdown_items::resolve(&dropdown_inputs);
         // DropdownButton handles the shared borders + unified variant so the
         // chevron half can't render brighter than the disabled main half.
         // `.small()` brings the chunky default-size pill down to ~32px tall
@@ -252,7 +300,7 @@ impl CommitArea {
         };
         let primary =
             primary.dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _cx| {
-                build_commit_menu(menu, window, &action_view, &action_for_menu)
+                build_commit_menu(menu, window, &action_view, &resolved_entries)
             });
 
         div()
@@ -270,95 +318,103 @@ impl CommitArea {
     }
 }
 
-/// Chevron dropdown items: commit-with-followups, standalone remote verbs,
-/// host-integrations. Commit / Commit & Push / Commit & Sync / Push / Pull /
-/// Sync / Fetch are functional. Create PR / Push & Create PR remain disabled
-/// — they depend on the PR adapter (Phase 06c).
+/// Chevron dropdown items: every entry comes from the resolved
+/// `Vec<DropdownEntry>`. Per-row label, tooltip, and disabled state are
+/// owned by `dropdown_items::resolve`; this function only wires each
+/// `DropdownActionKind` to the matching `CommitArea` method and turns
+/// `Separator` into a divider line.
 ///
-/// Gating:
-/// - `Commit*` items need a non-empty message + something to commit
-///   (delegates to `PrimaryActionKind::Commit` resolution).
-/// - Remote verbs are always enabled when a tokio runtime exists; the verb
-///   surfaces its own "no upstream" / network errors via `CommitStatus`.
+/// Items whose backend hasn't landed yet (force-push variants, rebase)
+/// dispatch to stub methods on `CommitArea` that surface a "Not yet
+/// implemented" message in the status row.
 fn build_commit_menu(
-    menu: gpui_component::menu::PopupMenu,
+    mut menu: gpui_component::menu::PopupMenu,
     window: &mut Window,
     view: &Entity<CommitArea>,
-    action: &PrimaryAction,
+    entries: &[DropdownEntry],
 ) -> gpui_component::menu::PopupMenu {
-    let can_commit = matches!(action.kind, PrimaryActionKind::Commit) && !action.disabled;
-    let view_commit = view.clone();
-    let view_commit_push = view.clone();
-    let view_commit_sync = view.clone();
-    let view_push = view.clone();
-    let view_pull = view.clone();
-    let view_sync = view.clone();
-    let view_fetch = view.clone();
-    let action_commit = action.clone();
+    menu = menu.min_w(px(224.0));
+    for entry in entries {
+        match entry {
+            DropdownEntry::Separator => {
+                menu = menu.separator();
+            }
+            DropdownEntry::Item {
+                kind,
+                label,
+                title,
+                disabled,
+            } => {
+                menu = menu.item(build_menu_item(window, view, *kind, label, title, *disabled));
+            }
+        }
+    }
+    menu
+}
 
-    menu.min_w(px(224.0))
-        .item(
-            PopupMenuItem::new("Commit")
-                .disabled(!can_commit)
-                .on_click(window.listener_for(&view_commit, move |area, _, _, cx| {
-                    area.submit(&action_commit, cx);
-                    cx.notify();
-                })),
-        )
-        .item(
-            PopupMenuItem::new("Commit & Push")
-                .disabled(!can_commit)
-                .on_click(
-                    window.listener_for(&view_commit_push, move |area, _, _, cx| {
-                        area.commit_and_push(cx);
-                        cx.notify();
-                    }),
-                ),
-        )
-        .item(
-            PopupMenuItem::new("Commit & Sync")
-                .disabled(!can_commit)
-                .on_click(
-                    window.listener_for(&view_commit_sync, move |area, _, _, cx| {
-                        area.commit_and_sync(cx);
-                        cx.notify();
-                    }),
-                ),
-        )
-        .separator()
-        .item(PopupMenuItem::new("Push").on_click(window.listener_for(
-            &view_push,
-            move |area, _, _, cx| {
-                area.push(cx);
-                cx.notify();
-            },
-        )))
-        // PR-creation items stay disabled until Phase 06c lands the GitHub
-        // adapter. Showing them keeps the menu shape stable across versions
-        // so the user's muscle memory doesn't change post-upgrade.
-        .item(PopupMenuItem::new("Create PR").disabled(true))
-        .item(PopupMenuItem::new("Push & Create PR").disabled(true))
-        .item(PopupMenuItem::new("Pull").on_click(window.listener_for(
-            &view_pull,
-            move |area, _, _, cx| {
-                area.pull(cx);
-                cx.notify();
-            },
-        )))
-        .item(PopupMenuItem::new("Sync").on_click(window.listener_for(
-            &view_sync,
-            move |area, _, _, cx| {
-                area.sync(cx);
-                cx.notify();
-            },
-        )))
-        .item(PopupMenuItem::new("Fetch").on_click(window.listener_for(
-            &view_fetch,
-            move |area, _, _, cx| {
-                area.fetch(cx);
-                cx.notify();
-            },
-        )))
+/// Map one resolved entry into a `PopupMenuItem`.
+///
+/// The menu component has no per-row hover-tooltip API, so we encode the
+/// disabled-reason copy inline in the label (`"Push — Nothing to push"`).
+/// Surfaces the "why not" without hover and keeps the menu shape stable.
+/// Enabled rows render the bare label.
+fn build_menu_item(
+    window: &mut Window,
+    view: &Entity<CommitArea>,
+    kind: DropdownActionKind,
+    label: &str,
+    title: &str,
+    disabled: bool,
+) -> PopupMenuItem {
+    let composed = if disabled && !title.is_empty() {
+        format!("{label} — {title}")
+    } else {
+        label.to_string()
+    };
+    let item = PopupMenuItem::new(composed).disabled(disabled);
+    // Disabled rows still need an on_click slot for the menu's click
+    // dispatcher; the gate happens at `PopupMenuItem.disabled` and the
+    // dispatch table no-ops on PR kinds so a wired click never escapes.
+    let view_for_click = view.clone();
+    item.on_click(window.listener_for(&view_for_click, move |area, _, _, cx| {
+        dispatch_dropdown(area, kind, cx);
+        cx.notify();
+    }))
+}
+
+/// Single dispatch table — kind → `CommitArea` method. Keeping the match
+/// here means the resolver and the action surface only meet at this one
+/// site; adding a new dropdown verb is "add a kind + add a stub method +
+/// add an arm here".
+fn dispatch_dropdown(area: &mut CommitArea, kind: DropdownActionKind, cx: &mut Context<CommitArea>) {
+    match kind {
+        // Compound commit-with-followup verbs need a synthesised
+        // `PrimaryAction { kind: Commit, disabled: false }` to satisfy
+        // `submit`'s gate. The resolver already gated the row so we
+        // know the user can commit; if it's disabled the menu blocked
+        // the click before we got here.
+        DropdownActionKind::Commit => {
+            let synthetic = PrimaryAction {
+                kind: PrimaryActionKind::Commit,
+                label: "Commit".to_string(),
+                title: String::new(),
+                disabled: false,
+            };
+            area.submit(&synthetic, cx);
+        }
+        DropdownActionKind::CommitPush => area.commit_and_push(cx),
+        DropdownActionKind::CommitForcePush => area.commit_and_force_push(cx),
+        DropdownActionKind::CommitSync => area.commit_and_sync(cx),
+        DropdownActionKind::Push => area.push(cx),
+        DropdownActionKind::ForcePush => area.force_push(cx),
+        DropdownActionKind::Pull => area.pull(cx),
+        DropdownActionKind::Sync => area.sync(cx),
+        DropdownActionKind::Rebase => area.rebase_from_base(cx),
+        DropdownActionKind::Fetch => area.fetch(cx),
+        DropdownActionKind::Publish => area.publish(cx),
+        // PR rows ship disabled — dispatch should never be reached.
+        DropdownActionKind::CreatePr | DropdownActionKind::PushBeforePr => {}
+    }
 }
 
 fn primary_icon_for(kind: PrimaryActionKind) -> Option<IconName> {

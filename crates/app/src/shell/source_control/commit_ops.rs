@@ -27,6 +27,11 @@ pub enum RemoteVerb {
     Pull,
     Sync,
     Fetch,
+    /// `git push -u origin <branch>` to publish a branch that has no
+    /// upstream yet. Reuses the Push in-flight status — there's no
+    /// dedicated `CommitStatus::Publishing` because the user-visible
+    /// distinction is only meaningful in the dropdown menu.
+    Publish,
 }
 
 impl RemoteVerb {
@@ -36,6 +41,7 @@ impl RemoteVerb {
             RemoteVerb::Pull => "pull",
             RemoteVerb::Sync => "sync",
             RemoteVerb::Fetch => "fetch",
+            RemoteVerb::Publish => "publish",
         }
     }
 
@@ -45,6 +51,10 @@ impl RemoteVerb {
             RemoteVerb::Pull => CommitStatus::Pulling,
             RemoteVerb::Sync => CommitStatus::Syncing,
             RemoteVerb::Fetch => CommitStatus::Fetching,
+            // Publishing a branch is functionally a push; reusing
+            // `Pushing` keeps the status row consistent without a new
+            // enum variant.
+            RemoteVerb::Publish => CommitStatus::Pushing,
         }
     }
 }
@@ -130,6 +140,11 @@ pub fn run_remote(area: &mut CommitArea, verb: RemoteVerb, cx: &mut Context<Comm
                     RemoteVerb::Pull => repo.pull().await,
                     RemoteVerb::Sync => repo.sync().await,
                     RemoteVerb::Fetch => repo.fetch().await,
+                    // Hardcoded `origin` matches the default-remote
+                    // assumption used elsewhere in the SCM surface. If a
+                    // future feature lets the user pick a remote, the
+                    // verb gains a payload field.
+                    RemoteVerb::Publish => repo.publish_branch("origin").await,
                 };
                 let _ = match r {
                     Ok(_) => tx.send(Ok(label)),
