@@ -6,10 +6,11 @@
 //! decorations onto each row.
 
 use crate::shell::git_panel::GitPanel;
+use crate::shell::git_panel::discard_confirm::DiscardAllArea;
 use crate::shell::git_panel::row_renderer::{RowKind, row};
 use crate::shell::source_control::style as sc_style;
 use gpui::{
-    ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Styled, div, px,
 };
 use gpui_component::{
@@ -120,6 +121,29 @@ pub struct RenderCtx<'a> {
     /// runtime. Borrowed from `GitPanel::in_flight_discards`; row
     /// renderer reads this to swap the revert icon for a spinner.
     pub in_flight_discards: &'a HashSet<PathBuf>,
+    /// `true` when the changed-files filter input has a non-empty
+    /// query. Section-header hover buttons are suppressed in that
+    /// case — the user filtered down to a subset of rows, and a
+    /// "Stage all" / "Discard all" action against the unfiltered
+    /// section would be surprising.
+    pub filter_active: bool,
+    /// `true` while a discard-confirm modal is mounted (single-row
+    /// or area). The section-header destructive button (Discard /
+    /// Delete all) disables in this state so a second click can't
+    /// queue a second modal — `GitPanel::discard_area` rejects the
+    /// click silently, but a disabled button gives the user honest
+    /// feedback for why it's not firing.
+    pub discard_pending: bool,
+}
+
+/// Map a `RowKind` to the matching `DiscardAllArea` for section-header
+/// "Discard all" / "Delete all" actions.
+fn area_for(kind: RowKind) -> DiscardAllArea {
+    match kind {
+        RowKind::Unstaged => DiscardAllArea::Unstaged,
+        RowKind::Staged => DiscardAllArea::Staged,
+        RowKind::Untracked => DiscardAllArea::Untracked,
+    }
 }
 
 /// Top-level renderer. Builds the three sections in order; emits a single
@@ -185,10 +209,28 @@ fn section(
     let count = rows.len();
     let theme = rctx.theme;
     // Stable id required for GPUI hover/click interactivity on raw divs.
-    let header_id = format!("git-section-{title}");
-    let view_all_id = format!("git-view-all-{title}");
+    // Also doubles as the `group()` scope so the hover action cluster
+    // appears on header hover (no row hover triggers it).
+    let header_id = gpui::SharedString::from(format!("git-section-{title}"));
+    // Hover cluster is suppressed when a filter is active — the
+    // section's row set is a subset, and "Stage all" / "Discard all"
+    // would silently act on rows the user filtered out.
+    let cluster_paths: Vec<PathBuf> = rows.iter().map(|f| f.path.clone()).collect();
+    let hover_cluster = if rctx.filter_active {
+        None
+    } else {
+        Some(section_hover_cluster(
+            kind,
+            cluster_paths,
+            header_id.clone(),
+            theme,
+            rctx.discard_pending,
+            cx,
+        ))
+    };
     let header = div()
-        .id(gpui::SharedString::from(header_id))
+        .id(header_id.clone())
+        .group(header_id.clone())
         .flex()
         .items_center()
         .gap(px(4.0))
@@ -213,19 +255,19 @@ fn section(
                 .text_color(rctx.theme.fg_subtle)
                 .child(format!("{count}")),
         )
-        // Right-aligned "View all" ghost link. Decorative until the multi-diff
-        // opener ships; the tooltip is honest about scope.
-        .child(
-            div().ml_auto().child(
-                Button::new(gpui::SharedString::from(view_all_id))
-                    .ghost()
-                    .xsmall()
-                    .label("View all")
-                    .tooltip("Open all diffs (coming soon)")
-                    .disabled(true)
-                    .on_click(|_: &ClickEvent, _, _| {}),
-            ),
-        );
+        // Right-aligned hover slot: empty by default, fades in the
+        // section action cluster (Stage all / Unstage all / Discard
+        // all / Delete all) when the user hovers the header. Replaces
+        // the always-disabled "View all" placeholder Phase 02 carried;
+        // Phase 11 will reintroduce a real "View all" once the
+        // multi-diff opener ships.
+        .children(hover_cluster.map(|c| {
+            div()
+                .ml_auto()
+                .invisible()
+                .group_hover(header_id.clone(), |s| s.visible())
+                .child(c)
+        }));
     let mut col = div()
         .flex()
         .flex_col()
@@ -238,6 +280,114 @@ fn section(
     }
     col.into_any_element()
 }
+
+/// Per-section action cluster: 2 ghost icon buttons.
+/// - CHANGES (Unstaged): `+ Stage all` · `↺ Discard all`
+/// - STAGED:             `− Unstage all` · `↺ Discard all`
+/// - UNTRACKED:          `+ Stage all` · `🗑 Delete all`
+///
+/// `paths` is the section's full path list (already filtered out of
+/// collapsed-section invisibility by the caller's `filter_active`
+/// check). The Stage / Unstage buttons fire-and-forget through
+/// `stage_paths_bulk` / `unstage_paths_bulk`. Discard / Delete opens
+/// the type-to-confirm modal via `discard_area`.
+///
+/// `discard_pending` disables the destructive button (Discard /
+/// Delete all) when a confirm modal is already mounted — without
+/// the guard the button looks active but the click would be silently
+/// dropped by `discard_area`'s single-flight check.
+#[allow(clippy::too_many_arguments)]
+fn section_hover_cluster(
+    kind: RowKind,
+    paths: Vec<PathBuf>,
+    header_id: gpui::SharedString,
+    theme: Theme,
+    discard_pending: bool,
+    cx: &mut Context<GitPanel>,
+) -> AnyElement {
+    let area = area_for(kind);
+    let mut cluster = div().flex().flex_row().items_center().gap(px(2.0));
+
+    // Additive button on the left for CHANGES / UNTRACKED, "Unstage
+    // all" for STAGED. All three live in the same visual slot.
+    let primary_paths = paths.clone();
+    let primary_id =
+        gpui::SharedString::from(format!("git-section-primary-{}", header_id.as_ref()));
+    cluster = cluster.child(match kind {
+        RowKind::Unstaged | RowKind::Untracked => Button::new(primary_id)
+            .ghost()
+            .xsmall()
+            .icon(
+                Icon::default()
+                    .path("icons/plus.svg")
+                    .size(px(SECTION_BTN_PX))
+                    .text_color(theme.status_added),
+            )
+            .tooltip("Stage all")
+            .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                panel.stage_paths_bulk(primary_paths.clone(), cx);
+            }))
+            .into_any_element(),
+        RowKind::Staged => Button::new(primary_id)
+            .ghost()
+            .xsmall()
+            .icon(
+                Icon::default()
+                    .path("icons/minus.svg")
+                    .size(px(SECTION_BTN_PX))
+                    .text_color(theme.status_removed),
+            )
+            .tooltip("Unstage all")
+            .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                panel.unstage_paths_bulk(primary_paths.clone(), cx);
+            }))
+            .into_any_element(),
+    });
+
+    // Destructive button on the right. `trash` for Untracked (the
+    // copy reads "Delete"), `undo` for Staged + Unstaged (copy reads
+    // "Discard"). Icon stays muted — the colour cue is the area
+    // copy, not the glyph, so the user reads the modal title before
+    // the worktree mutates.
+    let destructive_paths = paths.clone();
+    let destructive_id =
+        gpui::SharedString::from(format!("git-section-destructive-{}", header_id.as_ref()));
+    // `delete.svg` ships in the gpui-component asset bundle as the
+    // canonical "trash" glyph; `trash.svg` isn't bundled. The
+    // destructive button on Staged + Unstaged keeps `undo.svg` (used
+    // by the per-row revert affordance — same visual language).
+    let (dest_icon, dest_tooltip) = match area {
+        DiscardAllArea::Untracked => ("icons/delete.svg", "Delete all"),
+        _ => ("icons/undo.svg", "Discard all"),
+    };
+    let mut destructive_btn = Button::new(destructive_id)
+        .ghost()
+        .xsmall()
+        .icon(
+            Icon::default()
+                .path(dest_icon)
+                .size(px(SECTION_BTN_PX))
+                .text_color(theme.fg_muted),
+        )
+        .tooltip(dest_tooltip);
+    if discard_pending {
+        destructive_btn = destructive_btn.disabled(true);
+    } else {
+        destructive_btn = destructive_btn.on_click(cx.listener(
+            move |panel, _: &ClickEvent, _window, cx| {
+                panel.discard_area(area, destructive_paths.clone(), cx);
+            },
+        ));
+    }
+    cluster = cluster.child(destructive_btn);
+
+    cluster.into_any_element()
+}
+
+/// Section-header action button icon size. Slightly larger than the
+/// per-row action cluster (`row_actions::ACTION_BTN_W` = 16px) so the
+/// section-level affordances read distinct from row affordances.
+const SECTION_BTN_PX: f32 = 14.0;
 
 fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
     // Two-line empty state: a strong "No changes on this branch" headline

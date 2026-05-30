@@ -1,7 +1,7 @@
-//! Per-row discard copy table.
+//! Per-row + per-section discard copy table.
 //!
-//! Classifies a `FileStatus` into one of three user-visible flavors of
-//! "make this change go away":
+//! Per-row classifies a `FileStatus` into one of three user-visible
+//! flavors of "make this change go away":
 //! - [`DiscardKind::Delete`] — untracked or staged-add: the file only
 //!   exists locally (or only locally + in the index); discarding makes
 //!   it disappear.
@@ -10,8 +10,12 @@
 //! - [`DiscardKind::Discard`] — everything else (modify / rename /
 //!   copy / conflicted): revert the change in place.
 //!
-//! Copy is keyed off the kind so the host can build a [`ConfirmPrompt`]
-//! with the right title / body / button label.
+//! Per-section (Phase 03 Slice C) is keyed by [`DiscardAllArea`] — the
+//! section the user clicked "Discard all" / "Delete all" on. The copy
+//! is plural-aware so N=1 reads naturally.
+//!
+//! Both code paths produce a [`DiscardCopy`] the host pairs with a
+//! type-to-confirm string to drive [`ConfirmPrompt`].
 
 use gpui::SharedString;
 use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
@@ -28,6 +32,26 @@ pub enum DiscardKind {
     /// Everything else — modify, rename, copy, conflict; the op reverts
     /// the change in place.
     Discard,
+}
+
+/// Which SCM section the user clicked "Discard all" / "Delete all"
+/// on. Drives both the [`copy_for_area`] copy table and the discard
+/// sequence run by `GitPanel::confirmed_discard_area` (staged-area
+/// runs `unstage_paths` first, then `discard_paths`; unstaged and
+/// untracked go straight to `discard_paths`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardAllArea {
+    /// CHANGES section — files modified in the worktree but not yet
+    /// staged. "Discard all unstaged changes?"
+    Unstaged,
+    /// STAGED CHANGES section — files whose changes sit in the index.
+    /// `confirmed_discard_area` runs `unstage_paths` first, then
+    /// `discard_paths` so HEAD content lands in the worktree too.
+    Staged,
+    /// UNTRACKED FILES section — files not tracked by git at all.
+    /// "Delete all untracked files?" (`Delete` button label, the op
+    /// permanently removes the worktree files).
+    Untracked,
 }
 
 /// Resolved copy for a single discard request. The host pairs this
@@ -80,6 +104,86 @@ pub fn copy_for(file: &FileStatus) -> (DiscardKind, DiscardCopy) {
 /// well-defined).
 pub fn expected_for(file: &FileStatus) -> SharedString {
     display_name(file).into()
+}
+
+/// Copy for the "Discard all" / "Delete all" section-header action.
+/// `n` is the file count in the section — copy reads naturally for
+/// `n == 1` ("this file" instead of "1 files"); for `n > 1` the count
+/// is interpolated.
+///
+/// Caller is expected to guard against `n == 0` (the section header
+/// shouldn't surface "Discard all" buttons on an empty section).
+/// The `debug_assert!` makes the contract explicit so a future
+/// caller that skips the guard catches it in debug builds; release
+/// builds fall through to the plural branch with `0` interpolated.
+pub fn copy_for_area(area: DiscardAllArea, n: usize) -> DiscardCopy {
+    debug_assert!(
+        n > 0,
+        "copy_for_area called with n=0 — guard at the call site with `is_empty()`"
+    );
+    match area {
+        DiscardAllArea::Untracked => {
+            let (title, body, confirm) = if n == 1 {
+                (
+                    "Delete this untracked file?".to_string(),
+                    "This will permanently delete the file. This cannot be undone.".to_string(),
+                    "Delete",
+                )
+            } else {
+                (
+                    format!("Delete {n} untracked files?"),
+                    "This will permanently delete the files. This cannot be undone.".to_string(),
+                    "Delete all",
+                )
+            };
+            DiscardCopy {
+                title: title.into(),
+                body: body.into(),
+                confirm_label: confirm.into(),
+            }
+        }
+        DiscardAllArea::Staged => {
+            let title = if n == 1 {
+                "Discard this staged change?".to_string()
+            } else {
+                format!("Discard all {n} staged changes?")
+            };
+            DiscardCopy {
+                title: title.into(),
+                body: "This will unstage the changes and revert the files to their committed \
+                       state. This cannot be undone."
+                    .into(),
+                confirm_label: if n == 1 { "Discard" } else { "Discard all" }.into(),
+            }
+        }
+        DiscardAllArea::Unstaged => {
+            let title = if n == 1 {
+                "Discard this unstaged change?".to_string()
+            } else {
+                format!("Discard all {n} unstaged changes?")
+            };
+            DiscardCopy {
+                title: title.into(),
+                body: "This will revert the files to their staged or committed state. This cannot \
+                       be undone."
+                    .into(),
+                confirm_label: if n == 1 { "Discard" } else { "Discard all" }.into(),
+            }
+        }
+    }
+}
+
+/// Type-to-confirm string for an area discard. Short and area-specific
+/// so the user can type it without scanning paths — `"Discard all"`
+/// for Staged + Unstaged, `"Delete all"` for Untracked. Singular cases
+/// drop the "all" to read naturally.
+pub fn expected_for_area(area: DiscardAllArea, n: usize) -> SharedString {
+    match (area, n) {
+        (DiscardAllArea::Untracked, 1) => "Delete".into(),
+        (DiscardAllArea::Untracked, _) => "Delete all".into(),
+        (_, 1) => "Discard".into(),
+        (_, _) => "Discard all".into(),
+    }
 }
 
 fn display_name(file: &FileStatus) -> String {
@@ -215,5 +319,108 @@ mod tests {
         // path's own string form.
         let f = fs(".", IndexStatus::Modified, WorktreeStatus::Modified);
         assert_eq!(expected_for(&f).as_ref(), ".");
+    }
+
+    // ---------- copy_for_area / expected_for_area (Slice C) ----------
+
+    #[test]
+    fn untracked_area_singular_uses_delete_label() {
+        let c = copy_for_area(DiscardAllArea::Untracked, 1);
+        assert!(c.title.starts_with("Delete this untracked file"));
+        assert_eq!(c.confirm_label.as_ref(), "Delete");
+        assert_eq!(
+            expected_for_area(DiscardAllArea::Untracked, 1).as_ref(),
+            "Delete"
+        );
+    }
+
+    #[test]
+    fn untracked_area_plural_interpolates_count() {
+        let c = copy_for_area(DiscardAllArea::Untracked, 5);
+        assert!(c.title.contains("Delete 5 untracked files"));
+        assert_eq!(c.confirm_label.as_ref(), "Delete all");
+        assert_eq!(
+            expected_for_area(DiscardAllArea::Untracked, 5).as_ref(),
+            "Delete all"
+        );
+    }
+
+    #[test]
+    fn staged_area_singular_drops_the_all() {
+        let c = copy_for_area(DiscardAllArea::Staged, 1);
+        assert!(c.title.starts_with("Discard this staged change"));
+        assert_eq!(c.confirm_label.as_ref(), "Discard");
+        assert_eq!(
+            expected_for_area(DiscardAllArea::Staged, 1).as_ref(),
+            "Discard"
+        );
+    }
+
+    #[test]
+    fn staged_area_plural_says_all_n() {
+        let c = copy_for_area(DiscardAllArea::Staged, 3);
+        assert!(c.title.contains("Discard all 3 staged changes"));
+        assert_eq!(c.confirm_label.as_ref(), "Discard all");
+        assert_eq!(
+            expected_for_area(DiscardAllArea::Staged, 3).as_ref(),
+            "Discard all"
+        );
+    }
+
+    #[test]
+    fn unstaged_area_singular() {
+        let c = copy_for_area(DiscardAllArea::Unstaged, 1);
+        assert!(c.title.starts_with("Discard this unstaged change"));
+        assert_eq!(c.confirm_label.as_ref(), "Discard");
+        assert_eq!(
+            expected_for_area(DiscardAllArea::Unstaged, 1).as_ref(),
+            "Discard"
+        );
+    }
+
+    #[test]
+    fn unstaged_area_plural() {
+        let c = copy_for_area(DiscardAllArea::Unstaged, 7);
+        assert!(c.title.contains("Discard all 7 unstaged changes"));
+        assert_eq!(c.confirm_label.as_ref(), "Discard all");
+    }
+
+    #[test]
+    fn staged_and_unstaged_bodies_are_count_invariant() {
+        // Staged + Unstaged body is informational and singular-shaped
+        // ("revert the files to their committed state"). Only the
+        // title carries the count. Untracked body intentionally swaps
+        // "the file" ↔ "the files" so the prose reads naturally for
+        // a 1-file delete.
+        assert_eq!(
+            copy_for_area(DiscardAllArea::Staged, 1).body,
+            copy_for_area(DiscardAllArea::Staged, 4).body
+        );
+        assert_eq!(
+            copy_for_area(DiscardAllArea::Unstaged, 1).body,
+            copy_for_area(DiscardAllArea::Unstaged, 12).body
+        );
+    }
+
+    #[test]
+    fn area_bodies_reach_for_the_right_verb() {
+        // Untracked = "permanently delete"; Staged + Unstaged =
+        // "revert" / "unstage". Catches a copy-paste mistake where
+        // the wrong area pastes the wrong verb.
+        assert!(
+            copy_for_area(DiscardAllArea::Untracked, 1)
+                .body
+                .contains("delete")
+        );
+        assert!(
+            copy_for_area(DiscardAllArea::Staged, 1)
+                .body
+                .contains("unstage")
+        );
+        assert!(
+            copy_for_area(DiscardAllArea::Unstaged, 1)
+                .body
+                .contains("revert")
+        );
     }
 }

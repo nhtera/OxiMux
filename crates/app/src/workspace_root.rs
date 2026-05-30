@@ -559,11 +559,32 @@ impl WorkspaceRoot {
             return;
         };
 
+        // Dispatch on `scope`: Single → the existing single-path flow
+        // (which Slice C teaches about pure-untracked dispatch);
+        // Area → the per-section sequence with its unstage-first-for-
+        // staged + git-clean-for-untracked branches.
+        //
+        // `request.paths` is moved (not cloned): `request` is the
+        // owned snapshot from `pending_discard().cloned()` and we
+        // don't use the rest of it after this point. The inner
+        // `paths.clone()` in the callback is the unavoidable one —
+        // `ConfirmCallback` is `Rc<dyn Fn>` and may fire more than
+        // once.
         let on_confirm: ConfirmCallback = {
             let panel = panel.clone();
-            let path = request.path.clone();
+            let scope = request.scope;
+            let paths = request.paths;
             Rc::new(move |_window, cx| {
-                panel.update(cx, |p, cx| p.confirmed_discard_path(path.clone(), cx));
+                panel.update(cx, |p, cx| match scope {
+                    crate::shell::git_panel::DiscardScope::Single { .. } => {
+                        if let Some(path) = paths.first().cloned() {
+                            p.confirmed_discard_path(path, cx);
+                        }
+                    }
+                    crate::shell::git_panel::DiscardScope::Area { area } => {
+                        p.confirmed_discard_area(area, paths.clone(), cx);
+                    }
+                });
             })
         };
         let on_cancel: ConfirmCallback = {

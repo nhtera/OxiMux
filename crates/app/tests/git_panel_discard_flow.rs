@@ -100,8 +100,14 @@ async fn discard_path_sets_pending_with_modified_copy(cx: &mut TestAppContext) {
         let req = panel
             .pending_discard()
             .expect("pending_discard set after click");
-        assert_eq!(req.path, PathBuf::from("src.rs"));
-        assert_eq!(req.kind, DiscardKind::Discard);
+        // Slice C reshaped DiscardRequest: `path` → `paths` (always
+        // non-empty), `kind` → embedded in `scope: DiscardScope`.
+        assert_eq!(req.paths, vec![PathBuf::from("src.rs")]);
+        let kind = match req.scope {
+            oximux_app::shell::git_panel::DiscardScope::Single { kind } => kind,
+            other => panic!("expected DiscardScope::Single, got {other:?}"),
+        };
+        assert_eq!(kind, DiscardKind::Discard);
         assert!(req.copy.title.starts_with("Discard changes to"));
         assert_eq!(req.copy.confirm_label.as_ref(), "Discard");
         assert_eq!(req.expected.as_ref(), "src.rs");

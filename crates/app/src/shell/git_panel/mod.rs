@@ -15,21 +15,22 @@
 pub mod bulk_action_bar;
 pub mod changed_files;
 pub mod discard_confirm;
+pub mod discard_ops;
 pub mod range_select;
 pub mod row_actions;
 pub mod row_renderer;
 pub mod selection;
 
+pub use discard_ops::{DiscardRequest, DiscardRequested, DiscardScope};
+
 use crate::actions::{RevertFile, StageFile, UnstageFile};
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::changed_files::{RenderCtx, partition_files, render_sections};
-use crate::shell::git_panel::discard_confirm::{DiscardCopy, DiscardKind};
 use crate::shell::source_control::filter::filter_files;
 use crate::shell::source_control::style as sc_style;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Task,
-    Window, div, px,
+    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Render, ScrollHandle, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 use gpui_component::scroll::ScrollableElement as _;
 use oximux_core::GitState;
@@ -134,29 +135,11 @@ pub struct GitPanel {
     pub(super) bulk_op_in_flight: bool,
 }
 
-/// Information the shell host needs to render a discard confirm dialog.
-///
-/// Built by `discard_path` from the row's `FileStatus` via
-/// [`crate::shell::git_panel::discard_confirm::copy_for`]. The host
-/// passes `copy` + `expected` straight into a `ConfirmPrompt`.
-#[derive(Debug, Clone)]
-pub struct DiscardRequest {
-    pub path: PathBuf,
-    pub kind: DiscardKind,
-    pub copy: DiscardCopy,
-    pub expected: SharedString,
-}
-
-/// Event emitted whenever `discard_path` accepts a new request. The
-/// shell host subscribes to GitPanel and pulls the live request out of
-/// `pending_discard()` to build the confirm dialog. We could ship the
-/// `DiscardRequest` on the event itself, but routing through the field
-/// keeps the panel a single source of truth — re-subscribers see the
-/// same state.
-#[derive(Debug, Clone, Copy)]
-pub struct DiscardRequested;
-
-impl EventEmitter<DiscardRequested> for GitPanel {}
+// `DiscardRequest`, `DiscardScope`, `DiscardRequested`, and the
+// `discard_*` / `confirmed_discard_*` methods live in
+// [`crate::shell::git_panel::discard_ops`] so this module stays under
+// the 800-LOC fail cap as Phase 03 Slice C piles on the area-discard
+// branches. The types are re-exported at module scope above.
 
 impl GitPanel {
     /// Build the panel. `state_rx` is `StatusPoller::subscribe()`; the caller
@@ -304,159 +287,46 @@ impl GitPanel {
         );
     }
 
-    /// Open a confirm dialog for discarding `path`. Pulls the matching
-    /// `FileStatus` out of the current `git_state` so the modal copy
-    /// (Delete / Restore / Discard) matches what the user is looking
-    /// at. If `path` is no longer in `git_state` (stale UI state), the
-    /// fallback copy reads as a generic "Discard changes to ...".
+    /// Stage every path in `paths` — section-header "Stage all"
+    /// entrypoint. Fire-and-forget: no in-flight tracking, no
+    /// selection mutation, just one `git add` invocation. Failures
+    /// land in `tracing::warn!` via [`spawn_repo_op`]. No-op when
+    /// `paths` is empty.
     ///
-    /// This method does NOT mutate the working tree — it only sets
-    /// `pending_discard` and notifies. The shell host observes the
-    /// field, mounts a `ConfirmDialog`, and calls
-    /// [`confirmed_discard_path`] when the user confirms.
-    ///
-    /// Early-returns when another discard for the same path is already
-    /// in flight or when any request is currently pending. This
-    /// prevents the revert keybind from queueing a second confirm
-    /// dialog over an unresolved one (the hover button blocks clicks
-    /// via `.disabled(true)` already; the keybind has no equivalent
-    /// gate at the action handler).
-    ///
-    /// [`confirmed_discard_path`]: Self::confirmed_discard_path
-    pub fn discard_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.pending_discard.is_some() || self.in_flight_discards.contains(&path) {
+    /// Distinct from [`selection::bulk_stage_selected`] which acts
+    /// on `self.selected` and flips `bulk_op_in_flight` for the
+    /// BulkActionBar spinner.
+    pub fn stage_paths_bulk(&mut self, paths: Vec<PathBuf>, _cx: &mut Context<Self>) {
+        if paths.is_empty() {
             return;
         }
-        let request = self.build_discard_request(path);
-        self.pending_discard = Some(request);
-        cx.emit(DiscardRequested);
-        cx.notify();
+        spawn_repo_op(
+            self.repo.clone(),
+            move |repo| async move {
+                let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+                repo.stage_paths(&refs).await
+            },
+            "stage_paths_bulk",
+        );
     }
 
-    fn build_discard_request(&self, path: PathBuf) -> DiscardRequest {
-        let file_status = self
-            .git_state
-            .as_ref()
-            .and_then(|s| s.files.iter().find(|f| f.path == path).cloned());
-
-        match file_status {
-            Some(f) => {
-                let (kind, copy) = discard_confirm::copy_for(&f);
-                let expected = discard_confirm::expected_for(&f);
-                DiscardRequest {
-                    path,
-                    kind,
-                    copy,
-                    expected,
-                }
-            }
-            None => {
-                // Stale state — the poller hasn't reported this path
-                // (yet). Surface the generic Discard copy with the
-                // path basename so the user can decide.
-                let display = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                DiscardRequest {
-                    path,
-                    kind: DiscardKind::Discard,
-                    copy: DiscardCopy {
-                        title: format!("Discard changes to \"{display}\"?").into(),
-                        body: "This will revert all changes to this file. This cannot be undone."
-                            .into(),
-                        confirm_label: "Discard".into(),
-                    },
-                    expected: display.into(),
-                }
-            }
+    /// Unstage every path in `paths` — section-header "Unstage all"
+    /// entrypoint. Same shape as [`stage_paths_bulk`].
+    pub fn unstage_paths_bulk(&mut self, paths: Vec<PathBuf>, _cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
         }
-    }
-
-    /// Current pending discard request, if any. The shell host observes
-    /// this via `cx.observe(&panel)` to mount / dismiss the modal.
-    pub fn pending_discard(&self) -> Option<&DiscardRequest> {
-        self.pending_discard.as_ref()
-    }
-
-    /// Drop the pending request without mutating the working tree.
-    /// Called by the shell on Escape / cancel / click-outside.
-    pub fn clear_pending_discard(&mut self, cx: &mut Context<Self>) {
-        if self.pending_discard.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Paths whose `confirmed_discard_path` op is in flight on the
-    /// tokio runtime. The row renderer reads this set to swap the
-    /// revert icon for a spinner.
-    pub fn in_flight_discards(&self) -> &HashSet<PathBuf> {
-        &self.in_flight_discards
-    }
-
-    /// Actually run `git restore --` for `path`. Tracks the path in
-    /// `in_flight_discards` for spinner rendering and clears it after
-    /// the op completes (success or failure). The host calls this from
-    /// the ConfirmDialog `on_confirm` callback.
-    ///
-    /// Pauses editor autosave for the duration of the op so a buffer
-    /// open on the same path can't race the `git restore` write and
-    /// immediately re-save the user's old content over the checked-out
-    /// version (today both calls are no-op stubs; the semantics light
-    /// up automatically when the editor side ships an autosave pump).
-    pub fn confirmed_discard_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        // Clear the pending request so the modal can come down.
-        self.pending_discard = None;
-        self.in_flight_discards.insert(path.clone());
-        cx.notify();
-
-        oximux_editor::pause_autosave(&path);
-
-        let repo = self.repo.clone();
-        let op_path = path.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    let r = repo
-                        .discard_paths(&[op_path.as_path()])
-                        .await
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(r);
-                });
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "oximux_app::git_panel",
-                    "no tokio runtime; confirmed_discard_path skipped (test wiring)"
-                );
-                self.in_flight_discards.remove(&path);
-                oximux_editor::resume_autosave(&path);
-                cx.notify();
-                return;
-            }
-        }
-
-        // Detach the result-handling task so concurrent discards (a
-        // future Phase 03 bulk-discard flow) don't cancel each other.
-        cx.spawn(async move |this, cx| {
-            let result = rx.await;
-            let _ = this.update(cx, |panel, cx| {
-                panel.in_flight_discards.remove(&path);
-                oximux_editor::resume_autosave(&path);
-                if let Ok(Err(err)) = result {
-                    tracing::warn!(
-                        target: "oximux_app::git_panel",
-                        error = %err,
-                        "discard_paths failed"
-                    );
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        spawn_repo_op(
+            self.repo.clone(),
+            move |repo| async move {
+                let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+                repo.unstage_paths(&refs).await
+            },
+            "unstage_paths_bulk",
+        );
     }
 }
+
 
 impl Focusable for GitPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -497,6 +367,8 @@ impl Render for GitPanel {
                     collapsed: &self.collapsed_sections,
                     branch: state.branch.as_deref(),
                     in_flight_discards: &self.in_flight_discards,
+                    filter_active: !self.filter_query.trim().is_empty(),
+                    discard_pending: self.pending_discard.is_some(),
                 };
                 render_sections(&sections, &rctx, cx).into_any_element()
             }

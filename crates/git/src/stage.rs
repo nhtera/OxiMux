@@ -44,11 +44,51 @@ impl Repository {
     /// Discard worktree changes — DESTRUCTIVE. Equivalent to
     /// `git restore -- <paths>`. Caller is responsible for the type-to-confirm
     /// UX; this method has no guard.
+    ///
+    /// **Does NOT delete untracked files.** `git restore` operates on
+    /// the index, so a pathspec for an untracked path errors with
+    /// "pathspec did not match any file(s) known to git". Use
+    /// [`delete_untracked_paths`] for the Delete-an-untracked-file
+    /// flavour of "discard".
+    ///
+    /// [`delete_untracked_paths`]: Self::delete_untracked_paths
     pub async fn discard_paths(&self, paths: &[&Path]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
         let mut cmd = GitCmd::new(self.workdir()).args(["restore", "--"]);
+        for p in paths {
+            cmd = cmd.arg(p.as_os_str());
+        }
+        cmd.run().await?;
+        Ok(())
+    }
+
+    /// Permanently delete untracked files from the worktree —
+    /// DESTRUCTIVE. Equivalent to `git clean -f -- <paths>`. Caller
+    /// is responsible for the type-to-confirm UX.
+    ///
+    /// Uses `git clean` instead of `std::fs::remove_file` so:
+    /// - `clean.requireForce` config still gates accidental wipes
+    ///   (mode `-f` is explicit here; users with `requireForce=true`
+    ///   already opted in for everything else)
+    /// - symlinks are unlinked, not followed
+    /// - the same `GIT_CONFIG_NOSYSTEM` + tracing wrappers `GitCmd`
+    ///   sets apply
+    ///
+    /// Paths in the index are silently ignored by `git clean`; the
+    /// caller (`GitPanel::confirmed_discard_area(Untracked, …)` and
+    /// `confirmed_discard_path` for pure-untracked rows) is expected
+    /// to pass only paths whose `FileStatus.index == Untracked` AND
+    /// `worktree == Untracked`. Staged-added rows (`is_delete` per
+    /// `discard_confirm`) should NOT route here — they go through
+    /// `discard_paths` instead since their index entry needs to clear
+    /// first.
+    pub async fn delete_untracked_paths(&self, paths: &[&Path]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = GitCmd::new(self.workdir()).args(["clean", "-f", "--"]);
         for p in paths {
             cmd = cmd.arg(p.as_os_str());
         }
