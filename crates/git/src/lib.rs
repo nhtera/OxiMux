@@ -28,6 +28,7 @@ pub use error::{GitError, Result};
 pub use numstat::{diff_numstat_head, parse_numstat_z};
 pub use poller::{DEFAULT_TICK, PollState, StatusPoller};
 pub use process::{GitCmd, Output, RawOutput};
+pub use remote::LeaseStatus;
 pub use repository::Repository;
 pub use status::parse_porcelain_v2;
 pub use worktree::{derive_slug, validate_slug};

@@ -68,6 +68,13 @@ pub struct SourceControlPanel {
     poll_state: PollState,
     git_state: Option<GitState>,
 
+    /// Cached result of `Repository::lease_status` — drives the Force
+    /// Push label swap on the dropdown. Refreshed each time the poller
+    /// reports a state where the lease semantics could plausibly apply
+    /// (branch is diverged from its upstream). `false` while the first
+    /// check is in flight or when the state isn't a lease candidate.
+    force_push_with_lease: bool,
+
     scope: SourceControlScope,
     filter_query: String,
     filter_input: Entity<InputState>,
@@ -111,7 +118,7 @@ impl SourceControlPanel {
             PollState::Ready(s) => Some(s.clone()),
             _ => None,
         };
-        let observer = Self::start_state_observer(state_rx, cx);
+        let observer = Self::start_state_observer(state_rx, repo.clone(), cx);
 
         let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
         // Push every keystroke into both this panel's `filter_query` (used by
@@ -137,13 +144,10 @@ impl SourceControlPanel {
         let commit_graph =
             cx.new(|cx| CommitGraph::new(repo.clone(), theme, density, typography.clone(), cx));
 
-        // `repo` was passed into the children (CommitArea, CommitGraph) and
-        // GitPanel; the panel itself doesn't need to retain it for v1. If a
-        // future feature (e.g. branch switcher) lands here, restore the field.
-        let _ = repo;
         Self {
             poll_state: initial,
             git_state,
+            force_push_with_lease: false,
             scope: SourceControlScope::All,
             filter_query: String::new(),
             filter_input,
@@ -175,6 +179,7 @@ impl SourceControlPanel {
 
     fn start_state_observer(
         mut rx: watch::Receiver<PollState>,
+        repo: Repository,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
@@ -183,17 +188,38 @@ impl SourceControlPanel {
                     return;
                 }
                 let state = rx.borrow_and_update().clone();
+                // Decide whether to refresh the upstream-rewrite check
+                // BEFORE the panel-update borrow. The check only matters
+                // when local and upstream have actually diverged — pure
+                // ahead-only or behind-only states are never lease
+                // candidates, so we skip the (cached-but-still-locking)
+                // backend call.
+                let should_check_lease = matches!(
+                    &state,
+                    PollState::Ready(s)
+                        if s.upstream.is_some() && s.ahead > 0 && s.behind > 0
+                );
                 if this
                     .update(cx, |panel, cx| {
                         if let PollState::Ready(ref s) = state {
                             panel.git_state = Some(s.clone());
                         }
                         panel.poll_state = state;
+                        if !should_check_lease {
+                            // Reset stale lease state immediately when we
+                            // leave the diverged window — otherwise the
+                            // dropdown would keep showing Force Push on a
+                            // freshly-pulled branch.
+                            panel.force_push_with_lease = false;
+                        }
                         cx.notify();
                     })
                     .is_err()
                 {
                     return;
+                }
+                if should_check_lease {
+                    refresh_force_push_with_lease(&repo, &this, cx).await;
                 }
             }
         })
@@ -291,15 +317,16 @@ impl SourceControlPanel {
         }
     }
 
-    /// Build the dropdown-only inputs wrapper. The lease flag and
-    /// `base_ref` are stubbed here; they become real values once an
-    /// upstream-rewrite-detection query and a configurable base ref are
-    /// available on `Repository`. The PR-operation flag stays false
-    /// until a hosted-review backend exists.
+    /// Build the dropdown-only inputs wrapper. `force_push_with_lease`
+    /// is the cached result of `Repository::lease_status`, refreshed by
+    /// the state observer whenever the branch is diverged from its
+    /// upstream. `base_ref` is None until a configurable base ref lands;
+    /// the PR-operation flag stays false until a hosted-review backend
+    /// exists.
     fn build_dropdown_inputs(&self, cx: &Context<Self>) -> DropdownInputs {
         DropdownInputs {
             primary: self.build_primary_inputs(cx),
-            force_push_with_lease: false,
+            force_push_with_lease: self.force_push_with_lease,
             base_ref: None,
             is_pr_operation_active: false,
         }
@@ -600,4 +627,36 @@ impl Render for SourceControlPanel {
         }
         body
     }
+}
+
+/// Refresh the cached `force_push_with_lease` flag on the panel.
+///
+/// Calls `Repository::lease_status(false)` (the 30 s cache absorbs
+/// duplicate calls within that window) and writes the boolean back into
+/// the panel state via `update`. Errors from the backend are logged at
+/// `warn` and treated as `false` — better to surface a regular Push row
+/// than to silently encourage a force-push the backend couldn't confirm
+/// safe.
+async fn refresh_force_push_with_lease(
+    repo: &Repository,
+    this: &gpui::WeakEntity<SourceControlPanel>,
+    cx: &mut gpui::AsyncApp,
+) {
+    let lease_ok = match repo.lease_status(false).await {
+        Ok(status) => status.behind_is_patch_equivalent,
+        Err(err) => {
+            tracing::warn!(
+                target: "oximux_app::source_control",
+                error = %err,
+                "lease_status query failed; falling back to non-force-push label"
+            );
+            false
+        }
+    };
+    let _ = this.update(cx, |panel, cx| {
+        if panel.force_push_with_lease != lease_ok {
+            panel.force_push_with_lease = lease_ok;
+            cx.notify();
+        }
+    });
 }

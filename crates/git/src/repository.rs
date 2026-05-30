@@ -38,6 +38,9 @@ pub(crate) type RemoteBranchCache = Arc<RwLock<Option<(Instant, Vec<BranchInfo>)
 pub struct Repository {
     workdir: PathBuf,
     pub(crate) remote_branch_cache: RemoteBranchCache,
+    /// Cache slot for `lease_status`. Shared across cloned handles for
+    /// the same reason as `remote_branch_cache`.
+    pub(crate) lease_status_cache: crate::remote::LeaseStatusCache,
 }
 
 impl Repository {
@@ -93,6 +96,7 @@ impl Repository {
         Ok(Self {
             workdir: PathBuf::from(toplevel),
             remote_branch_cache: Arc::new(RwLock::new(None)),
+            lease_status_cache: Arc::new(RwLock::new(None)),
         })
     }
 

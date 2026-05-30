@@ -12,6 +12,7 @@ use crate::error::{GitError, Result};
 use crate::process::GitCmd;
 use crate::repository::Repository;
 use oximux_core::BranchInfo;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// Remote ops can talk to a network — give them more headroom than the 10 s
@@ -26,6 +27,44 @@ const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
 /// (e.g. immediately after a programmatic `fetch`) pass
 /// `force_refresh = true` to bypass the cache.
 const REMOTE_BRANCH_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// How long a `lease_status` result stays warm. The underlying
+/// `git log --left-right --cherry-pick` query walks both branches up
+/// to `LEASE_STATUS_MAX_COUNT` commits; the cache prevents the UI from
+/// re-running it on every status-poller tick (500 ms) while still
+/// picking up upstream rewrites within a reasonable window.
+const LEASE_STATUS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Walk-depth cap on the `git log --left-right --cherry-pick` query
+/// powering `lease_status`. Beyond a few hundred commits the answer
+/// stops changing in practice (a branch that diverged by >1000 commits
+/// isn't a candidate for force-push-with-lease anyway), and the cap
+/// keeps the cost bounded on pathological repos.
+const LEASE_STATUS_MAX_COUNT: u32 = 1000;
+
+/// Result of `Repository::lease_status`.
+///
+/// `behind_is_patch_equivalent` is true when every commit reachable from
+/// `@{u}` but not from `HEAD` has a patch-equivalent commit reachable
+/// from `HEAD` (i.e. the upstream commits exist locally as cherry-picks
+/// or amended/rebased variants). When true AND the branch is also
+/// ahead of upstream, force-pushing with lease is safe: nothing on
+/// upstream is being discarded that wasn't already represented locally.
+///
+/// `upstream_name` mirrors `git rev-parse --abbrev-ref @{u}` so callers
+/// can render which upstream is being compared. `None` means the branch
+/// has no upstream (in which case `behind_is_patch_equivalent` is also
+/// false — there's nothing to compare).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeaseStatus {
+    pub behind_is_patch_equivalent: bool,
+    pub upstream_name: Option<String>,
+}
+
+/// Cache slot for `lease_status`. Same shape as `RemoteBranchCache` so
+/// the Repository struct uses one consistent pattern for transient
+/// remote-derived state.
+pub(crate) type LeaseStatusCache = Arc<RwLock<Option<(Instant, LeaseStatus)>>>;
 
 impl Repository {
     /// `git push` against the configured upstream. Caller is responsible for
@@ -149,6 +188,101 @@ impl Repository {
         }
     }
 
+    /// Query the upstream-vs-local divergence and return whether every
+    /// "behind" commit has a patch-equivalent representation locally —
+    /// the precondition for safely surfacing `Force Push (with lease)`
+    /// as a user verb.
+    ///
+    /// Algorithm: `git log --left-right --cherry-pick --pretty=%m%H
+    /// --max-count=LEASE_STATUS_MAX_COUNT @{u}...HEAD` emits one line per
+    /// commit, prefixed with `<` (upstream-only, drops with cherry-pick
+    /// match) or `>` (local-only). `--cherry-pick` omits commits whose
+    /// patches match across sides. After the filter:
+    /// - any remaining `<` line → upstream has work NOT represented
+    ///   locally → lease-unsafe (force-pushing would lose it).
+    /// - zero `<` lines → every upstream commit is patch-equivalent to
+    ///   something local → lease-safe.
+    ///
+    /// Results are cached for [`LEASE_STATUS_CACHE_TTL`]; pass
+    /// `force_refresh = true` to bypass the cache. Branches with no
+    /// upstream return a default `LeaseStatus { false, None }` without
+    /// shelling out.
+    pub async fn lease_status(&self, force_refresh: bool) -> Result<LeaseStatus> {
+        if !force_refresh
+            && let Some(cached) = self.cached_lease_status()
+        {
+            return Ok(cached);
+        }
+        let upstream = match self.upstream_short_name().await? {
+            Some(name) => name,
+            None => {
+                let empty = LeaseStatus::default();
+                self.store_lease_status_cache(empty.clone());
+                return Ok(empty);
+            }
+        };
+        let max_count_arg = format!("--max-count={LEASE_STATUS_MAX_COUNT}");
+        let raw = GitCmd::new(self.workdir())
+            .args([
+                "log",
+                "--left-right",
+                "--cherry-pick",
+                "--pretty=%m%H",
+                max_count_arg.as_str(),
+                "@{u}...HEAD",
+            ])
+            .run()
+            .await?;
+        let text = String::from_utf8(raw.stdout)
+            .map_err(|e| GitError::parse(format!("non-utf8 in `git log --left-right`: {e}")))?;
+        let result = LeaseStatus {
+            behind_is_patch_equivalent: parse_lease_log(&text),
+            upstream_name: Some(upstream),
+        };
+        self.store_lease_status_cache(result.clone());
+        Ok(result)
+    }
+
+    /// `git rev-parse --abbrev-ref --symbolic-full-name @{u}` — returns
+    /// the short upstream tracking name (e.g. `origin/main`) or `None`
+    /// when the branch has no upstream. The exit code differentiates
+    /// these cases; treating "no upstream" as `None` keeps callers
+    /// branchless. Detached HEAD also returns `None`.
+    async fn upstream_short_name(&self) -> Result<Option<String>> {
+        let res = GitCmd::new(self.workdir())
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .run_raw()
+            .await?;
+        if !res.status.success() {
+            return Ok(None);
+        }
+        let name = String::from_utf8(res.stdout)
+            .map_err(|e| GitError::parse(format!("upstream name not utf-8: {e}")))?
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(name))
+    }
+
+    fn cached_lease_status(&self) -> Option<LeaseStatus> {
+        let guard = self.lease_status_cache.read().ok()?;
+        let (recorded_at, value) = guard.as_ref()?;
+        if recorded_at.elapsed() < LEASE_STATUS_CACHE_TTL {
+            Some(value.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_lease_status_cache(&self, value: LeaseStatus) {
+        // Lock poisoning here is benign — cache is best-effort.
+        if let Ok(mut guard) = self.lease_status_cache.write() {
+            *guard = Some((Instant::now(), value));
+        }
+    }
+
     async fn fetch_remote_branch_list(&self) -> Result<Vec<BranchInfo>> {
         let out = GitCmd::new(self.workdir())
             .args([
@@ -162,6 +296,31 @@ impl Repository {
             .map_err(|e| GitError::parse(format!("non-utf8 in `git for-each-ref`: {e}")))?;
         Ok(parse_remote_branch_list(&text))
     }
+}
+
+/// Parse the output of our `git log --left-right --cherry-pick
+/// --pretty=%m%H` invocation. Returns `true` when every "behind"
+/// commit (lines starting with `<`) is patch-equivalent to a local
+/// commit — i.e. zero `<` lines survived the `--cherry-pick` filter.
+///
+/// Empty output (no diverging commits in either direction) is also
+/// "lease-safe" trivially.
+pub(crate) fn parse_lease_log(text: &str) -> bool {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Each line is `<%H` or `>%H`. We only need the direction
+        // marker; the SHA is unused.
+        if line.starts_with('<') {
+            return false;
+        }
+        // `>` lines (local-only commits) are expected when ahead — not
+        // a lease problem. Any other prefix would be a git output
+        // change; ignore defensively rather than misclassifying.
+    }
+    true
 }
 
 /// Parse the output of our `git for-each-ref refs/remotes/`
@@ -236,5 +395,41 @@ upstream/HEAD
     fn parse_empty_input_yields_empty_vec() {
         assert!(parse_remote_branch_list("").is_empty());
         assert!(parse_remote_branch_list("\n\n\n").is_empty());
+    }
+
+    #[test]
+    fn lease_log_empty_is_safe() {
+        // No diverging commits in either direction → lease-safe trivially.
+        assert!(parse_lease_log(""));
+        assert!(parse_lease_log("\n\n"));
+    }
+
+    #[test]
+    fn lease_log_only_local_commits_is_safe() {
+        // Branch is ahead of upstream — nothing upstream needs preserving.
+        let text = ">abc123\n>def456\n>0011223\n";
+        assert!(parse_lease_log(text));
+    }
+
+    #[test]
+    fn lease_log_any_upstream_only_commit_is_unsafe() {
+        // One `<` line means upstream has work NOT represented locally.
+        let text = ">abc123\n<def456\n>0011223\n";
+        assert!(!parse_lease_log(text));
+    }
+
+    #[test]
+    fn lease_log_pure_upstream_drift_is_unsafe() {
+        // Pure-behind divergence (no local commits) is lease-unsafe.
+        let text = "<aaa\n<bbb\n<ccc\n";
+        assert!(!parse_lease_log(text));
+    }
+
+    #[test]
+    fn lease_log_ignores_malformed_lines() {
+        // Defensive: unknown line shape doesn't flip the verdict — only
+        // explicit `<` does.
+        let text = "  >abc\n   \n\tgarbage\n>def\n";
+        assert!(parse_lease_log(text));
     }
 }
