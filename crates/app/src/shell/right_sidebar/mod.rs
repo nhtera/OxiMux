@@ -144,6 +144,7 @@ impl RightSidebar {
                         theme,
                         density,
                         typography: typography.clone(),
+                        worktree_settings_repo: worktree_settings_repo.clone(),
                     },
                     sc_rx,
                     diff_view.clone(),
@@ -286,6 +287,9 @@ impl RightSidebar {
                     theme,
                     density,
                     typography: typography.clone(),
+                    // Test wiring: no persistence layer — the panel still
+                    // works for in-memory base-ref picks.
+                    worktree_settings_repo: None,
                 },
                 sc_rx,
                 diff_view.clone(),

@@ -34,13 +34,14 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, Styled, Subscription, Window, div, px,
 };
 use gpui_component::{
-    Disableable as _, Icon, IconName, Sizable as _,
+    Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
 };
 use oximux_core::GitState;
 use oximux_git::{PollState, Repository};
 use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::WorktreeSettingsRepo;
 use tokio::sync::watch;
 
 use crate::shell::diff_view::DiffView;
@@ -61,6 +62,11 @@ pub struct PanelConfig {
     pub theme: Theme,
     pub density: Density,
     pub typography: Typography,
+    /// Per-worktree V006 settings repo. `None` in test wiring; the
+    /// production path always supplies it. When absent, the panel
+    /// renders without persistence (BaseRef picker still works but
+    /// changes don't survive a restart).
+    pub worktree_settings_repo: Option<WorktreeSettingsRepo>,
 }
 
 pub struct SourceControlPanel {
@@ -77,6 +83,17 @@ pub struct SourceControlPanel {
     /// (branch is diverged from its upstream). `false` while the first
     /// check is in flight or when the state isn't a lease candidate.
     force_push_with_lease: bool,
+
+    /// Per-worktree base ref override. `None` = use the repo's default
+    /// branch as the diff base. Flows into the dropdown's "Rebase from
+    /// {base}" label and (downstream) the commit-graph diff base.
+    base_ref: Option<String>,
+
+    /// Per-worktree persistence layer; cloned for upserts after the user
+    /// picks a base ref. `None` when the panel runs without a settings
+    /// repo (test wiring); in that case the base ref still works in
+    /// memory but doesn't survive restart.
+    worktree_settings_repo: Option<WorktreeSettingsRepo>,
 
     /// Held for the async picker-fetch + branch-switch tasks that need a
     /// live `Repository` handle on the panel itself (the observer task
@@ -121,7 +138,14 @@ impl SourceControlPanel {
             theme,
             density,
             typography,
+            worktree_settings_repo,
         } = cfg;
+        // Read the persisted base ref synchronously — the repo handle
+        // is local SQLite, ~microsecond cost. If the row is missing /
+        // the read fails / no settings repo at all, fall through to
+        // `None` (use the repo default). Errors are logged but never
+        // raised; persistence is a nice-to-have, not a panel invariant.
+        let initial_base_ref = load_initial_base_ref(worktree_settings_repo.as_ref(), &repo);
         let initial = state_rx.borrow().clone();
         let git_state = match &initial {
             PollState::Ready(s) => Some(s.clone()),
@@ -154,15 +178,20 @@ impl SourceControlPanel {
             cx.new(|cx| CommitGraph::new(repo.clone(), theme, density, typography.clone(), cx));
 
         // Picker entity is built once and reused across opens — the
-        // owner-side callback (built below from a weak self-ref) routes
-        // the user's choice to the appropriate `apply_*` method on the
-        // panel. The callback only fires while the panel is alive
-        // because the picker holds it as a `Box<dyn Fn>` and the weak
-        // capture short-circuits when `self` is dropped.
+        // owner-side callback (built below from a weak self-ref) reads
+        // the picker's current mode at fire time and routes the user's
+        // choice through `apply_picker_outcome`. The callback only fires
+        // while the panel is alive because the picker holds it as a
+        // `Box<dyn Fn>` and the weak capture short-circuits when `self`
+        // is dropped.
         let panel_weak = cx.weak_entity();
         let on_pick: OnPick = Box::new(move |outcome, window, cx| {
             let _ = panel_weak.update(cx, |panel, cx| {
-                panel.apply_picker_outcome(outcome, window, cx);
+                // Read the live picker mode — the same picker entity
+                // services both Switch and BaseRef surfaces and the
+                // outcome's meaning depends on which one is active.
+                let mode = panel.branch_picker.read(cx).mode();
+                panel.apply_picker_outcome(outcome, mode, window, cx);
             });
         });
         let branch_picker = cx.new(|cx| {
@@ -181,6 +210,8 @@ impl SourceControlPanel {
             poll_state: initial,
             git_state,
             force_push_with_lease: false,
+            base_ref: initial_base_ref,
+            worktree_settings_repo,
             repo,
             scope: SourceControlScope::All,
             filter_query: String::new(),
@@ -362,7 +393,7 @@ impl SourceControlPanel {
         DropdownInputs {
             primary: self.build_primary_inputs(cx),
             force_push_with_lease: self.force_push_with_lease,
-            base_ref: None,
+            base_ref: self.base_ref.clone(),
             is_pr_operation_active: false,
         }
     }
@@ -473,10 +504,15 @@ impl SourceControlPanel {
             .map(|b| gpui::SharedString::from(b.to_string()));
 
         // Right-aligned compact icon cluster.
-        // settings-2 is still a placeholder (backend not yet wired);
-        // list-tree / list-collapse is the view-mode toggle (icon +
-        // tooltip swap built above from the current `view_mode`); refresh
-        // is wired to the commit-graph reload.
+        // settings-2 opens the BaseRef picker; list-tree / list-collapse
+        // is the view-mode toggle (icon + tooltip swap built above from
+        // the current `view_mode`); refresh is wired to the commit-graph
+        // reload.
+        let base_ref_tooltip = self
+            .base_ref
+            .as_deref()
+            .map(|b| format!("Base ref: {b} (click to change)"))
+            .unwrap_or_else(|| "Change base ref".to_string());
         let actions = div()
             .ml_auto()
             .flex()
@@ -492,8 +528,10 @@ impl SourceControlPanel {
                             .path("icons/settings-2.svg")
                             .size(px(sc_style::ICON)),
                     )
-                    .tooltip("Change base ref (coming soon)")
-                    .disabled(true),
+                    .tooltip(base_ref_tooltip)
+                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                        panel.open_base_ref_picker(window, cx);
+                    })),
             )
             .child(
                 Button::new("sc-toolbar-view-mode")
@@ -649,25 +687,105 @@ impl SourceControlPanel {
 
     /// Branch-picker callback router. Lives on the panel so the spawned
     /// closure stays tiny (just `panel.apply_picker_outcome(...)`) and
-    /// the actual dispatch is testable without GPUI plumbing.
+    /// the actual dispatch is testable without GPUI plumbing. `mode`
+    /// is the picker's live mode at fire time — the same `Branch`
+    /// outcome means "switch to it" in Switch mode but "use it as the
+    /// diff base" in BaseRef mode.
     fn apply_picker_outcome(
         &mut self,
         outcome: PickerOutcome,
+        mode: PickerMode,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match outcome {
-            PickerOutcome::Branch(name) => self.switch_to_branch(name, cx),
-            PickerOutcome::CreateFromHead(name) => self.create_branch_and_switch(name, cx),
-            PickerOutcome::UseRepoDefault => {
-                // BaseRef-mode outcome — wired in the next slice once
-                // the per-worktree settings repo is plumbed in.
-                tracing::debug!(
+        match (mode, outcome) {
+            (PickerMode::Switch, PickerOutcome::Branch(name)) => self.switch_to_branch(name, cx),
+            (PickerMode::Switch, PickerOutcome::CreateFromHead(name)) => {
+                self.create_branch_and_switch(name, cx)
+            }
+            (PickerMode::BaseRef, PickerOutcome::Branch(name)) => {
+                self.set_base_ref(Some(name), cx)
+            }
+            (PickerMode::BaseRef, PickerOutcome::UseRepoDefault) => self.set_base_ref(None, cx),
+            // Impossible combinations per `build_rows` invariants:
+            // Switch mode never emits `UseRepoDefault`; BaseRef mode
+            // never emits `CreateFromHead`. Log defensively so a future
+            // refactor that loosens those invariants is loud.
+            (mode, outcome) => {
+                tracing::warn!(
                     target: "oximux_app::source_control",
-                    "BaseRef picker not yet wired; ignoring UseRepoDefault outcome",
+                    ?mode,
+                    ?outcome,
+                    "branch picker emitted an outcome that's invalid for the active mode; ignoring",
                 );
             }
         }
+    }
+
+    /// Persist a new base ref selection — both in memory (so the
+    /// dropdown updates on the next render) and on disk (so it survives
+    /// app restart). Persistence errors are logged but never raised:
+    /// the in-memory change still wins so the picker UX isn't held
+    /// hostage to SQLite hiccups.
+    fn set_base_ref(&mut self, value: Option<String>, cx: &mut Context<Self>) {
+        self.base_ref = value.clone();
+        cx.notify();
+        let Some(ref settings_repo) = self.worktree_settings_repo else {
+            return;
+        };
+        let workspace_id = self.repo.workdir().to_string_lossy().to_string();
+        if let Err(err) = merge_base_ref_into_settings(settings_repo, &workspace_id, value) {
+            tracing::warn!(
+                target: "oximux_app::source_control",
+                error = %err,
+                workspace_id = %workspace_id,
+                "worktree_settings.upsert failed; base ref change won't survive restart",
+            );
+        }
+    }
+
+    /// Open the branch picker in BaseRef mode anchored under the
+    /// toolbar. Populates from `list_remote_branches` (5 s cache
+    /// absorbs spam clicks). The picker's "(repo default)" row maps
+    /// to `set_base_ref(None)`; any other row maps to
+    /// `set_base_ref(Some(name))`.
+    ///
+    /// Anchor uses the same left offset as the Switch picker rather
+    /// than the settings button's right-edge position — the picker
+    /// card is wide enough (`CARD_WIDTH = 280`) to cover the button
+    /// regardless, but the precise anchor wants the source button's
+    /// measured bounds, which GPUI doesn't expose synchronously from
+    /// the click handler. Worth revisiting once `Bounds` capture from
+    /// the toolbar's interactive elements becomes ergonomic.
+    fn open_base_ref_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let picker = self.branch_picker.clone();
+        let current_base = self.base_ref.clone();
+        cx.spawn_in(window, async move |_panel_weak, cx| {
+            let candidates: Vec<String> = match repo.list_remote_branches(false).await {
+                Ok(bs) => bs.into_iter().map(|b| b.name).collect(),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "oximux_app::source_control",
+                        error = %err,
+                        "list_remote_branches failed; opening BaseRef picker with empty list",
+                    );
+                    Vec::new()
+                }
+            };
+            let _ = picker.update_in(cx, |p, window, cx| {
+                p.set_mode(PickerMode::BaseRef);
+                p.open(
+                    candidates,
+                    current_base,
+                    sc_style::PAD_H,
+                    sc_style::TAB_H + sc_style::TOOLBAR_H,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
     }
 
     /// Dispatch `repo.switch_branch(name)`. Success leaves status
@@ -795,6 +913,52 @@ impl Render for SourceControlPanel {
             .h_full()
             .child(body)
             .child(picker)
+    }
+}
+
+/// Read-modify-write the per-workspace base ref into the V006
+/// `worktree_settings` row. Preserves sibling fields (`commit_draft`,
+/// `view_mode_override`) that other panels own — the upsert otherwise
+/// would null them out. Pure-ish (the side effect is the SQLite write),
+/// so an integration test can exercise the round-trip via
+/// `oximux_storage::open_memory`.
+pub fn merge_base_ref_into_settings(
+    settings_repo: &WorktreeSettingsRepo,
+    workspace_id: &str,
+    value: Option<String>,
+) -> Result<(), oximux_storage::StorageError> {
+    let mut current = settings_repo
+        .get(workspace_id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    current.base_ref = value;
+    settings_repo.upsert(workspace_id, &current)
+}
+
+/// Read the persisted base ref for this workspace from the V006
+/// `worktree_settings` table. Falls through to `None` (= use the repo
+/// default) whenever the read fails, the row is absent, or no settings
+/// repo was provided (test wiring). Errors are logged at warn but
+/// never raised — a missing initial value is not a startup-blocker.
+fn load_initial_base_ref(
+    settings_repo: Option<&WorktreeSettingsRepo>,
+    repo: &Repository,
+) -> Option<String> {
+    let sr = settings_repo?;
+    let workspace_id = repo.workdir().to_string_lossy().to_string();
+    match sr.get(&workspace_id) {
+        Ok(Some(settings)) => settings.base_ref,
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                target: "oximux_app::source_control",
+                error = %err,
+                workspace_id = %workspace_id,
+                "worktree_settings.get failed; base ref defaults to repo default",
+            );
+            None
+        }
     }
 }
 
