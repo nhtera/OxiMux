@@ -15,6 +15,7 @@
 //! All children stay always-mounted (Phase 04 plan: avoid IPC storms on tab
 //! switch). Filter / scope / commit state lives on `SourceControlPanel`.
 
+pub mod branch_picker;
 pub mod commit_area;
 pub mod commit_ops;
 pub mod dropdown_items;
