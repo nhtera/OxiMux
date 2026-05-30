@@ -24,9 +24,9 @@
 //! until the next selection event — harmless: chord actions iterate
 //! `selected` and the vectorised repo ops no-op or log on unknown paths.
 
+use crate::shell::git_panel::GitPanel;
 use crate::shell::git_panel::changed_files::{FileSections, partition_files};
 use crate::shell::git_panel::range_select;
-use crate::shell::git_panel::{GitPanel, spawn_repo_op};
 use crate::shell::source_control::filter::filter_files;
 use gpui::Context;
 use oximux_core::FileStatus;
@@ -119,46 +119,119 @@ impl GitPanel {
     }
 
     /// Vectorised stage for every path in `selected`. No-op when the
-    /// selection is empty. Routes through the same vectorised
-    /// [`repo.stage_paths`] backend as the hover-action single-path
-    /// stage, so a 1-row "selection" is indistinguishable from a
-    /// hover-click stage at the backend.
+    /// selection is empty or another bulk op is already running. Sets
+    /// [`bulk_op_in_flight`] for the duration of the op so the
+    /// `BulkActionBar` swaps the count for a spinner and disables both
+    /// action buttons. On success the selection is cleared (the rows
+    /// just moved to STAGED — the prior selection is no longer
+    /// meaningful); on failure the selection is preserved so the user
+    /// can retry.
     ///
-    /// Slice A wires this from the chord action (`S` key). The
-    /// `BulkActionBar` UI button lands in Slice B and calls the same
-    /// method.
+    /// Slice A wired this from the chord action (`S` key). Slice B
+    /// adds the `BulkActionBar` UI button that calls the same method.
     ///
-    /// [`repo.stage_paths`]: oximux_git::Repository::stage_paths
-    pub fn bulk_stage_selected(&mut self, _cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
-            return;
-        }
-        let paths: Vec<PathBuf> = self.selected.iter().cloned().collect();
-        spawn_repo_op(
-            self.repo.clone(),
-            move |repo| async move {
-                let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
-                repo.stage_paths(&refs).await
-            },
-            "bulk_stage_selected",
-        );
+    /// [`bulk_op_in_flight`]: super::GitPanel::bulk_op_in_flight
+    pub fn bulk_stage_selected(&mut self, cx: &mut Context<Self>) {
+        self.run_bulk_path_op(cx, "bulk_stage_selected", |repo, paths| async move {
+            let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+            repo.stage_paths(&refs).await
+        });
     }
 
     /// Vectorised unstage for every path in `selected`. Same shape as
     /// [`bulk_stage_selected`].
-    pub fn bulk_unstage_selected(&mut self, _cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
+    pub fn bulk_unstage_selected(&mut self, cx: &mut Context<Self>) {
+        self.run_bulk_path_op(cx, "bulk_unstage_selected", |repo, paths| async move {
+            let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+            repo.unstage_paths(&refs).await
+        });
+    }
+
+    /// Common driver for vectorised path ops: snapshot the selection,
+    /// flip [`bulk_op_in_flight`], spawn the work on tokio, and
+    /// reconcile state when the op resolves (clear selection +
+    /// `in_flight` on success; just clear `in_flight` on failure).
+    ///
+    /// Mirrors `confirmed_discard_path`'s oneshot + cx.spawn shape so
+    /// concurrent ops don't cancel each other and the UI always sees
+    /// a well-defined `in_flight` edge.
+    ///
+    /// `op` takes an owned `Repository` plus owned `Vec<PathBuf>` —
+    /// passing owned paths sidesteps the lifetime-stuck-in-the-future
+    /// trap a borrowed-`&Path` signature creates.
+    ///
+    /// [`bulk_op_in_flight`]: super::GitPanel::bulk_op_in_flight
+    fn run_bulk_path_op<F, Fut>(&mut self, cx: &mut Context<Self>, label: &'static str, op: F)
+    where
+        F: FnOnce(oximux_git::Repository, Vec<PathBuf>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = oximux_git::Result<()>> + Send + 'static,
+    {
+        if self.selected.is_empty() || self.bulk_op_in_flight {
             return;
         }
         let paths: Vec<PathBuf> = self.selected.iter().cloned().collect();
-        spawn_repo_op(
-            self.repo.clone(),
-            move |repo| async move {
-                let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
-                repo.unstage_paths(&refs).await
-            },
-            "bulk_unstage_selected",
-        );
+        self.bulk_op_in_flight = true;
+        cx.notify();
+
+        let repo = self.repo.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let r = op(repo, paths).await.map_err(|e| e.to_string());
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::git_panel",
+                    op = label,
+                    "no tokio runtime; bulk op skipped (test wiring)"
+                );
+                self.bulk_op_in_flight = false;
+                cx.notify();
+                return;
+            }
+        }
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.bulk_op_in_flight = false;
+                match result {
+                    Ok(Ok(())) => {
+                        // Success — the rows have moved (e.g. unstaged
+                        // → staged) and the prior selection no longer
+                        // corresponds to the same logical bucket. Drop
+                        // it so the BulkActionBar dismisses and the
+                        // user starts a fresh selection on the new
+                        // layout.
+                        panel.selected.clear();
+                        panel.last_clicked = None;
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            target: "oximux_app::git_panel",
+                            error = %err,
+                            op = label,
+                            "bulk path op failed; selection preserved for retry"
+                        );
+                    }
+                    Err(_) => {
+                        // Sender dropped (panic on the tokio side).
+                        // Same handling as a logged error — clear the
+                        // flag, leave selection intact.
+                        tracing::warn!(
+                            target: "oximux_app::git_panel",
+                            op = label,
+                            "bulk path op sender dropped before sending result"
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 

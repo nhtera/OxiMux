@@ -12,6 +12,7 @@
 //! runtime is entered (e.g. the GPUI smoke test), the handler logs and no-ops
 //! instead of panicking. Step 14 wires runtime setup at the shell mount point.
 
+pub mod bulk_action_bar;
 pub mod changed_files;
 pub mod discard_confirm;
 pub mod range_select;
@@ -120,6 +121,17 @@ pub struct GitPanel {
     /// tokio runtime. The row renderer reads this set to swap the
     /// revert icon for a spinner.
     in_flight_discards: HashSet<PathBuf>,
+    /// `true` while a vectorised `bulk_stage_selected` /
+    /// `bulk_unstage_selected` op is on the tokio runtime. The
+    /// [`bulk_action_bar`] reads this to swap the count badge for a
+    /// spinner and disable both action buttons until the op resolves.
+    ///
+    /// `pub(super)` so [`selection`] can flip the flag from its
+    /// completion handler and `bulk_action_bar` can read it during
+    /// render.
+    ///
+    /// [`bulk_action_bar`]: crate::shell::git_panel::bulk_action_bar
+    pub(super) bulk_op_in_flight: bool,
 }
 
 /// Information the shell host needs to render a discard confirm dialog.
@@ -186,6 +198,7 @@ impl GitPanel {
             on_open,
             pending_discard: None,
             in_flight_discards: HashSet::new(),
+            bulk_op_in_flight: false,
         }
     }
 
@@ -500,22 +513,39 @@ impl Render for GitPanel {
         // `relative()` anchors the gpui-component vertical scrollbar overlay;
         // `track_scroll` + `vertical_scrollbar` share `scroll_handle` so the
         // thumb mirrors the user's wheel/drag position.
+        //
+        // `BULK_BAR_PAD_PX` reserves space at the bottom of the scroll
+        // region when the BulkActionBar is mounted so the last row
+        // stays visible behind it. Zero when no selection — no waste
+        // on the common path.
+        let bar = bulk_action_bar::render_bulk_action_bar(
+            self,
+            self.theme,
+            self.density,
+            &self.typography,
+            cx,
+        );
+        let pad_bottom = if bar.is_some() { BULK_BAR_PAD_PX } else { 0.0 };
         let scroll_body = div()
             .id("git-panel-scroll")
             .relative()
             .flex_1()
             .min_h(px(0.0))
             .w_full()
+            .pb(px(pad_bottom))
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
             .child(body)
             .vertical_scrollbar(&self.scroll_handle);
 
+        // Outer container is `relative` so the floating `BulkActionBar`
+        // (positioned absolute, bottom-anchored) lays out against it.
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_stage_file))
             .on_action(cx.listener(Self::on_unstage_file))
             .on_action(cx.listener(Self::on_revert_file))
+            .relative()
             .flex()
             .flex_col()
             .h_full()
@@ -526,8 +556,16 @@ impl Render for GitPanel {
             .border_l_1()
             .border_color(self.theme.border_inactive)
             .child(scroll_body)
+            .children(bar)
     }
 }
+
+/// Bottom padding reserved inside the changed-files scroll body when
+/// the floating [`bulk_action_bar`] is mounted, so the last row keeps
+/// 1–2 line-heights of clearance behind the bar. Picked by eye to
+/// cover the bar's own `py(4.0)` + ~16px text + 1px border with a
+/// small margin.
+const BULK_BAR_PAD_PX: f32 = 32.0;
 
 /// Centered single-line text used for both the loading placeholder and the
 /// `PollState::Failed` surface. Same layout, different copy.
