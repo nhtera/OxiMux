@@ -6,6 +6,7 @@
 
 use crate::diff::parse_unified_diff;
 use crate::error::{GitError, Result};
+use crate::numstat;
 use crate::process::GitCmd;
 use crate::status;
 use oximux_core::{BranchInfo, FileDiff, GitState};
@@ -118,7 +119,31 @@ impl Repository {
             ])
             .run()
             .await?;
-        status::parse_porcelain_v2(&out.stdout)
+        let mut state = status::parse_porcelain_v2(&out.stdout)?;
+        // Enrich with `+N -N` counts from `git diff --numstat HEAD`. Best
+        // effort: a numstat failure (no HEAD, transient git error) leaves
+        // every `line_counts` at `None`, the UI keeps rendering, and the
+        // panel still gives users every other piece of information. The
+        // `warn!` on the failure path is the only signal a malformed
+        // numstat parse leaves — without it, the symptom "no counts ever
+        // show" is undiagnosable.
+        match numstat::diff_numstat_head(&self.workdir).await {
+            Ok(counts) => {
+                for f in state.files.iter_mut() {
+                    if let Some(&(added, removed)) = counts.get(f.path.as_path()) {
+                        f.line_counts = Some((added, removed));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workdir = %self.workdir.display(),
+                    "diff --numstat HEAD failed; status returned without line counts"
+                );
+            }
+        }
+        Ok(state)
     }
 
     /// Patch-format diff of the working tree against the index (changes not

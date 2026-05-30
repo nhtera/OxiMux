@@ -1,14 +1,16 @@
-//! Changed-files view — section routing + row rendering. Pure helpers; the
-//! stateful entity lives in `super::GitPanel`. Row click → `panel.set_selected`.
-//! Stage / unstage are dispatched via the workspace `StageFile` / `UnstageFile`
-//! actions (Phase 2 step 8 routes them through `GitPanel`'s action handlers).
+//! Changed-files view — section routing + section header. Pure helpers;
+//! the stateful entity lives in `super::GitPanel`. Per-row rendering
+//! (status badge, name + rename arrow, diff counts, conflict sub-label,
+//! hover-action cluster) lives in `row_renderer`. Splitting them keeps
+//! this module under the 500-LOC warn cap as Phase 02 piles three new
+//! decorations onto each row.
 
-use crate::shell::file_explorer::file_icon::icon_for_name;
 use crate::shell::git_panel::GitPanel;
+use crate::shell::git_panel::row_renderer::{RowKind, row};
 use crate::shell::source_control::style as sc_style;
 use gpui::{
     ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, div, prelude::FluentBuilder as _, px, svg,
+    ParentElement, Styled, div, px,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
@@ -84,32 +86,14 @@ pub(crate) fn is_conflict(f: &FileStatus) -> bool {
     matches!(f.index, IndexStatus::Unmerged) || matches!(f.worktree, WorktreeStatus::Unmerged)
 }
 
-#[derive(Copy, Clone)]
-enum RowKind {
-    Staged,
-    Unstaged,
-    Untracked,
-}
-
-/// Re-exported `RowKind` shape for `row_actions::action_cluster`. Defining
-/// it here (rather than passing the private `RowKind` directly) keeps
-/// `changed_files` the owner of the section taxonomy while letting the
-/// out-of-file action helpers see the variants.
+/// Public mirror of `row_renderer::RowKind` for the per-row action
+/// cluster. The variants match one-to-one; the duplication is so the
+/// private `RowKind` can stay an implementation detail of the renderer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RowKindForActions {
     Staged,
     Unstaged,
     Untracked,
-}
-
-impl From<RowKind> for RowKindForActions {
-    fn from(k: RowKind) -> Self {
-        match k {
-            RowKind::Staged => RowKindForActions::Staged,
-            RowKind::Unstaged => RowKindForActions::Unstaged,
-            RowKind::Untracked => RowKindForActions::Untracked,
-        }
-    }
 }
 
 /// Bundle of styling + selection state threaded through the render helpers.
@@ -248,218 +232,6 @@ fn section(
         }
     }
     col.into_any_element()
-}
-
-/// One status badge per row — `M`/`A`/`D`/`R`/`U`/`C`. The kind argument lets
-/// the staged-side dot fall back to "M" (modified) when the index is
-/// `Unmodified` but the worktree changed (a partial-stage row mirrored into
-/// the Staged section).
-fn status_badge_for(f: &FileStatus, kind: RowKind) -> (&'static str, fn(&Theme) -> gpui::Hsla) {
-    match kind {
-        RowKind::Staged => match f.index {
-            IndexStatus::Added => ("A", |t| t.git.added),
-            IndexStatus::Deleted => ("D", |t| t.git.deleted),
-            IndexStatus::Renamed => ("R", |t| t.git.renamed),
-            IndexStatus::Copied => ("C", |t| t.git.copied),
-            IndexStatus::Modified => ("M", |t| t.git.modified),
-            IndexStatus::Untracked => ("U", |t| t.git.untracked),
-            IndexStatus::Unmerged => ("!", |t| t.status_error),
-            IndexStatus::Ignored => ("I", |t| t.git.ignored),
-            IndexStatus::Unmodified => ("M", |t| t.git.modified),
-        },
-        RowKind::Unstaged => match f.worktree {
-            WorktreeStatus::Deleted => ("D", |t| t.git.deleted),
-            WorktreeStatus::Modified => ("M", |t| t.git.modified),
-            WorktreeStatus::Renamed => ("R", |t| t.git.renamed),
-            WorktreeStatus::Untracked => ("U", |t| t.git.untracked),
-            WorktreeStatus::Unmerged => ("!", |t| t.status_error),
-            WorktreeStatus::Ignored => ("I", |t| t.git.ignored),
-            WorktreeStatus::Unmodified => ("M", |t| t.git.modified),
-        },
-        RowKind::Untracked => ("U", |t| t.git.untracked),
-    }
-}
-
-fn row(
-    f: &FileStatus,
-    kind: RowKind,
-    rctx: &RenderCtx<'_>,
-    cx: &mut Context<GitPanel>,
-) -> impl IntoElement {
-    let is_selected = rctx.selected == Some(f.path.as_path());
-    let bg = if is_selected {
-        rctx.theme.selection
-    } else {
-        rctx.theme.bg_panel
-    };
-    let theme = rctx.theme;
-    let click_path = f.path.clone();
-    let click_staged = matches!(kind, RowKind::Staged);
-    // Untracked rows are git-invisible — `git diff` returns nothing for
-    // them. The host's `OnOpenDiff` callback routes such clicks through
-    // `Repository::diff_for_untracked` instead, reading the file off disk
-    // to synthesize an all-additions diff.
-    let click_untracked = matches!(kind, RowKind::Untracked);
-    // Skip the editor-open dispatch for rows whose worktree file no
-    // longer exists (deleted in working tree) — opening would surface an
-    // empty editor buffer for a path the user explicitly removed. The
-    // inline mini-diff in the sidebar still loads (showing the removed
-    // content as a `-` block) via `set_selected → DiffView::load`.
-    let click_should_open_editor = !matches!(f.worktree, oximux_core::WorktreeStatus::Deleted)
-        && !matches!(f.index, oximux_core::IndexStatus::Deleted);
-
-    let file_name = f
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| f.path.display().to_string());
-    let parent = f
-        .path
-        .parent()
-        .and_then(|p| {
-            let s = p.display().to_string();
-            if s.is_empty() { None } else { Some(s) }
-        })
-        .unwrap_or_default();
-
-    let (badge_text, badge_color_fn) = status_badge_for(f, kind);
-    let badge_color = badge_color_fn(&rctx.theme);
-
-    let icon_el: gpui::AnyElement = match icon_for_name(&file_name) {
-        Some(path) => svg()
-            .path(path)
-            .size(px(14.0))
-            .text_color(badge_color)
-            .into_any_element(),
-        None => Icon::new(IconName::File)
-            .size_3()
-            .text_color(badge_color)
-            .into_any_element(),
-    };
-
-    // Stable id (path + kind) keeps GPUI's hover interactivity working when
-    // the same row exists in both Staged and Unstaged sections after a partial
-    // stage. Without the kind suffix, both rows would share an id and only one
-    // would react to hover.
-    let row_id = format!(
-        "git-row-{}-{}",
-        match kind {
-            RowKind::Staged => "s",
-            RowKind::Unstaged => "u",
-            RowKind::Untracked => "n",
-        },
-        f.path.display()
-    );
-
-    // Hover-only action cluster (stage / unstage / discard). On hover the
-    // status badge fades out and these icons fade in within the same column
-    // via `group_hover`. The set varies by row kind — see `row_actions`.
-    let is_discarding = rctx.in_flight_discards.contains(&f.path);
-    let action_cluster = crate::shell::git_panel::row_actions::action_cluster(
-        f.path.clone(),
-        kind.into(),
-        gpui::SharedString::from(row_id.clone()),
-        is_discarding,
-        cx,
-    );
-
-    div()
-        .id(gpui::SharedString::from(row_id.clone()))
-        .group(gpui::SharedString::from(row_id.clone()))
-        .flex()
-        .items_center()
-        .gap(px(rctx.density.gap_inline))
-        .h(px(rctx.density.h_row + 2.0))
-        .px(px(sc_style::PAD_H))
-        .bg(bg)
-        .text_size(px(sc_style::TEXT))
-        .text_color(rctx.theme.fg_base)
-        .when(!is_selected, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |panel, _: &MouseDownEvent, window, cx| {
-                panel.set_selected(Some((click_path.clone(), click_staged)), cx);
-                // Open a real diff tab in the main pane via the host
-                // callback. The inline sidebar mini-diff also loads
-                // (via `set_selected` → `DiffView::load` above) as a
-                // glanceable summary alongside the main-pane tab.
-                // `click_should_open_editor` gates out files that are
-                // deleted on disk — the sidebar mini-diff already shows
-                // the `-` block for those.
-                if click_should_open_editor && let Some(cb) = panel.on_open.clone() {
-                    (cb)(
-                        click_path.clone(),
-                        click_staged,
-                        click_untracked,
-                        window,
-                        cx,
-                    );
-                }
-                cx.notify();
-            }),
-        )
-        .child(icon_el)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .gap(px(6.0))
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(rctx.theme.fg_base)
-                        .font_weight(rctx.typography.w_medium)
-                        .child(file_name),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .text_size(px(sc_style::META_TEXT))
-                        .text_color(rctx.theme.fg_subtle)
-                        .child(parent),
-                ),
-        )
-        .child(
-            // Right slot stacks badge + action cluster; group_hover toggles
-            // which is visible. Both occupy the same slot via absolute
-            // positioning so the swap is jitter-free. The slot is wider
-            // (38px) than before to host up to two action buttons.
-            div()
-                .relative()
-                .w(px(38.0))
-                .h(px(rctx.density.h_row))
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(rctx.typography.t_label_caps))
-                        .font_weight(rctx.typography.w_semibold)
-                        .text_color(badge_color)
-                        .group_hover(row_id.clone(), |s| s.invisible())
-                        .child(badge_text),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .invisible()
-                        .group_hover(row_id, |s| s.visible())
-                        .child(action_cluster),
-                ),
-        )
 }
 
 fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {

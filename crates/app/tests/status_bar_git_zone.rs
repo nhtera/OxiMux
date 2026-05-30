@@ -14,12 +14,7 @@ fn parse_err(msg: &str) -> GitError {
 use std::path::PathBuf;
 
 fn fs(index: IndexStatus, worktree: WorktreeStatus) -> FileStatus {
-    FileStatus {
-        path: PathBuf::from("a"),
-        index,
-        worktree,
-        rename: None,
-    }
+    FileStatus::with_status(PathBuf::from("a"), index, worktree)
 }
 
 #[test]

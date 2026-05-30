@@ -10,6 +10,7 @@
 //! (e.g. `AgentSessionId`) and are never confused with persisted ids.
 
 pub mod agent_session;
+pub mod conflict_kind;
 pub mod git_diff;
 pub mod git_ops;
 pub mod git_state;
@@ -18,6 +19,7 @@ pub mod project;
 pub mod workspace;
 
 pub use agent_session::{AgentSession, AgentSessionId, AgentStatus};
+pub use conflict_kind::ConflictKind;
 pub use git_diff::{
     DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, LARGE_DIFF_LINE_THRESHOLD,
 };

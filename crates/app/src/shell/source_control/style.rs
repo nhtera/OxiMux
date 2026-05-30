@@ -55,3 +55,14 @@ pub const COMMIT_BTN_H: f32 = 32.0;
 /// compact. The timeline column distributes connector lines across this
 /// height; without a definite parent height the lines collapse to 2-3 px.
 pub const COMMIT_ROW_H: f32 = 34.0;
+
+/// Horizontal gap between the `+A` (green) and `-B` (red) line-count
+/// fragments rendered to the right of a file name. Tight enough that the
+/// pair reads as one decoration, loose enough that the minus sign doesn't
+/// blur into the digits of the previous number.
+pub const LINE_COUNT_GAP: f32 = 4.0;
+
+/// Font size for the conflict-kind sub-label that hangs under a file name
+/// on unmerged rows (e.g. "both modified"). One point smaller than the
+/// secondary META_TEXT so it reads as a parenthetical to the row name.
+pub const SUB_LABEL_TEXT: f32 = 10.0;

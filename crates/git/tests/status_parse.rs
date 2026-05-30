@@ -3,7 +3,7 @@
 //! Each fixture is the literal byte stream `git status --porcelain=v2 --branch -z`
 //! would emit. NUL terminators between records are written as `\x00` in source.
 
-use oximux_core::{IndexStatus, RenameKind, WorktreeStatus};
+use oximux_core::{ConflictKind, IndexStatus, RenameKind, WorktreeStatus};
 use oximux_git::parse_porcelain_v2;
 
 #[test]
@@ -115,7 +115,7 @@ fn copied_file_partial_similarity() {
 }
 
 #[test]
-fn unmerged_file() {
+fn unmerged_file_populates_conflict_kind() {
     let buf = b"\
 # branch.head main\x00\
 u UU N... 100644 100644 100644 100644 hH1 hH2 hH3 conflict.txt\x00";
@@ -124,6 +124,50 @@ u UU N... 100644 100644 100644 100644 hH1 hH2 hH3 conflict.txt\x00";
     assert_eq!(f.path.to_str(), Some("conflict.txt"));
     assert!(matches!(f.index, IndexStatus::Unmerged));
     assert!(matches!(f.worktree, WorktreeStatus::Unmerged));
+    assert_eq!(f.conflict_kind, Some(ConflictKind::BothModified));
+}
+
+#[test]
+fn unmerged_kinds_all_seven_pairs() {
+    // Every legal porcelain v2 u-record XY combination must classify.
+    // Builds one fixture per (xy, kind) pair so a regression in `from_xy`
+    // surfaces with a precise variant in the failure message.
+    let cases: &[(&[u8; 2], ConflictKind)] = &[
+        (b"DD", ConflictKind::BothDeleted),
+        (b"AU", ConflictKind::AddedByUs),
+        (b"UD", ConflictKind::DeletedByThem),
+        (b"UA", ConflictKind::AddedByThem),
+        (b"DU", ConflictKind::DeletedByUs),
+        (b"AA", ConflictKind::BothAdded),
+        (b"UU", ConflictKind::BothModified),
+    ];
+    for (xy, expected) in cases {
+        let mut buf: Vec<u8> = b"# branch.head main\x00u ".to_vec();
+        buf.extend_from_slice(*xy);
+        buf.extend_from_slice(
+            b" N... 100644 100644 100644 100644 hH1 hH2 hH3 conflict.txt\x00",
+        );
+        let s = parse_porcelain_v2(&buf).expect("parse");
+        let f = &s.files[0];
+        assert_eq!(
+            f.conflict_kind,
+            Some(*expected),
+            "xy={:?} should map to {:?}",
+            std::str::from_utf8(xy.as_slice()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn ordinary_record_leaves_conflict_kind_none() {
+    // A type-1 modified record must NOT carry a conflict_kind.
+    let buf = b"\
+# branch.head main\x00\
+1 .M N... 100644 100644 100644 hH iH src.rs\x00";
+    let s = parse_porcelain_v2(buf).expect("parse");
+    assert_eq!(s.files[0].conflict_kind, None);
+    assert_eq!(s.files[0].line_counts, None);
 }
 
 #[test]

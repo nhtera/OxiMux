@@ -147,12 +147,7 @@ mod tests {
     use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
 
     fn fs(path: &str, index: IndexStatus, worktree: WorktreeStatus) -> FileStatus {
-        FileStatus {
-            path: PathBuf::from(path),
-            index,
-            worktree,
-            rename: None,
-        }
+        FileStatus::with_status(PathBuf::from(path), index, worktree)
     }
 
     // ── dominant ────────────────────────────────────────────────────────────

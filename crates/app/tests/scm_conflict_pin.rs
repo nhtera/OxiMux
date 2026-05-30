@@ -14,12 +14,7 @@ use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
 use std::path::PathBuf;
 
 fn fs(path: &str, index: IndexStatus, worktree: WorktreeStatus) -> FileStatus {
-    FileStatus {
-        path: PathBuf::from(path),
-        index,
-        worktree,
-        rename: None,
-    }
+    FileStatus::with_status(PathBuf::from(path), index, worktree)
 }
 
 #[test]

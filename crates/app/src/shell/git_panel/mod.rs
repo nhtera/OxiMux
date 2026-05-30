@@ -15,6 +15,7 @@
 pub mod changed_files;
 pub mod discard_confirm;
 pub mod row_actions;
+pub mod row_renderer;
 
 use crate::actions::{RevertFile, StageFile, UnstageFile};
 use crate::shell::diff_view::DiffView;

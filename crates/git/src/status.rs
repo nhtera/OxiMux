@@ -24,7 +24,9 @@
 //!   `! <path>`                                                         ignored
 
 use crate::error::{GitError, Result};
-use oximux_core::{FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus};
+use oximux_core::{
+    ConflictKind, FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus,
+};
 use std::path::PathBuf;
 
 pub fn parse_porcelain_v2(buf: &[u8]) -> Result<GitState> {
@@ -167,6 +169,8 @@ fn parse_ordinary(rec: &[u8], state: &mut GitState) -> Result<()> {
         index,
         worktree,
         rename: None,
+        line_counts: None,
+        conflict_kind: None,
     });
     Ok(())
 }
@@ -192,6 +196,8 @@ fn parse_renamed(rec: &[u8], orig: &[u8], state: &mut GitState) -> Result<()> {
             kind,
             score,
         }),
+        line_counts: None,
+        conflict_kind: None,
     });
     Ok(())
 }
@@ -203,12 +209,19 @@ fn parse_unmerged(rec: &[u8], state: &mut GitState) -> Result<()> {
     if xy.len() != 2 {
         return Err(GitError::parse(format!("unmerged XY not 2 chars: {xy:?}")));
     }
-    // For unmerged, X and Y are both conflict codes; flag both sides Unmerged.
+    // The XY pair is the conflict shape (DD/AU/UD/UA/DU/AA/UU); illegal
+    // pairs leave `conflict_kind = None` so the UI shows a plain conflict
+    // row rather than crashing on an unexpected git output. Both index
+    // and worktree sides are flagged `Unmerged` so existing predicates
+    // (`is_conflict`, partition) keep working.
+    let conflict_kind = ConflictKind::from_xy(xy.as_bytes()[0], xy.as_bytes()[1]);
     state.files.push(FileStatus {
         path: PathBuf::from(fields.path),
         index: IndexStatus::Unmerged,
         worktree: WorktreeStatus::Unmerged,
         rename: None,
+        line_counts: None,
+        conflict_kind,
     });
     Ok(())
 }
@@ -230,6 +243,8 @@ fn parse_path_only(
         index,
         worktree,
         rename: None,
+        line_counts: None,
+        conflict_kind: None,
     });
     Ok(())
 }

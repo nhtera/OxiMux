@@ -53,12 +53,11 @@ fn modified_state(path: &str) -> PollState {
         ahead: 0,
         behind: 0,
         head_oid: None,
-        files: vec![FileStatus {
-            path: PathBuf::from(path),
-            index: IndexStatus::Unmodified,
-            worktree: WorktreeStatus::Modified,
-            rename: None,
-        }],
+        files: vec![FileStatus::with_status(
+            PathBuf::from(path),
+            IndexStatus::Unmodified,
+            WorktreeStatus::Modified,
+        )],
     })
 }
 

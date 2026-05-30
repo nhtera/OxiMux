@@ -6,12 +6,11 @@ use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
 use std::path::PathBuf;
 
 fn fs(path: &str) -> FileStatus {
-    FileStatus {
-        path: PathBuf::from(path),
-        index: IndexStatus::Modified,
-        worktree: WorktreeStatus::Unmodified,
-        rename: None,
-    }
+    FileStatus::with_status(
+        PathBuf::from(path),
+        IndexStatus::Modified,
+        WorktreeStatus::Unmodified,
+    )
 }
 
 #[test]

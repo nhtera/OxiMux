@@ -4,6 +4,7 @@
 //! these types without pulling in tokio + the git process layer. The git crate
 //! owns the parser; this module owns the shapes.
 
+use crate::ConflictKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -32,6 +33,32 @@ pub struct FileStatus {
     pub worktree: WorktreeStatus,
     /// Populated for record type 2 (rename/copy).
     pub rename: Option<RenameInfo>,
+    /// `(added, removed)` line counts vs `HEAD`. Populated by merging
+    /// `git diff --numstat HEAD` into the porcelain v2 file list. `None`
+    /// when the path has no countable diff (binary, mode-only, untracked,
+    /// fresh repo without HEAD).
+    pub line_counts: Option<(u32, u32)>,
+    /// Three-way-merge conflict classification — `Some` only for `u`
+    /// records whose XY pair maps to one of the seven legal conflict
+    /// codes (`DD`, `AU`, `UD`, `UA`, `DU`, `AA`, `UU`).
+    pub conflict_kind: Option<ConflictKind>,
+}
+
+impl FileStatus {
+    /// Construct a `FileStatus` for a non-rename, non-conflict, no-numstat
+    /// path. Phase-02 helper that keeps the dozens of test / sample sites
+    /// out of `{rename: None, line_counts: None, conflict_kind: None}`
+    /// boilerplate.
+    pub fn with_status(path: PathBuf, index: IndexStatus, worktree: WorktreeStatus) -> Self {
+        Self {
+            path,
+            index,
+            worktree,
+            rename: None,
+            line_counts: None,
+            conflict_kind: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

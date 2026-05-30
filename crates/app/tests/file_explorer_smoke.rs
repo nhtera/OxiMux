@@ -67,12 +67,11 @@ async fn file_explorer_constructs_without_panic(cx: &mut TestAppContext) {
         ahead: 0,
         behind: 0,
         head_oid: None,
-        files: vec![FileStatus {
-            path: std::path::PathBuf::from("README.md"),
-            index: IndexStatus::Unmodified,
-            worktree: WorktreeStatus::Modified,
-            rename: None,
-        }],
+        files: vec![FileStatus::with_status(
+            std::path::PathBuf::from("README.md"),
+            IndexStatus::Unmodified,
+            WorktreeStatus::Modified,
+        )],
     };
     tx.send(PollState::Ready(git_state)).expect("send ok");
     cx.run_until_parked();

@@ -13,6 +13,7 @@ pub mod diff;
 pub mod error;
 pub mod log;
 pub mod merge;
+pub mod numstat;
 pub mod poller;
 pub mod process;
 pub mod remote;
@@ -24,6 +25,7 @@ pub mod worktree;
 
 pub use diff::{DiffParseError, parse_unified_diff};
 pub use error::{GitError, Result};
+pub use numstat::{diff_numstat_head, parse_numstat_z};
 pub use poller::{DEFAULT_TICK, PollState, StatusPoller};
 pub use process::{GitCmd, Output, RawOutput};
 pub use repository::Repository;
