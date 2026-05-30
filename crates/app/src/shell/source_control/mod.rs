@@ -8,12 +8,13 @@
 //! ├── commit area (prefix subj body btn) ┤
 //! ├── files list (GitPanel)              ┤
 //! ├── diff view (DiffView)               ┤
-//! ├── commit graph (Phase 05, scope=All) ┤
+//! ├── commit graph (scope=All)           ┤
 //! └──────────────────────────────────────┘
 //! ```
 //!
-//! All children stay always-mounted (Phase 04 plan: avoid IPC storms on tab
-//! switch). Filter / scope / commit state lives on `SourceControlPanel`.
+//! All children stay always-mounted — avoids IPC storms when the user
+//! flips between scope tabs or quickly switches workspaces. Filter /
+//! scope / commit state lives on `SourceControlPanel`.
 
 pub mod branch_picker;
 pub mod commit_area;
@@ -44,7 +45,8 @@ use tokio::sync::watch;
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::GitPanel;
-use crate::shell::source_control::commit_area::CommitArea;
+use crate::shell::source_control::branch_picker::{BranchPicker, OnPick, PickerMode, PickerOutcome};
+use crate::shell::source_control::commit_area::{CommitArea, CommitStatus};
 use crate::shell::source_control::dropdown_items::DropdownInputs;
 use crate::shell::source_control::graph::CommitGraph;
 use crate::shell::source_control::primary_action::{
@@ -76,6 +78,11 @@ pub struct SourceControlPanel {
     /// check is in flight or when the state isn't a lease candidate.
     force_push_with_lease: bool,
 
+    /// Held for the async picker-fetch + branch-switch tasks that need a
+    /// live `Repository` handle on the panel itself (the observer task
+    /// already has its own clone).
+    repo: Repository,
+
     scope: SourceControlScope,
     filter_query: String,
     filter_input: Entity<InputState>,
@@ -90,6 +97,7 @@ pub struct SourceControlPanel {
     pub diff_view: Entity<DiffView>,
     pub commit_area: Entity<CommitArea>,
     pub commit_graph: Entity<CommitGraph>,
+    pub branch_picker: Entity<BranchPicker>,
 
     theme: Theme,
     density: Density,
@@ -145,10 +153,35 @@ impl SourceControlPanel {
         let commit_graph =
             cx.new(|cx| CommitGraph::new(repo.clone(), theme, density, typography.clone(), cx));
 
+        // Picker entity is built once and reused across opens — the
+        // owner-side callback (built below from a weak self-ref) routes
+        // the user's choice to the appropriate `apply_*` method on the
+        // panel. The callback only fires while the panel is alive
+        // because the picker holds it as a `Box<dyn Fn>` and the weak
+        // capture short-circuits when `self` is dropped.
+        let panel_weak = cx.weak_entity();
+        let on_pick: OnPick = Box::new(move |outcome, window, cx| {
+            let _ = panel_weak.update(cx, |panel, cx| {
+                panel.apply_picker_outcome(outcome, window, cx);
+            });
+        });
+        let branch_picker = cx.new(|cx| {
+            BranchPicker::new(
+                PickerMode::Switch,
+                on_pick,
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
+
         Self {
             poll_state: initial,
             git_state,
             force_push_with_lease: false,
+            repo,
             scope: SourceControlScope::All,
             filter_query: String::new(),
             filter_input,
@@ -157,6 +190,7 @@ impl SourceControlPanel {
             diff_view,
             commit_area,
             commit_graph,
+            branch_picker,
             theme,
             density,
             typography,
@@ -411,33 +445,32 @@ impl SourceControlPanel {
             .as_ref()
             .map(|s| (s.ahead, s.behind, s.branch.clone()))
             .unwrap_or((0, 0, None));
-        // Branch name is appended ("of {branch}") so the cockpit reads
-        // like the rest of the chrome (status bar already shows branch).
-        // Detached HEAD / pre-poll → branch is None; drop the suffix so we
-        // don't render "ahead of None". `filter(!is_empty)` is defensive
-        // against a corrupt/synthetic `GitState` carrying `Some("")` —
-        // the live parser never emits empty, but the guard keeps the
-        // toolbar from showing a stray trailing " of ".
-        let suffix = branch
-            .as_deref()
-            .filter(|b| !b.is_empty())
-            .map(|b| format!(" of {b}"))
-            .unwrap_or_default();
-        let summary = if behind == 0 && ahead == 0 {
-            format!("0 commits ahead{suffix}")
+        // Split the summary into prefix (counts) + clickable branch chip
+        // suffix. The chip opens the Switch-mode branch picker.
+        // Detached HEAD / pre-poll → branch is None; we drop the chip
+        // entirely. `filter(!is_empty)` is defensive against a corrupt
+        // `GitState` carrying `Some("")` — the live parser never emits
+        // empty, but the guard keeps the toolbar from showing a stray
+        // trailing " of ".
+        let prefix = if behind == 0 && ahead == 0 {
+            "0 commits ahead".to_string()
         } else if behind == 0 {
             format!(
-                "{ahead} commit{} ahead{suffix}",
+                "{ahead} commit{} ahead",
                 if ahead == 1 { "" } else { "s" }
             )
         } else if ahead == 0 {
             format!(
-                "{behind} commit{} behind{suffix}",
+                "{behind} commit{} behind",
                 if behind == 1 { "" } else { "s" }
             )
         } else {
-            format!("{ahead} ahead • {behind} behind{suffix}")
+            format!("{ahead} ahead • {behind} behind")
         };
+        let branch_chip: Option<gpui::SharedString> = branch
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(|b| gpui::SharedString::from(b.to_string()));
 
         // Right-aligned compact icon cluster.
         // settings-2 is still a placeholder (backend not yet wired);
@@ -491,7 +524,7 @@ impl SourceControlPanel {
                     })),
             );
 
-        div()
+        let mut summary_row = div()
             .flex()
             .flex_row()
             .items_center()
@@ -502,8 +535,28 @@ impl SourceControlPanel {
             .border_color(theme.border_inactive)
             .text_size(px(sc_style::TEXT))
             .text_color(theme.fg_muted)
-            .child(summary)
-            .child(actions)
+            .child(prefix);
+        if let Some(chip) = branch_chip {
+            // " of " stays in the muted summary; only the branch name is
+            // clickable + emphasized so the affordance is obvious without
+            // needing a visible button frame.
+            summary_row = summary_row.child(" of ").child(
+                div()
+                    .id("sc-branch-chip")
+                    .ml(px(2.0))
+                    .text_color(theme.fg_base)
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|panel, _: &MouseDownEvent, window, cx| {
+                            panel.open_switch_picker(window, cx);
+                        }),
+                    )
+                    .child(chip),
+            );
+        }
+        summary_row.child(actions)
     }
 
     fn render_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -554,6 +607,110 @@ impl SourceControlPanel {
         panel.update(cx, |p, cx| p.set_filter(String::new(), cx));
         cx.notify();
     }
+
+    /// Open the branch picker in Switch mode anchored under the toolbar
+    /// branch chip. Branch list is fetched async; the popover opens
+    /// immediately (empty list with the placeholder text), then populates
+    /// when `list_branches` returns. `list_branches` is local and
+    /// typically resolves in tens of milliseconds.
+    fn open_switch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let current = self.git_state.as_ref().and_then(|s| s.branch.clone());
+        let picker = self.branch_picker.clone();
+        cx.spawn_in(window, async move |_panel_weak, cx| {
+            let candidates: Vec<String> = match repo.list_branches().await {
+                Ok(bs) => {
+                    let names: Vec<String> = bs.into_iter().map(|b| b.name).collect();
+                    promote_current_branch(names, current.as_deref())
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "oximux_app::source_control",
+                        error = %err,
+                        "list_branches failed; opening picker with empty list",
+                    );
+                    Vec::new()
+                }
+            };
+            let _ = picker.update_in(cx, |p, window, cx| {
+                p.set_mode(PickerMode::Switch);
+                p.open(
+                    candidates,
+                    current.clone(),
+                    sc_style::PAD_H,
+                    sc_style::TAB_H + sc_style::TOOLBAR_H,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// Branch-picker callback router. Lives on the panel so the spawned
+    /// closure stays tiny (just `panel.apply_picker_outcome(...)`) and
+    /// the actual dispatch is testable without GPUI plumbing.
+    fn apply_picker_outcome(
+        &mut self,
+        outcome: PickerOutcome,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            PickerOutcome::Branch(name) => self.switch_to_branch(name, cx),
+            PickerOutcome::CreateFromHead(name) => self.create_branch_and_switch(name, cx),
+            PickerOutcome::UseRepoDefault => {
+                // BaseRef-mode outcome — wired in the next slice once
+                // the per-worktree settings repo is plumbed in.
+                tracing::debug!(
+                    target: "oximux_app::source_control",
+                    "BaseRef picker not yet wired; ignoring UseRepoDefault outcome",
+                );
+            }
+        }
+    }
+
+    /// Dispatch `repo.switch_branch(name)`. Success leaves status
+    /// unchanged (the StatusPoller's next tick reflects the new branch).
+    /// Failure surfaces via `CommitStatus::Failed("switch", err)` so the
+    /// existing status row in the commit area shows the error without
+    /// needing a separate toast surface.
+    fn switch_to_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let commit_area = self.commit_area.clone();
+        cx.spawn(async move |_panel_weak, cx| {
+            let result = repo.switch_branch(&name).await;
+            commit_area.update(cx, |area, cx| {
+                write_branch_op_status(area, "switch", &name, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Chain `create_branch(name, Some("HEAD"))` followed by
+    /// `switch_branch(name)`. `create_branch` does NOT check out by
+    /// itself; the second call is mandatory for the user-visible "Create
+    /// branch from HEAD" semantics. If creation fails (name collision,
+    /// invalid characters), we bail before the switch so we don't leave
+    /// the user on an unintended branch.
+    fn create_branch_and_switch(&mut self, name: String, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let commit_area = self.commit_area.clone();
+        cx.spawn(async move |_panel_weak, cx| {
+            let create_result = repo.create_branch(&name, Some("HEAD")).await;
+            if create_result.is_err() {
+                commit_area.update(cx, |area, cx| {
+                    write_branch_op_status(area, "create branch", &name, create_result, cx);
+                });
+                return;
+            }
+            let switch_result = repo.switch_branch(&name).await;
+            commit_area.update(cx, |area, cx| {
+                write_branch_op_status(area, "switch", &name, switch_result, cx);
+            });
+        })
+        .detach();
+    }
 }
 
 impl Render for SourceControlPanel {
@@ -561,6 +718,7 @@ impl Render for SourceControlPanel {
         let theme = self.theme;
         let action = self.resolve_primary(cx);
         let dropdown_inputs = self.build_dropdown_inputs(cx);
+        let picker = self.branch_picker.clone();
 
         // Snapshot per-section render outputs as `AnyElement` so we can drop
         // each borrow of `cx` before composing the final tree.
@@ -626,8 +784,78 @@ impl Render for SourceControlPanel {
                     .child(self.commit_graph.clone()),
             );
         }
-        body
+        // `.relative()` makes the body the positioning ancestor for the
+        // branch picker's full-overlay (`absolute().inset_0()` inside its
+        // own render). That confines click-outside dismiss to the panel
+        // surface — clicks elsewhere in the cockpit don't accidentally
+        // trigger it.
+        div()
+            .relative()
+            .w_full()
+            .h_full()
+            .child(body)
+            .child(picker)
     }
+}
+
+/// Write the result of a branch-level operation (switch / create-branch)
+/// to the commit area's status row WITHOUT clobbering an in-flight
+/// commit / push / pull / sync / fetch op's own status.
+///
+/// The commit area's `in_flight` AtomicBool is owned by `commit_ops`
+/// for the lifetime of those ops. Reading it lets the branch-level path
+/// detect "someone else's status row" and step around — writing
+/// `CommitStatus::Idle` on a successful switch while a push is racing
+/// would silently swallow whatever the push reports next. The error
+/// case is also guarded so a slow switch failing AFTER a commit failed
+/// doesn't overwrite the commit error.
+///
+/// When the lane is busy we still log the result at warn level so the
+/// outcome isn't completely invisible to operators inspecting traces.
+fn write_branch_op_status(
+    area: &mut CommitArea,
+    verb: &'static str,
+    branch: &str,
+    result: oximux_git::Result<()>,
+    cx: &mut Context<CommitArea>,
+) {
+    let busy = area
+        .in_flight
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if busy {
+        if let Err(ref err) = result {
+            tracing::warn!(
+                target: "oximux_app::source_control",
+                verb = %verb,
+                branch = %branch,
+                error = %err,
+                "branch op failed while commit-area was in flight — status row owned elsewhere",
+            );
+        }
+        return;
+    }
+    match result {
+        Ok(()) => area.status = CommitStatus::Idle,
+        Err(err) => area.status = CommitStatus::Failed(verb.to_string(), err.to_string()),
+    }
+    cx.notify();
+}
+
+/// Move `current` (if present) to position 0 of `names`. Used to pin
+/// the currently-checked-out branch to the top of the Switch-picker
+/// list so the user can immediately see where they already are.
+/// Pure for unit-test coverage; the side-effect-free shape also makes
+/// it cheap to reuse from future call sites (e.g. a "recent branches"
+/// pre-filter pass).
+pub fn promote_current_branch(mut names: Vec<String>, current: Option<&str>) -> Vec<String> {
+    if let Some(c) = current
+        && let Some(pos) = names.iter().position(|n| n == c)
+        && pos > 0
+    {
+        let cur = names.remove(pos);
+        names.insert(0, cur);
+    }
+    names
 }
 
 /// Refresh the cached `force_push_with_lease` flag on the panel.
@@ -660,4 +888,43 @@ async fn refresh_force_push_with_lease(
             cx.notify();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::promote_current_branch;
+
+    #[test]
+    fn promote_current_to_front_when_present() {
+        let names = vec!["main".into(), "feat-a".into(), "feat-b".into()];
+        let out = promote_current_branch(names, Some("feat-a"));
+        assert_eq!(out, vec!["feat-a", "main", "feat-b"]);
+    }
+
+    #[test]
+    fn promote_no_op_when_current_already_at_front() {
+        let names = vec!["main".into(), "feat-a".into()];
+        let out = promote_current_branch(names, Some("main"));
+        assert_eq!(out, vec!["main", "feat-a"]);
+    }
+
+    #[test]
+    fn promote_no_op_when_current_not_in_list() {
+        let names = vec!["main".into(), "feat-a".into()];
+        let out = promote_current_branch(names, Some("missing"));
+        assert_eq!(out, vec!["main", "feat-a"]);
+    }
+
+    #[test]
+    fn promote_no_op_when_current_is_none() {
+        let names = vec!["main".into(), "feat-a".into()];
+        let out = promote_current_branch(names, None);
+        assert_eq!(out, vec!["main", "feat-a"]);
+    }
+
+    #[test]
+    fn promote_empty_input_returns_empty() {
+        let out = promote_current_branch(Vec::<String>::new(), Some("main"));
+        assert!(out.is_empty());
+    }
 }
