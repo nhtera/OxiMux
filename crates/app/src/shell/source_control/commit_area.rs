@@ -641,7 +641,7 @@ impl CommitArea {
             .child(meta_row)
             .child(textarea)
             .child(primary)
-            .child(status_row)
+            .children(status_row)
     }
 
     /// Prepend a conventional-commit prefix (`feat`, `fix`, …) to the
@@ -790,13 +790,17 @@ fn primary_icon_for(kind: PrimaryActionKind) -> Option<IconName> {
     }
 }
 
+/// Single-line status indicator beneath the primary action. Returns
+/// `None` while idle so the empty row doesn't reserve its line-height
+/// as dead space between the composer and the file list — the row only
+/// appears when there's something to say.
 fn render_status_row(
     theme: Theme,
     _typography: &Typography,
     status: &CommitStatus,
-) -> impl IntoElement {
+) -> Option<impl IntoElement> {
     let (color, msg) = match status {
-        CommitStatus::Idle => (theme.fg_subtle, String::new()),
+        CommitStatus::Idle => return None,
         CommitStatus::Committing => (theme.fg_muted, "Committing…".to_string()),
         CommitStatus::Pushing => (theme.fg_muted, "Pushing…".to_string()),
         CommitStatus::Pulling => (theme.fg_muted, "Pulling…".to_string()),
@@ -811,10 +815,12 @@ fn render_status_row(
             format!("{} failed: {error}", title_case_first(label)),
         ),
     };
-    div()
-        .text_size(px(sc_style::GRAPH_META_TEXT))
-        .text_color(color)
-        .child(msg)
+    Some(
+        div()
+            .text_size(px(sc_style::GRAPH_META_TEXT))
+            .text_color(color)
+            .child(msg),
+    )
 }
 
 fn title_case_first(s: &str) -> String {

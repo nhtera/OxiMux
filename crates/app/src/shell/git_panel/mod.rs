@@ -499,6 +499,9 @@ impl Render for GitPanel {
 
         // Outer container is `relative` so the floating `BulkActionBar`
         // (positioned absolute, bottom-anchored) lays out against it.
+        // No own border — the panel reads as one continuous surface
+        // with the SCM chrome above; any divider belongs on the
+        // composer/filter rows, not on this container.
         div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_stage_file))
@@ -512,8 +515,6 @@ impl Render for GitPanel {
             .min_h(px(0.0))
             .overflow_hidden()
             .bg(self.theme.bg_panel)
-            .border_l_1()
-            .border_color(self.theme.border_inactive)
             .child(scroll_body)
             .children(bar)
     }

@@ -1,9 +1,9 @@
 //! Toolbar rendering for the Source Control panel: scope tabs, branch
-//! summary chip + view-mode / base-ref / refresh icon cluster, and the
-//! filter input row.
+//! summary row (prefix counts + clickable branch chip + Push/Pull pills
+//! + the right-anchored panel-actions cluster), and the filter input row.
 //!
-//! All three render methods are `pub(super) fn` on `SourceControlPanel`
-//! so the panel's `Render` impl in `mod.rs` calls them with the same
+//! All render methods are `pub(super) fn` on `SourceControlPanel` so
+//! the panel's `Render` impl in `mod.rs` calls them with the same
 //! ergonomic `self.render_*(cx)` shape. The split is purely structural
 //! — there is no toolbar state of its own; everything reads from the
 //! panel's existing fields (`scope`, `git_state`, `git_panel`,
@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 
 use gpui::{
     ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
+    ParentElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Icon, IconName, Sizable as _,
@@ -33,97 +33,6 @@ use crate::shell::source_control::scope::SourceControlScope;
 use crate::shell::source_control::style as sc_style;
 
 impl SourceControlPanel {
-    /// Render the 32-px cockpit header strip docked at the very top of
-    /// the SCM panel: repo name on the left, Refresh + Settings cog on
-    /// the right. The strip relocates the two icon-only actions that
-    /// previously hung at the right end of the branch toolbar; moving
-    /// them above the scope tabs gives the panel a clear chrome row
-    /// that names the working surface and groups the global panel
-    /// actions, leaving the branch-toolbar row focused on
-    /// ahead/behind state + the branch chip + the Push/Pull pills.
-    ///
-    /// Repo name source: `workdir().file_name()` — the folder name.
-    /// Stable across workspace switches without plumbing a workspace
-    /// label through `PanelConfig`. Worktree paths (where the
-    /// basename is e.g. `worktree-feat-foo`) read fine; the
-    /// alternative (storage-backed `WorkspaceRow.name`) is a follow-
-    /// up if the basename ever proves visually confusing in practice.
-    pub(super) fn render_panel_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let typography = &self.typography;
-        let _ = self.density;
-        let repo_name: SharedString = self
-            .repo
-            .workdir()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("(no repo)")
-            .to_string()
-            .into();
-        let base_ref_tooltip = self
-            .base_ref
-            .as_deref()
-            .map(|b| format!("Base ref: {b} (click to change)"))
-            .unwrap_or_else(|| "Change base ref".to_string());
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .flex_shrink_0()
-            .h(px(sc_style::TOOLBAR_H))
-            .px(px(sc_style::pad_h(self.density)))
-            .border_b_1()
-            .border_color(theme.border_inactive)
-            // Repo name. Flex-1 lets the cog cluster anchor to the right
-            // edge; truncation guarantees long folder names don't push the
-            // icons off-screen on narrow panels.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_size(px(sc_style::BODY_TEXT))
-                    .font_weight(typography.w_semibold)
-                    .text_color(theme.fg_base)
-                    .child(repo_name),
-            )
-            // Refresh — Cmd+R also dispatches `RefreshSourceControl`
-            // and lands the same `commit_graph.refresh` call, so the
-            // tooltip advertises the chord. Cheap; no rate limit.
-            .child(
-                Button::new("sc-header-refresh")
-                    .ghost()
-                    .xsmall()
-                    .icon(
-                        Icon::default()
-                            .path("icons/refresh-cw.svg")
-                            .size(px(sc_style::ICON)),
-                    )
-                    .tooltip("Refresh (⌘R)")
-                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
-                        panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
-                    })),
-            )
-            // Settings cog — opens the BaseRef picker. Moved out of the
-            // branch toolbar's right-side cluster so the cluster can
-            // shrink to a single view-mode toggle.
-            .child(
-                Button::new("sc-header-settings")
-                    .ghost()
-                    .xsmall()
-                    .icon(
-                        Icon::default()
-                            .path("icons/settings-2.svg")
-                            .size(px(sc_style::ICON)),
-                    )
-                    .tooltip(base_ref_tooltip)
-                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
-                        panel.open_base_ref_picker(window, cx);
-                    })),
-            )
-    }
-
     pub(super) fn render_scope_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let typography = &self.typography;
@@ -276,17 +185,42 @@ impl SourceControlPanel {
             .filter(|b| !b.is_empty())
             .map(|b| gpui::SharedString::from(b.to_string()));
 
-        // Right-aligned compact icon cluster. Phase 07 relocated
-        // settings-2 + refresh up into the panel header strip (next to
-        // the repo name), so the toolbar's right end now holds only the
-        // view-mode toggle. Keeps the branch-summary row focused on
-        // ahead/behind state + Push/Pull pills + the view-mode toggle.
+        // Right-aligned compact icon cluster. Hosts every panel-scope
+        // action: settings (base-ref picker) → view-mode (flat/tree
+        // toggle) → refresh. Ordering puts the settings affordance on
+        // the outside because it's the rarest interaction; refresh is
+        // anchored to the panel's far edge so it's easy to land on
+        // without aim. The branch-summary row owns this cluster (rather
+        // than a separate chrome strip above the tabs) so the panel
+        // surface reads as one continuous control band: scope → state +
+        // actions → composer → file list.
+        let base_ref_tooltip = self
+            .base_ref
+            .as_deref()
+            .map(|b| format!("Base ref: {b} (click to change)"))
+            .unwrap_or_else(|| "Change base ref".to_string());
         let actions = div()
             .ml_auto()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(sc_style::ICON_CLUSTER_GAP))
+            // Settings — opens the BaseRef picker. Sliders glyph reads
+            // as "configure this panel" rather than as a destination.
+            .child(
+                Button::new("sc-toolbar-settings")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::default()
+                            .path("icons/settings-2.svg")
+                            .size(px(sc_style::ICON)),
+                    )
+                    .tooltip(base_ref_tooltip)
+                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                        panel.open_base_ref_picker(window, cx);
+                    })),
+            )
             .child(
                 Button::new("sc-toolbar-view-mode")
                     .ghost()
@@ -299,6 +233,23 @@ impl SourceControlPanel {
                     .tooltip(view_mode_tooltip)
                     .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
                         panel.git_panel.update(cx, |g, cx| g.cycle_view_mode(cx));
+                    })),
+            )
+            // Refresh — Cmd+R also dispatches `RefreshSourceControl`
+            // and lands the same `commit_graph.refresh` call, so the
+            // tooltip advertises the chord. Cheap; no rate limit.
+            .child(
+                Button::new("sc-toolbar-refresh")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::default()
+                            .path("icons/refresh-cw.svg")
+                            .size(px(sc_style::ICON)),
+                    )
+                    .tooltip("Refresh (⌘R)")
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                        panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
                     })),
             );
 
@@ -393,8 +344,13 @@ impl SourceControlPanel {
 
     pub(super) fn render_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let _ = (self.density, &self.typography);
+        let typography = &self.typography;
+        let _ = self.density;
         let has_query = !self.filter_query.is_empty();
+        // Filter input rides on `t_body_sm` (11px) — the Input widget
+        // ignores text-size set on its parent div, so the size must be
+        // applied to the Input itself. Matches the search-panel header's
+        // own filter strip for one-keyboard-feel across the cockpit.
         let mut row = div()
             .flex()
             .flex_row()
@@ -411,10 +367,12 @@ impl SourceControlPanel {
                     .text_color(theme.fg_subtle),
             )
             .child(
-                div()
-                    .flex_1()
-                    .text_size(px(sc_style::BODY_TEXT))
-                    .child(Input::new(&self.filter_input).appearance(false)),
+                div().flex_1().child(
+                    Input::new(&self.filter_input)
+                        .small()
+                        .appearance(false)
+                        .text_size(px(typography.t_body_sm)),
+                ),
             );
         if has_query {
             row = row.child(

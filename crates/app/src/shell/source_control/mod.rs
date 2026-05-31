@@ -657,7 +657,6 @@ impl Render for SourceControlPanel {
 
         // Snapshot per-section render outputs as `AnyElement` so we can drop
         // each borrow of `cx` before composing the final tree.
-        let panel_header: AnyElement = self.render_panel_header(cx).into_any_element();
         let scope_tabs: AnyElement = self.render_scope_tabs(cx).into_any_element();
         let toolbar: AnyElement = self.render_branch_toolbar(cx).into_any_element();
         let filter_row: AnyElement = self.render_filter_row(cx).into_any_element();
@@ -749,26 +748,24 @@ impl Render for SourceControlPanel {
                 .child(self.git_panel.clone())
         };
 
-        // Layout order: header → scope tabs → toolbar → filter →
-        // **commit area (top-docked)** → **files (flex_1)** → stash →
-        // graph. The composer sits directly under the filter row so
-        // the user's primary verb (write a message + commit / stage /
-        // push) is the first interactive surface they land on after
-        // skimming the toolbar — matches the reference cockpit. The
-        // file list takes the remaining vertical slack (`flex_1`),
+        // Layout order: scope tabs → branch toolbar (summary + Push/Pull
+        // + panel-actions cluster) → filter → **commit area (top-docked)**
+        // → **files (flex_1)** → stash → graph. The composer sits
+        // directly under the filter row so the user's primary verb
+        // (write a message + commit / stage / push) is the first
+        // interactive surface they land on after skimming the toolbar.
+        // The file list takes the remaining vertical slack (`flex_1`),
         // shrinking before the composer or graph rather than pushing
-        // them off-screen on short lists.
+        // them off-screen on short lists. The repo identity now lives
+        // in the surrounding workspace chrome rather than a dedicated
+        // SCM header strip — `render_branch_toolbar` owns the right-
+        // anchored Settings / View-mode / Refresh icon cluster.
         let mut body = div()
             .flex()
             .flex_col()
             .w_full()
             .h_full()
             .bg(theme.bg_panel)
-            // Phase 07 panel header strip — repo name + Refresh +
-            // Settings cog. Sits above the scope tabs so the panel
-            // surface reads top-down: workspace identity → scope → branch
-            // state → composer → file list → graph.
-            .child(panel_header)
             .child(scope_tabs)
             .child(toolbar)
             .child(filter_row)

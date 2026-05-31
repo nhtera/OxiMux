@@ -175,6 +175,15 @@ pub fn render_sections(
     // grow to its natural (sum-of-rows) height so `overflow_y_scroll` sees
     // overflow and actually scrolls. With `h_full()` the column would clamp
     // to parent height, content clips silently, and the scrollbar never fires.
+    //
+    // `is_topmost` flag suppresses the leading `pad_panel` on whichever
+    // section ends up rendering first — without it, the composer's
+    // "Stage All" button sits a `pad_panel` (8px) gap above the
+    // CHANGES header, which reads as dead space on a clean composer.
+    // Empty sections collapse to a zero-height div, so the next
+    // populated section inherits the "topmost" role naturally.
+    let unstaged_empty = sections.unstaged.is_empty();
+    let staged_empty = sections.staged.is_empty();
     div()
         .flex()
         .flex_col()
@@ -182,6 +191,7 @@ pub fn render_sections(
             "CHANGES",
             &sections.unstaged,
             RowKind::Unstaged,
+            true,
             rctx,
             cx,
         ))
@@ -189,6 +199,7 @@ pub fn render_sections(
             "STAGED CHANGES",
             &sections.staged,
             RowKind::Staged,
+            unstaged_empty,
             rctx,
             cx,
         ))
@@ -196,6 +207,7 @@ pub fn render_sections(
             "UNTRACKED FILES",
             &sections.untracked,
             RowKind::Untracked,
+            unstaged_empty && staged_empty,
             rctx,
             cx,
         ))
@@ -206,6 +218,7 @@ fn section(
     title: &'static str,
     rows: &[&FileStatus],
     kind: RowKind,
+    is_topmost: bool,
     rctx: &RenderCtx<'_>,
     cx: &mut Context<GitPanel>,
 ) -> impl IntoElement {
@@ -289,11 +302,15 @@ fn section(
                 })
                 .child(c)
         }));
-    let mut col = div()
-        .flex()
-        .flex_col()
-        .pt(px(rctx.density.pad_panel))
-        .child(header);
+    let mut col = div().flex().flex_col();
+    if !is_topmost {
+        // Inter-section breathing room. The topmost section skips this
+        // so its header reads as continuous with whatever sits above it
+        // in the panel (composer's Stage All button, conflict banner,
+        // etc.) — see render_sections' is_topmost wiring.
+        col = col.pt(px(rctx.density.pad_panel));
+    }
+    col = col.child(header);
     if !is_collapsed {
         match rctx.view_mode {
             ViewMode::Flat => {
