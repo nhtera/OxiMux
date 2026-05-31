@@ -145,6 +145,11 @@ impl RightSidebar {
                         density,
                         typography: typography.clone(),
                         worktree_settings_repo: worktree_settings_repo.clone(),
+                        // SCM panel's ConflictSummaryCard "Open all
+                        // in editor" needs the host file-open
+                        // callback. `OnOpenFile` is `Arc<dyn Fn ...>`
+                        // — clone is O(1).
+                        on_open_file: on_open_file.clone(),
                     },
                     sc_rx,
                     diff_view.clone(),
@@ -290,6 +295,10 @@ impl RightSidebar {
                     // Test wiring: no persistence layer — the panel still
                     // works for in-memory base-ref picks.
                     worktree_settings_repo: None,
+                    // Test wiring: no host file-open callback — the
+                    // ConflictSummaryCard's "Open all in editor"
+                    // button stays disabled.
+                    on_open_file: None,
                 },
                 sc_rx,
                 diff_view.clone(),

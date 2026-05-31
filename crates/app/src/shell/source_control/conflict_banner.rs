@@ -49,10 +49,10 @@ pub fn conflict_summary_text(count: usize) -> String {
 /// host's open-file callback for each.
 ///
 /// `enabled = false` renders the button in its disabled state with
-/// a "Wiring lands in next slice" tooltip; this lets the card ship
-/// before the click is wired without showing a silently-broken
-/// button. Callers that have the file-open callback in hand pass
-/// `enabled = true`.
+/// an "unavailable in this context" tooltip; callers without the
+/// host file-open callback wired (e.g. integration tests) pass
+/// `false` so the button reflects the actual capability rather
+/// than silently no-op'ing.
 ///
 /// Returns `None` when `count == 0` so the caller can
 /// `.children(iter)` the result without an extra outer `if`.
@@ -72,7 +72,7 @@ where
     let button_tooltip = if enabled {
         "Open every conflicting file in the editor"
     } else {
-        "Opens conflicting files — wiring lands in the next slice"
+        "Open-file action unavailable in this context"
     };
     Some(
         div()

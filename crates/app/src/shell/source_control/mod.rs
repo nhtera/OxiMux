@@ -74,6 +74,11 @@ pub struct PanelConfig {
     /// renders without persistence (BaseRef picker still works but
     /// changes don't survive a restart).
     pub worktree_settings_repo: Option<WorktreeSettingsRepo>,
+    /// Host callback to open a file in the main pane. Drives the
+    /// "Open all in editor" button on the ConflictSummaryCard. `None`
+    /// in test wiring → the button stays disabled with a "wiring
+    /// unavailable" tooltip rather than silently no-op'ing.
+    pub on_open_file: Option<crate::shell::file_tree_view::OnOpenFile>,
 }
 
 pub struct SourceControlPanel {
@@ -110,6 +115,12 @@ pub struct SourceControlPanel {
     /// repo (test wiring); in that case the base ref still works in
     /// memory but doesn't survive restart.
     worktree_settings_repo: Option<WorktreeSettingsRepo>,
+
+    /// Host callback to open a file in the main pane. Captured for
+    /// the ConflictSummaryCard's "Open all in editor" button; the
+    /// async fetch of `list_conflicting_paths` fires it once per
+    /// path returned.
+    on_open_file: Option<crate::shell::file_tree_view::OnOpenFile>,
 
     /// Held for the async picker-fetch + branch-switch tasks that need a
     /// live `Repository` handle on the panel itself (the observer task
@@ -155,6 +166,7 @@ impl SourceControlPanel {
             density,
             typography,
             worktree_settings_repo,
+            on_open_file,
         } = cfg;
         // Read the persisted base ref synchronously — the repo handle
         // is local SQLite, ~microsecond cost. If the row is missing /
@@ -240,6 +252,7 @@ impl SourceControlPanel {
             force_push_with_lease: false,
             base_ref: initial_base_ref,
             current_op: initial_op,
+            on_open_file,
             worktree_settings_repo,
             repo,
             scope: SourceControlScope::All,
@@ -270,6 +283,93 @@ impl SourceControlPanel {
     pub fn select_scope(&mut self, scope: SourceControlScope, cx: &mut Context<Self>) {
         self.scope = scope;
         cx.notify();
+    }
+
+    /// Fetch the current set of conflicting paths and dispatch the
+    /// host's `OnOpenFile` callback for each — opens every
+    /// conflicting file in its own editor tab. Async because
+    /// `list_conflicting_paths` shells out to `git diff
+    /// --diff-filter=U`; the per-path open dispatches inside
+    /// `update_in` on the panel's foreground executor so each click
+    /// lands as a real Window event.
+    ///
+    /// Paths from git are workdir-relative; the join with
+    /// `repo.workdir()` produces the absolute path `OnOpenFile`'s
+    /// contract requires. No-op (warn-logged) when the panel has no
+    /// host callback wired (test-only case).
+    /// Fetch the current set of conflicting paths and dispatch the
+    /// host's `OnOpenFile` callback for each — opens every
+    /// conflicting file in its own editor tab.
+    ///
+    /// Two-stage async to thread the tokio work + gpui dispatch
+    /// correctly (same pattern as `commit_ops::run_commit`): the
+    /// `git diff --diff-filter=U` shellout runs on the live tokio
+    /// runtime via `Handle::try_current().spawn(...)`, sends the
+    /// Vec<PathBuf> back through a `oneshot`, then a
+    /// `cx.spawn_in(window, ...)` task on the gpui executor awaits
+    /// the oneshot and fires `on_open` per path inside an
+    /// `update_in` block. Mixing the two runtimes directly (e.g.
+    /// awaiting a tokio future inside `cx.spawn_in`) silently no-ops
+    /// in headless test contexts; the channel hand-off works in both
+    /// production and tests.
+    ///
+    /// Paths from git are workdir-relative; the join with
+    /// `repo.workdir()` produces the absolute path `OnOpenFile`'s
+    /// contract requires. No-op (warn-logged) when the panel has no
+    /// host callback wired (test-only case) or when no tokio runtime
+    /// is entered.
+    ///
+    /// `pub` (not `pub(super)`) so integration tests at
+    /// `crates/app/tests/sc_open_all_conflicts.rs` can drive the
+    /// method directly without going through a Button click event.
+    pub fn open_all_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(on_open) = self.on_open_file.clone() else {
+            tracing::warn!(
+                target: "oximux_app::source_control",
+                "open_all_conflicts: no on_open_file callback wired; click ignored",
+            );
+            return;
+        };
+        let repo = self.repo.clone();
+        let workdir = repo.workdir().to_path_buf();
+        let (tx, rx) = tokio::sync::oneshot::channel::<oximux_git::Result<Vec<std::path::PathBuf>>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = tx.send(repo.list_conflicting_paths().await);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::source_control",
+                    "open_all_conflicts: no tokio runtime entered; skipping",
+                );
+                return;
+            }
+        }
+        cx.spawn_in(window, async move |_panel_weak, cx| {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            let paths = match result {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "oximux_app::source_control",
+                        error = %err,
+                        "list_conflicting_paths failed; open-all-conflicts skipped",
+                    );
+                    return;
+                }
+            };
+            let _ = cx.update(|window, app| {
+                for rel in paths {
+                    let absolute = workdir.join(&rel);
+                    on_open(absolute, window, app);
+                }
+            });
+        })
+        .detach();
     }
 
     fn start_state_observer(
@@ -485,15 +585,21 @@ impl Render for SourceControlPanel {
         // conflict" surface dominates the broader "operation
         // pending" surface so the user's eye lands on what they
         // can act on first.
+        // Capture the panel weak ref + on_open availability for the
+        // banner's click handler. Disabled (with explanatory
+        // tooltip) when no host callback is wired — test wiring
+        // path, production always supplies one.
+        let panel_weak = cx.weak_entity();
+        let open_all_enabled = self.on_open_file.is_some();
         let conflict_card: Option<AnyElement> = conflict_banner::render_conflict_summary_card(
             conflict_count,
             theme,
-            // `enabled = false` until the next slice plumbs the
-            // OnOpenFile callback + iterates list_conflicting_paths.
-            // The button renders disabled with explanatory tooltip
-            // rather than silently no-op'ing on click.
-            false,
-            |_window, _cx| {},
+            open_all_enabled,
+            move |window, app| {
+                let _ = panel_weak.update(app, |panel, cx| {
+                    panel.open_all_conflicts(window, cx);
+                });
+            },
         )
         .map(IntoElement::into_any_element);
         let operation_banner: Option<AnyElement> =
