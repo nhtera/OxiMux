@@ -423,6 +423,10 @@ impl Render for SourceControlPanel {
         let theme = self.theme;
         let action = self.resolve_primary(cx);
         let dropdown_inputs = self.build_dropdown_inputs(cx);
+        // Snapshot the conflict flag before we move `dropdown_inputs`
+        // into `commit_area_render` below — gates the composer-vs-
+        // placeholder swap a few lines down.
+        let has_conflict = dropdown_inputs.primary.has_unresolved_conflicts;
         let picker = self.branch_picker.clone();
 
         // Snapshot per-section render outputs as `AnyElement` so we can drop
@@ -430,9 +434,20 @@ impl Render for SourceControlPanel {
         let scope_tabs: AnyElement = self.render_scope_tabs(cx).into_any_element();
         let toolbar: AnyElement = self.render_branch_toolbar(cx).into_any_element();
         let filter_row: AnyElement = self.render_filter_row(cx).into_any_element();
-        let commit_area_render: AnyElement = self.commit_area.clone().update(cx, |a, cx| {
-            a.render(&action, dropdown_inputs, cx).into_any_element()
-        });
+        // Suppress the composer entirely under unresolved conflicts.
+        // Committing on top of conflict markers would persist them into
+        // the tree; force the user to resolve first. The real conflict
+        // banner (resolve / abort merge actions) lands in a follow-up
+        // phase — for now the placeholder is a one-line muted hint so
+        // the user sees WHY the composer is gone instead of an
+        // unexplained blank.
+        let commit_area_render: AnyElement = if has_conflict {
+            render_conflict_placeholder(theme).into_any_element()
+        } else {
+            self.commit_area.clone().update(cx, |a, cx| {
+                a.render(&action, dropdown_inputs, cx).into_any_element()
+            })
+        };
 
         // Filter wiring: helper `filter_files` is unit-tested in
         // `crates/app/tests/sc_filter.rs`; the changed-files list itself does
@@ -502,6 +517,27 @@ impl Render for SourceControlPanel {
             .child(picker)
     }
 }
+
+/// One-line muted placeholder shown in the composer slot while
+/// `has_unresolved_conflicts` is true. Keeps the layout stable (a
+/// disappearing composer would jump the file list around as the user
+/// resolves files) and gives the user a hint that the composer is
+/// intentionally hidden rather than broken. The full conflict banner
+/// — with resolve / abort merge action buttons — lands in a later
+/// phase; this is the minimum that closes the safety hole.
+fn render_conflict_placeholder(theme: oximux_settings::Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .w_full()
+        .px(px(style::PAD_H))
+        .py(px(style::PAD_V))
+        .text_size(px(style::META_TEXT))
+        .text_color(theme.fg_subtle)
+        .child("Resolve conflicts before committing")
+}
+
 /// Refresh the cached `force_push_with_lease` flag on the panel.
 ///
 /// Calls `Repository::lease_status(false)` (the 30 s cache absorbs
