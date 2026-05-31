@@ -62,6 +62,7 @@ use crate::shell::source_control::primary_action::{
 };
 use crate::shell::source_control::scope::SourceControlScope;
 use crate::shell::source_control::settings_persistence::load_initial_base_ref;
+use crate::shell::stash_panel::StashPanel;
 
 /// Bundle of repo + design tokens passed through `SourceControlPanel::new`.
 pub struct PanelConfig {
@@ -142,6 +143,11 @@ pub struct SourceControlPanel {
     pub commit_area: Entity<CommitArea>,
     pub commit_graph: Entity<CommitGraph>,
     pub branch_picker: Entity<BranchPicker>,
+    /// Stash list section docked between the commit area and the graph.
+    /// Default collapsed (power-user surface; see `StashPanel::new`).
+    /// `pub(crate)` so the host workspace can `cx.subscribe` to
+    /// `PushStashRequested` and mount the push-stash dialog.
+    pub(crate) stash_panel: Entity<StashPanel>,
 
     theme: Theme,
     density: Density,
@@ -216,6 +222,8 @@ impl SourceControlPanel {
         });
         let commit_graph =
             cx.new(|cx| CommitGraph::new(repo.clone(), theme, density, typography.clone(), cx));
+        let stash_panel =
+            cx.new(|cx| StashPanel::new(repo.clone(), theme, density, typography.clone(), cx));
 
         // Picker entity is built once and reused across opens — the
         // owner-side callback (built below from a weak self-ref) reads
@@ -264,6 +272,7 @@ impl SourceControlPanel {
             commit_area,
             commit_graph,
             branch_picker,
+            stash_panel,
             theme,
             density,
             typography,
@@ -662,7 +671,11 @@ impl Render for SourceControlPanel {
             .children(conflict_card)
             .children(operation_banner)
             .child(files_block)
-            .children(commit_area_render);
+            .children(commit_area_render)
+            // Stash list docked above the graph (or at the very bottom
+            // when the scope hides the graph). Always-mounted entity;
+            // collapsed by default — see `StashPanel::is_collapsed`.
+            .child(self.stash_panel.clone());
         if self.scope.shows_graph() {
             // Graph sits at its natural height, pinned to the bottom of the
             // panel by the `flex_1` files_block above. Top border separates

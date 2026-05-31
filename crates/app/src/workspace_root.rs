@@ -63,6 +63,10 @@ use crate::shell::{
     confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
     git_panel::{DiscardRequested, GitPanel},
+    stash_panel::{
+        PushStashRequested, StashPanel,
+        push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
+    },
     left_rail::{LeftRail, row_menu::WorkspaceRowMenu},
     main_area,
     openable_text_file::is_openable_text_file,
@@ -162,6 +166,20 @@ pub struct WorkspaceRoot {
     /// field before reusing the slot, otherwise the stale observer
     /// will race the new dialog's teardown.
     pub(crate) _discard_dialog_observer: Option<Subscription>,
+    /// Long-lived subscription on `StashPanel::PushStashRequested`. Same
+    /// lifetime contract as `_discard_subscription` — dropping it
+    /// silently disables the `+` push affordance in the stash section.
+    pub(crate) _push_stash_subscription: Option<Subscription>,
+    /// Active push-stash form modal (per-request; `None` when idle).
+    /// Wired alongside `confirm_dialog` but kept in its own slot so
+    /// the type-to-confirm flow stays separable from this creation
+    /// form.
+    pub(crate) push_stash_dialog: Option<Entity<PushStashDialog>>,
+    /// Per-mount observer on the active `PushStashDialog`. Same lifecycle
+    /// pattern as `_discard_dialog_observer` — reset each time a new
+    /// dialog is mounted so the previous observer is dropped along with
+    /// the previous dialog entity.
+    pub(crate) _push_stash_dialog_observer: Option<Subscription>,
 }
 
 impl WorkspaceRoot {
@@ -391,6 +409,25 @@ impl WorkspaceRoot {
                     },
                 )
             });
+
+        // Subscribe to StashPanel's push-stash requests. The header `+`
+        // button fires `PushStashRequested`; we mount a small form
+        // dialog (message + include-untracked) that, on confirm, calls
+        // `StashPanel::push` which shells out to `git stash push` and
+        // refreshes the list.
+        let push_stash_subscription = right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+            .map(|sc| sc.read(cx).stash_panel.clone())
+            .map(|panel| {
+                cx.subscribe_in(
+                    &panel,
+                    window,
+                    |root, panel, _ev: &PushStashRequested, window, cx| {
+                        root.mount_push_stash_dialog(panel.clone(), window, cx);
+                    },
+                )
+            });
         Self {
             theme,
             density,
@@ -412,6 +449,9 @@ impl WorkspaceRoot {
             _click_router: click_router,
             _discard_subscription: discard_subscription,
             _discard_dialog_observer: None,
+            _push_stash_subscription: push_stash_subscription,
+            push_stash_dialog: None,
+            _push_stash_dialog_observer: None,
             app_state,
             project_picker,
             workspace_dialog,
@@ -627,6 +667,71 @@ impl WorkspaceRoot {
         ));
 
         self.confirm_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// Mount a `PushStashDialog` for the SCM panel's stash-push
+    /// request. Wires `on_confirm` to call `StashPanel::push` with
+    /// the user-supplied message + include-untracked toggle. Installs
+    /// an observer that drops the dialog from the slot once the user
+    /// confirms or cancels.
+    ///
+    /// First-open-wins: a double-click on the header `+` button (or
+    /// any sequence that re-fires `PushStashRequested` while the
+    /// dialog is already mounted) is ignored. Replacing the slot
+    /// would silently drop a half-typed form, which is the bug Phase
+    /// 01's discard-dialog reviewer caught for the destructive flow;
+    /// applying the same guard here so the user's in-progress
+    /// message survives a stray re-click.
+    fn mount_push_stash_dialog(
+        &mut self,
+        panel: Entity<StashPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.push_stash_dialog.is_some() {
+            return;
+        }
+        let on_confirm: PushCallback = {
+            let panel = panel.clone();
+            Rc::new(move |msg, include_untracked, _window, cx| {
+                panel.update(cx, |p, cx| p.push(msg, include_untracked, cx));
+            })
+        };
+        // Cancel path is a no-op on the panel side — the dialog flips
+        // `cancelled`, the observer below drops the slot. Wired anyway
+        // so future telemetry (e.g. counting abandoned pushes) has a
+        // hook point.
+        let on_cancel: CancelCallback = Rc::new(|_window, _cx| {});
+
+        let prompt = PushStashPrompt {
+            on_confirm,
+            on_cancel: Some(on_cancel),
+        };
+
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog =
+            cx.new(|cx| PushStashDialog::new(prompt, theme, density, typography, window, cx));
+
+        // Drop the dialog the moment the user resolves it. Replacing
+        // `_push_stash_dialog_observer` cancels any previous observer
+        // tied to a stale dialog.
+        self._push_stash_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.push_stash_dialog = None;
+                    root._push_stash_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+
+        self.push_stash_dialog = Some(dialog);
         cx.notify();
     }
 
@@ -1975,6 +2080,19 @@ impl Render for WorkspaceRoot {
             })
             // Rename-tab modal — same overlay pattern as confirm_dialog.
             .when_some(self.rename_tab_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
+            // Push-stash form modal — same overlay pattern.
+            .when_some(self.push_stash_dialog.clone(), |parent, dialog| {
                 parent.child(
                     div()
                         .absolute()

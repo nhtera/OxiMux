@@ -5,18 +5,28 @@
 //! expected = "drop", and calls `drop_pending()` on confirm. Apply and Pop
 //! fire directly (Pop is reversible via reflog).
 //!
+//! Layout:
+//!   - Always-rendered header: chevron + "STASHES (N)" + "+" push button.
+//!   - Body: list (or "No stashes" placeholder). Hidden when collapsed
+//!     (default). Power-user surface; eats no visual real estate when
+//!     unused.
+//!
 //! Runtime: refresh + ops use `tokio::runtime::Handle::try_current` + the
 //! same log+no-op fallback as DiffView / CommitDialog. Refresh is
 //! single-flight via `_refresh_task: Option<Task<()>>` — dropping cancels.
 
 pub mod list_render;
+pub mod push_dialog;
 
 use crate::shell::stash_panel::list_render::row_label;
 use gpui::{
-    App, ClickEvent, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Task, Window, div, px,
+    App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{
+    Icon, Sizable as _,
+    button::{Button, ButtonVariants},
+};
 use oximux_core::{StashEntry, StashRef};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
@@ -30,6 +40,13 @@ pub enum StashListState {
     Failed(String),
 }
 
+/// Emitted when the user clicks the header `+` button. The host
+/// (`SourceControlPanel` via `WorkspaceRoot`) subscribes and mounts a
+/// `PushStashDialog`. Routed through an event rather than a direct
+/// callback so the panel stays free of host-modal coupling.
+#[derive(Debug, Clone, Copy)]
+pub struct PushStashRequested;
+
 pub struct StashPanel {
     repo: Repository,
     state: StashListState,
@@ -37,6 +54,12 @@ pub struct StashPanel {
     /// entity and mounts a ConfirmDialog when this becomes Some. Cleared
     /// on `clear_pending_drop()` or `drop_pending()`.
     pending_drop: Option<StashRef>,
+    /// Body visibility flag. Default `true` — the stash list is a
+    /// power-user surface; keeping it collapsed by default avoids
+    /// burning vertical real estate in the SCM tab for users who don't
+    /// rely on git stash. The header (with `STASHES (N)`) is always
+    /// rendered so the count is glanceable even when collapsed.
+    collapsed: bool,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -44,6 +67,8 @@ pub struct StashPanel {
     _refresh_task: Option<Task<()>>,
     _op_task: Option<Task<()>>,
 }
+
+impl EventEmitter<PushStashRequested> for StashPanel {}
 
 impl StashPanel {
     pub fn new(
@@ -57,6 +82,7 @@ impl StashPanel {
             repo,
             state: StashListState::Idle,
             pending_drop: None,
+            collapsed: true,
             focus_handle: cx.focus_handle(),
             theme,
             density,
@@ -78,6 +104,19 @@ impl StashPanel {
 
     pub fn clear_pending_drop(&mut self) {
         self.pending_drop = None;
+    }
+
+    /// Whether the body is currently hidden. Header stays rendered
+    /// regardless so the count and `+` push affordance are always
+    /// reachable.
+    pub fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    /// Flip the body visibility. Wired to the header's chevron click.
+    pub fn toggle_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.collapsed = !self.collapsed;
+        cx.notify();
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -145,6 +184,44 @@ impl StashPanel {
         );
     }
 
+    /// Fire-and-forget `git stash push` from outside the panel
+    /// (the host's `PushStashDialog` confirm callback). Mirrors the
+    /// existing `apply` / `pop` / `drop_pending` plumbing: shells out
+    /// on tokio, refreshes on completion regardless of success so the
+    /// user sees the current state. The push-result `StashRef` is
+    /// dropped — the new entry will land at `stash@{0}` and surface
+    /// via the refreshed list rendering.
+    pub fn push(&mut self, msg: Option<String>, include_untracked: bool, cx: &mut Context<Self>) {
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let r = repo
+                        .stash_push(msg.as_deref(), include_untracked)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::stash_panel",
+                    "no tokio runtime; stash_push skipped"
+                );
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let _result = rx.await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.refresh(cx);
+            });
+        });
+        self._op_task = Some(task);
+    }
+
     fn spawn_op<F, Fut>(&mut self, op: F, label: &'static str, cx: &mut Context<Self>)
     where
         F: FnOnce(Repository) -> Fut + Send + 'static,
@@ -184,47 +261,117 @@ impl Focusable for StashPanel {
 
 impl Render for StashPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match &self.state {
-            StashListState::Idle | StashListState::Loading => placeholder(
-                "Loading stashes…",
-                self.theme,
-                self.density,
-                &self.typography,
-            )
-            .into_any_element(),
-            StashListState::Failed(err) => placeholder(
-                &format!("stash list failed: {err}"),
-                self.theme,
-                self.density,
-                &self.typography,
-            )
-            .into_any_element(),
-            StashListState::Ready(entries) if entries.is_empty() => {
-                placeholder("No stashes", self.theme, self.density, &self.typography)
-                    .into_any_element()
-            }
-            StashListState::Ready(entries) => {
-                let mut col = div().flex().flex_col().h_full().w_full();
-                for entry in entries.iter().cloned() {
-                    col = col.child(self.render_row(entry, cx));
-                }
-                col.into_any_element()
-            }
+        let count = match &self.state {
+            StashListState::Ready(entries) => entries.len(),
+            _ => 0,
         };
-        div()
+        let header = self.render_header(count, cx);
+
+        let mut container = div()
             .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
-            .h_full()
+            .flex_shrink_0()
             .w_full()
             .bg(self.theme.bg_panel)
-            .border_l_1()
-            .border_color(self.theme.border_inactive)
-            .child(body)
+            .child(header);
+
+        if !self.collapsed {
+            let body = match &self.state {
+                StashListState::Idle | StashListState::Loading => placeholder(
+                    "Loading stashes…",
+                    self.theme,
+                    self.density,
+                    &self.typography,
+                )
+                .into_any_element(),
+                StashListState::Failed(err) => placeholder(
+                    &format!("stash list failed: {err}"),
+                    self.theme,
+                    self.density,
+                    &self.typography,
+                )
+                .into_any_element(),
+                StashListState::Ready(entries) if entries.is_empty() => {
+                    placeholder("No stashes yet", self.theme, self.density, &self.typography)
+                        .into_any_element()
+                }
+                StashListState::Ready(entries) => {
+                    let mut col = div().flex().flex_col().w_full();
+                    for entry in entries.iter().cloned() {
+                        col = col.child(self.render_row(entry, cx));
+                    }
+                    col.into_any_element()
+                }
+            };
+            container = container.child(body);
+        }
+
+        container
     }
 }
 
 impl StashPanel {
+    /// Header: chevron toggle + "STASHES (N)" label + push button.
+    /// Always rendered, even when the body is collapsed, so the count
+    /// stays visible at a glance and the `+` action is always
+    /// reachable. Chevron points down when open, right when collapsed
+    /// (matches the SCM-section convention).
+    fn render_header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::shell::source_control::style as sc_style;
+        let theme = self.theme;
+        let density = self.density;
+        let typography = &self.typography;
+        let collapsed = self.collapsed;
+        let chevron = if collapsed {
+            "icons/chevron-right.svg"
+        } else {
+            "icons/chevron-down.svg"
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(density.h_row))
+            .px(px(density.pad_panel))
+            .gap(px(density.gap_inline))
+            .border_b_1()
+            .border_color(theme.border_inactive)
+            .text_size(px(typography.t_label_caps))
+            .text_color(theme.fg_muted)
+            .child(
+                // Whole chevron+label area is clickable, mirroring
+                // collapsible-section UX elsewhere in the panel.
+                div()
+                    .id("stash-header-toggle")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(density.gap_inline))
+                    .flex_1()
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                        panel.toggle_collapsed(cx);
+                    }))
+                    .child(
+                        Icon::default()
+                            .path(chevron)
+                            .size(px(sc_style::ICON))
+                            .text_color(theme.fg_muted),
+                    )
+                    .child(format!("STASHES ({count})")),
+            )
+            .child(
+                Button::new("stash-push-new")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::default().path("icons/plus.svg"))
+                    .tooltip("Push new stash")
+                    .on_click(cx.listener(|_panel, _: &ClickEvent, _window, cx| {
+                        cx.emit(PushStashRequested);
+                    })),
+            )
+    }
+
     fn render_row(&self, entry: StashEntry, cx: &mut Context<Self>) -> impl IntoElement {
         let label = row_label(&entry);
         let theme = self.theme;
@@ -290,7 +437,7 @@ fn placeholder(
         .flex()
         .items_center()
         .justify_center()
-        .h_full()
+        .h(px(density.h_row * 1.4))
         .p(px(density.pad_panel))
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_subtle)
