@@ -12,7 +12,7 @@
 
 use std::sync::atomic::Ordering;
 
-use gpui::Context;
+use gpui::{Context, Window};
 use tokio::sync::oneshot;
 
 use crate::shell::source_control::commit_area::{CommitArea, CommitStatus};
@@ -61,10 +61,16 @@ impl RemoteVerb {
 
 /// Run the commit pipeline with optional follow-up push/sync.
 /// `followup_push` ⊕ `followup_sync` are mutually exclusive (asserted).
+///
+/// `window` is plumbed through so the completion task can root its
+/// `cx.spawn_in(window, …)` — that's what gives the success-arm
+/// access to a `&mut Window` inside `update_in`, which the textarea
+/// auto-clear (`InputState::set_value`) requires.
 pub fn run_commit(
     area: &mut CommitArea,
     followup_push: bool,
     followup_sync: bool,
+    window: &mut Window,
     cx: &mut Context<CommitArea>,
 ) {
     debug_assert!(!(followup_push && followup_sync));
@@ -119,7 +125,7 @@ pub fn run_commit(
             return;
         }
     }
-    spawn_completion(area, rx, cx);
+    spawn_commit_completion(area, rx, window, cx);
 }
 
 /// Run a standalone remote op (push/pull/sync/fetch). Updates `status`
@@ -161,9 +167,10 @@ pub fn run_remote(area: &mut CommitArea, verb: RemoteVerb, cx: &mut Context<Comm
     spawn_completion(area, rx, cx);
 }
 
-/// Shared completion path: await the oneshot, update status, clear
-/// in-flight. Both `run_commit` and `run_remote` route through this so
-/// they only differ in the work they schedule, not the bookkeeping.
+/// Completion path for remote-only verbs (push, pull, sync, fetch,
+/// publish). No textarea clear, no Window plumbing required —
+/// `apply_result` receives `window: None` and only flips the status
+/// row.
 fn spawn_completion(
     area: &mut CommitArea,
     rx: oneshot::Receiver<Result<&'static str, (&'static str, String)>>,
@@ -175,7 +182,36 @@ fn spawn_completion(
         };
         let _ = this.update(cx, |area, cx| {
             area.in_flight.store(false, Ordering::SeqCst);
-            area.apply_result(result);
+            area.apply_result(result, None, cx);
+            cx.notify();
+        });
+    });
+    area._commit_task = Some(task);
+}
+
+/// Completion path for the commit verb (and commit-with-followup
+/// variants). Roots the spawn in `cx.spawn_in(window, …)` so the
+/// `update_in` block on success can hand a live `&mut Window` to
+/// `apply_result`, which clears the textarea via `set_value`.
+///
+/// `cx.spawn_in` + `update_in` is the same pattern as the branch
+/// picker's async open flow (`picker_wiring::open_switch_picker`);
+/// verified to fire correctly from a click-rooted async chain. The
+/// `update_in silently fails in mouse callbacks` GPUI gotcha applies
+/// to `cx.spawn` (no `_in`), not to this `cx.spawn_in` rooted variant.
+fn spawn_commit_completion(
+    area: &mut CommitArea,
+    rx: oneshot::Receiver<Result<&'static str, (&'static str, String)>>,
+    window: &mut Window,
+    cx: &mut Context<CommitArea>,
+) {
+    let task = cx.spawn_in(window, async move |this, cx| {
+        let Ok(result) = rx.await else {
+            return;
+        };
+        let _ = this.update_in(cx, |area, window, cx| {
+            area.in_flight.store(false, Ordering::SeqCst);
+            area.apply_result(result, Some(window), cx);
             cx.notify();
         });
     });

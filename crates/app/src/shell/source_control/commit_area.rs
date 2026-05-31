@@ -201,24 +201,28 @@ impl CommitArea {
     /// Submit if the primary action says we can. Caller passes the resolved
     /// `PrimaryAction` so we only run when the rendered button would be
     /// enabled — keeps the keyboard path (Cmd+Enter, future binding) honest.
-    pub fn submit(&mut self, action: &PrimaryAction, cx: &mut Context<Self>) {
+    ///
+    /// `&mut Window` is plumbed through so the auto-clear of the textarea
+    /// after a successful commit (`set_value` requires Window) can fire
+    /// inside the completion path's `update_in` block.
+    pub fn submit(&mut self, action: &PrimaryAction, window: &mut Window, cx: &mut Context<Self>) {
         if action.disabled || action.kind != PrimaryActionKind::Commit {
             return;
         }
-        super::commit_ops::run_commit(self, false, false, cx);
+        super::commit_ops::run_commit(self, false, false, window, cx);
     }
 
     /// Commit-then-push convenience used by the dropdown's "Commit & Push"
     /// item. Push only fires on a successful commit; partial failure
     /// surfaces via `CommitStatus::Failed("commit"/"push", …)`.
-    pub fn commit_and_push(&mut self, cx: &mut Context<Self>) {
-        super::commit_ops::run_commit(self, true, false, cx);
+    pub fn commit_and_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        super::commit_ops::run_commit(self, true, false, window, cx);
     }
 
     /// Commit-then-sync (pull + push). Same single-flight + status surface
     /// as `commit_and_push`.
-    pub fn commit_and_sync(&mut self, cx: &mut Context<Self>) {
-        super::commit_ops::run_commit(self, false, true, cx);
+    pub fn commit_and_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        super::commit_ops::run_commit(self, false, true, window, cx);
     }
 
     /// Standalone `git push` — used by the dropdown's Push item and the
@@ -280,17 +284,44 @@ impl CommitArea {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Publish, cx);
     }
 
-    /// Apply a completed op result to the status surface. Called from the
-    /// commit-ops completion task; pub(super) so the helper module can
-    /// reach it without re-exposing the field.
-    pub(super) fn apply_result(&mut self, result: Result<&'static str, (&'static str, String)>) {
+    /// Apply a completed op result to the status surface. Called from
+    /// the commit-ops completion task; `pub(super)` so the helper
+    /// module can reach it without re-exposing the fields.
+    ///
+    /// `window` is `Some` only on the commit-completion path
+    /// (`run_commit`'s `spawn_in`-rooted oneshot), `None` on
+    /// remote-only paths (`run_remote`: push, pull, sync, fetch,
+    /// publish). When `Some` AND the op succeeded:
+    ///
+    /// 1. the textarea is cleared via `InputState::set_value("", window, cx)`,
+    /// 2. the SQLite-persisted draft is explicitly cleared via
+    ///    `schedule_draft_save(String::new(), cx)`.
+    ///
+    /// Step 2 is mandatory: `InputState::set_value` toggles
+    /// `emit_events = false` for the duration of the write (see
+    /// gpui-component `state.rs::set_value`), so the
+    /// `InputEvent::Change` observer set up in `new` does NOT fire
+    /// from a programmatic clear. Without the explicit
+    /// `schedule_draft_save` the in-memory textarea would empty but
+    /// the SQLite `commit_draft` column would still hold the
+    /// just-committed message — the next panel mount would ghost
+    /// the committed text back into the composer.
+    pub(super) fn apply_result(
+        &mut self,
+        result: Result<&'static str, (&'static str, String)>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         match result {
             Ok(_label) => {
                 self.status = CommitStatus::Idle;
-                // `InputState::set_value` requires `&mut Window`, which isn't
-                // available in this oneshot result callback. v1 trade-off:
-                // leave the message in place after commit; the user clears
-                // manually.
+                if let Some(window) = window {
+                    self.message_state
+                        .update(cx, |s, cx| s.set_value("", window, cx));
+                    // Mirror the in-memory clear to disk; the Change
+                    // observer is suppressed during set_value.
+                    self.schedule_draft_save(String::new(), cx);
+                }
             }
             Err((label, error)) => self.status = CommitStatus::Failed(label.to_string(), error),
         }
@@ -350,8 +381,8 @@ impl CommitArea {
         let mut inner_button = Button::new("source-control-primary-inner")
             .label(submit_label)
             .tooltip(submit_title)
-            .on_click(cx.listener(move |area, _: &ClickEvent, _window, cx| {
-                area.submit(&action_for_click, cx);
+            .on_click(cx.listener(move |area, _: &ClickEvent, window, cx| {
+                area.submit(&action_for_click, window, cx);
                 cx.notify();
             }))
             .flex_1();
@@ -467,8 +498,8 @@ fn build_menu_item(
     // dispatcher; the gate happens at `PopupMenuItem.disabled` and the
     // dispatch table no-ops on PR kinds so a wired click never escapes.
     let view_for_click = view.clone();
-    item.on_click(window.listener_for(&view_for_click, move |area, _, _, cx| {
-        dispatch_dropdown(area, kind, cx);
+    item.on_click(window.listener_for(&view_for_click, move |area, _, window, cx| {
+        dispatch_dropdown(area, kind, window, cx);
         cx.notify();
     }))
 }
@@ -477,7 +508,18 @@ fn build_menu_item(
 /// here means the resolver and the action surface only meet at this one
 /// site; adding a new dropdown verb is "add a kind + add a stub method +
 /// add an arm here".
-fn dispatch_dropdown(area: &mut CommitArea, kind: DropdownActionKind, cx: &mut Context<CommitArea>) {
+///
+/// `window` is plumbed through so commit-family verbs (Commit,
+/// CommitPush, CommitSync) can hand it to `submit` / `commit_and_push`
+/// / `commit_and_sync`, which in turn root their completion task in
+/// `cx.spawn_in(window, …)` so the success arm can auto-clear the
+/// textarea via `set_value`. Remote-only verbs ignore `window`.
+fn dispatch_dropdown(
+    area: &mut CommitArea,
+    kind: DropdownActionKind,
+    window: &mut Window,
+    cx: &mut Context<CommitArea>,
+) {
     match kind {
         // Compound commit-with-followup verbs need a synthesised
         // `PrimaryAction { kind: Commit, disabled: false }` to satisfy
@@ -491,11 +533,11 @@ fn dispatch_dropdown(area: &mut CommitArea, kind: DropdownActionKind, cx: &mut C
                 title: String::new(),
                 disabled: false,
             };
-            area.submit(&synthetic, cx);
+            area.submit(&synthetic, window, cx);
         }
-        DropdownActionKind::CommitPush => area.commit_and_push(cx),
+        DropdownActionKind::CommitPush => area.commit_and_push(window, cx),
         DropdownActionKind::CommitForcePush => area.commit_and_force_push(cx),
-        DropdownActionKind::CommitSync => area.commit_and_sync(cx),
+        DropdownActionKind::CommitSync => area.commit_and_sync(window, cx),
         DropdownActionKind::Push => area.push(cx),
         DropdownActionKind::ForcePush => area.force_push(cx),
         DropdownActionKind::Pull => area.pull(cx),
