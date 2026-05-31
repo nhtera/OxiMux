@@ -16,6 +16,8 @@
 //! flips between scope tabs or quickly switches workspaces. Filter /
 //! scope / commit state lives on `SourceControlPanel`.
 
+pub mod ai_generation;
+pub mod ai_overlay;
 pub mod branch_picker;
 pub mod commit_area;
 pub mod commit_ops;
@@ -218,7 +220,7 @@ impl SourceControlPanel {
         );
 
         let commit_area = cx.new(|cx| {
-            CommitArea::new(
+            let mut area = CommitArea::new(
                 repo.clone(),
                 worktree_settings_repo.clone(),
                 theme,
@@ -226,7 +228,23 @@ impl SourceControlPanel {
                 typography.clone(),
                 window,
                 cx,
-            )
+            );
+            // Seed the staged snapshot at construction so the
+            // sparkles button gates correctly on first render
+            // (without waiting for the first poll-tick observer to
+            // fire). When the panel mounts before the first poll,
+            // `git_state` is `None` and we leave the snapshot
+            // empty — sparkles stays disabled until the first tick.
+            if let Some(ref s) = git_state {
+                let staged: Vec<oximux_core::FileStatus> = s
+                    .files
+                    .iter()
+                    .filter(|f| f.is_staged())
+                    .cloned()
+                    .collect();
+                area.set_staged_snapshot(staged, cx);
+            }
+            area
         });
         // Phase 13: load persisted graph height now so the section
         // mounts at its previous size, no flash. Clamped against the
@@ -446,6 +464,23 @@ impl SourceControlPanel {
                     .update(cx, |panel, cx| {
                         if let PollState::Ready(ref s) = state {
                             panel.git_state = Some(s.clone());
+                            // Push the staged-filtered file list into
+                            // the commit area so the sparkles button
+                            // can gate on staged-count and feed the
+                            // heuristic without re-shelling out to
+                            // git on click. Equality-guarded inside
+                            // the setter so identical snapshots
+                            // don't fire spurious notifies.
+                            let staged: Vec<oximux_core::FileStatus> = s
+                                .files
+                                .iter()
+                                .filter(|f| f.is_staged())
+                                .cloned()
+                                .collect();
+                            let commit_area = panel.commit_area.clone();
+                            commit_area.update(cx, |area, cx| {
+                                area.set_staged_snapshot(staged, cx)
+                            });
                         }
                         panel.poll_state = state;
                         panel.current_op = op;

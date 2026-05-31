@@ -8,7 +8,7 @@
 //! triggers one commit.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
@@ -21,6 +21,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     menu::PopupMenuItem,
 };
+use oximux_core::FileStatus;
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::WorktreeSettingsRepo;
@@ -32,6 +33,8 @@ use oximux_storage::WorktreeSettingsRepo;
 /// draft to disk before they start typing again.
 const DRAFT_DEBOUNCE: Duration = Duration::from_millis(250);
 
+use crate::shell::source_control::ai_generation::AiState;
+use crate::shell::source_control::ai_overlay;
 use crate::shell::source_control::dropdown_items::{
     self, DropdownActionKind, DropdownEntry, DropdownInputs,
 };
@@ -89,10 +92,26 @@ pub struct CommitArea {
     /// after the user stops typing.
     _draft_debounce: Option<Task<()>>,
     /// Held for the lifetime of `CommitArea` so the message-input
-    /// change observer keeps firing. Dropping it would silently stop
-    /// the debounce — store as `Option` only because `None` is the
-    /// honest representation when no settings repo is plugged in.
+    /// change observer keeps firing. The observer drives BOTH the
+    /// 250 ms debounced draft persistence AND the AI-generation
+    /// race-protection cancel — keeping a single InputEvent
+    /// subscription means user typing always cancels in-flight AI
+    /// generation, even when no settings repo is plugged (test
+    /// wiring). `Option` is kept for API stability with the
+    /// pre-Phase-14 shape; it is now always `Some` in practice.
     _draft_subscription: Option<Subscription>,
+
+    /// Snapshot of staged files pushed in by the panel's state
+    /// observer on each poll tick. Read by the sparkles button to
+    /// gate enablement and by the generation task to feed the
+    /// heuristic. Empty when nothing is staged.
+    pub(in crate::shell::source_control) staged_snapshot: Vec<FileStatus>,
+
+    /// AI generation lifecycle for the sparkles button. `Idle` until
+    /// the user clicks; `Generating` while the spawned task is
+    /// computing + applying. Cancellation is cooperative through the
+    /// stored flag — the task checks it before mutating the textarea.
+    pub(in crate::shell::source_control) ai_state: AiState,
 }
 
 impl CommitArea {
@@ -125,18 +144,34 @@ impl CommitArea {
         // debounced upsert of the draft. Skip the wiring entirely when
         // no settings repo is plugged (test wiring); the textarea
         // still works, the value just doesn't persist.
-        let _draft_subscription = worktree_settings_repo.as_ref().map(|_| {
-            cx.subscribe_in(
-                &message_state,
-                window,
-                |area, input, ev: &InputEvent, _window, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        let value = input.read(cx).value().to_string();
-                        area.schedule_draft_save(value, cx);
-                    }
-                },
-            )
-        });
+        // Single Change observer drives both the persistence debounce
+        // AND the AI-generation race-protection. Programmatic writes
+        // via `InputState::set_value` toggle `emit_events = false` for
+        // the duration of the write (see gpui-component
+        // `state.rs::set_value`), so every Change we see here is a
+        // user-typed keystroke — exactly the signal the race-protect
+        // requirement wants. Subscribing once both ways keeps a single
+        // entry point for "user typed into the textarea".
+        //
+        // Subscription is mounted even when no settings repo is
+        // plugged (test wiring): the AI race-protect still matters
+        // and `schedule_draft_save` is internally a no-op without a
+        // repo.
+        let _draft_subscription = Some(cx.subscribe_in(
+            &message_state,
+            window,
+            |area, input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    // Drop any in-flight generation — the user is
+                    // typing now, so the heuristic result would
+                    // overwrite their input. Cheap when not
+                    // generating (a single enum match).
+                    area.ai_state.signal_cancel();
+                    let value = input.read(cx).value().to_string();
+                    area.schedule_draft_save(value, cx);
+                }
+            },
+        ));
         Self {
             repo,
             message_state,
@@ -150,6 +185,8 @@ impl CommitArea {
             workspace_id,
             _draft_debounce: None,
             _draft_subscription,
+            staged_snapshot: Vec::new(),
+            ai_state: AiState::Idle,
         }
     }
 
@@ -163,7 +200,11 @@ impl CommitArea {
     /// forever). Persistence errors are logged but never raised —
     /// same fail-safe policy as `load_initial_base_ref`: a UX nicety,
     /// not a panel invariant.
-    fn schedule_draft_save(&mut self, value: String, cx: &mut Context<Self>) {
+    pub(in crate::shell::source_control) fn schedule_draft_save(
+        &mut self,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.worktree_settings_repo.clone() else {
             return;
         };
@@ -343,15 +384,41 @@ impl CommitArea {
         let submit_disabled = action.disabled;
         let primary_icon = primary_icon_for(action.kind);
 
-        // Relative wrapper anchors the sparkles overlay in the top-right;
-        // backend lands later, so the button is disabled. Textarea sits on
-        // `bg_base` (darker than the surrounding `bg_panel`) so it reads as
-        // an inset field rather than a floating chip.
+        // Relative wrapper anchors both the sparkles button (top-right)
+        // and the AI overlay (full-area scrim during generation).
+        // Textarea sits on `bg_base` (darker than the surrounding
+        // `bg_panel`) so it reads as an inset field rather than a
+        // floating chip.
         //
         // Height is enforced on BOTH the wrapper (`.h(COMMIT_H)`) and the
         // inner Input (`.h_full()`); without the wrapper bound, the multi-
         // line Input would expand to the available column slack and the
         // composer would balloon to fill the panel.
+        //
+        // Sparkles enable rules (heuristic-only round; Phase 14):
+        //  - disabled while committing (`in_flight`),
+        //  - disabled while a generation is already running,
+        //  - disabled when nothing is staged (empty snapshot),
+        //  - disabled when the textarea already has user content
+        //    (don't overwrite). Future: Cmd+click bypass for
+        //    force-overwrite.
+        let staged_count = self.staged_snapshot.len();
+        let has_user_text = !self.message_state.read(cx).value().trim().is_empty();
+        let generating = self.ai_state.is_generating();
+        let committing = self.in_flight.load(Ordering::Relaxed);
+        let sparkles_disabled =
+            committing || generating || staged_count == 0 || has_user_text;
+        let sparkles_tooltip = if generating {
+            "Generating commit message…"
+        } else if committing {
+            "Commit in flight"
+        } else if staged_count == 0 {
+            "Stage at least one file"
+        } else if has_user_text {
+            "Clear the message first"
+        } else {
+            "Generate commit message"
+        };
         let textarea = div()
             .relative()
             .w_full()
@@ -373,10 +440,20 @@ impl CommitArea {
                                 .path("icons/sparkles.svg")
                                 .size(px(sc_style::ICON)),
                         )
-                        .tooltip("Generate commit message (coming soon)")
-                        .disabled(true),
+                        .tooltip(sparkles_tooltip)
+                        .disabled(sparkles_disabled)
+                        .on_click(cx.listener(|area, _: &ClickEvent, window, cx| {
+                            area.start_ai_generation(window, cx);
+                        })),
                 ),
-            );
+            )
+            .children(ai_overlay::render_ai_overlay(
+                generating,
+                theme,
+                cx.listener(|area, _: &ClickEvent, _window, cx| {
+                    area.cancel_ai_generation(cx);
+                }),
+            ));
 
         let mut inner_button = Button::new("source-control-primary-inner")
             .label(submit_label)
