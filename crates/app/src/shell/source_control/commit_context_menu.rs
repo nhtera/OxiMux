@@ -20,6 +20,7 @@ use gpui::{
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::source_control::commit_area::CommitArea;
+use crate::shell::source_control::commit_ops::{CommitVerb, run_commit_verb};
 
 /// Width of the dropdown card. Matches `FileTreeContextMenu::MENU_WIDTH`
 /// so the visual weight reads consistently across the cockpit.
@@ -135,7 +136,9 @@ impl Render for CommitContextMenu {
                     && let Some(strong) = area.upgrade()
                 {
                     let sha = pick_sha.clone();
-                    strong.update(cx, |a, cx| a.cherry_pick(sha, cx));
+                    strong.update(cx, |a, cx| {
+                        run_commit_verb(a, CommitVerb::CherryPick(sha), cx)
+                    });
                 }
                 this.close(cx);
             }),
@@ -154,7 +157,9 @@ impl Render for CommitContextMenu {
                     && let Some(strong) = area.upgrade()
                 {
                     let sha = revert_sha.clone();
-                    strong.update(cx, |a, cx| a.revert(sha, cx));
+                    strong.update(cx, |a, cx| {
+                        run_commit_verb(a, CommitVerb::Revert(sha), cx)
+                    });
                 }
                 this.close(cx);
             }),

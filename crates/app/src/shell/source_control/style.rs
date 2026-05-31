@@ -8,7 +8,28 @@
 
 /// Outer horizontal padding for tabs, toolbar, filter row, commit area, and
 /// section headers. Matches `px-3` (12px) in the reference layout.
+///
+/// Use [`pad_h`] when a render site has access to the panel's `Density` —
+/// at `Density::Compact` the panel tightens to 8px to recover visible
+/// width in narrow sidebars. The bare `PAD_H` constant stays for sites
+/// that don't get a density (e.g. test fixtures, pure helper functions
+/// that build sub-elements outside a density-aware render scope).
 pub const PAD_H: f32 = 12.0;
+
+/// Density-aware horizontal padding. Today returns `PAD_H` (12px) at
+/// every density — v1 only ships the `cockpit()` density preset, so
+/// there's no second branch to take. The helper exists so a future
+/// density (`Density::compact()` lands in v1.1) can drop the SCM
+/// surface to 8px without touching every call site: render code
+/// already reads `sc_style::pad_h(self.density)` and the constant
+/// becomes a runtime branch the moment the preset is added.
+///
+/// Threading `density` through every render method that currently
+/// hard-codes `PAD_H` is the load-bearing work, not the constant.
+pub fn pad_h(density: oximux_settings::Density) -> f32 {
+    let _ = density;
+    PAD_H
+}
 
 /// Vertical padding for the filter row (tight). Matches `py-1.5` (6px).
 pub const PAD_V_TIGHT: f32 = 6.0;

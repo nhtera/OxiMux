@@ -2286,6 +2286,25 @@ impl Render for WorkspaceRoot {
                     });
                 }
             }))
+            .on_action(cx.listener(|this, _: &crate::actions::RefreshSourceControl, _window, cx| {
+                // Cmd+R: refresh the commit graph's first page against
+                // the active worktree. Same call site as the header-strip
+                // refresh button; routes through the workspace so the
+                // chord works from any focused pane in the window. Silent
+                // no-op when the right sidebar is closed or the SCM tab
+                // isn't mounted — the alternative (popping the sidebar
+                // open on every Cmd+R) would surprise users who bound the
+                // chord to "refresh this window" muscle memory.
+                let Some(rs) = &this.right_sidebar else {
+                    return;
+                };
+                let Some(sc) = rs.read(cx).source_control.as_ref().cloned() else {
+                    return;
+                };
+                sc.update(cx, |panel, cx| {
+                    panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
+                });
+            }))
             .child(row)
             .child(status_bar::view(
                 theme,

@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 
 use gpui::{
     ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, Window, div, prelude::FluentBuilder as _, px,
+    ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Icon, IconName, Sizable as _,
@@ -33,6 +33,97 @@ use crate::shell::source_control::scope::SourceControlScope;
 use crate::shell::source_control::style as sc_style;
 
 impl SourceControlPanel {
+    /// Render the 32-px cockpit header strip docked at the very top of
+    /// the SCM panel: repo name on the left, Refresh + Settings cog on
+    /// the right. The strip relocates the two icon-only actions that
+    /// previously hung at the right end of the branch toolbar; moving
+    /// them above the scope tabs gives the panel a clear chrome row
+    /// that names the working surface and groups the global panel
+    /// actions, leaving the branch-toolbar row focused on
+    /// ahead/behind state + the branch chip + the Push/Pull pills.
+    ///
+    /// Repo name source: `workdir().file_name()` — the folder name.
+    /// Stable across workspace switches without plumbing a workspace
+    /// label through `PanelConfig`. Worktree paths (where the
+    /// basename is e.g. `worktree-feat-foo`) read fine; the
+    /// alternative (storage-backed `WorkspaceRow.name`) is a follow-
+    /// up if the basename ever proves visually confusing in practice.
+    pub(super) fn render_panel_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let typography = &self.typography;
+        let _ = self.density;
+        let repo_name: SharedString = self
+            .repo
+            .workdir()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(no repo)")
+            .to_string()
+            .into();
+        let base_ref_tooltip = self
+            .base_ref
+            .as_deref()
+            .map(|b| format!("Base ref: {b} (click to change)"))
+            .unwrap_or_else(|| "Change base ref".to_string());
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .h(px(sc_style::TOOLBAR_H))
+            .px(px(sc_style::pad_h(self.density)))
+            .border_b_1()
+            .border_color(theme.border_inactive)
+            // Repo name. Flex-1 lets the cog cluster anchor to the right
+            // edge; truncation guarantees long folder names don't push the
+            // icons off-screen on narrow panels.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(sc_style::TEXT))
+                    .font_weight(typography.w_semibold)
+                    .text_color(theme.fg_base)
+                    .child(repo_name),
+            )
+            // Refresh — Cmd+R also dispatches `RefreshSourceControl`
+            // and lands the same `commit_graph.refresh` call, so the
+            // tooltip advertises the chord. Cheap; no rate limit.
+            .child(
+                Button::new("sc-header-refresh")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::default()
+                            .path("icons/refresh-cw.svg")
+                            .size(px(sc_style::ICON)),
+                    )
+                    .tooltip("Refresh (⌘R)")
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                        panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
+                    })),
+            )
+            // Settings cog — opens the BaseRef picker. Moved out of the
+            // branch toolbar's right-side cluster so the cluster can
+            // shrink to a single view-mode toggle.
+            .child(
+                Button::new("sc-header-settings")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::default()
+                            .path("icons/settings-2.svg")
+                            .size(px(sc_style::ICON)),
+                    )
+                    .tooltip(base_ref_tooltip)
+                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                        panel.open_base_ref_picker(window, cx);
+                    })),
+            )
+    }
+
     pub(super) fn render_scope_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let typography = &self.typography;
@@ -169,36 +260,17 @@ impl SourceControlPanel {
             .filter(|b| !b.is_empty())
             .map(|b| gpui::SharedString::from(b.to_string()));
 
-        // Right-aligned compact icon cluster.
-        // settings-2 opens the BaseRef picker; list-tree / list-collapse
-        // is the view-mode toggle (icon + tooltip swap built above from
-        // the current `view_mode`); refresh is wired to the commit-graph
-        // reload.
-        let base_ref_tooltip = self
-            .base_ref
-            .as_deref()
-            .map(|b| format!("Base ref: {b} (click to change)"))
-            .unwrap_or_else(|| "Change base ref".to_string());
+        // Right-aligned compact icon cluster. Phase 07 relocated
+        // settings-2 + refresh up into the panel header strip (next to
+        // the repo name), so the toolbar's right end now holds only the
+        // view-mode toggle. Keeps the branch-summary row focused on
+        // ahead/behind state + Push/Pull pills + the view-mode toggle.
         let actions = div()
             .ml_auto()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(2.0))
-            .child(
-                Button::new("sc-toolbar-base-ref")
-                    .ghost()
-                    .xsmall()
-                    .icon(
-                        Icon::default()
-                            .path("icons/settings-2.svg")
-                            .size(px(sc_style::ICON)),
-                    )
-                    .tooltip(base_ref_tooltip)
-                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
-                        panel.open_base_ref_picker(window, cx);
-                    })),
-            )
             .child(
                 Button::new("sc-toolbar-view-mode")
                     .ghost()
@@ -211,20 +283,6 @@ impl SourceControlPanel {
                     .tooltip(view_mode_tooltip)
                     .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
                         panel.git_panel.update(cx, |g, cx| g.cycle_view_mode(cx));
-                    })),
-            )
-            .child(
-                Button::new("sc-toolbar-refresh")
-                    .ghost()
-                    .xsmall()
-                    .icon(
-                        Icon::default()
-                            .path("icons/refresh-cw.svg")
-                            .size(px(sc_style::ICON)),
-                    )
-                    .tooltip("Refresh")
-                    .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
-                        panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
                     })),
             );
 

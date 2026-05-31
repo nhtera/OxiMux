@@ -343,6 +343,13 @@ actions!(
         Search,
         /// Toggle the git changed-files panel (binding moved to SelectSourceControlTab).
         OpenGitPanel,
+        /// Refresh the source-control panel — re-runs the status poll
+        /// against the active worktree AND reloads the commit graph's
+        /// first page. Bound to Cmd+R; dispatched globally so the
+        /// shortcut works regardless of which pane has focus inside
+        /// the workspace. Cheap (a single poll-tick equivalent), so
+        /// the binding doesn't need a focus context guard.
+        RefreshSourceControl,
         /// Stage the file currently selected in the git panel.
         StageFile,
         /// Unstage the file currently selected in the git panel.

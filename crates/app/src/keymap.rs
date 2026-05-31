@@ -10,9 +10,9 @@ use crate::actions::{
     CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
     FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewTabInPane, NewWindow, NextTab,
     OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
-    PrevTab, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
-    SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitSubPaneDown,
-    SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
+    PrevTab, RefreshSourceControl, Search, SelectExplorerTab, SelectSearchTab,
+    SelectSourceControlTab, SendLastCommandOutputToAgent, SendTerminalSelectionToAgent,
+    SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
 };
 
 /// Build the default global key bindings. `main` installs these at boot via
@@ -77,6 +77,10 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         // command's output (bracketed by P8 shell-integration marks).
         KeyBinding::new("cmd-shift-i", SendTerminalSelectionToAgent, None),
         KeyBinding::new("cmd-shift-o", SendLastCommandOutputToAgent, None),
+        // cmd-r refreshes the source-control panel (status poll + graph
+        // page reload). Dispatched globally so the user can fire from any
+        // pane focus; cheap (single poll-tick equivalent), no rate limit.
+        KeyBinding::new("cmd-r", RefreshSourceControl, None),
         // cmd-s saves the active editor buffer; no-op when no editor focused.
         KeyBinding::new("cmd-s", SaveFile, None),
         // Escape dismisses any open transient overlay (handled at WorkspaceRoot).

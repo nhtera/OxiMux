@@ -657,6 +657,7 @@ impl Render for SourceControlPanel {
 
         // Snapshot per-section render outputs as `AnyElement` so we can drop
         // each borrow of `cx` before composing the final tree.
+        let panel_header: AnyElement = self.render_panel_header(cx).into_any_element();
         let scope_tabs: AnyElement = self.render_scope_tabs(cx).into_any_element();
         let toolbar: AnyElement = self.render_branch_toolbar(cx).into_any_element();
         let filter_row: AnyElement = self.render_filter_row(cx).into_any_element();
@@ -760,6 +761,11 @@ impl Render for SourceControlPanel {
             .w_full()
             .h_full()
             .bg(theme.bg_panel)
+            // Phase 07 panel header strip — repo name + Refresh +
+            // Settings cog. Sits above the scope tabs so the panel
+            // surface reads top-down: workspace identity → scope → branch
+            // state → file list → composer → graph.
+            .child(panel_header)
             .child(scope_tabs)
             .child(toolbar)
             .child(filter_row)

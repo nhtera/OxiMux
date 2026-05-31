@@ -353,31 +353,6 @@ impl CommitArea {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Publish, cx);
     }
 
-    /// `git cherry-pick <sha>` driven by the commit-graph row's right-click
-    /// → Cherry-pick item. Surfaces `CommitStatus::CherryPicking` while
-    /// running and lands on `Idle` (success) or `Failed("cherry-pick", …)`
-    /// (conflict). The operation banner picks up CHERRY_PICK_HEAD on the
-    /// next poll tick so the user gets a recovery surface.
-    pub fn cherry_pick(&mut self, sha: String, cx: &mut Context<Self>) {
-        super::commit_ops::run_commit_verb(
-            self,
-            super::commit_ops::CommitVerb::CherryPick(sha),
-            cx,
-        );
-    }
-
-    /// `git revert --no-edit <sha>` driven by the commit-graph row's
-    /// right-click → Revert item. Same lifecycle as `cherry_pick` — conflict
-    /// drops into the operation banner via the next poll-tick's
-    /// `current_operation()` read.
-    pub fn revert(&mut self, sha: String, cx: &mut Context<Self>) {
-        super::commit_ops::run_commit_verb(
-            self,
-            super::commit_ops::CommitVerb::Revert(sha),
-            cx,
-        );
-    }
-
     /// Apply a completed op result to the status surface. Called from
     /// the commit-ops completion task; `pub(super)` so the helper
     /// module can reach it without re-exposing the fields.
