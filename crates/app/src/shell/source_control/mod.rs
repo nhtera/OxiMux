@@ -30,11 +30,12 @@ pub mod style;
 pub mod toolbar;
 pub mod tree;
 
-// Re-export so external callers (notably the integration test at
-// `crates/app/tests/sc_base_ref_persistence.rs`) keep resolving against
-// `oximux_app::shell::source_control::merge_base_ref_into_settings`
-// after the helper moved into `settings_persistence`.
-pub use settings_persistence::merge_base_ref_into_settings;
+// Re-export so external callers (notably the integration tests at
+// `crates/app/tests/sc_base_ref_persistence.rs` and
+// `crates/app/tests/sc_commit_draft_persistence.rs`) keep resolving
+// against `oximux_app::shell::source_control::{symbol}` rather than
+// reaching into the deeper `settings_persistence` path.
+pub use settings_persistence::{load_initial_commit_draft, merge_base_ref_into_settings};
 
 use std::sync::Arc;
 
@@ -177,7 +178,15 @@ impl SourceControlPanel {
         );
 
         let commit_area = cx.new(|cx| {
-            CommitArea::new(repo.clone(), theme, density, typography.clone(), window, cx)
+            CommitArea::new(
+                repo.clone(),
+                worktree_settings_repo.clone(),
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
         });
         let commit_graph =
             cx.new(|cx| CommitGraph::new(repo.clone(), theme, density, typography.clone(), cx));

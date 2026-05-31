@@ -55,3 +55,33 @@ pub(super) fn load_initial_base_ref(
         }
     }
 }
+
+/// Read the persisted commit draft for this workspace from the V006
+/// `worktree_settings` table. Falls through to `None` (= empty
+/// textarea) whenever the read fails, the row is absent, or no
+/// settings repo was provided (test wiring). Errors are logged at
+/// warn — same policy as [`load_initial_base_ref`]: persistence is a
+/// nice-to-have, not a startup-blocker.
+///
+/// `pub` rather than `pub(super)` so integration tests can exercise
+/// the round-trip without driving the full GPUI `CommitArea::new`
+/// path (which would require a `Window` + `Context` harness).
+pub fn load_initial_commit_draft(
+    settings_repo: Option<&WorktreeSettingsRepo>,
+    workspace_id: &str,
+) -> Option<String> {
+    let sr = settings_repo?;
+    match sr.get(workspace_id) {
+        Ok(Some(settings)) => settings.commit_draft,
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                target: "oximux_app::commit_area",
+                error = %err,
+                workspace_id = %workspace_id,
+                "worktree_settings.get failed; commit draft starts empty",
+            );
+            None
+        }
+    }
+}

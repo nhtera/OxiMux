@@ -9,24 +9,34 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use gpui::{
     Anchor, AppContext, ClickEvent, Context, Entity, FocusHandle, IntoElement, ParentElement,
-    Styled, Task, Window, div, px,
+    Styled, Subscription, Task, Window, div, px,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants, DropdownButton},
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     menu::PopupMenuItem,
 };
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::WorktreeSettingsRepo;
+
+/// Coalesce per-keystroke commit_draft upserts. Drops two writes for
+/// every keystroke under the threshold (typing speed of ~4 keys/second
+/// → at most one upsert per ~250 ms typing burst). Tuned so the user
+/// pausing for a beat (e.g. to read the diff) commits the in-progress
+/// draft to disk before they start typing again.
+const DRAFT_DEBOUNCE: Duration = Duration::from_millis(250);
 
 use crate::shell::source_control::dropdown_items::{
     self, DropdownActionKind, DropdownEntry, DropdownInputs,
 };
 use crate::shell::source_control::primary_action::{PrimaryAction, PrimaryActionKind};
+use crate::shell::source_control::settings_persistence::load_initial_commit_draft;
 use crate::shell::source_control::style as sc_style;
 
 /// Last status surfaced from a commit / remote operation. Mirrors the
@@ -63,21 +73,69 @@ pub struct CommitArea {
     typography: Typography,
     /// Drop cancels the in-flight commit observer task.
     pub(in crate::shell::source_control) _commit_task: Option<Task<()>>,
+
+    /// Per-worktree V006 settings repo. `None` in test wiring; the
+    /// production path always supplies it. When absent, the textarea
+    /// works in-memory but drafts don't survive a restart.
+    worktree_settings_repo: Option<WorktreeSettingsRepo>,
+    /// Cached `repo.workdir().to_string_lossy().to_string()` — the
+    /// debounced task only needs a string key, not a live `Repository`
+    /// handle, so capturing it once at construction avoids re-deriving
+    /// inside the async closure on every keystroke.
+    workspace_id: String,
+    /// Currently-pending debounced commit_draft writer. Overwriting
+    /// the field drops the prior task (cancelling it before its timer
+    /// fires), so a 100-keystroke burst writes exactly once — 250 ms
+    /// after the user stops typing.
+    _draft_debounce: Option<Task<()>>,
+    /// Held for the lifetime of `CommitArea` so the message-input
+    /// change observer keeps firing. Dropping it would silently stop
+    /// the debounce — store as `Option` only because `None` is the
+    /// honest representation when no settings repo is plugged in.
+    _draft_subscription: Option<Subscription>,
 }
 
 impl CommitArea {
     pub fn new(
         repo: Repository,
+        worktree_settings_repo: Option<WorktreeSettingsRepo>,
         theme: Theme,
         density: Density,
         typography: Typography,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let workspace_id = repo.workdir().to_string_lossy().to_string();
+        // Pre-populate the textarea with the persisted draft, if any.
+        // `default_value` writes the rope directly without firing
+        // `InputEvent::Change`, so the subscription set up below doesn't
+        // immediately re-upsert the very value we just loaded.
+        let initial_draft =
+            load_initial_commit_draft(worktree_settings_repo.as_ref(), &workspace_id);
         let message_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            let mut state = InputState::new(window, cx)
                 .multi_line(true)
-                .placeholder("Message")
+                .placeholder("Message");
+            if let Some(draft) = initial_draft {
+                state = state.default_value(draft);
+            }
+            state
+        });
+        // Subscribe to keystrokes — every `Change` schedules a 250 ms
+        // debounced upsert of the draft. Skip the wiring entirely when
+        // no settings repo is plugged (test wiring); the textarea
+        // still works, the value just doesn't persist.
+        let _draft_subscription = worktree_settings_repo.as_ref().map(|_| {
+            cx.subscribe_in(
+                &message_state,
+                window,
+                |area, input, ev: &InputEvent, _window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let value = input.read(cx).value().to_string();
+                        area.schedule_draft_save(value, cx);
+                    }
+                },
+            )
         });
         Self {
             repo,
@@ -88,7 +146,40 @@ impl CommitArea {
             density,
             typography,
             _commit_task: None,
+            worktree_settings_repo,
+            workspace_id,
+            _draft_debounce: None,
+            _draft_subscription,
         }
+    }
+
+    /// Schedule a 250 ms-debounced upsert of the commit_draft column.
+    /// Replacing `_draft_debounce` drops the previous task (cancelling
+    /// it before its timer fires), so a 100-keystroke burst writes
+    /// exactly once — 250 ms after the user stops typing.
+    ///
+    /// Empty strings are coerced to `None` so a manually-cleared
+    /// textarea actually clears the column (vs. persisting `""`
+    /// forever). Persistence errors are logged but never raised —
+    /// same fail-safe policy as `load_initial_base_ref`: a UX nicety,
+    /// not a panel invariant.
+    fn schedule_draft_save(&mut self, value: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.worktree_settings_repo.clone() else {
+            return;
+        };
+        let workspace_id = self.workspace_id.clone();
+        let to_write: Option<String> = if value.is_empty() { None } else { Some(value) };
+        self._draft_debounce = Some(cx.spawn(async move |_this, cx| {
+            cx.background_executor().timer(DRAFT_DEBOUNCE).await;
+            if let Err(err) = repo.modify(&workspace_id, |s| s.commit_draft = to_write) {
+                tracing::warn!(
+                    target: "oximux_app::commit_area",
+                    error = %err,
+                    workspace_id = %workspace_id,
+                    "commit_draft upsert failed; draft will reset to last-persisted value on restart",
+                );
+            }
+        }));
     }
 
     /// True when the message field currently holds non-whitespace text.
@@ -462,3 +553,7 @@ fn title_case_first(s: &str) -> String {
 
 // `RemoteVerb` moved to `commit_ops.rs` — the helper module owns the
 // op-execution machinery and the verb enum it dispatches on.
+//
+// `load_initial_commit_draft` lives in `settings_persistence.rs` next
+// to its base-ref counterpart so the per-worktree load helpers stay in
+// one place and one integration test file can exercise both.
