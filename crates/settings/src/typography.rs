@@ -8,6 +8,11 @@ use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, SharedStrin
 #[derive(Debug, Clone)]
 pub struct Typography {
     // Sizes
+    /// Sub-label text — metadata annotations that read subordinate to
+    /// `t_label_xs`. Used for the tiny "vs main · 3 commits" sub-row
+    /// under workspace cards in the left rail and similar secondary
+    /// labels. Replaces hand-coded `t_body_sm * 0.85` arithmetic.
+    pub t_sub_label: f32,
     pub t_label_xs: f32,
     pub t_label_caps: f32,
     pub t_body_sm: f32,
@@ -35,6 +40,7 @@ pub struct Typography {
 impl Typography {
     pub fn cockpit() -> Self {
         Self {
+            t_sub_label: 9.5,
             t_label_xs: 10.0,
             t_label_caps: 10.5,
             t_body_sm: 11.0,

@@ -117,6 +117,21 @@ impl Theme {
             },
         }
     }
+
+    /// Translucent background for added-line highlights in diff views.
+    /// 22% alpha over `status_added` lets the underlying surface read
+    /// through while the line still scans as "this was added". Helper
+    /// exists so call sites stop constructing `Hsla { a: 0.22, ..foo }`
+    /// inline — palette retuning then lands in one place.
+    pub fn diff_added_bg(&self) -> Hsla {
+        Hsla { a: 0.22, ..self.status_added }
+    }
+
+    /// Translucent background for removed-line highlights. Paired with
+    /// `diff_added_bg` — same alpha, opposite hue.
+    pub fn diff_removed_bg(&self) -> Hsla {
+        Hsla { a: 0.22, ..self.status_removed }
+    }
 }
 
 impl Default for Theme {
@@ -171,5 +186,25 @@ mod tests {
         // stay distinct so banner UI can tune contrast independently.
         let t = Theme::charcoal();
         assert_ne!(t.status_warning, t.status_warn);
+    }
+
+    #[test]
+    fn diff_added_bg_uses_22pct_alpha_over_status_added() {
+        let t = Theme::charcoal();
+        let bg = t.diff_added_bg();
+        assert!((bg.a - 0.22).abs() < f32::EPSILON);
+        assert_eq!(bg.h, t.status_added.h);
+        assert_eq!(bg.s, t.status_added.s);
+        assert_eq!(bg.l, t.status_added.l);
+    }
+
+    #[test]
+    fn diff_removed_bg_uses_22pct_alpha_over_status_removed() {
+        let t = Theme::charcoal();
+        let bg = t.diff_removed_bg();
+        assert!((bg.a - 0.22).abs() < f32::EPSILON);
+        assert_eq!(bg.h, t.status_removed.h);
+        assert_eq!(bg.s, t.status_removed.s);
+        assert_eq!(bg.l, t.status_removed.l);
     }
 }

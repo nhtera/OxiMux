@@ -16,6 +16,7 @@ pub mod scm_layout_settings;
 pub mod shell;
 pub mod state;
 pub mod terminal_settings;
+pub mod ui;
 pub mod window_factory;
 pub mod window_registry;
 pub mod workspace_root;
