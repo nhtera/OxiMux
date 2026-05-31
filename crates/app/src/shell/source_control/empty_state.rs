@@ -1,0 +1,126 @@
+//! Empty-state card for the Source Control panel.
+//!
+//! Rendered when the working tree is clean (no staged / unstaged /
+//! untracked files) AND there are no unresolved conflicts. Replaces
+//! the bare "No changes" text the embedded `GitPanel` would otherwise
+//! render with a small icon + three contextual CTAs that surface the
+//! most-likely next actions for an idle repo:
+//!
+//! 1. **Switch Branch** — opens the existing branch picker (the same
+//!    surface the toolbar's branch chip dispatches into).
+//! 2. **Fetch** — runs a fetch via the commit area's single-flight
+//!    remote-op pipeline.
+//! 3. **View Graph** — switches the scope tab to All so the commit
+//!    graph dominates the panel.
+//!
+//! The card is mounted in `SourceControlPanel::render` via
+//! `render_empty_state(cx)` and slotted between the filter row and
+//! the file list. When the tree is dirty (or a conflict is pending)
+//! the card is omitted entirely and the standard file-list / conflict
+//! banner takes over.
+
+use gpui::{AnyElement, ClickEvent, Context, IntoElement, ParentElement, Styled, div, px};
+use gpui_component::{
+    Icon, Sizable as _,
+    button::{Button, ButtonVariants as _},
+};
+
+use crate::shell::source_control::SourceControlPanel;
+use crate::shell::source_control::commit_ops::{self, RemoteVerb};
+use crate::shell::source_control::scope::SourceControlScope;
+use crate::shell::source_control::style as sc_style;
+
+impl SourceControlPanel {
+    /// Returns `true` when the tree is clean AND there's a recorded
+    /// HEAD (i.e. not a brand-new repo with zero commits) AND there
+    /// are no unresolved conflicts. The card stays hidden in those
+    /// edge cases — a fresh repo with no commits should show the
+    /// usual "Stage everything" affordance the file list provides,
+    /// and a conflict state defers to the v1 ConflictSummaryCard.
+    pub(super) fn should_show_empty_state(&self) -> bool {
+        let Some(state) = self.git_state.as_ref() else {
+            return false;
+        };
+        if state.head_oid.is_none() {
+            return false;
+        }
+        let has_conflict = state.files.iter().any(|f| f.conflict_kind.is_some());
+        if has_conflict {
+            return false;
+        }
+        state.files.is_empty()
+    }
+
+    pub(super) fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let typography = self.typography.clone();
+
+        // Three CTAs: each is a small ghost button. The cluster sits
+        // inside a column with the icon + "No changes" headline so the
+        // user can scan top-to-bottom: icon → state → action.
+        let switch_btn = Button::new("sc-empty-switch")
+            .ghost()
+            .xsmall()
+            .label("Switch Branch")
+            .tooltip("Switch to another local branch")
+            .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                panel.open_switch_picker(window, cx);
+            }));
+
+        let fetch_btn = Button::new("sc-empty-fetch")
+            .ghost()
+            .xsmall()
+            .label("Fetch")
+            .tooltip("Fetch from remote without merging")
+            .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                panel.commit_area.update(cx, |area, cx| {
+                    commit_ops::run_remote(area, RemoteVerb::Fetch, cx);
+                });
+            }));
+
+        let graph_btn = Button::new("sc-empty-graph")
+            .ghost()
+            .xsmall()
+            .label("View Graph")
+            .tooltip("Switch to All tab to browse the commit graph")
+            .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                panel.select_scope(SourceControlScope::All, cx);
+            }));
+
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(10.0))
+            .py(px(28.0))
+            .px(px(sc_style::PAD_H))
+            .child(
+                // Branch icon stands in for "this branch is up to date".
+                // 20px reads as a panel-level glyph without crowding the
+                // headline beneath it.
+                Icon::default()
+                    .path("icons/git-branch.svg")
+                    .size(px(20.0))
+                    .text_color(theme.fg_subtle),
+            )
+            .child(
+                div()
+                    .text_size(px(sc_style::TEXT))
+                    .text_color(theme.fg_muted)
+                    .font_weight(typography.w_medium)
+                    .child("No changes on this branch"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(switch_btn)
+                    .child(fetch_btn)
+                    .child(graph_btn),
+            )
+            .into_any_element()
+    }
+}

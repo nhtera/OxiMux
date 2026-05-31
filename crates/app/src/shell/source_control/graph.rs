@@ -623,9 +623,18 @@ fn render_commit_row(
     // `flex_1` child a definite width to shrink against; without it taffy
     // hands the row its intrinsic (content) width and truncation never
     // engages — the long subject paints past the panel's right edge.
+    //
+    // `min_w(px(80))` is a hard floor so the subject can never collapse to
+    // nothing under narrow-panel pressure. At 12px sans-serif that's ~11
+    // characters before ellipsis — enough to keep the row meaningful at
+    // any width the cockpit shell allows. Combined with `flex_shrink_0`
+    // on the date/sha trailing columns and `overflow_hidden` on the row,
+    // any remaining overflow clips from the right (sha first, then date),
+    // giving the desired collapse priority without per-column shrink
+    // factors that GPUI's Styled trait doesn't expose numerically.
     let subject = div()
         .flex_1()
-        .min_w(px(0.0))
+        .min_w(px(80.0))
         .overflow_hidden()
         .whitespace_nowrap()
         .text_size(px(sc_style::TEXT))

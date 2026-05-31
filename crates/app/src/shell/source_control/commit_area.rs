@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use gpui::{
     Anchor, AppContext, ClickEvent, Context, Entity, FocusHandle, IntoElement, ParentElement,
-    Styled, Subscription, Task, Window, div, px,
+    Styled, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable as _,
@@ -23,8 +23,28 @@ use gpui_component::{
 };
 use oximux_core::FileStatus;
 use oximux_git::Repository;
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{CommitMessageAiMode, CommitMessageAiSettings, Density, Theme, Typography};
 use oximux_storage::WorktreeSettingsRepo;
+
+/// Conventional-commit prefix shortcuts surfaced as one-click chips
+/// above the message textarea. Click prepends the prefix + `: ` to the
+/// current message (or leaves a stub `feat: ` when the box is empty),
+/// so the user gets the most common formatting for free without
+/// memorising the convention. Order mirrors the relative frequency in
+/// typical workflow: feat > fix > chore > docs > refactor.
+const COMMIT_PREFIXES: &[&str] = &["feat", "fix", "chore", "docs", "refactor"];
+
+/// Soft warning threshold for the subject character counter. Subjects
+/// over ~50 characters get harder to read in `git log --oneline`; the
+/// counter shifts to `status_warning` at this length to give a visual
+/// nudge without blocking submission.
+const SUBJECT_WARN_CHARS: usize = 50;
+
+/// Hard target ceiling for commit subjects. The conventional 72-char
+/// cap keeps subjects from being truncated in standard git tooling
+/// (GitHub PR titles, `git log` columnar output). The counter turns
+/// `status_error` past this point — still allowed, but visibly hot.
+const SUBJECT_MAX_CHARS: usize = 72;
 
 /// Coalesce per-keystroke commit_draft upserts. Drops two writes for
 /// every keystroke under the threshold (typing speed of ~4 keys/second
@@ -423,22 +443,65 @@ impl CommitArea {
         } else {
             "Generate commit message"
         };
+        // Agent-mode sublabel: when the user has configured an agent
+        // (claude / codex / custom) in `commit_message_ai.toml`, show
+        // its name as a tiny muted chip beneath the sparkles button so
+        // the active backend is visible at a glance — no need to
+        // hover the tooltip to discover which model the click will run.
+        // Heuristic mode → no sublabel (the local generator is the
+        // default; surfacing "heuristic" everywhere reads as noise).
+        // Off mode → entire button is hidden by `ai_off`.
+        let agent_sublabel = cx
+            .try_global::<CommitMessageAiSettings>()
+            .and_then(|s| match s.mode {
+                CommitMessageAiMode::Agent => {
+                    let raw = s.agent.agent_id.trim();
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        let mut chars = raw.chars();
+                        let first = chars.next().map(|c| c.to_uppercase().to_string());
+                        Some(format!(
+                            "{}{}",
+                            first.unwrap_or_default(),
+                            chars.as_str()
+                        ))
+                    }
+                }
+                _ => None,
+            });
         let sparkles_button = (!ai_off).then(|| {
-            div().absolute().top(px(6.0)).right(px(6.0)).child(
-                Button::new("sc-ai-message")
-                    .ghost()
-                    .xsmall()
-                    .icon(
-                        Icon::default()
-                            .path("icons/sparkles.svg")
-                            .size(px(sc_style::ICON)),
+            div()
+                .absolute()
+                .top(px(6.0))
+                .right(px(6.0))
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(1.0))
+                .child(
+                    Button::new("sc-ai-message")
+                        .ghost()
+                        .xsmall()
+                        .icon(
+                            Icon::default()
+                                .path("icons/sparkles.svg")
+                                .size(px(sc_style::ICON)),
+                        )
+                        .tooltip(sparkles_tooltip)
+                        .disabled(sparkles_disabled)
+                        .on_click(cx.listener(|area, _: &ClickEvent, window, cx| {
+                            area.start_ai_generation(window, cx);
+                        })),
+                )
+                .when_some(agent_sublabel, |col, name| {
+                    col.child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme.fg_subtle)
+                            .child(name),
                     )
-                    .tooltip(sparkles_tooltip)
-                    .disabled(sparkles_disabled)
-                    .on_click(cx.listener(|area, _: &ClickEvent, window, cx| {
-                        area.start_ai_generation(window, cx);
-                    })),
-            )
+                })
         });
         let textarea = div()
             .relative()
@@ -507,6 +570,57 @@ impl CommitArea {
                 build_commit_menu(menu, window, &action_view, &resolved_entries)
             });
 
+        // Conventional-prefix shortcut row + subject character counter
+        // share one slim strip above the textarea. Chips stay on the
+        // left (frequent action), counter pins to the right via
+        // `ml_auto` (informational). The strip stays mounted regardless
+        // of message contents so the chips and counter never re-flow
+        // as the user types.
+        let subject_chars = self
+            .message_state
+            .read(cx)
+            .value()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .count();
+        let counter_color = if subject_chars > SUBJECT_MAX_CHARS {
+            theme.status_error
+        } else if subject_chars > SUBJECT_WARN_CHARS {
+            theme.status_warning
+        } else {
+            theme.fg_subtle
+        };
+        let mut prefix_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .w_full();
+        for (idx, prefix) in COMMIT_PREFIXES.iter().enumerate() {
+            let prefix_static: &'static str = prefix;
+            prefix_row = prefix_row.child(
+                Button::new(("sc-commit-prefix", idx))
+                    .ghost()
+                    .xsmall()
+                    .label(format!("{prefix_static}:"))
+                    .tooltip(format!(
+                        "Prepend `{prefix_static}: ` to the commit message"
+                    ))
+                    .on_click(cx.listener(move |area, _: &ClickEvent, window, cx| {
+                        area.prepend_prefix(prefix_static, window, cx);
+                    })),
+            );
+        }
+        let meta_row = prefix_row.child(
+            div()
+                .ml_auto()
+                .text_size(px(9.0))
+                .text_color(counter_color)
+                .child(format!("{subject_chars} / {SUBJECT_MAX_CHARS}")),
+        );
+
         div()
             .flex()
             .flex_col()
@@ -516,9 +630,35 @@ impl CommitArea {
             .pt(px(sc_style::PAD_V))
             .pb(px(sc_style::PAD_V_TIGHT))
             .gap(px(sc_style::PAD_V_TIGHT))
+            .child(meta_row)
             .child(textarea)
             .child(primary)
             .child(status_row)
+    }
+
+    /// Prepend a conventional-commit prefix (`feat`, `fix`, …) to the
+    /// current message contents. No-op if the message already starts
+    /// with the same prefix (avoids stacking `feat: feat: …`). Called
+    /// from the meta-row chip click handlers; kept as a method rather
+    /// than an inline closure so the click site stays terse.
+    pub(in crate::shell::source_control) fn prepend_prefix(
+        &mut self,
+        prefix: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.message_state.read(cx).value().to_string();
+        let stamp = format!("{prefix}: ");
+        if current.starts_with(&stamp) {
+            return;
+        }
+        let new_val = if current.is_empty() {
+            stamp
+        } else {
+            format!("{stamp}{current}")
+        };
+        self.message_state
+            .update(cx, |s, cx| s.set_value(&new_val, window, cx));
     }
 }
 

@@ -16,9 +16,11 @@
 //! dependency, so the render call site sits here and the handler sits
 //! in `picker_wiring.rs`.
 
+use std::sync::atomic::Ordering;
+
 use gpui::{
     ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, Window, div, px,
+    ParentElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Icon, IconName, Sizable as _,
@@ -51,6 +53,14 @@ impl SourceControlPanel {
             .border_b_1()
             .border_color(theme.border_inactive)
             .px(px(sc_style::PAD_H));
+        // Count of uncommitted changed files for the "Uncommitted" tab
+        // badge. Counted once outside the loop so the per-tab render
+        // doesn't re-walk `git_state.files` twice. Zero suppresses the
+        // pill entirely — an empty `(0)` would just add visual noise.
+        let uncommitted_count = self
+            .git_state
+            .as_ref()
+            .map_or(0, |s| s.files.len());
         for scope in scopes {
             let active = scope == self.scope;
             let label = scope.label();
@@ -67,6 +77,33 @@ impl SourceControlPanel {
             } else {
                 gpui::transparent_black()
             };
+            // Show a small count pill next to the "Uncommitted" tab when
+            // there are changed files. Skipped on the "All" tab because
+            // the total commit count isn't surfaced through git_state
+            // and a fabricated number would mislead.
+            let badge_count = if scope == SourceControlScope::Uncommitted {
+                uncommitted_count
+            } else {
+                0
+            };
+            let label_row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(label)
+                .when(badge_count > 0, |row| {
+                    row.child(
+                        div()
+                            .px(px(5.0))
+                            .py(px(0.0))
+                            .rounded(px(6.0))
+                            .bg(theme.bg_panel_alt)
+                            .text_size(px(9.0))
+                            .text_color(theme.fg_subtle)
+                            .child(badge_count.to_string()),
+                    )
+                });
             let tab = div()
                 .flex()
                 .items_center()
@@ -85,7 +122,7 @@ impl SourceControlPanel {
                         panel.select_scope(scope, cx);
                     }),
                 )
-                .child(label);
+                .child(label_row);
             row = row.child(tab);
         }
         row
@@ -221,6 +258,60 @@ impl SourceControlPanel {
                         }),
                     )
                     .child(chip),
+            );
+        }
+
+        // Push / Pull pills surface the same network ops that live in the
+        // dropdown, one click away. Gated by `ahead`/`behind` so they
+        // only appear when actionable, and by `in_flight` so a second
+        // click during the spawn doesn't double-trigger (the underlying
+        // single-flight contract in `commit_ops::run_remote` would catch
+        // it, but hiding the affordance keeps the surface honest).
+        //
+        // Push pill fires `CommitArea::push` directly — a regular
+        // (non-force) push. Force-push lives behind the dropdown's
+        // confirm-modal path; the pill is the fast happy-path only.
+        let in_flight = self
+            .commit_area
+            .read(cx)
+            .in_flight
+            .load(Ordering::Relaxed);
+        if ahead > 0 && !in_flight {
+            let push_label = format!("Push {ahead}");
+            let push_tooltip = format!(
+                "Push {ahead} commit{} to remote",
+                if ahead == 1 { "" } else { "s" }
+            );
+            summary_row = summary_row.child(
+                div().ml(px(8.0)).child(
+                    Button::new("sc-push-pill")
+                        .ghost()
+                        .xsmall()
+                        .label(push_label)
+                        .tooltip(push_tooltip)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                            panel.commit_area.update(cx, |ca, cx| ca.push(cx));
+                        })),
+                ),
+            );
+        }
+        if behind > 0 && !in_flight {
+            let pull_label = format!("Pull {behind}");
+            let pull_tooltip = format!(
+                "Pull {behind} commit{} from remote",
+                if behind == 1 { "" } else { "s" }
+            );
+            summary_row = summary_row.child(
+                div().ml(px(4.0)).child(
+                    Button::new("sc-pull-pill")
+                        .ghost()
+                        .xsmall()
+                        .label(pull_label)
+                        .tooltip(pull_tooltip)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
+                            panel.commit_area.update(cx, |ca, cx| ca.pull(cx));
+                        })),
+                ),
             );
         }
         summary_row.child(actions)

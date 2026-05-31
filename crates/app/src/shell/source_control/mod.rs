@@ -23,6 +23,7 @@ pub mod commit_area;
 pub mod commit_ops;
 pub mod conflict_banner;
 pub mod dropdown_items;
+pub mod empty_state;
 pub mod filter;
 pub mod graph;
 pub mod picker_wiring;
@@ -713,13 +714,37 @@ impl Render for SourceControlPanel {
         // `WorkspaceRoot::build_on_open_diff_callback`). The `diff_view`
         // entity is kept on `Self` to avoid churning the constructor
         // signature; it stays in `Empty` state and never renders.
-        let files_block = div()
-            .flex()
-            .flex_1()
-            .min_h(px(0.0))
-            .flex_col()
-            .overflow_hidden()
-            .child(self.git_panel.clone());
+        //
+        // When the working tree is clean (no staged / unstaged /
+        // untracked entries and HEAD points somewhere), the file list
+        // is replaced with a centered empty-state card carrying the
+        // three idle-repo CTAs (Switch / Fetch / View Graph). The
+        // git_panel's own internal "No changes" placeholder is bypassed
+        // entirely on this path — we render the richer card here rather
+        // than embedding buttons in the panel-internal element tree
+        // because the CTAs dispatch through SourceControlPanel methods
+        // (open_switch_picker, commit_area.update, select_scope) which
+        // the inner GitPanel can't reach directly.
+        let clean_tree = self.should_show_empty_state();
+        let files_block = if clean_tree {
+            div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .child(self.render_empty_state(cx))
+        } else {
+            div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex_col()
+                .overflow_hidden()
+                .child(self.git_panel.clone())
+        };
 
         // Layout order: scope tabs → toolbar → filter →
         // **files (flex_1)** → **commit area docked at bottom** → graph.
