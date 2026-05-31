@@ -114,6 +114,116 @@ fn cascade_deletes_settings_when_workspace_dropped() {
 }
 
 #[test]
+fn modify_inserts_with_defaults_when_row_missing() {
+    // `modify` on a never-touched workspace must:
+    //   (a) call the closure with `WorktreeSettings::default()`,
+    //   (b) perform an INSERT (not silently no-op), and
+    //   (c) the resulting row reflects whatever the closure wrote.
+    let db = open_memory().expect("open mem");
+    seed_workspace(&db, "ws-1");
+    let repo = WorktreeSettingsRepo::new(db);
+
+    let mut seen_default = false;
+    repo.modify("ws-1", |s| {
+        seen_default = *s == WorktreeSettings::default();
+        s.base_ref = Some("origin/main".to_string());
+    })
+    .expect("modify");
+
+    assert!(seen_default, "closure must observe the default-constructed row");
+    let r = repo.get("ws-1").expect("get").expect("row inserted");
+    assert_eq!(r.base_ref.as_deref(), Some("origin/main"));
+    assert!(r.commit_draft.is_none());
+    assert!(r.view_mode_override.is_none());
+}
+
+#[test]
+fn modify_preserves_sibling_fields() {
+    // The core motivation for `modify`: a writer that only touches one
+    // column must NOT null out the columns owned by other panels.
+    // Pre-seed all three fields via `upsert`, then mutate only
+    // `base_ref` via `modify`. Siblings must survive.
+    let db = open_memory().expect("open mem");
+    seed_workspace(&db, "ws-1");
+    let repo = WorktreeSettingsRepo::new(db);
+
+    repo.upsert(
+        "ws-1",
+        &WorktreeSettings {
+            base_ref: Some("origin/main".to_string()),
+            commit_draft: Some("WIP: hunt down race".to_string()),
+            view_mode_override: Some("tree".to_string()),
+        },
+    )
+    .expect("seed row");
+
+    repo.modify("ws-1", |s| {
+        s.base_ref = Some("origin/release".to_string());
+    })
+    .expect("modify base_ref");
+
+    let r = repo.get("ws-1").expect("get").expect("row");
+    assert_eq!(r.base_ref.as_deref(), Some("origin/release"));
+    assert_eq!(
+        r.commit_draft.as_deref(),
+        Some("WIP: hunt down race"),
+        "commit_draft must survive a base_ref-only modify",
+    );
+    assert_eq!(
+        r.view_mode_override.as_deref(),
+        Some("tree"),
+        "view_mode_override must survive a base_ref-only modify",
+    );
+}
+
+#[test]
+fn modify_is_idempotent_under_same_value() {
+    // Repeated writes of the same value should leave the row content
+    // unchanged. (`updated_at` may advance — we only assert on the
+    // payload columns, which the application surfaces.)
+    let db = open_memory().expect("open mem");
+    seed_workspace(&db, "ws-1");
+    let repo = WorktreeSettingsRepo::new(db);
+
+    for _ in 0..3 {
+        repo.modify("ws-1", |s| {
+            s.commit_draft = Some("draft text".to_string());
+        })
+        .expect("modify");
+    }
+    let r = repo.get("ws-1").expect("get").expect("row");
+    assert_eq!(r.commit_draft.as_deref(), Some("draft text"));
+    assert!(r.base_ref.is_none());
+    assert!(r.view_mode_override.is_none());
+}
+
+#[test]
+fn modify_handles_distinct_writers_to_disjoint_fields() {
+    // Simulate the two real call sites (base_ref + view_mode_override)
+    // alternating. Because `modify` re-reads inside the with_conn
+    // closure, each write observes the previous write's effect on the
+    // sibling column — no clobber. This is the structural property
+    // commit_draft (the third writer) is about to depend on.
+    let db = open_memory().expect("open mem");
+    seed_workspace(&db, "ws-1");
+    let repo = WorktreeSettingsRepo::new(db);
+
+    repo.modify("ws-1", |s| s.base_ref = Some("origin/main".to_string()))
+        .unwrap();
+    repo.modify("ws-1", |s| s.view_mode_override = Some("tree".to_string()))
+        .unwrap();
+    repo.modify("ws-1", |s| s.commit_draft = Some("typing…".to_string()))
+        .unwrap();
+    repo.modify("ws-1", |s| s.base_ref = Some("origin/release".to_string()))
+        .unwrap();
+
+    let r = repo.get("ws-1").expect("get").expect("row");
+    assert_eq!(r.base_ref.as_deref(), Some("origin/release"));
+    assert_eq!(r.view_mode_override.as_deref(), Some("tree"));
+    assert_eq!(r.commit_draft.as_deref(), Some("typing…"));
+}
+
+#[test]
 fn delete_missing_row_is_noop() {
     let db = open_memory().expect("open mem");
     seed_workspace(&db, "ws-1");

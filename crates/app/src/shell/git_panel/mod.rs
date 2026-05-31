@@ -230,21 +230,20 @@ impl GitPanel {
     }
 
     /// Flip Flat ↔ Tree and persist the new mode to the per-worktree
-    /// settings repo. Read-modify-write under the hood so we don't clobber
-    /// sibling fields (`base_ref`, `commit_draft`) on the same row.
+    /// settings repo. The persist path runs through
+    /// `WorktreeSettingsRepo::modify`, which fuses the read+write under
+    /// one connection lock so sibling fields (`base_ref`,
+    /// `commit_draft`) survive untouched even when other writers race.
     /// Storage errors are logged at `warn!` — a missed write only loses
     /// the preference for the next launch, never blocks the toggle.
     pub fn cycle_view_mode(&mut self, cx: &mut Context<Self>) {
         self.view_mode = self.view_mode.toggled();
         if let Some(settings_repo) = self.worktree_settings_repo.clone() {
             let key = self.repo.workdir().to_string_lossy().into_owned();
-            let mut current = settings_repo
-                .get(&key)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            current.view_mode_override = Some(self.view_mode.as_str().to_string());
-            if let Err(e) = settings_repo.upsert(&key, &current) {
+            let next = self.view_mode.as_str().to_string();
+            if let Err(e) = settings_repo.modify(&key, |s| {
+                s.view_mode_override = Some(next);
+            }) {
                 tracing::warn!(
                     target: "oximux_app::git_panel",
                     error = %e,

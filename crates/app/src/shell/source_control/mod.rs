@@ -916,24 +916,18 @@ impl Render for SourceControlPanel {
     }
 }
 
-/// Read-modify-write the per-workspace base ref into the V006
-/// `worktree_settings` row. Preserves sibling fields (`commit_draft`,
-/// `view_mode_override`) that other panels own — the upsert otherwise
-/// would null them out. Pure-ish (the side effect is the SQLite write),
-/// so an integration test can exercise the round-trip via
-/// `oximux_storage::open_memory`.
+/// Write the per-workspace base ref into the V006 `worktree_settings`
+/// row, preserving sibling fields (`commit_draft`, `view_mode_override`)
+/// that other surfaces own. Delegates to
+/// [`WorktreeSettingsRepo::modify`], which fuses the read+write under
+/// one connection lock so concurrent writers (view-mode toggle,
+/// commit-draft debounce) cannot interleave a stale read.
 pub fn merge_base_ref_into_settings(
     settings_repo: &WorktreeSettingsRepo,
     workspace_id: &str,
     value: Option<String>,
 ) -> Result<(), oximux_storage::StorageError> {
-    let mut current = settings_repo
-        .get(workspace_id)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    current.base_ref = value;
-    settings_repo.upsert(workspace_id, &current)
+    settings_repo.modify(workspace_id, |s| s.base_ref = value)
 }
 
 /// Read the persisted base ref for this workspace from the V006
