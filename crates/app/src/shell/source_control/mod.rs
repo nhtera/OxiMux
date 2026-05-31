@@ -749,12 +749,15 @@ impl Render for SourceControlPanel {
                 .child(self.git_panel.clone())
         };
 
-        // Layout order: scope tabs → toolbar → filter →
-        // **files (flex_1)** → **commit area docked at bottom** → graph.
-        // The previous order rendered the commit textarea mid-panel,
-        // floating above the file list when the list was short. Anchoring
-        // the composer to the bottom keeps the cockpit's "type-and-commit"
-        // surface in a stable position regardless of file-list height.
+        // Layout order: header → scope tabs → toolbar → filter →
+        // **commit area (top-docked)** → **files (flex_1)** → stash →
+        // graph. The composer sits directly under the filter row so
+        // the user's primary verb (write a message + commit / stage /
+        // push) is the first interactive surface they land on after
+        // skimming the toolbar — matches the reference cockpit. The
+        // file list takes the remaining vertical slack (`flex_1`),
+        // shrinking before the composer or graph rather than pushing
+        // them off-screen on short lists.
         let mut body = div()
             .flex()
             .flex_col()
@@ -764,15 +767,15 @@ impl Render for SourceControlPanel {
             // Phase 07 panel header strip — repo name + Refresh +
             // Settings cog. Sits above the scope tabs so the panel
             // surface reads top-down: workspace identity → scope → branch
-            // state → file list → composer → graph.
+            // state → composer → file list → graph.
             .child(panel_header)
             .child(scope_tabs)
             .child(toolbar)
             .child(filter_row)
             .children(conflict_card)
             .children(operation_banner)
-            .child(files_block)
             .children(commit_area_render)
+            .child(files_block)
             // Stash list docked above the graph (or at the very bottom
             // when the scope hides the graph). Always-mounted entity;
             // collapsed by default — see `StashPanel::is_collapsed`.
