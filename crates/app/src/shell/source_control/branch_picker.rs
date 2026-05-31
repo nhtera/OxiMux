@@ -31,10 +31,12 @@ const CARD_WIDTH: f32 = 280.0;
 /// Max card height before the rows scroll. Eight rows + filter + header
 /// at the default density.
 const CARD_MAX_HEIGHT: f32 = 320.0;
-/// Edge padding around the card content.
-const CARD_PADDING: f32 = 6.0;
-/// Single row height — matches `adapter_picker` for visual consistency
-/// with the other anchored popover in the cockpit.
+/// Single row height. Intentionally 2px shorter than the global
+/// `density.h_overlay_item = 30` because branch lists tend to be longer
+/// than action menus and benefit from packing more rows into the same
+/// visible popover area. Treated as an approved exception to the
+/// floating-surface chrome recipe; do not refactor toward
+/// `density.h_overlay_item` without a paired UX decision.
 const ROW_HEIGHT: f32 = 28.0;
 /// Horizontal padding inside each row.
 const ROW_PADDING_X: f32 = 10.0;
@@ -384,7 +386,7 @@ impl Render for BranchPicker {
             .flex_col()
             .w(px(CARD_WIDTH))
             .max_h(px(CARD_MAX_HEIGHT))
-            .p(px(CARD_PADDING))
+            .p(px(density.pad_overlay))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_active)
@@ -411,7 +413,7 @@ impl Render for BranchPicker {
             })
             .child(
                 div()
-                    .pb(px(CARD_PADDING))
+                    .pb(px(density.pad_overlay))
                     .child(Input::new(&self.query_input)),
             );
 

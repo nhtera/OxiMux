@@ -14,7 +14,6 @@ use gpui::{
 use oximux_settings::{Density, Theme, Typography};
 use std::path::{Path, PathBuf};
 
-pub(super) const ITEM_HEIGHT: f32 = 30.0;
 pub(super) const ROW_PADDING_X: f32 = 10.0;
 
 #[allow(clippy::too_many_arguments)]
@@ -386,7 +385,7 @@ where
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ITEM_HEIGHT))
+        .h(px(density.h_overlay_item))
         .px(px(ROW_PADDING_X))
         .rounded(px(density.r_xs))
         .text_size(px(typography.t_body_md))

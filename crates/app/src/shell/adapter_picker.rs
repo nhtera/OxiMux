@@ -26,10 +26,6 @@ const MENU_WIDTH: f32 = 240.0;
 /// Vertical gap below the chrome row before the popover starts. Matches the
 /// pane-actions menu so the two visually align if both happen to be open.
 const ANCHOR_TOP_PX: f32 = 42.0;
-/// Edge padding around the card content.
-const CARD_PADDING: f32 = 6.0;
-/// Single menu item height.
-const ITEM_HEIGHT: f32 = 30.0;
 /// Horizontal padding inside each row.
 const ROW_PADDING_X: f32 = 10.0;
 /// Vertical separator thickness between the "+ New terminal" row and the
@@ -202,7 +198,7 @@ impl Render for AdapterPicker {
         let mut card = div()
             .flex()
             .flex_col()
-            .p(px(CARD_PADDING))
+            .p(px(density.pad_overlay))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_active)
@@ -377,7 +373,7 @@ fn picker_row(
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ITEM_HEIGHT))
+        .h(px(density.h_overlay_item))
         .px(px(ROW_PADDING_X))
         .rounded(px(density.r_xs))
         .text_size(px(typography.t_body_md))

@@ -26,8 +26,14 @@ use oximux_storage::ProjectRepo;
 const MODAL_WIDTH: f32 = 560.0;
 /// Vertical offset from the top of the viewport.
 const MODAL_TOP_OFFSET: f32 = 96.0;
-/// Single row height.
+/// Single row height. Modal-only dimension (560px wide, scrollable list
+/// of recent projects) — sits in a different visual context than
+/// floating pickers, which is why it doesn't route through
+/// `density.h_overlay_item = 30`. Kept as a local named const.
 const ROW_HEIGHT: f32 = 40.0;
+/// Horizontal padding inside modal rows + header. Modal-only dimension;
+/// floating-surface chrome uses `density.pad_overlay = 6` instead.
+const ROW_PAD_X: f32 = 16.0;
 /// Empty-state placeholder height.
 const EMPTY_STATE_HEIGHT: f32 = 80.0;
 /// Maximum project rows rendered before the list scrolls. Matches
@@ -308,7 +314,7 @@ fn header(theme: Theme, typography: &Typography) -> impl IntoElement {
         .flex()
         .items_center()
         .h(px(40.))
-        .px(px(16.))
+        .px(px(ROW_PAD_X))
         .text_size(px(typography.t_body_md))
         .font_weight(typography.w_semibold)
         .text_color(theme.fg_base)
@@ -341,7 +347,7 @@ fn open_folder_row(
         .flex_row()
         .items_center()
         .h(px(ROW_HEIGHT))
-        .px(px(16.))
+        .px(px(ROW_PAD_X))
         .bg(bg)
         .text_size(px(typography.t_body_md))
         .text_color(fg)
@@ -382,7 +388,7 @@ fn recent_row(
         .flex_col()
         .h(px(ROW_HEIGHT))
         .justify_center()
-        .px(px(16.))
+        .px(px(ROW_PAD_X))
         .bg(bg)
         .cursor_pointer()
         .on_mouse_down(

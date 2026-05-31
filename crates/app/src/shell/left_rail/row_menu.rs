@@ -17,10 +17,11 @@ use crate::workspace_root::WorkspaceRoot;
 
 /// Width of the menu card.
 const MENU_WIDTH: f32 = 160.0;
-/// Vertical padding around the card content.
-const CARD_PADDING: f32 = 6.0;
-/// One row height.
-const ITEM_HEIGHT: f32 = 28.0;
+/// One row height. Intentionally 2px shorter than the global
+/// `density.h_overlay_item = 30` because the left-rail row menu sits
+/// inside an already-narrow rail and reads tighter at 28px. Document
+/// the divergence locally instead of bumping the global token.
+const ROW_MENU_ITEM_H: f32 = 28.0;
 /// Horizontal padding inside each row.
 const ROW_PADDING_X: f32 = 10.0;
 /// Y offset below the trigger button so the menu doesn't visually overlap it.
@@ -119,7 +120,7 @@ impl Render for WorkspaceRowMenu {
         let mut card = div()
             .flex()
             .flex_col()
-            .p(px(CARD_PADDING))
+            .p(px(density.pad_overlay))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_active)
@@ -137,7 +138,7 @@ impl Render for WorkspaceRowMenu {
                 .flex()
                 .flex_row()
                 .items_center()
-                .h(px(ITEM_HEIGHT))
+                .h(px(ROW_MENU_ITEM_H))
                 .px(px(ROW_PADDING_X))
                 .rounded(px(density.r_xs))
                 .cursor_pointer()

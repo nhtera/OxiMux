@@ -23,8 +23,6 @@ use oximux_settings::{Density, Theme, Typography};
 
 /// Width of the dropdown card. Matches `TabContextMenu::MENU_WIDTH`.
 pub const MENU_WIDTH: f32 = 200.0;
-const CARD_PADDING: f32 = 6.0;
-const ITEM_HEIGHT: f32 = 30.0;
 const ROW_PADDING_X: f32 = 10.0;
 
 /// What the menu is targeting at open time. `Row` covers right-clicks
@@ -125,7 +123,7 @@ impl Render for FileTreeContextMenu {
         let card_base = div()
             .flex()
             .flex_col()
-            .p(px(CARD_PADDING))
+            .p(px(density.pad_overlay))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_active)
@@ -510,7 +508,7 @@ where
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ITEM_HEIGHT))
+        .h(px(density.h_overlay_item))
         .px(px(ROW_PADDING_X))
         .rounded(px(density.r_xs))
         .text_size(px(typography.t_body_md))
@@ -543,7 +541,7 @@ where
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ITEM_HEIGHT))
+        .h(px(density.h_overlay_item))
         .px(px(ROW_PADDING_X))
         .rounded(px(density.r_xs))
         .text_size(px(typography.t_body_md))

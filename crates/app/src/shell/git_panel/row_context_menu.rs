@@ -38,7 +38,6 @@ use std::path::PathBuf;
 /// because multi-select labels carry a count suffix
 /// ("Stage 12 selected") that would otherwise wrap.
 pub const MENU_WIDTH: f32 = 220.0;
-const CARD_PADDING: f32 = 6.0;
 
 /// What the menu is targeting at open time. Drives which items render
 /// and how their click handlers dispatch through the captured
@@ -157,7 +156,7 @@ impl Render for GitRowContextMenu {
         let card_base = div()
             .flex()
             .flex_col()
-            .p(px(CARD_PADDING))
+            .p(px(density.pad_overlay))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_active)

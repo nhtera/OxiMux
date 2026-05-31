@@ -38,10 +38,6 @@ pub enum TabContextKind {
 
 /// Width of the dropdown card.
 pub const MENU_WIDTH: f32 = 188.0;
-/// Edge padding around the card content.
-const CARD_PADDING: f32 = 6.0;
-/// Single menu item height.
-const ITEM_HEIGHT: f32 = 30.0;
 /// Horizontal padding inside each row.
 const ROW_PADDING_X: f32 = 10.0;
 /// Split icon glyph size inside each split row.
@@ -173,7 +169,7 @@ impl Render for TabContextMenu {
         let mut card = div()
             .flex()
             .flex_col()
-            .p(px(CARD_PADDING))
+            .p(px(density.pad_overlay))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_active)
@@ -224,7 +220,7 @@ impl Render for TabContextMenu {
                 .flex_row()
                 .items_center()
                 .gap(px(SPLIT_ROW_GAP))
-                .h(px(ITEM_HEIGHT))
+                .h(px(density.h_overlay_item))
                 .px(px(ROW_PADDING_X))
                 .rounded(px(density.r_xs))
                 .cursor_pointer()
@@ -594,7 +590,7 @@ where
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ITEM_HEIGHT))
+        .h(px(density.h_overlay_item))
         .px(px(ROW_PADDING_X))
         .rounded(px(density.r_xs))
         .text_size(px(typography.t_body_md))
