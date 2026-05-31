@@ -26,6 +26,7 @@ pub mod dropdown_items;
 pub mod empty_state;
 pub mod filter;
 pub mod graph;
+pub mod graph_row;
 pub mod picker_wiring;
 pub mod primary_action;
 pub mod scope;
