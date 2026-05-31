@@ -27,7 +27,7 @@ pub mod worktree;
 
 pub use diff::{DiffParseError, parse_unified_diff};
 pub use error::{GitError, Result};
-pub use numstat::{diff_numstat_head, parse_numstat_z};
+pub use numstat::{diff_numstat_commit, diff_numstat_head, parse_numstat_z};
 pub use poller::{DEFAULT_TICK, PollState, StatusPoller};
 pub use process::{GitCmd, Output, RawOutput};
 pub use remote::LeaseStatus;

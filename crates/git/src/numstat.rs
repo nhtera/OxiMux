@@ -52,6 +52,39 @@ pub async fn diff_numstat_head(workdir: &Path) -> Result<HashMap<PathBuf, (u32, 
     parse_numstat_z(&raw.stdout)
 }
 
+/// Run `git diff --numstat -z <sha>^..<sha>` and aggregate the per-file
+/// `(added, removed)` counts into a single `(total_added, total_removed)`
+/// pair for the commit. Feeds the commit-graph row's hover tooltip with
+/// a one-line size signal so the user can scan the panel and tell at a
+/// glance which commits were three-line fixes vs thousand-line drops.
+///
+/// Returns `Ok((0, 0))` when the commit is a root (no parent, so the
+/// `sha^..sha` range fails), the file was renamed-only with no text
+/// delta, or git fails for any other reason — graceful degradation so
+/// the tooltip silently omits the stats line instead of surfacing a
+/// "git failed" toast for a non-functional decoration.
+pub async fn diff_numstat_commit(workdir: &Path, sha: &str) -> Result<(u32, u32)> {
+    let range = format!("{sha}^..{sha}");
+    let raw = GitCmd::new(workdir)
+        .timeout(NUMSTAT_TIMEOUT)
+        .args(["diff", "--numstat", "-z", &range])
+        .run_raw()
+        .await?;
+    if !raw.status.success() {
+        // Root commit or a transient git failure — return zeros rather
+        // than propagate. The tooltip caller treats `(0, 0)` the same
+        // as a successful no-change diff, which is the right
+        // user-visible behavior for a root commit (no parent to diff
+        // against = no stats to show).
+        return Ok((0, 0));
+    }
+    let map = parse_numstat_z(&raw.stdout)?;
+    let totals = map
+        .values()
+        .fold((0u32, 0u32), |(a, r), &(na, nr)| (a + na, r + nr));
+    Ok(totals)
+}
+
 /// Pure parser. Public so the unit tests can drive it with literal byte
 /// fixtures (and so future call sites — e.g. per-file numstat on hover —
 /// can reuse the logic).

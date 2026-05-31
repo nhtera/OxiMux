@@ -3,7 +3,7 @@
 //! Loads `Repository::log_recent(20)` on mount; "Load more" extends in
 //! 20-row chunks. State machine: `Loading → Ready | Failed`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
     App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
@@ -81,6 +81,15 @@ pub struct CommitGraph {
     /// Focusable rail rendered at the bottom of the body so the user
     /// can Tab to it and resize via Arrow / Shift+Arrow / Home / End.
     focus_handle: FocusHandle,
+    /// Cached `(added, removed)` line counts per commit OID, populated
+    /// inline by the same tokio task that loads each page (so commits
+    /// and their stats arrive together on the first render). The
+    /// hover tooltip reads from here to surface the +N/−N line below
+    /// the commit body; absent entries (root commits, transient git
+    /// failures) silently render without the stats slot. Replaced
+    /// wholesale on a refresh / fresh `spawn_load_initial`; extended
+    /// in place on `load_more` so prior pages keep their stats.
+    stat_cache: HashMap<String, (u32, u32)>,
 }
 
 impl CommitGraph {
@@ -106,6 +115,7 @@ impl CommitGraph {
             graph_height: initial_height,
             settings_repo,
             focus_handle,
+            stat_cache: HashMap::new(),
         };
         graph.spawn_load_initial(cx);
         graph
@@ -194,12 +204,23 @@ impl CommitGraph {
 
     fn spawn_load_initial(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo.clone();
-        let (tx, rx) = oneshot::channel::<Result<Vec<CommitInfo>, GitError>>();
+        let workdir = self.repo.workdir().to_path_buf();
+        // Combined payload: the commit page AND its per-commit numstat
+        // map arrive together so the tooltip stats slot is populated
+        // the first time the user hovers a row. Sequential fetch
+        // inside one tokio task — at 20 commits × ~50 ms per `git
+        // diff --numstat` shellout that's ~1 s total wall-clock,
+        // happening once on panel mount. Acceptable for the polish
+        // pass; a future revision can switch to a `JoinSet` for
+        // parallelism if profiling shows it matters.
+        let (tx, rx) =
+            oneshot::channel::<(Result<Vec<CommitInfo>, GitError>, HashMap<String, (u32, u32)>)>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let r = repo.log_recent(PAGE_SIZE).await;
-                    let _ = tx.send(r);
+                    let commits_result = repo.log_recent(PAGE_SIZE).await;
+                    let stats = collect_commit_stats(&workdir, commits_result.as_ref().ok()).await;
+                    let _ = tx.send((commits_result, stats));
                 });
             }
             Err(_) => {
@@ -211,8 +232,13 @@ impl CommitGraph {
             }
         }
         let task = cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.await else { return };
+            let Ok((result, stats)) = rx.await else { return };
             let _ = this.update(cx, |g, cx| {
+                // Wholesale replace — a fresh load drops every prior
+                // page's stats (refresh path), so the cache can't
+                // accumulate orphan entries from commits no longer
+                // visible.
+                g.stat_cache = stats;
                 g.state = match result {
                     Ok(commits) => GraphState::Ready {
                         can_load_more: commits.len() == PAGE_SIZE as usize,
@@ -249,12 +275,15 @@ impl CommitGraph {
             _ => return,
         };
         let repo = self.repo.clone();
-        let (tx, rx) = oneshot::channel::<Result<Vec<CommitInfo>, GitError>>();
+        let workdir = self.repo.workdir().to_path_buf();
+        let (tx, rx) =
+            oneshot::channel::<(Result<Vec<CommitInfo>, GitError>, HashMap<String, (u32, u32)>)>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let r = repo.log_page(offset, PAGE_SIZE).await;
-                    let _ = tx.send(r);
+                    let page_result = repo.log_page(offset, PAGE_SIZE).await;
+                    let stats = collect_commit_stats(&workdir, page_result.as_ref().ok()).await;
+                    let _ = tx.send((page_result, stats));
                 });
             }
             Err(_) => {
@@ -265,7 +294,7 @@ impl CommitGraph {
             }
         }
         let task = cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.await else { return };
+            let Ok((result, stats)) = rx.await else { return };
             let _ = this.update(cx, |g, cx| {
                 if let GraphState::Ready {
                     commits,
@@ -279,6 +308,10 @@ impl CommitGraph {
                         Ok(mut more) => {
                             *can_load_more = more.len() == PAGE_SIZE as usize;
                             commits.append(&mut more);
+                            // Extend cache in place — prior pages keep
+                            // their stats; only new commits' entries
+                            // get merged in.
+                            g.stat_cache.extend(stats);
                         }
                         Err(e) => {
                             g.state = GraphState::Failed(e.to_string());
@@ -290,6 +323,38 @@ impl CommitGraph {
         });
         self._load_task = Some(task);
     }
+}
+
+/// Fetch per-commit numstat for every OID in `commits` (if `Some`),
+/// returning a `oid → (added, removed)` map. Each commit is queried
+/// sequentially via `oximux_git::diff_numstat_commit`; failures are
+/// silently dropped — the tooltip caller treats a missing entry the
+/// same as a successful zero-change diff and just omits the stats
+/// slot. Returns an empty map when `commits` is `None` or empty.
+async fn collect_commit_stats(
+    workdir: &std::path::Path,
+    commits: Option<&Vec<CommitInfo>>,
+) -> HashMap<String, (u32, u32)> {
+    let mut out = HashMap::new();
+    let Some(commits) = commits else {
+        return out;
+    };
+    for c in commits {
+        match oximux_git::diff_numstat_commit(workdir, &c.oid).await {
+            Ok(stats) => {
+                out.insert(c.oid.clone(), stats);
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target: "oximux_app::source_control::graph",
+                    oid = %c.oid,
+                    error = %err,
+                    "diff_numstat_commit failed; tooltip stats slot will be absent for this row"
+                );
+            }
+        }
+    }
+    out
 }
 
 impl EventEmitter<ShowCommitRequested> for CommitGraph {}
@@ -450,6 +515,11 @@ impl Render for CommitGraph {
                 let theme_cap = theme;
                 let typography_cap = self.typography.clone();
                 let density_cap = self.density;
+                // Snapshot the stat cache once for the closure so
+                // each row's lookup is a constant-time HashMap hit.
+                // Cloning at most 20–60 (oid → (u32, u32)) entries is
+                // negligible compared to the per-row layout cost.
+                let stat_cache = self.stat_cache.clone();
                 // Author column auto-hide: skip rendering the author
                 // chunk when every loaded commit shares one author
                 // (solo-author repo). Short-circuits the scan as soon
@@ -481,11 +551,7 @@ impl Render for CommitGraph {
                         let mut rows = Vec::with_capacity(range.len());
                         for ix in range {
                             if let Some(c) = commits.get(ix) {
-                                // `stats: None` for v2 — the
-                                // per-commit numstat backend lands in
-                                // a follow-up. Tooltip gracefully
-                                // omits the +N/−N line when stats are
-                                // absent (see render_commit_tooltip).
+                                let stats = stat_cache.get(&c.oid).copied();
                                 rows.push(render_commit_row(
                                     c,
                                     theme_cap,
@@ -493,7 +559,7 @@ impl Render for CommitGraph {
                                     &typography_cap,
                                     weak.clone(),
                                     show_author,
-                                    None,
+                                    stats,
                                 ));
                             }
                         }
