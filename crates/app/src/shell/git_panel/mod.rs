@@ -18,6 +18,8 @@ pub mod discard_confirm;
 pub mod discard_ops;
 pub mod range_select;
 pub mod row_actions;
+pub mod row_context_menu;
+pub mod row_context_menu_items;
 pub mod row_renderer;
 pub mod selection;
 pub mod tree_render;

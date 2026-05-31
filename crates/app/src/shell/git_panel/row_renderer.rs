@@ -299,6 +299,7 @@ pub(super) fn row(
         + 2.0
         + if has_sub_label { 12.0 } else { 0.0 };
 
+    let right_click_path = f.path.clone();
     div()
         .id(gpui::SharedString::from(row_id.clone()))
         .group(gpui::SharedString::from(row_id.clone()))
@@ -340,6 +341,47 @@ pub(super) fn row(
                     }
                 }
                 cx.notify();
+            }),
+        )
+        // Right-click — open the shared `GitRowContextMenu` with the
+        // right scope variant. Multi-select aware: when the
+        // right-clicked row is itself part of a >1 selection, the
+        // selection set is bundled into `selection_paths` so the menu
+        // pluralises labels and dispatches over the whole set. When
+        // the right-clicked row is NOT in the current selection, the
+        // menu opens in Single scope against just this row — matches
+        // VSCode / Finder behaviour where right-clicking an unselected
+        // row implicitly targets that row.
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |panel, ev: &MouseDownEvent, window, cx| {
+                let is_in_selection = panel.selected.contains(&right_click_path);
+                let selection_paths: Vec<String> =
+                    if is_in_selection && panel.selected.len() > 1 {
+                        panel
+                            .selected
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                let x: f32 = ev.position.x.into();
+                let y: f32 = ev.position.y.into();
+                window.dispatch_action(
+                    Box::new(crate::actions::OpenGitRowContextMenuAt {
+                        x,
+                        y,
+                        path: right_click_path.to_string_lossy().into_owned(),
+                        is_staged: click_staged,
+                        is_untracked: click_untracked,
+                        is_folder: false,
+                        selection_paths,
+                        folder_leaves: Vec::new(),
+                    }),
+                    cx,
+                );
+                cx.stop_propagation();
             }),
         )
         .child(icon_el)

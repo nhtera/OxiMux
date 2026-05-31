@@ -138,6 +138,10 @@ fn folder_row(
     let click_path = folder_path.clone();
     let click_subtree = subtree.clone();
     let click_siblings = siblings.clone();
+    let right_click_folder = folder_path.clone();
+    let right_click_leaves = subtree.clone();
+    let right_click_is_staged = matches!(kind, RowKind::Staged);
+    let right_click_is_untracked = matches!(kind, RowKind::Untracked);
 
     // Hover cluster is suppressed when:
     // - filter is active (subtree may be a partial slice — the user
@@ -176,6 +180,36 @@ fn folder_row(
                     panel.toggle_collapsed_dir(click_path.clone(), cx);
                 }
             }),
+        )
+        // Right-click on a folder row — open `GitRowContextMenu`
+        // in Folder scope over the pre-computed subtree leaves.
+        // Same dispatch surface as the hover cluster (Stage all /
+        // Discard all in folder) but reachable from any pointer
+        // position.
+        .on_mouse_down(
+            MouseButton::Right,
+            move |ev: &MouseDownEvent, window, cx| {
+                let leaves: Vec<String> = right_click_leaves
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                let x: f32 = ev.position.x.into();
+                let y: f32 = ev.position.y.into();
+                window.dispatch_action(
+                    Box::new(crate::actions::OpenGitRowContextMenuAt {
+                        x,
+                        y,
+                        path: right_click_folder.to_string_lossy().into_owned(),
+                        is_staged: right_click_is_staged,
+                        is_untracked: right_click_is_untracked,
+                        is_folder: true,
+                        selection_paths: Vec::new(),
+                        folder_leaves: leaves,
+                    }),
+                    cx,
+                );
+                cx.stop_propagation();
+            },
         )
         .child(Icon::new(chevron).size_3().text_color(theme.fg_subtle))
         .child(Icon::new(folder_icon).size_3().text_color(theme.fg_muted))

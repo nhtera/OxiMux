@@ -49,11 +49,11 @@ use crate::state::AppState;
 use crate::actions::{
     ActivateGroupTab, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
     OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenFileFromContextMenu,
-    OpenFileTreeContextMenuAt, OpenPaneActions, OpenPaneActionsAt, OpenProjectPicker,
-    OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate, RequestOpenAdapterPicker,
-    SelectExplorerTab, SelectFilesTab, SelectSearchTab, SelectSourceControlTab,
-    SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal, SplitLeft, SplitRight,
-    SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
+    OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate,
+    RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
+    SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
+    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -62,7 +62,10 @@ use crate::shell::{
     command_palette::{PaletteModal, entry::PaletteMode},
     confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
-    git_panel::{DiscardRequested, GitPanel},
+    git_panel::{
+        DiscardRequested, GitPanel,
+        row_context_menu::{GitRowContextMenu, GitRowContextTarget},
+    },
     source_control::graph::ShowCommitRequested,
     stash_panel::{
         PushStashRequested, StashPanel,
@@ -112,6 +115,13 @@ pub struct WorkspaceRoot {
     /// as `tab_context_menu` — one menu owned at the workspace level so
     /// click-outside dismiss + z-order behave consistently.
     pub(crate) file_tree_context_menu: Entity<FileTreeContextMenu>,
+    /// Right-click context menu for git_panel file + folder rows
+    /// (Open in editor / Copy paths / Reveal in Finder / Stage /
+    /// Unstage / Discard…). Same shared-entity pattern as
+    /// `file_tree_context_menu`; scope (Single / Multi / Folder) is
+    /// chosen by the action dispatcher based on the click payload +
+    /// the panel's selection set.
+    pub(crate) git_row_context_menu: Entity<GitRowContextMenu>,
     /// Inline adapter-picker popover anchored to the workspace-tabs `+` button.
     pub(crate) adapter_picker: Entity<AdapterPicker>,
     /// PTY backend + status streams for every agent session. Held behind Arc
@@ -276,6 +286,8 @@ impl WorkspaceRoot {
         let tab_context_menu = cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
         let file_tree_context_menu =
             cx.new(|_| FileTreeContextMenu::new(theme, density, typography.clone()));
+        let git_row_context_menu =
+            cx.new(|_| GitRowContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
@@ -486,6 +498,7 @@ impl WorkspaceRoot {
             pane_actions,
             tab_context_menu,
             file_tree_context_menu,
+            git_row_context_menu,
             adapter_picker,
             cli_runtime,
             adapter_registry,
@@ -1562,6 +1575,9 @@ impl Render for WorkspaceRoot {
                     let left_anchor = action.x.unwrap_or(fallback_anchor);
                     // Mutex: only one full-window popover can hold the click-outside path.
                     this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                     this.adapter_picker
                         .update(cx, |p, cx| p.open(left_anchor, window, cx));
                 }),
@@ -1746,6 +1762,79 @@ impl Render for WorkspaceRoot {
                     this.tab_context_menu.update(cx, |m, cx| m.close(cx));
                     this.file_tree_context_menu
                         .update(cx, |m, cx| m.open_background(action.x, action.y, root, cx));
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &OpenGitRowContextMenuAt, _window, cx| {
+                    // Git-row right-click — opens the shared
+                    // `GitRowContextMenu` with the right scope variant
+                    // (Single / Multi / Folder) derived from the
+                    // payload. Close peer overlays first so two
+                    // context menus can never share screen real
+                    // estate.
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+
+                    // Resolve the GitPanel weak handle + workdir from
+                    // the active right-sidebar. Bail silently when the
+                    // sidebar is unmounted (right-click can't have
+                    // landed on a non-rendered surface, but defensive).
+                    let Some(sc) = this
+                        .right_sidebar
+                        .as_ref()
+                        .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+                    else {
+                        return;
+                    };
+                    let (panel, workdir) = {
+                        let sc_ref = sc.read(cx);
+                        (
+                            sc_ref.git_panel.downgrade(),
+                            Some(sc_ref.repo.workdir().to_path_buf()),
+                        )
+                    };
+
+                    let path = std::path::PathBuf::from(&action.path);
+                    let target = if action.is_folder {
+                        let leaves: Vec<std::path::PathBuf> = action
+                            .folder_leaves
+                            .iter()
+                            .map(std::path::PathBuf::from)
+                            .collect();
+                        GitRowContextTarget::Folder {
+                            leaves,
+                            is_staged_section: action.is_staged,
+                            is_untracked_section: action.is_untracked,
+                        }
+                    } else if !action.selection_paths.is_empty() {
+                        // Multi-select right-click. Section flags
+                        // ride from the right-clicked row — when the
+                        // selection spans sections, the right-clicked
+                        // row's section wins for dispatch (cleanest
+                        // mental model: user right-clicked from
+                        // Staged → action targets Staged).
+                        let paths: Vec<std::path::PathBuf> = action
+                            .selection_paths
+                            .iter()
+                            .map(std::path::PathBuf::from)
+                            .collect();
+                        GitRowContextTarget::Multi {
+                            paths,
+                            all_staged: action.is_staged,
+                            all_untracked: action.is_untracked,
+                        }
+                    } else {
+                        GitRowContextTarget::Single {
+                            path,
+                            is_staged: action.is_staged,
+                        }
+                    };
+
+                    this.git_row_context_menu.update(cx, |m, cx| {
+                        m.open(action.x, action.y, target, panel, workdir, cx);
+                    });
                 },
             ))
             .on_action(
@@ -2037,6 +2126,7 @@ impl Render for WorkspaceRoot {
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| m.close(cx));
                 this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
@@ -2098,6 +2188,9 @@ impl Render for WorkspaceRoot {
             // File-tree right-click context menu — same z-band; mutually
             // exclusive via close-on-open in OpenFileTreeContextMenuAt.
             .child(self.file_tree_context_menu.clone())
+            // Git-row right-click context menu — same z-band; mutually
+            // exclusive via close-on-open in OpenGitRowContextMenuAt.
+            .child(self.git_row_context_menu.clone())
             // Adapter picker — same z-band as pane_actions; only one of
             // them can be open at a time so order between them is moot.
             .child(self.adapter_picker.clone())

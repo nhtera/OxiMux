@@ -213,6 +213,32 @@ pub struct FileTreeDelete {
     pub path: String,
 }
 
+/// Right-click on a git_panel file row. Carries cursor coords + the
+/// clicked row's path + section flags + the current selection set so
+/// the shared `GitRowContextMenu` can pick the right scope variant
+/// (Single / Multi / Folder) at open time.
+///
+/// `selection_paths` is populated only when the clicked row is part
+/// of a >1 multi-select — that's what flips the menu into the Multi
+/// variant. `folder_leaves` is populated only when `is_folder` is
+/// true (tree-mode folder right-click).
+///
+/// `PathBuf` / `Vec<PathBuf>` aren't `Action`-compatible, so paths
+/// ride as `String` / `Vec<String>` and receivers parse via
+/// `PathBuf::from`.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenGitRowContextMenuAt {
+    pub x: f32,
+    pub y: f32,
+    pub path: String,
+    pub is_staged: bool,
+    pub is_untracked: bool,
+    pub is_folder: bool,
+    pub selection_paths: Vec<String>,
+    pub folder_leaves: Vec<String>,
+}
+
 /// Payload action carrying text from the focused terminal up to the
 /// workspace so it can resolve "the active agent session" and stream
 /// the bytes through its CLI runtime. Bubbles from `TerminalView` up
@@ -371,3 +397,64 @@ actions!(
         SendLastCommandOutputToAgent,
     ]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_git_row_context_menu_default_is_empty_single() {
+        let a = OpenGitRowContextMenuAt::default();
+        assert_eq!(a.x, 0.0);
+        assert_eq!(a.y, 0.0);
+        assert!(a.path.is_empty());
+        assert!(!a.is_staged);
+        assert!(!a.is_untracked);
+        assert!(!a.is_folder);
+        assert!(a.selection_paths.is_empty());
+        assert!(a.folder_leaves.is_empty());
+    }
+
+    #[test]
+    fn open_git_row_context_menu_round_trip_payload() {
+        // A multi-select right-click on a Staged row carrying 3 paths.
+        let original = OpenGitRowContextMenuAt {
+            x: 100.0,
+            y: 200.0,
+            path: "src/lib.rs".to_string(),
+            is_staged: true,
+            is_untracked: false,
+            is_folder: false,
+            selection_paths: vec![
+                "src/lib.rs".to_string(),
+                "src/main.rs".to_string(),
+                "Cargo.toml".to_string(),
+            ],
+            folder_leaves: Vec::new(),
+        };
+        // Clone + PartialEq prove the derive surface is intact (Action
+        // dispatch relies on Clone; equality is the test surface for
+        // payload preservation).
+        let dup = original.clone();
+        assert_eq!(original, dup);
+        assert_eq!(dup.selection_paths.len(), 3);
+        assert!(dup.is_staged);
+    }
+
+    #[test]
+    fn open_git_row_context_menu_folder_payload() {
+        let folder = OpenGitRowContextMenuAt {
+            x: 0.0,
+            y: 0.0,
+            path: "src".to_string(),
+            is_staged: false,
+            is_untracked: true,
+            is_folder: true,
+            selection_paths: Vec::new(),
+            folder_leaves: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        };
+        assert!(folder.is_folder);
+        assert!(folder.is_untracked);
+        assert_eq!(folder.folder_leaves.len(), 2);
+    }
+}
