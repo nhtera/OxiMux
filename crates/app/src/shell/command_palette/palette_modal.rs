@@ -91,7 +91,7 @@ fn header_row(
                 .py(px(2.))
                 .bg(theme.bg_panel_alt)
                 .rounded(px(4.))
-                .text_size(px(typography.t_body_sm * 0.85))
+                .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)
                 .child(mode_label),
         )

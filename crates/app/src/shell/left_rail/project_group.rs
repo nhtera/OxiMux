@@ -151,7 +151,7 @@ fn build_header(
         .py(px(1.0))
         .rounded(px(density.r_xs))
         .bg(theme.bg_panel_alt)
-        .text_size(px(typography.t_body_sm * 0.8))
+        .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_subtle)
         .child(plan.workspace_count.to_string());
 

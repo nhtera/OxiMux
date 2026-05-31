@@ -81,7 +81,7 @@ pub fn render_workspace_row(
     let primary_badge: Option<gpui::AnyElement> = plan.show_primary_badge.then(|| {
         div()
             .px(px(4.))
-            .text_size(px(typography.t_body_sm * 0.85))
+            .text_size(px(typography.t_sub_label))
             .text_color(theme.fg_subtle)
             .child("primary")
             .into_any_element()
@@ -119,7 +119,7 @@ pub fn render_workspace_row(
                         .flex_row()
                         .items_center()
                         .gap(px(density.gap_inline))
-                        .text_size(px(typography.t_body_sm * 0.85))
+                        .text_size(px(typography.t_sub_label))
                         .text_color(theme.fg_subtle)
                         .child(plan.branch_label);
                     if let Some(badge) = primary_badge {

@@ -303,7 +303,7 @@ impl AddProjectDialog {
             // Disabled — show a "Coming soon" footnote in place of hover.
             card = card.child(
                 div()
-                    .text_size(px(typography.t_body_sm * 0.85))
+                    .text_size(px(typography.t_sub_label))
                     .text_color(theme.fg_subtle)
                     .child("Coming soon"),
             );

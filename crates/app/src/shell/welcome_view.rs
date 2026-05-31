@@ -69,6 +69,10 @@ fn logo_tile(theme: Theme, density: Density) -> impl IntoElement {
         .bg(theme.bg_panel)
         .border_1()
         .border_color(theme.border_inactive)
+        // 2× r_card (16px) reads as a "feature card" radius — distinct from
+        // the panel chrome that uses plain r_card (8px). Used only on the
+        // welcome-view logo tile; the multiplier stays inline rather than
+        // promoting to a density token until a second site appears.
         .rounded(px(density.r_card * 2.0))
         .child(
             svg()

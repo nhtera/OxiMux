@@ -154,7 +154,7 @@ pub fn render_workspace_row(
                 )
                 .child(
                     div()
-                        .text_size(px(typography.t_body_sm * 0.85))
+                        .text_size(px(typography.t_sub_label))
                         .text_color(plan.fg_sub)
                         .child(plan.slug),
                 ),
