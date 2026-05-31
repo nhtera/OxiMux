@@ -103,8 +103,12 @@ impl Repository {
     }
 
     /// Files that still have unresolved conflict markers, per
-    /// `git diff --name-only --diff-filter=U`.
-    pub(crate) async fn list_conflicting_paths(&self) -> Result<Vec<PathBuf>> {
+    /// `git diff --name-only --diff-filter=U`. Returned paths are
+    /// workdir-relative; callers that need absolute paths join with
+    /// `self.workdir()`. `pub` (not `pub(crate)`) so the SCM panel's
+    /// conflict-banner "Open all in editor" button can iterate them
+    /// without depending on `oximux-git` internals.
+    pub async fn list_conflicting_paths(&self) -> Result<Vec<PathBuf>> {
         let out = GitCmd::new(self.workdir())
             .args(["diff", "--name-only", "--diff-filter=U"])
             .run()

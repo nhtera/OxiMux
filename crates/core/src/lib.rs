@@ -23,7 +23,7 @@ pub use conflict_kind::ConflictKind;
 pub use git_diff::{
     DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, LARGE_DIFF_LINE_THRESHOLD,
 };
-pub use git_ops::{BranchInfo, MergeOutcome, StashEntry, StashRef, WorktreeInfo};
+pub use git_ops::{BranchInfo, GitOperation, MergeOutcome, StashEntry, StashRef, WorktreeInfo};
 pub use git_state::{
     CommitInfo, FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus,
 };

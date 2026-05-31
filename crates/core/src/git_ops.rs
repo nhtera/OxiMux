@@ -93,3 +93,50 @@ pub enum MergeOutcome {
         pop_failed: bool,
     },
 }
+
+/// Long-running git operation that has been started but not yet
+/// completed, detected from the presence of sentinel files inside
+/// `.git/`. Surfaced by
+/// [`Repository::current_operation`](crate::git_ops) so the SCM panel
+/// can render an "X in progress" banner and gate destructive ops.
+///
+/// Detection precedence (highest priority first):
+///
+/// 1. `Rebase`   — `.git/rebase-merge/` OR `.git/rebase-apply/` exists
+/// 2. `Merge`    — `.git/MERGE_HEAD` exists
+/// 3. `CherryPick` — `.git/CHERRY_PICK_HEAD` exists
+/// 4. `Revert`   — `.git/REVERT_HEAD` exists
+/// 5. `Bisect`   — `.git/BISECT_LOG` exists
+///
+/// Under normal operation git permits only one of these states at a
+/// time. A partially-cleaned `.git/` (after a crash or interrupted
+/// sequence) can leave a stale `MERGE_HEAD` alongside an active
+/// `rebase-merge/`, which is why `Rebase` outranks `Merge`: the
+/// rebase is the live operation, the `MERGE_HEAD` is a straggler.
+///
+/// The plain-data shape (no IO, no git invocation) keeps it inside
+/// `oximux-core` so UI layers can hold it without depending on
+/// `oximux-git`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GitOperation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
+impl GitOperation {
+    /// User-facing label for the operation banner: "Merge in progress",
+    /// "Rebase in progress", etc. Stable copy — referenced by snapshot
+    /// tests in the UI layer, so changing this rotates banner text.
+    pub fn banner_label(self) -> &'static str {
+        match self {
+            GitOperation::Merge => "Merge in progress",
+            GitOperation::Rebase => "Rebase in progress",
+            GitOperation::CherryPick => "Cherry-pick in progress",
+            GitOperation::Revert => "Revert in progress",
+            GitOperation::Bisect => "Bisect in progress",
+        }
+    }
+}

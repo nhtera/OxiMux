@@ -37,6 +37,16 @@ pub(crate) type RemoteBranchCache = Arc<RwLock<Option<(Instant, Vec<BranchInfo>)
 #[derive(Debug, Clone)]
 pub struct Repository {
     workdir: PathBuf,
+    /// Resolved `.git` directory — the linked-worktree-aware path, NOT
+    /// `workdir.join(".git")`. For a primary worktree this is
+    /// `<workdir>/.git`. For a linked worktree (created via
+    /// `git worktree add`) this is `<main>/.git/worktrees/<name>/`,
+    /// which is where sentinel files like `MERGE_HEAD` /
+    /// `REBASE_HEAD` / `CHERRY_PICK_HEAD` actually live for THIS
+    /// worktree (not the main one's `.git/`). Captured at
+    /// [`Repository::open`] so `current_operation` can stat them
+    /// without re-shelling out per poll tick.
+    pub(crate) git_dir: PathBuf,
     pub(crate) remote_branch_cache: RemoteBranchCache,
     /// Cache slot for `lease_status`. Shared across cloned handles for
     /// the same reason as `remote_branch_cache`.
@@ -49,8 +59,14 @@ impl Repository {
     /// Returns `NotInstalled` if the `git` binary is missing from PATH.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        // Single rev-parse fetches both --show-toplevel (workdir root)
+        // and --git-dir (the worktree-specific .git directory, which
+        // differs from `workdir/.git` for linked worktrees). Output is
+        // two lines: toplevel first, git-dir second. Issuing the two
+        // queries in one process saves a spawn on every Repository
+        // open.
         let res = match GitCmd::new(path)
-            .args(["rev-parse", "--show-toplevel"])
+            .args(["rev-parse", "--show-toplevel", "--git-dir"])
             .run_raw()
             .await
         {
@@ -84,17 +100,29 @@ impl Repository {
         // Path bytes are macOS-native UTF-8 (v1 is macOS-only). On other
         // platforms a non-UTF-8 toplevel would Parse-error here; revisit if
         // we ever port to Linux.
-        let toplevel = String::from_utf8(res.stdout)
-            .map_err(|e| GitError::parse(format!("toplevel not utf-8: {e}")))?
-            .trim()
-            .to_string();
-        if toplevel.is_empty() {
+        let stdout = String::from_utf8(res.stdout)
+            .map_err(|e| GitError::parse(format!("rev-parse output not utf-8: {e}")))?;
+        let mut lines = stdout.lines();
+        let toplevel = lines.next().unwrap_or("").trim().to_string();
+        let git_dir_raw = lines.next().unwrap_or("").trim().to_string();
+        if toplevel.is_empty() || git_dir_raw.is_empty() {
             return Err(GitError::NotARepo {
                 path: path.to_path_buf(),
             });
         }
+        // `git rev-parse --git-dir` is relative to its `current_dir`
+        // by default — resolve against the toplevel so callers (and
+        // `current_operation`'s stat checks) get an absolute path
+        // that works regardless of process cwd.
+        let git_dir_path = PathBuf::from(&git_dir_raw);
+        let git_dir = if git_dir_path.is_absolute() {
+            git_dir_path
+        } else {
+            PathBuf::from(&toplevel).join(git_dir_path)
+        };
         Ok(Self {
             workdir: PathBuf::from(toplevel),
+            git_dir,
             remote_branch_cache: Arc::new(RwLock::new(None)),
             lease_status_cache: Arc::new(RwLock::new(None)),
         })

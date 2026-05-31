@@ -14,6 +14,7 @@ pub mod error;
 pub mod log;
 pub mod merge;
 pub mod numstat;
+pub mod operation;
 pub mod poller;
 pub mod process;
 pub mod remote;
