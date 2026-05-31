@@ -116,9 +116,9 @@ impl FileStatus {
     }
 }
 
-/// One row in the commit graph (phase-05). Parsed from a NUL-terminated
-/// `git log -z --pretty=format:<US-joined fields>` record (see
-/// `oximux_git::log` for the exact format string).
+/// One row in the commit graph. Parsed from a NUL-terminated `git log
+/// -z --pretty=format:<US-joined fields>` record (see `oximux_git::log`
+/// for the exact format string).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitInfo {
     /// Full 40-char SHA.
@@ -134,4 +134,35 @@ pub struct CommitInfo {
     /// Empty string when the commit has no body. Newlines preserved so the
     /// UI can render paragraphs as written.
     pub body: String,
+    /// Parsed `%D` decorate field — branch / tag / HEAD ref labels
+    /// attached to this commit. Empty when no refs decorate the commit
+    /// (typical for older commits in the history). Order matches git's
+    /// emission so the "HEAD -> branch" pair (when present) lands as
+    /// `[Head, BranchTip { name }, ...]` and the UI can foreground the
+    /// HEAD chip.
+    #[serde(default)]
+    pub refs: Vec<RefLabel>,
+}
+
+/// One ref pointing at a commit. Modeled to mirror the decorate
+/// formats `git log` emits when given `--decorate` (which is the
+/// default for `%D` on tty; `%D` itself works regardless).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefLabel {
+    /// Bare `HEAD` — emitted only when HEAD is detached. The
+    /// attached-HEAD case shows as `HEAD -> {branch}` which the parser
+    /// represents as `Head` followed by `BranchTip { name }` in the
+    /// emission order; renderers can collapse those two into a single
+    /// "HEAD on {branch}" chip.
+    Head,
+    /// Local branch tip — `main`, `feature/x`, etc.
+    BranchTip { name: String },
+    /// Remote-tracking branch tip — `origin/main`, `upstream/dev`, etc.
+    RemoteBranch { name: String },
+    /// Annotated or lightweight tag — `tag: v1.2.3`.
+    Tag { name: String },
+    /// Anything `%D` emits that doesn't fit the above (e.g.
+    /// `refs/stash`, `refs/notes/commits`). Keeps the raw label so
+    /// renderers can still show it, just without specialized styling.
+    Other { raw: String },
 }

@@ -579,6 +579,33 @@ impl ProjectPanes {
         }))
     }
 
+    /// Open or activate a commit-detail tab in the active group.
+    /// Mirrors `open_or_activate_diff_tab` but routes through
+    /// `PaneGroup::open_or_activate_commit_tab` which dedups by SHA
+    /// rather than path. The new tab loads via `DiffView::load_commit`
+    /// so the same DiffView render path handles both single-file and
+    /// commit-detail multi-file views.
+    pub fn open_or_activate_commit_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        sha: String,
+        short_oid: String,
+        subject: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied())?;
+        self.set_active_group(target_id, window, cx);
+        let target = self.groups.get(&target_id)?.clone();
+        Some(target.update(cx, |g, cx| {
+            g.open_or_activate_commit_tab(repo, sha, short_oid, subject, window, cx)
+        }))
+    }
+
     pub fn open_terminal_tab_in_active_group(
         &mut self,
         window: &mut Window,
@@ -797,11 +824,12 @@ impl ProjectPanes {
                             path: path.display().to_string(),
                         },
                     ),
-                    // Diff tabs are intentionally NOT persisted — they
-                    // regenerate from current `git diff` state when the
-                    // user clicks the SCM row again. Skip the slot so
-                    // the persisted tab list stays compact.
-                    PaneGroupTabKind::Diff { .. } => continue,
+                    // Diff and commit-detail tabs are intentionally NOT
+                    // persisted — they regenerate from current `git`
+                    // state when the user re-clicks the source row.
+                    // Skip the slot so the persisted tab list stays
+                    // compact.
+                    PaneGroupTabKind::Diff { .. } | PaneGroupTabKind::Commit { .. } => continue,
                     PaneGroupTabKind::Agent {
                         adapter,
                         adapter_id,

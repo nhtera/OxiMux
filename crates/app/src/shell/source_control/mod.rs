@@ -125,8 +125,10 @@ pub struct SourceControlPanel {
 
     /// Held for the async picker-fetch + branch-switch tasks that need a
     /// live `Repository` handle on the panel itself (the observer task
-    /// already has its own clone).
-    repo: Repository,
+    /// already has its own clone). `pub(crate)` so `workspace_root` can
+    /// clone the Arc-backed handle into the commit-row-click handler
+    /// without re-resolving the repo from `RightSidebar`.
+    pub(crate) repo: Repository,
 
     scope: SourceControlScope,
     filter_query: String,

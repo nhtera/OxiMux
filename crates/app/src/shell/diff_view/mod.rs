@@ -68,6 +68,29 @@ pub enum DiffViewState {
         untracked: bool,
         error: String,
     },
+    /// Commit-detail mode: showing every file a single commit touches.
+    /// Distinct from `Loading` because the routing key is a SHA (no
+    /// `staged`/`untracked`/`path` semantics) and the post-load state
+    /// disables hunk action chips — Stage/Unstage/Discard make no
+    /// sense against a historical commit.
+    CommitLoading {
+        sha: String,
+        short_oid: String,
+        subject: String,
+    },
+    CommitReady {
+        sha: String,
+        short_oid: String,
+        subject: String,
+        diffs: Vec<FileDiff>,
+        expanded: bool,
+    },
+    CommitFailed {
+        sha: String,
+        short_oid: String,
+        subject: String,
+        error: String,
+    },
 }
 
 /// Public visibility-decision payload returned by `DiffView::current_side`.
@@ -206,27 +229,137 @@ impl DiffView {
     }
 
     /// Re-run the most recent load. No-op unless the current state is
-    /// `Failed` (so retry-while-Ready doesn't spam refresh). Caller is
-    /// the `RetryDiff` action handler.
+    /// `Failed` or `CommitFailed` (so retry-while-Ready doesn't spam
+    /// refresh). Caller is the `RetryDiff` action handler.
     pub fn retry(&mut self, cx: &mut Context<Self>) {
-        let DiffViewState::Failed {
-            path,
-            staged,
-            untracked,
-            ..
-        } = &self.state
-        else {
-            return;
+        match &self.state {
+            DiffViewState::Failed {
+                path,
+                staged,
+                untracked,
+                ..
+            } => {
+                let (path, staged, untracked) = (path.clone(), *staged, *untracked);
+                self.load(path, staged, untracked, cx);
+            }
+            DiffViewState::CommitFailed {
+                sha,
+                short_oid,
+                subject,
+                ..
+            } => {
+                let (sha, short_oid, subject) =
+                    (sha.clone(), short_oid.clone(), subject.clone());
+                self.load_commit(sha, short_oid, subject, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Begin loading the per-file diff for a commit. Bypasses the
+    /// file/staged routing — uses `repo.commit_files(sha)` to fetch
+    /// every file the commit touches, then mounts them in the same
+    /// `Vec<FileDiff>` shape the unstaged/staged path uses. Hunk
+    /// action chips do NOT render on this side (`current_side`
+    /// returns `None` whenever the state isn't the file-mode `Ready`).
+    pub fn load_commit(
+        &mut self,
+        sha: String,
+        short_oid: String,
+        subject: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Same drop-on-entry rule as `load()`: a stale post-op reload
+        // from a prior file selection must not flash over the new
+        // commit-detail view.
+        self._op_task = None;
+        self.state = DiffViewState::CommitLoading {
+            sha: sha.clone(),
+            short_oid: short_oid.clone(),
+            subject: subject.clone(),
         };
-        let (path, staged, untracked) = (path.clone(), *staged, *untracked);
-        self.load(path, staged, untracked, cx);
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<Result<Vec<FileDiff>, String>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let sha_for_fetch = sha.clone();
+                handle.spawn(async move {
+                    let r = repo
+                        .commit_files(&sha_for_fetch)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::diff_view",
+                    "no tokio runtime entered; commit load skipped"
+                );
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.apply_commit_load_result(sha, short_oid, subject, result);
+                cx.notify();
+            });
+        });
+        self._load_task = Some(task);
+    }
+
+    fn apply_commit_load_result(
+        &mut self,
+        sha: String,
+        short_oid: String,
+        subject: String,
+        result: Result<Vec<FileDiff>, String>,
+    ) {
+        match result {
+            Ok(diffs) => {
+                // Preserve `expanded` across reloads of the same commit
+                // (e.g. via retry). Different SHA always starts
+                // collapsed — that's the user-intent signal.
+                let expanded = match &self.state {
+                    DiffViewState::CommitReady {
+                        sha: prev_sha,
+                        expanded: prev_expanded,
+                        ..
+                    } if *prev_sha == sha => *prev_expanded,
+                    _ => false,
+                };
+                self.state = DiffViewState::CommitReady {
+                    sha,
+                    short_oid,
+                    subject,
+                    diffs,
+                    expanded,
+                };
+            }
+            Err(error) => {
+                self.state = DiffViewState::CommitFailed {
+                    sha,
+                    short_oid,
+                    subject,
+                    error,
+                };
+            }
+        }
     }
 
     /// Toggle a large-diff file from collapsed → expanded. Invoked by the
     /// `ExpandDiff` action and the click on the expand row in `render.rs`.
+    /// Applies to both file-mode Ready and commit-detail CommitReady —
+    /// the large-diff threshold can trip either path (e.g. opening a
+    /// squash commit that touches a 50-file refactor).
     pub fn expand(&mut self) {
-        if let DiffViewState::Ready { expanded, .. } = &mut self.state {
-            *expanded = true;
+        match &mut self.state {
+            DiffViewState::Ready { expanded, .. } => *expanded = true,
+            DiffViewState::CommitReady { expanded, .. } => *expanded = true,
+            _ => {}
         }
     }
 
@@ -591,6 +724,33 @@ impl Render for DiffView {
             } => {
                 let plan = build_render_plan(diffs, *expanded);
                 render_plan(&plan, side, &rctx, cx).into_any_element()
+            }
+            DiffViewState::CommitLoading {
+                short_oid, subject, ..
+            } => loading_state(
+                &format!("Loading commit {short_oid}: {subject}…"),
+                &rctx,
+            )
+            .into_any_element(),
+            DiffViewState::CommitFailed {
+                short_oid, error, ..
+            } => failed_state(
+                &format!("commit {short_oid}"),
+                error,
+                &rctx,
+                cx,
+            )
+            .into_any_element(),
+            DiffViewState::CommitReady {
+                diffs, expanded, ..
+            } => {
+                // `side = None` (current_side returns None for any
+                // non-`Ready` state) means hunk action chips do NOT
+                // render on commit-detail rows. Stage/Unstage/Discard
+                // against a historical commit doesn't model anything
+                // git supports.
+                let plan = build_render_plan(diffs, *expanded);
+                render_plan(&plan, None, &rctx, cx).into_any_element()
             }
         };
         // Wrap the body in a stateful scroll container. The previous

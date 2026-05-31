@@ -65,6 +65,13 @@ pub enum PaneGroupTabKind {
         path: PathBuf,
         staged: bool,
     },
+    /// Commit-detail tab — every file a single commit touches.
+    /// Dedup key is the full SHA so the same commit clicked twice
+    /// reactivates the existing tab rather than opening a duplicate.
+    /// Not persisted across restarts (same lifecycle as `Diff`).
+    Commit {
+        sha: String,
+    },
 }
 
 pub struct PaneGroupTab {
@@ -824,6 +831,68 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open or activate a commit-detail tab. Dedup key is the full
+    /// SHA — clicking the same commit row twice activates the
+    /// existing tab. `short_oid` and `subject` are display-only and
+    /// land in the tab label.
+    pub fn open_or_activate_commit_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        sha: String,
+        short_oid: String,
+        subject: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::Commit { sha: s } if s == &sha)
+        }) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let sha_for_load = sha.clone();
+        let short_for_load = short_oid.clone();
+        let subject_for_load = subject.clone();
+        let view = cx.new(|cx| {
+            let mut v =
+                crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
+            v.load_commit(sha_for_load, short_for_load, subject_for_load, cx);
+            v
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        // Tab label: short SHA + truncated subject. The tab strip
+        // truncates anything long, so we keep the subject readable up
+        // to a sane bound rather than trying to fit the entire commit
+        // message.
+        let label = {
+            let subject_trim: String = subject.chars().take(50).collect();
+            let suffix = if subject.chars().count() > 50 { "…" } else { "" };
+            SharedString::from(format!("{short_oid}: {subject_trim}{suffix}"))
+        };
+        let tab = PaneGroupTab {
+            label,
+            content: PaneContent::Diff(view),
+            kind: PaneGroupTabKind::Commit { sha },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn push_agent_tab(
         &mut self,
@@ -1217,7 +1286,8 @@ impl PaneGroup {
             PaneGroupTabKind::Agent { session_id, .. } => TabId::from(*session_id) == tab_id,
             PaneGroupTabKind::Terminal
             | PaneGroupTabKind::Editor { .. }
-            | PaneGroupTabKind::Diff { .. } => false,
+            | PaneGroupTabKind::Diff { .. }
+            | PaneGroupTabKind::Commit { .. } => false,
         }) else {
             return false;
         };

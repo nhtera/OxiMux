@@ -4,16 +4,17 @@
 //! 20-row chunks. State machine: `Loading → Ready | Failed`.
 
 use gpui::{
-    ClickEvent, Context, ElementId, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Task,
-    UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
+    ClickEvent, Context, ElementId, EventEmitter, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
+    Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
     tooltip::Tooltip,
 };
-use oximux_core::CommitInfo;
+use oximux_core::{CommitInfo, RefLabel};
 use oximux_git::{GitError, Repository};
 use oximux_settings::{Density, Theme, Typography};
 use tokio::sync::oneshot;
@@ -21,6 +22,26 @@ use tokio::sync::oneshot;
 use crate::shell::source_control::style as sc_style;
 
 const PAGE_SIZE: u32 = 20;
+
+/// Max ref chips rendered inline per commit row before the overflow
+/// `+N` chip kicks in. Tuned for the standard sidebar width — two
+/// chips leave room for the subject, author, date, and SHA columns.
+const REF_CHIPS_VISIBLE: usize = 2;
+
+/// Emitted by `CommitGraph` when the user clicks a commit row. The
+/// host (workspace) subscribes and opens a commit-detail tab pinned
+/// to the SHA.
+#[derive(Debug, Clone)]
+pub struct ShowCommitRequested {
+    pub sha: String,
+    /// Short label for the detail tab title — typically the 7-char
+    /// short OID. Captured at click time so the host doesn't have to
+    /// re-walk `CommitGraph` state.
+    pub short_oid: String,
+    /// Single-line subject for the tab title; truncated by the tab
+    /// strip if too long.
+    pub subject: String,
+}
 
 #[derive(Debug, Clone)]
 enum GraphState {
@@ -199,6 +220,8 @@ impl CommitGraph {
     }
 }
 
+impl EventEmitter<ShowCommitRequested> for CommitGraph {}
+
 impl Render for CommitGraph {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -343,6 +366,13 @@ impl Render for CommitGraph {
                 let theme_cap = theme;
                 let typography_cap = self.typography.clone();
                 let density_cap = self.density;
+                // Weak self-handle so each row's click closure can
+                // upgrade and emit `ShowCommitRequested` back to the
+                // graph entity. The list callback receives only
+                // `&mut App` (no entity context), so a strong listener
+                // pattern doesn't fit — `WeakEntity::update` is the
+                // canonical bridge.
+                let weak = cx.entity().downgrade();
                 uniform_list(
                     "commit-graph-list",
                     commits.len(),
@@ -355,6 +385,7 @@ impl Render for CommitGraph {
                                     theme_cap,
                                     density_cap,
                                     &typography_cap,
+                                    weak.clone(),
                                 ));
                             }
                         }
@@ -432,6 +463,7 @@ fn render_commit_row(
     theme: Theme,
     density: Density,
     typography: &Typography,
+    weak: WeakEntity<CommitGraph>,
 ) -> gpui::AnyElement {
     // Single-line row: dot + subject (truncates) + author + date + short sha.
     // Reference layout collapses the v1 two-line "subject / author • date"
@@ -516,6 +548,15 @@ fn render_commit_row(
     // after an id is set. The short OID is unique per commit, so a
     // per-row id is both stable across renders and collision-free.
     let row_id = ElementId::Name(format!("graph-commit-{}", c.short_oid).into());
+    let chips = render_ref_chips(&c.refs, &c.short_oid, theme, typography);
+
+    // Capture-by-clone for the click closure — emits `ShowCommitRequested`
+    // so the host workspace can open a commit-detail tab. The closure
+    // holds `String` clones rather than borrowing the row's `CommitInfo`
+    // because GPUI listeners outlive the render call's borrow stack.
+    let click_sha = c.oid.clone();
+    let click_short = c.short_oid.clone();
+    let click_subject = c.subject.clone();
 
     div()
         .id(row_id)
@@ -527,8 +568,11 @@ fn render_commit_row(
         .h(px(sc_style::COMMIT_ROW_H))
         .w_full()
         .overflow_hidden()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.bg_panel_alt))
         .child(timeline.self_stretch())
         .child(subject)
+        .when_some(chips, |row, chips| row.child(chips))
         .child(author)
         .child(date)
         .child(sha)
@@ -542,7 +586,137 @@ fn render_commit_row(
             })
             .build(window, cx)
         })
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            let _ = weak.update(cx, |_graph, cx| {
+                cx.emit(ShowCommitRequested {
+                    sha: click_sha.clone(),
+                    short_oid: click_short.clone(),
+                    subject: click_subject.clone(),
+                });
+            });
+        })
         .into_any_element()
+}
+
+/// Render the `RefLabel` chip cluster shown between subject and author
+/// columns. `None` when the commit has no decorations — caller skips
+/// the slot entirely so the row layout stays tight.
+///
+/// Cap at `REF_CHIPS_VISIBLE` visible chips; overflow collapses into a
+/// `+N` chip whose tooltip lists the hidden refs. HEAD chip is
+/// foregrounded with `status_info` so the current commit reads at a
+/// glance.
+fn render_ref_chips(
+    refs: &[RefLabel],
+    row_id: &str,
+    theme: Theme,
+    typography: &Typography,
+) -> Option<gpui::Div> {
+    if refs.is_empty() {
+        return None;
+    }
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .flex_shrink_0();
+    let mut shown = 0usize;
+    for r in refs.iter().take(REF_CHIPS_VISIBLE) {
+        row = row.child(ref_chip_for(r, theme, typography));
+        shown += 1;
+    }
+    let hidden = refs.len().saturating_sub(shown);
+    if hidden > 0 {
+        let overflow_text: SharedString = format!("+{hidden}").into();
+        // Tooltip text lists every hidden ref's literal label; built
+        // once at render so the closure doesn't have to re-walk.
+        let hidden_labels: Vec<String> = refs
+            .iter()
+            .skip(shown)
+            .map(ref_label_text)
+            .collect();
+        let tip_text: SharedString = hidden_labels.join(", ").into();
+        // Per-commit unique id — keying on count alone collides when
+        // two visible commits both have the same total ref count
+        // (overflow chip tooltips would cross-pollute via shared
+        // interactive state).
+        let chip_id =
+            ElementId::Name(format!("ref-chip-overflow-{row_id}").into());
+        row = row.child(
+            div()
+                .id(chip_id)
+                .px(px(6.0))
+                .py(px(1.0))
+                .rounded(px(3.0))
+                .bg(theme.bg_panel_alt)
+                .text_size(px(sc_style::SUB_LABEL_TEXT))
+                .text_color(theme.fg_muted)
+                .child(overflow_text)
+                .tooltip(move |window, cx| {
+                    Tooltip::new(tip_text.clone()).build(window, cx)
+                }),
+        );
+    }
+    Some(row)
+}
+
+/// Single chip for one `RefLabel`. HEAD pops in `status_info` blue;
+/// branch tips, remote-tracking branches, and tags each pick their
+/// own neutral tint so the cluster scans like a legend without
+/// shouting.
+fn ref_chip_for(r: &RefLabel, theme: Theme, typography: &Typography) -> gpui::Div {
+    let (label, fg, bg) = match r {
+        RefLabel::Head => (
+            "HEAD".to_string(),
+            theme.status_info,
+            gpui::Hsla {
+                a: 0.20,
+                ..theme.status_info
+            },
+        ),
+        RefLabel::BranchTip { name } => (
+            name.clone(),
+            theme.fg_base,
+            theme.bg_panel_alt,
+        ),
+        RefLabel::RemoteBranch { name } => (
+            name.clone(),
+            theme.fg_muted,
+            theme.bg_panel_alt,
+        ),
+        RefLabel::Tag { name } => (
+            format!("⚑ {name}"),
+            theme.status_warning,
+            gpui::Hsla {
+                a: 0.20,
+                ..theme.status_warning
+            },
+        ),
+        RefLabel::Other { raw } => (raw.clone(), theme.fg_subtle, theme.bg_panel_alt),
+    };
+    let _ = typography; // kept for future font-tweak hooks (mono vs sans).
+    div()
+        .px(px(6.0))
+        .py(px(1.0))
+        .rounded(px(3.0))
+        .bg(bg)
+        .text_size(px(sc_style::SUB_LABEL_TEXT))
+        .text_color(fg)
+        .child(label)
+}
+
+/// Render text for a ref's tooltip representation. Mirrors what
+/// `git log --decorate` shows so the tooltip reads naturally to
+/// anyone who's used the CLI.
+fn ref_label_text(r: &RefLabel) -> String {
+    match r {
+        RefLabel::Head => "HEAD".to_string(),
+        RefLabel::BranchTip { name } => name.clone(),
+        RefLabel::RemoteBranch { name } => name.clone(),
+        RefLabel::Tag { name } => format!("tag: {name}"),
+        RefLabel::Other { raw } => raw.clone(),
+    }
 }
 
 /// Build the multi-line tooltip body shown on commit-row hover. Subject sits

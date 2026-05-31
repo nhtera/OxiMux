@@ -25,7 +25,8 @@ pub use git_diff::{
 };
 pub use git_ops::{BranchInfo, GitOperation, MergeOutcome, StashEntry, StashRef, WorktreeInfo};
 pub use git_state::{
-    CommitInfo, FileStatus, GitState, IndexStatus, RenameInfo, RenameKind, WorktreeStatus,
+    CommitInfo, FileStatus, GitState, IndexStatus, RefLabel, RenameInfo, RenameKind,
+    WorktreeStatus,
 };
 pub use pane_session::PaneSession;
 pub use project::Project;

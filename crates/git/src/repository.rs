@@ -292,6 +292,45 @@ impl Repository {
         }])
     }
 
+    /// Per-file patch diff for a single commit. `sha` may be any
+    /// ref-or-OID `git` accepts (short SHA, full SHA, branch, tag,
+    /// `HEAD`, etc.). Returns one `FileDiff` per file the commit
+    /// touches.
+    ///
+    /// Implementation uses `git show --format= -p --first-parent
+    /// <sha>` — the empty `--format=` suppresses the commit metadata
+    /// header so only the patch body lands in stdout (parseable by
+    /// the same `parse_unified_diff` the regular diff methods use).
+    /// `git show` handles root commits (no parent) natively, so a
+    /// dedicated initial-commit fallback isn't needed.
+    ///
+    /// `--first-parent` makes merge commits emit a standard unified
+    /// diff against their first parent (mainline) instead of the
+    /// combined diff format (`@@@ -a,b -c,d +e,f @@@`) which
+    /// `parse_unified_diff` doesn't speak. The trade-off: a merge
+    /// commit's detail view shows "what landed from the merged
+    /// branch", not the conflict resolutions baked into the merge —
+    /// matches GitHub's PR view and `git log -p` default behavior.
+    /// Combined-diff support is a v1.1 follow-up.
+    pub async fn commit_files(&self, sha: &str) -> Result<Vec<FileDiff>> {
+        let out = GitCmd::new(&self.workdir)
+            .timeout(DIFF_TIMEOUT)
+            .args([
+                "show",
+                "--no-color",
+                "--no-ext-diff",
+                "--format=",
+                "-p",
+                "--first-parent",
+                sha,
+            ])
+            .run()
+            .await?;
+        let raw = std::str::from_utf8(&out.stdout)
+            .map_err(|e| GitError::parse(format!("show stdout not utf-8: {e}")))?;
+        Ok(parse_unified_diff(raw)?)
+    }
+
     async fn diff_with_args(&self, extra: &[&str], path: Option<&Path>) -> Result<Vec<FileDiff>> {
         let mut cmd = GitCmd::new(&self.workdir)
             .timeout(DIFF_TIMEOUT)

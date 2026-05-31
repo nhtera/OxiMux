@@ -63,6 +63,7 @@ use crate::shell::{
     confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
     git_panel::{DiscardRequested, GitPanel},
+    source_control::graph::ShowCommitRequested,
     stash_panel::{
         PushStashRequested, StashPanel,
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
@@ -180,6 +181,12 @@ pub struct WorkspaceRoot {
     /// dialog is mounted so the previous observer is dropped along with
     /// the previous dialog entity.
     pub(crate) _push_stash_dialog_observer: Option<Subscription>,
+    /// Long-lived subscription on `CommitGraph::ShowCommitRequested`.
+    /// Fired when the user clicks a commit row in the graph; the
+    /// handler opens a commit-detail tab in the active pane group.
+    /// Same lifetime contract as `_discard_subscription` —  dropping
+    /// it silently disables the click-to-open affordance.
+    pub(crate) _show_commit_subscription: Option<Subscription>,
 }
 
 impl WorkspaceRoot {
@@ -428,6 +435,45 @@ impl WorkspaceRoot {
                     },
                 )
             });
+
+        // Subscribe to CommitGraph's row-click requests. When the user
+        // clicks a commit row, `ShowCommitRequested { sha, short_oid,
+        // subject }` fires; we open a commit-detail tab via
+        // `ProjectPanes::open_or_activate_commit_tab` in the active
+        // group. The repo handle is captured at subscription time —
+        // RightSidebar already owns it for the lifetime of the source-
+        // control surface, so cloning here is cheap (Repository is an
+        // Arc-backed shared handle).
+        let show_commit_subscription = right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+            .map(|sc| {
+                // Capture (graph entity, repo) at subscription time so
+                // the click handler doesn't re-read sidebar state every
+                // dispatch. Repository is Arc-backed; clone is cheap.
+                let sc_ref = sc.read(cx);
+                (sc_ref.commit_graph.clone(), sc_ref.repo.clone())
+            })
+            .map(|(graph, repo)| {
+                cx.subscribe_in(
+                    &graph,
+                    window,
+                    move |root, _graph, ev: &ShowCommitRequested, window, cx| {
+                        let Some(panes) = root.active_project_panes() else {
+                            return;
+                        };
+                        let sha = ev.sha.clone();
+                        let short_oid = ev.short_oid.clone();
+                        let subject = ev.subject.clone();
+                        let repo = repo.clone();
+                        panes.update(cx, |p, cx| {
+                            p.open_or_activate_commit_tab(
+                                repo, sha, short_oid, subject, window, cx,
+                            );
+                        });
+                    },
+                )
+            });
         Self {
             theme,
             density,
@@ -452,6 +498,7 @@ impl WorkspaceRoot {
             _push_stash_subscription: push_stash_subscription,
             push_stash_dialog: None,
             _push_stash_dialog_observer: None,
+            _show_commit_subscription: show_commit_subscription,
             app_state,
             project_picker,
             workspace_dialog,

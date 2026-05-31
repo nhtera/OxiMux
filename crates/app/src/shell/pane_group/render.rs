@@ -230,7 +230,12 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         PaneGroupTabKind::Terminal => PaneTabKindMarker::Terminal,
         PaneGroupTabKind::Agent { .. } => PaneTabKindMarker::Agent,
         PaneGroupTabKind::Editor { .. } => PaneTabKindMarker::Editor,
-        PaneGroupTabKind::Diff { .. } => PaneTabKindMarker::Diff,
+        // Commit-detail tabs share the Diff marker — same `±` semantics
+        // and same chip styling. The dedup key differs (SHA vs path)
+        // but the visual chrome is identical.
+        PaneGroupTabKind::Diff { .. } | PaneGroupTabKind::Commit { .. } => {
+            PaneTabKindMarker::Diff
+        }
     }
 }
 
@@ -1340,9 +1345,11 @@ fn render_mru_hud(
             .clone()
             .unwrap_or_else(|| tab.label.clone());
         let icon_path = match tab.kind {
-            // Diff tabs share the file glyph with editor tabs (see
-            // marker note above).
-            PaneGroupTabKind::Editor { .. } | PaneGroupTabKind::Diff { .. } => "icons/file.svg",
+            // Diff and commit-detail tabs share the file glyph with
+            // editor tabs (see marker note above).
+            PaneGroupTabKind::Editor { .. }
+            | PaneGroupTabKind::Diff { .. }
+            | PaneGroupTabKind::Commit { .. } => "icons/file.svg",
             PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. } => {
                 "icons/square-terminal.svg"
             }
