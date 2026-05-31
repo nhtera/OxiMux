@@ -19,6 +19,7 @@
 pub mod branch_picker;
 pub mod commit_area;
 pub mod commit_ops;
+pub mod conflict_banner;
 pub mod dropdown_items;
 pub mod filter;
 pub mod graph;
@@ -95,6 +96,15 @@ pub struct SourceControlPanel {
     /// {base}" label and (downstream) the commit-graph diff base.
     base_ref: Option<String>,
 
+    /// Cached result of `Repository::current_operation()` — drives the
+    /// amber OperationBanner above the file list. Refreshed by the
+    /// state observer once per poll tick (cheap: 5 fs::metadata reads
+    /// on the worktree's `.git/`), NOT once per render. Per-render
+    /// recomputation would burn the fs cost on every keystroke /
+    /// scope-tab click / unrelated cx.notify, violating phase-08's
+    /// non-functional req that detection runs once per poll tick.
+    current_op: Option<oximux_core::GitOperation>,
+
     /// Per-worktree persistence layer; cloned for upserts after the user
     /// picks a base ref. `None` when the panel runs without a settings
     /// repo (test wiring); in that case the base ref still works in
@@ -157,6 +167,10 @@ impl SourceControlPanel {
             PollState::Ready(s) => Some(s.clone()),
             _ => None,
         };
+        // Detect any in-progress git op at mount time so the banner
+        // shows immediately if the user opens OxiMux mid-rebase
+        // rather than waiting for the first poll tick.
+        let initial_op = repo.current_operation();
         let observer = Self::start_state_observer(state_rx, repo.clone(), cx);
 
         let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
@@ -225,6 +239,7 @@ impl SourceControlPanel {
             git_state,
             force_push_with_lease: false,
             base_ref: initial_base_ref,
+            current_op: initial_op,
             worktree_settings_repo,
             repo,
             scope: SourceControlScope::All,
@@ -279,12 +294,19 @@ impl SourceControlPanel {
                     PollState::Ready(s)
                         if s.upstream.is_some() && s.ahead > 0 && s.behind > 0
                 );
+                // Refresh the cached in-progress git op before the
+                // panel update so render sees the new value on the
+                // same tick. Stat-only — microsecond cost on APFS,
+                // tolerable on a poll tick (vs per-render, which
+                // would burn it on every keystroke).
+                let op = repo.current_operation();
                 if this
                     .update(cx, |panel, cx| {
                         if let PollState::Ready(ref s) = state {
                             panel.git_state = Some(s.clone());
                         }
                         panel.poll_state = state;
+                        panel.current_op = op;
                         if !should_check_lease {
                             // Reset stale lease state immediately when we
                             // leave the diverged window — otherwise the
@@ -424,9 +446,33 @@ impl Render for SourceControlPanel {
         let action = self.resolve_primary(cx);
         let dropdown_inputs = self.build_dropdown_inputs(cx);
         // Snapshot the conflict flag before we move `dropdown_inputs`
-        // into `commit_area_render` below — gates the composer-vs-
-        // placeholder swap a few lines down.
+        // into `commit_area_render` below — gates the composer
+        // suppression a few lines down.
         let has_conflict = dropdown_inputs.primary.has_unresolved_conflicts;
+        // Count files whose status is Unmerged for the
+        // ConflictSummaryCard. Mirrors `build_primary_inputs`'s
+        // detection but tallies rather than collapsing to bool.
+        let conflict_count = self
+            .git_state
+            .as_ref()
+            .map(|s| {
+                use oximux_core::{IndexStatus, WorktreeStatus};
+                s.files
+                    .iter()
+                    .filter(|f| {
+                        matches!(f.index, IndexStatus::Unmerged)
+                            || matches!(f.worktree, WorktreeStatus::Unmerged)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        // Read the cached in-progress git op (`self.current_op`).
+        // `Repository::current_operation` is refreshed by
+        // `start_state_observer` once per poll tick — the panel
+        // re-renders many times per tick (filter keystrokes,
+        // unrelated cx.notify), so caching keeps the per-render
+        // path free of the 5 fs::metadata calls.
+        let current_op = self.current_op;
         let picker = self.branch_picker.clone();
 
         // Snapshot per-section render outputs as `AnyElement` so we can drop
@@ -434,19 +480,36 @@ impl Render for SourceControlPanel {
         let scope_tabs: AnyElement = self.render_scope_tabs(cx).into_any_element();
         let toolbar: AnyElement = self.render_branch_toolbar(cx).into_any_element();
         let filter_row: AnyElement = self.render_filter_row(cx).into_any_element();
+        // Conflict cards: the summary card sits ABOVE the operation
+        // banner when both apply — the more granular "files in
+        // conflict" surface dominates the broader "operation
+        // pending" surface so the user's eye lands on what they
+        // can act on first.
+        let conflict_card: Option<AnyElement> = conflict_banner::render_conflict_summary_card(
+            conflict_count,
+            theme,
+            // `enabled = false` until the next slice plumbs the
+            // OnOpenFile callback + iterates list_conflicting_paths.
+            // The button renders disabled with explanatory tooltip
+            // rather than silently no-op'ing on click.
+            false,
+            |_window, _cx| {},
+        )
+        .map(IntoElement::into_any_element);
+        let operation_banner: Option<AnyElement> =
+            conflict_banner::render_operation_banner(current_op, theme)
+                .map(IntoElement::into_any_element);
         // Suppress the composer entirely under unresolved conflicts.
-        // Committing on top of conflict markers would persist them into
-        // the tree; force the user to resolve first. The real conflict
-        // banner (resolve / abort merge actions) lands in a follow-up
-        // phase — for now the placeholder is a one-line muted hint so
-        // the user sees WHY the composer is gone instead of an
-        // unexplained blank.
-        let commit_area_render: AnyElement = if has_conflict {
-            render_conflict_placeholder(theme).into_any_element()
+        // Committing on top of conflict markers would persist them
+        // into the tree; the ConflictSummaryCard above explains why
+        // the slot is empty, so the composer slot just collapses
+        // rather than rendering a muted placeholder.
+        let commit_area_render: Option<AnyElement> = if has_conflict {
+            None
         } else {
-            self.commit_area.clone().update(cx, |a, cx| {
+            Some(self.commit_area.clone().update(cx, |a, cx| {
                 a.render(&action, dropdown_inputs, cx).into_any_element()
-            })
+            }))
         };
 
         // Filter wiring: helper `filter_files` is unit-tested in
@@ -490,8 +553,10 @@ impl Render for SourceControlPanel {
             .child(scope_tabs)
             .child(toolbar)
             .child(filter_row)
+            .children(conflict_card)
+            .children(operation_banner)
             .child(files_block)
-            .child(commit_area_render);
+            .children(commit_area_render);
         if self.scope.shows_graph() {
             // Graph sits at its natural height, pinned to the bottom of the
             // panel by the `flex_1` files_block above. Top border separates
@@ -516,26 +581,6 @@ impl Render for SourceControlPanel {
             .child(body)
             .child(picker)
     }
-}
-
-/// One-line muted placeholder shown in the composer slot while
-/// `has_unresolved_conflicts` is true. Keeps the layout stable (a
-/// disappearing composer would jump the file list around as the user
-/// resolves files) and gives the user a hint that the composer is
-/// intentionally hidden rather than broken. The full conflict banner
-/// — with resolve / abort merge action buttons — lands in a later
-/// phase; this is the minimum that closes the safety hole.
-fn render_conflict_placeholder(theme: oximux_settings::Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .flex_shrink_0()
-        .w_full()
-        .px(px(style::PAD_H))
-        .py(px(style::PAD_V))
-        .text_size(px(style::META_TEXT))
-        .text_color(theme.fg_subtle)
-        .child("Resolve conflicts before committing")
 }
 
 /// Refresh the cached `force_push_with_lease` flag on the panel.
