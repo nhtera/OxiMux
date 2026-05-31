@@ -401,6 +401,19 @@ impl WorkspaceRoot {
                     crate::workspace_root::WorkspaceRoot::build_on_query_active_path_callback(weak);
                 let worktree_settings_repo =
                     Some(this.app_state.worktree_settings_repo.clone());
+                // Phase 13: load persisted panel width clamped against
+                // the current window so a too-large persisted value
+                // can't overflow a newly-smaller window. The settings
+                // repo is shared app-wide via the same DB handle.
+                let window_width = f32::from(window.bounds().size.width);
+                let settings_repo = this.app_state.settings_repo.clone();
+                let initial_width = gpui::px(
+                    crate::scm_layout_settings::load_panel_width(&settings_repo, window_width),
+                );
+                let layout_boot = crate::shell::right_sidebar::SidebarLayoutBoot {
+                    initial_width: Some(initial_width),
+                    settings_repo: Some(settings_repo),
+                };
                 this.right_sidebar = Some(cx.new(|cx| {
                     crate::shell::right_sidebar::RightSidebar::new(
                         repo,
@@ -410,6 +423,7 @@ impl WorkspaceRoot {
                         on_open_diff,
                         Some(on_query),
                         worktree_settings_repo,
+                        layout_boot,
                         theme,
                         density,
                         typography,

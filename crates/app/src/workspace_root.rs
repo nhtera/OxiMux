@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window, div,
+    AnyElement, AppContext, Context, DragMoveEvent, Entity, FocusHandle, InteractiveElement,
+    IntoElement, ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window, div,
     prelude::FluentBuilder, px,
 };
 use oximux_agents::{AdapterRegistry, AgentRuntime, AgentSessionConfig, CliRuntime};
@@ -263,6 +263,18 @@ impl WorkspaceRoot {
             let on_open_diff = Self::build_on_open_diff_callback(weak_self.clone(), r.clone());
             let on_query = Self::build_on_query_active_path_callback(weak_self.clone());
             let worktree_settings_repo = Some(app_state.worktree_settings_repo.clone());
+            // Phase 13: load persisted panel width clamped against the
+            // live window so a too-large value from a wider monitor
+            // can't overflow a smaller one on next boot.
+            let window_width = f32::from(window.bounds().size.width);
+            let initial_width = px(crate::scm_layout_settings::load_panel_width(
+                &app_state.settings_repo,
+                window_width,
+            ));
+            let layout_boot = crate::shell::right_sidebar::SidebarLayoutBoot {
+                initial_width: Some(initial_width),
+                settings_repo: Some(app_state.settings_repo.clone()),
+            };
             cx.new(|cx| {
                 RightSidebar::new(
                     Some(r),
@@ -272,6 +284,7 @@ impl WorkspaceRoot {
                     Some(on_open_diff),
                     Some(on_query),
                     worktree_settings_repo,
+                    layout_boot,
                     theme,
                     density,
                     typography.clone(),
@@ -1349,8 +1362,16 @@ impl Render for WorkspaceRoot {
         } else {
             0.0
         };
+        // Phase 13: the sidebar width is now state, not the
+        // DEFAULT_PANEL_WIDTH const. Read the live width through the
+        // sidebar entity so PTY grids reflow correctly on every drag
+        // tick (set_panel_width's cx.notify triggers a render, which
+        // re-runs this read).
         let right_chrome = if right_open {
-            f32::from(DEFAULT_PANEL_WIDTH)
+            self.right_sidebar
+                .as_ref()
+                .map(|s| f32::from(s.read(cx).panel_width()))
+                .unwrap_or_else(|| f32::from(DEFAULT_PANEL_WIDTH))
         } else {
             0.0
         };
@@ -1499,6 +1520,43 @@ impl Render for WorkspaceRoot {
             .size_full()
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
+            // Phase 13: route sidebar-resize drag ticks. The handle
+            // itself lives inside RightSidebar (left edge of the
+            // column); the move listener has to live on a parent
+            // wide enough to keep the cursor inside its bounds for
+            // the duration of the drag — `size_full` qualifies. The
+            // handler reads the cursor's window-relative x and the
+            // listener-div's LIVE bounds width (`ev.bounds.size`),
+            // so an OS-window resize mid-drag immediately shifts the
+            // clamp ceiling without staring at a stale snapshot. The
+            // payload's `window_width` is a fallback for the rare
+            // frame where bounds are still zero (pre-layout).
+            .on_drag_move::<crate::shell::right_sidebar::resize::SidebarResizePayload>(
+                cx.listener(
+                    |this, ev: &DragMoveEvent<
+                        crate::shell::right_sidebar::resize::SidebarResizePayload,
+                    >, _window, cx| {
+                        let Some(sidebar) = this.right_sidebar.clone() else {
+                            return;
+                        };
+                        let live_width = f32::from(ev.bounds.size.width);
+                        let window_width = if live_width > 0.0 {
+                            live_width
+                        } else {
+                            ev.drag(cx).window_width
+                        };
+                        let cursor_x = f32::from(ev.event.position.x);
+                        sidebar.update(cx, |s, cx| {
+                            crate::shell::right_sidebar::resize::apply_drag_move(
+                                s,
+                                cursor_x,
+                                window_width,
+                                cx,
+                            );
+                        });
+                    },
+                ),
+            )
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
@@ -1585,9 +1643,17 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &OpenPaneActions, _window, cx| {
                 // Right-edge anchor: matches the "..." button position relative to
                 // the right column when sidebar is open / center toggle when closed.
-                let r_open = this.right_sidebar.as_ref().is_some_and(|s| s.read(cx).open);
+                // Reads the live sidebar width (Phase 13) so the anchor tracks
+                // a freshly-dragged sidebar without staring at the old default.
+                let (r_open, r_width) = match this.right_sidebar.as_ref() {
+                    Some(s) => {
+                        let read = s.read(cx);
+                        (read.open, f32::from(read.panel_width()))
+                    }
+                    None => (false, f32::from(DEFAULT_PANEL_WIDTH)),
+                };
                 let right_anchor = if r_open {
-                    f32::from(DEFAULT_PANEL_WIDTH)
+                    r_width
                 } else {
                     top_bar::TOGGLE_BUTTON_WIDTH
                 };

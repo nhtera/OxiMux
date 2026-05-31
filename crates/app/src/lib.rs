@@ -11,6 +11,7 @@ pub mod notifier;
 pub mod persisted_terminals;
 pub mod project_panes_factory;
 pub mod relay_supervisor;
+pub mod scm_layout_settings;
 pub mod shell;
 pub mod state;
 pub mod terminal_settings;

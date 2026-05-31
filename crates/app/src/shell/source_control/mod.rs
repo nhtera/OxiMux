@@ -75,6 +75,11 @@ pub struct PanelConfig {
     /// renders without persistence (BaseRef picker still works but
     /// changes don't survive a restart).
     pub worktree_settings_repo: Option<WorktreeSettingsRepo>,
+    /// Global key/value settings store. `None` in test wiring; the
+    /// production path always supplies it. Phase 13 reads
+    /// `scm_graph_height` from here on mount and persists it on every
+    /// keyboard-resize tick.
+    pub settings_repo: Option<oximux_storage::SettingsRepo>,
     /// Host callback to open a file in the main pane. Drives the
     /// "Open all in editor" button on the ConflictSummaryCard. `None`
     /// in test wiring → the button stays disabled with a "wiring
@@ -174,6 +179,7 @@ impl SourceControlPanel {
             density,
             typography,
             worktree_settings_repo,
+            settings_repo,
             on_open_file,
         } = cfg;
         // Read the persisted base ref synchronously — the repo handle
@@ -222,8 +228,33 @@ impl SourceControlPanel {
                 cx,
             )
         });
-        let commit_graph =
-            cx.new(|cx| CommitGraph::new(repo.clone(), theme, density, typography.clone(), cx));
+        // Phase 13: load persisted graph height now so the section
+        // mounts at its previous size, no flash. Clamped against the
+        // live window height so a value persisted on a taller monitor
+        // can't overflow a shorter window. `settings_repo` is the
+        // global k/v store; `None` in test wiring → defaults apply.
+        let initial_graph_height = match settings_repo.as_ref() {
+            Some(repo) => {
+                let window_height = f32::from(window.bounds().size.height);
+                gpui::px(crate::scm_layout_settings::load_graph_height(
+                    repo,
+                    window_height,
+                ))
+            }
+            None => gpui::px(crate::scm_layout_settings::DEFAULT_GRAPH_HEIGHT),
+        };
+        let commit_graph_settings_repo = settings_repo.clone();
+        let commit_graph = cx.new(|cx| {
+            CommitGraph::new(
+                repo.clone(),
+                initial_graph_height,
+                commit_graph_settings_repo,
+                theme,
+                density,
+                typography.clone(),
+                cx,
+            )
+        });
         let stash_panel =
             cx.new(|cx| StashPanel::new(repo.clone(), theme, density, typography.clone(), cx));
 

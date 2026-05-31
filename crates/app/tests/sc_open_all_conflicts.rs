@@ -146,6 +146,7 @@ async fn open_all_conflicts_dispatches_on_open_file_per_path(cx: &mut TestAppCon
                     density: Density::default(),
                     typography: Typography::default(),
                     worktree_settings_repo: None,
+                    settings_repo: None,
                     on_open_file: Some(on_open_file),
                 },
                 state_rx,

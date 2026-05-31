@@ -4,9 +4,10 @@
 //! 20-row chunks. State machine: `Loading → Ready | Failed`.
 
 use gpui::{
-    ClickEvent, Context, ElementId, EventEmitter, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
-    Task, UniformListScrollHandle, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled, Task,
+    UniformListScrollHandle, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
     uniform_list,
 };
 use gpui_component::{
@@ -17,8 +18,10 @@ use gpui_component::{
 use oximux_core::{CommitInfo, RefLabel};
 use oximux_git::{GitError, Repository};
 use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::SettingsRepo;
 use tokio::sync::oneshot;
 
+use crate::scm_layout_settings;
 use crate::shell::source_control::style as sc_style;
 
 const PAGE_SIZE: u32 = 20;
@@ -69,16 +72,32 @@ pub struct CommitGraph {
     density: Density,
     typography: Typography,
     _load_task: Option<Task<()>>,
+    // ----- Phase 13: keyboard-resizable section height -----
+    /// Live body height of the commit-list area. Pre-Phase-13 this was
+    /// `px(240.0)` hard-coded — now state, clamped via
+    /// `scm_layout_settings::clamp_graph_height` on every mutation.
+    graph_height: Pixels,
+    /// Global key/value settings store. When present, every mutation
+    /// to `graph_height` writes back via `save_graph_height` so the
+    /// chosen size survives a restart; `None` is the test wiring
+    /// (in-memory only).
+    settings_repo: Option<SettingsRepo>,
+    /// Focusable rail rendered at the bottom of the body so the user
+    /// can Tab to it and resize via Arrow / Shift+Arrow / Home / End.
+    focus_handle: FocusHandle,
 }
 
 impl CommitGraph {
     pub fn new(
         repo: Repository,
+        initial_height: Pixels,
+        settings_repo: Option<SettingsRepo>,
         theme: Theme,
         density: Density,
         typography: Typography,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
         let mut graph = Self {
             repo,
             state: GraphState::Loading,
@@ -88,9 +107,66 @@ impl CommitGraph {
             density,
             typography,
             _load_task: None,
+            graph_height: initial_height,
+            settings_repo,
+            focus_handle,
         };
         graph.spawn_load_initial(cx);
         graph
+    }
+
+    /// Current body height — exposed so callers (e.g. snapshot tests
+    /// later) don't have to round-trip through render.
+    #[allow(dead_code)]
+    pub fn graph_height(&self) -> Pixels {
+        self.graph_height
+    }
+
+    /// Apply a new graph height; clamps against the live window
+    /// height, persists when a settings repo is wired, and notifies
+    /// the view tree. No-op when the value would be unchanged so the
+    /// repo isn't pelted with redundant writes during a held key.
+    pub fn set_graph_height(
+        &mut self,
+        candidate: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let window_height = f32::from(window.bounds().size.height);
+        let clamped = scm_layout_settings::clamp_graph_height(candidate, window_height);
+        let new_height = px(clamped);
+        if self.graph_height == new_height {
+            return;
+        }
+        self.graph_height = new_height;
+        if let Some(repo) = &self.settings_repo {
+            scm_layout_settings::save_graph_height(repo, clamped);
+        }
+        cx.notify();
+    }
+
+    /// Translate a key event on the resize rail into a height change.
+    /// Returns `true` when the key was consumed so the listener can
+    /// `cx.stop_propagation()` and prevent bubbling to other handlers.
+    /// Arithmetic lives in `scm_layout_settings::next_graph_height` so
+    /// the keyboard mapping is exercised by pure unit tests.
+    fn handle_resize_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = ev.keystroke.key.as_str();
+        let shift = ev.keystroke.modifiers.shift;
+        let current = f32::from(self.graph_height);
+        let window_height = f32::from(window.bounds().size.height);
+        match scm_layout_settings::next_graph_height(current, key, shift, window_height) {
+            Some(candidate) => {
+                self.set_graph_height(candidate, window, cx);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Refresh the graph (e.g. after a successful commit). When data is
@@ -222,8 +298,14 @@ impl CommitGraph {
 
 impl EventEmitter<ShowCommitRequested> for CommitGraph {}
 
+impl Focusable for CommitGraph {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for CommitGraph {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
@@ -346,14 +428,20 @@ impl Render for CommitGraph {
 
         let body = match &self.state {
             // Initial-load placeholder matches the eventual `uniform_list`
-            // height (240px) so the section doesn't pop taller when the
-            // first page resolves. Refresh never enters this arm — see
+            // height so the section doesn't pop taller when the first
+            // page resolves. Refresh never enters this arm — see
             // `refresh()` for the stale-while-revalidate path that keeps
-            // the existing list painted.
-            GraphState::Loading => {
-                placeholder_sized("Loading commits…", 240.0, theme, density, typography)
-                    .into_any_element()
-            }
+            // the existing list painted. Reads `graph_height` (Phase 13)
+            // so a user who shrank the section before quitting doesn't
+            // see a tall placeholder on next launch.
+            GraphState::Loading => placeholder_sized(
+                "Loading commits…",
+                f32::from(self.graph_height),
+                theme,
+                density,
+                typography,
+            )
+            .into_any_element(),
             GraphState::Failed(e) => {
                 placeholder(&format!("git log failed: {e}"), theme, density, typography)
                     .into_any_element()
@@ -392,7 +480,10 @@ impl Render for CommitGraph {
                         rows
                     },
                 )
-                .h(px(240.0))
+                // Phase 13: body height is state (graph_height) now,
+                // not a const. Keyboard rail below the body mutates
+                // it via Arrow / Shift+Arrow / Home / End.
+                .h(self.graph_height)
                 .track_scroll(&self.scroll)
                 .into_any_element()
             }
@@ -453,8 +544,48 @@ impl Render for CommitGraph {
             if let Some(lm) = load_more {
                 col = col.child(lm);
             }
+            // Phase 13: keyboard resize rail. Sits at the bottom of
+            // the section so Tab order arrives here AFTER the
+            // commit list. Reads the focus state to show the focus
+            // ring on tab arrival; Arrow / Shift+Arrow / Home / End
+            // mutate `graph_height`.
+            col = col.child(self.render_resize_rail(window, cx));
         }
         col
+    }
+}
+
+impl CommitGraph {
+    /// Build the focusable keyboard-resize rail rendered at the bottom
+    /// of the graph section. 3px tall; subtle by default, accent stripe
+    /// on focus + hover. cursor `row_resize` for parity with mouse
+    /// expectation even though only key handling is wired (mouse
+    /// dragging here would compete with the sidebar drag — out of
+    /// scope for Phase 13).
+    fn render_resize_rail(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let focused = self.focus_handle.is_focused(window);
+        let bar_color = if focused {
+            theme.focus_ring
+        } else {
+            theme.border_inactive
+        };
+        div()
+            .id(ElementId::Name(SharedString::from("graph-resize-rail")))
+            .track_focus(&self.focus_handle)
+            .w_full()
+            .h(px(3.0))
+            .flex_shrink_0()
+            .bg(bar_color)
+            .hover(|s| s.bg(theme.focus_ring))
+            .cursor_row_resize()
+            .on_key_down(
+                cx.listener(|graph, ev: &KeyDownEvent, window, cx| {
+                    if graph.handle_resize_key(ev, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
     }
 }
 

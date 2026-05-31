@@ -5,19 +5,21 @@
 
 pub mod activity_bar;
 pub mod layout;
+pub mod resize;
 pub mod tab;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Task, Window, div, px,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, Render,
+    Styled, Task, Window, div, px,
 };
 use oximux_git::{PollState, Repository, StatusPoller};
 use oximux_settings::{Density, Theme, Typography};
-use oximux_storage::WorktreeSettingsRepo;
+use oximux_storage::{SettingsRepo, WorktreeSettingsRepo};
 
+use crate::scm_layout_settings;
 use crate::shell::diff_view::DiffView;
 use crate::shell::file_explorer::FileExplorer;
 use crate::shell::file_tree_view::{FileTreeView, OnOpenDiff, OnOpenFile, OnQueryActivePath};
@@ -37,6 +39,35 @@ pub struct SidebarTestConfig {
     pub theme: Theme,
     pub density: Density,
     pub typography: Typography,
+}
+
+/// Search for the SettingsRepo + Pixels initial width pair so callers
+/// can pass them as a single arg through `RightSidebar::new` and the
+/// constructor stays comfortably under the 7-arg clippy limit.
+#[derive(Clone)]
+pub struct SidebarLayoutBoot {
+    /// Initial sidebar width (already loaded + clamped against current
+    /// window width by the caller). `None` falls back to the
+    /// `DEFAULT_PANEL_WIDTH` constant — used in tests and any code
+    /// path that doesn't have a SettingsRepo handy.
+    pub initial_width: Option<Pixels>,
+    /// Global key/value settings store. When present the sidebar
+    /// persists width changes on every drag tick; when absent
+    /// (test wiring) resize still works but state evaporates on
+    /// teardown.
+    pub settings_repo: Option<SettingsRepo>,
+}
+
+impl SidebarLayoutBoot {
+    /// Test wiring: no persisted width, no settings repo. The sidebar
+    /// falls back to `DEFAULT_PANEL_WIDTH` and resize ticks update
+    /// state in-memory only.
+    pub fn for_test() -> Self {
+        Self {
+            initial_width: None,
+            settings_repo: None,
+        }
+    }
 }
 
 /// Tab-switchable right panel that replaces the old fixed `GitMount` column.
@@ -69,6 +100,15 @@ pub struct RightSidebar {
     _poller: Option<Arc<StatusPoller>>,
     _poll_observer: Task<()>,
 
+    // ----- Phase 13: panel-width state -----
+    /// Live sidebar width in pixels. Read by `panel_width()` from
+    /// `WorkspaceRoot` for the chrome-width forwarding into
+    /// ProjectPanes, and by `render()` for the column's `w(...)` style.
+    panel_width: Pixels,
+    /// Global settings store for persistence on resize. `None` =
+    /// test/non-persistent mount; setter just updates state.
+    settings_repo: Option<SettingsRepo>,
+
     theme: Theme,
 }
 
@@ -86,6 +126,7 @@ impl RightSidebar {
         on_open_diff: Option<OnOpenDiff>,
         on_query_active_path: Option<OnQueryActivePath>,
         worktree_settings_repo: Option<WorktreeSettingsRepo>,
+        layout_boot: SidebarLayoutBoot,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -137,6 +178,7 @@ impl RightSidebar {
                     cx,
                 )
             });
+            let sc_settings_repo = layout_boot.settings_repo.clone();
             cx.new(|cx| {
                 SourceControlPanel::new(
                     PanelConfig {
@@ -145,6 +187,10 @@ impl RightSidebar {
                         density,
                         typography: typography.clone(),
                         worktree_settings_repo: worktree_settings_repo.clone(),
+                        // Phase 13: hand the SCM panel a clone of the
+                        // global settings repo so CommitGraph can
+                        // persist `scm_graph_height` on resize.
+                        settings_repo: sc_settings_repo.clone(),
                         // SCM panel's ConflictSummaryCard "Open all
                         // in editor" needs the host file-open
                         // callback. `OnOpenFile` is `Arc<dyn Fn ...>`
@@ -209,6 +255,12 @@ impl RightSidebar {
             RightTab::Explorer
         };
 
+        let SidebarLayoutBoot {
+            initial_width,
+            settings_repo,
+        } = layout_boot;
+        let panel_width = initial_width.unwrap_or(DEFAULT_PANEL_WIDTH);
+
         Self {
             open: initial_open,
             active_tab,
@@ -219,6 +271,8 @@ impl RightSidebar {
             latest_poll_state: initial,
             _poller: poller,
             _poll_observer: poll_observer,
+            panel_width,
+            settings_repo,
             theme,
         }
     }
@@ -295,6 +349,9 @@ impl RightSidebar {
                     // Test wiring: no persistence layer — the panel still
                     // works for in-memory base-ref picks.
                     worktree_settings_repo: None,
+                    // Test wiring: no global settings repo — graph
+                    // height + sidebar width default constants apply.
+                    settings_repo: None,
                     // Test wiring: no host file-open callback — the
                     // ConflictSummaryCard's "Open all in editor"
                     // button stays disabled.
@@ -352,8 +409,35 @@ impl RightSidebar {
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
+            panel_width: DEFAULT_PANEL_WIDTH,
+            settings_repo: None,
             theme,
         }
+    }
+
+    /// Live width of the panel column in pixels. `WorkspaceRoot`
+    /// reads this to forward the correct chrome width into
+    /// `ProjectPanes::set_chrome_width` after a resize, and the
+    /// adapter-picker / pane-actions anchors use it to compute the
+    /// right-edge offset.
+    pub fn panel_width(&self) -> Pixels {
+        self.panel_width
+    }
+
+    /// Apply a new panel width — clamps against the current window's
+    /// expected ceiling (caller already did this), updates state,
+    /// notifies the view tree to re-flow, and persists to
+    /// `SettingsRepo` when one is wired. Called from the
+    /// drag-move handler in `resize::apply_drag_move`.
+    pub fn set_panel_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.panel_width == width {
+            return;
+        }
+        self.panel_width = width;
+        if let Some(repo) = &self.settings_repo {
+            scm_layout_settings::save_panel_width(repo, f32::from(width));
+        }
+        cx.notify();
     }
 
     /// Expose the latest poll state so `WorkspaceRoot` can pass it to the status bar.
@@ -425,7 +509,7 @@ impl RightSidebar {
 }
 
 impl Render for RightSidebar {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
         // NOTE: on_action handlers for sidebar keybindings are registered on
@@ -538,19 +622,37 @@ impl Render for RightSidebar {
             }
         };
 
-        // Fixed-width column so it doesn't compete with MainPane's flex_1 in the
-        // parent row. bg_panel + border_l isolate the column visually so the
-        // terminal pane to the left can't visually bleed into the body area.
+        // Width is now state, not const — see set_panel_width / the
+        // Phase 13 drag handle below. bg_panel + border_l isolate the
+        // column visually so the terminal pane to the left can't bleed
+        // into the body area.
+        //
+        // Phase 13: the drag handle sits at the column's left edge as
+        // a sibling of the body in a horizontal flex row. Cursor pickup
+        // is forgiving (7px hitbox around a 1px visible stripe) and the
+        // matching on_drag_move listener lives on WorkspaceRoot's outer
+        // row so the cursor stays inside the listener's bounds across
+        // the full drag.
+        let window_width = f32::from(window.bounds().size.width);
         div()
             .id("right-sidebar")
             .flex()
-            .flex_col()
+            .flex_row()
             .h_full()
-            .w(DEFAULT_PANEL_WIDTH)
+            .w(self.panel_width)
             .bg(theme.bg_panel)
             .border_l_1()
             .border_color(theme.border_inactive)
-            .child(body)
+            .child(resize::build_handle(window_width))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .child(body),
+            )
             .into_any_element()
     }
 }
