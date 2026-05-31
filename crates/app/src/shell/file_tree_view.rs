@@ -10,10 +10,11 @@
 use gpui::{
     AnyElement, App, AppContext, Context, ElementId, Entity, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, UniformListScrollHandle, Window, div, prelude::FluentBuilder, px, rgb,
+    Styled, Subscription, UniformListScrollHandle, Window, div, prelude::FluentBuilder, px,
     uniform_list,
 };
 use oximux_editor::{FileTree, FileTreeEvent, FileTreeNode, TreeNodeId};
+use oximux_settings::{Theme, Typography};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -278,26 +279,26 @@ fn build_rows_recursive(
 // workspace `Theme` registry. Hex values mirror the dark cockpit
 // background used elsewhere; swap for real theme tokens when this
 // view is mounted into the workspace shell.
-const ROW_HEIGHT: f32 = 22.0;
+
+/// File-tree row height. Intentionally 2px tighter than
+/// `density.h_row = 24` so the explorer can fit more rows in the same
+/// vertical space — file-tree navigation is scan-heavy and benefits
+/// from compact rows; documented locally instead of adding a global
+/// `density.h_row_compact` token until a second compact surface appears.
+const FILE_TREE_ROW_H: f32 = 22.0;
 const INDENT_PX: f32 = 14.0;
 const CHEVRON_COL: f32 = 14.0;
 const ICON_COL: f32 = 16.0;
 const TITLEBAR_PAD: f32 = 30.0;
 
-const BG_PANEL: u32 = 0x141518;
-const FG_DEFAULT: u32 = 0xCBD0D8;
-const FG_DIM: u32 = 0x6A707A;
-const HOVER_BG: u32 = 0x22262C;
-const SELECT_BG: u32 = 0x2E343D;
-/// Active-file highlight: distinct from click-selection so the user can
-/// see both signals at once (e.g. the active file is `main.rs` but they
-/// just clicked `lib.rs` to preview). Darker accent + brighter foreground.
-const ACTIVE_BG: u32 = 0x1F3340;
-const ACTIVE_FG: u32 = 0xE2E8F0;
-
 impl Render for FileTreeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.rows.len();
+        // Theme / typography are resolved per-render and threaded into
+        // render_row so the closure captures stable Copy values rather
+        // than re-instantiating per row.
+        let theme = Theme::charcoal();
+        let typography = Typography::cockpit();
         // Resolve the focused-editor file path once per render. Cached
         // into the uniform_list closure so every row's match check is a
         // cheap `==` instead of an Arc call per row.
@@ -307,6 +308,7 @@ impl Render for FileTreeView {
             count,
             cx.processor({
                 let active_path = active_path.clone();
+                let typography = typography.clone();
                 move |me: &mut Self,
                       range: std::ops::Range<usize>,
                       _window: &mut Window,
@@ -314,10 +316,18 @@ impl Render for FileTreeView {
                     let rows = me.rows.clone();
                     let selected = me.selected;
                     let active_path = active_path.clone();
+                    let typography = typography.clone();
                     range
                         .map(|i| {
-                            render_row(rows[i].clone(), selected, active_path.as_deref(), cx)
-                                .into_any_element()
+                            render_row(
+                                rows[i].clone(),
+                                selected,
+                                active_path.as_deref(),
+                                theme,
+                                &typography,
+                                cx,
+                            )
+                            .into_any_element()
                         })
                         .collect::<Vec<AnyElement>>()
                 }
@@ -332,9 +342,9 @@ impl Render for FileTreeView {
             .flex_col()
             .h_full()
             .w_full()
-            .bg(rgb(BG_PANEL))
-            .text_color(rgb(FG_DEFAULT))
-            .text_size(px(12.0))
+            .bg(theme.bg_panel)
+            .text_color(theme.fg_base)
+            .text_size(px(typography.t_body_sm))
             // Top padding clears the transparent titlebar (traffic lights)
             // so the root row is not hidden behind the window controls.
             .pt(px(TITLEBAR_PAD))
@@ -347,6 +357,8 @@ fn render_row(
     row: DisplayRow,
     selected: Option<TreeNodeId>,
     active_path: Option<&std::path::Path>,
+    theme: Theme,
+    typography: &Typography,
     cx: &mut Context<FileTreeView>,
 ) -> impl IntoElement {
     let indent = px(row.depth as f32 * INDENT_PX);
@@ -391,8 +403,8 @@ fn render_row(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(9.0))
-        .text_color(rgb(FG_DIM))
+        .text_size(px(typography.t_label_xs))
+        .text_color(theme.fg_subtle)
         .child(chevron);
 
     let icon_el = div()
@@ -400,31 +412,45 @@ fn render_row(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(11.0))
+        .text_size(px(typography.t_body_sm))
         .child(icon);
 
     let label_el = div()
         .flex_1()
         .overflow_hidden()
-        .when(is_sentinel, |s| s.text_color(rgb(FG_DIM)).italic())
+        .when(is_sentinel, |s| s.text_color(theme.fg_subtle).italic())
         .child(row.label.clone());
 
+    // Row chrome states (mirrors the convention used in source-control rows):
+    //   - idle           → transparent (no bg)
+    //   - hover          → bg_panel_alt
+    //   - selected only  → bg_panel_alt + 1px border_active hairline so the
+    //                      click feedback survives without overpainting hover
+    //   - active editor  → theme.selection (the same blue used for text
+    //                      selection — semantically "this is what you're
+    //                      focused on") + fg_base for the row text
     let mut el = div()
         .id(row_id)
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
-        .h(px(ROW_HEIGHT))
+        .h(px(FILE_TREE_ROW_H))
         .mx(px(4.0))
         .pl(indent)
         .pr(px(6.0))
         .rounded(px(4.0))
         .when(is_active, |s| {
-            s.bg(rgb(ACTIVE_BG)).text_color(rgb(ACTIVE_FG))
+            s.bg(theme.selection).text_color(theme.fg_base)
         })
-        .when(is_selected && !is_active, |s| s.bg(rgb(SELECT_BG)))
-        .when(!is_sentinel, |s| s.hover(|h| h.bg(rgb(HOVER_BG))))
+        .when(is_selected && !is_active, |s| {
+            s.bg(theme.bg_panel_alt)
+                .border_1()
+                .border_color(theme.border_active)
+        })
+        .when(!is_sentinel && !is_active && !is_selected, |s| {
+            s.hover(|h| h.bg(theme.bg_panel_alt))
+        })
         .child(chevron_el)
         .child(icon_el)
         .child(label_el);
