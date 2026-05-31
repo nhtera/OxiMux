@@ -133,6 +133,34 @@ impl Repository {
             .await?;
         Ok(())
     }
+
+    /// Discard worktree changes within selected hunks — DESTRUCTIVE.
+    ///
+    /// `file` must come from `diff_unstaged()` or `diff_for_path(path, false)`.
+    /// `indices` are 0-based into `file.hunks`. Validation/rejection rules
+    /// match `stage_hunks` (empty selection, out-of-range index, binary,
+    /// no hunks) via the shared `build_patch` builder.
+    ///
+    /// Reuses the same forward patch the stage path builds, then runs
+    /// `git apply --reverse -` against the **worktree** (NOT `--cached`).
+    /// The index is untouched. Discarding a hunk that's already been
+    /// staged is a no-op against the worktree — the user should
+    /// `unstage_hunks` first to bring the change back to the worktree,
+    /// then `discard_hunks` to drop it.
+    ///
+    /// Caller is responsible for the type-to-confirm UX; this method has
+    /// no guard. Mirrors `discard_paths` in being the destructive
+    /// counterpart to a file-level op (`stage_paths` ↔ `discard_paths`,
+    /// `stage_hunks` ↔ `discard_hunks`).
+    pub async fn discard_hunks(&self, file: &FileDiff, indices: &[usize]) -> Result<()> {
+        let patch = build_patch(file, indices)?;
+        GitCmd::new(self.workdir())
+            .args(["apply", "--reverse", "-"])
+            .stdin(patch)
+            .run()
+            .await?;
+        Ok(())
+    }
 }
 
 /// Reconstruct a minimal unified-diff patch from a `FileDiff` and the

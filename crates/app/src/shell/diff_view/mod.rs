@@ -18,22 +18,26 @@
 //! builder. This file holds state, actions, async wiring, and the root
 //! container.
 
+pub mod hunk_actions;
 pub mod paint;
 pub mod render;
 pub mod syntax;
 pub mod word_diff;
 
 use crate::actions::{ExpandDiff, RetryDiff};
+use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::diff_view::paint::render_plan;
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement as _, Styled, Task, Window, div, px,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement as _, Styled, Subscription, Task, Window,
+    div, px,
 };
 use oximux_core::FileDiff;
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 use std::path::PathBuf;
+use std::rc::Rc;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -49,6 +53,12 @@ pub enum DiffViewState {
     Ready {
         path: PathBuf,
         staged: bool,
+        /// Source-of-truth for post-hunk-op reloads. Persisting it in the
+        /// Ready state means `stage_hunk` / `unstage_hunk` /
+        /// `confirmed_discard_hunk` can re-run `load()` with the same
+        /// routing the initial fetch used, instead of falling back to the
+        /// tracked-path branch for files git doesn't know about.
+        untracked: bool,
         diffs: Vec<FileDiff>,
         expanded: bool,
     },
@@ -58,6 +68,25 @@ pub enum DiffViewState {
         untracked: bool,
         error: String,
     },
+}
+
+/// Public visibility-decision payload returned by `DiffView::current_side`.
+/// Drives the `hunk_actions` overlay's button gating without exposing
+/// the full `DiffViewState` enum to the renderer.
+#[derive(Debug, Clone, Copy)]
+pub struct HunkActionSide {
+    pub staged: bool,
+    pub untracked: bool,
+}
+
+/// Snapshot of the file under cursor + the routing fields needed for a
+/// post-op reload. Kept private — `stage_hunk` / `unstage_hunk` /
+/// `confirmed_discard_hunk` build one before spawning their tokio task.
+struct HunkTarget {
+    path: PathBuf,
+    staged: bool,
+    untracked: bool,
+    file: FileDiff,
 }
 
 pub struct DiffView {
@@ -70,6 +99,23 @@ pub struct DiffView {
     /// In-flight load task. Dropping aborts; we replace on every `load()`
     /// call so a fast-switching user only sees the latest selection.
     _load_task: Option<Task<()>>,
+    /// In-flight hunk op (stage / unstage / discard). Single shared slot
+    /// mirrors `StashPanel::_op_task` — rapid back-to-back ops cancel
+    /// the prior op's gpui-side refresh, but the tokio side-effect still
+    /// completes; the next op fires its own reload.
+    _op_task: Option<Task<()>>,
+    /// Active hunk-discard confirm modal (per-request; `None` when idle).
+    /// Mounted INSIDE the DiffView's render tree rather than
+    /// workspace_root so multiple open diff tabs each carry their own
+    /// confirm slot, and so the dialog backdrop scopes to the diff
+    /// surface the user is reading (no full-window modal for a per-tab
+    /// destructive op).
+    confirm_dialog: Option<Entity<ConfirmDialog>>,
+    /// Per-mount observer on the active `ConfirmDialog`. Reset each time
+    /// a new dialog is mounted; the previous observer drops along with
+    /// its dialog. Same lifecycle pattern as
+    /// `WorkspaceRoot::_discard_dialog_observer`.
+    _confirm_dialog_observer: Option<Subscription>,
 }
 
 impl DiffView {
@@ -88,6 +134,9 @@ impl DiffView {
             density,
             typography,
             _load_task: None,
+            _op_task: None,
+            confirm_dialog: None,
+            _confirm_dialog_observer: None,
         }
     }
 
@@ -107,6 +156,12 @@ impl DiffView {
     /// untracked paths, which would leave the user staring at "No diff"
     /// when they clicked a new file row.
     pub fn load(&mut self, path: PathBuf, staged: bool, untracked: bool, cx: &mut Context<Self>) {
+        // Drop any pending post-op reload from a hunk dispatch against
+        // the prior file. Without this, a user who stages a hunk and
+        // immediately clicks a different file would see the new file
+        // load, then briefly flash back to the prior file's diff when
+        // the stale `_op_task` finishes its reload chain.
+        self._op_task = None;
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -184,11 +239,36 @@ impl DiffView {
     ) {
         match result {
             Ok(diffs) => {
+                // Preserve `expanded` across reloads of the same
+                // (path, staged, untracked) tuple. Hunk dispatch
+                // (stage / unstage / discard) chains a reload after
+                // every op; without this carry-over the user has to
+                // re-expand a large-diff file after every action.
+                // A fresh navigation (different path or staged-side
+                // flip) starts collapsed — that's the user-intent
+                // signal that the prior expansion was specific to
+                // the prior context.
+                let expanded = match &self.state {
+                    DiffViewState::Ready {
+                        path: prev_path,
+                        staged: prev_staged,
+                        untracked: prev_untracked,
+                        expanded: prev_expanded,
+                        ..
+                    } if *prev_path == path
+                        && *prev_staged == staged
+                        && *prev_untracked == untracked =>
+                    {
+                        *prev_expanded
+                    }
+                    _ => false,
+                };
                 self.state = DiffViewState::Ready {
                     path,
                     staged,
+                    untracked,
                     diffs,
-                    expanded: false,
+                    expanded,
                 };
             }
             Err(error) => {
@@ -200,6 +280,262 @@ impl DiffView {
                 };
             }
         }
+    }
+
+    /// Test-only: stamp the view into `Ready` with pre-fetched diffs.
+    /// Integration tests use this to skip the load chain (which would
+    /// require pumping the gpui executor across a tokio crossing, and
+    /// trip `test_scheduler.rs::detect_non_determinism`). Production
+    /// code goes through `load()` exclusively.
+    #[doc(hidden)]
+    pub fn seed_ready_for_test(
+        &mut self,
+        path: PathBuf,
+        staged: bool,
+        untracked: bool,
+        diffs: Vec<FileDiff>,
+    ) {
+        self.state = DiffViewState::Ready {
+            path,
+            staged,
+            untracked,
+            diffs,
+            expanded: false,
+        };
+    }
+
+    /// Inspector for the host: which side (staged vs unstaged) is on
+    /// screen, and is the file untracked. Drives the `hunk_actions`
+    /// overlay's button visibility — Stage shows when `!staged`, Unstage
+    /// when `staged`, Discard when `!staged && !untracked`. Returns
+    /// `None` when the view isn't in `Ready`.
+    pub fn current_side(&self) -> Option<HunkActionSide> {
+        let DiffViewState::Ready {
+            staged, untracked, ..
+        } = &self.state
+        else {
+            return None;
+        };
+        Some(HunkActionSide {
+            staged: *staged,
+            untracked: *untracked,
+        })
+    }
+
+    /// Snapshot the FileDiff under `file_idx` plus the routing fields
+    /// needed to reload after a hunk op. Returns `None` when the view
+    /// isn't Ready or `file_idx` is out of range — the host must NOT
+    /// dispatch in that window.
+    fn hunk_target(&self, file_idx: usize) -> Option<HunkTarget> {
+        let DiffViewState::Ready {
+            path,
+            staged,
+            untracked,
+            diffs,
+            ..
+        } = &self.state
+        else {
+            return None;
+        };
+        let file = diffs.get(file_idx)?.clone();
+        Some(HunkTarget {
+            path: path.clone(),
+            staged: *staged,
+            untracked: *untracked,
+            file,
+        })
+    }
+
+    /// Stage the hunk at `hunk_idx` within `file_idx`. No-op if the view
+    /// isn't Ready, the file is untracked (untracked → whole-file stage
+    /// only), the view is already showing the staged side, or the index
+    /// is out of range. Reloads the diff on completion.
+    pub fn stage_hunk(&mut self, file_idx: usize, hunk_idx: usize, cx: &mut Context<Self>) {
+        let Some(target) = self.hunk_target(file_idx) else {
+            return;
+        };
+        if target.staged || target.untracked {
+            return;
+        }
+        if hunk_idx >= target.file.hunks.len() {
+            return;
+        }
+        let repo = self.repo.clone();
+        let file = target.file;
+        self.spawn_hunk_op(target.path, target.staged, target.untracked, cx, async move {
+            repo.stage_hunks(&file, &[hunk_idx])
+                .await
+                .map_err(|e| e.to_string())
+        });
+    }
+
+    /// Unstage the hunk at `hunk_idx` within `file_idx`. No-op if the
+    /// view isn't Ready, the file is untracked, the view is showing the
+    /// unstaged side, or the index is out of range. Reloads on
+    /// completion.
+    pub fn unstage_hunk(&mut self, file_idx: usize, hunk_idx: usize, cx: &mut Context<Self>) {
+        let Some(target) = self.hunk_target(file_idx) else {
+            return;
+        };
+        if !target.staged || target.untracked {
+            return;
+        }
+        if hunk_idx >= target.file.hunks.len() {
+            return;
+        }
+        let repo = self.repo.clone();
+        let file = target.file;
+        self.spawn_hunk_op(target.path, target.staged, target.untracked, cx, async move {
+            repo.unstage_hunks(&file, &[hunk_idx])
+                .await
+                .map_err(|e| e.to_string())
+        });
+    }
+
+    /// Open the type-to-confirm modal for "Discard this hunk?". On
+    /// confirm, runs `discard_hunks` and reloads. No-op when the view
+    /// isn't Ready, the file is untracked, the staged side is on
+    /// screen (discard is worktree-only — user must unstage first), or
+    /// the index is out of range. First-open-wins: a re-fire while a
+    /// dialog is already mounted is ignored so a rapid double-click
+    /// doesn't replace a half-typed confirm string.
+    pub fn request_discard_hunk(
+        &mut self,
+        file_idx: usize,
+        hunk_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirm_dialog.is_some() {
+            return;
+        }
+        let Some(target) = self.hunk_target(file_idx) else {
+            return;
+        };
+        if target.staged || target.untracked {
+            return;
+        }
+        if hunk_idx >= target.file.hunks.len() {
+            return;
+        }
+
+        let weak = cx.entity().downgrade();
+        let on_confirm: ConfirmCallback = Rc::new(move |_window, cx| {
+            let _ = weak.update(cx, |view, cx| {
+                view.confirmed_discard_hunk(file_idx, hunk_idx, cx);
+            });
+        });
+        // Cancel path is purely cosmetic — the observer below drops the
+        // slot when `is_cancelled()` flips. No host-side state to clear.
+        let on_cancel: ConfirmCallback = Rc::new(|_window, _cx| {});
+
+        let prompt = ConfirmPrompt {
+            title: "Discard this hunk?".into(),
+            body: "This will revert this hunk in the worktree. The index is \
+                   untouched. This cannot be undone."
+                .into(),
+            expected: "Discard".into(),
+            on_confirm,
+            confirm_label: Some("Discard".into()),
+            on_cancel: Some(on_cancel),
+        };
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog =
+            cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+
+        self._confirm_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |view, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    view.confirm_dialog = None;
+                    view._confirm_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.confirm_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// Wired by the `ConfirmDialog` on-confirm callback. The dialog has
+    /// already validated typed input; this method runs the destructive
+    /// op + reload chain. Public for tests + the callback closure (must
+    /// be reachable from `&mut Self`).
+    pub fn confirmed_discard_hunk(
+        &mut self,
+        file_idx: usize,
+        hunk_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.hunk_target(file_idx) else {
+            return;
+        };
+        if target.staged || target.untracked {
+            return;
+        }
+        if hunk_idx >= target.file.hunks.len() {
+            return;
+        }
+        let repo = self.repo.clone();
+        let file = target.file;
+        self.spawn_hunk_op(target.path, target.staged, target.untracked, cx, async move {
+            repo.discard_hunks(&file, &[hunk_idx])
+                .await
+                .map_err(|e| e.to_string())
+        });
+    }
+
+    /// Shared tokio→oneshot→gpui machinery for stage / unstage / discard.
+    /// Spawns the future on tokio, awaits on the gpui side, and reloads
+    /// the diff via `load()` with the same routing the initial fetch
+    /// used. Errors from the underlying git op are logged; the reload
+    /// still runs so the user sees the actual git state.
+    fn spawn_hunk_op<F>(
+        &mut self,
+        path: PathBuf,
+        staged: bool,
+        untracked: bool,
+        cx: &mut Context<Self>,
+        op: F,
+    ) where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let r = op.await;
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::diff_view",
+                    "no tokio runtime entered; hunk op skipped"
+                );
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            if let Err(err) = result {
+                tracing::warn!(
+                    target: "oximux_app::diff_view",
+                    %err,
+                    "hunk op failed; reloading to surface live state"
+                );
+            }
+            let _ = this.update(cx, |view, cx| {
+                view.load(path, staged, untracked, cx);
+            });
+        });
+        self._op_task = Some(task);
     }
 
     fn on_expand_diff(&mut self, _: &ExpandDiff, _window: &mut Window, cx: &mut Context<Self>) {
@@ -238,6 +574,10 @@ impl Render for DiffView {
             density: self.density,
             typography: &self.typography,
         };
+        // Resolve action-chip visibility BEFORE the match — inside the
+        // arm, `&self.state` is borrowed and `current_side` (which reads
+        // `&self.state`) would conflict.
+        let side = self.current_side();
         let body = match &self.state {
             DiffViewState::Empty => unreachable!("handled above"),
             DiffViewState::Loading { path, .. } => {
@@ -250,7 +590,7 @@ impl Render for DiffView {
                 diffs, expanded, ..
             } => {
                 let plan = build_render_plan(diffs, *expanded);
-                render_plan(&plan, &rctx, cx).into_any_element()
+                render_plan(&plan, side, &rctx, cx).into_any_element()
             }
         };
         // Wrap the body in a stateful scroll container. The previous
@@ -269,10 +609,27 @@ impl Render for DiffView {
             .w_full()
             .overflow_y_scroll()
             .child(body);
-        div()
+        // When the discard-hunk confirm modal is mounted, stack it as a
+        // centered overlay over the diff body. Mirrors `confirm_dialog`
+        // and `rename_tab_dialog` overlay shape in `workspace_root` but
+        // scoped to THIS diff tab (other open diff tabs each carry their
+        // own slot) so a destructive action in one tab doesn't backdrop
+        // the rest of the workspace.
+        let overlay = self.confirm_dialog.clone().map(|dialog| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(96.0))
+                .child(dialog)
+        });
+        let mut root = div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_expand_diff))
             .on_action(cx.listener(Self::on_retry_diff))
+            .relative()
             .flex()
             .flex_col()
             .h_full()
@@ -280,8 +637,11 @@ impl Render for DiffView {
             .bg(self.theme.bg_base)
             .border_l_1()
             .border_color(self.theme.border_inactive)
-            .child(scroll_body)
-            .into_any_element()
+            .child(scroll_body);
+        if let Some(o) = overlay {
+            root = root.child(o);
+        }
+        root.into_any_element()
     }
 }
 

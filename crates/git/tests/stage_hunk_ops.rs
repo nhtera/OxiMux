@@ -263,6 +263,151 @@ async fn stage_hunk_handles_filename_with_spaces() {
 }
 
 #[tokio::test]
+async fn discard_hunk_partial_reverts_only_selected_hunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    // 10-line file with two distant edits so the diff yields ≥2 hunks.
+    let base = (1..=10).map(|n| format!("line {n}\n")).collect::<String>();
+    write(&p.join("multi.txt"), &base);
+    run_git(p, &["add", "multi.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    let mut modified = base.clone();
+    modified = modified.replace("line 1\n", "LINE 1\n");
+    modified = modified.replace("line 10\n", "LINE 10\n");
+    write(&p.join("multi.txt"), &modified);
+
+    let repo = Repository::open(p).await.unwrap();
+    let diffs = repo.diff_unstaged().await.unwrap();
+    assert_eq!(diffs.len(), 1);
+    let file = &diffs[0];
+    assert!(
+        file.hunks.len() >= 2,
+        "expected 2 hunks, got {}",
+        file.hunks.len()
+    );
+
+    // Discard the first hunk only — the worktree should regain `line 1`
+    // while keeping the `LINE 10` change intact.
+    repo.discard_hunks(file, &[0]).await.unwrap();
+
+    let on_disk = std::fs::read_to_string(p.join("multi.txt")).unwrap();
+    assert!(
+        on_disk.contains("line 1\n"),
+        "discard should have restored line 1: {on_disk:?}"
+    );
+    assert!(
+        on_disk.contains("LINE 10\n"),
+        "discard should have left line 10 alone: {on_disk:?}"
+    );
+
+    // Index is untouched — discard is worktree-only.
+    let staged = repo.diff_staged().await.unwrap();
+    assert!(
+        staged.is_empty(),
+        "discard_hunks must not touch the index: {staged:?}"
+    );
+}
+
+#[tokio::test]
+async fn discard_hunk_full_returns_worktree_to_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    let base = (1..=5).map(|n| format!("line {n}\n")).collect::<String>();
+    write(&p.join("solo.txt"), &base);
+    run_git(p, &["add", "solo.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    write(&p.join("solo.txt"), "TOTALLY\nDIFFERENT\nCONTENT\n");
+
+    let repo = Repository::open(p).await.unwrap();
+    let diffs = repo.diff_unstaged().await.unwrap();
+    assert_eq!(diffs.len(), 1);
+    let file = &diffs[0];
+
+    // Discard every hunk → worktree returns to the committed bytes.
+    let all_indices: Vec<usize> = (0..file.hunks.len()).collect();
+    repo.discard_hunks(file, &all_indices).await.unwrap();
+
+    let on_disk = std::fs::read_to_string(p.join("solo.txt")).unwrap();
+    assert_eq!(on_disk, base, "full discard should match HEAD content");
+}
+
+#[tokio::test]
+async fn discard_hunk_handles_no_newline_at_eof() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    // Trailing-newline flip on the modified side exercises the
+    // `\ No newline at end of file` marker through --reverse.
+    write(&p.join("tail.txt"), "first\nsecond\n");
+    run_git(p, &["add", "tail.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    write(&p.join("tail.txt"), "first\nSECOND");
+
+    let repo = Repository::open(p).await.unwrap();
+    let diffs = repo.diff_unstaged().await.unwrap();
+    assert_eq!(diffs.len(), 1);
+    repo.discard_hunks(&diffs[0], &[0]).await.unwrap();
+
+    let on_disk = std::fs::read_to_string(p.join("tail.txt")).unwrap();
+    assert_eq!(on_disk, "first\nsecond\n");
+}
+
+#[tokio::test]
+async fn discard_hunk_leaves_index_untouched_when_staged_separately() {
+    // Stage hunk A, then in a separate gesture modify the worktree to
+    // create hunk B, then discard B. A must remain staged afterwards —
+    // discard is worktree-only and must not roll back the index.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    let base = (1..=10).map(|n| format!("line {n}\n")).collect::<String>();
+    write(&p.join("multi.txt"), &base);
+    run_git(p, &["add", "multi.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    // Stage hunk A.
+    let modified_a = base.replace("line 1\n", "LINE 1\n");
+    write(&p.join("multi.txt"), &modified_a);
+    let repo = Repository::open(p).await.unwrap();
+    let unstaged_a = repo.diff_unstaged().await.unwrap();
+    repo.stage_hunks(&unstaged_a[0], &[0]).await.unwrap();
+
+    // Re-dirty with hunk B (distant from A so it's a separate hunk).
+    let modified_b = modified_a.replace("line 10\n", "LINE 10\n");
+    write(&p.join("multi.txt"), &modified_b);
+
+    // Discard hunk B from the (refreshed) unstaged diff.
+    let unstaged_b = repo.diff_unstaged().await.unwrap();
+    assert_eq!(unstaged_b.len(), 1);
+    let file = &unstaged_b[0];
+    assert!(
+        !file.hunks.is_empty(),
+        "expected at least one unstaged hunk for B"
+    );
+    repo.discard_hunks(file, &[0]).await.unwrap();
+
+    // A still in the index.
+    let staged = repo.diff_staged().await.unwrap();
+    let staged_lines: Vec<&str> = staged
+        .iter()
+        .flat_map(|f| f.hunks.iter().flat_map(|h| h.lines.iter()))
+        .map(|l| l.content.as_str())
+        .collect();
+    assert!(
+        staged_lines.contains(&"LINE 1"),
+        "hunk A should still be staged after B-discard: {staged_lines:?}"
+    );
+    // B reverted in the worktree.
+    let on_disk = std::fs::read_to_string(p.join("multi.txt")).unwrap();
+    assert!(on_disk.contains("line 10\n"));
+    assert!(on_disk.contains("LINE 1\n"));
+}
+
+#[tokio::test]
 async fn build_patch_roundtrips_through_real_git() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();

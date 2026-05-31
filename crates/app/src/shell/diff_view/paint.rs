@@ -6,10 +6,11 @@
 //! out so the data-plan side stays unit-testable without spinning up GPUI
 //! and so `render.rs` fits comfortably under the file-size cap.
 
-use crate::shell::diff_view::DiffView;
+use crate::shell::diff_view::hunk_actions::render_hunk_actions;
 use crate::shell::diff_view::render::{FilePlan, HunkPlan, LinePlan, RenderCtx};
 use crate::shell::diff_view::syntax::HiToken;
 use crate::shell::diff_view::word_diff::{TokenSpan, WordOp};
+use crate::shell::diff_view::{DiffView, HunkActionSide};
 use gpui::{
     ClickEvent, ClipboardItem, Context, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Rgba, StatefulInteractiveElement as _, Styled, div, px,
@@ -18,8 +19,15 @@ use gpui_component::{Icon, Sizable as _, tooltip::Tooltip};
 use oximux_core::DiffLineKind;
 
 /// Render the plan into an element. Called from `DiffView::render`.
+///
+/// `side` MUST come from the host (`DiffView::current_side()` invoked
+/// from inside `DiffView::render`, where `&self` is reachable). Reading
+/// the entity from a context already locked for render panics —
+/// `Context::entity().read(cx)` inside the render call sees the live
+/// borrow and aborts.
 pub fn render_plan(
     plan: &[FilePlan],
+    side: Option<HunkActionSide>,
     rctx: &RenderCtx<'_>,
     cx: &mut Context<DiffView>,
 ) -> impl IntoElement {
@@ -41,14 +49,16 @@ pub fn render_plan(
             .into_any_element();
     }
     let mut col = div().flex().flex_col().w_full();
-    for fp in plan {
-        col = col.child(render_file_plan(fp, rctx, cx));
+    for (file_idx, fp) in plan.iter().enumerate() {
+        col = col.child(render_file_plan(file_idx, fp, side, rctx, cx));
     }
     col.into_any_element()
 }
 
 fn render_file_plan(
+    file_idx: usize,
     fp: &FilePlan,
+    side: Option<HunkActionSide>,
     rctx: &RenderCtx<'_>,
     cx: &mut Context<DiffView>,
 ) -> impl IntoElement {
@@ -69,7 +79,7 @@ fn render_file_plan(
                     rctx,
                     cx,
                 ))
-                .child(hunks_body(hunks, rctx));
+                .child(hunks_body(file_idx, hunks, side, rctx, cx));
             col = col.font(rctx.typography.mono_font());
             col
         }
@@ -219,7 +229,13 @@ fn stats_chips(added: u32, removed: u32, rctx: &RenderCtx<'_>) -> impl IntoEleme
         .child(div().text_color(removed_color).child(format!("-{removed}")))
 }
 
-fn hunks_body(hunks: &[HunkPlan], rctx: &RenderCtx<'_>) -> impl IntoElement {
+fn hunks_body(
+    file_idx: usize,
+    hunks: &[HunkPlan],
+    side: Option<HunkActionSide>,
+    rctx: &RenderCtx<'_>,
+    cx: &mut Context<DiffView>,
+) -> impl IntoElement {
     // Gutter width auto-fits the largest line number across all hunks so
     // the divider between gutter and content stays aligned across the
     // whole file (no per-hunk shift when one hunk ends at line 9 and the
@@ -233,14 +249,16 @@ fn hunks_body(hunks: &[HunkPlan], rctx: &RenderCtx<'_>) -> impl IntoElement {
     let gutter_digits = digit_count(max_line);
 
     let mut col = div().flex().flex_col();
-    for h in hunks {
+    for (hunk_idx, h) in hunks.iter().enumerate() {
         // Per-hunk strip color — read at a glance whether the hunk is
         // pure adds (green), pure deletes (red), or both (orange). Acts
         // as a minimap-lite: scroll the diff and the colored bands hint
         // where the next changed region begins.
         let strip = hunk_strip_color(&h.rows, rctx);
         if !h.suppress_header {
-            col = col.child(hunk_header(h.header.clone(), rctx, strip));
+            col = col.child(hunk_header(
+                file_idx, hunk_idx, h.header.clone(), side, rctx, strip, cx,
+            ));
         }
         for r in &h.rows {
             col = col.child(line_row(r, rctx, gutter_digits, strip));
@@ -295,16 +313,23 @@ fn digit_count(n: u32) -> usize {
         .max(2)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hunk_header(
+    file_idx: usize,
+    hunk_idx: usize,
     header: String,
+    side: Option<HunkActionSide>,
     rctx: &RenderCtx<'_>,
     strip: Option<gpui::Hsla>,
+    cx: &mut Context<DiffView>,
 ) -> impl IntoElement {
     // Neutral `fg_subtle` text — the previous `status_warn` (orange)
     // collided with the indicator strip's "mixed hunk" orange, making
     // the `@@` marker look like it belonged to the strip. Muted gray
     // reads as metadata, which is what it is.
-    div()
+    let actions =
+        side.and_then(|s| render_hunk_actions(s, file_idx, hunk_idx, rctx.theme, rctx.density, rctx.typography, cx));
+    let mut row = div()
         .flex()
         .items_center()
         .h(px(rctx.density.h_row))
@@ -312,7 +337,15 @@ fn hunk_header(
         .text_size(px(rctx.typography.t_body_sm))
         .text_color(rctx.theme.fg_subtle)
         .child(strip_cell(strip, rctx.density.h_row))
-        .child(div().px(px(rctx.density.pad_panel)).child(header))
+        .child(div().px(px(rctx.density.pad_panel)).child(header));
+    if let Some(actions) = actions {
+        // Push the action chips to the trailing edge of the row so the
+        // `@@` header reads from the left and the affordances dock
+        // right. `flex_1` spacer matches the trailing-icon pattern
+        // already used in `interactive_file_header`.
+        row = row.child(div().flex_1()).child(actions);
+    }
+    row
 }
 
 fn line_row(
