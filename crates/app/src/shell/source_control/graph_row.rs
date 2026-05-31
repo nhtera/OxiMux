@@ -85,7 +85,7 @@ pub(super) fn render_commit_row(
         .min_w(px(80.0))
         .overflow_hidden()
         .whitespace_nowrap()
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .text_color(theme.fg_base)
         .child(c.subject.clone());
 
@@ -98,13 +98,13 @@ pub(super) fn render_commit_row(
         .max_w(px(88.0))
         .overflow_hidden()
         .whitespace_nowrap()
-        .text_size(px(sc_style::META_TEXT))
+        .text_size(px(sc_style::GRAPH_META_TEXT))
         .text_color(theme.fg_subtle)
         .child(c.author.clone());
 
     let date = div()
         .flex_shrink_0()
-        .text_size(px(sc_style::META_TEXT))
+        .text_size(px(sc_style::GRAPH_META_TEXT))
         .text_color(theme.fg_subtle)
         .child(c.short_date.clone());
 
@@ -354,7 +354,7 @@ pub(super) fn render_commit_tooltip(
         .flex()
         .flex_col()
         .max_w(max_width)
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .text_color(theme.fg_base)
         .child(div().font_weight(typography.w_semibold).child(subject));
 
@@ -385,7 +385,7 @@ pub(super) fn render_commit_tooltip(
                 .flex_row()
                 .gap(px(8.0))
                 .pt(px(sc_style::PAD_V_TIGHT))
-                .text_size(px(sc_style::META_TEXT))
+                .text_size(px(sc_style::GRAPH_META_TEXT))
                 .child(
                     div()
                         .text_color(theme.status_added)

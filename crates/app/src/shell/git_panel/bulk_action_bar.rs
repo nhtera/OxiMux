@@ -107,7 +107,7 @@ pub fn render_bulk_action_bar(
         .gap(px(density.gap_inline))
         .px(px(sc_style::PAD_H))
         .py(px(4.0))
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .child(count_slot);
 
     // Stage / Unstage buttons: omit when their count is 0 (the op

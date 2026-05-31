@@ -98,7 +98,7 @@ pub fn render_diff_counts(
         .items_baseline()
         .gap(px(sc_style::LINE_COUNT_GAP))
         .flex_shrink_0()
-        .text_size(px(sc_style::META_TEXT))
+        .text_size(px(sc_style::GRAPH_META_TEXT))
         .font_weight(typography.w_medium);
     if added > 0 {
         row = row.child(
@@ -275,7 +275,7 @@ pub(super) fn row(
                 .flex_1()
                 .min_w(px(0.0))
                 .overflow_hidden()
-                .text_size(px(sc_style::META_TEXT))
+                .text_size(px(sc_style::GRAPH_META_TEXT))
                 .text_color(rctx.theme.fg_subtle)
                 .child(parent),
         );
@@ -309,7 +309,7 @@ pub(super) fn row(
         .h(px(row_height))
         .px(px(sc_style::PAD_H))
         .bg(bg)
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .text_color(rctx.theme.fg_base)
         .when(!is_selected, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
         .on_mouse_down(

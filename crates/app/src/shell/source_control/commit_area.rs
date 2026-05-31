@@ -520,7 +520,7 @@ impl CommitArea {
             .border_color(theme.border_inactive)
             .rounded(px(density.r_xs))
             .bg(theme.bg_base)
-            .text_size(px(sc_style::TEXT))
+            .text_size(px(sc_style::BODY_TEXT))
             .child(Input::new(&self.message_state).h_full())
             .children(sparkles_button)
             .children(ai_overlay::render_ai_overlay(
@@ -604,7 +604,7 @@ impl CommitArea {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(2.0))
+            .gap(px(sc_style::ICON_CLUSTER_GAP))
             .w_full();
         for (idx, prefix) in COMMIT_PREFIXES.iter().enumerate() {
             let prefix_static: &'static str = prefix;
@@ -812,7 +812,7 @@ fn render_status_row(
         ),
     };
     div()
-        .text_size(px(sc_style::META_TEXT))
+        .text_size(px(sc_style::GRAPH_META_TEXT))
         .text_color(color)
         .child(msg)
 }

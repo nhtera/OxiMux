@@ -83,7 +83,7 @@ impl SourceControlPanel {
                     .min_w(px(0.0))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_size(px(sc_style::TEXT))
+                    .text_size(px(sc_style::BODY_TEXT))
                     .font_weight(typography.w_semibold)
                     .text_color(theme.fg_base)
                     .child(repo_name),
@@ -217,7 +217,7 @@ impl SourceControlPanel {
                 .justify_center()
                 .px(px(sc_style::PAD_H))
                 .pb(px(sc_style::PAD_V))
-                .text_size(px(sc_style::TEXT))
+                .text_size(px(sc_style::BODY_TEXT))
                 .font_weight(typography.w_medium)
                 .text_color(fg)
                 .cursor_pointer()
@@ -286,7 +286,7 @@ impl SourceControlPanel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(2.0))
+            .gap(px(sc_style::ICON_CLUSTER_GAP))
             .child(
                 Button::new("sc-toolbar-view-mode")
                     .ghost()
@@ -311,7 +311,7 @@ impl SourceControlPanel {
             .px(px(sc_style::PAD_H))
             .border_b_1()
             .border_color(theme.border_inactive)
-            .text_size(px(sc_style::TEXT))
+            .text_size(px(sc_style::BODY_TEXT))
             .text_color(theme.fg_muted)
             .child(prefix);
         if let Some(chip) = branch_chip {
@@ -413,7 +413,7 @@ impl SourceControlPanel {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(sc_style::TEXT))
+                    .text_size(px(sc_style::BODY_TEXT))
                     .child(Input::new(&self.filter_input).appearance(false)),
             );
         if has_query {

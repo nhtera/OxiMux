@@ -120,7 +120,7 @@ impl SourceControlPanel {
             )
             .child(
                 div()
-                    .text_size(px(sc_style::TEXT))
+                    .text_size(px(sc_style::BODY_TEXT))
                     .text_color(theme.fg_muted)
                     .font_weight(typography.w_medium)
                     .child("No changes on this branch"),

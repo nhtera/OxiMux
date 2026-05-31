@@ -19,6 +19,7 @@ pub mod list_render;
 pub mod push_dialog;
 
 use crate::shell::stash_panel::list_render::row_label;
+use crate::ui::danger_ghost;
 use gpui::{
     App, ClickEvent, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Task, Window, div, px,
@@ -385,7 +386,7 @@ impl StashPanel {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(density.h_row * 1.4))
+            .h(px(density.h_action_row))
             .px(px(density.pad_panel))
             .gap(px(density.gap_inline))
             .border_b_1()
@@ -397,9 +398,13 @@ impl StashPanel {
                     .text_color(theme.fg_base)
                     .child(label),
             )
+            // Apply / Pop / Drop all sit at the same xsmall (22px) height so
+            // the row reads as one action cluster — the destructive verb
+            // doesn't dominate by being larger than its siblings.
             .child(
                 Button::new(("stash-apply", index))
                     .ghost()
+                    .xsmall()
                     .label("Apply")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
                         panel.apply(apply_ref.clone(), cx);
@@ -409,21 +414,24 @@ impl StashPanel {
             .child(
                 Button::new(("stash-pop", index))
                     .ghost()
+                    .xsmall()
                     .label("Pop")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
                         panel.pop(pop_ref.clone(), cx);
                         cx.notify();
                     })),
             )
-            .child(
-                Button::new(("stash-drop", index))
-                    .danger()
-                    .label("Drop")
-                    .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
-                        panel.request_drop(drop_ref.clone());
-                        cx.notify();
-                    })),
-            )
+            .child(danger_ghost(
+                ("stash-drop", index),
+                "Drop",
+                &theme,
+                &density,
+                typography,
+                cx.listener(move |panel, _: &ClickEvent, _window, cx| {
+                    panel.request_drop(drop_ref.clone());
+                    cx.notify();
+                }),
+            ))
     }
 }
 
@@ -437,7 +445,7 @@ fn placeholder(
         .flex()
         .items_center()
         .justify_center()
-        .h(px(density.h_row * 1.4))
+        .h(px(density.h_action_row))
         .p(px(density.pad_panel))
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_subtle)

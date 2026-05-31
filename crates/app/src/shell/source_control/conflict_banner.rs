@@ -86,7 +86,7 @@ where
             .py(px(sc_style::PAD_V))
             .border_b_1()
             .border_color(theme.status_warning)
-            .text_size(px(sc_style::TEXT))
+            .text_size(px(sc_style::BODY_TEXT))
             .text_color(theme.fg_base)
             .child(
                 div()
@@ -136,7 +136,7 @@ pub fn render_operation_banner(
             .py(px(sc_style::PAD_V))
             .border_b_1()
             .border_color(theme.status_warning)
-            .text_size(px(sc_style::TEXT))
+            .text_size(px(sc_style::BODY_TEXT))
             .text_color(theme.fg_base)
             .gap(px(sc_style::PAD_V))
             .child(

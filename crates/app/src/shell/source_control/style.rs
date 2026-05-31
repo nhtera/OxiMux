@@ -46,12 +46,24 @@ pub const TAB_H: f32 = 32.0;
 /// Primary text size used for tabs, toolbar copy, filter input, file rows,
 /// commit subject placeholder, and graph subject lines. Matches `text-xs`
 /// (12px) in the reference.
-pub const TEXT: f32 = 12.0;
+///
+/// **Why not `typography.t_body_sm` (11px)?** The SCM panel intentionally
+/// runs a notch larger so file names and commit subjects scan from arm's
+/// length while the operator works the cockpit. Keeping the const local
+/// (instead of bumping `t_body_sm`) lets the file explorer and terminal
+/// stay at 11px without ratcheting up everything.
+pub const BODY_TEXT: f32 = 12.0;
 
-/// Secondary text size for parent paths and graph author/date meta lines.
-pub const META_TEXT: f32 = 11.0;
+/// Metadata text size for parent paths and graph author/date columns.
+/// Equals `typography.t_body_sm` (11px) but kept as a named const so the
+/// SCM-specific intent (graph metadata, secondary annotations) is self-
+/// documenting at call sites.
+pub const GRAPH_META_TEXT: f32 = 11.0;
 
 /// Uppercase section-header text size (e.g. "STAGED CHANGES", "GRAPH").
+/// Same value as `GRAPH_META_TEXT` today but a semantically-distinct
+/// concept; kept separate so the two can diverge without a sweeping
+/// rename.
 pub const CAPS_TEXT: f32 = 11.0;
 
 /// Inline icon size for the toolbar / filter / split-button chevron. The
@@ -67,10 +79,6 @@ pub const COMMIT_H: f32 = 46.0;
 /// Row height for the branch-compare toolbar.
 pub const TOOLBAR_H: f32 = 32.0;
 
-/// Primary commit button height. Reference button is noticeably chunkier
-/// than the cockpit default ghost button.
-pub const COMMIT_BTN_H: f32 = 32.0;
-
 /// Minimum row height for one commit in the graph list. Lets rows with a
 /// ref-badge sub-row (e.g. "(main)") grow taller, while non-ref rows stay
 /// compact. The timeline column distributes connector lines across this
@@ -85,5 +93,13 @@ pub const LINE_COUNT_GAP: f32 = 4.0;
 
 /// Font size for the conflict-kind sub-label that hangs under a file name
 /// on unmerged rows (e.g. "both modified"). One point smaller than the
-/// secondary META_TEXT so it reads as a parenthetical to the row name.
+/// secondary GRAPH_META_TEXT so it reads as a parenthetical to the row name.
 pub const SUB_LABEL_TEXT: f32 = 10.0;
+
+/// Tight gap used inside dense icon-button clusters (toolbar view-mode
+/// group, graph commit-row action cluster, commit-area trailing icons).
+/// Sub-token: 2px is smaller than the global `density.gap_inline = 6`
+/// because icon buttons inside a cluster need to read as one element
+/// row, not three separate buttons. Not a general-purpose token —
+/// promote to `density` only if a non-SCM surface needs the same value.
+pub const ICON_CLUSTER_GAP: f32 = 2.0;

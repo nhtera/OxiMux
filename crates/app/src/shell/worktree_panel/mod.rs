@@ -14,6 +14,7 @@
 pub mod list_render;
 
 use crate::shell::worktree_panel::list_render::{row_label, suggest_worktree_path};
+use crate::ui::danger_ghost;
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, Styled, Task, Window, div, px,
@@ -329,7 +330,7 @@ impl WorktreePanel {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(density.h_row * 1.4))
+            .h(px(density.h_action_row))
             .px(px(density.pad_panel))
             .gap(px(density.gap_inline))
             .border_b_1()
@@ -342,15 +343,17 @@ impl WorktreePanel {
                     .child(label),
             );
         if !is_main {
-            row = row.child(
-                Button::new(("worktree-remove", idx))
-                    .danger()
-                    .label("Remove")
-                    .on_click(cx.listener(move |p, _: &ClickEvent, _window, cx| {
-                        p.request_remove(row_path.clone());
-                        cx.notify();
-                    })),
-            );
+            row = row.child(danger_ghost(
+                ("worktree-remove", idx),
+                "Remove",
+                &theme,
+                &density,
+                typography,
+                cx.listener(move |p, _: &ClickEvent, _window, cx| {
+                    p.request_remove(row_path.clone());
+                    cx.notify();
+                }),
+            ));
         }
         row
     }

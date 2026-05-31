@@ -540,7 +540,7 @@ fn placeholder_state(
         .justify_center()
         .h_full()
         .p(px(density.pad_panel))
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .text_color(theme.fg_subtle)
         .child(msg.to_string())
 }

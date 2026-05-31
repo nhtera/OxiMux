@@ -454,7 +454,7 @@ fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
     // Falls back to a single-line headline when branch is unknown (detached
     // HEAD, pre-first-poll, etc.) — avoids "no changes ahead of None".
     let headline = div()
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .font_weight(rctx.typography.w_medium)
         .text_color(rctx.theme.fg_base)
         .child("No changes on this branch");
@@ -463,7 +463,7 @@ fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
     let subline = rctx.branch.filter(|b| !b.is_empty()).map(|b| {
         div()
             .mt(px(4.0))
-            .text_size(px(sc_style::TEXT - 1.0))
+            .text_size(px(sc_style::BODY_TEXT - 1.0))
             .text_color(rctx.theme.fg_subtle)
             .child(format!(
                 "This workspace is clean and this branch has no changes ahead of {b}"

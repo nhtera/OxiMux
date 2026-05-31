@@ -165,7 +165,7 @@ fn folder_row(
         .h(px(rctx.density.h_tab))
         .pl(px(depth_px + sc_style::PAD_H))
         .pr(px(sc_style::PAD_H))
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .text_color(theme.fg_base)
         .cursor_pointer()
         .hover(|s| s.bg(theme.bg_panel_alt))

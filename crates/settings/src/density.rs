@@ -20,11 +20,13 @@ pub struct Density {
     pub pad_row: f32,
     pub gap_inline: f32,
 
-    // Section + overlay chrome (added in design-system tightening pass).
-    /// Section header row inside a panel — taller than a plain row so
-    /// "STASHES (3) +" / "WORKTREES (2) +" read as section dividers, not
-    /// data rows. Replaces hand-coded `h_row * 1.4` arithmetic.
-    pub h_section_header: f32,
+    // Action-row + overlay chrome (added in design-system tightening pass).
+    /// Row that hosts inline action buttons (stash entry with Apply/Pop/
+    /// Drop, worktree entry with Remove, empty placeholders that need
+    /// to occupy the same height). Taller than a plain `h_row` so the
+    /// 22px xsmall buttons sit centred without crowding the row border.
+    /// Replaces hand-coded `h_row * 1.4` arithmetic.
+    pub h_action_row: f32,
     /// Inner padding for floating cards (context menus, pickers,
     /// dropdowns). Slightly tighter than `pad_panel` because overlays
     /// sit on their own surface with a border and don't need the same
@@ -68,7 +70,7 @@ impl Density {
             pad_panel: 8.0,
             pad_row: 6.0,
             gap_inline: 6.0,
-            h_section_header: 34.0,
+            h_action_row: 34.0,
             pad_overlay: 6.0,
             h_overlay_item: 30.0,
             r_chip: 3.0,

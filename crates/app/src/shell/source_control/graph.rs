@@ -392,7 +392,7 @@ impl Render for CommitGraph {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(2.0))
+            .gap(px(sc_style::ICON_CLUSTER_GAP))
             .child(
                 Button::new("graph-help")
                     .ghost()
@@ -463,13 +463,13 @@ impl Render for CommitGraph {
             .child("GRAPH")
             .child(
                 div()
-                    .text_size(px(sc_style::META_TEXT))
+                    .text_size(px(sc_style::GRAPH_META_TEXT))
                     .text_color(theme.fg_subtle)
                     .child(count_label),
             )
             .child(if can_load_more_flag {
                 div()
-                    .text_size(px(sc_style::META_TEXT))
+                    .text_size(px(sc_style::GRAPH_META_TEXT))
                     .text_color(theme.fg_subtle)
                     .child("+")
             } else {
@@ -481,7 +481,7 @@ impl Render for CommitGraph {
             .items_center()
             .h(px(density.h_tab))
             .px(px(sc_style::PAD_H))
-            .text_size(px(sc_style::TEXT))
+            .text_size(px(sc_style::BODY_TEXT))
             .font_weight(typography.w_semibold)
             .text_color(theme.fg_muted)
             .child(toggle_label)
@@ -591,7 +591,7 @@ impl Render for CommitGraph {
                         .flex()
                         .justify_center()
                         .py(px(sc_style::PAD_V_TIGHT))
-                        .text_size(px(sc_style::META_TEXT))
+                        .text_size(px(sc_style::GRAPH_META_TEXT))
                         .text_color(theme.fg_subtle)
                         .when(!is_loading, |s| {
                             s.cursor_pointer().hover(|s| s.text_color(theme.fg_base))
@@ -699,7 +699,7 @@ fn placeholder_sized(
         .justify_center()
         .p(px(density.pad_panel))
         .h(px(height_px))
-        .text_size(px(sc_style::TEXT))
+        .text_size(px(sc_style::BODY_TEXT))
         .text_color(theme.fg_subtle)
         .child(msg.to_string())
 }
