@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod assets;
+pub mod commit_message_ai_settings;
 pub mod keymap;
 pub mod notifier;
 pub mod persisted_terminals;

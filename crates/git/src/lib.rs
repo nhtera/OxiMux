@@ -20,6 +20,7 @@ pub mod process;
 pub mod remote;
 pub mod repository;
 pub mod stage;
+pub mod staged_context;
 pub mod stash;
 pub mod status;
 pub mod worktree;

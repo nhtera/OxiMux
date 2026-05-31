@@ -13,6 +13,15 @@ oximux-pty = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 regex = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+oximux-git = { workspace = true }
+toml = { workspace = true }
+
+[[example]]
+name = "commit_message_demo"
+path = "examples/commit_message_demo.rs"

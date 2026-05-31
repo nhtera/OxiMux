@@ -6,6 +6,7 @@
 //! and emits lifecycle events the UI badge + dashboard consume.
 
 pub mod cli;
+pub mod commit_message;
 pub mod commit_message_heuristic;
 pub mod registry;
 pub mod runtime;

@@ -395,13 +395,17 @@ impl CommitArea {
         // line Input would expand to the available column slack and the
         // composer would balloon to fill the panel.
         //
-        // Sparkles enable rules (heuristic-only round; Phase 14):
+        // Sparkles enable rules:
+        //  - HIDDEN entirely when settings have `mode = "off"` —
+        //    disabled-with-tooltip would imply "you could click
+        //    this" when actually nothing's wired.
         //  - disabled while committing (`in_flight`),
         //  - disabled while a generation is already running,
         //  - disabled when nothing is staged (empty snapshot),
         //  - disabled when the textarea already has user content
         //    (don't overwrite). Future: Cmd+click bypass for
         //    force-overwrite.
+        let ai_off = self.ai_disabled_by_settings(cx);
         let staged_count = self.staged_snapshot.len();
         let has_user_text = !self.message_state.read(cx).value().trim().is_empty();
         let generating = self.ai_state.is_generating();
@@ -419,6 +423,23 @@ impl CommitArea {
         } else {
             "Generate commit message"
         };
+        let sparkles_button = (!ai_off).then(|| {
+            div().absolute().top(px(6.0)).right(px(6.0)).child(
+                Button::new("sc-ai-message")
+                    .ghost()
+                    .xsmall()
+                    .icon(
+                        Icon::default()
+                            .path("icons/sparkles.svg")
+                            .size(px(sc_style::ICON)),
+                    )
+                    .tooltip(sparkles_tooltip)
+                    .disabled(sparkles_disabled)
+                    .on_click(cx.listener(|area, _: &ClickEvent, window, cx| {
+                        area.start_ai_generation(window, cx);
+                    })),
+            )
+        });
         let textarea = div()
             .relative()
             .w_full()
@@ -430,23 +451,7 @@ impl CommitArea {
             .bg(theme.bg_base)
             .text_size(px(sc_style::TEXT))
             .child(Input::new(&self.message_state).h_full())
-            .child(
-                div().absolute().top(px(6.0)).right(px(6.0)).child(
-                    Button::new("sc-ai-message")
-                        .ghost()
-                        .xsmall()
-                        .icon(
-                            Icon::default()
-                                .path("icons/sparkles.svg")
-                                .size(px(sc_style::ICON)),
-                        )
-                        .tooltip(sparkles_tooltip)
-                        .disabled(sparkles_disabled)
-                        .on_click(cx.listener(|area, _: &ClickEvent, window, cx| {
-                            area.start_ai_generation(window, cx);
-                        })),
-                ),
-            )
+            .children(sparkles_button)
             .children(ai_overlay::render_ai_overlay(
                 generating,
                 theme,

@@ -152,6 +152,11 @@ fn main() {
         // Load user terminal settings into a global + start the live-reload
         // watcher BEFORE any window opens so the first pane reads real values.
         oximux_app::terminal_settings::install(cx);
+        // Same install pattern for AI commit-message settings — the sparkles
+        // button reads the global at click time, so loading here means the
+        // first click after launch sees the user's configured mode (heuristic
+        // by default; agent when configured).
+        oximux_app::commit_message_ai_settings::install(cx);
         cx.bind_keys(oximux_app::keymap::default_key_bindings());
         cx.activate(true);
 

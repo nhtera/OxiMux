@@ -4436,10 +4436,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "oximux-core",
+ "oximux-git",
  "oximux-pty",
  "regex",
+ "serde",
  "thiserror 1.0.69",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
