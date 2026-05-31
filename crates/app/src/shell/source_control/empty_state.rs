@@ -48,7 +48,21 @@ impl SourceControlPanel {
         if has_conflict {
             return false;
         }
-        state.files.is_empty()
+        // Filter Ignored entries the same way `build_primary_inputs`,
+        // `partition_files`, and the Uncommitted-tab badge count do.
+        // `git_state.files` carries `target/`, `node_modules/`, and
+        // anything else matched by `.gitignore` because the poller
+        // asks for them — but the user never thinks of them as
+        // "uncommitted changes". Without this filter, `state.files`
+        // is never empty on a real repo and the rich empty-state
+        // card (branch icon + headline + 3 CTAs) never paints; the
+        // user falls through to `GitPanel`'s plainer internal
+        // placeholder instead, which is what's been happening.
+        use oximux_core::{IndexStatus, WorktreeStatus};
+        !state.files.iter().any(|f| {
+            !matches!(f.index, IndexStatus::Ignored)
+                && !matches!(f.worktree, WorktreeStatus::Ignored)
+        })
     }
 
     pub(super) fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
