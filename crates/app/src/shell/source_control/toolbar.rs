@@ -145,13 +145,29 @@ impl SourceControlPanel {
             .border_color(theme.border_inactive)
             .px(px(sc_style::PAD_H));
         // Count of uncommitted changed files for the "Uncommitted" tab
-        // badge. Counted once outside the loop so the per-tab render
-        // doesn't re-walk `git_state.files` twice. Zero suppresses the
-        // pill entirely — an empty `(0)` would just add visual noise.
+        // badge. Mirrors the Ignored filter from `build_primary_inputs`
+        // and `partition_files`: ignored entries (`target/`, build
+        // artifacts, anything matched by `.gitignore`) surface in
+        // `git_state.files` because the poller asks for them, but the
+        // user never thinks of them as "uncommitted changes" — and the
+        // empty-state card already hides them via `should_show_empty_state`,
+        // so showing "Uncommitted 12" next to "No changes on this
+        // branch" reads as a bug. Counted once outside the loop.
+        // Zero suppresses the badge entirely — `(0)` would just be noise.
         let uncommitted_count = self
             .git_state
             .as_ref()
-            .map_or(0, |s| s.files.len());
+            .map(|s| {
+                use oximux_core::{IndexStatus, WorktreeStatus};
+                s.files
+                    .iter()
+                    .filter(|f| {
+                        !matches!(f.index, IndexStatus::Ignored)
+                            && !matches!(f.worktree, WorktreeStatus::Ignored)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
         for scope in scopes {
             let active = scope == self.scope;
             let label = scope.label();
