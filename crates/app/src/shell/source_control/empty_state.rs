@@ -101,6 +101,13 @@ impl SourceControlPanel {
                 panel.select_scope(SourceControlScope::All, cx);
             }));
 
+        // Card-level spacing: 10px vertical gap between icon, headline,
+        // and CTA cluster (slightly tighter than the global gap_inline
+        // because the three elements visually belong together as one
+        // unit); 28px outer y-padding so the card breathes inside the
+        // panel without floating in the middle of a sparse layout.
+        // Both values are local to this empty-state component and
+        // documented inline rather than promoted to density tokens.
         div()
             .flex()
             .flex_col()

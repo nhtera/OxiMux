@@ -135,6 +135,10 @@ impl SearchPanel {
         self.theme
     }
 
+    pub fn density(&self) -> Density {
+        self.density
+    }
+
     pub fn typography_ref(&self) -> &Typography {
         &self.typography
     }

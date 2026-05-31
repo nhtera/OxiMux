@@ -35,6 +35,7 @@ const TOGGLE_SIZE_PX: f32 = 18.0;
 
 pub(super) fn render_header(panel: &SearchPanel, cx: &mut Context<SearchPanel>) -> AnyElement {
     let theme = panel.theme();
+    let density = panel.density();
     let typography = panel.typography_ref();
     let opts = panel.options();
 
@@ -45,7 +46,7 @@ pub(super) fn render_header(panel: &SearchPanel, cx: &mut Context<SearchPanel>) 
     let leading: Option<AnyElement> = if panel.is_loading() {
         Some(spinner_slot(theme))
     } else if has_text {
-        Some(clear_slot(theme, cx))
+        Some(clear_slot(theme, density, cx))
     } else {
         None
     };
@@ -65,6 +66,7 @@ pub(super) fn render_header(panel: &SearchPanel, cx: &mut Context<SearchPanel>) 
             opts.case_sensitive,
             HeaderToggle::CaseSensitive,
             theme,
+            density,
             cx,
         ))
         .child(toggle_pill(
@@ -74,6 +76,7 @@ pub(super) fn render_header(panel: &SearchPanel, cx: &mut Context<SearchPanel>) 
             opts.whole_word,
             HeaderToggle::WholeWord,
             theme,
+            density,
             cx,
         ))
         .child(toggle_pill(
@@ -83,6 +86,7 @@ pub(super) fn render_header(panel: &SearchPanel, cx: &mut Context<SearchPanel>) 
             opts.use_regex,
             HeaderToggle::UseRegex,
             theme,
+            density,
             cx,
         ));
 
@@ -169,6 +173,7 @@ fn filter_section(
 
 /// Single icon-toggle pill. Selected state uses `bg_overlay` + `border_active`
 /// for clear visual separation from the input field's fill.
+#[allow(clippy::too_many_arguments)]
 fn toggle_pill(
     id: &'static str,
     icon_path: &'static str,
@@ -176,6 +181,7 @@ fn toggle_pill(
     active: bool,
     which: HeaderToggle,
     theme: oximux_settings::Theme,
+    density: oximux_settings::Density,
     cx: &mut Context<SearchPanel>,
 ) -> AnyElement {
     let (bg, border, fg) = if active {
@@ -195,7 +201,7 @@ fn toggle_pill(
         .justify_center()
         .w(px(TOGGLE_SIZE_PX))
         .h(px(TOGGLE_SIZE_PX))
-        .rounded(px(3.0))
+        .rounded(px(density.r_chip))
         .border_1()
         .border_color(border)
         .bg(bg)
@@ -238,7 +244,11 @@ fn spinner_slot(theme: oximux_settings::Theme) -> AnyElement {
 }
 
 /// Inline clear (×) — click resets the query and re-focuses the input.
-fn clear_slot(theme: oximux_settings::Theme, cx: &mut Context<SearchPanel>) -> AnyElement {
+fn clear_slot(
+    theme: oximux_settings::Theme,
+    density: oximux_settings::Density,
+    cx: &mut Context<SearchPanel>,
+) -> AnyElement {
     div()
         .id(ElementId::Name("sp-clear-query".into()))
         .flex()
@@ -246,7 +256,7 @@ fn clear_slot(theme: oximux_settings::Theme, cx: &mut Context<SearchPanel>) -> A
         .justify_center()
         .w(px(TOGGLE_SIZE_PX))
         .h(px(TOGGLE_SIZE_PX))
-        .rounded(px(3.0))
+        .rounded(px(density.r_chip))
         .text_color(theme.fg_muted)
         .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
         .tooltip(move |window, cx| Tooltip::new("Clear").build(window, cx))

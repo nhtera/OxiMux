@@ -139,7 +139,7 @@ pub(super) fn render_commit_row(
     // after an id is set. The short OID is unique per commit, so a
     // per-row id is both stable across renders and collision-free.
     let row_id = ElementId::Name(format!("graph-commit-{}", c.short_oid).into());
-    let chips = render_ref_chips(&c.refs, &c.short_oid, theme, typography);
+    let chips = render_ref_chips(&c.refs, &c.short_oid, theme, density, typography);
 
     // Capture-by-clone for the click closure — emits `ShowCommitRequested`
     // so the host workspace can open a commit-detail tab. The closure
@@ -230,6 +230,7 @@ fn render_ref_chips(
     refs: &[RefLabel],
     row_id: &str,
     theme: Theme,
+    density: oximux_settings::Density,
     typography: &Typography,
 ) -> Option<gpui::Div> {
     if refs.is_empty() {
@@ -243,7 +244,7 @@ fn render_ref_chips(
         .flex_shrink_0();
     let mut shown = 0usize;
     for r in refs.iter().take(REF_CHIPS_VISIBLE) {
-        row = row.child(ref_chip_for(r, theme, typography));
+        row = row.child(ref_chip_for(r, theme, density, typography));
         shown += 1;
     }
     let hidden = refs.len().saturating_sub(shown);
@@ -267,7 +268,7 @@ fn render_ref_chips(
                 .id(chip_id)
                 .px(px(6.0))
                 .py(px(1.0))
-                .rounded(px(3.0))
+                .rounded(px(density.r_chip))
                 .bg(theme.bg_panel_alt)
                 .text_size(px(sc_style::SUB_LABEL_TEXT))
                 .text_color(theme.fg_muted)
@@ -282,7 +283,12 @@ fn render_ref_chips(
 /// branch tips, remote-tracking branches, and tags each pick their
 /// own neutral tint so the cluster scans like a legend without
 /// shouting.
-fn ref_chip_for(r: &RefLabel, theme: Theme, typography: &Typography) -> gpui::Div {
+fn ref_chip_for(
+    r: &RefLabel,
+    theme: Theme,
+    density: oximux_settings::Density,
+    typography: &Typography,
+) -> gpui::Div {
     let (label, fg, bg) = match r {
         RefLabel::Head => (
             "HEAD".to_string(),
@@ -308,7 +314,7 @@ fn ref_chip_for(r: &RefLabel, theme: Theme, typography: &Typography) -> gpui::Di
     div()
         .px(px(6.0))
         .py(px(1.0))
-        .rounded(px(3.0))
+        .rounded(px(density.r_chip))
         .bg(bg)
         .text_size(px(sc_style::SUB_LABEL_TEXT))
         .text_color(fg)

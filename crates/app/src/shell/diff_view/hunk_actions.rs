@@ -53,6 +53,7 @@ pub fn render_hunk_actions(
             hunk_idx,
             HunkAction::Unstage,
             theme,
+            density,
             typography,
             cx,
         ));
@@ -65,8 +66,9 @@ pub fn render_hunk_actions(
                 hunk_idx,
                 HunkAction::Stage,
                 theme,
-                typography,
-                cx,
+            density,
+            typography,
+            cx,
             ))
             .child(action_chip(
                 "discard",
@@ -75,8 +77,9 @@ pub fn render_hunk_actions(
                 hunk_idx,
                 HunkAction::Discard,
                 theme,
-                typography,
-                cx,
+            density,
+            typography,
+            cx,
             ));
     }
     Some(row)
@@ -100,6 +103,7 @@ fn action_chip(
     hunk_idx: usize,
     action: HunkAction,
     theme: Theme,
+    density: Density,
     typography: &Typography,
     cx: &mut Context<DiffView>,
 ) -> gpui::Stateful<gpui::Div> {
@@ -113,7 +117,7 @@ fn action_chip(
         .id(id)
         .px(px(6.0))
         .py(px(1.0))
-        .rounded(px(3.0))
+        .rounded(px(density.r_chip))
         .text_size(px(typography.t_body_sm))
         .text_color(fg)
         .cursor_pointer()

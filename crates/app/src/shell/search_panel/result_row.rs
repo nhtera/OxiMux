@@ -15,7 +15,13 @@ use gpui::{
 use gpui_component::{Icon, IconName, Sizable as _};
 use oximux_settings::{Theme, Typography};
 
-/// Constants shared by file + match rows.
+/// Constants shared by file + match rows. Both heights are intentionally
+/// tighter than the global `density.h_row = 24` because search results
+/// are scan-heavy: file rows pack 2px tighter and per-line match rows
+/// pack another 4px tighter so a typical 10-match file fits in the same
+/// vertical space as a single SCM file row. Documented locally instead
+/// of adding `h_search_file` / `h_search_match` tokens until a second
+/// surface needs them.
 const FILE_ROW_H: f32 = 22.0;
 const MATCH_ROW_H: f32 = 18.0;
 const ROW_INDENT: f32 = 14.0;
