@@ -20,6 +20,7 @@ pub mod ai_generation;
 pub mod ai_overlay;
 pub mod branch_picker;
 pub mod commit_area;
+pub mod commit_context_menu;
 pub mod commit_ops;
 pub mod conflict_banner;
 pub mod dropdown_items;

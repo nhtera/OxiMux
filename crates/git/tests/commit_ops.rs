@@ -229,3 +229,78 @@ async fn commit_message_with_special_chars_no_shell_injection() {
     repo.commit(msg).await.unwrap();
     assert_eq!(read_head_message(p), msg);
 }
+
+#[tokio::test]
+async fn cherry_pick_applies_commit_onto_head() {
+    // Set up: main has one commit; a feature branch adds a second commit;
+    // switch back to main; cherry-pick the feature commit onto main.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    run_git(p, &["checkout", "-b", "feat"]);
+    write(&p.join("b.txt"), "feat\n");
+    run_git(p, &["add", "b.txt"]);
+    run_git(p, &["commit", "-m", "feat: add b"]);
+    let feat_sha = read_head_sha(p);
+    run_git(p, &["checkout", "main"]);
+
+    let repo = Repository::open(p).await.unwrap();
+    repo.cherry_pick(&feat_sha).await.unwrap();
+
+    // HEAD should now carry the same subject as the feature commit and
+    // the file should exist in the working tree.
+    assert_eq!(read_head_message(p), "feat: add b");
+    assert!(p.join("b.txt").exists(), "cherry-picked file must land");
+}
+
+#[tokio::test]
+async fn cherry_pick_empty_sha_errors_invalid_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    let repo = Repository::open(p).await.unwrap();
+    let err = repo.cherry_pick("").await.unwrap_err();
+    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn revert_commit_creates_inverse_commit() {
+    // Two commits on main; revert the latest one. HEAD should advance by
+    // one commit (the auto-generated "Revert …") and the touched file
+    // should be back to its pre-commit content.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    write(&p.join("a.txt"), "v2\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "bump to v2"]);
+    let bump_sha = read_head_sha(p);
+
+    let repo = Repository::open(p).await.unwrap();
+    repo.revert_commit(&bump_sha).await.unwrap();
+
+    // git's auto-message starts with "Revert ".
+    let head_msg = read_head_message(p);
+    assert!(
+        head_msg.starts_with("Revert"),
+        "revert subject must start with 'Revert', got {head_msg:?}"
+    );
+    let content = std::fs::read_to_string(p.join("a.txt")).unwrap();
+    assert_eq!(content, "v1\n", "file must roll back to pre-bump content");
+}
+
+#[tokio::test]
+async fn revert_commit_empty_sha_errors_invalid_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    let repo = Repository::open(p).await.unwrap();
+    let err = repo.revert_commit("").await.unwrap_err();
+    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
+}

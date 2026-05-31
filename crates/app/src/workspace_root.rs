@@ -48,12 +48,13 @@ use crate::state::AppState;
 
 use crate::actions::{
     ActivateGroupTab, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
-    OpenAddProjectDialog, OpenCommandPalette, OpenCommitDialog, OpenFileFromContextMenu,
-    OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
-    OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate,
-    RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
-    SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
-    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    OpenAddProjectDialog, OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog,
+    OpenFileFromContextMenu, OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions,
+    OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
+    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
+    SelectSearchTab, SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt,
+    SplitHorizontal, SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar,
+    ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -66,7 +67,7 @@ use crate::shell::{
         DiscardRequested, GitPanel,
         row_context_menu::{GitRowContextMenu, GitRowContextTarget},
     },
-    source_control::graph::ShowCommitRequested,
+    source_control::{commit_context_menu::CommitContextMenu, graph::ShowCommitRequested},
     stash_panel::{
         PushStashRequested, StashPanel,
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
@@ -122,6 +123,14 @@ pub struct WorkspaceRoot {
     /// chosen by the action dispatcher based on the click payload +
     /// the panel's selection set.
     pub(crate) git_row_context_menu: Entity<GitRowContextMenu>,
+    /// Right-click context menu for commit-graph rows
+    /// (Cherry-pick / Revert / Copy SHA / Copy short SHA). Same
+    /// shared-entity z-band as `git_row_context_menu`; mutually
+    /// exclusive via close-on-open in the `OpenCommitContextMenuAt`
+    /// handler. Holds a weak handle to the active `CommitArea` so
+    /// Cherry-pick / Revert dispatches route through the existing
+    /// single-flight `in_flight` flag.
+    pub(crate) commit_context_menu: Entity<CommitContextMenu>,
     /// Inline adapter-picker popover anchored to the workspace-tabs `+` button.
     pub(crate) adapter_picker: Entity<AdapterPicker>,
     /// PTY backend + status streams for every agent session. Held behind Arc
@@ -301,6 +310,8 @@ impl WorkspaceRoot {
             cx.new(|_| FileTreeContextMenu::new(theme, density, typography.clone()));
         let git_row_context_menu =
             cx.new(|_| GitRowContextMenu::new(theme, density, typography.clone()));
+        let commit_context_menu =
+            cx.new(|_| CommitContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
@@ -512,6 +523,7 @@ impl WorkspaceRoot {
             tab_context_menu,
             file_tree_context_menu,
             git_row_context_menu,
+            commit_context_menu,
             adapter_picker,
             cli_runtime,
             adapter_registry,
@@ -1903,6 +1915,45 @@ impl Render for WorkspaceRoot {
                     });
                 },
             ))
+            .on_action(cx.listener(
+                |this, action: &OpenCommitContextMenuAt, _window, cx| {
+                    // Commit-graph row right-click — opens
+                    // `CommitContextMenu` with the right-clicked
+                    // commit's full + short OID. Close peer overlays
+                    // first so the menu z-band stays single-occupancy.
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
+
+                    // Resolve the active source-control panel's
+                    // CommitArea weak handle. Bail silently if the
+                    // right sidebar isn't mounted (defensive — the
+                    // action can't have been dispatched without a
+                    // commit-graph row painted, but the lookup chain
+                    // is fail-safe).
+                    let Some(commit_area_weak) = this
+                        .right_sidebar
+                        .as_ref()
+                        .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+                        .map(|sc| sc.read(cx).commit_area.downgrade())
+                    else {
+                        return;
+                    };
+
+                    this.commit_context_menu.update(cx, |m, cx| {
+                        m.open(
+                            action.x,
+                            action.y,
+                            action.sha.clone(),
+                            action.short_sha.clone(),
+                            commit_area_weak,
+                            cx,
+                        );
+                    });
+                },
+            ))
             .on_action(
                 cx.listener(|this, action: &crate::actions::FindInFolder, window, cx| {
                     // Switch right sidebar to Search and seed its include
@@ -2193,6 +2244,7 @@ impl Render for WorkspaceRoot {
                 this.tab_context_menu.update(cx, |m, cx| m.close(cx));
                 this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
+                this.commit_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
@@ -2257,6 +2309,10 @@ impl Render for WorkspaceRoot {
             // Git-row right-click context menu — same z-band; mutually
             // exclusive via close-on-open in OpenGitRowContextMenuAt.
             .child(self.git_row_context_menu.clone())
+            // Commit-graph row right-click menu — same z-band as the
+            // peer context menus; mutually exclusive via close-on-open
+            // in OpenCommitContextMenuAt.
+            .child(self.commit_context_menu.clone())
             // Adapter picker — same z-band as pane_actions; only one of
             // them can be open at a time so order between them is moot.
             .child(self.adapter_picker.clone())

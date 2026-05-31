@@ -239,6 +239,23 @@ pub struct OpenGitRowContextMenuAt {
     pub folder_leaves: Vec<String>,
 }
 
+/// Right-click on a commit-graph row in the source control panel.
+/// Carries cursor coords + the full 40-char OID + the 8-char short OID
+/// so the shared `CommitContextMenu` renders the Cherry-pick / Revert /
+/// Copy SHA / Copy short SHA items without re-deriving the short prefix.
+///
+/// Mounted at `WorkspaceRoot` level (same pattern as
+/// `FileTreeContextMenu` and `GitRowContextMenu`) so dismissal +
+/// peer-overlay close-on-open behavior is shared.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenCommitContextMenuAt {
+    pub x: f32,
+    pub y: f32,
+    pub sha: String,
+    pub short_sha: String,
+}
+
 /// Payload action carrying text from the focused terminal up to the
 /// workspace so it can resolve "the active agent session" and stream
 /// the bytes through its CLI runtime. Bubbles from `TerminalView` up
@@ -439,6 +456,29 @@ mod tests {
         assert_eq!(original, dup);
         assert_eq!(dup.selection_paths.len(), 3);
         assert!(dup.is_staged);
+    }
+
+    #[test]
+    fn open_commit_context_menu_default_is_empty() {
+        let a = OpenCommitContextMenuAt::default();
+        assert_eq!(a.x, 0.0);
+        assert_eq!(a.y, 0.0);
+        assert!(a.sha.is_empty());
+        assert!(a.short_sha.is_empty());
+    }
+
+    #[test]
+    fn open_commit_context_menu_round_trip_payload() {
+        let original = OpenCommitContextMenuAt {
+            x: 200.0,
+            y: 320.5,
+            sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            short_sha: "abcdef01".to_string(),
+        };
+        let dup = original.clone();
+        assert_eq!(original, dup);
+        assert_eq!(dup.sha.len(), 40);
+        assert_eq!(dup.short_sha.len(), 8);
     }
 
     #[test]

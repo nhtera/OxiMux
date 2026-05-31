@@ -128,6 +128,75 @@ pub fn run_commit(
     spawn_commit_completion(area, rx, window, cx);
 }
 
+/// History-rewriting / history-extending verbs fired from the commit
+/// graph row's right-click context menu. Distinct from `RemoteVerb` —
+/// these always carry a target commit SHA, never touch the network,
+/// and surface their in-flight state through the dedicated
+/// `CommitStatus::CherryPicking` / `CommitStatus::Reverting` variants
+/// so the status row reads "Cherry-picking…" rather than the generic
+/// "Committing…" .
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitVerb {
+    CherryPick(String),
+    Revert(String),
+}
+
+impl CommitVerb {
+    fn label(&self) -> &'static str {
+        match self {
+            CommitVerb::CherryPick(_) => "cherry-pick",
+            CommitVerb::Revert(_) => "revert",
+        }
+    }
+
+    fn in_flight_status(&self) -> CommitStatus {
+        match self {
+            CommitVerb::CherryPick(_) => CommitStatus::CherryPicking,
+            CommitVerb::Revert(_) => CommitStatus::Reverting,
+        }
+    }
+}
+
+/// Run a per-commit history op (cherry-pick / revert). Mirrors `run_remote`
+/// but takes a `CommitVerb` carrying the target SHA. Single-flight on the
+/// `in_flight` flag — a second click on a Cherry-pick / Revert row while
+/// the first is still running is a no-op rather than a queue.
+///
+/// Conflict failure leaves the worktree in CHERRY_PICK_HEAD / REVERT_HEAD
+/// state; `Repository::current_operation()` (polled once per tick) picks
+/// the new state up on the next refresh, so the operation banner appears
+/// to guide the user through the recovery sequence.
+pub fn run_commit_verb(area: &mut CommitArea, verb: CommitVerb, cx: &mut Context<CommitArea>) {
+    if area.in_flight.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    area.status = verb.in_flight_status();
+    let repo = area.repo.clone();
+    let label = verb.label();
+    let (tx, rx) = oneshot::channel::<Result<&'static str, (&'static str, String)>>();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let verb_for_task = verb.clone();
+            handle.spawn(async move {
+                let r = match verb_for_task {
+                    CommitVerb::CherryPick(sha) => repo.cherry_pick(&sha).await,
+                    CommitVerb::Revert(sha) => repo.revert_commit(&sha).await,
+                };
+                let _ = match r {
+                    Ok(_) => tx.send(Ok(label)),
+                    Err(e) => tx.send(Err((label, e.to_string()))),
+                };
+            });
+        }
+        Err(_) => {
+            area.status = CommitStatus::Failed(label.to_string(), "no tokio runtime".to_string());
+            area.in_flight.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
+    spawn_completion(area, rx, cx);
+}
+
 /// Run a standalone remote op (push/pull/sync/fetch). Updates `status`
 /// to the matching in-flight variant and back to Idle/Failed on completion.
 pub fn run_remote(area: &mut CommitArea, verb: RemoteVerb, cx: &mut Context<CommitArea>) {

@@ -79,6 +79,14 @@ pub enum CommitStatus {
     Pulling,
     Syncing,
     Fetching,
+    /// `git cherry-pick <sha>` in flight. Surfaced by the commit-row
+    /// right-click → Cherry-pick item. Reaches `Idle` on success or
+    /// `Failed("cherry-pick", …)` on conflict (the operation banner
+    /// covers the recovery surface via `current_op`).
+    CherryPicking,
+    /// `git revert --no-edit <sha>` in flight. Same lifecycle as
+    /// `CherryPicking` — conflict drops into the operation banner.
+    Reverting,
     Failed(String, String),
 }
 
@@ -343,6 +351,31 @@ impl CommitArea {
     /// which uses the existing `Repository::publish_branch` backend.
     pub fn publish(&mut self, cx: &mut Context<Self>) {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Publish, cx);
+    }
+
+    /// `git cherry-pick <sha>` driven by the commit-graph row's right-click
+    /// → Cherry-pick item. Surfaces `CommitStatus::CherryPicking` while
+    /// running and lands on `Idle` (success) or `Failed("cherry-pick", …)`
+    /// (conflict). The operation banner picks up CHERRY_PICK_HEAD on the
+    /// next poll tick so the user gets a recovery surface.
+    pub fn cherry_pick(&mut self, sha: String, cx: &mut Context<Self>) {
+        super::commit_ops::run_commit_verb(
+            self,
+            super::commit_ops::CommitVerb::CherryPick(sha),
+            cx,
+        );
+    }
+
+    /// `git revert --no-edit <sha>` driven by the commit-graph row's
+    /// right-click → Revert item. Same lifecycle as `cherry_pick` — conflict
+    /// drops into the operation banner via the next poll-tick's
+    /// `current_operation()` read.
+    pub fn revert(&mut self, sha: String, cx: &mut Context<Self>) {
+        super::commit_ops::run_commit_verb(
+            self,
+            super::commit_ops::CommitVerb::Revert(sha),
+            cx,
+        );
     }
 
     /// Apply a completed op result to the status surface. Called from
@@ -794,6 +827,8 @@ fn render_status_row(
         CommitStatus::Pulling => (theme.fg_muted, "Pulling…".to_string()),
         CommitStatus::Syncing => (theme.fg_muted, "Syncing…".to_string()),
         CommitStatus::Fetching => (theme.fg_muted, "Fetching…".to_string()),
+        CommitStatus::CherryPicking => (theme.fg_muted, "Cherry-picking…".to_string()),
+        CommitStatus::Reverting => (theme.fg_muted, "Reverting…".to_string()),
         CommitStatus::Failed(label, error) => (
             theme.status_error,
             // Title-case the verb so "Push failed: …" reads naturally;

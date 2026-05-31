@@ -13,9 +13,9 @@
 //! the simplest possible.
 
 use gpui::{
-    AnyElement, ClickEvent, ClipboardItem, ElementId, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _,
-    Styled, WeakEntity, div, prelude::FluentBuilder as _, px,
+    AnyElement, ClickEvent, ElementId, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled,
+    WeakEntity, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::tooltip::Tooltip;
 use oximux_core::{CommitInfo, RefLabel};
@@ -149,13 +149,12 @@ pub(super) fn render_commit_row(
     let click_short = c.short_oid.clone();
     let click_subject = c.subject.clone();
 
-    // Right-click shortcut: copy the short OID to the clipboard. The
-    // most-asked-for context-menu action ("copy this commit's hash")
-    // collapsed into a single mouse gesture so a power user can fire
-    // and forget. A future v3 promotes this to a full popover with
-    // Cherry-pick / Revert / Copy full SHA / Copy short SHA rows
-    // backed by a dedicated `CommitRowContextMenu` entity; v2 stays
-    // minimal so the affordance ships clean.
+    // Right-click opens the shared `CommitContextMenu` mounted on
+    // WorkspaceRoot (same pattern as the file-tree + git-row menus).
+    // The full menu offers Cherry-pick / Revert / Copy SHA / Copy
+    // short SHA; closure ships both forms in the action payload so
+    // the menu doesn't have to re-derive the short prefix.
+    let ctx_full = c.oid.clone();
     let ctx_short = c.short_oid.clone();
 
     div()
@@ -195,8 +194,16 @@ pub(super) fn render_commit_row(
         })
         .on_mouse_down(
             MouseButton::Right,
-            move |_ev: &MouseDownEvent, _window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(ctx_short.clone()));
+            move |ev: &MouseDownEvent, window, cx| {
+                window.dispatch_action(
+                    Box::new(crate::actions::OpenCommitContextMenuAt {
+                        x: ev.position.x.into(),
+                        y: ev.position.y.into(),
+                        sha: ctx_full.clone(),
+                        short_sha: ctx_short.clone(),
+                    }),
+                    cx,
+                );
             },
         )
         .on_click(move |_: &ClickEvent, _window, cx| {

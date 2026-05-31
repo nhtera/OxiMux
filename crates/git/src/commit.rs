@@ -61,6 +61,49 @@ impl Repository {
         self.head_sha().await
     }
 
+    /// `git cherry-pick <sha>` — re-apply one historical commit onto HEAD.
+    ///
+    /// Returns `Ok(())` once cherry-pick exits cleanly (the new commit
+    /// lands on HEAD). On conflict, git exits non-zero and leaves the
+    /// worktree in CHERRY_PICK_HEAD state; the caller surfaces this via
+    /// the operation banner (already wired through
+    /// `Repository::current_operation()`), so the resulting `Err` carries
+    /// raw stderr for the status row.
+    ///
+    /// `sha` is forwarded verbatim — short hashes and named refs are both
+    /// valid input (`git cherry-pick HEAD~3` works) but the UI only ever
+    /// passes a full 40-char OID from the commit graph row.
+    pub async fn cherry_pick(&self, sha: &str) -> Result<()> {
+        if sha.trim().is_empty() {
+            return Err(GitError::invalid_input("cherry_pick sha is empty"));
+        }
+        GitCmd::new(self.workdir())
+            .args(["cherry-pick", sha])
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// `git revert --no-edit <sha>` — append an inverse commit that undoes
+    /// the named one. `--no-edit` skips the editor (matches GUI tool
+    /// behavior); the commit message defaults to git's auto-generated
+    /// "Revert ‹original subject›".
+    ///
+    /// Same conflict + status surfacing as `cherry_pick` — a conflicted
+    /// revert leaves the worktree in REVERT_HEAD state and surfaces
+    /// through the operation banner. Returns raw stderr in the `Err` for
+    /// the status row.
+    pub async fn revert_commit(&self, sha: &str) -> Result<()> {
+        if sha.trim().is_empty() {
+            return Err(GitError::invalid_input("revert_commit sha is empty"));
+        }
+        GitCmd::new(self.workdir())
+            .args(["revert", "--no-edit", sha])
+            .run()
+            .await?;
+        Ok(())
+    }
+
     /// Full HEAD SHA. Tiny helper used by `commit` / `commit_paths` to surface
     /// the freshly-minted commit. `git rev-parse HEAD` is locale-stable and
     /// doesn't depend on the noisy `git commit` stdout format.
