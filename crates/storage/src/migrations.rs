@@ -46,8 +46,12 @@ pub struct Migration {
 /// project never clobber each other's saved state; legacy rows default
 /// to window_id='main'. V006 adds `worktree_settings` — one row per
 /// workspace holding SCM scratch state (base ref selection, in-flight
-/// commit draft, view-mode override) keyed by `workspace_id`. Future
-/// migrations append; never reorder, never rewrite.
+/// commit draft, view-mode override) keyed by `workspace_id`. V007
+/// drops the FK on `worktree_settings.workspace_id`: the SCM panel
+/// uses a worktree filesystem path as the key, not a `workspaces.id`
+/// UUID, so the FK was always violated on a freshly-opened project
+/// with no workspace row. Future migrations append; never reorder,
+/// never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -78,6 +82,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "worktree_settings",
         sql: include_str!("../migrations/V006__worktree_settings.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "worktree_settings_drop_fk",
+        sql: include_str!("../migrations/V007__worktree_settings_drop_fk.sql"),
     },
 ];
 

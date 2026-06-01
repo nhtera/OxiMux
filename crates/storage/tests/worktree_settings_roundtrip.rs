@@ -87,7 +87,14 @@ fn upsert_replaces_existing_row() {
 }
 
 #[test]
-fn cascade_deletes_settings_when_workspace_dropped() {
+fn settings_outlive_workspace_after_v007_fk_drop() {
+    // V006 modeled `worktree_settings.workspace_id REFERENCES
+    // workspaces(id) ON DELETE CASCADE`, but the SCM panel keys on a
+    // worktree filesystem path rather than a `workspaces.id` UUID, so
+    // the FK was always violated on a freshly-opened project with no
+    // workspace row. V007 drops the FK; settings rows are now
+    // free-standing and survive workspace deletion (orphan rows are
+    // accepted — a few hundred bytes at worst per archived worktree).
     let db = open_memory().expect("open mem");
     seed_workspace(&db, "ws-1");
     let repo = WorktreeSettingsRepo::new(db.clone());
@@ -107,10 +114,11 @@ fn cascade_deletes_settings_when_workspace_dropped() {
     })
     .expect("drop workspace");
 
-    assert!(
-        repo.get("ws-1").expect("get").is_none(),
-        "FK CASCADE must drop the settings row"
-    );
+    let row = repo
+        .get("ws-1")
+        .expect("get")
+        .expect("settings row survives workspace deletion (no FK CASCADE post-V007)");
+    assert_eq!(row.base_ref.as_deref(), Some("origin/main"));
 }
 
 #[test]

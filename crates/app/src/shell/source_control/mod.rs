@@ -287,12 +287,13 @@ impl SourceControlPanel {
         // `Box<dyn Fn>` and the weak capture short-circuits when `self`
         // is dropped.
         let panel_weak = cx.weak_entity();
-        let on_pick: OnPick = Box::new(move |outcome, window, cx| {
+        // `mode` is supplied by `BranchPicker::confirm` so we never
+        // call `panel.branch_picker.read(cx).mode()` here — that read
+        // would re-enter the picker entity while it is mid-update
+        // (the callback fires from within `BranchPicker::confirm`) and
+        // gpui's `entity_map` enforces single-writer access at runtime.
+        let on_pick: OnPick = Box::new(move |outcome, mode, window, cx| {
             let _ = panel_weak.update(cx, |panel, cx| {
-                // Read the live picker mode — the same picker entity
-                // services both Switch and BaseRef surfaces and the
-                // outcome's meaning depends on which one is active.
-                let mode = panel.branch_picker.read(cx).mode();
                 panel.apply_picker_outcome(outcome, mode, window, cx);
             });
         });

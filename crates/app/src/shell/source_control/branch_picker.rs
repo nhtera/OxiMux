@@ -76,7 +76,15 @@ pub enum PickerOutcome {
 /// picker entity is owned by one parent and the callback fires inside
 /// that parent's `Context`. `Send + 'static` matches the parent
 /// `PaneActionsMenu`-style pattern.
-pub type OnPick = Box<dyn Fn(PickerOutcome, &mut Window, &mut App) + Send + 'static>;
+///
+/// `PickerMode` is passed alongside the outcome so the owner doesn't
+/// need to re-read the picker entity to discover which surface
+/// (Switch vs BaseRef) fired — the callback is invoked from
+/// `BranchPicker::confirm`, which runs inside the picker's own
+/// `update` and would panic on `picker.read(cx)` from a re-entrant
+/// access (gpui entity_map enforces one writer at a time).
+pub type OnPick =
+    Box<dyn Fn(PickerOutcome, PickerMode, &mut Window, &mut App) + Send + 'static>;
 
 /// One row in the rendered display. Separators are non-selectable; arrow
 /// nav skips them. `Branch.is_current` drives a check-mark indicator.
@@ -358,7 +366,10 @@ impl BranchPicker {
         // over a still-visible popover — matches the
         // `ProjectPickerModal::finalize_recent` sequencing (C2).
         self.close(cx);
-        (self.on_pick)(outcome, window, cx);
+        // Pass `self.mode` so the callback never has to call
+        // `picker.read(cx).mode()` — that would re-enter this entity
+        // (we're still inside its `update`) and panic.
+        (self.on_pick)(outcome, self.mode, window, cx);
     }
 }
 
