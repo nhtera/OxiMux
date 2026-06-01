@@ -68,6 +68,10 @@ pub struct LeftRail {
     active_workspace_id: Option<String>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
+    /// Worktree paths that currently have an open agent tab. A workspace
+    /// in this set reads as "live" (green idle dot) even before its
+    /// session reports a concrete status.
+    live_worktrees: HashSet<String>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -95,6 +99,7 @@ impl LeftRail {
             active_workspace_id: None,
             workspaces_by_project: HashMap::new(),
             latest_status: HashMap::new(),
+            live_worktrees: HashSet::new(),
             width: px(density.w_left_rail),
             settings_repo: None,
             collapsed: HashSet::new(),
@@ -170,6 +175,7 @@ impl LeftRail {
         active_workspace_id: Option<String>,
         workspaces_by_project: HashMap<String, Vec<Workspace>>,
         latest_status: LatestStatusMap,
+        live_worktrees: HashSet<String>,
         cx: &mut Context<Self>,
     ) {
         self.projects = projects;
@@ -177,6 +183,7 @@ impl LeftRail {
         self.active_workspace_id = active_workspace_id;
         self.workspaces_by_project = workspaces_by_project;
         self.latest_status = latest_status;
+        self.live_worktrees = live_worktrees;
         cx.notify();
     }
 
@@ -207,6 +214,7 @@ impl Render for LeftRail {
             entity.clone(),
             self.workspaces_by_project.clone(),
             self.latest_status.clone(),
+            self.live_worktrees.clone(),
             self.weak_root.clone(),
             theme,
             density,
@@ -254,6 +262,7 @@ fn render_workspace_list(
     rail: gpui::Entity<LeftRail>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
+    live_worktrees: HashSet<String>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -293,6 +302,7 @@ fn render_workspace_list(
             workspaces,
             latest_status_for,
             active_workspace_id.as_deref(),
+            &live_worktrees,
             rail.clone(),
             weak_root.clone(),
             on_row_menu,

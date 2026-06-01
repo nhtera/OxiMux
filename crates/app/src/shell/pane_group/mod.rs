@@ -469,6 +469,17 @@ impl PaneGroup {
             .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == path))
     }
 
+    /// Worktree paths of every open agent tab in this group. Feeds the
+    /// sidebar's live/idle status dot — a workspace with an open agent
+    /// tab reads as "live" (green) even before its session reports a
+    /// concrete status.
+    pub fn agent_worktree_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.tabs.iter().filter_map(|t| match &t.kind {
+            PaneGroupTabKind::Agent { worktree_path, .. } => Some(worktree_path.as_path()),
+            _ => None,
+        })
+    }
+
     /// Index of an existing agent tab whose worktree matches `path`, if
     /// any. Lets the sidebar focus the tab already running in a clicked
     /// workspace's worktree instead of spawning a duplicate.

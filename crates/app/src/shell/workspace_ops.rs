@@ -529,6 +529,13 @@ impl WorkspaceRoot {
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
         let active_workspace_id = self.active_workspace_id.clone();
+        // Worktree paths with an open agent tab — drives the live (green)
+        // status dot. Only the active project has live panes built, so its
+        // open tabs are the full set; other projects contribute none.
+        let live_worktrees = self
+            .active_project_panes()
+            .map(|panes| panes.read(cx).open_agent_worktree_paths(cx))
+            .unwrap_or_default();
         let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
             HashMap::with_capacity(projects.len());
         let mut latest_status: LatestStatusMap = HashMap::new();
@@ -602,6 +609,7 @@ impl WorkspaceRoot {
                 active_workspace_id,
                 workspaces_by_project,
                 latest_status,
+                live_worktrees,
                 cx,
             );
         });

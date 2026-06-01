@@ -67,6 +67,7 @@ pub fn render_project_group(
     workspaces: Vec<Workspace>,
     latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
     active_workspace_id: Option<&str>,
+    live_worktrees: &std::collections::HashSet<String>,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
@@ -103,12 +104,14 @@ pub fn render_project_group(
         // row with no branch is a non-git folder project → "Folder" badge.
         let is_primary = workspace.worktree_path == project.root_path;
         let is_folder = is_primary && workspace.branch.is_empty();
+        let is_live = live_worktrees.contains(&workspace.worktree_path);
         let latest = latest_status_for(&workspace.id);
         let row_plan = build_workspace_row_plan(
             &workspace,
             is_active,
             is_primary,
             is_folder,
+            is_live,
             latest.as_ref(),
             theme,
         );
