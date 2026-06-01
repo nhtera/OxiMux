@@ -72,7 +72,7 @@ use crate::shell::{
         PushStashRequested, StashPanel,
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
     },
-    left_rail::{LeftRail, row_menu::WorkspaceRowMenu},
+    left_rail::{LeftRail, project_menu::ProjectRowMenu, row_menu::WorkspaceRowMenu},
     main_area,
     openable_text_file::is_openable_text_file,
     pane_actions::{PaneActionsAnchor, PaneActionsMenu},
@@ -168,6 +168,9 @@ pub struct WorkspaceRoot {
     pub(crate) active_workspace_id: Option<String>,
     /// Sidebar Rename/Archive/Delete popover (mounted at root for full-window backdrop).
     pub(crate) row_menu: Entity<WorkspaceRowMenu>,
+    /// Sidebar per-project-header action popover (Reveal/Copy/Remove).
+    /// Same full-window-backdrop mount contract as `row_menu`.
+    pub(crate) project_menu: Entity<ProjectRowMenu>,
     pub(crate) add_project_dialog: Entity<AddProjectDialog>,
     /// Render root tracks this so action dispatch reaches the workspace
     /// even when no pane is focused (sidebar toggle, command palette).
@@ -410,6 +413,10 @@ impl WorkspaceRoot {
         let weak_for_menu: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let row_menu =
             cx.new(|_| WorkspaceRowMenu::new(theme, density, typography.clone(), weak_for_menu));
+        let weak_for_project_menu: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let project_menu = cx.new(|_| {
+            ProjectRowMenu::new(theme, density, typography.clone(), weak_for_project_menu)
+        });
         let pr = app_state.project_repo.clone();
         let add_project_dialog =
             build_add_project_dialog(theme, density, typography.clone(), pr, cx);
@@ -575,6 +582,7 @@ impl WorkspaceRoot {
             active_project: None,
             active_workspace_id: None,
             row_menu,
+            project_menu,
             add_project_dialog,
             focus_handle,
             window_id,
@@ -2397,6 +2405,8 @@ impl Render for WorkspaceRoot {
             .child(self.workspace_dialog.clone())
             // Per-row action popover (sidebar Rename / Archive / Delete).
             .child(self.row_menu.clone())
+            // Per-project-header action popover (Reveal / Copy / Remove).
+            .child(self.project_menu.clone())
             .child(self.add_project_dialog.clone())
             // Type-to-confirm dialog for destructive workspace ops. Built
             // per-request; `None` when idle. Wrapped in a full-window

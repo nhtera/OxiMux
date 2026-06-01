@@ -503,6 +503,7 @@ impl WorkspaceRoot {
         self.project_picker.update(cx, |p, cx| p.close(cx));
         self.workspace_dialog.update(cx, |d, cx| d.close(cx));
         self.row_menu.update(cx, |m, cx| m.close(cx));
+        self.project_menu.update(cx, |m, cx| m.close(cx));
         self.add_project_dialog.update(cx, |d, cx| d.close(cx));
     }
 
@@ -518,6 +519,21 @@ impl WorkspaceRoot {
         self.close_modal_overlays(cx);
         self.row_menu
             .update(cx, |m, cx| m.open(workspace, x, y, cx));
+    }
+
+    /// Open the per-project-header action popover at the given screen
+    /// coordinates. Closes any other overlays first so backdrops don't
+    /// compete.
+    pub(crate) fn open_project_menu(
+        &mut self,
+        project: oximux_core::Project,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_modal_overlays(cx);
+        self.project_menu
+            .update(cx, |m, cx| m.open(project, x, y, cx));
     }
 
     /// Snapshot the sidebar data (all recent projects, their workspaces,
@@ -874,6 +890,100 @@ impl WorkspaceRoot {
         self._discard_dialog_observer = None;
         self.confirm_dialog =
             Some(cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx)));
+        cx.notify();
+    }
+
+    /// Open the project's root directory in the macOS Finder. Best-effort:
+    /// a spawn failure is logged, never surfaced as a hard error, because
+    /// "reveal" is a convenience action with no state to keep consistent.
+    pub(crate) fn reveal_project_in_finder(&self, project: &Project) {
+        #[cfg(target_os = "macos")]
+        if let Err(err) = std::process::Command::new("open")
+            .arg(&project.root_path)
+            .spawn()
+        {
+            tracing::warn!(?err, path = %project.root_path, "reveal_project_in_finder: open failed");
+        }
+    }
+
+    /// Copy the project's root path to the system clipboard.
+    pub(crate) fn copy_project_path(&self, project: &Project, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(project.root_path.clone()));
+    }
+
+    /// Open the plain confirm dialog for removing a project from the
+    /// cockpit. No type-to-confirm — removal is reversible (re-open the
+    /// folder) and leaves every file on disk in place. On confirm: deletes
+    /// the `projects` row — the `ON DELETE CASCADE` FK then drops the
+    /// project's workspaces, pane buffers, and relay-id rows. If the removed
+    /// project was active, the active selection is cleared.
+    pub(crate) fn request_remove_project(
+        &mut self,
+        project: Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let project_repo = self.app_state.project_repo.clone();
+        let project_id = project.id.clone();
+        let on_confirm: ConfirmCallback = std::rc::Rc::new(move |_window, cx| {
+            let project_repo = project_repo.clone();
+            let project_id = project_id.clone();
+            let weak = weak.clone();
+            let _ = weak.update(cx, |this, cx| {
+                if let Err(err) = project_repo.delete(&project_id) {
+                    tracing::warn!(?err, project_id = %project_id, "remove_project: delete failed");
+                    cx.notify();
+                    return;
+                }
+                // Drop the in-memory panes + observer for the gone project so
+                // a stale entity can't keep rendering or saving.
+                this.project_panes_by_project.remove(&project_id);
+                if this.active_project.as_ref().map(|p| p.id.as_str()) == Some(project_id.as_str())
+                {
+                    this.active_project = None;
+                    this.active_workspace_id = None;
+                    this._project_panes_observer = None;
+                    this.right_sidebar = None;
+                }
+                this.refresh_recent_projects();
+                cx.notify();
+            });
+        });
+        let prompt = ConfirmPrompt {
+            title: "Remove Project".into(),
+            body: format!(
+                "Removes {} from OxiMux and forgets its workspaces. Files on disk are not deleted.",
+                project.name
+            )
+            .into(),
+            // Empty `expected` → plain confirm (no type-to-confirm field).
+            expected: "".into(),
+            on_confirm,
+            confirm_label: Some("Remove".into()),
+            on_cancel: None,
+        };
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog =
+            cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+        // Drop the dialog the moment the user confirms or cancels. Reusing
+        // `_discard_dialog_observer` cancels any stale observer first; the
+        // SCM discard / workspace-delete paths share the same slot.
+        self._discard_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.confirm_dialog = None;
+                    root._discard_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.confirm_dialog = Some(dialog);
         cx.notify();
     }
 }

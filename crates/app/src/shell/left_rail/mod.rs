@@ -21,6 +21,7 @@
 
 pub mod nav_section;
 pub mod project_group;
+pub mod project_menu;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
@@ -296,6 +297,16 @@ fn render_workspace_list(
                 weak_root_for_menu.update(cx, |root, cx| root.open_row_menu(workspace, x, y, cx));
         };
 
+        let weak_root_for_project_menu = weak_root.clone();
+        let on_project_menu = move |project: Project,
+                                    x: f32,
+                                    y: f32,
+                                    _window: &mut gpui::Window,
+                                    cx: &mut gpui::App| {
+            let _ = weak_root_for_project_menu
+                .update(cx, |root, cx| root.open_project_menu(project, x, y, cx));
+        };
+
         col = col.child(render_project_group(
             plan,
             project,
@@ -306,6 +317,7 @@ fn render_workspace_list(
             rail.clone(),
             weak_root.clone(),
             on_row_menu,
+            on_project_menu,
             theme,
             density,
             typography,

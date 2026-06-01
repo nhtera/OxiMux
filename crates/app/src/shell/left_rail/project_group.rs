@@ -71,6 +71,7 @@ pub fn render_project_group(
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
+    on_project_menu: impl Fn(Project, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -84,6 +85,7 @@ pub fn render_project_group(
         group_name.clone(),
         rail,
         weak_root.clone(),
+        on_project_menu,
         theme,
         density,
         typography,
@@ -160,12 +162,14 @@ pub fn render_project_group(
     col
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_header(
     plan: ProjectGroupPlan,
     project: Project,
     group_name: SharedString,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
+    on_project_menu: impl Fn(Project, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -290,6 +294,43 @@ fn build_header(
             window.dispatch_action(Box::new(OpenWorkspaceCreate), cx);
         });
 
+    // "…" more-actions button — hidden at rest, revealed on header hover
+    // (matching the chevron / workspace-row menu affordance). Opens the
+    // project popover (Reveal / Copy / Remove) anchored at the click point.
+    let menu_id: SharedString = format!("project-menu-{}", project.id).into();
+    let project_for_menu = project.clone();
+    let menu_btn = div()
+        .id(menu_id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(PLUS_BTN_SIZE))
+        .rounded(px(density.r_xs))
+        .text_color(theme.fg_muted)
+        .invisible()
+        .group_hover(group_name.clone(), |s| s.visible())
+        .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
+        .child(
+            svg()
+                .path("icons/ellipsis.svg")
+                .size(px(HEADER_ICON_SIZE))
+                .text_color(theme.fg_muted),
+        )
+        .tooltip(|window, cx| {
+            gpui_component::tooltip::Tooltip::new("Project actions").build(window, cx)
+        })
+        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            let pos = ev.position;
+            on_project_menu(
+                project_for_menu.clone(),
+                f32::from(pos.x),
+                f32::from(pos.y),
+                window,
+                cx,
+            );
+        });
+
     // Click anywhere on the header (folder / title / count chip / gap) to
     // activate this project. The "+" button stop-propagates so it stays
     // a workspace-create shortcut, not an activate-and-open one.
@@ -320,6 +361,7 @@ fn build_header(
         .child(title)
         .child(count_chip)
         .child(div().flex_1())
+        .child(menu_btn)
         .child(plus_btn)
 }
 

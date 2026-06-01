@@ -1,13 +1,17 @@
-//! ConfirmDialog — reusable type-to-confirm modal.
+//! ConfirmDialog — reusable confirm modal with two intensities.
 //!
-//! The destructive `Confirm` button is enabled only when the user types
-//! the `expected` string exactly. The callback runs on confirm; the dialog
-//! flips `confirmed = true` so the host can drop it from the modal stack.
+//! - **Type-to-confirm** (`expected` non-empty): the destructive button is
+//!   enabled only once the user types `expected` exactly. Used for
+//!   irreversible, on-disk operations (revert file, drop stash, remove
+//!   worktree) where a reflex click would lose data.
+//! - **Plain confirm** (`expected` empty): no text field; the destructive
+//!   button is enabled immediately. Used for reversible / non-destructive
+//!   operations (e.g. removing a project from the cockpit — files on disk
+//!   are untouched).
 //!
-//! Used by:
-//!   - revert file (step 11/14) — expected = filename
-//!   - drop stash  (step 12)    — expected = "drop"
-//!   - remove worktree (step 13) — expected = worktree slug
+//! Either way a Cancel button and Escape dismiss the dialog. The callback
+//! runs on confirm; the dialog flips `confirmed = true` so the host can
+//! drop it from the modal stack.
 //!
 //! Pure match predicate lives at `logic::is_match` so tests run without
 //! GPUI.
@@ -18,9 +22,10 @@ use crate::shell::confirm_dialog::logic::is_match;
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, div, px,
+    prelude::FluentBuilder,
 };
 use gpui_component::{
-    Disableable,
+    Disableable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
 };
@@ -115,13 +120,24 @@ impl ConfirmDialog {
         self.cancelled
     }
 
+    /// `true` when this dialog gates confirmation behind typing `expected`.
+    /// Empty `expected` → plain confirm (button enabled immediately).
+    fn requires_typing(&self) -> bool {
+        !self.expected.is_empty()
+    }
+
     pub fn typed_matches(&self, cx: &App) -> bool {
         let typed = self.input_state.read(cx).value().to_string();
         is_match(&typed, &self.expected)
     }
 
+    /// Whether the destructive button may fire right now.
+    fn can_confirm(&self, cx: &App) -> bool {
+        (!self.requires_typing() || self.typed_matches(cx)) && !self.confirmed
+    }
+
     fn try_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.typed_matches(cx) {
+        if !self.can_confirm(cx) {
             return;
         }
         if let Some(cb) = self.on_confirm.take() {
@@ -157,7 +173,8 @@ impl Render for ConfirmDialog {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
-        let can_confirm = self.typed_matches(cx) && !self.confirmed;
+        let can_confirm = self.can_confirm(cx);
+        let requires_typing = self.requires_typing();
         let prompt = format!("Type {} to confirm:", self.expected);
 
         let confirm_label = self.confirm_label.clone();
@@ -176,8 +193,8 @@ impl Render for ConfirmDialog {
             ))
             .flex()
             .flex_col()
-            .w(px(440.0))
-            .p(px(density.pad_panel * 2.0))
+            .w(px(360.0))
+            .p(px(density.pad_panel + density.pad_overlay))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_active)
@@ -194,23 +211,39 @@ impl Render for ConfirmDialog {
                 div()
                     .text_size(px(typography.t_body_sm))
                     .text_color(theme.fg_muted)
+                    .line_height(px(typography.t_body_sm * 1.45))
                     .child(self.body.clone()),
             )
-            .child(
-                div()
-                    .text_size(px(typography.t_label_caps))
-                    .text_color(theme.fg_subtle)
-                    .child(prompt),
-            )
-            .child(Input::new(&self.input_state))
+            // Type-to-confirm field — shown only when a match string is
+            // required. Plain-confirm dialogs (empty `expected`) skip it.
+            .when(requires_typing, |this| {
+                this.child(
+                    div()
+                        .text_size(px(typography.t_label_caps))
+                        .text_color(theme.fg_subtle)
+                        .child(prompt),
+                )
+                .child(Input::new(&self.input_state))
+            })
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .justify_end()
                     .gap(px(density.gap_inline))
+                    .mt(px(density.pad_panel))
+                    .child(
+                        Button::new("cancel-button")
+                            .small()
+                            .outline()
+                            .label("Cancel")
+                            .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
+                                dlg.cancel(window, cx);
+                            })),
+                    )
                     .child(
                         Button::new("confirm-button")
+                            .small()
                             .danger()
                             .label(confirm_label)
                             .disabled(!can_confirm)
