@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
@@ -27,9 +28,21 @@ pub enum ClientError {
     UnexpectedResponse(String),
     #[error("daemon closed the connection")]
     Disconnected,
+    #[error("daemon did not respond within {0:?}")]
+    Timeout(Duration),
     #[error("handshake failed: {0}")]
     Handshake(String),
 }
+
+// Upper bound on how long a synchronous RPC waits for the daemon's
+// reply. Control requests (Spawn/Attach/Resize/ListPtys) normally
+// complete in well under a second; this ceiling exists only so a
+// daemon that is connected but wedged (not replying, not dropping the
+// socket) cannot block the caller forever. The sync backend bridge
+// runs `request` on the GPUI main thread via `Handle::block_on`, so an
+// unbounded wait here freezes the whole UI — the timeout converts that
+// into a recoverable error instead.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Per-PTY subscriber Sender. Unbounded because the relay's own
 // fan_out applies back-pressure at the socket level and the client
@@ -139,9 +152,19 @@ impl RelayClient {
             self.pending.remove(&request_id);
             return Err(ClientError::Disconnected);
         }
-        match rx.await {
-            Ok(response) => Ok(response),
-            Err(_) => Err(ClientError::Disconnected),
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            // Sender dropped without a value — reader_loop cleared
+            // `pending` on disconnect.
+            Ok(Err(_)) => Err(ClientError::Disconnected),
+            // Daemon is still connected but never answered. Drop our
+            // pending slot so a late reply is discarded as an unknown
+            // request_id rather than resolving a stale awaiter, and
+            // surface a recoverable error instead of hanging.
+            Err(_elapsed) => {
+                self.pending.remove(&request_id);
+                Err(ClientError::Timeout(REQUEST_TIMEOUT))
+            }
         }
     }
 
