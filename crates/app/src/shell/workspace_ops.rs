@@ -529,13 +529,15 @@ impl WorkspaceRoot {
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
         let active_workspace_id = self.active_workspace_id.clone();
-        // Worktree paths with an open agent tab — drives the live (green)
-        // status dot. Only the active project has live panes built, so its
-        // open tabs are the full set; other projects contribute none.
-        let live_worktrees = self
-            .active_project_panes()
-            .map(|panes| panes.read(cx).open_agent_worktree_paths(cx))
-            .unwrap_or_default();
+        // Worktree paths with an open PTY tab (terminal or agent) — drives
+        // the live (green) status dot. Aggregated across every project whose
+        // panes have been built, so a worktree stays green while its session
+        // lives even after switching to another project.
+        let mut live_worktrees: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for panes in self.project_panes_by_project.values() {
+            live_worktrees.extend(panes.read(cx).live_worktree_paths(cx));
+        }
         let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
             HashMap::with_capacity(projects.len());
         let mut latest_status: LatestStatusMap = HashMap::new();

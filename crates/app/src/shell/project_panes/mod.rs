@@ -580,14 +580,14 @@ impl ProjectPanes {
         true
     }
 
-    /// Collect the worktree paths of every open agent tab across all
+    /// Collect the worktree paths kept "live" by open PTY tabs across all
     /// groups (as strings, to match the sidebar's `Workspace.worktree_path`).
     /// Drives the left rail's live/idle status dot: a workspace with an
-    /// open agent tab reads as "live" (green).
-    pub fn open_agent_worktree_paths(&self, cx: &gpui::App) -> std::collections::HashSet<String> {
+    /// open terminal or agent reads as "live" (green).
+    pub fn live_worktree_paths(&self, cx: &gpui::App) -> std::collections::HashSet<String> {
         let mut set = std::collections::HashSet::new();
         for group in self.groups.values() {
-            for path in group.read(cx).agent_worktree_paths() {
+            for path in group.read(cx).live_worktree_paths() {
                 set.insert(path.display().to_string());
             }
         }

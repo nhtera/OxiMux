@@ -469,15 +469,28 @@ impl PaneGroup {
             .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == path))
     }
 
-    /// Worktree paths of every open agent tab in this group. Feeds the
-    /// sidebar's live/idle status dot — a workspace with an open agent
-    /// tab reads as "live" (green) even before its session reports a
-    /// concrete status.
-    pub fn agent_worktree_paths(&self) -> impl Iterator<Item = &std::path::Path> {
-        self.tabs.iter().filter_map(|t| match &t.kind {
-            PaneGroupTabKind::Agent { worktree_path, .. } => Some(worktree_path.as_path()),
-            _ => None,
-        })
+    /// Worktree paths this group keeps "live" for the sidebar status dot.
+    /// A worktree is live when it owns an open PTY-backed tab — an agent
+    /// (keyed by its `worktree_path`) or a plain terminal (keyed by the
+    /// group's cwd, since terminals run at the project/worktree root).
+    /// Mirrors the upstream rule that any live terminal session marks the
+    /// worktree active (green), not just agent sessions.
+    pub fn live_worktree_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut has_terminal = false;
+        for tab in &self.tabs {
+            match &tab.kind {
+                PaneGroupTabKind::Agent { worktree_path, .. } => {
+                    paths.push(worktree_path.clone());
+                }
+                PaneGroupTabKind::Terminal => has_terminal = true,
+                _ => {}
+            }
+        }
+        if has_terminal {
+            paths.push(self.cwd.clone());
+        }
+        paths
     }
 
     /// Index of an existing agent tab whose worktree matches `path`, if
