@@ -326,8 +326,23 @@ impl WorkspaceRoot {
             let _ = weak.update(cx, |this, cx| match selection {
                 AdapterSelection::NewTerminal => this.spawn_local_terminal_tab(window, cx),
                 AdapterSelection::Adapter { kind, id } => {
-                    let cwd =
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    // Root the agent at the active project (its panes' cwd),
+                    // so the worktree the agent runs in matches a sidebar
+                    // workspace row — that drives the live (green) status
+                    // dot. The process cwd is irrelevant to the user's
+                    // project and would leave every agent orphaned.
+                    let cwd = this
+                        .active_project_panes()
+                        .map(|panes| panes.read(cx).cwd().clone())
+                        .or_else(|| {
+                            this.active_project
+                                .as_ref()
+                                .map(|p| std::path::PathBuf::from(&p.root_path))
+                        })
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        });
                     this.spawn_agent_tab(kind, id, cwd, window, cx)
                 }
             });
