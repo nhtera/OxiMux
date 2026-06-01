@@ -10,7 +10,7 @@
 
 use gpui::{
     Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    SharedString, Styled, div, px, svg,
+    SharedString, StatefulInteractiveElement, Styled, div, px, svg,
 };
 use oximux_core::{AgentStatus, Workspace};
 use oximux_settings::{Density, Theme, Typography};
@@ -34,6 +34,13 @@ pub struct WorkspaceRowPlan {
     pub bg: Hsla,
     pub fg: Hsla,
     pub fg_sub: Hsla,
+    /// `true` for the project's primary (main) worktree — renders a
+    /// `primary` badge and suppresses the rename/archive/delete menu
+    /// (the main worktree is removed by removing the project, not here).
+    pub is_primary: bool,
+    /// `true` when this row represents a non-git folder project — renders
+    /// a `Folder` badge (instead of `primary`/branch), mirroring the reference UX.
+    pub is_folder: bool,
 }
 
 /// Resolve the status-dot color for a workspace given its latest agent
@@ -64,6 +71,8 @@ pub fn status_dot_color(status: Option<&AgentStatus>, theme: Theme) -> Hsla {
 pub fn build_workspace_row_plan(
     workspace: &Workspace,
     is_active: bool,
+    is_primary: bool,
+    is_folder: bool,
     latest_status: Option<&AgentStatus>,
     theme: Theme,
 ) -> WorkspaceRowPlan {
@@ -80,6 +89,8 @@ pub fn build_workspace_row_plan(
         bg,
         fg,
         fg_sub: theme.fg_subtle,
+        is_primary,
+        is_folder,
     }
 }
 
@@ -91,6 +102,7 @@ pub fn render_workspace_row(
     plan: WorkspaceRowPlan,
     row_id: SharedString,
     group_name: SharedString,
+    show_menu: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -98,27 +110,72 @@ pub fn render_workspace_row(
     on_menu_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     let menu_id: SharedString = format!("{row_id}-menu").into();
-    let trailing_btn = div()
-        .id(menu_id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(TRAILING_BTN_SIZE))
-        .rounded(px(density.r_xs))
-        .text_color(theme.fg_muted)
-        .invisible()
-        .group_hover(group_name.clone(), |s| s.visible())
-        .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
-        .child(
-            svg()
-                .path("icons/ellipsis.svg")
-                .size(px(FOLDER_ICON_SIZE))
-                .text_color(theme.fg_muted),
-        )
-        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-            cx.stop_propagation();
-            on_menu_click(ev, window, cx);
-        });
+    // Primary (main worktree) rows have no rename/archive/delete menu —
+    // the main worktree goes away with the project, not on its own.
+    let trailing_btn = show_menu.then(|| {
+        div()
+            .id(menu_id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(TRAILING_BTN_SIZE))
+            .rounded(px(density.r_xs))
+            .text_color(theme.fg_muted)
+            .invisible()
+            .group_hover(group_name.clone(), |s| s.visible())
+            .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
+            .child(
+                svg()
+                    .path("icons/ellipsis.svg")
+                    .size(px(FOLDER_ICON_SIZE))
+                    .text_color(theme.fg_muted),
+            )
+            .tooltip(|window, cx| {
+                gpui_component::tooltip::Tooltip::new("Workspace actions").build(window, cx)
+            })
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                cx.stop_propagation();
+                on_menu_click(ev, window, cx);
+            })
+    });
+
+    // `primary` badge — outline pill in the title row (git main worktree
+    // only; folders show a "Folder" badge in the subtext row instead).
+    let primary_badge = (plan.is_primary && !plan.is_folder).then(|| {
+        div()
+            .flex()
+            .items_center()
+            .px(px(5.0))
+            .h(px(15.0))
+            .rounded(px(density.r_xs))
+            .border_1()
+            .border_color(theme.border_inactive)
+            .text_size(px(typography.t_sub_label))
+            .text_color(theme.fg_subtle)
+            .child("primary")
+    });
+
+    // Subtext row: a "Folder" badge for non-git folder projects, else the
+    // slug/branch text.
+    let subtext = if plan.is_folder {
+        div()
+            .flex()
+            .items_center()
+            .px(px(5.0))
+            .h(px(15.0))
+            .rounded(px(density.r_xs))
+            .bg(theme.bg_panel_alt)
+            .text_size(px(typography.t_sub_label))
+            .text_color(theme.fg_subtle)
+            .child("Folder")
+            .into_any_element()
+    } else {
+        div()
+            .text_size(px(typography.t_sub_label))
+            .text_color(plan.fg_sub)
+            .child(plan.slug)
+            .into_any_element()
+    };
 
     div()
         .id(row_id)
@@ -144,22 +201,26 @@ pub fn render_workspace_row(
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .child(
                     div()
-                        .text_size(px(typography.t_body_sm))
-                        .text_color(plan.fg)
-                        .child(plan.name),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(density.gap_inline))
+                        .child(
+                            div()
+                                .text_size(px(typography.t_body_sm))
+                                .text_color(plan.fg)
+                                .child(plan.name),
+                        )
+                        .children(primary_badge),
                 )
-                .child(
-                    div()
-                        .text_size(px(typography.t_sub_label))
-                        .text_color(plan.fg_sub)
-                        .child(plan.slug),
-                ),
+                .child(div().flex().flex_row().child(subtext)),
         )
-        .child(trailing_btn)
+        .children(trailing_btn)
         .on_mouse_down(MouseButton::Left, on_row_click)
 }
 
@@ -269,7 +330,7 @@ mod tests {
     fn row_plan_active_uses_panel_alt_bg() {
         let t = Theme::charcoal();
         let w = ws("Fix Login", "fix-login");
-        let plan = build_workspace_row_plan(&w, true, None, t);
+        let plan = build_workspace_row_plan(&w, true, false, false, None, t);
         assert_eq!(plan.bg, t.bg_panel_alt);
         assert_eq!(plan.fg, t.fg_base);
     }
@@ -278,7 +339,7 @@ mod tests {
     fn row_plan_inactive_uses_panel_bg() {
         let t = Theme::charcoal();
         let w = ws("Fix Login", "fix-login");
-        let plan = build_workspace_row_plan(&w, false, None, t);
+        let plan = build_workspace_row_plan(&w, false, false, false, None, t);
         assert_eq!(plan.bg, t.bg_panel);
     }
 
@@ -286,7 +347,7 @@ mod tests {
     fn row_plan_carries_name_and_slug() {
         let t = Theme::charcoal();
         let w = ws("Fix Login", "fix-login");
-        let plan = build_workspace_row_plan(&w, false, None, t);
+        let plan = build_workspace_row_plan(&w, false, false, false, None, t);
         assert_eq!(plan.name, "Fix Login");
         assert_eq!(plan.slug, "fix-login");
     }
@@ -295,7 +356,19 @@ mod tests {
     fn row_plan_dot_color_reflects_latest_status() {
         let t = Theme::charcoal();
         let w = ws("X", "x");
-        let plan = build_workspace_row_plan(&w, false, Some(&AgentStatus::Running), t);
+        let plan = build_workspace_row_plan(&w, false, false, false, Some(&AgentStatus::Running), t);
         assert_eq!(plan.dot_color, t.status_info);
+    }
+
+    #[test]
+    fn row_plan_carries_primary_and_folder_flags() {
+        let t = Theme::charcoal();
+        let w = ws("main", "main");
+        let primary = build_workspace_row_plan(&w, false, true, false, None, t);
+        let folder = build_workspace_row_plan(&w, false, true, true, None, t);
+        let linked = build_workspace_row_plan(&w, false, false, false, None, t);
+        assert!(primary.is_primary && !primary.is_folder);
+        assert!(folder.is_primary && folder.is_folder);
+        assert!(!linked.is_primary && !linked.is_folder);
     }
 }

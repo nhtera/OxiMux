@@ -447,6 +447,53 @@ impl WorkspaceRoot {
         .detach();
     }
 
+    /// Activate the workspace clicked in the left rail: switch to its
+    /// owning project, record the selection (drives the active-row
+    /// highlight), then focus the agent tab already running in its
+    /// worktree if one exists.
+    ///
+    /// When no matching tab is found the project + selection still
+    /// update, but we stop short of spawning: launching a fresh agent
+    /// for an empty worktree needs an adapter choice, so that path is a
+    /// deliberate follow-up rather than an arbitrary auto-start.
+    pub(crate) fn activate_workspace(
+        &mut self,
+        workspace: Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Switch to the owning project first so the correct ProjectPanes
+        // is live before we search it for the worktree's tab.
+        let already_active =
+            self.active_project.as_ref().map(|p| p.id.as_str()) == Some(workspace.project_id.as_str());
+        if !already_active
+            && let Some(project) = self
+                .app_state
+                .recent_projects
+                .iter()
+                .find(|p| p.id == workspace.project_id)
+                .cloned()
+        {
+            self.set_active_project(project, window, cx);
+        }
+
+        self.active_workspace_id = Some(workspace.id.clone());
+
+        let worktree_path = PathBuf::from(&workspace.worktree_path);
+        if let Some(panes) = self.active_project_panes() {
+            let focused =
+                panes.update(cx, |p, cx| p.focus_workspace_tab(&worktree_path, window, cx));
+            if !focused {
+                tracing::info!(
+                    workspace_id = %workspace.id,
+                    path = %worktree_path.display(),
+                    "activate_workspace: no agent tab for this worktree; selection set, spawn deferred"
+                );
+            }
+        }
+        cx.notify();
+    }
+
     /// Close every full-window modal overlay. Callers invoke this before
     /// opening a new overlay so two inset-0 dismiss regions never compete.
     pub(crate) fn close_modal_overlays(&mut self, cx: &mut Context<Self>) {
@@ -481,17 +528,57 @@ impl WorkspaceRoot {
     pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
+        let active_workspace_id = self.active_workspace_id.clone();
         let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
             HashMap::with_capacity(projects.len());
         let mut latest_status: LatestStatusMap = HashMap::new();
         for project in &projects {
-            let list = match self.app_state.workspace_repo.list_for_project(&project.id) {
+            let mut list = match self.app_state.workspace_repo.list_for_project(&project.id) {
                 Ok(list) => list,
                 Err(err) => {
                     tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
                     Vec::new()
                 }
             };
+            // Every project always surfaces its primary (main) worktree as
+            // the first row — the repo root checkout — matching the reference UX's
+            // invariant that a project is never an empty group. Synthesized
+            // for display (not a DB row); identified later by
+            // `worktree_path == project.root_path`. Skip if a real workspace
+            // already occupies the root (defensive against future schemas).
+            let has_root_row = list.iter().any(|w| w.worktree_path == project.root_path);
+            if !has_root_row {
+                // Git repo → branch-based primary ("main" + primary badge).
+                // Plain folder (no `.git` at root) → a single "Folder" row
+                // with an empty branch, which the renderer badges "Folder"
+                // and omits the primary marker (mirrors the reference UX's isFolderRepo).
+                let is_git = std::path::Path::new(&project.root_path)
+                    .join(".git")
+                    .exists();
+                let (name, slug, branch) = if is_git {
+                    (
+                        project.default_branch.clone(),
+                        project.default_branch.clone(),
+                        project.default_branch.clone(),
+                    )
+                } else {
+                    (project.name.clone(), String::new(), String::new())
+                };
+                list.insert(
+                    0,
+                    Workspace {
+                        id: format!("primary:{}", project.id),
+                        project_id: project.id.clone(),
+                        name,
+                        slug,
+                        branch,
+                        worktree_path: project.root_path.clone(),
+                        status: "active".to_string(),
+                        created_at: String::new(),
+                        archived_at: None,
+                    },
+                );
+            }
             for workspace in &list {
                 let latest = match self
                     .app_state
@@ -512,6 +599,7 @@ impl WorkspaceRoot {
             rail.set_sidebar_data(
                 projects,
                 active_project_id,
+                active_workspace_id,
                 workspaces_by_project,
                 latest_status,
                 cx,

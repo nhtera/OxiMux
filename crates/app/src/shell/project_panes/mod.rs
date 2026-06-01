@@ -553,6 +553,33 @@ impl ProjectPanes {
         Some(target.update(cx, |g, cx| g.open_or_activate_editor_tab(path, window, cx)))
     }
 
+    /// Focus the agent tab already running in `worktree_path`, if one
+    /// exists in any group. Returns `true` when a matching tab was found
+    /// and activated; `false` when no tab matches (caller decides whether
+    /// to spawn a fresh session). Mirrors the cross-group activate path of
+    /// `open_or_activate_editor_tab` but never opens a new tab itself.
+    pub fn focus_workspace_tab(
+        &mut self,
+        worktree_path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .agent_tab_index_for_worktree(worktree_path)
+                .map(|idx| (*id, idx))
+        });
+        let Some((id, idx)) = existing else {
+            return false;
+        };
+        self.set_active_group(id, window, cx);
+        if let Some(group) = self.groups.get(&id).cloned() {
+            group.update(cx, |g, cx| g.set_active(idx, window, cx));
+        }
+        true
+    }
+
     /// Open or activate a diff tab in the active group for `(path, staged)`.
     /// Mirrors `open_or_activate_editor_tab` but routes through `PaneGroup::
     /// open_or_activate_diff_tab` which constructs a fresh `DiffView` bound

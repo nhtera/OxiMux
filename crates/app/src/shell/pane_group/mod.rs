@@ -469,6 +469,15 @@ impl PaneGroup {
             .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == path))
     }
 
+    /// Index of an existing agent tab whose worktree matches `path`, if
+    /// any. Lets the sidebar focus the tab already running in a clicked
+    /// workspace's worktree instead of spawning a duplicate.
+    pub fn agent_tab_index_for_worktree(&self, path: &std::path::Path) -> Option<usize> {
+        self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::Agent { worktree_path, .. } if worktree_path == path)
+        })
+    }
+
     /// Retained for the sidebar-width tracking plumbing (`set_chrome_width`
     /// still fires a repaint when a side panel toggles). Grid sizing no
     /// longer reads it — that moved to each TerminalView's canvas-bounds

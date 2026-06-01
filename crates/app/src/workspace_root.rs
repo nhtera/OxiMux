@@ -162,6 +162,10 @@ pub struct WorkspaceRoot {
     pub(crate) rename_tab_dialog: Option<Entity<crate::shell::rename_tab_dialog::RenameTabDialog>>,
     /// Currently active project — `None` until the user opens one.
     pub(crate) active_project: Option<Project>,
+    /// Currently selected workspace id in the left rail — drives the
+    /// active-row highlight. `None` until the user clicks a workspace.
+    /// Window-local UI selection, not persisted.
+    pub(crate) active_workspace_id: Option<String>,
     /// Sidebar Rename/Archive/Delete popover (mounted at root for full-window backdrop).
     pub(crate) row_menu: Entity<WorkspaceRowMenu>,
     pub(crate) add_project_dialog: Entity<AddProjectDialog>,
@@ -303,6 +307,11 @@ impl WorkspaceRoot {
             })
         });
         let left_rail = cx.new(|cx| LeftRail::new(weak_self.clone(), cx));
+        // Load persisted rail layout (width + collapsed groups) so it
+        // survives restart.
+        left_rail.update(cx, |rail, _cx| {
+            rail.init_layout(app_state.settings_repo.clone());
+        });
         let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
         let tab_context_menu = cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
@@ -543,6 +552,7 @@ impl WorkspaceRoot {
             confirm_dialog: None,
             rename_tab_dialog: None,
             active_project: None,
+            active_workspace_id: None,
             row_menu,
             add_project_dialog,
             focus_handle,
@@ -1369,8 +1379,11 @@ impl Render for WorkspaceRoot {
         // Push current chrome width into the active ProjectPanes so PTY
         // grids match the actual visible area. ProjectPanes forwards the
         // value into each group it owns.
+        // Read the live rail width through the entity so pane grids
+        // reflow on every resize-drag tick (set_width's cx.notify
+        // triggers a render which re-runs this read).
         let left_chrome = if self.left_rail_open {
-            density.w_left_rail
+            f32::from(self.left_rail.read(cx).width())
         } else {
             0.0
         };
@@ -1565,6 +1578,26 @@ impl Render for WorkspaceRoot {
                                 window_width,
                                 cx,
                             );
+                        });
+                    },
+                ),
+            )
+            // Route left-rail resize drag ticks. The handle lives on the
+            // rail's right edge; the move listener sits on this full-size
+            // row so the cursor stays inside its bounds for the whole
+            // drag. The rail's left edge is pinned at window x=0, so the
+            // new width is simply the cursor's window x.
+            .on_drag_move::<crate::shell::left_rail::resize::LeftRailResizePayload>(
+                cx.listener(
+                    |this,
+                     ev: &DragMoveEvent<
+                        crate::shell::left_rail::resize::LeftRailResizePayload,
+                    >,
+                     _window,
+                     cx| {
+                        let cursor_x = f32::from(ev.event.position.x);
+                        this.left_rail.update(cx, |rail, cx| {
+                            crate::shell::left_rail::resize::apply_drag_move(rail, cursor_x, cx);
                         });
                     },
                 ),

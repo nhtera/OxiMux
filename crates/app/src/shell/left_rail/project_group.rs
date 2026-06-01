@@ -6,15 +6,19 @@
 //! whether the project was already active when the user clicked.
 
 use gpui::{
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
-    Styled, WeakEntity, div, px, svg,
+    Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, div, px, svg,
 };
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::OpenWorkspaceCreate;
+use crate::shell::left_rail::LeftRail;
 use crate::shell::left_rail::workspace_row::{build_workspace_row_plan, render_workspace_row};
 use crate::workspace_root::WorkspaceRoot;
+
+/// Chevron / folder glyph size in the header.
+const CHEVRON_ICON_SIZE: f32 = 12.0;
 
 /// Header height in CSS pixels (matches WORKSPACES section header).
 const HEADER_HEIGHT: f32 = 28.0;
@@ -32,17 +36,22 @@ pub struct ProjectGroupPlan {
     /// `true` when this is the currently active project — the header
     /// gets a slightly stronger foreground colour to match the mockup.
     pub is_active: bool,
+    /// `true` when the group is collapsed — workspace rows are hidden
+    /// and the chevron points right instead of down.
+    pub is_collapsed: bool,
 }
 
 pub fn build_project_group_plan(
     project: &Project,
     workspaces: &[Workspace],
     is_active: bool,
+    is_collapsed: bool,
 ) -> ProjectGroupPlan {
     ProjectGroupPlan {
         project_name: project.name.clone(),
         workspace_count: workspaces.len(),
         is_active,
+        is_collapsed,
     }
 }
 
@@ -58,6 +67,7 @@ pub fn render_project_group(
     workspaces: Vec<Workspace>,
     latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
     active_workspace_id: Option<&str>,
+    rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
     theme: Theme,
@@ -65,11 +75,13 @@ pub fn render_project_group(
     typography: &Typography,
 ) -> impl IntoElement {
     let group_name: SharedString = format!("project-group-{}", project.id).into();
+    let is_collapsed = plan.is_collapsed;
 
     let header = build_header(
         plan,
         project.clone(),
         group_name.clone(),
+        rail,
         weak_root.clone(),
         theme,
         density,
@@ -78,11 +90,28 @@ pub fn render_project_group(
 
     let mut col = div().flex().flex_col().w_full().child(header);
 
+    // Collapsed groups render the header only.
+    if is_collapsed {
+        return col;
+    }
+
     for workspace in workspaces {
         let row_group: SharedString = format!("ws-row-{}", workspace.id).into();
         let is_active = active_workspace_id == Some(workspace.id.as_str());
+        // The main worktree lives at the project root; that row is the
+        // project's primary (the repo's main worktree). A primary
+        // row with no branch is a non-git folder project → "Folder" badge.
+        let is_primary = workspace.worktree_path == project.root_path;
+        let is_folder = is_primary && workspace.branch.is_empty();
         let latest = latest_status_for(&workspace.id);
-        let row_plan = build_workspace_row_plan(&workspace, is_active, latest.as_ref(), theme);
+        let row_plan = build_workspace_row_plan(
+            &workspace,
+            is_active,
+            is_primary,
+            is_folder,
+            latest.as_ref(),
+            theme,
+        );
         let row_id: SharedString = format!("ws-row-{}", workspace.id).into();
 
         let on_menu = on_row_menu.clone();
@@ -99,16 +128,24 @@ pub fn render_project_group(
                 );
             };
 
+        // Clicking a row activates the workspace: switch to its project,
+        // select it (highlight), and focus the agent tab running in its
+        // worktree. `update` + outer `window` — `update_in` returns Err
+        // from a mouse-callback context.
+        let weak_root_for_row = weak_root.clone();
+        let workspace_for_row = workspace.clone();
         let row_handler =
-            |_ev: &MouseDownEvent, _window: &mut gpui::Window, _cx: &mut gpui::App| {
-                // v1: clicking a workspace row in the rail is a no-op. Activation
-                // of a workspace's tabs lands in a later phase.
+            move |_ev: &MouseDownEvent, window: &mut gpui::Window, cx: &mut gpui::App| {
+                let workspace = workspace_for_row.clone();
+                let _ = weak_root_for_row
+                    .update(cx, |root, cx| root.activate_workspace(workspace, window, cx));
             };
 
         col = col.child(render_workspace_row(
             row_plan,
             row_id,
             row_group,
+            !is_primary,
             theme,
             density,
             typography,
@@ -124,6 +161,7 @@ fn build_header(
     plan: ProjectGroupPlan,
     project: Project,
     group_name: SharedString,
+    rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -134,11 +172,72 @@ fn build_header(
     } else {
         theme.fg_muted
     };
+    let is_collapsed = plan.is_collapsed;
 
-    let folder_icon = svg()
-        .path("icons/folder.svg")
-        .size(px(HEADER_ICON_SIZE))
-        .text_color(header_fg);
+    // Leading icon slot — matches the reference UX: the folder icon shows at rest
+    // and is replaced in-place by a disclosure chevron on header hover
+    // (no layout shift, folder stays flush-left). Clicking the chevron
+    // toggles collapse; stop_propagation keeps it off the header's
+    // activate-project handler. Chevron points right when collapsed,
+    // down when expanded.
+    let chevron_id: SharedString = format!("project-chevron-{}", project.id).into();
+    let chevron_path = if is_collapsed {
+        "icons/chevron-right.svg"
+    } else {
+        "icons/chevron-down.svg"
+    };
+    let rail_for_chevron = rail.clone();
+    let project_id_for_chevron = project.id.clone();
+    let icon_slot = div()
+        .relative()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(HEADER_ICON_SIZE + 2.0))
+        // Folder — hidden while the header is hovered.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .group_hover(group_name.clone(), |s| s.invisible())
+                .child(
+                    svg()
+                        .path("icons/folder.svg")
+                        .size(px(HEADER_ICON_SIZE))
+                        .text_color(header_fg),
+                ),
+        )
+        // Chevron — overlaid, revealed on hover, click toggles collapse.
+        .child(
+            div()
+                .id(chevron_id)
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .invisible()
+                .cursor_pointer()
+                .text_color(theme.fg_muted)
+                .hover(|s| s.text_color(theme.fg_base))
+                .group_hover(group_name.clone(), |s| s.visible())
+                .child(
+                    svg()
+                        .path(chevron_path)
+                        .size(px(CHEVRON_ICON_SIZE))
+                        .text_color(theme.fg_muted),
+                )
+                .tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new("Collapse / expand").build(window, cx)
+                })
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    cx.stop_propagation();
+                    let id = project_id_for_chevron.clone();
+                    rail_for_chevron.update(cx, |r, cx| r.toggle_collapsed(id, cx));
+                }),
+        );
 
     let title = div()
         .text_size(px(typography.t_body_sm))
@@ -156,6 +255,7 @@ fn build_header(
         .child(plan.workspace_count.to_string());
 
     let plus_id: SharedString = format!("project-plus-{}", project.id).into();
+    let plus_tooltip: SharedString = format!("Create workspace for {}", project.name).into();
     let weak_for_plus = weak_root.clone();
     let project_for_plus = project.clone();
     let plus_btn = div()
@@ -166,8 +266,6 @@ fn build_header(
         .size(px(PLUS_BTN_SIZE))
         .rounded(px(density.r_xs))
         .text_color(theme.fg_muted)
-        .invisible()
-        .group_hover(group_name.clone(), |s| s.visible())
         .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
         .child(
             svg()
@@ -175,6 +273,9 @@ fn build_header(
                 .size(px(HEADER_ICON_SIZE))
                 .text_color(theme.fg_muted),
         )
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(plus_tooltip.clone()).build(window, cx)
+        })
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             cx.stop_propagation();
             let project = project_for_plus.clone();
@@ -212,7 +313,7 @@ fn build_header(
                 root.set_active_project(project, window, cx);
             });
         })
-        .child(folder_icon)
+        .child(icon_slot)
         .child(title)
         .child(count_chip)
         .child(div().flex_1())
@@ -252,15 +353,15 @@ mod tests {
     fn plan_count_matches_workspace_list_len() {
         let p = project("p1", "OxiMux");
         let ws = vec![workspace("a", "p1"), workspace("b", "p1")];
-        let plan = build_project_group_plan(&p, &ws, true);
+        let plan = build_project_group_plan(&p, &ws, true, false);
         assert_eq!(plan.workspace_count, 2);
     }
 
     #[test]
     fn plan_carries_active_flag() {
         let p = project("p1", "OxiMux");
-        let active = build_project_group_plan(&p, &[], true);
-        let inactive = build_project_group_plan(&p, &[], false);
+        let active = build_project_group_plan(&p, &[], true, false);
+        let inactive = build_project_group_plan(&p, &[], false, false);
         assert!(active.is_active);
         assert!(!inactive.is_active);
     }
@@ -268,14 +369,23 @@ mod tests {
     #[test]
     fn plan_empty_workspace_list_is_zero_count() {
         let p = project("p1", "OxiMux");
-        let plan = build_project_group_plan(&p, &[], true);
+        let plan = build_project_group_plan(&p, &[], true, false);
         assert_eq!(plan.workspace_count, 0);
     }
 
     #[test]
     fn plan_name_matches_project_name() {
         let p = project("p1", "OxiMux");
-        let plan = build_project_group_plan(&p, &[], true);
+        let plan = build_project_group_plan(&p, &[], true, false);
         assert_eq!(plan.project_name, "OxiMux");
+    }
+
+    #[test]
+    fn plan_carries_collapsed_flag() {
+        let p = project("p1", "OxiMux");
+        let collapsed = build_project_group_plan(&p, &[], false, true);
+        let expanded = build_project_group_plan(&p, &[], false, false);
+        assert!(collapsed.is_collapsed);
+        assert!(!expanded.is_collapsed);
     }
 }
