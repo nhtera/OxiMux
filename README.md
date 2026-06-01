@@ -9,10 +9,15 @@ A Rust-native, multi-agent development cockpit for macOS. Open a repo → spawn 
 ## Quick start
 
 ```bash
+# Build the PTY relay daemon first — the app resolves it as a sibling of
+# its own binary, and without it terminals fall back to in-process PTYs
+# that don't survive a relaunch.
+cargo build -p oximux-relay --release
+
 # Build + run the shell (release ~slow first time due to GPUI compile)
 cargo run -p oximux-app --release
 
-# Or produce an .app bundle in dist/
+# Or produce an .app bundle in dist/ (bundles oximux + oximux-relay)
 ./scripts/bundle-macos.sh
 open dist/OxiMux.app
 ```
