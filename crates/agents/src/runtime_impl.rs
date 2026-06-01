@@ -75,6 +75,13 @@ struct Inner {
     adapters: HashMap<AgentAdapter, Arc<dyn CliAgentAdapter>>,
     sessions: HashMap<AgentSessionId, SessionEntry>,
     next_id: u64,
+    /// When set, agent PTYs are spawned through this shared backend (the
+    /// out-of-process relay daemon) instead of a private in-process PTY.
+    /// Daemon-owned PTYs outlive the app, so an agent tab can re-attach to
+    /// its still-running CLI on the next launch — the same survival path
+    /// plain terminals already use. `None` (no relay) falls back to a
+    /// private `PortablePtyBackend` that dies with the app.
+    shared_backend: Option<SharedBackend>,
 }
 
 /// The CLI-agent runtime. `clone()` is cheap (just an `Arc` bump); the
@@ -90,13 +97,73 @@ impl CliRuntime {
     /// so the app can wire adapters from settings without a panic on a
     /// missing one.
     pub fn new() -> Self {
+        Self::with_shared_backend(None)
+    }
+
+    /// Build a runtime that spawns agent PTYs through `shared_backend` (the
+    /// relay daemon) when `Some`. The app passes the process-wide relay
+    /// backend so agent sessions survive app restarts and can re-attach.
+    /// `None` keeps the legacy per-session in-process PTY behavior.
+    pub fn with_shared_backend(shared_backend: Option<SharedBackend>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 adapters: HashMap::new(),
                 sessions: HashMap::new(),
                 next_id: 1,
+                shared_backend,
             })),
         }
+    }
+
+    /// Adopt a PTY that is already alive on a backend (a relay session
+    /// re-attached via `attach_existing`) as a fresh agent session: wire up
+    /// the status machine + poll loop without spawning a new child. Used by
+    /// the restore path to reconnect a tab to its still-running CLI. Errors
+    /// when no adapter is registered for `adapter_key` (needed for status
+    /// patterns).
+    pub fn adopt_session(
+        &self,
+        adapter_key: AgentAdapter,
+        backend: SharedBackend,
+        term_id: TerminalSessionId,
+    ) -> Result<AgentSessionId> {
+        let adapter = {
+            let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+            inner
+                .adapters
+                .get(&adapter_key)
+                .cloned()
+                .ok_or_else(|| anyhow!("no adapter registered for {:?}", adapter_key))?
+        };
+        Ok(self.register_session(adapter, backend, term_id))
+    }
+
+    /// Wire up the status machine + poll task for a ready `(backend,
+    /// term_id)` and record the session. Shared by the spawn path
+    /// (`start_session`) and the re-attach path (`adopt_session`).
+    fn register_session(
+        &self,
+        adapter: Arc<dyn CliAgentAdapter>,
+        backend: SharedBackend,
+        term_id: TerminalSessionId,
+    ) -> AgentSessionId {
+        let patterns: Arc<[_]> = adapter.status_patterns().to_vec().into();
+        let machine = StatusMachine::new(patterns);
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Idle);
+        let poll_handle = tokio::spawn(poll_loop(backend.clone(), term_id, machine, status_tx));
+        let mut inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        let id = AgentSessionId::new(inner.next_id);
+        inner.next_id = inner.next_id.saturating_add(1);
+        inner.sessions.insert(
+            id,
+            SessionEntry {
+                backend,
+                term_id,
+                status_rx,
+                poll_handle,
+            },
+        );
+        id
     }
 
     /// Register one adapter under its `AgentAdapter` enum. Last-write-wins
@@ -193,41 +260,56 @@ impl AgentRuntime for CliRuntime {
                 "stdin_seed exceeds safe size; spawn may block on PTY buffer"
             );
         }
-        let (backend_box, term_id) = tokio::task::spawn_blocking(
-            move || -> Result<(Box<dyn TerminalBackend>, TerminalSessionId)> {
-                let mut be: Box<dyn TerminalBackend> = Box::new(PortablePtyBackend::new());
-                let id = be.spawn(spawn_cfg)?;
+        let shared = {
+            self.inner
+                .lock()
+                .expect("CliRuntime mutex poisoned")
+                .shared_backend
+                .clone()
+        };
+
+        let (backend, term_id): (SharedBackend, TerminalSessionId) = if let Some(shared) = shared {
+            // Relay path: the daemon can only spawn a shell (its Spawn RPC
+            // carries no argv), so launch the agent the way a user would —
+            // spawn the login shell, then `exec` the agent command into it.
+            // `exec` replaces the shell so the PTY's foreground process IS
+            // the agent (process-group SIGTERM on cancel still reaches it),
+            // and the daemon owns the PTY so it survives an app restart and
+            // the tab can re-attach to the live CLI on next launch.
+            let relay_cfg = SpawnConfig {
+                shell: wrapper_shell(),
+                args: Vec::new(),
+                ..spawn_cfg.clone()
+            };
+            let launch = build_launch_line(&spec.program, &spec.args);
+            let shared_for_spawn = shared.clone();
+            let term_id = tokio::task::spawn_blocking(move || -> Result<TerminalSessionId> {
+                let mut be = shared_for_spawn.lock().expect("backend mutex poisoned");
+                let id = be.spawn(relay_cfg)?;
+                be.write(id, launch.as_bytes())?;
                 if let Some(seed) = stdin_seed {
                     be.write(id, &seed)?;
                 }
-                Ok((be, id))
-            },
-        )
-        .await??;
-        let backend: SharedBackend = Arc::new(Mutex::new(backend_box));
-
-        let patterns: Arc<[_]> = adapter.status_patterns().to_vec().into();
-        let machine = StatusMachine::new(patterns);
-        let (status_tx, status_rx) = watch::channel(AgentStatus::Idle);
-
-        let poll_backend = backend.clone();
-        let poll_handle = tokio::spawn(poll_loop(poll_backend, term_id, machine, status_tx));
-
-        let id = {
-            let mut inner = self.inner.lock().expect("CliRuntime mutex poisoned");
-            let id = AgentSessionId::new(inner.next_id);
-            inner.next_id = inner.next_id.saturating_add(1);
-            inner.sessions.insert(
-                id,
-                SessionEntry {
-                    backend,
-                    term_id,
-                    status_rx,
-                    poll_handle,
+                Ok(id)
+            })
+            .await??;
+            (shared, term_id)
+        } else {
+            let (backend_box, term_id) = tokio::task::spawn_blocking(
+                move || -> Result<(Box<dyn TerminalBackend>, TerminalSessionId)> {
+                    let mut be: Box<dyn TerminalBackend> = Box::new(PortablePtyBackend::new());
+                    let id = be.spawn(spawn_cfg)?;
+                    if let Some(seed) = stdin_seed {
+                        be.write(id, &seed)?;
+                    }
+                    Ok((be, id))
                 },
-            );
-            id
+            )
+            .await??;
+            (Arc::new(Mutex::new(backend_box)), term_id)
         };
+
+        let id = self.register_session(adapter, backend, term_id);
         Ok(id)
     }
 
@@ -310,6 +392,42 @@ impl AgentRuntime for CliRuntime {
     }
 }
 
+/// The login shell used to wrap a relay-spawned agent. The relay daemon's
+/// Spawn RPC takes only a shell (no argv), so we run the user's shell and
+/// `exec` the agent into it. Falls back to zsh when `$SHELL` is unset.
+fn wrapper_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+}
+
+/// Build the one-line `exec <program> <args…>` command written into the
+/// wrapper shell's stdin. Every token is POSIX-quoted so paths/args with
+/// spaces or shell metacharacters survive intact.
+fn build_launch_line(program: &std::path::Path, args: &[String]) -> String {
+    let mut line = String::from("exec ");
+    line.push_str(&shell_quote(&program.to_string_lossy()));
+    for a in args {
+        line.push(' ');
+        line.push_str(&shell_quote(a));
+    }
+    line.push('\n');
+    line
+}
+
+/// Minimal POSIX shell quoting. Bare-word when the token is all "safe"
+/// characters; otherwise single-quote and escape embedded single quotes
+/// as `'\''`. Sufficient for argv tokens (no need to handle newlines).
+fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'=' | b':' | b',')
+        });
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 /// Per-session poll loop. Owns the `StatusMachine` for its session — the
 /// machine never crosses task boundaries so no Mutex is needed around it.
 /// Exits when the PTY emits `Exit` (and the terminal transition has been
@@ -329,7 +447,11 @@ async fn poll_loop(
         interval.tick().await;
         let events = {
             let mut be = backend.lock().expect("backend mutex poisoned");
-            be.drain_events()
+            // Per-session drain: on the shared relay backend a plain
+            // `drain_events()` would steal every other pane's events. The
+            // default impl filters by id, so this is also correct for the
+            // private single-session backend.
+            be.drain_events_for(term_id)
         };
         let now = Instant::now();
         let mut saw_exit = false;

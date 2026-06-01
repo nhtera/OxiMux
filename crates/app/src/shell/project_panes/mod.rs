@@ -882,6 +882,19 @@ impl ProjectPanes {
                         if matches!(adapter, AgentAdapter::Custom) {
                             continue;
                         }
+                        // Capture the live daemon PTY id (if the agent ran
+                        // through the relay) so restore can re-attach to the
+                        // still-running CLI instead of respawning it. Paired
+                        // with the current relay session id — restore only
+                        // re-attaches when both still match.
+                        let relay_external_id = if let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content {
+                            tree.active_view().and_then(|v| v.read(cx).external_id())
+                        } else {
+                            None
+                        };
+                        let relay_session = relay_external_id.as_ref().and_then(|_| {
+                            crate::shell::terminal_view::relay_state_snapshot().session_id
+                        });
                         (
                             Some(PersistedAgentTab {
                                 adapter: *adapter,
@@ -889,6 +902,8 @@ impl ProjectPanes {
                                 worktree_path: worktree_path.display().to_string(),
                                 model: model.clone(),
                                 effort: effort.clone(),
+                                relay_external_id,
+                                relay_session,
                             }),
                             PersistedTabKind::Terminal,
                         )

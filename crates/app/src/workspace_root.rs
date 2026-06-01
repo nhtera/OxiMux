@@ -232,7 +232,13 @@ impl WorkspaceRoot {
         // the Cmd+Shift+A action handler calls it at spawn time. Step 10's
         // popover will switch to fire-on-startup once the UX needs the
         // installed-list rendered before user interaction.
-        let cli_runtime = Arc::new(CliRuntime::new());
+        // Route agent PTYs through the relay daemon (when up) so they
+        // survive an app restart and the tab can re-attach to the live CLI,
+        // matching plain-terminal restore. Falls back to in-process PTYs
+        // when no relay is installed.
+        let cli_runtime = Arc::new(CliRuntime::with_shared_backend(
+            crate::shell::terminal_view::shared_backend(),
+        ));
         let adapter_registry = Arc::new(AdapterRegistry::with_builtin_adapters());
         for kind in [
             AgentAdapter::ClaudeCode,

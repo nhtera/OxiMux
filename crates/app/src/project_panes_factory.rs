@@ -32,7 +32,8 @@ use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{
-    TerminalView, attach_pty_existing, spawn_local_pty, spawn_local_pty_dormant,
+    TerminalView, attach_pty_existing, relay_state_snapshot, spawn_local_pty,
+    spawn_local_pty_dormant,
 };
 use crate::workspace_root::WorkspaceRoot;
 
@@ -406,39 +407,83 @@ fn restore_agent_tab(
     let adapter_id: &'static str = static_adapter_id(persisted.adapter);
     let persisted_clone = persisted.clone();
     cx.spawn_in(window, async move |_root, cx| {
-        let session_id = match cli_runtime.start_session(cfg).await {
-            Ok(id) => id,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    adapter = adapter_id,
-                    "agent restore: start_session failed"
-                );
-                return;
-            }
+        // Warm re-attach: if the agent's PTY is still alive in the relay
+        // daemon (same session id), adopt the running CLI instead of
+        // respawning — the conversation + scrollback resume exactly where
+        // they were, identical to plain-terminal restore. `None` falls
+        // through to a fresh respawn (which also routes through the daemon,
+        // so a cold-restored agent survives the NEXT quit).
+        let reattached = {
+            let snap = relay_state_snapshot();
+            let session_ok = matches!(
+                (&persisted_clone.relay_session, &snap.session_id),
+                (Some(s), Some(c)) if s == c
+            );
+            persisted_clone.relay_external_id.as_deref().and_then(|ext| {
+                (session_ok && snap.live_external_ids.contains(ext))
+                    .then(|| attach_pty_existing(ext))
+                    .flatten()
+            })
         };
-        let backend = match cli_runtime.backend_for(session_id) {
-            Ok(b) => b,
-            Err(err) => {
-                tracing::warn!(?err, "agent restore: backend_for failed");
-                let _ = cli_runtime.cancel(session_id).await;
-                return;
+
+        let attached = if let Some((backend, term_id)) = reattached {
+            match cli_runtime.adopt_session(persisted_clone.adapter, backend.clone(), term_id) {
+                Ok(session_id) => match cli_runtime.subscribe_status(session_id) {
+                    Ok(status_rx) => Some((session_id, backend, term_id, status_rx)),
+                    Err(err) => {
+                        tracing::warn!(?err, "agent restore: subscribe_status (reattach) failed");
+                        let _ = cli_runtime.cancel(session_id).await;
+                        None
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(?err, "agent restore: adopt_session failed; respawning");
+                    None
+                }
             }
+        } else {
+            None
         };
-        let term_id = match cli_runtime.terminal_session_id(session_id) {
-            Ok(id) => id,
-            Err(err) => {
-                tracing::warn!(?err, "agent restore: terminal_session_id failed");
-                let _ = cli_runtime.cancel(session_id).await;
-                return;
-            }
-        };
-        let status_rx = match cli_runtime.subscribe_status(session_id) {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::warn!(?err, "agent restore: subscribe_status failed");
-                let _ = cli_runtime.cancel(session_id).await;
-                return;
+
+        let (session_id, backend, term_id, status_rx) = match attached {
+            Some(t) => t,
+            None => {
+                let session_id = match cli_runtime.start_session(cfg).await {
+                    Ok(id) => id,
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            adapter = adapter_id,
+                            "agent restore: start_session failed"
+                        );
+                        return;
+                    }
+                };
+                let backend = match cli_runtime.backend_for(session_id) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        tracing::warn!(?err, "agent restore: backend_for failed");
+                        let _ = cli_runtime.cancel(session_id).await;
+                        return;
+                    }
+                };
+                let term_id = match cli_runtime.terminal_session_id(session_id) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        tracing::warn!(?err, "agent restore: terminal_session_id failed");
+                        let _ = cli_runtime.cancel(session_id).await;
+                        return;
+                    }
+                };
+                let status_rx = match cli_runtime.subscribe_status(session_id) {
+                    Ok(rx) => rx,
+                    Err(err) => {
+                        tracing::warn!(?err, "agent restore: subscribe_status failed");
+                        let _ = cli_runtime.cancel(session_id).await;
+                        return;
+                    }
+                };
+                (session_id, backend, term_id, status_rx)
             }
         };
         let mount = panes.update_in(cx, |p, window, cx| match target_group {

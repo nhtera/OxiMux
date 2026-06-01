@@ -112,6 +112,15 @@ pub fn install_shared_backend(backend: SharedBackend) {
     }
 }
 
+/// Clone of the process-wide relay backend, if the daemon came up at boot.
+/// Handed to `CliRuntime` so agent PTYs spawn through the same surviving
+/// daemon as plain terminals (enables agent-tab re-attach across restarts).
+/// `None` when no relay is installed — agents then use a private in-process
+/// PTY that dies with the app.
+pub fn shared_backend() -> Option<SharedBackend> {
+    SHARED_BACKEND.get().map(Arc::clone)
+}
+
 /// Snapshot of the relay daemon's currently-live state. Returned by
 /// [`relay_state_snapshot`] so the factory can do all the relay queries
 /// once per project switch instead of per leaf.

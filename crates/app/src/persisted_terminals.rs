@@ -224,6 +224,18 @@ pub struct PersistedAgentTab {
     pub worktree_path: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Daemon-side PTY id of the live agent session at snapshot time.
+    /// Present only when the agent ran through the relay. On restore, if
+    /// the relay is still on the same session and this id is still alive,
+    /// the tab re-attaches to the running CLI instead of respawning it.
+    /// `#[serde(default)]` keeps pre-existing blobs (no field) readable.
+    #[serde(default)]
+    pub relay_external_id: Option<String>,
+    /// Relay daemon session id at snapshot time. Compared against the
+    /// current session on restore — a mismatch (daemon restarted) means
+    /// the PTY is gone, so the tab respawns fresh instead of re-attaching.
+    #[serde(default)]
+    pub relay_session: Option<String>,
 }
 
 /// Mirrors `PaneTree` but without GPUI-side `PaneId`s (regenerated on
@@ -424,6 +436,8 @@ mod tests {
                     worktree_path: "/tmp/proj".into(),
                     model: Some("claude-opus-4-7".into()),
                     effort: Some("high".into()),
+                    relay_external_id: None,
+                    relay_session: None,
                 }),
                 kind: PersistedTabKind::Terminal,
                 ..PersistedTab::default()
