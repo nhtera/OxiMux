@@ -18,6 +18,22 @@ use std::time::{Duration, Instant};
 /// than the 10 s default; keep status calls fast while giving diff room.
 const DIFF_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Whole-file context for patch output. `git` has no "infinite context"
+/// flag; a number larger than any real source file makes every unchanged
+/// line render as context, so the diff VIEW shows the FULL file with
+/// change markers (scroll the whole document) instead of just the changed
+/// hunks with 3 lines around them.
+///
+/// Applied only to the diff-view fetch paths (`diff_for_path`,
+/// `commit_files`) — NOT to `diff_unstaged`/`diff_staged`, which feed
+/// hunk-count-sensitive callers and tests with git's default 3-line
+/// context. The diff view re-derives stageable hunks from the full-context
+/// diff via `oximux_core::change_regions`, so per-hunk staging keeps its
+/// `git add -p` granularity. The large-diff guard
+/// (`LARGE_DIFF_LINE_THRESHOLD`) still collapses oversized files, and the
+/// virtualized renderer keeps a fully expanded big file cheap to paint.
+const FULL_FILE_CONTEXT: &str = "--unified=1000000";
+
 /// Common args shared across all `git diff` invocations:
 /// - `-p`: produce a patch (we only parse this format)
 /// - `--no-color`: ANSI codes would corrupt our line parser
@@ -200,7 +216,14 @@ impl Repository {
     /// missing" via `git status` on the same path — `git diff` does not
     /// error on an unmodified path.
     pub async fn diff_for_path(&self, path: &Path, staged: bool) -> Result<Vec<FileDiff>> {
-        let extra: &[&str] = if staged { &["--cached"] } else { &[] };
+        // Full-file context so the diff view can scroll the whole document;
+        // per-hunk staging granularity is recovered downstream via
+        // `oximux_core::change_regions`.
+        let extra: &[&str] = if staged {
+            &[FULL_FILE_CONTEXT, "--cached"]
+        } else {
+            &[FULL_FILE_CONTEXT]
+        };
         self.diff_with_args(extra, Some(path)).await
     }
 
@@ -319,6 +342,7 @@ impl Repository {
                 "show",
                 "--no-color",
                 "--no-ext-diff",
+                FULL_FILE_CONTEXT,
                 "--format=",
                 "-p",
                 "--first-parent",

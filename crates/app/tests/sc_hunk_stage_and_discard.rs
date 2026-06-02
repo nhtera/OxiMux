@@ -78,15 +78,19 @@ async fn stage_hunk_dispatches_through_to_git(cx: &mut TestAppContext) {
     assert!(pre.is_empty(), "expected clean index, got {pre:?}");
 
     // Snapshot the unstaged diff so the test owns the FileDiff the
-    // DiffView would have fetched. Two hunks expected.
+    // DiffView would have fetched. Diffs are fetched with full-file context
+    // (scroll-the-whole-file), so the two distant edits land in ONE display
+    // hunk — but `change_regions` must re-split them into two stageable
+    // regions, which is what the per-region chips dispatch against.
     let unstaged = rt
         .block_on(repo.diff_unstaged())
         .expect("diff_unstaged pre");
     assert_eq!(unstaged.len(), 1);
+    let regions = oximux_core::change_regions(&unstaged[0]);
     assert!(
-        unstaged[0].hunks.len() >= 2,
-        "expected ≥2 hunks, got {}",
-        unstaged[0].hunks.len()
+        regions.len() >= 2,
+        "expected ≥2 stageable regions, got {}",
+        regions.len()
     );
 
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
@@ -164,7 +168,7 @@ async fn discard_hunk_reverts_worktree_without_touching_index(cx: &mut TestAppCo
         .block_on(repo.diff_unstaged())
         .expect("diff_unstaged pre");
     assert_eq!(unstaged.len(), 1);
-    assert!(unstaged[0].hunks.len() >= 2);
+    assert!(oximux_core::change_regions(&unstaged[0]).len() >= 2);
 
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
 

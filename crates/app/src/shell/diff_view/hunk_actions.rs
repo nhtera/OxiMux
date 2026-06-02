@@ -16,17 +16,24 @@
 //!
 //! Returns `None` when no chip would render — caller skips the slot
 //! entirely so the hunk-header row stays narrow on read-only views.
+//!
+//! Dispatch wiring: chips are built inside the diff body's `uniform_list`
+//! render closure, which only carries `&mut App` (not `Context<DiffView>`).
+//! So the click handlers route through a `WeakEntity<DiffView>` captured
+//! from the host before the list is built — `weak.update(cx, …)` reaches
+//! the view the same way `cx.listener(…)` would, but from App scope.
 
 use crate::shell::diff_view::{DiffView, HunkActionSide};
 use gpui::{
-    ClickEvent, Context, Hsla, InteractiveElement, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, div, px,
+    App, ClickEvent, Hsla, InteractiveElement, ParentElement, SharedString,
+    StatefulInteractiveElement as _, Styled, WeakEntity, div, px,
 };
 use oximux_settings::{Density, Theme, Typography};
 
 /// Render the action-chip cluster for one hunk. `None` when the
 /// current side carries no actions (untracked file, or no visible chip
 /// applies to the current snapshot).
+#[allow(clippy::too_many_arguments)]
 pub fn render_hunk_actions(
     side: HunkActionSide,
     file_idx: usize,
@@ -34,7 +41,7 @@ pub fn render_hunk_actions(
     theme: Theme,
     density: Density,
     typography: &Typography,
-    cx: &mut Context<DiffView>,
+    weak: &WeakEntity<DiffView>,
 ) -> Option<gpui::Div> {
     if side.untracked {
         return None;
@@ -55,7 +62,7 @@ pub fn render_hunk_actions(
             theme,
             density,
             typography,
-            cx,
+            weak,
         ));
     } else {
         row = row
@@ -66,9 +73,9 @@ pub fn render_hunk_actions(
                 hunk_idx,
                 HunkAction::Stage,
                 theme,
-            density,
-            typography,
-            cx,
+                density,
+                typography,
+                weak,
             ))
             .child(action_chip(
                 "discard",
@@ -77,9 +84,9 @@ pub fn render_hunk_actions(
                 hunk_idx,
                 HunkAction::Discard,
                 theme,
-            density,
-            typography,
-            cx,
+                density,
+                typography,
+                weak,
             ));
     }
     Some(row)
@@ -105,7 +112,7 @@ fn action_chip(
     theme: Theme,
     density: Density,
     typography: &Typography,
-    cx: &mut Context<DiffView>,
+    weak: &WeakEntity<DiffView>,
 ) -> gpui::Stateful<gpui::Div> {
     // Per-hunk unique id keeps GPUI's interactive-element bookkeeping
     // from collapsing chips that share a label across hunks.
@@ -113,6 +120,7 @@ fn action_chip(
         gpui::ElementId::Name(format!("hunk-action-{id_seed}-{file_idx}-{hunk_idx}").into());
     let (fg, hover_bg) = chip_palette(action, &theme);
     let label: SharedString = label.into();
+    let weak = weak.clone();
     div()
         .id(id)
         .px(px(6.0))
@@ -123,8 +131,8 @@ fn action_chip(
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg))
         .child(label)
-        .on_click(cx.listener(
-            move |view, _: &ClickEvent, window, cx| match action {
+        .on_click(move |_: &ClickEvent, window, cx: &mut App| {
+            let _ = weak.update(cx, |view, cx| match action {
                 HunkAction::Stage => {
                     view.stage_hunk(file_idx, hunk_idx, cx);
                     cx.notify();
@@ -137,8 +145,8 @@ fn action_chip(
                     view.request_discard_hunk(file_idx, hunk_idx, window, cx);
                     cx.notify();
                 }
-            },
-        ))
+            });
+        })
 }
 
 /// Map action → (foreground color, hover background). Stage/Unstage

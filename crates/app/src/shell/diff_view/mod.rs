@@ -26,12 +26,12 @@ pub mod word_diff;
 
 use crate::actions::{ExpandDiff, RetryDiff};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
-use crate::shell::diff_view::paint::render_plan;
+use crate::shell::diff_view::paint::{PreparedRow, prepare, render_rows};
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement as _, Styled, Subscription, Task, Window,
-    div, px,
+    ParentElement, Render, StatefulInteractiveElement as _, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, px,
 };
 use oximux_core::FileDiff;
 use oximux_git::Repository;
@@ -139,6 +139,15 @@ pub struct DiffView {
     /// its dialog. Same lifecycle pattern as
     /// `WorkspaceRoot::_discard_dialog_observer`.
     _confirm_dialog_observer: Option<Subscription>,
+    /// Vertical scroll state for the virtualized diff body. Owned here so
+    /// the `uniform_list` reports an exact content height (`rows × h_row`)
+    /// and scrolling reaches the true end of the diff.
+    scroll_handle: UniformListScrollHandle,
+    /// Cached flattened render rows. Built once per (diff, expanded) change
+    /// — NOT per frame — so syntax highlighting and word-diff pairing stay
+    /// off the scroll path. `None` means "stale, rebuild on next render";
+    /// every state transition that changes the body resets it.
+    prepared: Option<Rc<Vec<PreparedRow>>>,
 }
 
 impl DiffView {
@@ -160,7 +169,16 @@ impl DiffView {
             _op_task: None,
             confirm_dialog: None,
             _confirm_dialog_observer: None,
+            scroll_handle: UniformListScrollHandle::new(),
+            prepared: None,
         }
+    }
+
+    /// Invalidate the cached render rows so the next `render` rebuilds them
+    /// from the current state. Called on every transition that changes the
+    /// diff body (load, commit load, expand, seed).
+    fn invalidate_prepared(&mut self) {
+        self.prepared = None;
     }
 
     /// Inspect-only accessor used by tests + by `GitPanel` to avoid
@@ -185,6 +203,7 @@ impl DiffView {
         // load, then briefly flash back to the prior file's diff when
         // the stale `_op_task` finishes its reload chain.
         self._op_task = None;
+        self.invalidate_prepared();
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -273,6 +292,7 @@ impl DiffView {
         // from a prior file selection must not flash over the new
         // commit-detail view.
         self._op_task = None;
+        self.invalidate_prepared();
         self.state = DiffViewState::CommitLoading {
             sha: sha.clone(),
             short_oid: short_oid.clone(),
@@ -361,6 +381,9 @@ impl DiffView {
             DiffViewState::CommitReady { expanded, .. } => *expanded = true,
             _ => {}
         }
+        // Expanding a collapsed large diff changes which rows render — drop
+        // the cached row list so the next render rebuilds the full body.
+        self.invalidate_prepared();
     }
 
     fn apply_load_result(
@@ -435,6 +458,7 @@ impl DiffView {
             diffs,
             expanded: false,
         };
+        self.invalidate_prepared();
     }
 
     /// Inspector for the host: which side (staged vs unstaged) is on
@@ -455,10 +479,17 @@ impl DiffView {
         })
     }
 
-    /// Snapshot the FileDiff under `file_idx` plus the routing fields
-    /// needed to reload after a hunk op. Returns `None` when the view
-    /// isn't Ready or `file_idx` is out of range — the host must NOT
-    /// dispatch in that window.
+    /// Build a STAGING snapshot for `file_idx`: a `FileDiff` whose `hunks`
+    /// are the file's stageable change regions (from `change_regions`), not
+    /// its full-file display hunks. Returns `None` when the view isn't
+    /// Ready or `file_idx` is out of range.
+    ///
+    /// Diffs are fetched with full-file context so the user can scroll the
+    /// whole document, which collapses every edit into one giant hunk. The
+    /// per-hunk Stage/Unstage/Discard chips index REGIONS, so the op path
+    /// rebuilds a `FileDiff` carrying one `git apply`-ready hunk per region
+    /// — then `repo.stage_hunks(&file, &[region_idx])` works unchanged with
+    /// per-region (git add -p) granularity instead of whole-file ops.
     fn hunk_target(&self, file_idx: usize) -> Option<HunkTarget> {
         let DiffViewState::Ready {
             path,
@@ -470,7 +501,14 @@ impl DiffView {
         else {
             return None;
         };
-        let file = diffs.get(file_idx)?.clone();
+        let orig = diffs.get(file_idx)?;
+        let regions = oximux_core::change_regions(orig);
+        let file = FileDiff {
+            path: orig.path.clone(),
+            status: orig.status.clone(),
+            hunks: regions.into_iter().map(|r| r.stage_hunk).collect(),
+            large: false,
+        };
         Some(HunkTarget {
             path: path.clone(),
             staged: *staged,
@@ -702,6 +740,38 @@ impl Render for DiffView {
                 .into_any_element();
         }
 
+        // Rebuild the cached row list only when stale. This keeps the
+        // expensive work — walking every hunk, syntect highlighting each
+        // line, word-diff pairing — OFF the per-frame render path; it runs
+        // once per (diff, expanded) change, not on every scroll tick.
+        // Done before borrowing `&self.state` for the body so the heavy
+        // plan build doesn't tangle with the element tree below.
+        if self.prepared.is_none() {
+            let rows = match &self.state {
+                DiffViewState::Ready {
+                    diffs, expanded, ..
+                }
+                | DiffViewState::CommitReady {
+                    diffs, expanded, ..
+                } => {
+                    let plan = build_render_plan(diffs, *expanded);
+                    // Stageable change regions per file — full-file context
+                    // makes one giant hunk, so the renderer docks a chip bar
+                    // per region (git add -p granularity) using these.
+                    let regions: Vec<Vec<oximux_core::ChangeRegion>> =
+                        diffs.iter().map(oximux_core::change_regions).collect();
+                    let rctx = RenderCtx {
+                        theme: self.theme,
+                        density: self.density,
+                        typography: &self.typography,
+                    };
+                    Some(Rc::new(prepare(&plan, &regions, &rctx)))
+                }
+                _ => None,
+            };
+            self.prepared = rows;
+        }
+
         let rctx = RenderCtx {
             theme: self.theme,
             density: self.density,
@@ -711,6 +781,10 @@ impl Render for DiffView {
         // arm, `&self.state` is borrowed and `current_side` (which reads
         // `&self.state`) would conflict.
         let side = self.current_side();
+        // Weak handle routes chip / expand / copy clicks back into the
+        // view from the virtualized list's App-scope render closure (which
+        // doesn't carry a `Context<DiffView>`).
+        let weak = cx.entity().downgrade();
         let body = match &self.state {
             DiffViewState::Empty => unreachable!("handled above"),
             DiffViewState::Loading { path, .. } => {
@@ -719,11 +793,9 @@ impl Render for DiffView {
             DiffViewState::Failed { path, error, .. } => {
                 failed_state(&path.display().to_string(), error, &rctx, cx).into_any_element()
             }
-            DiffViewState::Ready {
-                diffs, expanded, ..
-            } => {
-                let plan = build_render_plan(diffs, *expanded);
-                render_plan(&plan, side, &rctx, cx).into_any_element()
+            DiffViewState::Ready { .. } => {
+                let rows = self.prepared.clone().unwrap_or_default();
+                render_rows(rows, side, &self.scroll_handle, &rctx, weak).into_any_element()
             }
             DiffViewState::CommitLoading {
                 short_oid, subject, ..
@@ -741,34 +813,19 @@ impl Render for DiffView {
                 cx,
             )
             .into_any_element(),
-            DiffViewState::CommitReady {
-                diffs, expanded, ..
-            } => {
-                // `side = None` (current_side returns None for any
-                // non-`Ready` state) means hunk action chips do NOT
-                // render on commit-detail rows. Stage/Unstage/Discard
-                // against a historical commit doesn't model anything
-                // git supports.
-                let plan = build_render_plan(diffs, *expanded);
-                render_plan(&plan, None, &rctx, cx).into_any_element()
+            DiffViewState::CommitReady { .. } => {
+                // `side = None` so hunk action chips do NOT render on
+                // commit-detail rows — Stage/Unstage/Discard against a
+                // historical commit model nothing git supports.
+                let rows = self.prepared.clone().unwrap_or_default();
+                render_rows(rows, None, &self.scroll_handle, &rctx, weak).into_any_element()
             }
         };
-        // Wrap the body in a stateful scroll container. The previous
-        // layout had `.h_full().w_full()` without an overflow handler,
-        // which worked when DiffView was mounted in the sidebar (the
-        // outer column was the scroll surface). Now that DiffView lives
-        // as a main-pane tab, it has to own its own scroll — without
-        // `flex_1 + min_h(0) + overflow_y_scroll` long diffs clip past
-        // the visible viewport. `id` is required for `overflow_y_scroll`
-        // to wire up; the constant string is safe because each tab has
-        // its own `Entity<DiffView>` so the GPUI ids don't collide.
-        let scroll_body = div()
-            .id("diff-view-scroll")
-            .flex_1()
-            .min_h(px(0.0))
-            .w_full()
-            .overflow_y_scroll()
-            .child(body);
+        // The body owns its own scrolling now: `Ready`/`CommitReady` return
+        // a `uniform_list` (flex_1 + min_h(0)) that virtualizes rows and
+        // reports an exact content height, so scrolling reaches the true
+        // end of the diff. Non-Ready states return a centered placeholder.
+        let scroll_body = body;
         // When the discard-hunk confirm modal is mounted, stack it as a
         // centered overlay over the diff body. Mirrors `confirm_dialog`
         // and `rename_tab_dialog` overlay shape in `workspace_root` but
