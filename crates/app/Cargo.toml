@@ -51,6 +51,11 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"
+# Objective-C bridge for the NSProcessInfo `beginActivityWithOptions`
+# call that opts the app out of App Nap (see the `app_nap` module).
+# Already in the transitive graph via gpui; declaring it explicitly keeps
+# the msg_send! macro available without leaning on a re-export.
+objc = "0.2"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

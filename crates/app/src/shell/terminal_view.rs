@@ -136,6 +136,9 @@ pub fn relay_state_snapshot() -> RelayStateSnapshot {
             session_id: None,
         };
     };
+    // `list_external_ids` is a synchronous daemon round-trip; hold off App
+    // Nap so the system can't wedge the main thread while it's in flight.
+    let _nap = crate::app_nap::prevent("relay list ptys");
     let guard = shared.lock().expect("shared backend poisoned");
     RelayStateSnapshot {
         live_external_ids: guard.list_external_ids().into_iter().collect(),
@@ -148,6 +151,9 @@ pub fn relay_state_snapshot() -> RelayStateSnapshot {
 /// (caller falls back to spawn + visual prefill).
 pub fn attach_pty_existing(external_id: &str) -> Option<(SharedBackend, TerminalSessionId)> {
     let shared = SHARED_BACKEND.get()?;
+    // Attach is a synchronous daemon round-trip on the main thread during
+    // restore — the original freeze window. Hold off App Nap for its duration.
+    let _nap = crate::app_nap::prevent("relay attach");
     let mut guard = shared.lock().expect("shared backend poisoned");
     match guard.attach_existing(external_id) {
         Ok(session_id) => {
@@ -184,6 +190,9 @@ pub fn spawn_local_pty(
             scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
+        // Spawn is a synchronous daemon round-trip on the main thread; hold
+        // off App Nap so it can't wedge mid-request.
+        let _nap = crate::app_nap::prevent("relay spawn");
         let mut guard = shared.lock().expect("shared backend poisoned");
         match guard.spawn(cfg) {
             Ok(session_id) => {

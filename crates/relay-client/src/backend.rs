@@ -334,38 +334,49 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn resize(&mut self, id: TerminalSessionId, cols: u16, rows: u16) -> Result<()> {
+        // Called from the GPUI render thread whenever the pane bounds change.
+        // It MUST NOT block on a daemon round-trip: a synchronous
+        // `Handle::block_on` here parks the render loop (and, on macOS, lets
+        // the system wedge the main thread in the App-Nap assertion path).
+        //
+        // Instead we update the local grid immediately — the daemon's ack
+        // carries no data the renderer needs — and fire the daemon resize as
+        // a detached task on the relay runtime. The live process repaints via
+        // SIGWINCH on the output stream; a failed resize surfaces there, not
+        // through a per-call ack. This mirrors how a terminal forwards a
+        // resize to its PTY (a one-way ioctl) without waiting.
         let (pty_id, attachment_id) = {
-            let sessions = self.sessions.lock().expect("sessions poisoned");
+            let mut sessions = self.sessions.lock().expect("sessions poisoned");
             let s = sessions
-                .get(&id)
+                .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
+            s.cols = cols;
+            s.rows = rows;
+            if let Ok(mut state) = s.state.lock() {
+                state.resize(cols, rows);
+            }
             (s.relay_pty_id.clone(), s.attachment_id)
         };
-        let resp = self.request(Request::Resize {
-            pty_id,
-            attachment_id,
-            cols,
-            rows,
-        })?;
-        match resp {
-            Response::Ok => {
-                let mut sessions = self.sessions.lock().expect("sessions poisoned");
-                if let Some(s) = sessions.get_mut(&id) {
-                    s.cols = cols;
-                    s.rows = rows;
-                    if let Ok(mut state) = s.state.lock() {
-                        state.resize(cols, rows);
-                    }
-                }
-                push_event(
-                    &self.event_queues,
-                    id,
-                    TerminalEvent::Resize { id, cols, rows },
-                );
-                Ok(())
+        push_event(
+            &self.event_queues,
+            id,
+            TerminalEvent::Resize { id, cols, rows },
+        );
+        let client = Arc::clone(&self.client);
+        self.handle.spawn(async move {
+            if let Err(err) = client
+                .request(Request::Resize {
+                    pty_id,
+                    attachment_id,
+                    cols,
+                    rows,
+                })
+                .await
+            {
+                tracing::warn!(?err, "daemon resize request failed");
             }
-            other => Err(anyhow!("resize: {other:?}")),
-        }
+        });
+        Ok(())
     }
 
     fn snapshot(&self, id: TerminalSessionId) -> Result<TerminalSnapshot> {

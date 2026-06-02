@@ -5,6 +5,7 @@
 //! binary at `src/main.rs` imports from this library.
 
 pub mod actions;
+pub mod app_nap;
 pub mod assets;
 pub mod commit_message_ai_settings;
 pub mod keymap;

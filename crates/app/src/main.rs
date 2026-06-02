@@ -11,7 +11,7 @@
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use gpui::{
@@ -125,7 +125,10 @@ fn main() {
     // survives Cmd-Q. On failure, log and continue — the app falls
     // back to per-pane `PortablePtyBackend` (today's behavior, no
     // survival, but the shell still works).
-    boot_relay_supervisor(&rt, app_state.pane_relay_id_repo().clone());
+    // Held for the whole process: dropping the relay runtime would tear
+    // down the client's reader/writer tasks and wedge every PTY. Kept
+    // alongside `rt` until `app.run` returns on graceful quit.
+    let _relay_rt = boot_relay_supervisor(app_state.pane_relay_id_repo().clone());
 
     // `with_assets` registers our composite SVG source: local app icons
     // (e.g. `icons/git-branch.svg`) first, falling through to gpui-component's
@@ -265,11 +268,43 @@ fn install_app_lifecycle(
 /// (any thread, no allocation, no mutex).
 static SHUTDOWN_SIGNAL: AtomicBool = AtomicBool::new(false);
 
+/// Count of shutdown signals received. The first drives the graceful
+/// `cx.quit()` path; the second escalates to a hard kill so a wedged
+/// foreground executor can never leave the app un-quittable.
+static SHUTDOWN_SIGNAL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// How long the graceful `cx.quit()` path gets after the first shutdown
+/// signal before the deadline thread force-exits. A successful quit tears
+/// the process down well within this window (~400 ms observed).
+const SHUTDOWN_GRACE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Whether a shutdown signal should escalate to a hard kill. `prior_count`
+/// is the number of signals seen BEFORE this one: the first (0) drives the
+/// graceful path; any repeat (>= 1) means graceful is likely wedged, so we
+/// restore the default disposition and re-raise.
+fn signal_should_force_exit(prior_count: u32) -> bool {
+    prior_count >= 1
+}
+
 /// Async-signal-safe handler. Stores to an atomic and returns.
 /// Anything else (logging, locking, calling into GPUI) would risk
 /// deadlock if the signal interrupted a critical section.
-extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+///
+/// Escalation: the graceful path (set flag → GPUI task calls `cx.quit()`)
+/// only works while the foreground executor still runs. If the main
+/// thread is wedged (e.g. blocked inside a macOS dispatch wait), that
+/// path is dead and repeated Ctrl+C would otherwise do nothing. So on
+/// the SECOND signal we restore the default disposition and re-raise,
+/// letting the kernel terminate us immediately. `signal` + `raise` are
+/// both async-signal-safe.
+extern "C" fn handle_shutdown_signal(sig: libc::c_int) {
     SHUTDOWN_SIGNAL.store(true, Ordering::SeqCst);
+    if signal_should_force_exit(SHUTDOWN_SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst)) {
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
 }
 
 /// Install SIGINT + SIGTERM handlers + start a GPUI task that polls
@@ -284,6 +319,23 @@ fn install_signal_watchdog(cx: &mut gpui::App) {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
     }
+    // Hard-kill deadline, independent of the GPUI executor. A plain OS
+    // thread (never wedged by the UI) waits for the shutdown flag, gives the
+    // graceful `cx.quit()` path a few seconds to persist state + exit, then
+    // force-exits if we're somehow still alive. A successful graceful quit
+    // tears the process down first, so this only fires when the foreground
+    // executor cannot run `cx.quit()` — the exact "Ctrl+C does nothing" case.
+    std::thread::Builder::new()
+        .name("shutdown-deadline".into())
+        .spawn(|| loop {
+            if SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+                std::thread::sleep(SHUTDOWN_GRACE_DEADLINE);
+                // Still running ⇒ graceful quit stalled. 130 = 128 + SIGINT.
+                unsafe { libc::_exit(130) };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        })
+        .expect("spawn shutdown-deadline watchdog thread");
     cx.spawn(async move |cx| {
         loop {
             if SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
@@ -542,24 +594,60 @@ fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
 // Best-effort: bring up the relay daemon and install the shared
 // backend. Any error here is downgraded to a warning — the app
 // degrades to in-process PTYs rather than refusing to start.
+//
+// The relay client gets its OWN tokio runtime, kept alive by the
+// returned handle. This is load-bearing: every `RelayBackend` request
+// (spawn / attach / list / resize) is a synchronous `Handle::block_on`
+// issued from the GPUI render thread, and that thread already has the
+// git/db runtime entered for the whole process. Driving relay requests
+// on a SEPARATE runtime keeps `block_on` off the entered runtime's
+// context, matching the invariant documented on `RelayBackend::new`.
+// `None` ⇒ no relay; the app falls back to in-process PTYs.
 fn boot_relay_supervisor(
-    rt: &tokio::runtime::Runtime,
     pane_relay_id_repo: oximux_storage::PaneRelayIdRepo,
-) {
+) -> Option<tokio::runtime::Runtime> {
     let Some(data_dir) = dirs::data_dir() else {
         tracing::warn!("no data_dir; skipping relay supervisor");
-        return;
+        return None;
     };
     let runtime_dir = data_dir.join(APP_DATA_SUBDIR);
     let Some(home) = dirs::home_dir() else {
         tracing::warn!("no home_dir; skipping relay supervisor");
-        return;
+        return None;
     };
     // macOS convention: per-app logs live under ~/Library/Logs.
     let log_dir = home.join("Library/Logs").join(APP_DATA_SUBDIR);
 
+    // Dedicated runtime for the relay client's reader/writer tasks and
+    // every later `block_on`. Two workers is plenty: the socket I/O is
+    // light and the heavy lifting lives in the daemon process.
+    let relay_rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("relay-rt")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            tracing::warn!(?err, "failed to build relay runtime; using in-process PTYs");
+            return None;
+        }
+    };
+
     let supervisor = RelaySupervisor::new(runtime_dir, log_dir);
-    let client = match rt.block_on(supervisor.ensure_running()) {
+    // Run the handshake on `relay_rt` from a thread with NO runtime
+    // entered (the caller's thread has the git/db runtime entered via
+    // `_rt_guard`). A scoped thread lets `ensure_running` spawn the
+    // client's reader/writer tasks onto `relay_rt`, and side-steps the
+    // "block_on within an entered runtime" hazard entirely.
+    let relay_handle = relay_rt.handle().clone();
+    let connect_result = std::thread::scope(|scope| {
+        scope
+            .spawn(|| relay_handle.block_on(supervisor.ensure_running()))
+            .join()
+            .expect("relay handshake thread panicked")
+    });
+    let client = match connect_result {
         Ok(c) => c,
         Err(SupervisorError::VersionMismatch) => {
             tracing::warn!("relay version mismatch; falling back to in-process PTYs");
@@ -575,11 +663,11 @@ fn boot_relay_supervisor(
                         .send();
                 });
             }
-            return;
+            return None;
         }
         Err(SupervisorError::Other(err)) => {
             tracing::warn!(?err, "relay supervisor failed; using in-process PTYs");
-            return;
+            return None;
         }
     };
     let server_session_id = client.server_session_id().to_owned();
@@ -588,7 +676,7 @@ fn boot_relay_supervisor(
     if let Some(pid) = supervisor.read_pid() {
         let repo_for_death = pane_relay_id_repo;
         let session_for_death = server_session_id.clone();
-        let _enter = rt.handle().enter();
+        let _enter = relay_rt.handle().enter();
         // JoinHandle dropped intentionally: the heartbeat task exits
         // by itself when the daemon dies, and we have no way to call
         // back into the GPUI window from this boot frame anyway.
@@ -599,7 +687,7 @@ fn boot_relay_supervisor(
         tracing::warn!("relay PID file missing; crash heartbeat disabled");
     }
 
-    let backend = RelayBackend::new(client_arc, rt.handle().clone());
+    let backend = RelayBackend::new(client_arc, relay_rt.handle().clone());
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
     install_shared_backend(shared);
@@ -609,6 +697,7 @@ fn boot_relay_supervisor(
         supervisor.socket_path().to_string_lossy().into_owned(),
     );
     tracing::info!("relay supervisor up; PTYs will route through the daemon");
+    Some(relay_rt)
 }
 
 // Invoked once when the supervisor's heartbeat sees the relay PID go
@@ -638,4 +727,36 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression guard for the Ctrl+C escalation contract: the FIRST
+    // shutdown signal must take the graceful `cx.quit()` path, and any
+    // REPEAT must hard-escalate (restore SIG_DFL + re-raise) so a wedged
+    // foreground executor can't leave the app un-quittable.
+    #[test]
+    fn first_shutdown_signal_is_graceful_repeats_escalate() {
+        assert!(
+            !signal_should_force_exit(0),
+            "first signal must try graceful quit"
+        );
+        assert!(
+            signal_should_force_exit(1),
+            "second signal must hard-escalate"
+        );
+        assert!(signal_should_force_exit(2), "further signals keep escalating");
+    }
+
+    // The hard-kill deadline must stay long enough for a normal graceful
+    // quit (~400 ms observed) yet short enough that a wedged app dies
+    // promptly. Guards against an accidental bump to an effectively-never
+    // value that would reintroduce the "unkillable" behavior.
+    #[test]
+    fn shutdown_grace_deadline_is_bounded() {
+        assert!(SHUTDOWN_GRACE_DEADLINE >= Duration::from_secs(1));
+        assert!(SHUTDOWN_GRACE_DEADLINE <= Duration::from_secs(5));
+    }
 }

@@ -258,6 +258,52 @@ fn snapshot_mirrors_remote_state() {
     });
 }
 
+// Regression guard: `resize` must apply to the local grid SYNCHRONOUSLY
+// and return immediately, without blocking the caller on a daemon ack.
+// The render thread calls this every time pane bounds change; a
+// re-introduced `block_on(request(Resize))` would park the UI (and, on
+// macOS, can wedge the main thread in the App-Nap path). We assert the
+// snapshot reflects the new dims on the very next line — proving the
+// local state update happens before (not after) the daemon round-trip.
+#[test]
+fn resize_applies_to_local_grid_synchronously() {
+    let mut fx = boot_fixture();
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        cwd: PathBuf::from("/tmp"),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    let id = fx.backend.spawn(cfg).expect("spawn");
+
+    let before = fx.backend.snapshot(id).expect("snapshot");
+    assert_eq!((before.cols, before.rows), (80, 24), "initial dims");
+
+    // Resize must return Ok immediately and not surface a daemon error
+    // synchronously (the ack is fire-and-forget on the relay runtime).
+    fx.backend.resize(id, 120, 40).expect("resize returns Ok");
+
+    // Read the snapshot on the next line — no drain/sleep. If this is
+    // already 120x40, the local grid was resized synchronously.
+    let after = fx.backend.snapshot(id).expect("snapshot");
+    assert_eq!(
+        (after.cols, after.rows),
+        (120, 40),
+        "resize did not update the local grid synchronously"
+    );
+
+    // A Resize event is emitted synchronously for the view to observe.
+    let saw_resize = fx
+        .backend
+        .drain_events()
+        .iter()
+        .any(|e| matches!(e, TerminalEvent::Resize { cols: 120, rows: 40, .. }));
+    assert!(saw_resize, "no synchronous Resize event");
+
+    fx.backend.write(id, b"exit\n").ok();
+}
+
 // End-to-end keystroke latency probe. Measures write→echo round-trip
 // for N single-byte writes against a real /bin/sh through the live
 // daemon. Run with:
