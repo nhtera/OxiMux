@@ -72,6 +72,7 @@ async fn file_explorer_constructs_without_panic(cx: &mut TestAppContext) {
             IndexStatus::Unmodified,
             WorktreeStatus::Modified,
         )],
+        ..Default::default()
     };
     tx.send(PollState::Ready(git_state)).expect("send ok");
     cx.run_until_parked();

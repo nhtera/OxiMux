@@ -58,6 +58,7 @@ fn modified_state(path: &str) -> PollState {
             IndexStatus::Unmodified,
             WorktreeStatus::Modified,
         )],
+        ..Default::default()
     })
 }
 

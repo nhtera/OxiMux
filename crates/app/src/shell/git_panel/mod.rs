@@ -116,6 +116,14 @@ pub struct GitPanel {
     /// clicks land in a tab that is explicitly a diff — no risk of
     /// confusing the diff with an editable text buffer.
     pub(crate) on_open: Option<OnOpenDiff>,
+    /// Optional "Committed on Branch" section, rendered INSIDE this panel's
+    /// scroll list directly below the file sections so it scrolls and
+    /// styles as one continuous surface with CHANGES / UNTRACKED. Held as
+    /// an `AnyView` so the panel stays decoupled from the section's concrete
+    /// type; the host (`SourceControlPanel`) injects its `BranchCommitsPanel`
+    /// entity via `set_branch_section`. `None` in test wiring / when the
+    /// branch has no committed work ahead of its base.
+    branch_section: Option<gpui::AnyView>,
     /// In-flight discard request awaiting user confirmation. `Some` from
     /// the moment the user clicks the revert icon (or hits the revert
     /// chord) until `confirmed_discard_path` runs or
@@ -215,6 +223,7 @@ impl GitPanel {
             scroll_handle: ScrollHandle::new(),
             _watch_task: watch_task,
             on_open,
+            branch_section: None,
             pending_discard: None,
             in_flight_discards: HashSet::new(),
             bulk_op_in_flight: false,
@@ -265,6 +274,16 @@ impl GitPanel {
             self.filter_query = query;
             cx.notify();
         }
+    }
+
+    /// Inject the "Committed on Branch" section view, rendered inside this
+    /// panel's scroll list. Called once at mount by `SourceControlPanel`
+    /// with its `BranchCommitsPanel` entity (the section manages its own
+    /// data + click events; this panel just hosts it for contiguous
+    /// layout).
+    pub fn set_branch_section(&mut self, view: Option<gpui::AnyView>, cx: &mut Context<Self>) {
+        self.branch_section = view;
+        cx.notify();
     }
 
     /// Toggle a section's collapsed state. `name` matches the section title
@@ -495,6 +514,11 @@ impl Render for GitPanel {
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
             .child(body)
+            // "Committed on Branch" section docks here — inside the same
+            // scroll list as CHANGES / UNTRACKED so it reads as one
+            // continuous, uniformly-styled surface (and scrolls together)
+            // rather than a detached block below the file list.
+            .children(self.branch_section.clone())
             .vertical_scrollbar(&self.scroll_handle);
 
         // Outer container is `relative` so the floating `BulkActionBar`

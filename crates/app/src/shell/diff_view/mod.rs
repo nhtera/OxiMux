@@ -91,6 +91,31 @@ pub enum DiffViewState {
         subject: String,
         error: String,
     },
+    /// Range mode: a single file's diff across `base..head` (the
+    /// "Committed on Branch" section's per-file view). Read-only like
+    /// commit-detail — no staging chips — but keyed by a revision range +
+    /// path rather than a SHA. `title` is the display label (file name).
+    RangeLoading {
+        base: String,
+        head: String,
+        path: PathBuf,
+        title: String,
+    },
+    RangeReady {
+        base: String,
+        head: String,
+        path: PathBuf,
+        title: String,
+        diffs: Vec<FileDiff>,
+        expanded: bool,
+    },
+    RangeFailed {
+        base: String,
+        head: String,
+        path: PathBuf,
+        title: String,
+        error: String,
+    },
 }
 
 /// Public visibility-decision payload returned by `DiffView::current_side`.
@@ -271,6 +296,17 @@ impl DiffView {
                     (sha.clone(), short_oid.clone(), subject.clone());
                 self.load_commit(sha, short_oid, subject, cx);
             }
+            DiffViewState::RangeFailed {
+                base,
+                head,
+                path,
+                title,
+                ..
+            } => {
+                let (base, head, path, title) =
+                    (base.clone(), head.clone(), path.clone(), title.clone());
+                self.load_range(base, head, path, title, cx);
+            }
             _ => {}
         }
     }
@@ -370,6 +406,103 @@ impl DiffView {
         }
     }
 
+    /// Begin loading a single file's diff across `base..head` — the
+    /// read-only per-file view opened from the "Committed on Branch"
+    /// section. Mirrors `load_commit`'s async machinery but fetches
+    /// `diff_for_range(base, head, path)` and lands in the `Range*`
+    /// states (no staging chips, since the change is already committed).
+    pub fn load_range(
+        &mut self,
+        base: String,
+        head: String,
+        path: PathBuf,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self._op_task = None;
+        self.invalidate_prepared();
+        self.state = DiffViewState::RangeLoading {
+            base: base.clone(),
+            head: head.clone(),
+            path: path.clone(),
+            title: title.clone(),
+        };
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<Result<Vec<FileDiff>, String>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let (base_f, head_f, path_f) = (base.clone(), head.clone(), path.clone());
+                handle.spawn(async move {
+                    let r = repo
+                        .diff_for_range(&base_f, &head_f, &path_f)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::diff_view",
+                    "no tokio runtime entered; range load skipped"
+                );
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.apply_range_load_result(base, head, path, title, result);
+                cx.notify();
+            });
+        });
+        self._load_task = Some(task);
+    }
+
+    fn apply_range_load_result(
+        &mut self,
+        base: String,
+        head: String,
+        path: PathBuf,
+        title: String,
+        result: Result<Vec<FileDiff>, String>,
+    ) {
+        match result {
+            Ok(diffs) => {
+                // Preserve `expanded` across reloads of the same range+path
+                // (e.g. retry). A different range or file starts collapsed.
+                let expanded = match &self.state {
+                    DiffViewState::RangeReady {
+                        base: pb,
+                        head: ph,
+                        path: pp,
+                        expanded: pe,
+                        ..
+                    } if *pb == base && *ph == head && *pp == path => *pe,
+                    _ => false,
+                };
+                self.state = DiffViewState::RangeReady {
+                    base,
+                    head,
+                    path,
+                    title,
+                    diffs,
+                    expanded,
+                };
+            }
+            Err(error) => {
+                self.state = DiffViewState::RangeFailed {
+                    base,
+                    head,
+                    path,
+                    title,
+                    error,
+                };
+            }
+        }
+    }
+
     /// Toggle a large-diff file from collapsed → expanded. Invoked by the
     /// `ExpandDiff` action and the click on the expand row in `render.rs`.
     /// Applies to both file-mode Ready and commit-detail CommitReady —
@@ -379,6 +512,7 @@ impl DiffView {
         match &mut self.state {
             DiffViewState::Ready { expanded, .. } => *expanded = true,
             DiffViewState::CommitReady { expanded, .. } => *expanded = true,
+            DiffViewState::RangeReady { expanded, .. } => *expanded = true,
             _ => {}
         }
         // Expanding a collapsed large diff changes which rows render — drop
@@ -753,6 +887,9 @@ impl Render for DiffView {
                 }
                 | DiffViewState::CommitReady {
                     diffs, expanded, ..
+                }
+                | DiffViewState::RangeReady {
+                    diffs, expanded, ..
                 } => {
                     let plan = build_render_plan(diffs, *expanded);
                     // Stageable change regions per file — full-file context
@@ -817,6 +954,17 @@ impl Render for DiffView {
                 // `side = None` so hunk action chips do NOT render on
                 // commit-detail rows — Stage/Unstage/Discard against a
                 // historical commit model nothing git supports.
+                let rows = self.prepared.clone().unwrap_or_default();
+                render_rows(rows, None, &self.scroll_handle, &rctx, weak).into_any_element()
+            }
+            DiffViewState::RangeLoading { title, .. } => {
+                loading_state(&format!("Loading {title}…"), &rctx).into_any_element()
+            }
+            DiffViewState::RangeFailed { title, error, .. } => {
+                failed_state(title, error, &rctx, cx).into_any_element()
+            }
+            DiffViewState::RangeReady { .. } => {
+                // Read-only, like commit detail: `side = None`, no chips.
                 let rows = self.prepared.clone().unwrap_or_default();
                 render_rows(rows, None, &self.scroll_handle, &rctx, weak).into_any_element()
             }

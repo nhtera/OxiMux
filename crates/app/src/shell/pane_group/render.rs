@@ -233,9 +233,9 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         // Commit-detail tabs share the Diff marker — same `±` semantics
         // and same chip styling. The dedup key differs (SHA vs path)
         // but the visual chrome is identical.
-        PaneGroupTabKind::Diff { .. } | PaneGroupTabKind::Commit { .. } => {
-            PaneTabKindMarker::Diff
-        }
+        PaneGroupTabKind::Diff { .. }
+        | PaneGroupTabKind::Commit { .. }
+        | PaneGroupTabKind::BranchFile { .. } => PaneTabKindMarker::Diff,
     }
 }
 
@@ -1349,7 +1349,8 @@ fn render_mru_hud(
             // editor tabs (see marker note above).
             PaneGroupTabKind::Editor { .. }
             | PaneGroupTabKind::Diff { .. }
-            | PaneGroupTabKind::Commit { .. } => "icons/file.svg",
+            | PaneGroupTabKind::Commit { .. }
+            | PaneGroupTabKind::BranchFile { .. } => "icons/file.svg",
             PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. } => {
                 "icons/square-terminal.svg"
             }

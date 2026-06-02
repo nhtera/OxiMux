@@ -5,6 +5,7 @@
 //! owns the parser; this module owns the shapes.
 
 use crate::ConflictKind;
+use crate::DiffStatus;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -23,6 +24,43 @@ pub struct GitState {
     pub head_oid: Option<String>,
     /// One entry per changed/untracked path.
     pub files: Vec<FileStatus>,
+    /// Files changed by commits on this branch that aren't on its base
+    /// (the "Committed on Branch" section): the aggregate of
+    /// `merge_base(base, HEAD)..HEAD`. Empty when no base resolves or the
+    /// branch is level with its base. Enriched onto the status poll, so a
+    /// computation failure leaves it empty rather than poisoning status.
+    #[serde(default)]
+    pub branch_committed: Vec<BranchCommittedFile>,
+    /// The revision range `branch_committed` was computed against — needed
+    /// to open a per-file range diff. `None` when no base resolved.
+    #[serde(default)]
+    pub branch_range: Option<BranchRange>,
+}
+
+/// One file in the "Committed on Branch" section — the net change a file
+/// received across the branch's unpushed commits, summarised like a
+/// status row (one status code + `+added −removed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchCommittedFile {
+    /// New path (post-change); for renames the destination, origin in
+    /// `status`.
+    pub path: PathBuf,
+    pub status: DiffStatus,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// The revision range the branch-committed file list spans. Carries the
+/// resolved base ref (for display) plus the concrete `merge_base..head`
+/// OIDs a per-file range diff is computed against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchRange {
+    /// Resolved base ref, e.g. `origin/main` — display + provenance.
+    pub base_ref: String,
+    /// `merge-base(base_ref, HEAD)` OID — the left side of the range.
+    pub merge_base: String,
+    /// HEAD OID — the right side of the range.
+    pub head: String,
 }
 
 /// One changed path. Mirrors porcelain v2 record types 1, 2, u, ?.

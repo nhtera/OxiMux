@@ -149,13 +149,22 @@ impl Repository {
         &self.workdir
     }
 
-    /// Run `git status --porcelain=v2 --branch --ignored=matching -z` and
-    /// parse into `GitState`. `--ignored=matching` emits one `!` record per
-    /// path that directly matches a `.gitignore` rule, instead of the
-    /// traditional `--ignored` which recursively enumerates every file
-    /// inside ignored trees (catastrophically slow in repos with large
-    /// `target/`, `node_modules/`, etc.). The file explorer hides whole
-    /// ignored subtrees anyway — leaf-level enumeration is wasted work.
+    /// Run `git status --porcelain=v2 --branch --ignored=matching
+    /// --untracked-files=all -z` and parse into `GitState`.
+    ///
+    /// `--ignored=matching` emits one `!` record per path that directly
+    /// matches a `.gitignore` rule, instead of the traditional `--ignored`
+    /// which recursively enumerates every file inside ignored trees
+    /// (catastrophically slow in repos with large `target/`,
+    /// `node_modules/`, etc.). The file explorer hides whole ignored
+    /// subtrees anyway — leaf-level enumeration is wasted work.
+    ///
+    /// `--untracked-files=all` expands untracked DIRECTORIES into their
+    /// individual files. Without it git's default (`normal`) collapses a
+    /// new directory to a single `dir/` record, which the diff view then
+    /// tries to read as a file — failing with "Is a directory". Listing
+    /// leaf files instead makes every untracked row a real, diffable path
+    /// (and respects `.gitignore`, so ignored trees are still skipped).
     pub async fn status(&self) -> Result<GitState> {
         let out = GitCmd::new(&self.workdir)
             .args([
@@ -163,6 +172,7 @@ impl Repository {
                 "--porcelain=v2",
                 "--branch",
                 "--ignored=matching",
+                "--untracked-files=all",
                 "-z",
             ])
             .run()
@@ -188,6 +198,23 @@ impl Repository {
                     error = %e,
                     workdir = %self.workdir.display(),
                     "diff --numstat HEAD failed; status returned without line counts"
+                );
+            }
+        }
+        // Enrich with the "Committed on Branch" file list (commits this
+        // branch carries vs its base). Best-effort, same contract as
+        // numstat: a failure leaves the section empty and never fails the
+        // poll.
+        match self.branch_committed().await {
+            Ok((range, files)) => {
+                state.branch_range = range;
+                state.branch_committed = files;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workdir = %self.workdir.display(),
+                    "branch-committed enrichment failed; section will be empty"
                 );
             }
         }
@@ -225,6 +252,22 @@ impl Repository {
             &[FULL_FILE_CONTEXT]
         };
         self.diff_with_args(extra, Some(path)).await
+    }
+
+    /// Full-context diff of a single path across an arbitrary revision
+    /// range (`<base> <head>`). Powers the read-only per-file diff opened
+    /// from the "Committed on Branch" section, where `base` is the
+    /// merge-base and `head` is the branch tip. Same full-file context and
+    /// patch shape as `diff_for_path`, so the diff view renders it
+    /// identically (minus the staging chips, which the caller suppresses).
+    pub async fn diff_for_range(
+        &self,
+        base: &str,
+        head: &str,
+        path: &Path,
+    ) -> Result<Vec<FileDiff>> {
+        self.diff_with_args(&[FULL_FILE_CONTEXT, base, head], Some(path))
+            .await
     }
 
     /// Synthesize an "all-additions" diff for an untracked file by reading

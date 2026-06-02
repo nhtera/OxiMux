@@ -67,7 +67,10 @@ use crate::shell::{
         DiscardRequested, GitPanel,
         row_context_menu::{GitRowContextMenu, GitRowContextTarget},
     },
-    source_control::{commit_context_menu::CommitContextMenu, graph::ShowCommitRequested},
+    source_control::{
+        branch_commits::ShowBranchFileRequested, commit_context_menu::CommitContextMenu,
+        graph::ShowCommitRequested,
+    },
     stash_panel::{
         PushStashRequested, StashPanel,
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
@@ -213,6 +216,11 @@ pub struct WorkspaceRoot {
     /// Same lifetime contract as `_discard_subscription` —  dropping
     /// it silently disables the click-to-open affordance.
     pub(crate) _show_commit_subscription: Option<Subscription>,
+    /// Long-lived subscription on `BranchCommitsPanel::ShowBranchFileRequested`.
+    /// Fired when the user clicks a row in the "Committed on Branch"
+    /// section; the handler opens a read-only range-diff tab in the active
+    /// pane group. Same lifetime contract as `_show_commit_subscription`.
+    pub(crate) _show_branch_file_subscription: Option<Subscription>,
 }
 
 impl WorkspaceRoot {
@@ -547,6 +555,38 @@ impl WorkspaceRoot {
                     },
                 )
             });
+
+        // Subscribe to the "Committed on Branch" section's row clicks. The
+        // event carries the `merge_base..head` range + path; we open a
+        // read-only range-diff tab in the active group. Same capture +
+        // lifetime contract as the commit subscription above.
+        let show_branch_file_subscription = right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+            .map(|sc| {
+                let sc_ref = sc.read(cx);
+                (sc_ref.branch_commits.clone(), sc_ref.repo.clone())
+            })
+            .map(|(panel, repo)| {
+                cx.subscribe_in(
+                    &panel,
+                    window,
+                    move |root, _panel, ev: &ShowBranchFileRequested, window, cx| {
+                        let Some(panes) = root.active_project_panes() else {
+                            return;
+                        };
+                        let base = ev.base.clone();
+                        let head = ev.head.clone();
+                        let path = ev.path.clone();
+                        let repo = repo.clone();
+                        panes.update(cx, |p, cx| {
+                            p.open_or_activate_branch_diff_tab(
+                                repo, base, head, path, window, cx,
+                            );
+                        });
+                    },
+                )
+            });
         Self {
             theme,
             density,
@@ -571,6 +611,7 @@ impl WorkspaceRoot {
             _discard_subscription: discard_subscription,
             _discard_dialog_observer: None,
             _push_stash_subscription: push_stash_subscription,
+            _show_branch_file_subscription: show_branch_file_subscription,
             push_stash_dialog: None,
             _push_stash_dialog_observer: None,
             _show_commit_subscription: show_commit_subscription,

@@ -52,6 +52,27 @@ pub async fn diff_numstat_head(workdir: &Path) -> Result<HashMap<PathBuf, (u32, 
     parse_numstat_z(&raw.stdout)
 }
 
+/// Run `git diff --numstat -z -M <base> <head>` and parse into a
+/// `path → (added, removed)` map. Used by the "Committed on Branch"
+/// section to decorate each branch-committed file with its net line
+/// counts. Best-effort: a non-zero exit (bad range, no HEAD) yields an
+/// empty map rather than propagating.
+pub async fn diff_numstat_range(
+    workdir: &Path,
+    base: &str,
+    head: &str,
+) -> Result<HashMap<PathBuf, (u32, u32)>> {
+    let raw = GitCmd::new(workdir)
+        .timeout(NUMSTAT_TIMEOUT)
+        .args(["diff", "--numstat", "-z", "-M", base, head])
+        .run_raw()
+        .await?;
+    if !raw.status.success() {
+        return Ok(HashMap::new());
+    }
+    parse_numstat_z(&raw.stdout)
+}
+
 /// Run `git diff --numstat -z <sha>^..<sha>` and aggregate the per-file
 /// `(added, removed)` counts into a single `(total_added, total_removed)`
 /// pair for the commit. Feeds the commit-graph row's hover tooltip with

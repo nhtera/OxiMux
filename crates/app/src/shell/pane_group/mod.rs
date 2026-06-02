@@ -72,6 +72,13 @@ pub enum PaneGroupTabKind {
     Commit {
         sha: String,
     },
+    /// Read-only range diff for one file from the "Committed on Branch"
+    /// section (`merge_base..HEAD`). Dedup key is the path — clicking the
+    /// same branch file reactivates its tab. Not persisted (regenerates
+    /// from current branch state on click).
+    BranchFile {
+        path: PathBuf,
+    },
 }
 
 pub struct PaneGroupTab {
@@ -926,6 +933,64 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open or activate a read-only range-diff tab for one file from the
+    /// "Committed on Branch" section. Dedup key is the path. `base`/`head`
+    /// are the `merge_base`/`HEAD` OIDs the section was computed against;
+    /// the `DiffView` loads `diff_for_range(base, head, path)`.
+    pub fn open_or_activate_branch_diff_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        base: String,
+        head: String,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::BranchFile { path: p } if p == &path)
+        }) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let leaf = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("diff")
+            .to_string();
+        let title = leaf.clone();
+        let path_for_load = path.clone();
+        let view = cx.new(|cx| {
+            let mut v =
+                crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
+            v.load_range(base, head, path_for_load, title, cx);
+            v
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let label = SharedString::from(format!("{leaf} · branch"));
+        let tab = PaneGroupTab {
+            label,
+            content: PaneContent::Diff(view),
+            kind: PaneGroupTabKind::BranchFile { path },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn push_agent_tab(
         &mut self,
@@ -1320,7 +1385,8 @@ impl PaneGroup {
             PaneGroupTabKind::Terminal
             | PaneGroupTabKind::Editor { .. }
             | PaneGroupTabKind::Diff { .. }
-            | PaneGroupTabKind::Commit { .. } => false,
+            | PaneGroupTabKind::Commit { .. }
+            | PaneGroupTabKind::BranchFile { .. } => false,
         }) else {
             return false;
         };

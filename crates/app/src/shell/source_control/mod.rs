@@ -18,6 +18,7 @@
 
 pub mod ai_generation;
 pub mod ai_overlay;
+pub mod branch_commits;
 pub mod branch_picker;
 pub mod commit_area;
 pub mod commit_context_menu;
@@ -58,6 +59,7 @@ use tokio::sync::watch;
 
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::GitPanel;
+use crate::shell::source_control::branch_commits::BranchCommitsPanel;
 use crate::shell::source_control::branch_picker::{BranchPicker, OnPick, PickerMode};
 use crate::shell::source_control::commit_area::CommitArea;
 use crate::shell::source_control::dropdown_items::DropdownInputs;
@@ -154,6 +156,10 @@ pub struct SourceControlPanel {
     pub diff_view: Entity<DiffView>,
     pub commit_area: Entity<CommitArea>,
     pub commit_graph: Entity<CommitGraph>,
+    /// "Committed on Branch" section — files this branch carries vs its
+    /// base. `pub` so the host workspace can subscribe to its
+    /// `ShowBranchFileRequested` event and open the range-diff tab.
+    pub branch_commits: Entity<BranchCommitsPanel>,
     pub branch_picker: Entity<BranchPicker>,
     /// Stash list section docked between the commit area and the graph.
     /// Default collapsed (power-user surface; see `StashPanel::new`).
@@ -279,6 +285,24 @@ impl SourceControlPanel {
         let stash_panel =
             cx.new(|cx| StashPanel::new(repo.clone(), theme, density, typography.clone(), cx));
 
+        // "Committed on Branch" section. Seed from the initial poll
+        // snapshot (if any) so the section is correct on first paint
+        // rather than blank until the next tick.
+        let branch_commits = cx.new(|cx| {
+            let mut p = BranchCommitsPanel::new(theme, density, typography.clone());
+            if let Some(ref s) = git_state {
+                p.set_state(s.branch_committed.clone(), s.branch_range.clone(), cx);
+            }
+            p
+        });
+        // Host the section INSIDE the GitPanel's scroll list so it sits
+        // directly below CHANGES / UNTRACKED as one continuous, uniformly
+        // styled surface (rather than a detached block under the file
+        // list). The entity still owns its own state + click events.
+        git_panel.update(cx, |gp, cx| {
+            gp.set_branch_section(Some(branch_commits.clone().into()), cx);
+        });
+
         // Picker entity is built once and reused across opens — the
         // owner-side callback (built below from a weak self-ref) reads
         // the picker's current mode at fire time and routes the user's
@@ -326,6 +350,7 @@ impl SourceControlPanel {
             diff_view,
             commit_area,
             commit_graph,
+            branch_commits,
             branch_picker,
             stash_panel,
             theme,
@@ -484,6 +509,13 @@ impl SourceControlPanel {
                             let commit_area = panel.commit_area.clone();
                             commit_area.update(cx, |area, cx| {
                                 area.set_staged_snapshot(staged, cx)
+                            });
+                            // Feed the "Committed on Branch" section.
+                            let branch_commits = panel.branch_commits.clone();
+                            let bc_files = s.branch_committed.clone();
+                            let bc_range = s.branch_range.clone();
+                            branch_commits.update(cx, |p, cx| {
+                                p.set_state(bc_files, bc_range, cx)
                             });
                         }
                         panel.poll_state = state;
