@@ -79,6 +79,13 @@ pub enum PaneGroupTabKind {
     BranchFile {
         path: PathBuf,
     },
+    /// Combined multi-file diff (all-changes / staged / untracked / branch),
+    /// opened from a "View all" CTA in the SCM panel. Dedup key is the
+    /// scope's title so re-clicking the same CTA reactivates the tab. Not
+    /// persisted (regenerates from current git state on click).
+    CombinedDiff {
+        scope_key: SharedString,
+    },
 }
 
 pub struct PaneGroupTab {
@@ -991,6 +998,61 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open or activate a combined multi-file diff tab for `scope`. Dedup
+    /// key is the scope title ("All Changes" / "Staged Changes" /
+    /// "Untracked" / "Branch Diff") so re-clicking the same "View all" CTA
+    /// reactivates the existing tab. The new `DiffView` loads via
+    /// `load_combined` — the same multi-file render path commit/branch tabs
+    /// use, with per-file-group staging routing.
+    pub fn open_or_activate_combined_diff_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        scope: oximux_core::CombinedDiffScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        // Dedup by `tab_key` (range-aware for Branch) so switching branches
+        // opens a fresh tab; the display label stays the shorter `title`.
+        let scope_key = SharedString::from(scope.tab_key());
+        let label = SharedString::from(scope.title());
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::CombinedDiff { scope_key: k } if k == &scope_key)
+        }) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let scope_for_load = scope.clone();
+        let view = cx.new(|cx| {
+            let mut v =
+                crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
+            v.load_combined(scope_for_load, cx);
+            v
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let tab = PaneGroupTab {
+            label,
+            content: PaneContent::Diff(view),
+            kind: PaneGroupTabKind::CombinedDiff { scope_key },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn push_agent_tab(
         &mut self,
@@ -1386,7 +1448,8 @@ impl PaneGroup {
             | PaneGroupTabKind::Editor { .. }
             | PaneGroupTabKind::Diff { .. }
             | PaneGroupTabKind::Commit { .. }
-            | PaneGroupTabKind::BranchFile { .. } => false,
+            | PaneGroupTabKind::BranchFile { .. }
+            | PaneGroupTabKind::CombinedDiff { .. } => false,
         }) else {
             return false;
         };

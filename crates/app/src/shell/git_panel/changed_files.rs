@@ -10,17 +10,39 @@ use crate::shell::git_panel::discard_confirm::DiscardAllArea;
 use crate::shell::git_panel::row_renderer::{RowKind, row};
 use crate::shell::source_control::style as sc_style;
 use gpui::{
-    AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, div, px,
+    AnyElement, ClickEvent, Context, EventEmitter, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Styled, div, px,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
-use oximux_core::{FileStatus, IndexStatus, ViewMode, WorktreeStatus};
+use oximux_core::{CombinedDiffScope, FileStatus, IndexStatus, ViewMode, WorktreeStatus};
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+/// Emitted when a section's "View all" CTA is clicked. The host opens a
+/// combined multi-file diff tab for `scope` (CHANGES → all working-tree
+/// changes, STAGED → staged only, UNTRACKED → untracked only). The right
+/// SCM panel stays the primary navigator alongside it.
+#[derive(Debug, Clone)]
+pub struct ShowCombinedDiffRequested {
+    pub scope: CombinedDiffScope,
+}
+
+impl EventEmitter<ShowCombinedDiffRequested> for GitPanel {}
+
+/// The combined-diff scope a section's "View all" opens. CHANGES (unstaged)
+/// opens the full working-tree combined view; the staged/untracked sections
+/// scope to their own files.
+fn combined_scope_for(kind: RowKind) -> CombinedDiffScope {
+    match kind {
+        RowKind::Unstaged => CombinedDiffScope::AllChanges,
+        RowKind::Staged => CombinedDiffScope::Staged,
+        RowKind::Untracked => CombinedDiffScope::Untracked,
+    }
+}
 
 /// Borrowed-slice sectioning of `GitState::files` into Staged / Unstaged /
 /// Untracked. A partially-staged file (non-`Unmodified` on both sides) appears
@@ -383,6 +405,27 @@ fn section_hover_cluster(
 ) -> AnyElement {
     let area = area_for(kind);
     let mut cluster = div().flex().flex_row().items_center().gap(px(2.0));
+
+    // "View all" — opens this section's files in one combined diff tab. The
+    // right SCM panel stays the primary navigator; this is the full-pane
+    // review surface for scanning every change without clicking file by
+    // file. Leftmost so it reads before the staging actions. Emits an event
+    // the workspace turns into a combined-diff tab.
+    let view_all_scope = combined_scope_for(kind);
+    let view_all_id =
+        gpui::SharedString::from(format!("git-section-viewall-{}", header_id.as_ref()));
+    cluster = cluster.child(
+        Button::new(view_all_id)
+            .ghost()
+            .xsmall()
+            .label("View all")
+            .tooltip("Open all changes in a combined diff")
+            .on_click(cx.listener(move |_panel, _: &ClickEvent, _window, cx| {
+                cx.emit(ShowCombinedDiffRequested {
+                    scope: view_all_scope.clone(),
+                });
+            })),
+    );
 
     // Additive button on the left for CHANGES / UNTRACKED, "Unstage
     // all" for STAGED. All three live in the same visual slot.

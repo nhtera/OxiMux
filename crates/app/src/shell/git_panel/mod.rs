@@ -24,6 +24,7 @@ pub mod row_renderer;
 pub mod selection;
 pub mod tree_render;
 
+pub use changed_files::ShowCombinedDiffRequested;
 pub use discard_ops::{DiscardRequest, DiscardRequested, DiscardScope};
 
 use crate::actions::{RevertFile, StageFile, UnstageFile};

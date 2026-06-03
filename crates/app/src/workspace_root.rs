@@ -64,11 +64,12 @@ use crate::shell::{
     confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
     git_panel::{
-        DiscardRequested, GitPanel,
+        DiscardRequested, GitPanel, ShowCombinedDiffRequested,
         row_context_menu::{GitRowContextMenu, GitRowContextTarget},
     },
     source_control::{
-        branch_commits::ShowBranchFileRequested, commit_context_menu::CommitContextMenu,
+        branch_commits::{ShowBranchDiffAllRequested, ShowBranchFileRequested},
+        commit_context_menu::CommitContextMenu,
         graph::ShowCommitRequested,
     },
     stash_panel::{
@@ -221,6 +222,14 @@ pub struct WorkspaceRoot {
     /// section; the handler opens a read-only range-diff tab in the active
     /// pane group. Same lifetime contract as `_show_commit_subscription`.
     pub(crate) _show_branch_file_subscription: Option<Subscription>,
+    /// Long-lived subscription on `GitPanel::ShowCombinedDiffRequested`.
+    /// Fired by a section "View all" CTA; opens a combined multi-file diff
+    /// tab. Same lifetime contract as `_show_commit_subscription`.
+    pub(crate) _show_combined_diff_subscription: Option<Subscription>,
+    /// Long-lived subscription on `BranchCommitsPanel::ShowBranchDiffAllRequested`.
+    /// Fired by the branch section's "View all" CTA; opens a combined
+    /// read-only range diff. Same lifetime contract as above.
+    pub(crate) _show_branch_diff_all_subscription: Option<Subscription>,
 }
 
 impl WorkspaceRoot {
@@ -587,6 +596,63 @@ impl WorkspaceRoot {
                     },
                 )
             });
+
+        // Subscribe to the SCM panel section "View all" CTAs. The event
+        // carries the combined scope (all-changes / staged / untracked); the
+        // handler opens a combined multi-file diff tab in the active group.
+        // Same capture + lifetime contract as the commit subscription.
+        let show_combined_diff_subscription = right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+            .map(|sc| {
+                let sc_ref = sc.read(cx);
+                (sc_ref.git_panel.clone(), sc_ref.repo.clone())
+            })
+            .map(|(panel, repo)| {
+                cx.subscribe_in(
+                    &panel,
+                    window,
+                    move |root, _panel, ev: &ShowCombinedDiffRequested, window, cx| {
+                        let Some(panes) = root.active_project_panes() else {
+                            return;
+                        };
+                        let scope = ev.scope.clone();
+                        let repo = repo.clone();
+                        panes.update(cx, |p, cx| {
+                            p.open_or_activate_combined_diff_tab(repo, scope, window, cx);
+                        });
+                    },
+                )
+            });
+
+        // Subscribe to the "Committed on Branch" section's "View all" CTA.
+        // Opens a combined read-only diff of every file in the branch range.
+        let show_branch_diff_all_subscription = right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+            .map(|sc| {
+                let sc_ref = sc.read(cx);
+                (sc_ref.branch_commits.clone(), sc_ref.repo.clone())
+            })
+            .map(|(panel, repo)| {
+                cx.subscribe_in(
+                    &panel,
+                    window,
+                    move |root, _panel, ev: &ShowBranchDiffAllRequested, window, cx| {
+                        let Some(panes) = root.active_project_panes() else {
+                            return;
+                        };
+                        let scope = oximux_core::CombinedDiffScope::Branch {
+                            base: ev.base.clone(),
+                            head: ev.head.clone(),
+                        };
+                        let repo = repo.clone();
+                        panes.update(cx, |p, cx| {
+                            p.open_or_activate_combined_diff_tab(repo, scope, window, cx);
+                        });
+                    },
+                )
+            });
         Self {
             theme,
             density,
@@ -612,6 +678,8 @@ impl WorkspaceRoot {
             _discard_dialog_observer: None,
             _push_stash_subscription: push_stash_subscription,
             _show_branch_file_subscription: show_branch_file_subscription,
+            _show_combined_diff_subscription: show_combined_diff_subscription,
+            _show_branch_diff_all_subscription: show_branch_diff_all_subscription,
             push_stash_dialog: None,
             _push_stash_dialog_observer: None,
             _show_commit_subscription: show_commit_subscription,

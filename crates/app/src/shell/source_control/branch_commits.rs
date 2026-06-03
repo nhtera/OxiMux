@@ -44,7 +44,17 @@ pub struct BranchCommitsPanel {
     collapsed: bool,
 }
 
+/// Emitted when the section header's "View all" CTA is clicked. Carries the
+/// `merge_base..head` range so the host opens a combined read-only diff of
+/// every file committed on the branch.
+#[derive(Debug, Clone)]
+pub struct ShowBranchDiffAllRequested {
+    pub base: String,
+    pub head: String,
+}
+
 impl EventEmitter<ShowBranchFileRequested> for BranchCommitsPanel {}
+impl EventEmitter<ShowBranchDiffAllRequested> for BranchCommitsPanel {}
 
 impl BranchCommitsPanel {
     pub fn new(theme: Theme, density: Density, typography: Typography) -> Self {
@@ -98,8 +108,38 @@ impl Render for BranchCommitsPanel {
         } else {
             IconName::ChevronDown
         };
+        // "View all" — opens a combined read-only diff of every file
+        // committed on the branch. Hover-revealed (like git_panel's section
+        // clusters), only when a range is known. Stops click propagation so
+        // it doesn't toggle the section collapse.
+        let r_xs = self.density.r_xs;
+        let view_all = self.range.as_ref().map(|range| {
+            let base = range.merge_base.clone();
+            let head = range.head.clone();
+            div()
+                .id("branch-commits-view-all")
+                .ml_auto()
+                .invisible()
+                .group_hover("branch-commits-header", |s| s.visible())
+                .px(px(6.0))
+                .py(px(1.0))
+                .rounded(px(r_xs))
+                .text_size(px(sc_style::GRAPH_META_TEXT))
+                .text_color(theme.fg_muted)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+                .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    cx.emit(ShowBranchDiffAllRequested {
+                        base: base.clone(),
+                        head: head.clone(),
+                    });
+                }))
+                .child("View all")
+        });
         let header = div()
             .id("branch-commits-header")
+            .group("branch-commits-header")
             .flex()
             .items_center()
             .gap(px(4.0))
@@ -118,7 +158,8 @@ impl Render for BranchCommitsPanel {
                 div()
                     .text_color(theme.fg_subtle)
                     .child(format!("{}", self.files.len())),
-            );
+            )
+            .children(view_all);
 
         // `pt(pad_panel)` mirrors the inter-section breathing room git_panel's
         // `section()` adds to every non-topmost file section, so the gap above

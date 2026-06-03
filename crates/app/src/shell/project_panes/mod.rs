@@ -672,6 +672,29 @@ impl ProjectPanes {
         }))
     }
 
+    /// Mirrors `open_or_activate_commit_tab` but routes through
+    /// `PaneGroup::open_or_activate_combined_diff_tab` — a combined
+    /// multi-file diff for `scope` (SCM "View all" CTAs), deduped by the
+    /// scope's title.
+    pub fn open_or_activate_combined_diff_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        scope: oximux_core::CombinedDiffScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied())?;
+        self.set_active_group(target_id, window, cx);
+        let target = self.groups.get(&target_id)?.clone();
+        Some(target.update(cx, |g, cx| {
+            g.open_or_activate_combined_diff_tab(repo, scope, window, cx)
+        }))
+    }
+
     pub fn open_terminal_tab_in_active_group(
         &mut self,
         window: &mut Window,
@@ -897,7 +920,8 @@ impl ProjectPanes {
                     // compact.
                     PaneGroupTabKind::Diff { .. }
                     | PaneGroupTabKind::Commit { .. }
-                    | PaneGroupTabKind::BranchFile { .. } => continue,
+                    | PaneGroupTabKind::BranchFile { .. }
+                    | PaneGroupTabKind::CombinedDiff { .. } => continue,
                     PaneGroupTabKind::Agent {
                         adapter,
                         adapter_id,

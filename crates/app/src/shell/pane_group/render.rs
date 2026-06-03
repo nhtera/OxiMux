@@ -235,7 +235,8 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         // but the visual chrome is identical.
         PaneGroupTabKind::Diff { .. }
         | PaneGroupTabKind::Commit { .. }
-        | PaneGroupTabKind::BranchFile { .. } => PaneTabKindMarker::Diff,
+        | PaneGroupTabKind::BranchFile { .. }
+        | PaneGroupTabKind::CombinedDiff { .. } => PaneTabKindMarker::Diff,
     }
 }
 
@@ -1350,7 +1351,8 @@ fn render_mru_hud(
             PaneGroupTabKind::Editor { .. }
             | PaneGroupTabKind::Diff { .. }
             | PaneGroupTabKind::Commit { .. }
-            | PaneGroupTabKind::BranchFile { .. } => "icons/file.svg",
+            | PaneGroupTabKind::BranchFile { .. }
+            | PaneGroupTabKind::CombinedDiff { .. } => "icons/file.svg",
             PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. } => {
                 "icons/square-terminal.svg"
             }

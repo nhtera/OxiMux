@@ -84,6 +84,75 @@ pub struct FileDiff {
 /// 1000 visible lines → renderer should collapse by default.
 pub const LARGE_DIFF_LINE_THRESHOLD: usize = 1000;
 
+/// Which working-tree partition a file in a combined diff belongs to. Drives
+/// staging routing (a region in an `Unstaged` file stages; in a `Staged`
+/// file unstages) and the read-at-rest vs stageable distinction (`Committed`
+/// is a historical range — read-only). Runs PARALLEL to a combined view's
+/// `Vec<FileDiff>` so every file knows its own action side without a second
+/// git query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileGroup {
+    /// Worktree change not yet staged — Stage / Discard apply.
+    Unstaged,
+    /// Change already in the index — Unstage applies.
+    Staged,
+    /// New file git doesn't track yet — whole-file stage only (no per-hunk).
+    Untracked,
+    /// Already committed (a branch/commit range) — read-only, no staging.
+    Committed,
+}
+
+/// Request describing which slice of the working tree a combined diff covers.
+/// The entry point (a "View all" CTA per SCM section) picks the scope; the
+/// git layer assembles the matching ordered `Vec<FileDiff>` + parallel
+/// `Vec<FileGroup>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CombinedDiffScope {
+    /// Everything in the working tree: unstaged, then staged, then untracked
+    /// — one file appearing in both index and worktree shows under BOTH
+    /// (each side stages/unstages independently).
+    AllChanges,
+    /// Staged (index-vs-HEAD) changes only.
+    Staged,
+    /// Untracked files only.
+    Untracked,
+    /// A committed revision range (`base..head`), all files — read-only.
+    Branch { base: String, head: String },
+}
+
+impl CombinedDiffScope {
+    /// Human label for the combined-diff tab.
+    pub fn title(&self) -> &'static str {
+        match self {
+            CombinedDiffScope::AllChanges => "All Changes",
+            CombinedDiffScope::Staged => "Staged Changes",
+            CombinedDiffScope::Untracked => "Untracked",
+            CombinedDiffScope::Branch { .. } => "Branch Diff",
+        }
+    }
+
+    /// Stable dedup key for the combined-diff tab. Distinct per scope AND,
+    /// for `Branch`, per range — so switching branches opens a fresh tab
+    /// instead of silently reactivating a stale one (the `title()` is shared
+    /// across all branch ranges, but the range itself isn't). The display
+    /// label stays `title()`.
+    pub fn tab_key(&self) -> String {
+        match self {
+            CombinedDiffScope::Branch { base, head } => format!("Branch Diff {base}..{head}"),
+            other => other.title().to_string(),
+        }
+    }
+}
+
+/// Result of assembling a combined diff: the merged file list plus a parallel
+/// group tag per file (`groups[i]` describes `diffs[i]`). Invariant:
+/// `diffs.len() == groups.len()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedDiff {
+    pub diffs: Vec<FileDiff>,
+    pub groups: Vec<FileGroup>,
+}
+
 /// Context lines kept around each change cluster when re-deriving
 /// stageable sub-hunks. Matches `git diff -U3` / `git add -p` granularity.
 pub const HUNK_CONTEXT: usize = 3;

@@ -21,8 +21,8 @@ pub mod workspace;
 pub use agent_session::{AgentSession, AgentSessionId, AgentStatus};
 pub use conflict_kind::ConflictKind;
 pub use git_diff::{
-    ChangeRegion, DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, HUNK_CONTEXT,
-    LARGE_DIFF_LINE_THRESHOLD, change_regions,
+    ChangeRegion, CombinedDiff, CombinedDiffScope, DiffHunk, DiffLine, DiffLineKind, DiffStatus,
+    FileDiff, FileGroup, HUNK_CONTEXT, LARGE_DIFF_LINE_THRESHOLD, change_regions,
 };
 pub use git_ops::{BranchInfo, GitOperation, MergeOutcome, StashEntry, StashRef, WorktreeInfo};
 pub use git_state::{

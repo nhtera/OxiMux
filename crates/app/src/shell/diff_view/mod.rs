@@ -39,7 +39,7 @@ use gpui::{
     Task, UniformListScrollHandle, Window, div, px,
 };
 use gpui_component::{Icon, Sizable as _};
-use oximux_core::FileDiff;
+use oximux_core::{CombinedDiffScope, FileDiff, FileGroup};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
@@ -123,9 +123,29 @@ pub enum DiffViewState {
         title: String,
         error: String,
     },
+    /// Combined multi-file working-tree mode: every changed file in `scope`
+    /// (all-changes / staged / untracked / branch-range) in one virtualized
+    /// scroll. `groups[i]` tags `diffs[i]`'s partition so per-region staging
+    /// routes the right side (Unstaged→stage, Staged→unstage) and read-only
+    /// `Committed` files suppress chips. Reloads re-run `load_combined(scope)`
+    /// so a stage inside any file refreshes the whole combined view in place.
+    CombinedLoading {
+        scope: CombinedDiffScope,
+    },
+    CombinedReady {
+        scope: CombinedDiffScope,
+        diffs: Vec<FileDiff>,
+        /// Parallel to `diffs` — the partition tag driving staging routing.
+        groups: Vec<FileGroup>,
+        expanded: bool,
+    },
+    CombinedFailed {
+        scope: CombinedDiffScope,
+        error: String,
+    },
 }
 
-/// Public visibility-decision payload returned by `DiffView::current_side`.
+/// Public visibility-decision payload returned by `DiffView::side_for_region`.
 /// Drives the `hunk_actions` overlay's button gating without exposing
 /// the full `DiffViewState` enum to the renderer.
 #[derive(Debug, Clone, Copy)]
@@ -134,14 +154,31 @@ pub struct HunkActionSide {
     pub untracked: bool,
 }
 
+/// How a post-hunk-op reload re-fetches the diff. Single-file mode replays
+/// `load()` with the same routing the initial fetch used; combined mode
+/// replays `load_combined(scope)` so staging inside one file refreshes the
+/// whole combined view instead of collapsing it to a single file.
+enum ReloadTarget {
+    Single {
+        path: PathBuf,
+        staged: bool,
+        untracked: bool,
+    },
+    Combined {
+        scope: CombinedDiffScope,
+    },
+}
+
 /// Snapshot of the file under cursor + the routing fields needed for a
 /// post-op reload. Kept private — `stage_hunk` / `unstage_hunk` /
 /// `confirmed_discard_hunk` build one before spawning their tokio task.
+/// `staged`/`untracked` are the file's OWN action side (per-file-group in
+/// combined mode), gating which op is legal.
 struct HunkTarget {
-    path: PathBuf,
     staged: bool,
     untracked: bool,
     file: FileDiff,
+    reload: ReloadTarget,
 }
 
 pub struct DiffView {
@@ -318,7 +355,8 @@ impl DiffView {
         match &self.state {
             DiffViewState::Ready { diffs, .. }
             | DiffViewState::CommitReady { diffs, .. }
-            | DiffViewState::RangeReady { diffs, .. } => diffs.len(),
+            | DiffViewState::RangeReady { diffs, .. }
+            | DiffViewState::CombinedReady { diffs, .. } => diffs.len(),
             _ => 0,
         }
     }
@@ -488,6 +526,10 @@ impl DiffView {
                     (base.clone(), head.clone(), path.clone(), title.clone());
                 self.load_range(base, head, path, title, cx);
             }
+            DiffViewState::CombinedFailed { scope, .. } => {
+                let scope = scope.clone();
+                self.load_combined(scope, cx);
+            }
             _ => {}
         }
     }
@@ -496,7 +538,7 @@ impl DiffView {
     /// file/staged routing — uses `repo.commit_files(sha)` to fetch
     /// every file the commit touches, then mounts them in the same
     /// `Vec<FileDiff>` shape the unstaged/staged path uses. Hunk
-    /// action chips do NOT render on this side (`current_side`
+    /// action chips do NOT render on this side (`side_for_region`
     /// returns `None` whenever the state isn't the file-mode `Ready`).
     pub fn load_commit(
         &mut self,
@@ -686,6 +728,84 @@ impl DiffView {
         }
     }
 
+    /// Begin loading a combined multi-file diff for `scope`. Fans out to
+    /// `repo.diff_combined(scope)` (staged + unstaged + untracked, or a
+    /// scoped subset) and lands in the `Combined*` states. The same
+    /// `Vec<FileDiff>` render path serves single-file, commit, range, and
+    /// combined views; only the staging routing differs (per-file-group).
+    pub fn load_combined(&mut self, scope: CombinedDiffScope, cx: &mut Context<Self>) {
+        // Same drop-on-entry + fresh-selection reset as `load()`.
+        self._op_task = None;
+        self.invalidate_prepared();
+        self.collapsed.clear();
+        self.expanded_folds.clear();
+        self.state = DiffViewState::CombinedLoading {
+            scope: scope.clone(),
+        };
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<Result<oximux_core::CombinedDiff, String>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let scope_for_fetch = scope.clone();
+                handle.spawn(async move {
+                    let r = repo
+                        .diff_combined(scope_for_fetch)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(r);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::diff_view",
+                    "no tokio runtime entered; combined load skipped"
+                );
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.apply_combined_result(scope, result);
+                cx.notify();
+            });
+        });
+        self._load_task = Some(task);
+    }
+
+    fn apply_combined_result(
+        &mut self,
+        scope: CombinedDiffScope,
+        result: Result<oximux_core::CombinedDiff, String>,
+    ) {
+        match result {
+            Ok(combined) => {
+                // Preserve `expanded` across reloads of the SAME scope (a hunk
+                // op chains a combined reload); a different scope starts
+                // collapsed.
+                let expanded = match &self.state {
+                    DiffViewState::CombinedReady {
+                        scope: prev,
+                        expanded: prev_expanded,
+                        ..
+                    } if *prev == scope => *prev_expanded,
+                    _ => false,
+                };
+                self.state = DiffViewState::CombinedReady {
+                    scope,
+                    diffs: combined.diffs,
+                    groups: combined.groups,
+                    expanded,
+                };
+            }
+            Err(error) => {
+                self.state = DiffViewState::CombinedFailed { scope, error };
+            }
+        }
+    }
+
     /// Toggle a large-diff file from collapsed → expanded. Invoked by the
     /// `ExpandDiff` action and the click on the expand row in `render.rs`.
     /// Applies to both file-mode Ready and commit-detail CommitReady —
@@ -696,6 +816,7 @@ impl DiffView {
             DiffViewState::Ready { expanded, .. } => *expanded = true,
             DiffViewState::CommitReady { expanded, .. } => *expanded = true,
             DiffViewState::RangeReady { expanded, .. } => *expanded = true,
+            DiffViewState::CombinedReady { expanded, .. } => *expanded = true,
             _ => {}
         }
         // Expanding a collapsed large diff changes which rows render — drop
@@ -778,28 +899,63 @@ impl DiffView {
         self.invalidate_prepared();
     }
 
-    /// Inspector for the host: which side (staged vs unstaged) is on
-    /// screen, and is the file untracked. Drives the `hunk_actions`
-    /// overlay's button visibility — Stage shows when `!staged`, Unstage
-    /// when `staged`, Discard when `!staged && !untracked`. Returns
-    /// `None` when the view isn't in `Ready`.
-    pub fn current_side(&self) -> Option<HunkActionSide> {
-        let DiffViewState::Ready {
-            staged, untracked, ..
-        } = &self.state
-        else {
-            return None;
+    /// Test-only: stamp the view into `CombinedReady` with pre-fetched diffs
+    /// + parallel group tags, bypassing the async `load_combined` chain.
+    #[doc(hidden)]
+    pub fn seed_combined_for_test(
+        &mut self,
+        scope: CombinedDiffScope,
+        diffs: Vec<FileDiff>,
+        groups: Vec<FileGroup>,
+    ) {
+        self.state = DiffViewState::CombinedReady {
+            scope,
+            diffs,
+            groups,
+            expanded: false,
         };
-        Some(HunkActionSide {
-            staged: *staged,
-            untracked: *untracked,
-        })
+        self.invalidate_prepared();
+    }
+
+    /// Which action side applies to the region in `file_idx` — gating the
+    /// floating staging card. In single-file `Ready` every region shares the
+    /// view's `(staged, untracked)`. In `CombinedReady` it's resolved
+    /// per-file from the group tag (`Unstaged`→stage, `Staged`→unstage,
+    /// `Untracked`→whole-file only, `Committed`→read-only/no card). Returns
+    /// `None` for commit/range views (read-only) and out-of-range indices.
+    pub fn side_for_region(&self, file_idx: usize) -> Option<HunkActionSide> {
+        match &self.state {
+            DiffViewState::Ready {
+                staged, untracked, ..
+            } => Some(HunkActionSide {
+                staged: *staged,
+                untracked: *untracked,
+            }),
+            DiffViewState::CombinedReady { groups, .. } => match groups.get(file_idx)? {
+                FileGroup::Unstaged => Some(HunkActionSide {
+                    staged: false,
+                    untracked: false,
+                }),
+                FileGroup::Staged => Some(HunkActionSide {
+                    staged: true,
+                    untracked: false,
+                }),
+                FileGroup::Untracked => Some(HunkActionSide {
+                    staged: false,
+                    untracked: true,
+                }),
+                // Already committed — no staging chrome.
+                FileGroup::Committed => None,
+            },
+            _ => None,
+        }
     }
 
     /// Build a STAGING snapshot for `file_idx`: a `FileDiff` whose `hunks`
     /// are the file's stageable change regions (from `change_regions`), not
-    /// its full-file display hunks. Returns `None` when the view isn't
-    /// Ready or `file_idx` is out of range.
+    /// its full-file display hunks. Returns `None` when the view isn't a
+    /// stageable mode (`Ready`/`CombinedReady`), the file is read-only
+    /// (`Committed` group), or `file_idx` is out of range.
     ///
     /// Diffs are fetched with full-file context so the user can scroll the
     /// whole document, which collapses every edit into one giant hunk. The
@@ -807,18 +963,48 @@ impl DiffView {
     /// rebuilds a `FileDiff` carrying one `git apply`-ready hunk per region
     /// — then `repo.stage_hunks(&file, &[region_idx])` works unchanged with
     /// per-region (git add -p) granularity instead of whole-file ops.
+    ///
+    /// In combined mode the file's own path + group drive the op + reload:
+    /// the op targets that file, and the post-op reload re-runs the combined
+    /// scope (not a single-file load) so the whole view refreshes in place.
     fn hunk_target(&self, file_idx: usize) -> Option<HunkTarget> {
-        let DiffViewState::Ready {
-            path,
-            staged,
-            untracked,
-            diffs,
-            ..
-        } = &self.state
-        else {
-            return None;
+        let (orig, staged, untracked, reload) = match &self.state {
+            DiffViewState::Ready {
+                path,
+                staged,
+                untracked,
+                diffs,
+                ..
+            } => {
+                let orig = diffs.get(file_idx)?;
+                let reload = ReloadTarget::Single {
+                    path: path.clone(),
+                    staged: *staged,
+                    untracked: *untracked,
+                };
+                (orig, *staged, *untracked, reload)
+            }
+            DiffViewState::CombinedReady {
+                scope,
+                diffs,
+                groups,
+                ..
+            } => {
+                let orig = diffs.get(file_idx)?;
+                let (staged, untracked) = match groups.get(file_idx)? {
+                    FileGroup::Unstaged => (false, false),
+                    FileGroup::Staged => (true, false),
+                    FileGroup::Untracked => (false, true),
+                    // Read-only: never stageable, even if a chip somehow fired.
+                    FileGroup::Committed => return None,
+                };
+                let reload = ReloadTarget::Combined {
+                    scope: scope.clone(),
+                };
+                (orig, staged, untracked, reload)
+            }
+            _ => return None,
         };
-        let orig = diffs.get(file_idx)?;
         let regions = oximux_core::change_regions(orig);
         let file = FileDiff {
             path: orig.path.clone(),
@@ -827,10 +1013,10 @@ impl DiffView {
             large: false,
         };
         Some(HunkTarget {
-            path: path.clone(),
-            staged: *staged,
-            untracked: *untracked,
+            staged,
+            untracked,
             file,
+            reload,
         })
     }
 
@@ -850,7 +1036,7 @@ impl DiffView {
         }
         let repo = self.repo.clone();
         let file = target.file;
-        self.spawn_hunk_op(target.path, target.staged, target.untracked, cx, async move {
+        self.spawn_hunk_op(target.reload, cx, async move {
             repo.stage_hunks(&file, &[hunk_idx])
                 .await
                 .map_err(|e| e.to_string())
@@ -873,7 +1059,7 @@ impl DiffView {
         }
         let repo = self.repo.clone();
         let file = target.file;
-        self.spawn_hunk_op(target.path, target.staged, target.untracked, cx, async move {
+        self.spawn_hunk_op(target.reload, cx, async move {
             repo.unstage_hunks(&file, &[hunk_idx])
                 .await
                 .map_err(|e| e.to_string())
@@ -970,7 +1156,7 @@ impl DiffView {
         }
         let repo = self.repo.clone();
         let file = target.file;
-        self.spawn_hunk_op(target.path, target.staged, target.untracked, cx, async move {
+        self.spawn_hunk_op(target.reload, cx, async move {
             repo.discard_hunks(&file, &[hunk_idx])
                 .await
                 .map_err(|e| e.to_string())
@@ -978,18 +1164,13 @@ impl DiffView {
     }
 
     /// Shared tokio→oneshot→gpui machinery for stage / unstage / discard.
-    /// Spawns the future on tokio, awaits on the gpui side, and reloads
-    /// the diff via `load()` with the same routing the initial fetch
-    /// used. Errors from the underlying git op are logged; the reload
-    /// still runs so the user sees the actual git state.
-    fn spawn_hunk_op<F>(
-        &mut self,
-        path: PathBuf,
-        staged: bool,
-        untracked: bool,
-        cx: &mut Context<Self>,
-        op: F,
-    ) where
+    /// Spawns the future on tokio, awaits on the gpui side, and reloads the
+    /// diff via `reload` (single-file `load` or `load_combined`) with the
+    /// same routing the initial fetch used. Errors from the underlying git
+    /// op are logged; the reload still runs so the user sees the actual git
+    /// state.
+    fn spawn_hunk_op<F>(&mut self, reload: ReloadTarget, cx: &mut Context<Self>, op: F)
+    where
         F: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
         // Remember where the reader is BEFORE the op so the post-op reload
@@ -1023,10 +1204,18 @@ impl DiffView {
                 );
             }
             let _ = this.update(cx, |view, cx| {
-                // `load` clears any anchor via `collapsed.clear()`-adjacent
-                // reset, so set it AFTER load schedules the reload — it's
-                // consumed on the next prepared rebuild once Ready lands.
-                view.load(path, staged, untracked, cx);
+                // `load`/`load_combined` clears any anchor via the
+                // `collapsed.clear()`-adjacent reset, so set it AFTER the
+                // reload is scheduled — it's consumed on the next prepared
+                // rebuild once the Ready state lands.
+                match reload {
+                    ReloadTarget::Single {
+                        path,
+                        staged,
+                        untracked,
+                    } => view.load(path, staged, untracked, cx),
+                    ReloadTarget::Combined { scope } => view.load_combined(scope, cx),
+                }
                 view.pending_scroll_anchor = Some(anchor);
             });
         });
@@ -1079,6 +1268,9 @@ impl Render for DiffView {
                     diffs, expanded, ..
                 }
                 | DiffViewState::RangeReady {
+                    diffs, expanded, ..
+                }
+                | DiffViewState::CombinedReady {
                     diffs, expanded, ..
                 } => {
                     let plan = build_render_plan(diffs, *expanded);
@@ -1149,10 +1341,6 @@ impl Render for DiffView {
             density: self.density,
             typography: &self.typography,
         };
-        // Resolve action-chip visibility BEFORE the match — inside the
-        // arm, `&self.state` is borrowed and `current_side` (which reads
-        // `&self.state`) would conflict.
-        let side = self.current_side();
         let hovered_region = self.hovered_region;
         let split = self.split;
         let split_h_offset = self.split_h_offset;
@@ -1237,6 +1425,29 @@ impl Render for DiffView {
                 )
                 .into_any_element()
             }
+            DiffViewState::CombinedLoading { scope } => {
+                loading_state(scope.title(), &rctx).into_any_element()
+            }
+            DiffViewState::CombinedFailed { scope, error } => {
+                failed_state(scope.title(), error, &rctx, cx).into_any_element()
+            }
+            DiffViewState::CombinedReady { .. } => {
+                // Stageable per-file-group: the card overlay resolves
+                // `side_for_region` per the hovered file's tag (Unstaged →
+                // Stage, Staged → Unstage, Committed → none).
+                let rows = self.prepared.clone().unwrap_or_default();
+                render_rows(
+                    rows,
+                    hovered_region,
+                    self.prepared_widest,
+                    split,
+                    split_h_offset,
+                    &self.scroll_handle,
+                    &rctx,
+                    weak,
+                )
+                .into_any_element()
+            }
         };
         // The body owns its own scrolling now: `Ready`/`CommitReady` return
         // a `uniform_list` (flex_1 + min_h(0)) that virtualizes rows and
@@ -1251,6 +1462,7 @@ impl Render for DiffView {
             DiffViewState::Ready { .. }
                 | DiffViewState::CommitReady { .. }
                 | DiffViewState::RangeReady { .. }
+                | DiffViewState::CombinedReady { .. }
         );
         let toolbar = has_body.then(|| {
             let label = if split { "Inline" } else { "Side by side" };
@@ -1411,12 +1623,14 @@ impl Render for DiffView {
         // Floating Stage/Discard card for the hovered region — pinned to the
         // viewport's right edge at the anchor row's on-screen Y (so it's
         // always visible regardless of the changed line's length or the
-        // horizontal scroll). Gated on `side`: only the unstaged working-tree
-        // view stages; commit/range/staged views resolve `side = None`.
+        // horizontal scroll). Gated on the hovered region's per-file side:
+        // single-file `Ready` and combined `Unstaged`/`Staged` files stage;
+        // commit/range views and `Committed`/`Untracked`-resolved sides that
+        // return `None` show no card.
         if has_body
-            && let Some(side) = side
             && let Some(region) = hovered_region
             && let Some(row) = self.hovered_row
+            && let Some(side) = self.side_for_region(region.0)
         {
             let h = self.density.h_row;
             let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);

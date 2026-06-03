@@ -9,7 +9,7 @@ use crate::error::{GitError, Result};
 use crate::numstat;
 use crate::process::GitCmd;
 use crate::status;
-use oximux_core::{BranchInfo, FileDiff, GitState};
+use oximux_core::{BranchInfo, CombinedDiff, CombinedDiffScope, FileDiff, FileGroup, GitState};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -396,6 +396,91 @@ impl Repository {
         let raw = std::str::from_utf8(&out.stdout)
             .map_err(|e| GitError::parse(format!("show stdout not utf-8: {e}")))?;
         Ok(parse_unified_diff(raw)?)
+    }
+
+    /// Full-context diff of an arbitrary revision range (`<base> <head>`) for
+    /// EVERY changed file — the all-files counterpart to `diff_for_range`.
+    /// Powers the combined "Branch Diff" view. Read-only (already committed),
+    /// so callers suppress staging chips.
+    pub async fn diff_range_all(&self, base: &str, head: &str) -> Result<Vec<FileDiff>> {
+        self.diff_with_args(&[FULL_FILE_CONTEXT, base, head], None)
+            .await
+    }
+
+    /// Assemble a combined multi-file diff for `scope`, returning the merged
+    /// `Vec<FileDiff>` plus a parallel `Vec<FileGroup>` tagging each file's
+    /// partition. Uses FULL-file context everywhere (like `diff_for_path`) so
+    /// the combined view scrolls whole documents and per-region staging via
+    /// `change_regions` keeps `git add -p` granularity.
+    ///
+    /// `AllChanges` order is unstaged → staged → untracked (the SCM panel's
+    /// section order). A file changed in both index and worktree appears in
+    /// BOTH the unstaged and staged slices — each stages/unstages its own
+    /// side independently, so they're kept as separate entries.
+    pub async fn diff_combined(&self, scope: CombinedDiffScope) -> Result<CombinedDiff> {
+        let mut diffs: Vec<FileDiff> = Vec::new();
+        let mut groups: Vec<FileGroup> = Vec::new();
+        let mut push_all = |ds: Vec<FileDiff>, g: FileGroup| {
+            for d in ds {
+                diffs.push(d);
+                groups.push(g);
+            }
+        };
+        match scope {
+            CombinedDiffScope::AllChanges => {
+                // Concurrent: worktree-vs-index, index-vs-HEAD, and a status
+                // scan to enumerate untracked paths (git diff ignores those).
+                let (unstaged, staged, state) = tokio::join!(
+                    self.diff_with_args(&[FULL_FILE_CONTEXT], None),
+                    self.diff_with_args(&[FULL_FILE_CONTEXT, "--cached"], None),
+                    self.status(),
+                );
+                push_all(unstaged?, FileGroup::Unstaged);
+                push_all(staged?, FileGroup::Staged);
+                push_all(self.untracked_diffs(&state?).await, FileGroup::Untracked);
+            }
+            CombinedDiffScope::Staged => {
+                let staged = self
+                    .diff_with_args(&[FULL_FILE_CONTEXT, "--cached"], None)
+                    .await?;
+                push_all(staged, FileGroup::Staged);
+            }
+            CombinedDiffScope::Untracked => {
+                let state = self.status().await?;
+                push_all(self.untracked_diffs(&state).await, FileGroup::Untracked);
+            }
+            CombinedDiffScope::Branch { base, head } => {
+                let ranged = self.diff_range_all(&base, &head).await?;
+                push_all(ranged, FileGroup::Committed);
+            }
+        }
+        Ok(CombinedDiff { diffs, groups })
+    }
+
+    /// Synthesize all-additions diffs for every untracked file in `state`.
+    /// Untracked = porcelain `??` (Untracked on BOTH sides); git's `diff`
+    /// skips these, so each is read off disk via `diff_for_untracked`. A
+    /// single file's read failure is logged and skipped — the rest of the
+    /// combined view still renders.
+    async fn untracked_diffs(&self, state: &GitState) -> Vec<FileDiff> {
+        use oximux_core::{IndexStatus, WorktreeStatus};
+        let mut out = Vec::new();
+        for f in &state.files {
+            let is_untracked = matches!(f.index, IndexStatus::Untracked)
+                && matches!(f.worktree, WorktreeStatus::Untracked);
+            if !is_untracked {
+                continue;
+            }
+            match self.diff_for_untracked(&f.path).await {
+                Ok(mut ds) => out.append(&mut ds),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    path = %f.path.display(),
+                    "untracked diff synth failed; skipping in combined view"
+                ),
+            }
+        }
+        out
     }
 
     async fn diff_with_args(&self, extra: &[&str], path: Option<&Path>) -> Result<Vec<FileDiff>> {
