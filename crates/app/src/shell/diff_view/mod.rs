@@ -26,7 +26,10 @@ pub mod word_diff;
 
 use crate::actions::{ExpandDiff, RetryDiff};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
-use crate::shell::diff_view::paint::{PreparedRow, prepare, render_rows};
+use crate::shell::diff_view::paint::{
+    OverviewRun, PreparedRow, overview_ruler, overview_runs, prepare, prepare_split, render_rows,
+    widest_row_chars, widest_row_index,
+};
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -173,6 +176,33 @@ pub struct DiffView {
     /// off the scroll path. `None` means "stale, rebuild on next render";
     /// every state transition that changes the body resets it.
     prepared: Option<Rc<Vec<PreparedRow>>>,
+    /// Side-by-side toggle. `false` → unified/inline body (default); `true`
+    /// → original | modified columns. Flipping it rebuilds `prepared` (the
+    /// two modes emit different row sets) so it routes through
+    /// `invalidate_prepared`.
+    split: bool,
+    /// Index of the widest prepared row — the `uniform_list` measurement
+    /// item that sets the horizontal scroll range. Recomputed alongside
+    /// `prepared`; `0` when there are no rows.
+    prepared_widest: usize,
+    /// Character count of the widest row's content — clamps the split-mode
+    /// horizontal offset so you can't scroll past the longest line.
+    prepared_widest_chars: usize,
+    /// Synced horizontal scroll offset (px) for side-by-side columns. Inline
+    /// mode uses the list's native h-scroll instead; split mode shifts each
+    /// column's CONTENT by this (gutters stay sticky). Reset on rebuild.
+    split_h_offset: f32,
+    /// Region the pointer is currently over, as `(file_idx, region_idx)`.
+    /// Driven by hovering a region's `@@` header; reveals that region's
+    /// Stage/Unstage/Discard card and widens its gutter sliver. Pure view
+    /// state — changing it never invalidates `prepared` (no re-highlight on
+    /// hover), only triggers a cheap re-render of the visible rows.
+    hovered_region: Option<(usize, usize)>,
+    /// Overview-ruler runs (change positions as 0..1 fractions, coalesced
+    /// per change block). Recomputed alongside `prepared`; empty when the
+    /// body has no changes. Cached behind `Rc` so the per-frame render only
+    /// paints the bars, never rescans the row list.
+    overview: Rc<Vec<OverviewRun>>,
 }
 
 impl DiffView {
@@ -196,6 +226,31 @@ impl DiffView {
             _confirm_dialog_observer: None,
             scroll_handle: UniformListScrollHandle::new(),
             prepared: None,
+            prepared_widest: 0,
+            prepared_widest_chars: 0,
+            split_h_offset: 0.0,
+            hovered_region: None,
+            overview: Rc::new(Vec::new()),
+            split: false,
+        }
+    }
+
+    /// Flip inline ↔ side-by-side. Rebuilds the row set (the two modes differ
+    /// in layout) and clears hover; cheap — the diff data is unchanged, only
+    /// the flattening differs.
+    fn toggle_split(&mut self, cx: &mut Context<Self>) {
+        self.split = !self.split;
+        self.invalidate_prepared();
+        cx.notify();
+    }
+
+    /// Update the hovered region (from a header row's `on_hover`). Cheap —
+    /// re-renders the visible rows without touching the `prepared` cache.
+    /// No-op when unchanged so a stationary pointer doesn't spam `notify`.
+    fn set_hovered_region(&mut self, region: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        if self.hovered_region != region {
+            self.hovered_region = region;
+            cx.notify();
         }
     }
 
@@ -204,6 +259,12 @@ impl DiffView {
     /// diff body (load, commit load, expand, seed).
     fn invalidate_prepared(&mut self) {
         self.prepared = None;
+        // Region indices are only meaningful against the current row set;
+        // a rebuild may renumber them, so drop any stale hover.
+        self.hovered_region = None;
+        // A new body means a new max line length — reset the split scroll so
+        // we don't start mid-line on a different file.
+        self.split_h_offset = 0.0;
     }
 
     /// Inspect-only accessor used by tests + by `GitPanel` to avoid
@@ -902,11 +963,32 @@ impl Render for DiffView {
                         density: self.density,
                         typography: &self.typography,
                     };
-                    Some(Rc::new(prepare(&plan, &regions, &rctx)))
+                    let body = if self.split {
+                        prepare_split(&plan, &regions, &rctx)
+                    } else {
+                        prepare(&plan, &regions, &rctx)
+                    };
+                    Some(Rc::new(body))
                 }
                 _ => None,
             };
             self.prepared = rows;
+            // Recompute the horizontal-scroll measurement row + its char
+            // count alongside the rebuild (off the per-frame path).
+            let (widest, chars) = self
+                .prepared
+                .as_ref()
+                .map(|r| (widest_row_index(r), widest_row_chars(r)))
+                .unwrap_or((0, 0));
+            self.prepared_widest = widest;
+            self.prepared_widest_chars = chars;
+            // Overview-ruler runs come from the same rebuild so the ruler
+            // paints off a cached list, never rescanning rows per frame.
+            self.overview = self
+                .prepared
+                .as_ref()
+                .map(|r| Rc::new(overview_runs(r)))
+                .unwrap_or_default();
         }
 
         let rctx = RenderCtx {
@@ -918,6 +1000,9 @@ impl Render for DiffView {
         // arm, `&self.state` is borrowed and `current_side` (which reads
         // `&self.state`) would conflict.
         let side = self.current_side();
+        let hovered_region = self.hovered_region;
+        let split = self.split;
+        let split_h_offset = self.split_h_offset;
         // Weak handle routes chip / expand / copy clicks back into the
         // view from the virtualized list's App-scope render closure (which
         // doesn't carry a `Context<DiffView>`).
@@ -932,7 +1017,18 @@ impl Render for DiffView {
             }
             DiffViewState::Ready { .. } => {
                 let rows = self.prepared.clone().unwrap_or_default();
-                render_rows(rows, side, &self.scroll_handle, &rctx, weak).into_any_element()
+                render_rows(
+                    rows,
+                    side,
+                    hovered_region,
+                    self.prepared_widest,
+                    split,
+                    split_h_offset,
+                    &self.scroll_handle,
+                    &rctx,
+                    weak,
+                )
+                .into_any_element()
             }
             DiffViewState::CommitLoading {
                 short_oid, subject, ..
@@ -955,7 +1051,18 @@ impl Render for DiffView {
                 // commit-detail rows — Stage/Unstage/Discard against a
                 // historical commit model nothing git supports.
                 let rows = self.prepared.clone().unwrap_or_default();
-                render_rows(rows, None, &self.scroll_handle, &rctx, weak).into_any_element()
+                render_rows(
+                    rows,
+                    None,
+                    hovered_region,
+                    self.prepared_widest,
+                    split,
+                    split_h_offset,
+                    &self.scroll_handle,
+                    &rctx,
+                    weak,
+                )
+                .into_any_element()
             }
             DiffViewState::RangeLoading { title, .. } => {
                 loading_state(&format!("Loading {title}…"), &rctx).into_any_element()
@@ -966,7 +1073,18 @@ impl Render for DiffView {
             DiffViewState::RangeReady { .. } => {
                 // Read-only, like commit detail: `side = None`, no chips.
                 let rows = self.prepared.clone().unwrap_or_default();
-                render_rows(rows, None, &self.scroll_handle, &rctx, weak).into_any_element()
+                render_rows(
+                    rows,
+                    None,
+                    hovered_region,
+                    self.prepared_widest,
+                    split,
+                    split_h_offset,
+                    &self.scroll_handle,
+                    &rctx,
+                    weak,
+                )
+                .into_any_element()
             }
         };
         // The body owns its own scrolling now: `Ready`/`CommitReady` return
@@ -974,6 +1092,100 @@ impl Render for DiffView {
         // reports an exact content height, so scrolling reaches the true
         // end of the diff. Non-Ready states return a centered placeholder.
         let scroll_body = body;
+        // A one-row toolbar above the body carries the inline ↔ side-by-side
+        // toggle (only when a diff is actually shown). The button label flips
+        // to name the OTHER mode, like the reference editors.
+        let has_body = matches!(
+            self.state,
+            DiffViewState::Ready { .. }
+                | DiffViewState::CommitReady { .. }
+                | DiffViewState::RangeReady { .. }
+        );
+        let toolbar = has_body.then(|| {
+            let label = if split { "Inline" } else { "Side by side" };
+            let hover_bg = self.theme.bg_panel_alt;
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .flex_shrink_0()
+                .h(px(self.density.h_row))
+                .w_full()
+                .px(px(self.density.pad_panel))
+                .bg(self.theme.bg_panel)
+                .border_b_1()
+                .border_color(self.theme.border_inactive)
+                .child(
+                    div()
+                        .id("diff-split-toggle")
+                        .px(px(8.0))
+                        .py(px(1.0))
+                        .rounded(px(self.density.r_chip))
+                        .text_size(px(self.typography.t_body_sm))
+                        .text_color(self.theme.fg_muted)
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_click(cx.listener(|view, _: &gpui::ClickEvent, _window, cx| {
+                            view.toggle_split(cx);
+                        }))
+                        .child(label),
+                )
+        });
+        // The body lives in a `flex_1 + min_h(0)` wrapper so the toolbar can
+        // sit above it while the `uniform_list` inside still gets a DEFINITE
+        // height (`h_full` of this wrapper) — preserving scroll-to-end.
+        let mut body_wrap = div()
+            // `relative` makes this the positioning context for the overview
+            // ruler stacked on its right edge (added below).
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .w_full()
+            .child(scroll_body);
+        // In split mode, a horizontal-intent wheel (trackpad swipe or
+        // Shift+wheel) scrolls BOTH columns' content in sync. We never stop
+        // propagation, so the list still handles vertical scroll from the
+        // same event; we only act on the horizontal component.
+        if split {
+            let char_w = self.typography.t_body_sm * 0.6;
+            let max_off = (self.prepared_widest_chars as f32 * char_w - 80.0).max(0.0);
+            body_wrap = body_wrap.on_scroll_wheel(cx.listener(
+                move |view, ev: &gpui::ScrollWheelEvent, _window, cx| {
+                    if !view.split {
+                        return;
+                    }
+                    let (dx, dy) = match ev.delta {
+                        gpui::ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
+                        gpui::ScrollDelta::Lines(l) => (l.x * char_w, l.y * char_w),
+                    };
+                    // Shift makes a vertical wheel scroll horizontally; else
+                    // honor a horizontal-dominant trackpad delta.
+                    let amount = if ev.modifiers.shift {
+                        dy
+                    } else if dx.abs() > dy.abs() {
+                        dx
+                    } else {
+                        0.0
+                    };
+                    if amount != 0.0 {
+                        let next = (view.split_h_offset - amount).clamp(0.0, max_off);
+                        if next != view.split_h_offset {
+                            view.split_h_offset = next;
+                            cx.notify();
+                        }
+                    }
+                },
+            ));
+        }
+        // Overview ruler: a thin change-map on the body's right edge (only
+        // when a diff with changes is shown). Stacked last so it paints over
+        // the scrollable body; the body owns scrolling underneath it.
+        if has_body && !self.overview.is_empty() {
+            body_wrap = body_wrap.child(overview_ruler(&self.overview, &self.theme));
+        }
         // When the discard-hunk confirm modal is mounted, stack it as a
         // centered overlay over the diff body. Mirrors `confirm_dialog`
         // and `rename_tab_dialog` overlay shape in `workspace_root` but
@@ -1001,8 +1213,11 @@ impl Render for DiffView {
             .w_full()
             .bg(self.theme.bg_base)
             .border_l_1()
-            .border_color(self.theme.border_inactive)
-            .child(scroll_body);
+            .border_color(self.theme.border_inactive);
+        if let Some(tb) = toolbar {
+            root = root.child(tb);
+        }
+        root = root.child(body_wrap);
         if let Some(o) = overlay {
             root = root.child(o);
         }

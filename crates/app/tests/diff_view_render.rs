@@ -10,8 +10,12 @@
 //!   - large diff + expanded=false → `FilePlan::Collapsed` with totals
 //!   - large diff + expanded=true  → `FilePlan::Hunked` (full body)
 
-use oximux_app::shell::diff_view::render::{FilePlan, build_render_plan};
-use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff};
+use oximux_app::shell::diff_view::paint::{
+    PreparedRow, RulerMark, overview_runs, prepare, prepare_split,
+};
+use oximux_app::shell::diff_view::render::{FilePlan, RenderCtx, build_render_plan};
+use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, change_regions};
+use oximux_settings::{Density, Theme, Typography};
 use std::path::PathBuf;
 
 fn line(kind: DiffLineKind, content: &str) -> DiffLine {
@@ -456,4 +460,196 @@ fn multi_file_plan_preserves_order() {
         })
         .collect();
     assert_eq!(labels, ["a.rs", "b.rs", "c.rs"]);
+}
+
+/// Helper: build the side-by-side rows for one file and return each
+/// `SplitLine`'s `(has_left, has_right)` occupancy, in order.
+fn split_occupancy(f: &FileDiff) -> Vec<(bool, bool)> {
+    let plan = build_render_plan(std::slice::from_ref(f), false);
+    let regions = vec![change_regions(f)];
+    let typography = Typography::default();
+    let rctx = RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography: &typography,
+    };
+    prepare_split(&plan, &regions, &rctx)
+        .into_iter()
+        .filter_map(|r| match r {
+            PreparedRow::SplitLine { left, right } => Some((left.is_some(), right.is_some())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn split_aligns_one_to_one_modify_without_fillers() {
+    // ctx, removed, added, ctx — the removed/added pair must land on ONE
+    // SplitLine row (left+right), never split across filler rows.
+    let f = file(
+        "a.rs",
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 3),
+            (1, 3),
+            "",
+            vec![
+                line(DiffLineKind::Context, "keep"),
+                line(DiffLineKind::Removed, "old"),
+                line(DiffLineKind::Added, "new"),
+                line(DiffLineKind::Context, "tail"),
+            ],
+        )],
+        false,
+    );
+    let occ = split_occupancy(&f);
+    // Every row is fully occupied (two context + one paired modify).
+    assert_eq!(occ, vec![(true, true), (true, true), (true, true)]);
+}
+
+#[test]
+fn split_block_replace_emits_filler_for_longer_side() {
+    // 2 removed vs 3 added → rows: (r0,a0), (r1,a1), (filler,a2).
+    let f = file(
+        "b.rs",
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 4),
+            (1, 5),
+            "",
+            vec![
+                line(DiffLineKind::Context, "keep"),
+                line(DiffLineKind::Removed, "r1"),
+                line(DiffLineKind::Removed, "r2"),
+                line(DiffLineKind::Added, "a1"),
+                line(DiffLineKind::Added, "a2"),
+                line(DiffLineKind::Added, "a3"),
+                line(DiffLineKind::Context, "tail"),
+            ],
+        )],
+        false,
+    );
+    let occ = split_occupancy(&f);
+    assert_eq!(
+        occ,
+        vec![
+            (true, true),  // ctx "keep"
+            (true, true),  // r1 | a1
+            (true, true),  // r2 | a2
+            (false, true), // filler | a3
+            (true, true),  // ctx "tail"
+        ]
+    );
+}
+
+#[test]
+fn split_pure_addition_has_left_fillers() {
+    // New-only lines (e.g. an addition block) → left filler, right content.
+    let f = file(
+        "c.rs",
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 1),
+            (1, 3),
+            "",
+            vec![
+                line(DiffLineKind::Context, "keep"),
+                line(DiffLineKind::Added, "a1"),
+                line(DiffLineKind::Added, "a2"),
+            ],
+        )],
+        false,
+    );
+    let occ = split_occupancy(&f);
+    assert_eq!(occ, vec![(true, true), (false, true), (false, true)]);
+}
+
+/// Helper: overview-ruler runs for one file's INLINE body, as
+/// `(start, end, mark)` tuples in order.
+fn inline_runs(f: &FileDiff) -> Vec<(f32, f32, RulerMark)> {
+    let plan = build_render_plan(std::slice::from_ref(f), false);
+    let regions = vec![change_regions(f)];
+    let typography = Typography::default();
+    let rctx = RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography: &typography,
+    };
+    let rows = prepare(&plan, &regions, &rctx);
+    overview_runs(&rows)
+        .into_iter()
+        .map(|r| (r.start, r.end, r.mark))
+        .collect()
+}
+
+#[test]
+fn overview_runs_coalesce_same_kind_block() {
+    // ctx, rem, rem, add, add, ctx → inline rows:
+    //   FileHeader, Line(ctx), HunkHeader, Line(rem), Line(rem),
+    //   Line(add), Line(add), Line(ctx)  = 8 rows.
+    // The two removed rows fuse into ONE Removed run, the two added rows
+    // into ONE Added run — the ruler paints a bar per block, not per line.
+    let f = file(
+        "a.rs",
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 4),
+            (1, 4),
+            "",
+            vec![
+                line(DiffLineKind::Context, "keep"),
+                line(DiffLineKind::Removed, "r1"),
+                line(DiffLineKind::Removed, "r2"),
+                line(DiffLineKind::Added, "a1"),
+                line(DiffLineKind::Added, "a2"),
+                line(DiffLineKind::Context, "tail"),
+            ],
+        )],
+        false,
+    );
+    let runs = inline_runs(&f);
+    let marks: Vec<RulerMark> = runs.iter().map(|r| r.2).collect();
+    assert_eq!(marks, vec![RulerMark::Removed, RulerMark::Added]);
+    // Each run spans exactly 2 of the 8 rows (width 0.25) and the Added run
+    // begins where the Removed run ends (contiguous block, no gap).
+    let (rs, re, _) = runs[0];
+    let (as_, ae, _) = runs[1];
+    assert!((re - rs - 0.25).abs() < 1e-6, "removed run width");
+    assert!((ae - as_ - 0.25).abs() < 1e-6, "added run width");
+    assert!((re - as_).abs() < 1e-6, "runs are contiguous");
+    assert!(rs >= 0.0 && ae <= 1.0, "runs lie within the body");
+}
+
+#[test]
+fn overview_split_modify_row_is_mixed() {
+    // In side-by-side, a removed/added pair shares ONE SplitLine row, so its
+    // ruler tick is Mixed (amber) rather than two separate add/remove bars.
+    let f = file(
+        "b.rs",
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 3),
+            (1, 3),
+            "",
+            vec![
+                line(DiffLineKind::Context, "keep"),
+                line(DiffLineKind::Removed, "old"),
+                line(DiffLineKind::Added, "new"),
+                line(DiffLineKind::Context, "tail"),
+            ],
+        )],
+        false,
+    );
+    let plan = build_render_plan(std::slice::from_ref(&f), false);
+    let regions = vec![change_regions(&f)];
+    let typography = Typography::default();
+    let rctx = RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography: &typography,
+    };
+    let rows = prepare_split(&plan, &regions, &rctx);
+    let runs = overview_runs(&rows);
+    assert_eq!(runs.len(), 1, "one change block → one run");
+    assert_eq!(runs[0].mark, RulerMark::Mixed);
 }

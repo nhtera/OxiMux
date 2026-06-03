@@ -108,8 +108,11 @@ impl Theme {
 
             git: GitDecorations {
                 modified: rgb(0xD9A441).into(),
-                added: rgb(0x6FA86A).into(),
-                deleted: rgb(0xD26464).into(),
+                // Conventional dark-editor git-decoration palette — sage
+                // green + brick red. Drives the diff gutter sliver, line
+                // tints, and +N/-N chips.
+                added: rgb(0x81B88B).into(),
+                deleted: rgb(0xC74E39).into(),
                 renamed: rgb(0x5B97C9).into(),
                 untracked: rgb(0x9CC79A).into(),
                 copied: rgb(0x4DA8A8).into(),
@@ -119,18 +122,31 @@ impl Theme {
     }
 
     /// Translucent background for added-line highlights in diff views.
-    /// 22% alpha over `status_added` lets the underlying surface read
-    /// through while the line still scans as "this was added". Helper
-    /// exists so call sites stop constructing `Hsla { a: 0.22, ..foo }`
-    /// inline — palette retuning then lands in one place.
+    /// `git.added` (#81b88b) at 16% alpha — the line scans as "added" while
+    /// syntax/text reads cleanly through. Tuned up from a lighter-surface
+    /// 10% baseline so the wash carries equal presence over OxiMux's darker
+    /// charcoal base. Single source of truth so retuning lands in one place.
     pub fn diff_added_bg(&self) -> Hsla {
-        Hsla { a: 0.22, ..self.status_added }
+        Hsla { a: 0.16, ..self.git.added }
     }
 
-    /// Translucent background for removed-line highlights. Paired with
-    /// `diff_added_bg` — same alpha, opposite hue.
+    /// Translucent background for removed-line highlights — `git.deleted`
+    /// (#c74e39) at 17% alpha (paired one notch above `diff_added_bg` since
+    /// the brick hue reads slightly weaker than the sage at equal alpha).
     pub fn diff_removed_bg(&self) -> Hsla {
-        Hsla { a: 0.22, ..self.status_removed }
+        Hsla { a: 0.17, ..self.git.deleted }
+    }
+
+    /// Brighter background for the changed *words* on a modified line,
+    /// layered over the preserved syntax foreground so the exact change
+    /// pops without recoloring the text. Stronger than the line tint.
+    pub fn diff_word_added_bg(&self) -> Hsla {
+        Hsla { a: 0.30, ..self.git.added }
+    }
+
+    /// Removed-side counterpart of `diff_word_added_bg`.
+    pub fn diff_word_removed_bg(&self) -> Hsla {
+        Hsla { a: 0.40, ..self.git.deleted }
     }
 }
 
@@ -151,9 +167,14 @@ mod tests {
     }
 
     #[test]
-    fn git_decorations_added_matches_status_ok() {
+    fn git_decorations_added_deleted_are_diff_palette() {
+        // git.added/deleted are the diff sage/brick used by the gutter
+        // sliver, line tints, and stat chips — intentionally decoupled from
+        // `status_ok` (general OK green).
         let t = Theme::charcoal();
-        assert_eq!(t.git.added, t.status_ok);
+        assert_eq!(t.git.added, rgb(0x81B88B).into());
+        assert_eq!(t.git.deleted, rgb(0xC74E39).into());
+        assert_ne!(t.git.added, t.status_ok);
     }
 
     #[test]
@@ -189,22 +210,33 @@ mod tests {
     }
 
     #[test]
-    fn diff_added_bg_uses_22pct_alpha_over_status_added() {
+    fn diff_added_bg_uses_16pct_alpha_over_git_added() {
+        // 16% alpha over the git.added sage hue.
         let t = Theme::charcoal();
         let bg = t.diff_added_bg();
-        assert!((bg.a - 0.22).abs() < f32::EPSILON);
-        assert_eq!(bg.h, t.status_added.h);
-        assert_eq!(bg.s, t.status_added.s);
-        assert_eq!(bg.l, t.status_added.l);
+        assert!((bg.a - 0.16).abs() < f32::EPSILON);
+        assert_eq!(bg.h, t.git.added.h);
+        assert_eq!(bg.s, t.git.added.s);
+        assert_eq!(bg.l, t.git.added.l);
     }
 
     #[test]
-    fn diff_removed_bg_uses_22pct_alpha_over_status_removed() {
+    fn diff_removed_bg_uses_17pct_alpha_over_git_deleted() {
+        // 17% alpha over the git.deleted brick hue.
         let t = Theme::charcoal();
         let bg = t.diff_removed_bg();
-        assert!((bg.a - 0.22).abs() < f32::EPSILON);
-        assert_eq!(bg.h, t.status_removed.h);
-        assert_eq!(bg.s, t.status_removed.s);
-        assert_eq!(bg.l, t.status_removed.l);
+        assert!((bg.a - 0.17).abs() < f32::EPSILON);
+        assert_eq!(bg.h, t.git.deleted.h);
+        assert_eq!(bg.s, t.git.deleted.s);
+        assert_eq!(bg.l, t.git.deleted.l);
+    }
+
+    #[test]
+    fn diff_word_bgs_are_stronger_than_line_tints() {
+        // Changed-word backgrounds must out-weigh the line tint so the
+        // exact change pops over the softer whole-line wash.
+        let t = Theme::charcoal();
+        assert!(t.diff_word_added_bg().a > t.diff_added_bg().a);
+        assert!(t.diff_word_removed_bg().a > t.diff_removed_bg().a);
     }
 }

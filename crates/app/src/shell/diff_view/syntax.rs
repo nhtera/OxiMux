@@ -23,6 +23,7 @@
 //! Subsequent calls reuse it. A second `LazyLock` holds the active theme.
 //! Both are `Send + Sync` so they're safe to read from the GPUI thread.
 
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -34,18 +35,23 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 /// Lazy holders. `SyntaxSet::load_defaults_nonewlines()` is the heavy call
-/// (~30 ms cold start, ~550 KB embedded grammars). `ThemeSet::load_defaults`
-/// is cheap by comparison. Both are read-only after init.
+/// (~30 ms cold start, ~550 KB embedded grammars). Read-only after init.
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_nonewlines);
-static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
-/// Pick the theme that best matches OxiMux's dark cockpit palette. The
-/// bundled `base16-ocean.dark` reads well against `bg_panel` and has clear
-/// keyword/string/comment differentiation. Light-theme support is a v1.1
-/// follow-up — switching themes means re-running the highlighter, which
-/// is cheap, but the renderer's row-tint alphas were tuned against dark.
+/// The diff syntax theme — a conventional dark-editor token palette
+/// (keyword-blue / string-orange / comment-green) bundled as a TextMate
+/// theme (`assets/themes/syntax-dark.tmTheme`) and embedded at compile
+/// time. Only token foregrounds are consumed; the theme's background is
+/// inert (OxiMux paints its own charcoal surface).
+static SYNTAX_DARK: LazyLock<Theme> = LazyLock::new(|| {
+    let bytes = include_bytes!("../../../assets/themes/syntax-dark.tmTheme");
+    ThemeSet::load_from_reader(&mut Cursor::new(&bytes[..]))
+        .expect("bundled syntax-dark.tmTheme parses")
+});
+
+/// The active highlight theme for the diff body.
 fn active_theme() -> &'static Theme {
-    &THEME_SET.themes["base16-ocean.dark"]
+    &SYNTAX_DARK
 }
 
 /// Coarse language buckets — keyed on file extension. Mirrors the
@@ -175,9 +181,7 @@ fn syntax_for(lang: Language) -> Option<&'static SyntaxReference> {
 /// up in profiling. Default policy: don't pre-warm; let lazy init absorb
 /// the cost.
 pub fn prewarm() {
-    let _ = (&*SYNTAX_SET, &*THEME_SET);
-    // Touch the active theme too so the HashMap lookup is cached.
-    let _ = active_theme();
+    let _ = (&*SYNTAX_SET, &*SYNTAX_DARK);
 }
 
 /// Test-only — expose a Style→u8 helper. Production code reads
@@ -264,6 +268,22 @@ mod tests {
                 "keyword and string should have distinct colors"
             );
         }
+    }
+
+    #[test]
+    fn syntax_theme_keyword_and_string_have_expected_hues() {
+        // Lock the dark-editor hues: keyword #569CD6 (blue), string body
+        // #CE9178 (orange). Guards against an accidental theme swap silently
+        // regressing the syntax palette.
+        let toks = highlight_line(r#"let x = "hello";"#, Language::Rust);
+        let kw = toks.iter().find(|t| t.start == 0).expect("keyword token");
+        assert_eq!((kw.r, kw.g, kw.b), (0x56, 0x9C, 0xD6), "keyword should be blue");
+        // The string body sits inside the quotes (bytes 8..=15).
+        let s = toks
+            .iter()
+            .find(|t| t.start >= 9 && t.end <= 15)
+            .expect("string token");
+        assert_eq!((s.r, s.g, s.b), (0xCE, 0x91, 0x78), "string should be orange");
     }
 
     #[test]
