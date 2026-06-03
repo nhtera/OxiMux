@@ -128,6 +128,11 @@ pub struct SideCell {
     pub fg: Hsla,
     pub bg: Option<Hsla>,
     pub strip: Option<Hsla>,
+    /// True when this cell's file is already staged — the sliver renders
+    /// hollow (outlined) instead of solid. Only meaningful in the combined
+    /// view where staged + unstaged files coexist; single-file diffs are
+    /// uniformly one state so this stays `false`.
+    pub hollow: bool,
     /// Overview-ruler classification for this side (`None` for context).
     pub mark: Option<RulerMark>,
 }
@@ -165,6 +170,10 @@ pub struct PreparedLine {
     pub fg: Hsla,
     pub row_bg: Option<Hsla>,
     pub strip: Option<Hsla>,
+    /// True when this line's file is already staged — the sliver renders
+    /// hollow (outlined) instead of solid. Set in a per-file post-pass from
+    /// the combined view's group tag; `false` for single-file diffs.
+    pub hollow: bool,
     /// The file this line belongs to — disambiguates the row's interactive
     /// id across files and owns the row in the sticky-overlay map.
     pub file_idx: usize,
@@ -335,11 +344,17 @@ pub fn overview_ruler(
 ///
 /// `expanded_folds` are the context runs the user has clicked open; a run
 /// whose `FoldId` is present renders in full instead of behind an expander.
+///
+/// `staged_per_file[i]` (when present) marks `plan[i]` as already staged, so
+/// its gutter slivers render hollow instead of solid — the combined view's
+/// staged-vs-unstaged cue. An empty slice (single-file diffs) renders every
+/// sliver solid.
 pub fn prepare(
     plan: &[FilePlan],
     regions_per_file: &[Vec<oximux_core::ChangeRegion>],
     collapsed: &std::collections::HashSet<usize>,
     expanded_folds: &std::collections::HashSet<FoldId>,
+    staged_per_file: &[bool],
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -491,7 +506,55 @@ pub fn prepare(
             }
         }
     }
+    apply_staged_slivers(&mut rows, staged_per_file);
     rows
+}
+
+/// Flip every changed line's sliver to hollow for files the combined view
+/// has tagged staged. Runs once after the row list is built — the staged
+/// flag is uniform per file, so this avoids threading it through every
+/// per-line/per-block builder. No-op when nothing is staged (single-file
+/// diffs pass an empty slice).
+fn apply_staged_slivers(rows: &mut [PreparedRow], staged_per_file: &[bool]) {
+    if !staged_per_file.iter().any(|&s| s) {
+        return;
+    }
+    // An empty slice (single-file views) skips this whole pass; a non-empty
+    // one must run parallel to the plan or trailing files silently fall back
+    // to solid. Caught in dev, free in release.
+    debug_assert!(
+        staged_per_file.len()
+            >= rows
+                .iter()
+                .filter_map(|r| match r {
+                    PreparedRow::Line(l) => Some(l.file_idx),
+                    PreparedRow::SplitLine { file_idx, .. } => Some(*file_idx),
+                    _ => None,
+                })
+                .max()
+                .map_or(0, |m| m + 1),
+        "staged_per_file must span every file index in the row list",
+    );
+    let staged = |idx: usize| staged_per_file.get(idx).copied().unwrap_or(false);
+    for row in rows.iter_mut() {
+        match row {
+            PreparedRow::Line(line) if staged(line.file_idx) => line.hollow = true,
+            PreparedRow::SplitLine {
+                file_idx,
+                left,
+                right,
+                ..
+            } if staged(*file_idx) => {
+                if let Some(cell) = left {
+                    cell.hollow = true;
+                }
+                if let Some(cell) = right {
+                    cell.hollow = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Emit the buffered run of unchanged context as `Line` rows, folding the
@@ -595,6 +658,7 @@ pub fn prepare_split(
     regions_per_file: &[Vec<oximux_core::ChangeRegion>],
     collapsed: &std::collections::HashSet<usize>,
     expanded_folds: &std::collections::HashSet<FoldId>,
+    staged_per_file: &[bool],
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -780,6 +844,7 @@ pub fn prepare_split(
             }
         }
     }
+    apply_staged_slivers(&mut rows, staged_per_file);
     rows
 }
 
@@ -882,6 +947,7 @@ fn side_cell(l: &LinePlan, is_left: bool, gutter_digits: usize, rctx: &RenderCtx
         fg,
         bg,
         strip: line_change_strip(l.kind, rctx),
+        hollow: false,
         mark: mark_for_kind(l.kind),
     }
 }
@@ -930,6 +996,7 @@ fn prepare_line(
         fg,
         row_bg,
         strip,
+        hollow: false,
         file_idx,
         region,
         region_anchor,
@@ -1339,7 +1406,7 @@ fn line_row_el(
     if let Some(bg) = line.row_bg {
         row = row.bg(bg);
     }
-    row.child(strip_cell(line.strip, hovered, density.h_row))
+    row.child(strip_cell(line.strip, line.hollow, hovered, density.h_row))
         .child(gutter)
         .child(sign)
         .child(content)
@@ -1548,7 +1615,7 @@ fn split_half(
                         .with_highlights(cell.highlights.iter().cloned()),
                 ),
         );
-    half.child(strip_cell(cell.strip, hovered, density.h_row))
+    half.child(strip_cell(cell.strip, cell.hollow, hovered, density.h_row))
         .child(gutter)
         .child(sign)
         .child(content_viewport)
@@ -1671,12 +1738,20 @@ fn line_matches_anchor(l: &LinePlan, region: &oximux_core::ChangeRegion) -> bool
 /// 7px-wide column (so the gutter never reflows) with the bar drawn left-
 /// aligned inside it: 3px at rest, widening to the full 7px when the row's
 /// region is hovered. Transparent bar when `color` is `None` (context rows).
-fn strip_cell(color: Option<Hsla>, hovered: bool, h: f32) -> gpui::Div {
+///
+/// `hollow` draws the bar outlined (border + faint fill) instead of solid —
+/// the combined view's cue that the file is already staged. Solid = unstaged
+/// / untracked / single-file.
+fn strip_cell(color: Option<Hsla>, hollow: bool, hovered: bool, h: f32) -> gpui::Div {
     const COL_W: f32 = 7.0;
     let bar_w = if hovered { COL_W } else { 3.0 };
     let mut bar = div().w(px(bar_w)).h(px(h));
     if let Some(c) = color {
-        bar = bar.bg(c);
+        if hollow {
+            bar = bar.bg(Hsla { a: 0.16, ..c }).border_1().border_color(c);
+        } else {
+            bar = bar.bg(c);
+        }
     }
     div().w(px(COL_W)).h(px(h)).child(bar)
 }

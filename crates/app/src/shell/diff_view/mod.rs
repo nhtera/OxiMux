@@ -1279,15 +1279,40 @@ impl Render for DiffView {
                     // per region (git add -p granularity) using these.
                     let regions: Vec<Vec<oximux_core::ChangeRegion>> =
                         diffs.iter().map(oximux_core::change_regions).collect();
+                    // Hollow-vs-solid gutter slivers: only the combined view
+                    // carries per-file group tags, so staged files render
+                    // hollow there. Single-file / commit / range views pass an
+                    // empty slice → every sliver solid (uniformly one state).
+                    let staged_per_file: Vec<bool> = match &self.state {
+                        DiffViewState::CombinedReady { groups, .. } => groups
+                            .iter()
+                            .map(|g| matches!(g, FileGroup::Staged))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
                     let rctx = RenderCtx {
                         theme: self.theme,
                         density: self.density,
                         typography: &self.typography,
                     };
                     let body = if self.split {
-                        prepare_split(&plan, &regions, &self.collapsed, &self.expanded_folds, &rctx)
+                        prepare_split(
+                            &plan,
+                            &regions,
+                            &self.collapsed,
+                            &self.expanded_folds,
+                            &staged_per_file,
+                            &rctx,
+                        )
                     } else {
-                        prepare(&plan, &regions, &self.collapsed, &self.expanded_folds, &rctx)
+                        prepare(
+                            &plan,
+                            &regions,
+                            &self.collapsed,
+                            &self.expanded_folds,
+                            &staged_per_file,
+                            &rctx,
+                        )
                     };
                     Some(Rc::new(body))
                 }

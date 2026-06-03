@@ -475,7 +475,7 @@ fn split_occupancy(f: &FileDiff) -> Vec<(bool, bool)> {
         density: Density::default(),
         typography: &typography,
     };
-    prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx)
+    prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx)
         .into_iter()
         .filter_map(|r| match r {
             PreparedRow::SplitLine { left, right, .. } => Some((left.is_some(), right.is_some())),
@@ -577,7 +577,7 @@ fn inline_runs(f: &FileDiff) -> Vec<(f32, f32, RulerMark)> {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx);
+    let rows = prepare(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx);
     overview_runs(&rows)
         .into_iter()
         .map(|r| (r.start, r.end, r.mark))
@@ -651,7 +651,7 @@ fn overview_split_modify_row_is_mixed() {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx);
+    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx);
     let runs = overview_runs(&rows);
     assert_eq!(runs.len(), 1, "one change block → one run");
     assert_eq!(runs[0].mark, RulerMark::Mixed);
@@ -684,7 +684,7 @@ fn folded_file_emits_header_only() {
     };
     let mut collapsed = HashSet::new();
     collapsed.insert(0usize);
-    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &rctx);
+    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &[], &rctx);
     let owner = build_row_owner(&rows);
 
     // File 0 contributes exactly one row — its (folded) header.
@@ -750,7 +750,7 @@ fn split_merged_region_keeps_all_blocks_tagged() {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx);
+    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx);
 
     let mut tagged = 0;
     let mut anchors = 0;
@@ -788,7 +788,7 @@ fn inline_rows(f: &FileDiff, expanded: &HashSet<(usize, u32)>) -> Vec<PreparedRo
         density: Density::default(),
         typography: &typography,
     };
-    prepare(&plan, &regions, &HashSet::new(), expanded, &rctx)
+    prepare(&plan, &regions, &HashSet::new(), expanded, &[], &rctx)
 }
 
 /// A long unchanged-context run between two changes folds its middle: 3
@@ -962,11 +962,134 @@ fn collect_headers_one_per_file_with_fold_state() {
     };
     let mut collapsed = HashSet::new();
     collapsed.insert(1usize);
-    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &rctx);
+    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &[], &rctx);
     let headers = collect_headers(&rows);
     assert_eq!(headers.len(), 2, "one header per file");
     assert_eq!(headers[0].file_idx, 0);
     assert!(!headers[0].folded);
     assert_eq!(headers[1].file_idx, 1);
     assert!(headers[1].folded);
+}
+
+fn render_ctx_for<'a>(typography: &'a Typography) -> RenderCtx<'a> {
+    RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography,
+    }
+}
+
+/// One single-line modified file — enough to emit one changed `Line`/
+/// `SplitLine` row carrying a sliver.
+fn one_change_file(path: &str, content: &str) -> FileDiff {
+    file(
+        path,
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 1),
+            (1, 1),
+            "",
+            vec![line(DiffLineKind::Added, content)],
+        )],
+        false,
+    )
+}
+
+/// `(file_idx, hollow)` for every changed inline `Line` row (those that carry
+/// a sliver), given a multi-file plan + per-file staged tags.
+fn inline_hollow_by_file(files: &[FileDiff], staged_per_file: &[bool]) -> Vec<(usize, bool)> {
+    let plan = build_render_plan(files, false);
+    let regions: Vec<_> = files.iter().map(change_regions).collect();
+    let typography = Typography::default();
+    let rctx = render_ctx_for(&typography);
+    prepare(
+        &plan,
+        &regions,
+        &HashSet::new(),
+        &HashSet::new(),
+        staged_per_file,
+        &rctx,
+    )
+    .into_iter()
+    .filter_map(|r| match r {
+        PreparedRow::Line(l) if l.strip.is_some() => Some((l.file_idx, l.hollow)),
+        _ => None,
+    })
+    .collect()
+}
+
+#[test]
+fn staged_file_group_renders_hollow_sliver_only_for_staged_files() {
+    // Combined-view tags: file 0 unstaged (solid), file 1 staged (hollow).
+    let files = [
+        one_change_file("u.rs", "x"),
+        one_change_file("s.rs", "y"),
+    ];
+    let flags = inline_hollow_by_file(&files, &[false, true]);
+    assert!(!flags.is_empty(), "both files contribute a changed line");
+    for (file_idx, hollow) in flags {
+        assert_eq!(
+            hollow,
+            file_idx == 1,
+            "file {file_idx}: staged → hollow, unstaged → solid"
+        );
+    }
+}
+
+#[test]
+fn single_file_diff_renders_solid_sliver() {
+    // No group tags (empty staged_per_file) → uniformly solid, never hollow.
+    let files = [one_change_file("a.rs", "z")];
+    let flags = inline_hollow_by_file(&files, &[]);
+    assert!(!flags.is_empty(), "must have at least one changed line");
+    assert!(
+        flags.iter().all(|(_, hollow)| !hollow),
+        "single-file slivers are solid"
+    );
+}
+
+#[test]
+fn staged_file_group_renders_hollow_sliver_in_split_mode() {
+    // The hollow post-pass must reach both columns of a `SplitLine` too.
+    let files = [
+        one_change_file("u.rs", "x"),
+        one_change_file("s.rs", "y"),
+    ];
+    let plan = build_render_plan(&files, false);
+    let regions: Vec<_> = files.iter().map(change_regions).collect();
+    let typography = Typography::default();
+    let rctx = render_ctx_for(&typography);
+    let rows = prepare_split(
+        &plan,
+        &regions,
+        &HashSet::new(),
+        &HashSet::new(),
+        &[false, true],
+        &rctx,
+    );
+    let mut saw_unstaged_solid = false;
+    let mut saw_staged_hollow = false;
+    for r in rows {
+        if let PreparedRow::SplitLine {
+            file_idx,
+            left,
+            right,
+            ..
+        } = r
+        {
+            for cell in [left, right].into_iter().flatten() {
+                if cell.strip.is_none() {
+                    continue;
+                }
+                if file_idx == 1 {
+                    assert!(cell.hollow, "staged file column must be hollow");
+                    saw_staged_hollow = true;
+                } else {
+                    assert!(!cell.hollow, "unstaged file column must be solid");
+                    saw_unstaged_solid = true;
+                }
+            }
+        }
+    }
+    assert!(saw_unstaged_solid && saw_staged_hollow, "both cases exercised");
 }
