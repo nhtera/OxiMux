@@ -25,11 +25,22 @@
 //!      `HighlightStyle` ranges over a single shaped run, never a child
 //!      element per colored token.
 //!
+//! ## Continuous flow + foldable context
+//!
+//! The body reads as one continuous numbered listing — no `@@` marker rows
+//! at rest. Each changed line tints inline; the per-region Stage/Discard
+//! card reveals on hover, anchored on the region's first changed line. Long
+//! runs of unchanged context collapse behind a `ContextFold` expander
+//! (3 lines kept on each side of a change; a run longer than the collapse
+//! threshold folds its middle). Folding happens at this prepared-row layer
+//! only — `change_regions` still anchors over the full diff, so per-region
+//! `git add -p` staging is unaffected.
+//!
 //! Color resolution, gutter strings, and highlight ranges are all baked
 //! once into `PreparedRow` (see `prepare`) so the per-frame render closure
 //! does no string or highlight work for off-screen rows. The host
 //! (`mod.rs`) caches the prepared vec behind an `Rc` and rebuilds it only
-//! when the diff or `expanded` flag changes — never on scroll.
+//! when the diff, fold, or `expanded` flag changes — never on scroll.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -48,6 +59,19 @@ use gpui::{
 use oximux_core::DiffLineKind;
 use oximux_settings::{Density, Theme, Typography};
 
+/// Number of unchanged context lines kept on EACH side of a change before a
+/// long run is folded.
+const CONTEXT_KEEP: usize = 3;
+/// An unchanged-context run longer than this collapses its middle behind a
+/// single `ContextFold` expander. Runs at or under it render in full.
+const COLLAPSE_THRESHOLD: usize = 10;
+
+/// Stable identity for a folded context run: `(file_idx, first-hidden-line)`.
+/// Anchored by the new-side (or old-side) line number of the first folded
+/// line so the id survives a prepared-row rebuild (row indices shift, line
+/// numbers don't). The host tracks which fold ids the user has expanded.
+pub type FoldId = (usize, u32);
+
 /// One row in the flat, virtualization-ready body. Every variant renders
 /// at exactly `density.h_row` so `uniform_list` can position rows by index
 /// without per-item measurement.
@@ -63,14 +87,6 @@ pub enum PreparedRow {
         stats: Option<(u32, u32)>,
         folded: bool,
     },
-    /// `@@ … @@` hunk marker. Carries the originating (file, hunk) index so
-    /// the Stage/Unstage/Discard chips can dispatch against the live diff.
-    HunkHeader {
-        file_idx: usize,
-        hunk_idx: usize,
-        header: SharedString,
-        strip: Option<Hsla>,
-    },
     /// A diff body line, fully resolved (colors, gutter cells, highlight
     /// ranges) so painting it touches no syntect / word-diff machinery.
     Line(PreparedLine),
@@ -78,8 +94,23 @@ pub enum PreparedRow {
     /// side is `None` (filler) where a block is longer on the opposite side.
     /// Only emitted in split mode; inline mode uses `Line`.
     SplitLine {
+        file_idx: usize,
         left: Option<SideCell>,
         right: Option<SideCell>,
+        /// The change region this row belongs to, as `(file_idx, region_idx)`,
+        /// or `None` for context. Drives hover (sliver-widen + staging card).
+        region: Option<(usize, usize)>,
+        /// True on the first row of a change block — where the floating
+        /// Stage/Discard card anchors on hover.
+        region_anchor: bool,
+    },
+    /// Collapsed unchanged-context run. Click expands just this run
+    /// (`DiffView::expand_fold`); the body otherwise reads continuously.
+    ContextFold {
+        file_idx: usize,
+        fold_id: FoldId,
+        /// Hidden line count, shown as "⋯ N unchanged lines".
+        count: usize,
     },
     /// Large-diff collapse affordance — click expands the whole view.
     Collapsed { label: String },
@@ -134,10 +165,16 @@ pub struct PreparedLine {
     pub fg: Hsla,
     pub row_bg: Option<Hsla>,
     pub strip: Option<Hsla>,
+    /// The file this line belongs to — disambiguates the row's interactive
+    /// id across files and owns the row in the sticky-overlay map.
+    pub file_idx: usize,
     /// The change region this line belongs to, as `(file_idx, region_idx)`,
     /// or `None` for context outside any region. Drives the hover-widen of
-    /// the gutter sliver when its region's header is hovered.
+    /// the gutter sliver + reveals the region's staging card.
     pub region: Option<(usize, usize)>,
+    /// True on the region's first changed line — where the floating
+    /// Stage/Discard card anchors when the region is hovered.
+    pub region_anchor: bool,
     /// Overview-ruler classification (`None` for context — context rows put
     /// no tick on the ruler).
     pub mark: Option<RulerMark>,
@@ -152,21 +189,7 @@ pub struct PreparedLine {
 pub fn widest_row_index(rows: &[PreparedRow]) -> usize {
     rows.iter()
         .enumerate()
-        .max_by_key(|(_, row)| match row {
-            PreparedRow::Line(l) => l.content.chars().count(),
-            PreparedRow::SplitLine { left, right } => {
-                // Either column can be the wider; the body lays the two side
-                // by side so the row's effective width tracks the larger one.
-                let w = |c: &Option<SideCell>| c.as_ref().map_or(0, |s| s.content.chars().count());
-                w(left).max(w(right))
-            }
-            PreparedRow::HunkHeader { header, .. } => header.chars().count(),
-            PreparedRow::FileHeader { path, label, .. } => {
-                path.chars().count() + label.chars().count()
-            }
-            PreparedRow::Collapsed { label } => label.chars().count(),
-            PreparedRow::Special { text } => text.chars().count(),
-        })
+        .max_by_key(|(_, row)| row_width_chars(row))
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
@@ -174,32 +197,35 @@ pub fn widest_row_index(rows: &[PreparedRow]) -> usize {
 /// Character count of the widest row's content — clamps the split-mode
 /// horizontal scroll. For split rows it's the longer of the two columns.
 pub fn widest_row_chars(rows: &[PreparedRow]) -> usize {
-    rows.iter()
-        .map(|row| match row {
-            PreparedRow::Line(l) => l.content.chars().count(),
-            PreparedRow::SplitLine { left, right } => {
-                let w = |c: &Option<SideCell>| c.as_ref().map_or(0, |s| s.content.chars().count());
-                w(left).max(w(right))
-            }
-            PreparedRow::HunkHeader { header, .. } => header.chars().count(),
-            PreparedRow::FileHeader { path, label, .. } => {
-                path.chars().count() + label.chars().count()
-            }
-            PreparedRow::Collapsed { label } => label.chars().count(),
-            PreparedRow::Special { text } => text.chars().count(),
-        })
-        .max()
-        .unwrap_or(0)
+    rows.iter().map(row_width_chars).max().unwrap_or(0)
+}
+
+/// Approximate laid-out width of one prepared row, in content characters.
+/// Shared by the widest-index + widest-chars passes.
+fn row_width_chars(row: &PreparedRow) -> usize {
+    match row {
+        PreparedRow::Line(l) => l.content.chars().count(),
+        PreparedRow::SplitLine { left, right, .. } => {
+            // Either column can be the wider; the body lays the two side
+            // by side so the row's effective width tracks the larger one.
+            let w = |c: &Option<SideCell>| c.as_ref().map_or(0, |s| s.content.chars().count());
+            w(left).max(w(right))
+        }
+        PreparedRow::FileHeader { path, label, .. } => path.chars().count() + label.chars().count(),
+        PreparedRow::ContextFold { count, .. } => count_fold_label(*count).chars().count(),
+        PreparedRow::Collapsed { label } => label.chars().count(),
+        PreparedRow::Special { text } => text.chars().count(),
+    }
 }
 
 /// Overview-ruler classification for one prepared row: the change kind to
 /// mark on the scrollbar ruler, or `None` for rows that aren't changed body
-/// lines (headers, context, collapsed, special). A split row whose two
+/// lines (headers, context, fold, collapsed, special). A split row whose two
 /// columns are a removed/added pair reads as `Mixed`.
 fn row_mark(row: &PreparedRow) -> Option<RulerMark> {
     match row {
         PreparedRow::Line(l) => l.mark,
-        PreparedRow::SplitLine { left, right } => {
+        PreparedRow::SplitLine { left, right, .. } => {
             let l = left.as_ref().and_then(|c| c.mark);
             let r = right.as_ref().and_then(|c| c.mark);
             match (l, r) {
@@ -297,20 +323,23 @@ pub fn overview_ruler(
 
 /// Flatten the structured plan into the virtualization-ready row list,
 /// resolving all colors, gutter strings, and highlight ranges up front.
-/// Runs once per (diff, expanded) change — NOT per frame.
+/// Runs once per (diff, fold, expanded) change — NOT per frame.
 ///
 /// `regions_per_file[i]` are the stageable change regions for `plan[i]`
 /// (from `oximux_core::change_regions`). Because diffs are fetched with
-/// full-file context, the chip bar (Stage/Unstage/Discard) is docked at
-/// the start of EACH region rather than once per file — restoring
-/// `git add -p` granularity over a whole-file view. The chip's
-/// `hunk_idx` field carries the REGION index, which
-/// `DiffView::stage_hunk` maps back through `change_regions` to the
-/// matching standalone patch.
+/// full-file context, the staging card (Stage/Unstage/Discard) anchors at
+/// the FIRST changed line of EACH region rather than once per file —
+/// restoring `git add -p` granularity over a whole-file view. The card's
+/// `region_idx` (carried on the anchor line) is what `DiffView::stage_hunk`
+/// maps back through `change_regions` to the matching standalone patch.
+///
+/// `expanded_folds` are the context runs the user has clicked open; a run
+/// whose `FoldId` is present renders in full instead of behind an expander.
 pub fn prepare(
     plan: &[FilePlan],
     regions_per_file: &[Vec<oximux_core::ChangeRegion>],
     collapsed: &std::collections::HashSet<usize>,
+    expanded_folds: &std::collections::HashSet<FoldId>,
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -343,41 +372,64 @@ pub fn prepare(
                 if folded {
                     continue;
                 }
-                // Walk every line in file order; before the first changed
-                // line of each region, dock that region's chip bar. Regions
-                // are anchored by line number (robust to hunk merging) and
-                // matched sequentially since both lists are in file order.
+                // Walk every line in file order. Unchanged context is
+                // buffered so a long run can fold; the first changed line of
+                // each region is tagged as that region's staging anchor.
+                // Regions are matched sequentially by line-number anchor
+                // (robust to hunk merging) since both lists are in file order.
                 let mut next_region = 0usize;
-                // The most recently docked region — every line until the next
-                // header is tagged with it so its gutter sliver widens when
-                // the region's header is hovered. Context lines carry no
-                // strip, so a "wrong" tag on surrounding context is inert.
                 let mut current_region: Option<usize> = None;
+                let mut ctx_buf: Vec<&LinePlan> = Vec::new();
                 for h in hunks.iter() {
                     for l in &h.rows {
-                        if next_region < regions.len()
-                            && line_matches_anchor(l, &regions[next_region])
-                        {
-                            let r = &regions[next_region];
-                            rows.push(PreparedRow::HunkHeader {
-                                file_idx,
-                                hunk_idx: next_region,
-                                header: region_label(r).into(),
-                                strip: region_strip(r, rctx),
-                            });
+                        if matches!(l.kind, DiffLineKind::Context) {
+                            ctx_buf.push(l);
+                            continue;
+                        }
+                        // A changed (or no-newline) line ends the context run.
+                        flush_context_inline(
+                            &mut rows,
+                            &mut ctx_buf,
+                            file_idx,
+                            gutter_digits,
+                            expanded_folds,
+                            rctx,
+                        );
+                        let is_anchor = next_region < regions.len()
+                            && line_matches_anchor(l, &regions[next_region]);
+                        if is_anchor {
                             current_region = Some(next_region);
                             next_region += 1;
                         }
+                        // Only changed lines carry the region tag (context
+                        // between regions clears it, so hovering context
+                        // doesn't keep a stale staging card open).
+                        let region = if matches!(l.kind, DiffLineKind::Added | DiffLineKind::Removed)
+                        {
+                            current_region.map(|r| (file_idx, r))
+                        } else {
+                            None
+                        };
                         let strip = line_change_strip(l.kind, rctx);
-                        let region = current_region.map(|r| (file_idx, r));
                         rows.push(PreparedRow::Line(prepare_line(
                             l,
                             strip,
                             gutter_digits,
+                            file_idx,
                             region,
+                            is_anchor,
                             rctx,
                         )));
                     }
+                    // Don't carry a context run across a hunk boundary.
+                    flush_context_inline(
+                        &mut rows,
+                        &mut ctx_buf,
+                        file_idx,
+                        gutter_digits,
+                        expanded_folds,
+                        rctx,
+                    );
                 }
             }
             FilePlan::Collapsed {
@@ -442,6 +494,77 @@ pub fn prepare(
     rows
 }
 
+/// Emit the buffered run of unchanged context as `Line` rows, folding the
+/// middle behind a `ContextFold` when the run is longer than the threshold
+/// and the user hasn't expanded it. Clears the buffer.
+fn flush_context_inline(
+    rows: &mut Vec<PreparedRow>,
+    buf: &mut Vec<&LinePlan>,
+    file_idx: usize,
+    gutter_digits: usize,
+    expanded_folds: &std::collections::HashSet<FoldId>,
+    rctx: &RenderCtx<'_>,
+) {
+    let n = buf.len();
+    if n == 0 {
+        return;
+    }
+    if n > COLLAPSE_THRESHOLD {
+        let fold_id = context_fold_id(file_idx, buf[CONTEXT_KEEP]);
+        if !expanded_folds.contains(&fold_id) {
+            for l in &buf[..CONTEXT_KEEP] {
+                rows.push(context_line(l, gutter_digits, file_idx, rctx));
+            }
+            rows.push(PreparedRow::ContextFold {
+                file_idx,
+                fold_id,
+                count: n - 2 * CONTEXT_KEEP,
+            });
+            for l in &buf[n - CONTEXT_KEEP..] {
+                rows.push(context_line(l, gutter_digits, file_idx, rctx));
+            }
+            buf.clear();
+            return;
+        }
+    }
+    for l in buf.iter() {
+        rows.push(context_line(l, gutter_digits, file_idx, rctx));
+    }
+    buf.clear();
+}
+
+/// One unchanged-context inline row (no strip, no region tag).
+fn context_line(
+    l: &LinePlan,
+    gutter_digits: usize,
+    file_idx: usize,
+    rctx: &RenderCtx<'_>,
+) -> PreparedRow {
+    PreparedRow::Line(prepare_line(
+        l,
+        None,
+        gutter_digits,
+        file_idx,
+        None,
+        false,
+        rctx,
+    ))
+}
+
+/// `FoldId` for a context run, anchored by the new-side (or old-side) line
+/// number of its first hidden line so the id is stable across rebuilds.
+fn context_fold_id(file_idx: usize, first_hidden: &LinePlan) -> FoldId {
+    let line = first_hidden
+        .new_line
+        .or(first_hidden.old_line)
+        .unwrap_or(0);
+    (file_idx, line)
+}
+
+fn count_fold_label(count: usize) -> String {
+    format!("⋯ {count} unchanged lines")
+}
+
 /// Gutter width auto-fits the largest line number across the WHOLE body so
 /// the gutter/content divider stays aligned across every file and hunk (no
 /// per-hunk horizontal shift). Shared by inline + split builders.
@@ -460,17 +583,18 @@ fn gutter_digits_for(plan: &[FilePlan]) -> usize {
     digit_count(max_line)
 }
 
-/// Side-by-side variant of [`prepare`]. Re-uses the same file/region headers
-/// and special bodies, but renders the body as `SplitLine` rows: original
-/// (left) | modified (right). Within each change block, removed lines align
-/// top-down against added lines, with a `None` filler where one side is
-/// longer. Context lines appear on both sides. Region chip headers and the
-/// large-diff / binary / mode-only affordances are emitted identically to
-/// inline so staging + hover behavior is unchanged.
+/// Side-by-side variant of [`prepare`]. Re-uses the same file headers, fold
+/// expanders, and special bodies, but renders the body as `SplitLine` rows:
+/// original (left) | modified (right). Within each change block, removed
+/// lines align top-down against added lines, with a `None` filler where one
+/// side is longer. Context lines appear on both sides and fold identically
+/// to inline. The change block's first row carries the region's staging
+/// anchor so Stage/Unstage/Discard works unchanged.
 pub fn prepare_split(
     plan: &[FilePlan],
     regions_per_file: &[Vec<oximux_core::ChangeRegion>],
     collapsed: &std::collections::HashSet<usize>,
+    expanded_folds: &std::collections::HashSet<FoldId>,
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -499,50 +623,70 @@ pub fn prepare_split(
                 if folded {
                     continue;
                 }
-                let mut next_region = 0usize;
                 // Buffers for the current change block (consecutive non-
                 // context lines); flushed — removed aligned against added —
-                // at the next context line or hunk end. A region's `@@`
-                // header docks at the START of its block (not on the anchor
-                // line, which sits between the removed and added halves of a
-                // modify and would split the pair across filler rows).
+                // at the next context line or hunk end. Context runs buffer
+                // separately so a long run can fold. Region assignment mirrors
+                // the inline walk EXACTLY (anchor-matched + carried), so split
+                // region indices stay aligned with `change_regions` even when
+                // two change clusters within `2*HUNK_CONTEXT` context lines
+                // merge into one region — a block-counting scheme would drift
+                // and strand later blocks with no region (no staging card).
+                let mut next_region = 0usize;
+                let mut current_region: Option<usize> = None;
                 let mut rem: Vec<&LinePlan> = Vec::new();
                 let mut add: Vec<&LinePlan> = Vec::new();
                 let mut in_block = false;
+                let mut block_region: Option<usize> = None;
+                // True when the open block is its region's FIRST cluster (the
+                // card anchors here); false for a later cluster of a merged
+                // region — which still carries the tag for slivers + hover.
+                let mut block_anchor = false;
+                let mut ctx_buf: Vec<&LinePlan> = Vec::new();
                 for h in hunks.iter() {
                     for l in &h.rows {
                         match l.kind {
+                            // Stripped upstream by `collapse_no_newline_eof`
+                            // (no body row); handled defensively in case one
+                            // survives — it neither folds nor anchors.
                             DiffLineKind::NoNewlineHint => {}
                             DiffLineKind::Context => {
-                                flush_split_block(
-                                    &mut rows,
-                                    &mut rem,
-                                    &mut add,
-                                    gutter_digits,
-                                    rctx,
-                                );
-                                in_block = false;
-                                rows.push(PreparedRow::SplitLine {
-                                    left: Some(side_cell(l, true, gutter_digits, rctx)),
-                                    right: Some(side_cell(l, false, gutter_digits, rctx)),
-                                });
+                                if in_block {
+                                    flush_split_block(
+                                        &mut rows,
+                                        &mut rem,
+                                        &mut add,
+                                        file_idx,
+                                        block_region.map(|r| (file_idx, r)),
+                                        block_anchor,
+                                        gutter_digits,
+                                        rctx,
+                                    );
+                                    in_block = false;
+                                }
+                                ctx_buf.push(l);
                             }
                             DiffLineKind::Removed | DiffLineKind::Added => {
-                                // First changed line of a block → dock the
-                                // region header above the whole block. Blocks
-                                // and regions are 1:1 in file order (a region
-                                // is a contiguous change run), so the running
-                                // region index stays correct for staging.
+                                flush_context_split(
+                                    &mut rows,
+                                    &mut ctx_buf,
+                                    file_idx,
+                                    gutter_digits,
+                                    expanded_folds,
+                                    rctx,
+                                );
+                                // A changed line matching the next region's
+                                // anchor opens that region; otherwise it belongs
+                                // to the current (possibly merged) region.
+                                let is_region_start = next_region < regions.len()
+                                    && line_matches_anchor(l, &regions[next_region]);
+                                if is_region_start {
+                                    current_region = Some(next_region);
+                                    next_region += 1;
+                                }
                                 if !in_block {
-                                    if let Some(r) = regions.get(next_region) {
-                                        rows.push(PreparedRow::HunkHeader {
-                                            file_idx,
-                                            hunk_idx: next_region,
-                                            header: region_label(r).into(),
-                                            strip: region_strip(r, rctx),
-                                        });
-                                        next_region += 1;
-                                    }
+                                    block_region = current_region;
+                                    block_anchor = is_region_start;
                                     in_block = true;
                                 }
                                 if matches!(l.kind, DiffLineKind::Removed) {
@@ -553,8 +697,29 @@ pub fn prepare_split(
                             }
                         }
                     }
+                    // Don't carry a change block or context run across a hunk
+                    // boundary (mirrors the inline walk). At most one buffer
+                    // is non-empty here.
+                    flush_split_block(
+                        &mut rows,
+                        &mut rem,
+                        &mut add,
+                        file_idx,
+                        block_region.map(|r| (file_idx, r)),
+                        block_anchor,
+                        gutter_digits,
+                        rctx,
+                    );
+                    in_block = false;
+                    flush_context_split(
+                        &mut rows,
+                        &mut ctx_buf,
+                        file_idx,
+                        gutter_digits,
+                        expanded_folds,
+                        rctx,
+                    );
                 }
-                flush_split_block(&mut rows, &mut rem, &mut add, gutter_digits, rctx);
             }
             FilePlan::Collapsed {
                 path,
@@ -620,23 +785,88 @@ pub fn prepare_split(
 
 /// Emit the buffered change block as aligned `SplitLine` rows: removed[i] on
 /// the left, added[i] on the right, `None` filler where one side is shorter.
-/// Clears both buffers. No-op when both are empty.
+/// `region_anchor` marks the block's first row as the region's staging anchor
+/// — but ONLY when this block actually starts its region (`block_anchor`);
+/// a block that is a later cluster of a merged region carries the region tag
+/// (so its slivers + hover resolve) without re-anchoring the card. Clears
+/// both buffers. No-op when both are empty.
+#[allow(clippy::too_many_arguments)]
 fn flush_split_block(
     rows: &mut Vec<PreparedRow>,
     rem: &mut Vec<&LinePlan>,
     add: &mut Vec<&LinePlan>,
+    file_idx: usize,
+    region: Option<(usize, usize)>,
+    block_anchor: bool,
     gutter_digits: usize,
     rctx: &RenderCtx<'_>,
 ) {
     let n = rem.len().max(add.len());
     for i in 0..n {
         rows.push(PreparedRow::SplitLine {
+            file_idx,
             left: rem.get(i).map(|l| side_cell(l, true, gutter_digits, rctx)),
             right: add.get(i).map(|l| side_cell(l, false, gutter_digits, rctx)),
+            region,
+            region_anchor: block_anchor && i == 0,
         });
     }
     rem.clear();
     add.clear();
+}
+
+/// Emit the buffered context run as `SplitLine` rows (both columns filled),
+/// folding the middle behind a `ContextFold` when long + not expanded.
+fn flush_context_split(
+    rows: &mut Vec<PreparedRow>,
+    buf: &mut Vec<&LinePlan>,
+    file_idx: usize,
+    gutter_digits: usize,
+    expanded_folds: &std::collections::HashSet<FoldId>,
+    rctx: &RenderCtx<'_>,
+) {
+    let n = buf.len();
+    if n == 0 {
+        return;
+    }
+    if n > COLLAPSE_THRESHOLD {
+        let fold_id = context_fold_id(file_idx, buf[CONTEXT_KEEP]);
+        if !expanded_folds.contains(&fold_id) {
+            for l in &buf[..CONTEXT_KEEP] {
+                rows.push(context_split_row(l, file_idx, gutter_digits, rctx));
+            }
+            rows.push(PreparedRow::ContextFold {
+                file_idx,
+                fold_id,
+                count: n - 2 * CONTEXT_KEEP,
+            });
+            for l in &buf[n - CONTEXT_KEEP..] {
+                rows.push(context_split_row(l, file_idx, gutter_digits, rctx));
+            }
+            buf.clear();
+            return;
+        }
+    }
+    for l in buf.iter() {
+        rows.push(context_split_row(l, file_idx, gutter_digits, rctx));
+    }
+    buf.clear();
+}
+
+/// One unchanged-context split row (both columns the same line, no region).
+fn context_split_row(
+    l: &LinePlan,
+    file_idx: usize,
+    gutter_digits: usize,
+    rctx: &RenderCtx<'_>,
+) -> PreparedRow {
+    PreparedRow::SplitLine {
+        file_idx,
+        left: Some(side_cell(l, true, gutter_digits, rctx)),
+        right: Some(side_cell(l, false, gutter_digits, rctx)),
+        region: None,
+        region_anchor: false,
+    }
 }
 
 /// Build one column of a `SplitLine`. `is_left` selects the old-side gutter
@@ -681,11 +911,14 @@ fn line_visuals(kind: DiffLineKind, rctx: &RenderCtx<'_>) -> (Hsla, Option<Hsla>
 }
 
 /// Resolve one plan line into a fully-baked `PreparedLine`.
+#[allow(clippy::too_many_arguments)]
 fn prepare_line(
     l: &LinePlan,
     strip: Option<Hsla>,
     gutter_digits: usize,
+    file_idx: usize,
     region: Option<(usize, usize)>,
+    region_anchor: bool,
     rctx: &RenderCtx<'_>,
 ) -> PreparedLine {
     let (fg, row_bg) = line_visuals(l.kind, rctx);
@@ -697,7 +930,9 @@ fn prepare_line(
         fg,
         row_bg,
         strip,
+        file_idx,
         region,
+        region_anchor,
         mark: mark_for_kind(l.kind),
     }
 }
@@ -719,19 +954,34 @@ fn line_highlights(l: &LinePlan, rctx: &RenderCtx<'_>) -> Vec<(Range<usize>, Hig
     let max = content.len();
     let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
 
-    // 1. Syntax foreground tokens (always).
+    // Effective row background for a tinted (Added/Removed) row — the
+    // translucent tint composited over the base — so syntax tokens that
+    // would wash out against it can be nudged back to legible contrast.
+    let eff_bg = match l.kind {
+        DiffLineKind::Added => Some(composite_over(rctx.theme.diff_added_bg(), rctx.theme.bg_base)),
+        DiffLineKind::Removed => {
+            Some(composite_over(rctx.theme.diff_removed_bg(), rctx.theme.bg_base))
+        }
+        _ => None,
+    };
+
+    // 1. Syntax foreground tokens (always). On tinted rows, contrast-protect
+    //    each token so it stays legible over the wash.
     for tok in &l.tokens {
         let start = tok.start.min(max);
         let end = tok.end.min(max);
         if start >= end || !content.is_char_boundary(start) || !content.is_char_boundary(end) {
             continue;
         }
-        let color = Hsla::from(gpui::Rgba {
+        let mut color = Hsla::from(gpui::Rgba {
             r: tok.r as f32 / 255.0,
             g: tok.g as f32 / 255.0,
             b: tok.b as f32 / 255.0,
             a: 1.0,
         });
+        if let Some(bg) = eff_bg {
+            color = ensure_minimum_contrast(color, bg, MIN_TOKEN_CONTRAST);
+        }
         out.push((start..end, fg_highlight(color)));
     }
 
@@ -776,16 +1026,87 @@ fn bg_highlight(color: Hsla) -> HighlightStyle {
     }
 }
 
+/// Minimum WCAG contrast ratio a syntax token must keep against a tinted
+/// row background before its lightness is nudged. ~3:1 keeps colored tokens
+/// legible without flattening them to white.
+const MIN_TOKEN_CONTRAST: f32 = 3.0;
+
+/// Alpha-composite a translucent `top` over an opaque `base`, returning the
+/// resulting opaque color — used to resolve a diff row's effective on-screen
+/// background (translucent tint over the panel base) for contrast checks.
+fn composite_over(top: Hsla, base: Hsla) -> Hsla {
+    let t = gpui::Rgba::from(top);
+    let b = gpui::Rgba::from(base);
+    // Callers pass the opaque panel/base color; the blend below assumes it.
+    debug_assert!((b.a - 1.0).abs() < 1e-4, "composite_over base must be opaque");
+    let a = t.a;
+    Hsla::from(gpui::Rgba {
+        r: t.r * a + b.r * (1.0 - a),
+        g: t.g * a + b.g * (1.0 - a),
+        b: t.b * a + b.b * (1.0 - a),
+        a: 1.0,
+    })
+}
+
+/// Linearize one sRGB channel (gamma-expand) for relative-luminance, per the
+/// WCAG 2.x definition (normative `0.04045` knee).
+fn channel_lin(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// WCAG relative luminance of a color.
+fn relative_luminance(c: Hsla) -> f32 {
+    let r = gpui::Rgba::from(c);
+    0.2126 * channel_lin(r.r) + 0.7152 * channel_lin(r.g) + 0.0722 * channel_lin(r.b)
+}
+
+/// WCAG contrast ratio between two colors (≥ 1.0).
+fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Nudge a syntax token's lightness until it clears `min` contrast against
+/// the (composited) row background, preserving hue + saturation so the token
+/// keeps its syntactic color. Pushes toward white on dark backgrounds, black
+/// on light ones; stops at the first passing step or a lightness bound.
+fn ensure_minimum_contrast(fg: Hsla, bg: Hsla, min: f32) -> Hsla {
+    if contrast_ratio(fg, bg) >= min {
+        return fg;
+    }
+    let step = if relative_luminance(bg) < 0.5 { 0.04 } else { -0.04 };
+    let mut out = fg;
+    // 26 steps of 0.04 span the full [0,1] lightness range, so the loop can
+    // always reach the brightest/darkest end before giving up.
+    for _ in 0..26 {
+        let next = (out.l + step).clamp(0.0, 1.0);
+        if (next - out.l).abs() < f32::EPSILON {
+            break; // hit a clamp bound — can't push further
+        }
+        out.l = next;
+        if contrast_ratio(out, bg) >= min {
+            break;
+        }
+    }
+    out
+}
+
 /// Render the prepared rows into the virtualized body. Called from
 /// `DiffView::render` with the cached `Rc<Vec<PreparedRow>>`.
 ///
-/// `side` gates the per-hunk action chips (Stage/Unstage/Discard) — `None`
-/// on commit-detail / read-only views. `weak` routes chip + expand + copy
-/// clicks back into the view from the `uniform_list` closure's App scope.
+/// The per-region staging card is NOT rendered here — it floats at the
+/// body-wrap level (see `staging_card_overlay`) so it stays pinned to the
+/// viewport regardless of line length / horizontal scroll. `weak` routes
+/// hover + fold + expand + copy clicks back into the view from the
+/// `uniform_list` closure's App scope.
 #[allow(clippy::too_many_arguments)]
 pub fn render_rows(
     rows: Rc<Vec<PreparedRow>>,
-    side: Option<HunkActionSide>,
     hovered_region: Option<(usize, usize)>,
     widest_idx: usize,
     split: bool,
@@ -805,11 +1126,11 @@ pub fn render_rows(
         rows.len(),
         move |range, _window, _cx| {
             range
-                .filter_map(|i| rows.get(i))
-                .map(|row| {
+                .filter_map(|i| rows.get(i).map(|row| (i, row)))
+                .map(|(i, row)| {
                     build_prepared_row(
+                        i,
                         row,
-                        side,
                         hovered_region,
                         h_offset,
                         theme,
@@ -849,8 +1170,8 @@ pub fn render_rows(
 /// the list's uniform-height assumption holds.
 #[allow(clippy::too_many_arguments)]
 fn build_prepared_row(
+    row_index: usize,
     row: &PreparedRow,
-    side: Option<HunkActionSide>,
     hovered_region: Option<(usize, usize)>,
     h_offset: f32,
     theme: Theme,
@@ -878,27 +1199,40 @@ fn build_prepared_row(
             weak,
         )
         .into_any_element(),
-        PreparedRow::HunkHeader {
+        PreparedRow::Line(line) => {
+            let hovered = line.region.is_some() && line.region == hovered_region;
+            line_row_el(row_index, line, hovered, theme, density, typography, weak)
+                .into_any_element()
+        }
+        PreparedRow::SplitLine {
             file_idx,
-            hunk_idx,
-            header,
-            strip,
+            left,
+            right,
+            region,
+            region_anchor: _,
         } => {
-            let hovered = hovered_region == Some((*file_idx, *hunk_idx));
-            hunk_header_row(
-                *file_idx, *hunk_idx, header.clone(), *strip, hovered, side, theme, density,
-                typography, weak,
+            let hovered = region.is_some() && *region == hovered_region;
+            split_line_el(
+                row_index,
+                *file_idx,
+                left.as_ref(),
+                right.as_ref(),
+                *region,
+                hovered,
+                h_offset,
+                theme,
+                density,
+                typography,
+                weak,
             )
             .into_any_element()
         }
-        PreparedRow::Line(line) => {
-            let hovered = line.region.is_some() && line.region == hovered_region;
-            line_row_el(line, hovered, theme, density, typography).into_any_element()
-        }
-        PreparedRow::SplitLine { left, right } => {
-            split_line_el(left.as_ref(), right.as_ref(), h_offset, theme, density, typography)
-                .into_any_element()
-        }
+        PreparedRow::ContextFold {
+            file_idx,
+            fold_id,
+            count,
+        } => context_fold_row(*file_idx, *fold_id, *count, theme, density, typography, weak)
+            .into_any_element(),
         PreparedRow::Collapsed { label } => {
             collapsed_row(label.clone(), theme, density, typography, weak).into_any_element()
         }
@@ -908,80 +1242,28 @@ fn build_prepared_row(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn hunk_header_row(
-    file_idx: usize,
-    hunk_idx: usize,
-    header: SharedString,
-    strip: Option<Hsla>,
-    hovered: bool,
-    side: Option<HunkActionSide>,
-    theme: Theme,
-    density: Density,
-    typography: &Typography,
-    weak: WeakEntity<DiffView>,
-) -> impl IntoElement {
-    // The action chips are revealed only while the pointer is over this
-    // region's header — at rest the header shows just the `@@` label, so a
-    // multi-region diff stays calm instead of docking a chip bar per region.
-    let actions = side
-        .filter(|_| hovered)
-        .and_then(|s| render_hunk_actions(s, file_idx, hunk_idx, theme, density, typography, &weak));
-    // Drive the hover state from the header row. `on_hover` fires true on
-    // enter, false on leave; the card + sliver-widen both key off it. The
-    // chips card is a child of this row, so moving onto it stays "hovered".
-    let hover_weak = weak.clone();
-    let mut row = div()
-        .id(gpui::ElementId::Name(
-            format!("diff-hunk-header-{file_idx}-{hunk_idx}").into(),
-        ))
-        .flex()
-        .items_center()
-        .h(px(density.h_row))
-        .w_full()
-        .bg(theme.bg_panel_alt)
-        .text_size(px(typography.t_body_sm))
-        .text_color(theme.fg_subtle)
-        .on_hover(move |hovered, _window, cx: &mut App| {
-            let region = hovered.then_some((file_idx, hunk_idx));
-            let _ = hover_weak.update(cx, |view, cx| view.set_hovered_region(region, cx));
-        })
-        .child(strip_cell(strip, hovered, density.h_row))
-        .child(div().px(px(density.pad_panel)).child(header));
-    if let Some(actions) = actions {
-        // Float the chips as an elevated card at the right of the header —
-        // raised surface + crisp border + soft shadow so it reads as a
-        // floating control docked over the diff, not a flat inline chip.
-        let card = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .mr(px(density.pad_panel))
-            .px(px(6.0))
-            .py(px(1.0))
-            .rounded(px(density.r_xs))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .shadow_md()
-            .child(actions);
-        row = row.child(div().flex_1()).child(card);
-    }
-    row
-}
-
 /// One diff body line: strip cell + dual gutter + a SINGLE `StyledText`
 /// for the content (colors via highlight ranges, not child elements).
-/// Clean line numbers + tint carry the add/remove cue — no `+`/`-` glyph in
-/// the body. The row is `min_w_full` so it always fills the viewport (tint
-/// spans full width) but grows past it for long lines, which the list's
-/// `Unconstrained` horizontal scroll then reveals.
+/// Clean line numbers + tint carry the add/remove cue. The row is
+/// `min_w_full` so it always fills the viewport (tint spans full width) but
+/// grows past it for long lines, which the list's `Unconstrained` horizontal
+/// scroll then reveals.
+///
+/// Every body row carries enter-driven hover wiring: entering a changed line
+/// arms its region (`set_hovered_region`), widening every sliver in the
+/// region and floating the Stage/Discard card (rendered separately at the
+/// body-wrap level — see `staging_card_overlay`); entering context disarms.
+/// Leave events are ignored so the pointer can travel onto the floating card
+/// without it vanishing.
+#[allow(clippy::too_many_arguments)]
 fn line_row_el(
+    row_index: usize,
     line: &PreparedLine,
     hovered: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
+    weak: WeakEntity<DiffView>,
 ) -> impl IntoElement {
     let gutter = div()
         .flex()
@@ -996,22 +1278,50 @@ fn line_row_el(
         .child(div().child(line.old_cell.clone()))
         .child(div().child(line.new_cell.clone()));
 
+    // Narrow `+`/`−` column between the numbers and content: `+` (green) on
+    // additions, `−` (red) on deletions, blank on context. Fixed mono width
+    // so content stays column-aligned across all rows.
+    let sign = sign_cell(line.mark, typography, theme);
+
     let content = div()
         .flex()
         .flex_row()
-        // Small left pad replaces the old glyph column so content doesn't
-        // butt against the gutter.
+        // Small left pad separates the sign column from the content.
         .pl(px(density.gap_inline))
         .pr(px(density.pad_panel))
         .font(typography.mono_font())
         .text_size(px(typography.t_body_sm))
         .text_color(line.fg)
-        .child(
-            StyledText::new(line.content.clone())
-                .with_highlights(line.highlights.iter().cloned()),
-        );
+        .child(StyledText::new(line.content.clone()).with_highlights(line.highlights.iter().cloned()));
 
+    let row_id = gpui::ElementId::Name(
+        format!(
+            "diff-line-{}-{}-{}",
+            line.file_idx,
+            line.old_cell.trim(),
+            line.new_cell.trim()
+        )
+        .into(),
+    );
+    // Hover wash: on a tinted row, deepen the same hue a touch so the cue
+    // survives (the add/remove color "wins" under the pointer); on context,
+    // a neutral panel highlight.
+    let hover_bg = match line.row_bg {
+        Some(bg) => Hsla {
+            a: (bg.a + 0.10).min(0.9),
+            ..bg
+        },
+        None => theme.bg_panel_alt,
+    };
+    // Enter-driven hover: entering a changed line arms its region (for the
+    // sliver widen) + this row (for the card's Y); entering context disarms.
+    // Leave is ignored so the pointer can reach the floating staging card
+    // without it vanishing.
+    let target_region = line.region;
+    let target_row = line.region.map(|_| row_index);
     let mut row = div()
+        .id(row_id)
+        .relative()
         .flex()
         .items_center()
         .h(px(density.h_row))
@@ -1019,38 +1329,145 @@ fn line_row_el(
         // edge-to-edge, but allow growth past it so long lines extend into
         // the list's horizontal scroll range instead of clipping.
         .min_w_full()
-        .text_size(px(typography.t_body_sm));
+        .text_size(px(typography.t_body_sm))
+        .hover(move |s| s.bg(hover_bg))
+        .on_hover(move |hovered, _window, cx: &mut App| {
+            if *hovered {
+                let _ = weak.update(cx, |view, cx| view.set_hover(target_region, target_row, cx));
+            }
+        });
     if let Some(bg) = line.row_bg {
         row = row.bg(bg);
     }
     row.child(strip_cell(line.strip, hovered, density.h_row))
         .child(gutter)
+        .child(sign)
         .child(content)
+}
+
+/// The elevated Stage/Discard card — a raised surface + crisp border + soft
+/// shadow so it reads as a floating control docked over the diff.
+fn action_card(actions: gpui::Div, theme: Theme, density: Density) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(6.0))
+        .py(px(1.0))
+        .rounded(px(density.r_xs))
+        .bg(theme.bg_overlay)
+        .border_1()
+        .border_color(theme.border_active)
+        .shadow_md()
+        .child(actions)
+}
+
+/// Map each change region to the prepared-row index of its anchor (first
+/// changed) line, so the host can float the staging card at that row's
+/// on-screen Y. Built once per prepared rebuild, off the per-frame path.
+pub fn region_anchor_rows(rows: &[PreparedRow]) -> std::collections::HashMap<(usize, usize), usize> {
+    let mut map = std::collections::HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let (region, anchor) = match row {
+            PreparedRow::Line(l) => (l.region, l.region_anchor),
+            PreparedRow::SplitLine {
+                region,
+                region_anchor,
+                ..
+            } => (*region, *region_anchor),
+            _ => (None, false),
+        };
+        if anchor && let Some(r) = region {
+            map.entry(r).or_insert(i);
+        }
+    }
+    map
+}
+
+/// The floating Stage/Discard card for the hovered region. Lives at the
+/// body-wrap level (NOT inside the scrollable list row) and is absolutely
+/// positioned at `top` (the hovered row's on-screen Y) on the viewport's
+/// right edge, so it is always visible regardless of the changed line's
+/// length or the horizontal scroll. It re-arms the hover (region + the
+/// `anchor_row` it sits at) on its own hover so the pointer can travel onto
+/// it without it vanishing. Returns `None` on read-only / untracked sides.
+#[allow(clippy::too_many_arguments)]
+pub fn staging_card_overlay(
+    top: f32,
+    file_idx: usize,
+    region_idx: usize,
+    anchor_row: usize,
+    side: HunkActionSide,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    weak: WeakEntity<DiffView>,
+) -> Option<impl IntoElement> {
+    let actions = render_hunk_actions(side, file_idx, region_idx, theme, density, typography, &weak)?;
+    let hover_weak = weak.clone();
+    Some(
+        div()
+            .id(gpui::ElementId::Name(
+                format!("diff-staging-card-{file_idx}-{region_idx}").into(),
+            ))
+            .absolute()
+            .top(px(top))
+            // Clear the overview ruler (right edge) so the card never paints
+            // over the change-map strip.
+            .right(px(density.pad_panel + 6.0))
+            .on_hover(move |hovered, _window, cx: &mut App| {
+                if *hovered {
+                    let _ = hover_weak.update(cx, |view, cx| {
+                        view.set_hover(Some((file_idx, region_idx)), Some(anchor_row), cx)
+                    });
+                }
+            })
+            .child(action_card(actions, theme, density)),
+    )
 }
 
 /// One side-by-side row: original (left) | 1px divider | modified (right).
 /// Each half is a 50% column with its own sliver + single (sticky) gutter +
 /// content; `None` halves render as a faint filler so unequal blocks still
 /// align. `h_offset` shifts each column's CONTENT left (synced horizontal
-/// scroll) while the gutter stays pinned.
+/// scroll) while the gutter stays pinned. Enter-driven hover arms the row's
+/// region; the staging card floats separately at the body-wrap level.
+#[allow(clippy::too_many_arguments)]
 fn split_line_el(
+    row_index: usize,
+    file_idx: usize,
     left: Option<&SideCell>,
     right: Option<&SideCell>,
+    region: Option<(usize, usize)>,
+    hovered: bool,
     h_offset: f32,
     theme: Theme,
     density: Density,
     typography: &Typography,
+    weak: WeakEntity<DiffView>,
 ) -> impl IntoElement {
+    let lid = left.map(|c| c.gutter.trim().to_string()).unwrap_or_default();
+    let rid = right.map(|c| c.gutter.trim().to_string()).unwrap_or_default();
+    let row_id = gpui::ElementId::Name(format!("diff-split-{file_idx}-{lid}-{rid}").into());
+    let target_region = region;
+    let target_row = region.map(|_| row_index);
     div()
+        .id(row_id)
+        .relative()
         .flex()
         .flex_row()
         .items_center()
         .h(px(density.h_row))
         .w_full()
         .text_size(px(typography.t_body_sm))
-        .child(split_half(left, h_offset, theme, density, typography))
+        .on_hover(move |hovered, _window, cx: &mut App| {
+            if *hovered {
+                let _ = weak.update(cx, |view, cx| view.set_hover(target_region, target_row, cx));
+            }
+        })
+        .child(split_half(left, hovered, h_offset, theme, density, typography))
         .child(div().w(px(1.0)).h(px(density.h_row)).bg(theme.border_inactive))
-        .child(split_half(right, h_offset, theme, density, typography))
+        .child(split_half(right, hovered, h_offset, theme, density, typography))
 }
 
 /// One 50%-width column of a `SplitLine`. `None` → filler (faint wash, no
@@ -1059,6 +1476,7 @@ fn split_line_el(
 /// rather than clip, with the gutter staying fixed).
 fn split_half(
     cell: Option<&SideCell>,
+    hovered: bool,
     h_offset: f32,
     theme: Theme,
     density: Density,
@@ -1072,15 +1490,27 @@ fn split_half(
         .h(px(density.h_row))
         .overflow_hidden();
     let Some(cell) = cell else {
-        // Filler: a faint neutral wash signals "no line on this side".
+        // Filler: a faint neutral wash signals "no line on this side" — a
+        // touch stronger than the body so the absence reads clearly.
         return half.bg(Hsla {
-            a: 0.03,
+            a: 0.05,
             ..theme.fg_subtle
         });
     };
     if let Some(bg) = cell.bg {
         half = half.bg(bg);
     }
+    // Per-half hover wash (parity with inline): deepen the tint on a changed
+    // half, neutral highlight on context. Each half owns its own bg, so the
+    // hover style attaches here, not on the whole split row.
+    let hover_bg = match cell.bg {
+        Some(bg) => Hsla {
+            a: (bg.a + 0.10).min(0.9),
+            ..bg
+        },
+        None => theme.bg_panel_alt,
+    };
+    half = half.hover(move |s| s.bg(hover_bg));
     // Sliver + gutter stay pinned (do not scroll horizontally).
     let gutter = div()
         .flex_shrink_0()
@@ -1089,6 +1519,9 @@ fn split_half(
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_subtle)
         .child(cell.gutter.clone());
+    // Per-side `+`/`−` sign (the left half shows deletions, the right half
+    // additions) — pinned beside the gutter so it doesn't scroll.
+    let sign = sign_cell(cell.mark, typography, theme);
     // Content viewport fills the rest of the half and clips; the inner line
     // is absolutely positioned and shifted left by the shared offset to
     // reveal long lines (proven pattern — `relative` clip box + `absolute`
@@ -1115,9 +1548,51 @@ fn split_half(
                         .with_highlights(cell.highlights.iter().cloned()),
                 ),
         );
-    half.child(strip_cell(cell.strip, false, density.h_row))
+    half.child(strip_cell(cell.strip, hovered, density.h_row))
         .child(gutter)
+        .child(sign)
         .child(content_viewport)
+}
+
+/// Collapsed-context expander row — a centered muted "⋯ N unchanged lines"
+/// between two hairline rules. Click expands just this run.
+fn context_fold_row(
+    file_idx: usize,
+    fold_id: FoldId,
+    count: usize,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    weak: WeakEntity<DiffView>,
+) -> impl IntoElement {
+    let id = gpui::ElementId::Name(format!("diff-fold-{file_idx}-{}", fold_id.1).into());
+    let hover_bg = theme.bg_panel;
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(density.h_row))
+        .w_full()
+        .px(px(density.pad_panel))
+        .bg(theme.bg_panel_alt)
+        .border_t_1()
+        .border_b_1()
+        .border_color(theme.border_inactive)
+        .text_size(px(typography.t_body_sm))
+        .text_color(theme.fg_subtle)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_: &MouseDownEvent, _window, cx: &mut App| {
+                let _ = weak.update(cx, |view, cx| {
+                    view.expand_fold(fold_id);
+                    cx.notify();
+                });
+            },
+        )
+        .child(count_fold_label(count))
 }
 
 fn collapsed_row(
@@ -1179,37 +1654,6 @@ fn line_change_strip(kind: DiffLineKind, rctx: &RenderCtx<'_>) -> Option<Hsla> {
     }
 }
 
-/// Strip color for a region's chip-bar header: orange when the region
-/// mixes adds + deletes, green for pure adds, red for pure deletes.
-fn region_strip(region: &oximux_core::ChangeRegion, rctx: &RenderCtx<'_>) -> Option<Hsla> {
-    let mut has_add = false;
-    let mut has_rem = false;
-    for l in &region.stage_hunk.lines {
-        match l.kind {
-            DiffLineKind::Added => has_add = true,
-            DiffLineKind::Removed => has_rem = true,
-            _ => {}
-        }
-    }
-    let alpha = |c: Hsla| Hsla { a: 0.7, ..c };
-    match (has_add, has_rem) {
-        (true, true) => Some(alpha(rctx.theme.status_warn)),
-        (true, false) => Some(alpha(rctx.theme.git.added)),
-        (false, true) => Some(alpha(rctx.theme.git.deleted)),
-        _ => None,
-    }
-}
-
-/// `@@ -a,b +c,d @@` location label for a region's chip bar — tells the
-/// reviewer where in the file the change sits, the way `git add -p` does.
-fn region_label(region: &oximux_core::ChangeRegion) -> String {
-    let h = &region.stage_hunk;
-    format!(
-        "@@ -{},{} +{},{} @@",
-        h.old_start, h.old_lines, h.new_start, h.new_lines
-    )
-}
-
 /// Does this display line start `region`? Regions are anchored by the
 /// line number of their first changed line (addition → new side, deletion
 /// → old side), which survives hunk merging from full-file context.
@@ -1235,6 +1679,26 @@ fn strip_cell(color: Option<Hsla>, hovered: bool, h: f32) -> gpui::Div {
         bar = bar.bg(c);
     }
     div().w(px(COL_W)).h(px(h)).child(bar)
+}
+
+/// Fixed-width `+`/`−` sign column derived from a row's ruler mark: `+`
+/// (green) for an addition, `−` (red) for a deletion, blank otherwise. Mono
+/// + fixed width so the content column stays aligned across all row kinds.
+fn sign_cell(mark: Option<RulerMark>, typography: &Typography, theme: Theme) -> gpui::Div {
+    let (glyph, color) = match mark {
+        Some(RulerMark::Added) => ("+", theme.git.added),
+        Some(RulerMark::Removed) => ("−", theme.git.deleted),
+        // Non-breaking space holds the fixed column even if a layout pass
+        // would collapse a plain space.
+        _ => ("\u{00A0}", theme.fg_subtle),
+    };
+    div()
+        .flex_shrink_0()
+        .w(px(10.0))
+        .font(typography.mono_font())
+        .text_size(px(typography.t_body_sm))
+        .text_color(color)
+        .child(glyph)
 }
 
 fn digit_count(n: u32) -> usize {
@@ -1266,4 +1730,63 @@ fn placeholder(msg: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
         .text_size(px(rctx.typography.t_body_sm))
         .text_color(rctx.theme.fg_subtle)
         .child(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray(l: f32) -> Hsla {
+        Hsla {
+            h: 0.0,
+            s: 0.0,
+            l,
+            a: 1.0,
+        }
+    }
+
+    #[test]
+    fn contrast_ratio_white_over_black_is_maximal() {
+        let r = contrast_ratio(gray(1.0), gray(0.0));
+        assert!((r - 21.0).abs() < 0.5, "white/black ≈ 21:1, got {r}");
+    }
+
+    #[test]
+    fn ensure_contrast_lifts_low_contrast_token_on_dark_bg() {
+        let bg = gray(0.12); // dark tinted row
+        let fg = gray(0.18); // nearly invisible over it
+        assert!(contrast_ratio(fg, bg) < MIN_TOKEN_CONTRAST);
+        let fixed = ensure_minimum_contrast(fg, bg, MIN_TOKEN_CONTRAST);
+        assert!(fixed.l > fg.l, "pushed lighter on a dark background");
+        // Small slack absorbs f32 rounding + the 0.04 lightness step; it is
+        // NOT a tolerance for under-delivering contrast.
+        assert!(
+            contrast_ratio(fixed, bg) >= MIN_TOKEN_CONTRAST - 0.05,
+            "reaches (≈) the minimum contrast"
+        );
+    }
+
+    #[test]
+    fn ensure_contrast_preserves_already_legible_token() {
+        let bg = gray(0.12);
+        let fg = gray(0.9);
+        let same = ensure_minimum_contrast(fg, bg, MIN_TOKEN_CONTRAST);
+        assert_eq!(same.l, fg.l, "legible token is returned unchanged");
+    }
+
+    #[test]
+    fn composite_over_respects_alpha_bounds() {
+        let base = gray(0.1);
+        let clear = Hsla { a: 0.0, ..gray(0.9) };
+        let solid = Hsla { a: 1.0, ..gray(0.9) };
+        // a=0 → base luminance; a=1 → top luminance.
+        assert!(
+            (relative_luminance(composite_over(clear, base)) - relative_luminance(base)).abs()
+                < 1e-4
+        );
+        assert!(
+            (relative_luminance(composite_over(solid, base)) - relative_luminance(gray(0.9))).abs()
+                < 1e-3
+        );
+    }
 }

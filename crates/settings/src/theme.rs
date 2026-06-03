@@ -122,31 +122,34 @@ impl Theme {
     }
 
     /// Translucent background for added-line highlights in diff views.
-    /// `git.added` (#81b88b) at 16% alpha — the line scans as "added" while
-    /// syntax/text reads cleanly through. Tuned up from a lighter-surface
-    /// 10% baseline so the wash carries equal presence over OxiMux's darker
-    /// charcoal base. Single source of truth so retuning lands in one place.
+    /// `git.added` (#81b88b) at 20% alpha — the line scans clearly as
+    /// "added" (a saturated two-tier wash like reference editors) while
+    /// syntax/text still reads through. Single source of truth so retuning
+    /// lands in one place; the changed-word box (`diff_word_added_bg`) must
+    /// stay visibly stronger so the exact change still out-pops the line.
     pub fn diff_added_bg(&self) -> Hsla {
-        Hsla { a: 0.16, ..self.git.added }
+        Hsla { a: 0.20, ..self.git.added }
     }
 
     /// Translucent background for removed-line highlights — `git.deleted`
-    /// (#c74e39) at 17% alpha (paired one notch above `diff_added_bg` since
+    /// (#c74e39) at 22% alpha (paired one notch above `diff_added_bg` since
     /// the brick hue reads slightly weaker than the sage at equal alpha).
     pub fn diff_removed_bg(&self) -> Hsla {
-        Hsla { a: 0.17, ..self.git.deleted }
+        Hsla { a: 0.22, ..self.git.deleted }
     }
 
     /// Brighter background for the changed *words* on a modified line,
     /// layered over the preserved syntax foreground so the exact change
-    /// pops without recoloring the text. Stronger than the line tint.
+    /// pops without recoloring the text. Tuned distinctly above the line
+    /// tint for the two-tier look — the word box clearly out-pops the wash.
     pub fn diff_word_added_bg(&self) -> Hsla {
-        Hsla { a: 0.30, ..self.git.added }
+        Hsla { a: 0.40, ..self.git.added }
     }
 
-    /// Removed-side counterpart of `diff_word_added_bg`.
+    /// Removed-side counterpart of `diff_word_added_bg`. The brick hue reads
+    /// weaker at equal alpha, so it runs hotter (still readable on charcoal).
     pub fn diff_word_removed_bg(&self) -> Hsla {
-        Hsla { a: 0.40, ..self.git.deleted }
+        Hsla { a: 0.60, ..self.git.deleted }
     }
 }
 
@@ -210,22 +213,22 @@ mod tests {
     }
 
     #[test]
-    fn diff_added_bg_uses_16pct_alpha_over_git_added() {
-        // 16% alpha over the git.added sage hue.
+    fn diff_added_bg_uses_20pct_alpha_over_git_added() {
+        // 20% alpha over the git.added sage hue (two-tier wash).
         let t = Theme::charcoal();
         let bg = t.diff_added_bg();
-        assert!((bg.a - 0.16).abs() < f32::EPSILON);
+        assert!((bg.a - 0.20).abs() < f32::EPSILON);
         assert_eq!(bg.h, t.git.added.h);
         assert_eq!(bg.s, t.git.added.s);
         assert_eq!(bg.l, t.git.added.l);
     }
 
     #[test]
-    fn diff_removed_bg_uses_17pct_alpha_over_git_deleted() {
-        // 17% alpha over the git.deleted brick hue.
+    fn diff_removed_bg_uses_22pct_alpha_over_git_deleted() {
+        // 22% alpha over the git.deleted brick hue.
         let t = Theme::charcoal();
         let bg = t.diff_removed_bg();
-        assert!((bg.a - 0.17).abs() < f32::EPSILON);
+        assert!((bg.a - 0.22).abs() < f32::EPSILON);
         assert_eq!(bg.h, t.git.deleted.h);
         assert_eq!(bg.s, t.git.deleted.s);
         assert_eq!(bg.l, t.git.deleted.l);

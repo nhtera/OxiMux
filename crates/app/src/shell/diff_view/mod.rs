@@ -29,8 +29,8 @@ use crate::actions::{ExpandDiff, RetryDiff};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::diff_view::file_header::{StickyHeader, build_row_owner, collect_headers, sticky_header_overlay};
 use crate::shell::diff_view::paint::{
-    OverviewRun, PreparedRow, overview_ruler, overview_runs, prepare, prepare_split, render_rows,
-    widest_row_chars, widest_row_index,
+    FoldId, OverviewRun, PreparedRow, overview_ruler, overview_runs, prepare, prepare_split,
+    render_rows, staging_card_overlay, widest_row_chars, widest_row_index,
 };
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
 use gpui::{
@@ -197,11 +197,17 @@ pub struct DiffView {
     /// column's CONTENT by this (gutters stay sticky). Reset on rebuild.
     split_h_offset: f32,
     /// Region the pointer is currently over, as `(file_idx, region_idx)`.
-    /// Driven by hovering a region's `@@` header; reveals that region's
-    /// Stage/Unstage/Discard card and widens its gutter sliver. Pure view
-    /// state — changing it never invalidates `prepared` (no re-highlight on
-    /// hover), only triggers a cheap re-render of the visible rows.
+    /// Drives the gutter-sliver widen across every row of that region. Pure
+    /// view state — changing it never invalidates `prepared` (no re-highlight
+    /// on hover), only triggers a cheap re-render of the visible rows.
     hovered_region: Option<(usize, usize)>,
+    /// Prepared-row index the pointer is currently over (a changed row only;
+    /// `None` over context). Floats the staging card at THIS row's on-screen
+    /// Y — i.e. right where the pointer is — rather than at the region's
+    /// first line, which (when `change_regions` merges nearby edits into one
+    /// region) can be far above the change being hovered. Set together with
+    /// `hovered_region`.
+    hovered_row: Option<usize>,
     /// Overview-ruler runs (change positions as 0..1 fractions, coalesced
     /// per change block). Recomputed alongside `prepared`; empty when the
     /// body has no changes. Cached behind `Rc` so the per-frame render only
@@ -212,6 +218,12 @@ pub struct DiffView {
     /// fresh selection (`load`/`load_commit`/`load_range`) so a new file
     /// always opens expanded. Toggling routes through `invalidate_prepared`.
     collapsed: HashSet<usize>,
+    /// Context runs the user has expanded, keyed by `FoldId`
+    /// (`(file_idx, first-hidden-line)`). A run whose id is present renders
+    /// in full instead of behind a `⋯ N unchanged lines` expander. Pure view
+    /// state; reset on every fresh selection (`load`/`load_commit`/
+    /// `load_range`). Toggling routes through `invalidate_prepared`.
+    expanded_folds: HashSet<FoldId>,
     /// The file_idx owning each prepared row (most recent header above it).
     /// Built alongside `prepared`; lets the sticky overlay resolve "which
     /// file sits at the top of the viewport" in O(1) from the scroll offset.
@@ -250,9 +262,11 @@ impl DiffView {
             prepared_widest_chars: 0,
             split_h_offset: 0.0,
             hovered_region: None,
+            hovered_row: None,
             overview: Rc::new(Vec::new()),
             split: false,
             collapsed: HashSet::new(),
+            expanded_folds: HashSet::new(),
             row_owner: Rc::new(Vec::new()),
             headers: Rc::new(Vec::new()),
             pending_scroll_anchor: None,
@@ -266,6 +280,15 @@ impl DiffView {
         if !self.collapsed.remove(&file_idx) {
             self.collapsed.insert(file_idx);
         }
+        self.invalidate_prepared();
+    }
+
+    /// Expand a single collapsed context run so its hidden lines render in
+    /// full. Cheap — only the row set changes, so it routes through
+    /// `invalidate_prepared`. The fold's `FoldId` persists until the next
+    /// fresh selection (a stale id for a run that no longer exists is inert).
+    fn expand_fold(&mut self, fold_id: FoldId) {
+        self.expanded_folds.insert(fold_id);
         self.invalidate_prepared();
     }
 
@@ -327,12 +350,20 @@ impl DiffView {
         cx.notify();
     }
 
-    /// Update the hovered region (from a header row's `on_hover`). Cheap —
-    /// re-renders the visible rows without touching the `prepared` cache.
-    /// No-op when unchanged so a stationary pointer doesn't spam `notify`.
-    fn set_hovered_region(&mut self, region: Option<(usize, usize)>, cx: &mut Context<Self>) {
-        if self.hovered_region != region {
+    /// Update the hovered region + row (from a body row's `on_hover`). The
+    /// region drives the sliver widen; the row floats the staging card at the
+    /// pointer's Y. Cheap — re-renders the visible rows without touching the
+    /// `prepared` cache. No-op when unchanged so a stationary pointer doesn't
+    /// spam `notify`.
+    fn set_hover(
+        &mut self,
+        region: Option<(usize, usize)>,
+        row: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hovered_region != region || self.hovered_row != row {
             self.hovered_region = region;
+            self.hovered_row = row;
             cx.notify();
         }
     }
@@ -342,9 +373,11 @@ impl DiffView {
     /// diff body (load, commit load, expand, seed).
     fn invalidate_prepared(&mut self) {
         self.prepared = None;
-        // Region indices are only meaningful against the current row set;
-        // a rebuild may renumber them, so drop any stale hover.
+        // Region indices + row indices are only meaningful against the
+        // current row set; a rebuild may renumber them, so drop any stale
+        // hover (region for slivers + row for the card position).
         self.hovered_region = None;
+        self.hovered_row = None;
         // A new body means a new max line length — reset the split scroll so
         // we don't start mid-line on a different file.
         self.split_h_offset = 0.0;
@@ -373,8 +406,10 @@ impl DiffView {
         // the stale `_op_task` finishes its reload chain.
         self._op_task = None;
         self.invalidate_prepared();
-        // A fresh selection always opens fully expanded.
+        // A fresh selection always opens fully expanded (no folded files, no
+        // pre-expanded context runs from the prior file).
         self.collapsed.clear();
+        self.expanded_folds.clear();
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -475,6 +510,7 @@ impl DiffView {
         // commit-detail view.
         self._op_task = None;
         self.invalidate_prepared();
+        self.expanded_folds.clear();
         self.state = DiffViewState::CommitLoading {
             sha: sha.clone(),
             short_oid: short_oid.clone(),
@@ -567,6 +603,7 @@ impl DiffView {
     ) {
         self._op_task = None;
         self.invalidate_prepared();
+        self.expanded_folds.clear();
         self.state = DiffViewState::RangeLoading {
             base: base.clone(),
             head: head.clone(),
@@ -1056,9 +1093,9 @@ impl Render for DiffView {
                         typography: &self.typography,
                     };
                     let body = if self.split {
-                        prepare_split(&plan, &regions, &self.collapsed, &rctx)
+                        prepare_split(&plan, &regions, &self.collapsed, &self.expanded_folds, &rctx)
                     } else {
-                        prepare(&plan, &regions, &self.collapsed, &rctx)
+                        prepare(&plan, &regions, &self.collapsed, &self.expanded_folds, &rctx)
                     };
                     Some(Rc::new(body))
                 }
@@ -1135,7 +1172,6 @@ impl Render for DiffView {
                 let rows = self.prepared.clone().unwrap_or_default();
                 render_rows(
                     rows,
-                    side,
                     hovered_region,
                     self.prepared_widest,
                     split,
@@ -1163,13 +1199,12 @@ impl Render for DiffView {
             )
             .into_any_element(),
             DiffViewState::CommitReady { .. } => {
-                // `side = None` so hunk action chips do NOT render on
-                // commit-detail rows — Stage/Unstage/Discard against a
-                // historical commit model nothing git supports.
+                // Read-only: the staging-card overlay is gated on `side`
+                // (None here) so Stage/Unstage/Discard never appears on
+                // commit-detail rows — nothing git supports against history.
                 let rows = self.prepared.clone().unwrap_or_default();
                 render_rows(
                     rows,
-                    None,
                     hovered_region,
                     self.prepared_widest,
                     split,
@@ -1187,11 +1222,11 @@ impl Render for DiffView {
                 failed_state(title, error, &rctx, cx).into_any_element()
             }
             DiffViewState::RangeReady { .. } => {
-                // Read-only, like commit detail: `side = None`, no chips.
+                // Read-only, like commit detail: `side = None` gates out the
+                // staging card overlay.
                 let rows = self.prepared.clone().unwrap_or_default();
                 render_rows(
                     rows,
-                    None,
                     hovered_region,
                     self.prepared_widest,
                     split,
@@ -1281,7 +1316,14 @@ impl Render for DiffView {
         // The body lives in a `flex_1 + min_h(0)` wrapper so the toolbar can
         // sit above it while the `uniform_list` inside still gets a DEFINITE
         // height (`h_full` of this wrapper) — preserving scroll-to-end.
+        // Clearing hover on body-leave: the body rows ignore hover-leave (so
+        // the pointer can travel onto the floating staging card), which means
+        // nothing disarms `hovered_region` when the pointer exits the diff
+        // entirely. This wrapper-level leave catches that, hiding a stranded
+        // card. Re-entering a changed line (or the card) re-arms it.
+        let weak_leave = cx.entity().downgrade();
         let mut body_wrap = div()
+            .id("diff-body-wrap")
             // `relative` makes this the positioning context for the overview
             // ruler stacked on its right edge (added below).
             .relative()
@@ -1290,6 +1332,11 @@ impl Render for DiffView {
             .flex()
             .flex_col()
             .w_full()
+            .on_hover(move |hovered, _window, cx: &mut App| {
+                if !*hovered {
+                    let _ = weak_leave.update(cx, |view, cx| view.set_hover(None, None, cx));
+                }
+            })
             .child(scroll_body);
         // In split mode, a horizontal-intent wheel (trackpad swipe or
         // Shift+wheel) scrolls BOTH columns' content in sync. We never stop
@@ -1360,6 +1407,37 @@ impl Render for DiffView {
             let weak_ruler = cx.entity().downgrade();
             body_wrap =
                 body_wrap.child(overview_ruler(&self.overview, total_rows, &self.theme, weak_ruler));
+        }
+        // Floating Stage/Discard card for the hovered region — pinned to the
+        // viewport's right edge at the anchor row's on-screen Y (so it's
+        // always visible regardless of the changed line's length or the
+        // horizontal scroll). Gated on `side`: only the unstaged working-tree
+        // view stages; commit/range/staged views resolve `side = None`.
+        if has_body
+            && let Some(side) = side
+            && let Some(region) = hovered_region
+            && let Some(row) = self.hovered_row
+        {
+            let h = self.density.h_row;
+            let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
+            // The hovered row's on-screen Y — the card floats right at the
+            // pointer, not at the (possibly far-above) region anchor. Clamp
+            // ≥ 0 defensively; the hovered row is by definition on screen.
+            let top = (row as f32 * h + offset_y).max(0.0);
+            let weak_card = cx.entity().downgrade();
+            if let Some(card) = staging_card_overlay(
+                top,
+                region.0,
+                region.1,
+                row,
+                side,
+                self.theme,
+                self.density,
+                &self.typography,
+                weak_card,
+            ) {
+                body_wrap = body_wrap.child(card);
+            }
         }
         // When the discard-hunk confirm modal is mounted, stack it as a
         // centered overlay over the diff body. Mirrors `confirm_dialog`

@@ -12,7 +12,7 @@
 
 use oximux_app::shell::diff_view::file_header::{build_row_owner, collect_headers};
 use oximux_app::shell::diff_view::paint::{
-    PreparedRow, RulerMark, overview_runs, prepare, prepare_split,
+    PreparedRow, RulerMark, overview_runs, prepare, prepare_split, region_anchor_rows,
 };
 use oximux_app::shell::diff_view::render::{FilePlan, RenderCtx, build_render_plan};
 use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, change_regions};
@@ -475,10 +475,10 @@ fn split_occupancy(f: &FileDiff) -> Vec<(bool, bool)> {
         density: Density::default(),
         typography: &typography,
     };
-    prepare_split(&plan, &regions, &HashSet::new(), &rctx)
+    prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx)
         .into_iter()
         .filter_map(|r| match r {
-            PreparedRow::SplitLine { left, right } => Some((left.is_some(), right.is_some())),
+            PreparedRow::SplitLine { left, right, .. } => Some((left.is_some(), right.is_some())),
             _ => None,
         })
         .collect()
@@ -577,7 +577,7 @@ fn inline_runs(f: &FileDiff) -> Vec<(f32, f32, RulerMark)> {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare(&plan, &regions, &HashSet::new(), &rctx);
+    let rows = prepare(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx);
     overview_runs(&rows)
         .into_iter()
         .map(|r| (r.start, r.end, r.mark))
@@ -586,9 +586,9 @@ fn inline_runs(f: &FileDiff) -> Vec<(f32, f32, RulerMark)> {
 
 #[test]
 fn overview_runs_coalesce_same_kind_block() {
-    // ctx, rem, rem, add, add, ctx → inline rows:
-    //   FileHeader, Line(ctx), HunkHeader, Line(rem), Line(rem),
-    //   Line(add), Line(add), Line(ctx)  = 8 rows.
+    // ctx, rem, rem, add, add, ctx → continuous-flow inline rows (no `@@`):
+    //   FileHeader, Line(ctx), Line(rem), Line(rem),
+    //   Line(add), Line(add), Line(ctx)  = 7 rows.
     // The two removed rows fuse into ONE Removed run, the two added rows
     // into ONE Added run — the ruler paints a bar per block, not per line.
     let f = file(
@@ -612,12 +612,13 @@ fn overview_runs_coalesce_same_kind_block() {
     let runs = inline_runs(&f);
     let marks: Vec<RulerMark> = runs.iter().map(|r| r.2).collect();
     assert_eq!(marks, vec![RulerMark::Removed, RulerMark::Added]);
-    // Each run spans exactly 2 of the 8 rows (width 0.25) and the Added run
-    // begins where the Removed run ends (contiguous block, no gap).
+    // Each run spans exactly 2 of the 7 rows and the Added run begins where
+    // the Removed run ends (contiguous block, no gap).
+    let width = 2.0 / 7.0;
     let (rs, re, _) = runs[0];
     let (as_, ae, _) = runs[1];
-    assert!((re - rs - 0.25).abs() < 1e-6, "removed run width");
-    assert!((ae - as_ - 0.25).abs() < 1e-6, "added run width");
+    assert!((re - rs - width).abs() < 1e-6, "removed run width");
+    assert!((ae - as_ - width).abs() < 1e-6, "added run width");
     assert!((re - as_).abs() < 1e-6, "runs are contiguous");
     assert!(rs >= 0.0 && ae <= 1.0, "runs lie within the body");
 }
@@ -650,7 +651,7 @@ fn overview_split_modify_row_is_mixed() {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare_split(&plan, &regions, &HashSet::new(), &rctx);
+    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx);
     let runs = overview_runs(&rows);
     assert_eq!(runs.len(), 1, "one change block → one run");
     assert_eq!(runs[0].mark, RulerMark::Mixed);
@@ -683,7 +684,7 @@ fn folded_file_emits_header_only() {
     };
     let mut collapsed = HashSet::new();
     collapsed.insert(0usize);
-    let rows = prepare(&plan, &regions, &collapsed, &rctx);
+    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &rctx);
     let owner = build_row_owner(&rows);
 
     // File 0 contributes exactly one row — its (folded) header.
@@ -711,6 +712,232 @@ fn folded_file_emits_header_only() {
     );
 }
 
+/// Two edits 4 context lines apart fall WITHIN `2*HUNK_CONTEXT`, so
+/// `change_regions` merges them into ONE region — but the split walk makes
+/// TWO change blocks. Both blocks must carry that one region (so neither
+/// strands without a staging card), and only the first block anchors it.
+/// Regression: a block-counting scheme drifted `next_region` and left later
+/// blocks with `region = None` (no Stage/Discard on hover).
+#[test]
+fn split_merged_region_keeps_all_blocks_tagged() {
+    let f = file(
+        "a.rs",
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 8),
+            (1, 8),
+            "",
+            vec![
+                line(DiffLineKind::Removed, "a"),
+                line(DiffLineKind::Added, "A"),
+                line(DiffLineKind::Context, "c1"),
+                line(DiffLineKind::Context, "c2"),
+                line(DiffLineKind::Context, "c3"),
+                line(DiffLineKind::Context, "c4"),
+                line(DiffLineKind::Removed, "b"),
+                line(DiffLineKind::Added, "B"),
+            ],
+        )],
+        false,
+    );
+    assert_eq!(change_regions(&f).len(), 1, "two close edits merge to 1 region");
+
+    let plan = build_render_plan(std::slice::from_ref(&f), false);
+    let regions = vec![change_regions(&f)];
+    let typography = Typography::default();
+    let rctx = RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography: &typography,
+    };
+    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &rctx);
+
+    let mut tagged = 0;
+    let mut anchors = 0;
+    for r in &rows {
+        if let PreparedRow::SplitLine {
+            region,
+            region_anchor,
+            left,
+            right,
+            ..
+        } = r
+        {
+            let is_change = left.as_ref().is_some_and(|c| c.mark.is_some())
+                || right.as_ref().is_some_and(|c| c.mark.is_some());
+            if is_change {
+                assert_eq!(*region, Some((0, 0)), "changed split row carries the merged region");
+                tagged += 1;
+                if *region_anchor {
+                    anchors += 1;
+                }
+            }
+        }
+    }
+    assert!(tagged >= 2, "both clusters' changed rows are tagged");
+    assert_eq!(anchors, 1, "exactly one anchor for the merged region");
+}
+
+/// Helper: build inline rows for one file with the given expanded folds.
+fn inline_rows(f: &FileDiff, expanded: &HashSet<(usize, u32)>) -> Vec<PreparedRow> {
+    let plan = build_render_plan(std::slice::from_ref(f), false);
+    let regions = vec![change_regions(f)];
+    let typography = Typography::default();
+    let rctx = RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography: &typography,
+    };
+    prepare(&plan, &regions, &HashSet::new(), expanded, &rctx)
+}
+
+/// A long unchanged-context run between two changes folds its middle: 3
+/// lines kept on each side, the rest behind one `ContextFold`. Continuous
+/// flow means NO `@@` marker rows are ever emitted.
+#[test]
+fn long_context_run_folds_middle() {
+    // Added(new=1), 20×Context(new=2..21), Added(new=22) — the 20-line
+    // context run (> threshold 10) collapses to 3 + fold(14) + 3.
+    let mut lines = vec![line(DiffLineKind::Added, "first change")];
+    for i in 0..20 {
+        lines.push(line(DiffLineKind::Context, &format!("ctx {i}")));
+    }
+    lines.push(line(DiffLineKind::Added, "second change"));
+    let f = file(
+        "a.rs",
+        DiffStatus::Modified,
+        vec![hunk((1, 21), (1, 22), "", lines)],
+        false,
+    );
+
+    let rows = inline_rows(&f, &HashSet::new());
+    let folds: Vec<(usize, usize)> = rows
+        .iter()
+        .filter_map(|r| match r {
+            PreparedRow::ContextFold { fold_id, count, .. } => Some((fold_id.1 as usize, *count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(folds.len(), 1, "one folded run");
+    // Hidden count = 20 - 2*3 = 14; fold anchored at the 4th context line
+    // (new line number 5).
+    assert_eq!(folds[0], (5, 14), "(first-hidden-line, hidden-count)");
+
+    // Exactly 3 context lines survive on each side (6 total) plus the two
+    // changed lines = 8 `Line` rows.
+    let line_rows = rows
+        .iter()
+        .filter(|r| matches!(r, PreparedRow::Line(_)))
+        .count();
+    assert_eq!(line_rows, 8, "3 kept context each side + 2 changes");
+
+    // Expanding the fold renders the full run (no ContextFold, all 20 ctx).
+    let mut expanded = HashSet::new();
+    expanded.insert((0usize, 5u32));
+    let rows = inline_rows(&f, &expanded);
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, PreparedRow::ContextFold { .. })),
+        "expanded fold emits no expander"
+    );
+    let line_rows = rows
+        .iter()
+        .filter(|r| matches!(r, PreparedRow::Line(_)))
+        .count();
+    assert_eq!(line_rows, 22, "20 context + 2 changes fully rendered");
+}
+
+/// A short context run (≤ threshold) never folds, and the first changed
+/// line of a region carries the staging `region_anchor` flag.
+#[test]
+fn short_context_keeps_full_and_anchors_region() {
+    let f = file(
+        "a.rs",
+        DiffStatus::Modified,
+        vec![hunk(
+            (1, 3),
+            (1, 4),
+            "",
+            vec![
+                line(DiffLineKind::Context, "keep"),
+                line(DiffLineKind::Removed, "old"),
+                line(DiffLineKind::Added, "new1"),
+                line(DiffLineKind::Added, "new2"),
+                line(DiffLineKind::Context, "tail"),
+            ],
+        )],
+        false,
+    );
+    let rows = inline_rows(&f, &HashSet::new());
+    assert!(
+        !rows
+            .iter()
+            .any(|r| matches!(r, PreparedRow::ContextFold { .. })),
+        "short context never folds"
+    );
+    // The first changed line (the removed "old") is the region anchor; the
+    // following added lines are in the region but are NOT anchors.
+    let anchors: Vec<(&str, bool)> = rows
+        .iter()
+        .filter_map(|r| match r {
+            PreparedRow::Line(l) if l.region.is_some() => {
+                Some((l.content.as_ref(), l.region_anchor))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        anchors,
+        vec![("old", true), ("new1", false), ("new2", false)],
+        "only the region's first changed line anchors the staging card"
+    );
+    // Context lines carry no region (so hovering them won't keep a card open).
+    let ctx_with_region = rows.iter().any(|r| matches!(
+        r,
+        PreparedRow::Line(l) if l.region.is_some()
+            && (l.content.as_ref() == "keep" || l.content.as_ref() == "tail")
+    ));
+    assert!(!ctx_with_region, "context lines carry no region tag");
+}
+
+/// `region_anchor_rows` maps every change region to the prepared-row index
+/// of its anchor (first changed) line — what the host floats the staging
+/// card against. Robust to context folding (anchors are never folded).
+#[test]
+fn region_anchor_rows_point_at_anchor_lines() {
+    // Two changes separated by a long context run → two regions; the run
+    // also folds, so anchor rows must still resolve through the fold.
+    let mut lines = vec![line(DiffLineKind::Added, "first change")];
+    for i in 0..20 {
+        lines.push(line(DiffLineKind::Context, &format!("ctx {i}")));
+    }
+    lines.push(line(DiffLineKind::Added, "second change"));
+    let f = file(
+        "a.rs",
+        DiffStatus::Modified,
+        vec![hunk((1, 21), (1, 22), "", lines)],
+        false,
+    );
+    let rows = inline_rows(&f, &HashSet::new());
+    let map = region_anchor_rows(&rows);
+
+    // One entry per change region.
+    assert_eq!(map.len(), change_regions(&f).len());
+    assert_eq!(map.len(), 2, "two changes separated by a wide gap → 2 regions");
+
+    // Every mapped index points at a Line that is the region's anchor.
+    for (region, &idx) in &map {
+        match &rows[idx] {
+            PreparedRow::Line(l) => {
+                assert!(l.region_anchor, "mapped row is a region anchor");
+                assert_eq!(l.region, Some(*region), "anchor row carries its region");
+            }
+            _ => panic!("anchor row must be a Line"),
+        }
+    }
+}
+
 /// `collect_headers` returns one entry per file, in order, carrying each
 /// file's fold state.
 #[test]
@@ -735,7 +962,7 @@ fn collect_headers_one_per_file_with_fold_state() {
     };
     let mut collapsed = HashSet::new();
     collapsed.insert(1usize);
-    let rows = prepare(&plan, &regions, &collapsed, &rctx);
+    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &rctx);
     let headers = collect_headers(&rows);
     assert_eq!(headers.len(), 2, "one header per file");
     assert_eq!(headers[0].file_idx, 0);
