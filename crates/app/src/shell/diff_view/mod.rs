@@ -18,6 +18,7 @@
 //! builder. This file holds state, actions, async wiring, and the root
 //! container.
 
+pub mod file_header;
 pub mod hunk_actions;
 pub mod paint;
 pub mod render;
@@ -26,6 +27,7 @@ pub mod word_diff;
 
 use crate::actions::{ExpandDiff, RetryDiff};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
+use crate::shell::diff_view::file_header::{StickyHeader, build_row_owner, collect_headers, sticky_header_overlay};
 use crate::shell::diff_view::paint::{
     OverviewRun, PreparedRow, overview_ruler, overview_runs, prepare, prepare_split, render_rows,
     widest_row_chars, widest_row_index,
@@ -33,12 +35,14 @@ use crate::shell::diff_view::paint::{
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement as _, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, div, px,
+    ParentElement, Render, ScrollStrategy, StatefulInteractiveElement as _, Styled, Subscription,
+    Task, UniformListScrollHandle, Window, div, px,
 };
+use gpui_component::{Icon, Sizable as _};
 use oximux_core::FileDiff;
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::oneshot;
@@ -203,6 +207,22 @@ pub struct DiffView {
     /// body has no changes. Cached behind `Rc` so the per-frame render only
     /// paints the bars, never rescans the row list.
     overview: Rc<Vec<OverviewRun>>,
+    /// File indices the user has folded. A folded file emits its header
+    /// only (body suppressed in `prepare`). Pure view state; reset on every
+    /// fresh selection (`load`/`load_commit`/`load_range`) so a new file
+    /// always opens expanded. Toggling routes through `invalidate_prepared`.
+    collapsed: HashSet<usize>,
+    /// The file_idx owning each prepared row (most recent header above it).
+    /// Built alongside `prepared`; lets the sticky overlay resolve "which
+    /// file sits at the top of the viewport" in O(1) from the scroll offset.
+    row_owner: Rc<Vec<usize>>,
+    /// Per-file header metadata, in file order, for the sticky overlay.
+    /// Built alongside `prepared`.
+    headers: Rc<Vec<StickyHeader>>,
+    /// One-shot scroll target consumed on the next prepared rebuild — set by
+    /// a hunk op so the post-stage reload restores the reader's position
+    /// instead of snapping to the top. `None` when idle.
+    pending_scroll_anchor: Option<usize>,
 }
 
 impl DiffView {
@@ -232,7 +252,70 @@ impl DiffView {
             hovered_region: None,
             overview: Rc::new(Vec::new()),
             split: false,
+            collapsed: HashSet::new(),
+            row_owner: Rc::new(Vec::new()),
+            headers: Rc::new(Vec::new()),
+            pending_scroll_anchor: None,
         }
+    }
+
+    /// Fold/unfold a single file's body. Cheap — only the row set changes,
+    /// so it routes through `invalidate_prepared` (which drops the cached
+    /// rows + stale hover) and re-renders.
+    fn toggle_file_fold(&mut self, file_idx: usize) {
+        if !self.collapsed.remove(&file_idx) {
+            self.collapsed.insert(file_idx);
+        }
+        self.invalidate_prepared();
+    }
+
+    /// Collapse every file (Collapse all) or expand every file (Expand all).
+    /// Folds the set of files present in the current diff; expanding just
+    /// clears the set.
+    fn set_all_folded(&mut self, folded: bool, cx: &mut Context<Self>) {
+        if folded {
+            let n = self.current_file_count();
+            self.collapsed = (0..n).collect();
+        } else {
+            self.collapsed.clear();
+        }
+        self.invalidate_prepared();
+        cx.notify();
+    }
+
+    /// True when every file in the current diff is folded — drives the
+    /// toolbar button label (Collapse all ↔ Expand all).
+    fn all_folded(&self) -> bool {
+        let n = self.current_file_count();
+        n > 0 && self.collapsed.len() >= n
+    }
+
+    /// Number of files in the current Ready/CommitReady/RangeReady diff.
+    fn current_file_count(&self) -> usize {
+        match &self.state {
+            DiffViewState::Ready { diffs, .. }
+            | DiffViewState::CommitReady { diffs, .. }
+            | DiffViewState::RangeReady { diffs, .. } => diffs.len(),
+            _ => 0,
+        }
+    }
+
+    /// First-visible row index, derived from the list's pixel scroll offset
+    /// and the fixed row height. Every row is exactly `density.h_row` tall,
+    /// so this is exact. Returns 0 when nothing is scrolled or measured.
+    fn first_visible_row(&self) -> usize {
+        let h = self.density.h_row;
+        if h <= 0.0 {
+            return 0;
+        }
+        let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
+        ((-offset_y) / h).floor().max(0.0) as usize
+    }
+
+    /// Scroll the body so `row` sits at the top of the viewport. Used by the
+    /// overview-ruler click-to-jump.
+    pub fn scroll_to_row(&self, row: usize) {
+        self.scroll_handle.scroll_to_item(row, ScrollStrategy::Top);
     }
 
     /// Flip inline ↔ side-by-side. Rebuilds the row set (the two modes differ
@@ -290,6 +373,8 @@ impl DiffView {
         // the stale `_op_task` finishes its reload chain.
         self._op_task = None;
         self.invalidate_prepared();
+        // A fresh selection always opens fully expanded.
+        self.collapsed.clear();
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -870,6 +955,9 @@ impl DiffView {
     ) where
         F: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
+        // Remember where the reader is BEFORE the op so the post-op reload
+        // restores their position instead of snapping to the top.
+        let anchor = self.first_visible_row();
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -898,7 +986,11 @@ impl DiffView {
                 );
             }
             let _ = this.update(cx, |view, cx| {
+                // `load` clears any anchor via `collapsed.clear()`-adjacent
+                // reset, so set it AFTER load schedules the reload — it's
+                // consumed on the next prepared rebuild once Ready lands.
                 view.load(path, staged, untracked, cx);
+                view.pending_scroll_anchor = Some(anchor);
             });
         });
         self._op_task = Some(task);
@@ -964,9 +1056,9 @@ impl Render for DiffView {
                         typography: &self.typography,
                     };
                     let body = if self.split {
-                        prepare_split(&plan, &regions, &rctx)
+                        prepare_split(&plan, &regions, &self.collapsed, &rctx)
                     } else {
-                        prepare(&plan, &regions, &rctx)
+                        prepare(&plan, &regions, &self.collapsed, &rctx)
                     };
                     Some(Rc::new(body))
                 }
@@ -989,6 +1081,30 @@ impl Render for DiffView {
                 .as_ref()
                 .map(|r| Rc::new(overview_runs(r)))
                 .unwrap_or_default();
+            // Row→file map + per-file headers for the sticky overlay, also
+            // off the per-frame path.
+            self.row_owner = self
+                .prepared
+                .as_ref()
+                .map(|r| Rc::new(build_row_owner(r)))
+                .unwrap_or_default();
+            self.headers = self
+                .prepared
+                .as_ref()
+                .map(|r| Rc::new(collect_headers(r)))
+                .unwrap_or_default();
+            // A hunk op left a position to restore — apply it once the
+            // rebuilt rows actually exist (NOT during the intermediate
+            // Loading frame, where `prepared` is empty and the anchor would
+            // be consumed before the reload lands), so staging doesn't snap
+            // the reader to the top.
+            let len = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
+            if len > 0
+                && let Some(anchor) = self.pending_scroll_anchor.take()
+            {
+                self.scroll_handle
+                    .scroll_to_item(anchor.min(len - 1), ScrollStrategy::Top);
+            }
         }
 
         let rctx = RenderCtx {
@@ -1104,11 +1220,14 @@ impl Render for DiffView {
         let toolbar = has_body.then(|| {
             let label = if split { "Inline" } else { "Side by side" };
             let hover_bg = self.theme.bg_panel_alt;
+            let all_folded = self.all_folded();
+            let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .justify_end()
+                .gap(px(self.density.gap_inline))
                 .flex_shrink_0()
                 .h(px(self.density.h_row))
                 .w_full()
@@ -1116,6 +1235,33 @@ impl Render for DiffView {
                 .bg(self.theme.bg_panel)
                 .border_b_1()
                 .border_color(self.theme.border_inactive)
+                .child(
+                    // Collapse-all / Expand-all — folds every file to its
+                    // header so a many-file diff reads as a tight index.
+                    div()
+                        .id("diff-collapse-all")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .px(px(8.0))
+                        .py(px(1.0))
+                        .rounded(px(self.density.r_chip))
+                        .text_size(px(self.typography.t_body_sm))
+                        .text_color(self.theme.fg_muted)
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_click(cx.listener(move |view, _: &gpui::ClickEvent, _window, cx| {
+                            view.set_all_folded(!all_folded, cx);
+                        }))
+                        .child(
+                            Icon::default()
+                                .path("icons/list-collapse.svg")
+                                .xsmall()
+                                .text_color(self.theme.fg_subtle),
+                        )
+                        .child(fold_label),
+                )
                 .child(
                     div()
                         .id("diff-split-toggle")
@@ -1180,11 +1326,40 @@ impl Render for DiffView {
                 },
             ));
         }
+        // Sticky file header: a pinned twin of the first-visible file's
+        // header so its name + stats stay on screen while the body scrolls
+        // under it. Stacked above the rows but below the ruler. Gains a
+        // shadow only when a real header has scrolled past the top.
+        if has_body && !self.headers.is_empty() {
+            let fv = self.first_visible_row();
+            let file_idx = self.row_owner.get(fv).copied().unwrap_or(0);
+            if let Some(header) = self.headers.iter().find(|h| h.file_idx == file_idx) {
+                // No shadow while a file's own header is flush at the top —
+                // the overlay then overlaps that row seamlessly.
+                let stuck = !matches!(
+                    self.prepared.as_ref().and_then(|r| r.get(fv)),
+                    Some(PreparedRow::FileHeader { .. })
+                );
+                let weak_sticky = cx.entity().downgrade();
+                body_wrap = body_wrap.child(sticky_header_overlay(
+                    header,
+                    stuck,
+                    self.theme,
+                    self.density,
+                    &self.typography,
+                    weak_sticky,
+                ));
+            }
+        }
         // Overview ruler: a thin change-map on the body's right edge (only
         // when a diff with changes is shown). Stacked last so it paints over
-        // the scrollable body; the body owns scrolling underneath it.
+        // the scrollable body; the body owns scrolling underneath it. Each
+        // run is click-to-jump (maps its start fraction back to a row).
         if has_body && !self.overview.is_empty() {
-            body_wrap = body_wrap.child(overview_ruler(&self.overview, &self.theme));
+            let total_rows = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
+            let weak_ruler = cx.entity().downgrade();
+            body_wrap =
+                body_wrap.child(overview_ruler(&self.overview, total_rows, &self.theme, weak_ruler));
         }
         // When the discard-hunk confirm modal is mounted, stack it as a
         // centered overlay over the diff body. Mirrors `confirm_dialog`
@@ -1226,7 +1401,24 @@ impl Render for DiffView {
 }
 
 fn loading_state(path: &str, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    centered(format!("Loading diff for {path}…"), rctx)
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(6.0))
+        .h_full()
+        .w_full()
+        .p(px(rctx.density.pad_panel))
+        .text_size(px(rctx.typography.t_body_sm))
+        .text_color(rctx.theme.fg_subtle)
+        .child(
+            Icon::default()
+                .path("icons/refresh-cw.svg")
+                .xsmall()
+                .text_color(rctx.theme.status_info),
+        )
+        .child(format!("Loading diff for {path}…"))
 }
 
 fn failed_state(
@@ -1250,7 +1442,17 @@ fn failed_state(
         .text_color(rctx.theme.fg_subtle)
         .child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
                 .text_color(rctx.theme.status_error)
+                .child(
+                    Icon::default()
+                        .path("icons/alert-triangle.svg")
+                        .xsmall()
+                        .text_color(rctx.theme.status_error),
+                )
                 .child(format!("Failed to load {path}")),
         )
         .child(div().child(error.to_string()))
@@ -1261,6 +1463,10 @@ fn failed_state(
             // routing the original call used.
             div()
                 .id("diff-view-retry")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
                 .px(px(12.0))
                 .py(px(6.0))
                 .text_color(rctx.theme.status_info)
@@ -1273,19 +1479,13 @@ fn failed_state(
                     view.retry(cx);
                     cx.notify();
                 }))
+                .child(
+                    Icon::default()
+                        .path("icons/refresh-cw.svg")
+                        .xsmall()
+                        .text_color(rctx.theme.status_info),
+                )
                 .child("Retry"),
         )
 }
 
-fn centered(msg: String, rctx: &RenderCtx<'_>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .h_full()
-        .w_full()
-        .p(px(rctx.density.pad_panel))
-        .text_size(px(rctx.typography.t_body_sm))
-        .text_color(rctx.theme.fg_subtle)
-        .child(msg)
-}

@@ -10,12 +10,14 @@
 //!   - large diff + expanded=false → `FilePlan::Collapsed` with totals
 //!   - large diff + expanded=true  → `FilePlan::Hunked` (full body)
 
+use oximux_app::shell::diff_view::file_header::{build_row_owner, collect_headers};
 use oximux_app::shell::diff_view::paint::{
     PreparedRow, RulerMark, overview_runs, prepare, prepare_split,
 };
 use oximux_app::shell::diff_view::render::{FilePlan, RenderCtx, build_render_plan};
 use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, change_regions};
 use oximux_settings::{Density, Theme, Typography};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 fn line(kind: DiffLineKind, content: &str) -> DiffLine {
@@ -473,7 +475,7 @@ fn split_occupancy(f: &FileDiff) -> Vec<(bool, bool)> {
         density: Density::default(),
         typography: &typography,
     };
-    prepare_split(&plan, &regions, &rctx)
+    prepare_split(&plan, &regions, &HashSet::new(), &rctx)
         .into_iter()
         .filter_map(|r| match r {
             PreparedRow::SplitLine { left, right } => Some((left.is_some(), right.is_some())),
@@ -575,7 +577,7 @@ fn inline_runs(f: &FileDiff) -> Vec<(f32, f32, RulerMark)> {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare(&plan, &regions, &rctx);
+    let rows = prepare(&plan, &regions, &HashSet::new(), &rctx);
     overview_runs(&rows)
         .into_iter()
         .map(|r| (r.start, r.end, r.mark))
@@ -648,8 +650,96 @@ fn overview_split_modify_row_is_mixed() {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare_split(&plan, &regions, &rctx);
+    let rows = prepare_split(&plan, &regions, &HashSet::new(), &rctx);
     let runs = overview_runs(&rows);
     assert_eq!(runs.len(), 1, "one change block → one run");
     assert_eq!(runs[0].mark, RulerMark::Mixed);
+}
+
+/// A folded file emits its header only — no body rows — while siblings
+/// keep their full body. The header carries `folded = true`.
+#[test]
+fn folded_file_emits_header_only() {
+    let mk = || {
+        hunk(
+            (1, 2),
+            (1, 3),
+            "",
+            vec![
+                line(DiffLineKind::Context, "ctx"),
+                line(DiffLineKind::Added, "new"),
+            ],
+        )
+    };
+    let f0 = file("a.rs", DiffStatus::Modified, vec![mk()], false);
+    let f1 = file("b.rs", DiffStatus::Modified, vec![mk()], false);
+    let plan = build_render_plan(&[f0.clone(), f1.clone()], false);
+    let regions = vec![change_regions(&f0), change_regions(&f1)];
+    let typography = Typography::default();
+    let rctx = RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography: &typography,
+    };
+    let mut collapsed = HashSet::new();
+    collapsed.insert(0usize);
+    let rows = prepare(&plan, &regions, &collapsed, &rctx);
+    let owner = build_row_owner(&rows);
+
+    // File 0 contributes exactly one row — its (folded) header.
+    let file0: Vec<&PreparedRow> = rows
+        .iter()
+        .zip(&owner)
+        .filter(|(_, o)| **o == 0)
+        .map(|(r, _)| r)
+        .collect();
+    assert_eq!(file0.len(), 1, "folded file emits header only");
+    match file0[0] {
+        PreparedRow::FileHeader {
+            file_idx, folded, ..
+        } => {
+            assert_eq!(*file_idx, 0);
+            assert!(*folded, "folded file's header carries folded=true");
+        }
+        _ => panic!("expected folded FileHeader"),
+    }
+
+    // File 1 keeps its body (header + region header + lines).
+    assert!(
+        owner.iter().filter(|o| **o == 1).count() > 1,
+        "unfolded sibling keeps its body"
+    );
+}
+
+/// `collect_headers` returns one entry per file, in order, carrying each
+/// file's fold state.
+#[test]
+fn collect_headers_one_per_file_with_fold_state() {
+    let mk = || {
+        hunk(
+            (1, 1),
+            (1, 2),
+            "",
+            vec![line(DiffLineKind::Added, "x")],
+        )
+    };
+    let f0 = file("a.rs", DiffStatus::Modified, vec![mk()], false);
+    let f1 = file("b.rs", DiffStatus::Modified, vec![mk()], false);
+    let plan = build_render_plan(&[f0.clone(), f1.clone()], false);
+    let regions = vec![change_regions(&f0), change_regions(&f1)];
+    let typography = Typography::default();
+    let rctx = RenderCtx {
+        theme: Theme::charcoal(),
+        density: Density::default(),
+        typography: &typography,
+    };
+    let mut collapsed = HashSet::new();
+    collapsed.insert(1usize);
+    let rows = prepare(&plan, &regions, &collapsed, &rctx);
+    let headers = collect_headers(&rows);
+    assert_eq!(headers.len(), 2, "one header per file");
+    assert_eq!(headers[0].file_idx, 0);
+    assert!(!headers[0].folded);
+    assert_eq!(headers[1].file_idx, 1);
+    assert!(headers[1].folded);
 }

@@ -34,17 +34,17 @@
 use std::ops::Range;
 use std::rc::Rc;
 
+use crate::shell::diff_view::file_header::file_header_row;
 use crate::shell::diff_view::hunk_actions::render_hunk_actions;
 use crate::shell::diff_view::render::{FilePlan, LinePlan, RenderCtx};
 use crate::shell::diff_view::word_diff::WordOp;
 use crate::shell::diff_view::{DiffView, HunkActionSide};
 use gpui::{
-    App, ClickEvent, ClipboardItem, HighlightStyle, Hsla, InteractiveElement, IntoElement,
+    App, ClickEvent, HighlightStyle, Hsla, InteractiveElement, IntoElement,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ParentElement, SharedString,
     StatefulInteractiveElement as _, Styled, StyledText, UniformListScrollHandle, WeakEntity, div,
     px, relative, uniform_list,
 };
-use gpui_component::{Icon, Sizable as _, tooltip::Tooltip};
 use oximux_core::DiffLineKind;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -52,13 +52,16 @@ use oximux_settings::{Density, Theme, Typography};
 /// at exactly `density.h_row` so `uniform_list` can position rows by index
 /// without per-item measurement.
 pub enum PreparedRow {
-    /// Interactive file header — click copies the path. `stats` carries
-    /// `+added / -removed` chips for hunked files; `None` for
-    /// binary/mode-only/collapsed headers that have no per-row tally.
+    /// Interactive file header — click folds the file, the copy glyph
+    /// copies the path. `stats` carries `+added / -removed` chips for hunked
+    /// files; `None` for binary/mode-only/collapsed headers. `folded`
+    /// drives the chevron direction and (via `prepare`) body suppression.
     FileHeader {
+        file_idx: usize,
         path: SharedString,
         label: String,
         stats: Option<(u32, u32)>,
+        folded: bool,
     },
     /// `@@ … @@` hunk marker. Carries the originating (file, hunk) index so
     /// the Stage/Unstage/Discard chips can dispatch against the live diff.
@@ -243,8 +246,14 @@ pub fn overview_runs(rows: &[PreparedRow]) -> Vec<OverviewRun> {
 /// colored bar at the relative position of each change run (green add / red
 /// remove / amber mixed) — a glance shows where the diff's changes sit. The
 /// host stacks this absolutely over the right edge of the scrollable body
-/// (which has no platform scrollbar). Purely indicative (no click-to-jump).
-pub fn overview_ruler(runs: &[OverviewRun], theme: &Theme) -> impl IntoElement {
+/// (which has no platform scrollbar). Each run is clickable: it scrolls the
+/// body to the first row of that change block (`start` fraction → row).
+pub fn overview_ruler(
+    runs: &[OverviewRun],
+    total_rows: usize,
+    theme: &Theme,
+    weak: WeakEntity<DiffView>,
+) -> impl IntoElement {
     const RULER_W: f32 = 5.0;
     let mut ruler = div()
         .absolute()
@@ -253,14 +262,18 @@ pub fn overview_ruler(runs: &[OverviewRun], theme: &Theme) -> impl IntoElement {
         .h_full()
         .w(px(RULER_W))
         .overflow_hidden();
-    for run in runs {
+    for (i, run) in runs.iter().enumerate() {
         let base = match run.mark {
             RulerMark::Added => theme.git.added,
             RulerMark::Removed => theme.git.deleted,
             RulerMark::Mixed => theme.status_warn,
         };
+        // Target row = run start fraction mapped back onto the row count.
+        let target = ((run.start * total_rows as f32) as usize).min(total_rows.saturating_sub(1));
+        let weak = weak.clone();
         ruler = ruler.child(
             div()
+                .id(gpui::ElementId::Name(format!("diff-ruler-run-{i}").into()))
                 .absolute()
                 .right(px(0.0))
                 .w_full()
@@ -269,7 +282,14 @@ pub fn overview_ruler(runs: &[OverviewRun], theme: &Theme) -> impl IntoElement {
                 // Keep a single-line change visible even when the body is
                 // tall enough that its fractional height rounds below a pixel.
                 .min_h(px(2.0))
-                .bg(Hsla { a: 0.85, ..base }),
+                .cursor_pointer()
+                .bg(Hsla { a: 0.85, ..base })
+                .on_click(move |_: &ClickEvent, _window, cx: &mut App| {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.scroll_to_row(target);
+                        cx.notify();
+                    });
+                }),
         );
     }
     ruler
@@ -290,6 +310,7 @@ pub fn overview_ruler(runs: &[OverviewRun], theme: &Theme) -> impl IntoElement {
 pub fn prepare(
     plan: &[FilePlan],
     regions_per_file: &[Vec<oximux_core::ChangeRegion>],
+    collapsed: &std::collections::HashSet<usize>,
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -300,6 +321,10 @@ pub fn prepare(
             .get(file_idx)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        // A folded file emits its header only — the body (and the syntect /
+        // word-diff work behind it) is skipped entirely until the user
+        // unfolds it.
+        let folded = collapsed.contains(&file_idx);
         match fp {
             FilePlan::Hunked {
                 path,
@@ -309,10 +334,15 @@ pub fn prepare(
                 removed,
             } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: Some((*added, *removed)),
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 // Walk every line in file order; before the first changed
                 // line of each region, dock that region's chip bar. Regions
                 // are anchored by line number (robust to hunk merging) and
@@ -357,10 +387,15 @@ pub fn prepare(
                 hunk_count,
             } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: None,
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 rows.push(PreparedRow::Collapsed {
                     label: format!(
                         "Large diff: {hunk_count} hunks, {total_lines} lines — click to expand"
@@ -369,10 +404,15 @@ pub fn prepare(
             }
             FilePlan::Binary { path, header } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: None,
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 rows.push(PreparedRow::Special {
                     text: "Binary file (body suppressed)".to_string(),
                 });
@@ -384,10 +424,15 @@ pub fn prepare(
                 new_mode,
             } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: None,
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 rows.push(PreparedRow::Special {
                     text: format!("Mode change only: {old_mode:o} → {new_mode:o}"),
                 });
@@ -425,6 +470,7 @@ fn gutter_digits_for(plan: &[FilePlan]) -> usize {
 pub fn prepare_split(
     plan: &[FilePlan],
     regions_per_file: &[Vec<oximux_core::ChangeRegion>],
+    collapsed: &std::collections::HashSet<usize>,
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -434,6 +480,7 @@ pub fn prepare_split(
             .get(file_idx)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let folded = collapsed.contains(&file_idx);
         match fp {
             FilePlan::Hunked {
                 path,
@@ -443,10 +490,15 @@ pub fn prepare_split(
                 removed,
             } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: Some((*added, *removed)),
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 let mut next_region = 0usize;
                 // Buffers for the current change block (consecutive non-
                 // context lines); flushed — removed aligned against added —
@@ -511,10 +563,15 @@ pub fn prepare_split(
                 hunk_count,
             } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: None,
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 rows.push(PreparedRow::Collapsed {
                     label: format!(
                         "Large diff: {hunk_count} hunks, {total_lines} lines — click to expand"
@@ -523,10 +580,15 @@ pub fn prepare_split(
             }
             FilePlan::Binary { path, header } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: None,
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 rows.push(PreparedRow::Special {
                     text: "Binary file (body suppressed)".to_string(),
                 });
@@ -538,10 +600,15 @@ pub fn prepare_split(
                 new_mode,
             } => {
                 rows.push(PreparedRow::FileHeader {
+                    file_idx,
                     path: path.clone().into(),
                     label: header.label.clone(),
                     stats: None,
+                    folded,
                 });
+                if folded {
+                    continue;
+                }
                 rows.push(PreparedRow::Special {
                     text: format!("Mode change only: {old_mode:o} → {new_mode:o}"),
                 });
@@ -792,10 +859,25 @@ fn build_prepared_row(
     weak: WeakEntity<DiffView>,
 ) -> gpui::AnyElement {
     match row {
-        PreparedRow::FileHeader { path, label, stats } => {
-            file_header_row(path.clone(), label.clone(), *stats, theme, density, typography)
-                .into_any_element()
-        }
+        PreparedRow::FileHeader {
+            file_idx,
+            path,
+            label,
+            stats,
+            folded,
+        } => file_header_row(
+            *file_idx,
+            path.clone(),
+            label.clone(),
+            *stats,
+            *folded,
+            false,
+            theme,
+            density,
+            typography,
+            weak,
+        )
+        .into_any_element(),
         PreparedRow::HunkHeader {
             file_idx,
             hunk_idx,
@@ -824,82 +906,6 @@ fn build_prepared_row(
             special_row(text.clone(), theme, density, typography).into_any_element()
         }
     }
-}
-
-/// Interactive file header — click copies the path. Layout, left→right:
-/// `<path>` `· <status>` `+added` `-removed` `<spacer>` `<copy glyph>`.
-fn file_header_row(
-    path: SharedString,
-    label: String,
-    stats: Option<(u32, u32)>,
-    theme: Theme,
-    density: Density,
-    typography: &Typography,
-) -> impl IntoElement {
-    let id = gpui::ElementId::Name(format!("diff-header-{path}").into());
-    let copy_path = path.clone();
-    let hover_bg = theme.bg_panel_alt;
-    let tooltip_text: SharedString = "Click to copy path".into();
-    let mut row = div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.0))
-        .h(px(density.h_row))
-        .w_full()
-        .px(px(density.pad_panel))
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border_inactive)
-        .text_size(px(typography.t_label_caps))
-        .font_weight(typography.w_semibold)
-        .text_color(theme.fg_base)
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover_bg))
-        .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
-        .on_click(move |_: &ClickEvent, _window, cx: &mut App| {
-            cx.write_to_clipboard(ClipboardItem::new_string(copy_path.to_string()));
-        })
-        .child(div().child(path))
-        .child(
-            div()
-                .text_color(theme.fg_muted)
-                .text_size(px(typography.t_body_sm))
-                .child(format!("· {label}")),
-        );
-    if let Some((added, removed)) = stats {
-        row = row.child(stats_chips(added, removed, theme, typography));
-    }
-    row.child(div().flex_1()).child(
-        div().child(
-            Icon::default()
-                .path("icons/copy.svg")
-                .xsmall()
-                .text_color(theme.fg_subtle),
-        ),
-    )
-}
-
-/// `+N -N` chip cluster. Both sides always show (e.g. `+0`) so the header
-/// doesn't reflow when one side's count changes.
-fn stats_chips(
-    added: u32,
-    removed: u32,
-    theme: Theme,
-    typography: &Typography,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .gap(px(6.0))
-        .text_size(px(typography.t_body_sm))
-        .child(div().text_color(theme.git.added).child(format!("+{added}")))
-        .child(
-            div()
-                .text_color(theme.git.deleted)
-                .child(format!("-{removed}")),
-        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -943,7 +949,9 @@ fn hunk_header_row(
         .child(strip_cell(strip, hovered, density.h_row))
         .child(div().px(px(density.pad_panel)).child(header));
     if let Some(actions) = actions {
-        // Float the chips as a compact card at the right of the header.
+        // Float the chips as an elevated card at the right of the header —
+        // raised surface + crisp border + soft shadow so it reads as a
+        // floating control docked over the diff, not a flat inline chip.
         let card = div()
             .flex()
             .flex_row()
@@ -951,10 +959,11 @@ fn hunk_header_row(
             .mr(px(density.pad_panel))
             .px(px(6.0))
             .py(px(1.0))
-            .rounded(px(density.r_chip))
-            .bg(theme.bg_panel)
+            .rounded(px(density.r_xs))
+            .bg(theme.bg_overlay)
             .border_1()
-            .border_color(theme.border_inactive)
+            .border_color(theme.border_active)
+            .shadow_md()
             .child(actions);
         row = row.child(div().flex_1()).child(card);
     }

@@ -76,6 +76,14 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/chevron-down.svg",
         include_bytes!("../assets/icons/chevron-down.svg"),
     ),
+    (
+        "icons/chevron-right.svg",
+        include_bytes!("../assets/icons/chevron-right.svg"),
+    ),
+    (
+        "icons/alert-triangle.svg",
+        include_bytes!("../assets/icons/alert-triangle.svg"),
+    ),
 ];
 
 impl AssetSource for AppAssets {
