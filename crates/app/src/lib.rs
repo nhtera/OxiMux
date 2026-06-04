@@ -11,6 +11,7 @@ pub mod commit_message_ai_settings;
 pub mod git_state_cache;
 pub mod keymap;
 pub mod left_rail_layout;
+pub mod menu;
 pub mod notifier;
 pub mod persisted_terminals;
 pub mod project_panes_factory;

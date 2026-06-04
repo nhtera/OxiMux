@@ -167,6 +167,12 @@ fn main() {
         // projects to paint the prior snapshot instead of "Loading…").
         cx.set_global(oximux_app::git_state_cache::GitStateCache::default());
         cx.bind_keys(oximux_app::keymap::default_key_bindings());
+        // Install the application menu so the macOS menu bar reads "OxiMux"
+        // (not the launching process's name) and the standard Quit / Edit
+        // items exist. `Quit` routes through `cx.quit()` so it shares the
+        // graceful-shutdown path with Cmd+Q.
+        cx.set_menus(oximux_app::menu::app_menus());
+        cx.on_action::<oximux_app::menu::Quit>(|_, cx| cx.quit());
         cx.activate(true);
 
         // Register the once-per-process lifecycle observers (quit-save,
