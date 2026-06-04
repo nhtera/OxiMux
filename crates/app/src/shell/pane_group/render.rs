@@ -647,17 +647,29 @@ fn render_leaf(
 ) -> Option<AnyElement> {
     let leaf = tree.leaf(idx)?;
     let view = leaf.active_view().clone();
-    let show_bar = tree.live_count() > 1 || leaf.len() > 1;
+    let is_split = tree.live_count() > 1;
+    let is_active_leaf = idx == tree.active();
+    let show_bar = is_split || leaf.len() > 1;
     if !show_bar {
         return Some(view.into_any_element());
     }
     let bar = render_leaf_tab_bar(idx, leaf, group, theme);
+    let mut container = div().flex().flex_col().size_full().overflow_hidden();
+    // Active-pane outline: in a split, the focused leaf gets a quiet
+    // `border_active` rim so "which pane is active" reads positively —
+    // inactive panes' text is only gently dimmed, so the border carries
+    // the focus signal. Width stays 1px in both states (transparent when
+    // unfocused) so toggling focus never reflows the split. A single
+    // (unsplit) pane never gets an outline.
+    if is_split {
+        container = container.border_1().border_color(if is_active_leaf {
+            theme.border_active
+        } else {
+            gpui::transparent_black()
+        });
+    }
     Some(
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .overflow_hidden()
+        container
             .child(bar)
             .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(view))
             .into_any_element(),

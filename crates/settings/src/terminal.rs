@@ -56,16 +56,18 @@ pub struct TerminalSettings {
 
 impl Default for TerminalSettings {
     fn default() -> Self {
-        // These MUST match the constants they replace so a fresh install has
-        // no visual/behavior diff: scrollback 5000, blink 530ms, dim 0.7,
-        // unfocused 0.4 / cursor 0.3, grid 100x32.
+        // Defaults: scrollback 5000, blink 530ms, dim 0.7,
+        // unfocused 0.85 / cursor 0.3, grid 100x32. `unfocused_alpha` keeps
+        // inactive-pane text legible (a gentle de-emphasis); the active pane
+        // is marked positively by a border outline in split layouts, so the
+        // dim no longer has to carry the whole "which pane is focused" signal.
         Self {
             scrollback_lines: 5000,
             scroll_multiplier: 1.0,
             cursor_blink: true,
             blink_interval_ms: 530,
             dim_alpha: 0.7,
-            unfocused_alpha: 0.4,
+            unfocused_alpha: 0.85,
             unfocused_cursor_alpha: 0.3,
             osc52_clipboard: true,
             option_as_meta: true,
@@ -154,14 +156,16 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_legacy_constants() {
-        // Pin the exact legacy values so a future edit can't silently change
+    fn defaults_match_expected_constants() {
+        // Pin the exact default values so a future edit can't silently change
         // out-of-box behavior.
         let s = TerminalSettings::default();
         assert_eq!(s.scrollback_lines, 5000);
         assert_eq!(s.blink_interval_ms, 530);
         assert_eq!(s.dim_alpha, 0.7);
-        assert_eq!(s.unfocused_alpha, 0.4);
+        // Inactive-pane text is only gently de-emphasized — the active-pane
+        // border carries the focus signal in splits.
+        assert_eq!(s.unfocused_alpha, 0.85);
         assert_eq!(s.unfocused_cursor_alpha, 0.3);
     }
 }

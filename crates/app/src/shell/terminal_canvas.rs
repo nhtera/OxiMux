@@ -45,7 +45,7 @@ use crate::shell::terminal_search_state::{MatchHit, MatchKind};
 /// Alpha multipliers from `TerminalSettings`, passed in per paint so they
 /// live-reload. `dim` = SGR-2 faint text; `unfocused` = lighter text in an
 /// inactive pane; `unfocused_cursor` = the faint ghost cursor block there.
-/// `Default` reproduces the prior constants (0.7 / 0.4 / 0.3).
+/// `Default` mirrors `TerminalSettings` defaults (0.7 / 0.85 / 0.3).
 #[derive(Clone, Copy)]
 pub struct Alphas {
     pub dim: f32,
@@ -57,7 +57,7 @@ impl Default for Alphas {
     fn default() -> Self {
         Self {
             dim: 0.7,
-            unfocused: 0.4,
+            unfocused: 0.85,
             unfocused_cursor: 0.3,
         }
     }
