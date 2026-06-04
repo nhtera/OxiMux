@@ -1932,23 +1932,25 @@ impl Render for DiffView {
 }
 
 fn loading_state(path: &str, rctx: &RenderCtx<'_>) -> impl IntoElement {
+    // Centered vertical stack: a prominent rotating spinner above the label
+    // so an in-flight load reads as deliberate, active work filling the pane
+    // rather than a single muted line of text.
     div()
         .flex()
-        .flex_row()
+        .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(6.0))
+        .gap(px(12.0))
         .h_full()
         .w_full()
         .p(px(rctx.density.pad_panel))
         .text_size(px(rctx.typography.t_body_sm))
         .text_color(rctx.theme.fg_subtle)
-        .child(
-            Icon::default()
-                .path("icons/refresh-cw.svg")
-                .xsmall()
-                .text_color(rctx.theme.status_info),
-        )
+        .child(crate::ui::spinning_loader_sized(
+            "diff-loading-spinner",
+            rctx.theme.status_info,
+            gpui_component::Size::Large,
+        ))
         .child(format!("Loading diff for {path}…"))
 }
 

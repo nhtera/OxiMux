@@ -475,8 +475,7 @@ impl Render for GitPanel {
             )
             .into_any_element(),
             (PollState::Loading, None) => {
-                placeholder_state("Loading…", self.theme, self.density, &self.typography)
-                    .into_any_element()
+                loading_placeholder("Loading…", self.theme, self.density).into_any_element()
             }
             (_, Some(state)) => {
                 // Filter first, then partition. `filter_files` returns
@@ -504,8 +503,9 @@ impl Render for GitPanel {
                 };
                 render_sections(&sections, &rctx, cx).into_any_element()
             }
-            (_, None) => placeholder_state("Loading…", self.theme, self.density, &self.typography)
-                .into_any_element(),
+            (_, None) => {
+                loading_placeholder("Loading…", self.theme, self.density).into_any_element()
+            }
         };
 
         // Inner scroll region: stateful (id required for `overflow_y_scroll`)
@@ -593,6 +593,26 @@ fn placeholder_state(
         .p(px(density.pad_panel))
         .text_size(px(sc_style::BODY_TEXT))
         .text_color(theme.fg_subtle)
+        .child(msg.to_string())
+}
+
+/// Loading variant of [`placeholder_state`]: the same centered message
+/// prefixed with the shared rotating spinner so an in-flight status poll
+/// reads as active work rather than a frozen panel. Used only for the
+/// `Loading` arms — the failure placeholder stays static (a stalled icon
+/// on an error would imply work is still happening).
+fn loading_placeholder(msg: &str, theme: Theme, density: Density) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(6.0))
+        .h_full()
+        .p(px(density.pad_panel))
+        .text_size(px(sc_style::BODY_TEXT))
+        .text_color(theme.fg_subtle)
+        .child(crate::ui::spinning_loader("scm-loading-spinner", theme.fg_muted))
         .child(msg.to_string())
 }
 
