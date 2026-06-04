@@ -47,7 +47,14 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
     fi
     cp -f "target/debug/oximux" "$APP_DIR/Contents/MacOS/oximux"
     cp -f "target/debug/oximux-relay" "$APP_DIR/Contents/MacOS/oximux-relay"
-    echo "==> Refreshed $APP_DIR/Contents/MacOS/{oximux,oximux-relay} from target/debug"
+    # Keep Info.plist + app icon in sync too, so a fast refresh produces a
+    # complete bundle (correct menu-bar name + Dock icon), not just binaries.
+    cp -f "assets/Info.plist" "$APP_DIR/Contents/Info.plist"
+    if [[ -f "assets/AppIcon.icns" ]]; then
+        mkdir -p "$APP_DIR/Contents/Resources"
+        cp -f "assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+    fi
+    echo "==> Refreshed $APP_DIR/Contents/{MacOS,Info.plist,Resources} from target/debug"
     exit 0
 fi
 
@@ -79,7 +86,8 @@ cp "target/$TARGET_SUBDIR/oximux" "$APP_DIR/Contents/MacOS/oximux"
 cp "target/$TARGET_SUBDIR/oximux-relay" "$APP_DIR/Contents/MacOS/oximux-relay"
 cp "assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 
-# Placeholder icon — replace with assets/AppIcon.icns when designed.
+# App icon — charcoal rounded tile + terminal prompt glyph (matches the
+# in-app welcome-view brand). Regenerate from assets/AppIcon.icns.
 if [[ -f "assets/AppIcon.icns" ]]; then
     cp "assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
