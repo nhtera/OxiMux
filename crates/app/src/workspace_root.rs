@@ -1605,8 +1605,10 @@ impl Render for WorkspaceRoot {
                     .w_full()
                     .h(px(strip_row_height_px))
                     .bg(theme.bg_panel)
-                    .border_b_1()
-                    .border_color(theme.border_inactive)
+                    // No bottom border here: the hoisted tab strip already
+                    // paints its own bottom border (the focused-group accent),
+                    // so a border on this wrapper would double it into a
+                    // parallel hairline a couple px below.
                     .child(strip)
             });
             let body = div()
