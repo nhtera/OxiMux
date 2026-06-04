@@ -1,34 +1,57 @@
 //! macOS application menu.
 //!
 //! Without an installed main menu, macOS titles the bold application menu
-//! from the launching process (e.g. the terminal that spawned a dev build),
-//! so the app surfaces under the wrong name. Installing a menu whose first
-//! entry is named "OxiMux" makes the menu bar read correctly and restores
-//! the standard Quit / Edit items the OS-default menu would otherwise carry.
+//! from the launching process, so a dev build surfaces under the wrong name.
+//! Installing a menu whose first entry is named "OxiMux" fixes the menu bar
+//! and gives the standard macOS items (About / Hide / Quit / Window) their
+//! conventional shape and keyboard shortcuts.
 //!
-//! Built once at startup and handed to `cx.set_menus(...)` in `main.rs`.
-//! The `Quit` action is dispatched by the menu and handled centrally so it
-//! flows through the same graceful-shutdown path as Cmd+Q today.
+//! Menu-item shortcuts are derived by GPUI from the keymap binding for each
+//! action, so [`key_bindings`] must be installed alongside [`app_menus`] for
+//! ⌘Q / ⌘H / ⌘M to display. The native items (About, Hide, Minimize, …) are
+//! dispatched as GPUI actions and handled in `main.rs`, which calls into the
+//! [`platform`] helpers below to invoke the AppKit responder selectors.
 
-use gpui::{Menu, MenuItem, OsAction, SystemMenuType, actions};
+use gpui::{KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, actions};
 
-// Marker actions for menu items. The clipboard entries (Cut/Copy/Paste/
-// Select All) are driven by the OS through their `OsAction` selector, so
-// these units exist only to satisfy the menu API; only `Quit` carries a
-// handler (wired in `main.rs`). Undo/Redo are no-ops in a terminal context
-// but kept so the Edit menu has its conventional shape.
-actions!(oximux, [Quit, Undo, Redo, Cut, Copy, Paste, SelectAll]);
+// Menu actions. `Quit` and the native window/app items carry handlers wired
+// in `main.rs`; the Edit entries are driven by the OS via their `OsAction`
+// selector, so those units only satisfy the menu API.
+actions!(
+    oximux,
+    [
+        Quit,
+        About,
+        HideApp,
+        HideOthers,
+        ShowAll,
+        Minimize,
+        Zoom,
+        Undo,
+        Redo,
+        Cut,
+        Copy,
+        Paste,
+        SelectAll,
+    ]
+);
 
-/// The application menu bar. First entry's name ("OxiMux") becomes the
-/// bold app-menu title in the macOS menu bar. v1 is macOS-only, so the
-/// Services submenu is always present (no platform gate needed).
+/// The application menu bar. First entry's name ("OxiMux") becomes the bold
+/// app-menu title in the macOS menu bar. v1 is macOS-only, so the Services
+/// submenu is always present (no platform gate needed).
 pub fn app_menus() -> Vec<Menu> {
     vec![
         Menu {
             name: "OxiMux".into(),
             disabled: false,
             items: vec![
+                MenuItem::action("About OxiMux", About),
+                MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide OxiMux", HideApp),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
                 MenuItem::action("Quit OxiMux", Quit),
             ],
@@ -47,5 +70,102 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
             ],
         },
+        Menu {
+            name: "Window".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("Minimize", Minimize),
+                MenuItem::action("Zoom", Zoom),
+            ],
+        },
     ]
+}
+
+/// Keyboard shortcuts for the menu actions. Installed via `cx.bind_keys` in
+/// `main.rs`; GPUI reads these back to render the ⌘Q / ⌘H / ⌥⌘H / ⌘M glyphs
+/// next to the menu items. Clipboard shortcuts are intentionally NOT bound
+/// here — the terminal owns ⌘C/⌘V/⌘X, and a global binding would shadow it.
+pub fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-h", HideApp, None),
+        KeyBinding::new("cmd-alt-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
+    ]
+}
+
+/// AppKit responder selectors for the standard app/window menu items. GPUI's
+/// menu API only natively wires the clipboard `OsAction`s, so the rest are
+/// invoked here against `NSApplication` / its key window.
+#[cfg(target_os = "macos")]
+pub mod platform {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::ptr;
+
+    unsafe fn shared_app() -> *mut Object {
+        msg_send![class!(NSApplication), sharedApplication]
+    }
+
+    /// Standard About panel — populated from the bundle's name / version /
+    /// icon (Info.plist), so it shows "OxiMux 0.1.0" with the app icon.
+    pub fn about() {
+        unsafe {
+            let app = shared_app();
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            let _: () = msg_send![app, orderFrontStandardAboutPanel: ptr::null_mut::<Object>()];
+        }
+    }
+
+    pub fn hide() {
+        unsafe {
+            let app = shared_app();
+            let _: () = msg_send![app, hide: ptr::null_mut::<Object>()];
+        }
+    }
+
+    pub fn hide_others() {
+        unsafe {
+            let app = shared_app();
+            let _: () = msg_send![app, hideOtherApplications: ptr::null_mut::<Object>()];
+        }
+    }
+
+    pub fn show_all() {
+        unsafe {
+            let app = shared_app();
+            let _: () = msg_send![app, unhideAllApplications: ptr::null_mut::<Object>()];
+        }
+    }
+
+    pub fn minimize() {
+        unsafe {
+            let app = shared_app();
+            let win: *mut Object = msg_send![app, keyWindow];
+            if !win.is_null() {
+                let _: () = msg_send![win, performMiniaturize: ptr::null_mut::<Object>()];
+            }
+        }
+    }
+
+    pub fn zoom() {
+        unsafe {
+            let app = shared_app();
+            let win: *mut Object = msg_send![app, keyWindow];
+            if !win.is_null() {
+                let _: () = msg_send![win, performZoom: ptr::null_mut::<Object>()];
+            }
+        }
+    }
+}
+
+/// No-op stubs so non-macOS builds compile (v1 ships macOS-only).
+#[cfg(not(target_os = "macos"))]
+pub mod platform {
+    pub fn about() {}
+    pub fn hide() {}
+    pub fn hide_others() {}
+    pub fn show_all() {}
+    pub fn minimize() {}
+    pub fn zoom() {}
 }

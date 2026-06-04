@@ -168,11 +168,25 @@ fn main() {
         cx.set_global(oximux_app::git_state_cache::GitStateCache::default());
         cx.bind_keys(oximux_app::keymap::default_key_bindings());
         // Install the application menu so the macOS menu bar reads "OxiMux"
-        // (not the launching process's name) and the standard Quit / Edit
-        // items exist. `Quit` routes through `cx.quit()` so it shares the
-        // graceful-shutdown path with Cmd+Q.
+        // (not the launching process's name) and carries the standard
+        // About / Hide / Quit / Window items. Menu-item shortcuts are read
+        // back from the keymap, so the menu key bindings must be installed
+        // too. `Quit` routes through `cx.quit()` so it shares the graceful-
+        // shutdown path; the native items defer to AppKit selectors.
+        // Menu key bindings MUST be installed before `set_menus`: GPUI reads
+        // the keymap when it builds the menu to render each item's ⌘ glyph,
+        // and never re-reads it for a static menu. Bind first, then build.
+        cx.bind_keys(oximux_app::menu::key_bindings());
         cx.set_menus(oximux_app::menu::app_menus());
         cx.on_action::<oximux_app::menu::Quit>(|_, cx| cx.quit());
+        cx.on_action::<oximux_app::menu::About>(|_, _cx| oximux_app::menu::platform::about());
+        cx.on_action::<oximux_app::menu::HideApp>(|_, _cx| oximux_app::menu::platform::hide());
+        cx.on_action::<oximux_app::menu::HideOthers>(|_, _cx| {
+            oximux_app::menu::platform::hide_others()
+        });
+        cx.on_action::<oximux_app::menu::ShowAll>(|_, _cx| oximux_app::menu::platform::show_all());
+        cx.on_action::<oximux_app::menu::Minimize>(|_, _cx| oximux_app::menu::platform::minimize());
+        cx.on_action::<oximux_app::menu::Zoom>(|_, _cx| oximux_app::menu::platform::zoom());
         cx.activate(true);
 
         // Register the once-per-process lifecycle observers (quit-save,
