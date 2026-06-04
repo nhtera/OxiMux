@@ -59,6 +59,15 @@ enum GraphState {
     Failed(String),
 }
 
+/// Two-stage payload from the initial-load tokio task. The commit page
+/// arrives first so the list paints immediately; the per-commit stats map
+/// follows once its concurrent numstat fetch completes and fills the hover
+/// tooltip cache under the already-visible list.
+enum InitialLoad {
+    Commits(Result<Vec<CommitInfo>, GitError>),
+    Stats(HashMap<String, (u32, u32)>),
+}
+
 pub struct CommitGraph {
     repo: Repository,
     state: GraphState,
@@ -205,22 +214,27 @@ impl CommitGraph {
     fn spawn_load_initial(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo.clone();
         let workdir = self.repo.workdir().to_path_buf();
-        // Combined payload: the commit page AND its per-commit numstat
-        // map arrive together so the tooltip stats slot is populated
-        // the first time the user hovers a row. Sequential fetch
-        // inside one tokio task — at 20 commits × ~50 ms per `git
-        // diff --numstat` shellout that's ~1 s total wall-clock,
-        // happening once on panel mount. Acceptable for the polish
-        // pass; a future revision can switch to a `JoinSet` for
-        // parallelism if profiling shows it matters.
-        let (tx, rx) =
-            oneshot::channel::<(Result<Vec<CommitInfo>, GitError>, HashMap<String, (u32, u32)>)>();
+        // Two-stage delivery so the commit list paints the moment the
+        // single `git log` returns instead of waiting on the per-commit
+        // `--numstat` stats (which only feed the hover tooltip). Stage 1
+        // sends the commit page; the UI renders it immediately. Stage 2
+        // sends the stats map once the concurrent numstat fetch finishes,
+        // and the tooltip cache fills in under the already-visible list.
+        // Previously both arrived in one message, gating the whole list
+        // behind ~1 s of stat shellouts.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InitialLoad>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     let commits_result = repo.log_recent(PAGE_SIZE).await;
-                    let stats = collect_commit_stats(&workdir, commits_result.as_ref().ok()).await;
-                    let _ = tx.send((commits_result, stats));
+                    // Keep an owned copy for the stats pass before the
+                    // result is moved into the stage-1 message.
+                    let commits_for_stats = commits_result.as_ref().ok().cloned();
+                    if tx.send(InitialLoad::Commits(commits_result)).is_err() {
+                        return;
+                    }
+                    let stats = collect_commit_stats(&workdir, commits_for_stats.as_ref()).await;
+                    let _ = tx.send(InitialLoad::Stats(stats));
                 });
             }
             Err(_) => {
@@ -232,24 +246,35 @@ impl CommitGraph {
             }
         }
         let task = cx.spawn(async move |this, cx| {
-            let Ok((result, stats)) = rx.await else { return };
-            let _ = this.update(cx, |g, cx| {
-                // Wholesale replace — a fresh load drops every prior
-                // page's stats (refresh path), so the cache can't
-                // accumulate orphan entries from commits no longer
-                // visible.
-                g.stat_cache = stats;
-                g.state = match result {
-                    Ok(commits) => GraphState::Ready {
-                        can_load_more: commits.len() == PAGE_SIZE as usize,
-                        commits,
-                        loading_more: false,
-                        refreshing: false,
-                    },
-                    Err(e) => GraphState::Failed(e.to_string()),
-                };
-                cx.notify();
-            });
+            while let Some(msg) = rx.recv().await {
+                let applied = this.update(cx, |g, cx| {
+                    match msg {
+                        InitialLoad::Commits(result) => {
+                            g.state = match result {
+                                Ok(commits) => GraphState::Ready {
+                                    can_load_more: commits.len() == PAGE_SIZE as usize,
+                                    commits,
+                                    loading_more: false,
+                                    refreshing: false,
+                                },
+                                Err(e) => GraphState::Failed(e.to_string()),
+                            };
+                        }
+                        InitialLoad::Stats(stats) => {
+                            // Wholesale replace — a fresh load drops every
+                            // prior page's stats so the cache can't
+                            // accumulate orphan entries from commits no
+                            // longer visible.
+                            g.stat_cache = stats;
+                        }
+                    }
+                    cx.notify();
+                });
+                // Entity gone (panel dropped) — stop draining.
+                if applied.is_err() {
+                    return;
+                }
+            }
         });
         self._load_task = Some(task);
     }
@@ -335,19 +360,33 @@ async fn collect_commit_stats(
     workdir: &std::path::Path,
     commits: Option<&Vec<CommitInfo>>,
 ) -> HashMap<String, (u32, u32)> {
-    let mut out = HashMap::new();
     let Some(commits) = commits else {
-        return out;
+        return HashMap::new();
     };
-    for c in commits {
-        match oximux_git::diff_numstat_commit(workdir, &c.oid).await {
+    // One `git diff --numstat` shellout per commit. Run them concurrently
+    // rather than awaiting each in turn: a page is 20 commits, and at
+    // ~50 ms per shellout a serial loop costs ~1 s of wall-clock — long
+    // enough to be the visible delay before the commit list's hover
+    // tooltips populate. `join_all` drives every shellout on the same
+    // task simultaneously, collapsing the wall-clock to roughly the
+    // slowest single diff. Order is irrelevant: results land in a map
+    // keyed by OID.
+    let results = futures::future::join_all(
+        commits
+            .iter()
+            .map(|c| async move { (c.oid.clone(), oximux_git::diff_numstat_commit(workdir, &c.oid).await) }),
+    )
+    .await;
+    let mut out = HashMap::with_capacity(results.len());
+    for (oid, res) in results {
+        match res {
             Ok(stats) => {
-                out.insert(c.oid.clone(), stats);
+                out.insert(oid, stats);
             }
             Err(err) => {
                 tracing::debug!(
                     target: "oximux_app::source_control::graph",
-                    oid = %c.oid,
+                    oid = %oid,
                     error = %err,
                     "diff_numstat_commit failed; tooltip stats slot will be absent for this row"
                 );

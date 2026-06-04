@@ -4452,6 +4452,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
+ "futures",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -4515,6 +4516,7 @@ dependencies = [
 name = "oximux-git"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "oximux-core",
  "tempfile",
  "thiserror 1.0.69",

@@ -166,7 +166,17 @@ impl Repository {
     /// leaf files instead makes every untracked row a real, diffable path
     /// (and respects `.gitignore`, so ignored trees are still skipped).
     pub async fn status(&self) -> Result<GitState> {
-        let out = GitCmd::new(&self.workdir)
+        // The status query, the `+N -N` numstat enrichment, and the
+        // "Committed on Branch" range are three independent read-only git
+        // queries — none consumes another's output. Running them
+        // concurrently makes each poll cost the SLOWEST query instead of
+        // the sum of all three, which matters most on the first poll at
+        // startup (when the runtime is also spawning the relay, the editor
+        // LSP, and the commit-graph stats) and on large repos where
+        // `branch_committed`'s five-shellout chain dominates. `git`'s own
+        // index lock is sidestepped by `GIT_OPTIONAL_LOCKS=0` (set in the
+        // process wrapper), so concurrent reads don't contend.
+        let status_fut = GitCmd::new(&self.workdir)
             .args([
                 "status",
                 "--porcelain=v2",
@@ -175,9 +185,16 @@ impl Repository {
                 "--untracked-files=all",
                 "-z",
             ])
-            .run()
-            .await?;
+            .run();
+        let (status_out, numstat_res, branch_res) = tokio::join!(
+            status_fut,
+            numstat::diff_numstat_head(&self.workdir),
+            self.branch_committed(),
+        );
+
+        let out = status_out?;
         let mut state = status::parse_porcelain_v2(&out.stdout)?;
+
         // Enrich with `+N -N` counts from `git diff --numstat HEAD`. Best
         // effort: a numstat failure (no HEAD, transient git error) leaves
         // every `line_counts` at `None`, the UI keeps rendering, and the
@@ -185,7 +202,7 @@ impl Repository {
         // `warn!` on the failure path is the only signal a malformed
         // numstat parse leaves — without it, the symptom "no counts ever
         // show" is undiagnosable.
-        match numstat::diff_numstat_head(&self.workdir).await {
+        match numstat_res {
             Ok(counts) => {
                 for f in state.files.iter_mut() {
                     if let Some(&(added, removed)) = counts.get(f.path.as_path()) {
@@ -205,7 +222,7 @@ impl Repository {
         // branch carries vs its base). Best-effort, same contract as
         // numstat: a failure leaves the section empty and never fails the
         // poll.
-        match self.branch_committed().await {
+        match branch_res {
             Ok((range, files)) => {
                 state.branch_range = range;
                 state.branch_committed = files;
@@ -470,18 +487,28 @@ impl Repository {
     /// combined view still renders.
     async fn untracked_diffs(&self, state: &GitState) -> Vec<FileDiff> {
         use oximux_core::{IndexStatus, WorktreeStatus};
+        // Read + synthesize every untracked file CONCURRENTLY rather than one
+        // at a time — a combined "Untracked" view over many files otherwise
+        // blocks on a long sequential chain of disk reads. `join_all`
+        // preserves input order, so the section stays in file order.
+        let paths: Vec<&std::path::Path> = state
+            .files
+            .iter()
+            .filter(|f| {
+                matches!(f.index, IndexStatus::Untracked)
+                    && matches!(f.worktree, WorktreeStatus::Untracked)
+            })
+            .map(|f| f.path.as_path())
+            .collect();
+        let results = futures::future::join_all(paths.iter().map(|p| self.diff_for_untracked(p)))
+            .await;
         let mut out = Vec::new();
-        for f in &state.files {
-            let is_untracked = matches!(f.index, IndexStatus::Untracked)
-                && matches!(f.worktree, WorktreeStatus::Untracked);
-            if !is_untracked {
-                continue;
-            }
-            match self.diff_for_untracked(&f.path).await {
+        for (path, res) in paths.iter().zip(results) {
+            match res {
                 Ok(mut ds) => out.append(&mut ds),
                 Err(e) => tracing::warn!(
                     error = %e,
-                    path = %f.path.display(),
+                    path = %path.display(),
                     "untracked diff synth failed; skipping in combined view"
                 ),
             }

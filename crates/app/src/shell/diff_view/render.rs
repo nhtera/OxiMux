@@ -105,12 +105,30 @@ pub struct LinePlan {
     pub tokens: Vec<HiToken>,
 }
 
-/// Build the pure render plan.
+/// Total diff-body lines past which syntax highlighting is skipped for the
+/// whole plan. Syntect tokenization is the dominant per-line cost; a combined
+/// multi-file diff can sum to tens of thousands of lines and stall the render
+/// thread. Past this budget the body still renders with tints, `+`/`−` signs,
+/// gutter slivers, and word-diff — only per-token syntax color drops.
+pub const SYNTAX_HIGHLIGHT_BUDGET_LINES: usize = 4000;
+
+/// Build the pure render plan. Highlighting is gated on the total body size:
+/// a very large multi-file diff renders without syntax color to stay
+/// responsive (see [`SYNTAX_HIGHLIGHT_BUDGET_LINES`]).
 pub fn build_render_plan(diffs: &[FileDiff], expanded: bool) -> Vec<FilePlan> {
-    diffs.iter().map(|d| build_file_plan(d, expanded)).collect()
+    let total_lines: usize = diffs
+        .iter()
+        .flat_map(|d| d.hunks.iter())
+        .map(|h| h.lines.len())
+        .sum();
+    let highlight = total_lines <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
+    diffs
+        .iter()
+        .map(|d| build_file_plan(d, expanded, highlight))
+        .collect()
 }
 
-fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
+fn build_file_plan(d: &FileDiff, expanded: bool, highlight: bool) -> FilePlan {
     let path = d.path.display().to_string();
     let lang = detect_language(d.path.as_path());
     let header = FileHeader {
@@ -171,7 +189,8 @@ fn build_file_plan(d: &FileDiff, expanded: bool) -> FilePlan {
                                     }
                                     DiffLineKind::NoNewlineHint => (None, None),
                                 };
-                                let tokens = tokens_for_row(&l.content, l.kind, lang);
+                                let tokens =
+                                    tokens_for_row(&l.content, l.kind, lang, highlight);
                                 LinePlan {
                                     kind: l.kind,
                                     content: l.content.clone(),
@@ -258,8 +277,13 @@ fn sum_added_removed(hunks: &[HunkPlan]) -> (u32, u32) {
 /// no-newline marker (it isn't real source) and respects the language
 /// stub — Unknown languages yield an empty vec, which the renderer reads
 /// as "fall back to mono color".
-fn tokens_for_row(content: &str, kind: DiffLineKind, lang: Language) -> Vec<HiToken> {
-    if matches!(kind, DiffLineKind::NoNewlineHint) {
+fn tokens_for_row(
+    content: &str,
+    kind: DiffLineKind,
+    lang: Language,
+    highlight: bool,
+) -> Vec<HiToken> {
+    if !highlight || matches!(kind, DiffLineKind::NoNewlineHint) {
         return Vec::new();
     }
     highlight_line(content, lang)

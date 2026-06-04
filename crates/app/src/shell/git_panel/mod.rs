@@ -28,6 +28,7 @@ pub use changed_files::ShowCombinedDiffRequested;
 pub use discard_ops::{DiscardRequest, DiscardRequested, DiscardScope};
 
 use crate::actions::{RevertFile, StageFile, UnstageFile};
+use crate::git_state_cache::GitStateCache;
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::changed_files::{RenderCtx, partition_files, render_sections};
 use crate::shell::source_control::filter::filter_files;
@@ -202,9 +203,17 @@ impl GitPanel {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let initial = state_rx.borrow().clone();
+        // Seed the rendered state: the live poll sample if one is already
+        // available, otherwise the last-known snapshot for this workdir from
+        // the process cache. The fallback is what eliminates the "Loading…"
+        // flash when the user returns to an already-visited project (the
+        // rebuilt panel's fresh poller starts at `Loading`). A cold start
+        // with no cached entry stays `None` → normal placeholder.
         let git_state = match &initial {
             PollState::Ready(s) => Some(s.clone()),
-            _ => None,
+            _ => cx
+                .try_global::<GitStateCache>()
+                .and_then(|c| c.get(repo.workdir())),
         };
         let view_mode = initial_view_mode(&repo, worktree_settings_repo.as_ref());
         let watch_task = Self::start_watch_task(state_rx, cx);
@@ -239,6 +248,15 @@ impl GitPanel {
     /// Flat-affordance copies.
     pub fn view_mode(&self) -> ViewMode {
         self.view_mode
+    }
+
+    /// File count of the snapshot the panel is currently rendering, or
+    /// `None` when no snapshot is available yet (the placeholder is
+    /// showing). `Some` while a poll is still in flight means the panel
+    /// seeded from the process-wide last-known-state cache — i.e. it
+    /// painted the previous snapshot instead of "Loading…".
+    pub fn snapshot_file_count(&self) -> Option<usize> {
+        self.git_state.as_ref().map(|s| s.files.len())
     }
 
     /// Flip Flat ↔ Tree and persist the new mode to the per-worktree
@@ -318,10 +336,17 @@ impl GitPanel {
                 let state = rx.borrow_and_update().clone();
                 if this
                     .update(cx, |panel, cx| {
+                        // Only a successful poll replaces the rendered file
+                        // list; a transition to `Loading`/`Failed` keeps the
+                        // last-known snapshot visible (stale-while-
+                        // revalidate). A `Failed` poll still surfaces its
+                        // banner — the render match gives `Failed` precedence
+                        // over `git_state` regardless of what's cached.
                         if let PollState::Ready(ref s) = state {
                             panel.git_state = Some(s.clone());
-                        } else {
-                            panel.git_state = None;
+                            if let Some(cache) = cx.try_global::<GitStateCache>() {
+                                cache.put(panel.repo.workdir(), s.clone());
+                            }
                         }
                         panel.poll_state = state;
                         cx.notify();

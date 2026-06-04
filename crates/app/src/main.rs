@@ -160,6 +160,12 @@ fn main() {
         // first click after launch sees the user's configured mode (heuristic
         // by default; agent when configured).
         oximux_app::commit_message_ai_settings::install(cx);
+        // Process-wide last-known-`GitState` cache. Registered before any
+        // window opens so the first SCM panel can seed from it (no-op on a
+        // cold start; populated as each project's poller produces a sample,
+        // then read back when the user switches between already-visited
+        // projects to paint the prior snapshot instead of "Loading…").
+        cx.set_global(oximux_app::git_state_cache::GitStateCache::default());
         cx.bind_keys(oximux_app::keymap::default_key_bindings());
         cx.activate(true);
 

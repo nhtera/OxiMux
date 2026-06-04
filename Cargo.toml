@@ -59,6 +59,7 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 
 # Async + util
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 anyhow = "1"
 async-trait = "0.1"
 thiserror = "1"

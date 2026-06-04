@@ -392,6 +392,29 @@ fn rust_file_rows_carry_syntax_tokens() {
 }
 
 #[test]
+fn oversize_diff_skips_syntax_highlighting() {
+    use oximux_app::shell::diff_view::render::SYNTAX_HIGHLIGHT_BUDGET_LINES;
+    // A diff whose total body exceeds the budget renders without syntax
+    // tokens (tints/signs/word-diff still apply) so a huge multi-file diff
+    // stays responsive.
+    let lines: Vec<_> = (0..SYNTAX_HIGHLIGHT_BUDGET_LINES + 1)
+        .map(|_| line(DiffLineKind::Added, r#"let x = "hello";"#))
+        .collect();
+    let big = hunk((1, 1), (1, lines.len() as u32), "", lines);
+    let plan = build_render_plan(
+        &[file("src/main.rs", DiffStatus::Modified, vec![big], false)],
+        false,
+    );
+    let FilePlan::Hunked { hunks, .. } = &plan[0] else {
+        panic!("expected hunked");
+    };
+    assert!(
+        hunks[0].rows.iter().all(|r| r.tokens.is_empty()),
+        "over-budget diff must skip syntax tokens"
+    );
+}
+
+#[test]
 fn unknown_extension_rows_have_no_syntax_tokens() {
     // Extension-less or unrecognized file → no language → tokens empty.
     // Renderer reads the empty vec as "fall back to mono color".
