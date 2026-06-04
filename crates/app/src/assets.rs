@@ -84,6 +84,15 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/alert-triangle.svg",
         include_bytes!("../assets/icons/alert-triangle.svg"),
     ),
+    // Per-adapter agent tab glyphs. Filenames are the agent registry slugs
+    // (not vendor names); monochrome `currentColor` so they tint with the
+    // tab's active/inactive icon color.
+    (
+        "icons/claude-code.svg",
+        include_bytes!("../assets/icons/claude-code.svg"),
+    ),
+    ("icons/codex.svg", include_bytes!("../assets/icons/codex.svg")),
+    ("icons/aider.svg", include_bytes!("../assets/icons/aider.svg")),
 ];
 
 impl AssetSource for AppAssets {

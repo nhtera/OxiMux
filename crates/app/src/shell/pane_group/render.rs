@@ -217,7 +217,9 @@ struct PaneGroupTabHeader {
 #[derive(Clone, Copy)]
 enum PaneTabKindMarker {
     Terminal,
-    Agent,
+    /// Agent tab — carries the registry adapter slug so the chip can show a
+    /// per-adapter brand glyph instead of the generic terminal icon.
+    Agent(&'static str),
     Editor,
     /// Diff tabs reuse the Editor chip styling (file icon, no agent
     /// status badge) but keep their own marker so future visual
@@ -228,7 +230,7 @@ enum PaneTabKindMarker {
 fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
     match kind {
         PaneGroupTabKind::Terminal => PaneTabKindMarker::Terminal,
-        PaneGroupTabKind::Agent { .. } => PaneTabKindMarker::Agent,
+        PaneGroupTabKind::Agent { adapter_id, .. } => PaneTabKindMarker::Agent(adapter_id),
         PaneGroupTabKind::Editor { .. } => PaneTabKindMarker::Editor,
         // Commit-detail tabs share the Diff marker — same `±` semantics
         // and same chip styling. The dedup key differs (SHA vs path)
@@ -245,6 +247,18 @@ fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus>
         Some(status_rx.borrow().clone())
     } else {
         None
+    }
+}
+
+/// Per-adapter brand glyph for an agent tab. Slugs match the agent
+/// registry; unknown / custom adapters fall back to the generic terminal
+/// glyph so a tab always has an icon.
+fn agent_icon(adapter_id: &str) -> &'static str {
+    match adapter_id {
+        "claude-code" => "icons/claude-code.svg",
+        "codex" => "icons/codex.svg",
+        "aider" => "icons/aider.svg",
+        _ => "icons/square-terminal.svg",
     }
 }
 
@@ -898,7 +912,8 @@ fn render_tab_chip(
         // Diff tabs reuse the editor "file" glyph until a dedicated
         // diff icon ships (deferred — see plan phase 04 file-type icons).
         PaneTabKindMarker::Editor | PaneTabKindMarker::Diff => "icons/file.svg",
-        PaneTabKindMarker::Terminal | PaneTabKindMarker::Agent => "icons/square-terminal.svg",
+        PaneTabKindMarker::Terminal => "icons/square-terminal.svg",
+        PaneTabKindMarker::Agent(adapter_id) => agent_icon(adapter_id),
     };
     let icon_color = if is_active {
         theme.fg_muted
@@ -1280,7 +1295,7 @@ fn pane_actions_button(entity_id_raw: u64, is_focused: bool, theme: Theme) -> im
 /// Trailing "+" button on every group's strip.
 ///
 /// Left-click opens the adapter picker popover — the picker offers
-/// "New Terminal" (⌘T), "New Agent" / Claude / Codex / ... rows. Direct
+/// "New Terminal" (⌘T) plus one row per registered agent adapter. Direct
 /// terminal spawn is reachable via the ⌘T keybind on `NewTab`; the `+`
 /// button is the surface for picking a non-default kind.
 ///
@@ -1365,9 +1380,10 @@ fn render_mru_hud(
             | PaneGroupTabKind::Commit { .. }
             | PaneGroupTabKind::BranchFile { .. }
             | PaneGroupTabKind::CombinedDiff { .. } => "icons/file.svg",
-            PaneGroupTabKind::Terminal | PaneGroupTabKind::Agent { .. } => {
-                "icons/square-terminal.svg"
-            }
+            PaneGroupTabKind::Terminal => "icons/square-terminal.svg",
+            // Match the tab chip: brand the agent by its adapter glyph so
+            // the Ctrl+Tab switcher reads the same as the strip.
+            PaneGroupTabKind::Agent { adapter_id, .. } => agent_icon(adapter_id),
         };
         let is_highlighted = row_ix == cursor;
         let row_bg = if is_highlighted {
