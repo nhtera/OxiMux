@@ -439,6 +439,12 @@ impl Repository {
                 push_all(staged?, FileGroup::Staged);
                 push_all(self.untracked_diffs(&state?).await, FileGroup::Untracked);
             }
+            CombinedDiffScope::Unstaged => {
+                // The SCM "Changes" section: worktree-vs-index only (no
+                // --cached, no untracked).
+                let unstaged = self.diff_with_args(&[FULL_FILE_CONTEXT], None).await?;
+                push_all(unstaged, FileGroup::Unstaged);
+            }
             CombinedDiffScope::Staged => {
                 let staged = self
                     .diff_with_args(&[FULL_FILE_CONTEXT, "--cached"], None)

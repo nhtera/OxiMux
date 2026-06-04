@@ -72,6 +72,21 @@ async fn all_changes_orders_unstaged_then_staged_then_untracked() {
 }
 
 #[tokio::test]
+async fn unstaged_scope_returns_only_unstaged_changes() {
+    let (_dir, repo) = repo_with_mixed_changes().await;
+    let combined = repo
+        .diff_combined(CombinedDiffScope::Unstaged)
+        .await
+        .unwrap();
+
+    // Only a.txt has a worktree-vs-index change (A1→A2). b.txt is staged
+    // with no unstaged remainder; c.txt is untracked — both excluded.
+    assert_eq!(combined.diffs.len(), 1);
+    assert_eq!(combined.diffs[0].path, PathBuf::from("a.txt"));
+    assert_eq!(combined.groups, vec![FileGroup::Unstaged]);
+}
+
+#[tokio::test]
 async fn staged_scope_returns_only_staged_files() {
     let (_dir, repo) = repo_with_mixed_changes().await;
     let combined = repo.diff_combined(CombinedDiffScope::Staged).await.unwrap();

@@ -112,6 +112,9 @@ pub enum CombinedDiffScope {
     /// — one file appearing in both index and worktree shows under BOTH
     /// (each side stages/unstages independently).
     AllChanges,
+    /// Unstaged (worktree-vs-index) tracked changes only — the SCM panel's
+    /// "Changes" section. Excludes staged and untracked.
+    Unstaged,
     /// Staged (index-vs-HEAD) changes only.
     Staged,
     /// Untracked files only.
@@ -125,6 +128,7 @@ impl CombinedDiffScope {
     pub fn title(&self) -> &'static str {
         match self {
             CombinedDiffScope::AllChanges => "All Changes",
+            CombinedDiffScope::Unstaged => "Changes",
             CombinedDiffScope::Staged => "Staged Changes",
             CombinedDiffScope::Untracked => "Untracked",
             CombinedDiffScope::Branch { .. } => "Branch Diff",

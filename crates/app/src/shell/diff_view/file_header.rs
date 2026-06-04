@@ -47,6 +47,24 @@ pub fn build_row_owner(rows: &[PreparedRow]) -> Vec<usize> {
     owner
 }
 
+/// The prepared-row index of each file's `FileHeader`, indexed by `file_idx`
+/// (files are emitted in order, so the result is dense from 0). Lets the file
+/// rail jump the body to a clicked file in O(1). Built once per prepared
+/// rebuild, off the per-frame path.
+pub fn build_first_row_of_file(rows: &[PreparedRow]) -> Vec<usize> {
+    let mut first = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        if let PreparedRow::FileHeader { file_idx, .. } = row {
+            // Files are emitted in ascending order, one header each, so this
+            // pushes index `file_idx` exactly once in order.
+            if *file_idx == first.len() {
+                first.push(row_idx);
+            }
+        }
+    }
+    first
+}
+
 /// Collect one `StickyHeader` per file, in file order. Built alongside
 /// `build_row_owner` during the prepared rebuild.
 pub fn collect_headers(rows: &[PreparedRow]) -> Vec<StickyHeader> {
@@ -162,8 +180,14 @@ pub fn file_header_row(
 
 /// `+N -N` chip cluster. Both sides always show (e.g. `+0`) so the header
 /// doesn't reflow when one side's count changes. Thin space (U+2009) +
-/// figure dash (U+2012) for a tighter, typographically clean tally.
-fn stats_chips(added: u32, removed: u32, theme: Theme, typography: &Typography) -> impl IntoElement {
+/// figure dash (U+2012) for a tighter, typographically clean tally. Shared
+/// with the file rail.
+pub(crate) fn stats_chips(
+    added: u32,
+    removed: u32,
+    theme: Theme,
+    typography: &Typography,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_row()

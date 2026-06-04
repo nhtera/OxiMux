@@ -489,171 +489,13 @@ impl WorkspaceRoot {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        // Subscribe to GitPanel's discard requests. When the user clicks
-        // the revert icon on a file row, the panel emits
-        // `DiscardRequested`; we mount a `ConfirmDialog` populated from
-        // the panel's `pending_discard` snapshot.
-        let discard_subscription = right_sidebar
-            .as_ref()
-            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
-            .map(|sc| sc.read(cx).git_panel.clone())
-            .map(|panel| {
-                cx.subscribe_in(
-                    &panel,
-                    window,
-                    |root, panel, _ev: &DiscardRequested, window, cx| {
-                        root.mount_discard_dialog(panel.clone(), window, cx);
-                    },
-                )
-            });
+        // SCM-panel event subscriptions (discard, push-stash, commit-click,
+        // branch-file, combined "View all", branch-diff-all) are wired by
+        // `rewire_scm_subscriptions` below — and re-wired after every
+        // `set_active_project` sidebar rebuild, since that mints fresh panel
+        // entities the original subscriptions would otherwise orphan.
 
-        // Subscribe to StashPanel's push-stash requests. The header `+`
-        // button fires `PushStashRequested`; we mount a small form
-        // dialog (message + include-untracked) that, on confirm, calls
-        // `StashPanel::push` which shells out to `git stash push` and
-        // refreshes the list.
-        let push_stash_subscription = right_sidebar
-            .as_ref()
-            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
-            .map(|sc| sc.read(cx).stash_panel.clone())
-            .map(|panel| {
-                cx.subscribe_in(
-                    &panel,
-                    window,
-                    |root, panel, _ev: &PushStashRequested, window, cx| {
-                        root.mount_push_stash_dialog(panel.clone(), window, cx);
-                    },
-                )
-            });
-
-        // Subscribe to CommitGraph's row-click requests. When the user
-        // clicks a commit row, `ShowCommitRequested { sha, short_oid,
-        // subject }` fires; we open a commit-detail tab via
-        // `ProjectPanes::open_or_activate_commit_tab` in the active
-        // group. The repo handle is captured at subscription time —
-        // RightSidebar already owns it for the lifetime of the source-
-        // control surface, so cloning here is cheap (Repository is an
-        // Arc-backed shared handle).
-        let show_commit_subscription = right_sidebar
-            .as_ref()
-            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
-            .map(|sc| {
-                // Capture (graph entity, repo) at subscription time so
-                // the click handler doesn't re-read sidebar state every
-                // dispatch. Repository is Arc-backed; clone is cheap.
-                let sc_ref = sc.read(cx);
-                (sc_ref.commit_graph.clone(), sc_ref.repo.clone())
-            })
-            .map(|(graph, repo)| {
-                cx.subscribe_in(
-                    &graph,
-                    window,
-                    move |root, _graph, ev: &ShowCommitRequested, window, cx| {
-                        let Some(panes) = root.active_project_panes() else {
-                            return;
-                        };
-                        let sha = ev.sha.clone();
-                        let short_oid = ev.short_oid.clone();
-                        let subject = ev.subject.clone();
-                        let repo = repo.clone();
-                        panes.update(cx, |p, cx| {
-                            p.open_or_activate_commit_tab(
-                                repo, sha, short_oid, subject, window, cx,
-                            );
-                        });
-                    },
-                )
-            });
-
-        // Subscribe to the "Committed on Branch" section's row clicks. The
-        // event carries the `merge_base..head` range + path; we open a
-        // read-only range-diff tab in the active group. Same capture +
-        // lifetime contract as the commit subscription above.
-        let show_branch_file_subscription = right_sidebar
-            .as_ref()
-            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
-            .map(|sc| {
-                let sc_ref = sc.read(cx);
-                (sc_ref.branch_commits.clone(), sc_ref.repo.clone())
-            })
-            .map(|(panel, repo)| {
-                cx.subscribe_in(
-                    &panel,
-                    window,
-                    move |root, _panel, ev: &ShowBranchFileRequested, window, cx| {
-                        let Some(panes) = root.active_project_panes() else {
-                            return;
-                        };
-                        let base = ev.base.clone();
-                        let head = ev.head.clone();
-                        let path = ev.path.clone();
-                        let repo = repo.clone();
-                        panes.update(cx, |p, cx| {
-                            p.open_or_activate_branch_diff_tab(
-                                repo, base, head, path, window, cx,
-                            );
-                        });
-                    },
-                )
-            });
-
-        // Subscribe to the SCM panel section "View all" CTAs. The event
-        // carries the combined scope (all-changes / staged / untracked); the
-        // handler opens a combined multi-file diff tab in the active group.
-        // Same capture + lifetime contract as the commit subscription.
-        let show_combined_diff_subscription = right_sidebar
-            .as_ref()
-            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
-            .map(|sc| {
-                let sc_ref = sc.read(cx);
-                (sc_ref.git_panel.clone(), sc_ref.repo.clone())
-            })
-            .map(|(panel, repo)| {
-                cx.subscribe_in(
-                    &panel,
-                    window,
-                    move |root, _panel, ev: &ShowCombinedDiffRequested, window, cx| {
-                        let Some(panes) = root.active_project_panes() else {
-                            return;
-                        };
-                        let scope = ev.scope.clone();
-                        let repo = repo.clone();
-                        panes.update(cx, |p, cx| {
-                            p.open_or_activate_combined_diff_tab(repo, scope, window, cx);
-                        });
-                    },
-                )
-            });
-
-        // Subscribe to the "Committed on Branch" section's "View all" CTA.
-        // Opens a combined read-only diff of every file in the branch range.
-        let show_branch_diff_all_subscription = right_sidebar
-            .as_ref()
-            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
-            .map(|sc| {
-                let sc_ref = sc.read(cx);
-                (sc_ref.branch_commits.clone(), sc_ref.repo.clone())
-            })
-            .map(|(panel, repo)| {
-                cx.subscribe_in(
-                    &panel,
-                    window,
-                    move |root, _panel, ev: &ShowBranchDiffAllRequested, window, cx| {
-                        let Some(panes) = root.active_project_panes() else {
-                            return;
-                        };
-                        let scope = oximux_core::CombinedDiffScope::Branch {
-                            base: ev.base.clone(),
-                            head: ev.head.clone(),
-                        };
-                        let repo = repo.clone();
-                        panes.update(cx, |p, cx| {
-                            p.open_or_activate_combined_diff_tab(repo, scope, window, cx);
-                        });
-                    },
-                )
-            });
-        Self {
+        let mut this = Self {
             theme,
             density,
             typography,
@@ -674,15 +516,17 @@ impl WorkspaceRoot {
             _project_panes_observer: project_panes_observer,
             _window_activation_observer: window_activation_observer,
             _click_router: click_router,
-            _discard_subscription: discard_subscription,
+            // SCM subscriptions are wired by `rewire_scm_subscriptions` just
+            // below, then re-wired after each sidebar rebuild.
+            _discard_subscription: None,
             _discard_dialog_observer: None,
-            _push_stash_subscription: push_stash_subscription,
-            _show_branch_file_subscription: show_branch_file_subscription,
-            _show_combined_diff_subscription: show_combined_diff_subscription,
-            _show_branch_diff_all_subscription: show_branch_diff_all_subscription,
+            _push_stash_subscription: None,
+            _show_branch_file_subscription: None,
+            _show_combined_diff_subscription: None,
+            _show_branch_diff_all_subscription: None,
             push_stash_dialog: None,
             _push_stash_dialog_observer: None,
-            _show_commit_subscription: show_commit_subscription,
+            _show_commit_subscription: None,
             app_state,
             project_picker,
             workspace_dialog,
@@ -695,7 +539,9 @@ impl WorkspaceRoot {
             add_project_dialog,
             focus_handle,
             window_id,
-        }
+        };
+        this.rewire_scm_subscriptions(window, cx);
+        this
     }
 
     /// Open a fresh local-PTY tab in the active project's active pane group.
@@ -713,6 +559,132 @@ impl WorkspaceRoot {
     pub(crate) fn active_project_panes(&self) -> Option<Entity<ProjectPanes>> {
         let id = self.active_project.as_ref().map(|p| p.id.as_str())?;
         self.project_panes_by_project.get(id).cloned()
+    }
+
+    /// (Re)wire every source-control-panel event subscription against the
+    /// CURRENT `right_sidebar` entities. Called from `new` AND after every
+    /// `set_active_project` sidebar rebuild: that rebuild mints fresh
+    /// `git_panel` / `commit_graph` / `branch_commits` / `stash_panel`
+    /// entities, so any subscription captured against the prior generation
+    /// silently stops firing. (Single-file diff opens survive a rebuild
+    /// because they route through a stable `weak_self` callback re-passed at
+    /// every sidebar build, not through an entity subscription.) Overwriting
+    /// each `_*_subscription` field drops the stale one.
+    pub(crate) fn rewire_scm_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sc) = self
+            .right_sidebar
+            .as_ref()
+            .and_then(|rs| rs.read(cx).source_control.as_ref().cloned())
+        else {
+            // Non-git sidebar — no SCM panels. Drop any subscriptions left
+            // over from a prior git project.
+            self._discard_subscription = None;
+            self._push_stash_subscription = None;
+            self._show_commit_subscription = None;
+            self._show_branch_file_subscription = None;
+            self._show_combined_diff_subscription = None;
+            self._show_branch_diff_all_subscription = None;
+            return;
+        };
+        // Clone the child entities + repo up front so the immutable read
+        // borrow ends before `cx.subscribe_in` borrows `cx` mutably.
+        let (git_panel, stash_panel, commit_graph, branch_commits, repo) = {
+            let sc = sc.read(cx);
+            (
+                sc.git_panel.clone(),
+                sc.stash_panel.clone(),
+                sc.commit_graph.clone(),
+                sc.branch_commits.clone(),
+                sc.repo.clone(),
+            )
+        };
+
+        self._discard_subscription = Some(cx.subscribe_in(
+            &git_panel,
+            window,
+            |root, panel, _ev: &DiscardRequested, window, cx| {
+                root.mount_discard_dialog(panel.clone(), window, cx);
+            },
+        ));
+
+        self._push_stash_subscription = Some(cx.subscribe_in(
+            &stash_panel,
+            window,
+            |root, panel, _ev: &PushStashRequested, window, cx| {
+                root.mount_push_stash_dialog(panel.clone(), window, cx);
+            },
+        ));
+
+        let commit_repo = repo.clone();
+        self._show_commit_subscription = Some(cx.subscribe_in(
+            &commit_graph,
+            window,
+            move |root, _graph, ev: &ShowCommitRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                let sha = ev.sha.clone();
+                let short_oid = ev.short_oid.clone();
+                let subject = ev.subject.clone();
+                let repo = commit_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_commit_tab(repo, sha, short_oid, subject, window, cx);
+                });
+            },
+        ));
+
+        let branch_file_repo = repo.clone();
+        self._show_branch_file_subscription = Some(cx.subscribe_in(
+            &branch_commits,
+            window,
+            move |root, _panel, ev: &ShowBranchFileRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                let base = ev.base.clone();
+                let head = ev.head.clone();
+                let path = ev.path.clone();
+                let repo = branch_file_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_branch_diff_tab(repo, base, head, path, window, cx);
+                });
+            },
+        ));
+
+        let combined_repo = repo.clone();
+        self._show_combined_diff_subscription = Some(cx.subscribe_in(
+            &git_panel,
+            window,
+            move |root, _panel, ev: &ShowCombinedDiffRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                let scope = ev.scope.clone();
+                let repo = combined_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_combined_diff_tab(repo, scope, window, cx);
+                });
+            },
+        ));
+
+        let branch_all_repo = repo.clone();
+        self._show_branch_diff_all_subscription = Some(cx.subscribe_in(
+            &branch_commits,
+            window,
+            move |root, _panel, ev: &ShowBranchDiffAllRequested, window, cx| {
+                let Some(panes) = root.active_project_panes() else {
+                    return;
+                };
+                let scope = oximux_core::CombinedDiffScope::Branch {
+                    base: ev.base.clone(),
+                    head: ev.head.clone(),
+                };
+                let repo = branch_all_repo.clone();
+                panes.update(cx, |p, cx| {
+                    p.open_or_activate_combined_diff_tab(repo, scope, window, cx);
+                });
+            },
+        ));
     }
 
     /// Route the Explorer context-menu Rename action into the FileExplorer's

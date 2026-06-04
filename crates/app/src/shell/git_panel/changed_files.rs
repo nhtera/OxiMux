@@ -33,12 +33,13 @@ pub struct ShowCombinedDiffRequested {
 
 impl EventEmitter<ShowCombinedDiffRequested> for GitPanel {}
 
-/// The combined-diff scope a section's "View all" opens. CHANGES (unstaged)
-/// opens the full working-tree combined view; the staged/untracked sections
-/// scope to their own files.
+/// The combined-diff scope a section's "View all" opens. Each section scopes
+/// to its OWN files — CHANGES to unstaged tracked changes, STAGED to staged,
+/// UNTRACKED to untracked — so "View all" never widens past the section the
+/// user clicked.
 fn combined_scope_for(kind: RowKind) -> CombinedDiffScope {
     match kind {
-        RowKind::Unstaged => CombinedDiffScope::AllChanges,
+        RowKind::Unstaged => CombinedDiffScope::Unstaged,
         RowKind::Staged => CombinedDiffScope::Staged,
         RowKind::Untracked => CombinedDiffScope::Untracked,
     }

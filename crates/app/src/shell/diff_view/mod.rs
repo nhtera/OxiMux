@@ -19,6 +19,7 @@
 //! container.
 
 pub mod file_header;
+pub mod file_rail;
 pub mod hunk_actions;
 pub mod paint;
 pub mod render;
@@ -27,7 +28,10 @@ pub mod word_diff;
 
 use crate::actions::{ExpandDiff, RetryDiff};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
-use crate::shell::diff_view::file_header::{StickyHeader, build_row_owner, collect_headers, sticky_header_overlay};
+use crate::shell::diff_view::file_header::{
+    StickyHeader, build_first_row_of_file, build_row_owner, collect_headers, sticky_header_overlay,
+};
+use crate::shell::diff_view::file_rail::{RAIL_WIDTH, RailContext, file_rail};
 use crate::shell::diff_view::paint::{
     FoldId, OverviewRun, PreparedRow, overview_ruler, overview_runs, prepare, prepare_split,
     render_rows, staging_card_overlay, widest_row_chars, widest_row_index,
@@ -38,6 +42,7 @@ use gpui::{
     ParentElement, Render, ScrollStrategy, StatefulInteractiveElement as _, Styled, Subscription,
     Task, UniformListScrollHandle, Window, div, px,
 };
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, Sizable as _};
 use oximux_core::{CombinedDiffScope, FileDiff, FileGroup};
 use oximux_git::Repository;
@@ -268,6 +273,24 @@ pub struct DiffView {
     /// Per-file header metadata, in file order, for the sticky overlay.
     /// Built alongside `prepared`.
     headers: Rc<Vec<StickyHeader>>,
+    /// First prepared-row index of each file (its `FileHeader` row), indexed
+    /// by `file_idx`. Built alongside `prepared`; the file rail uses it to
+    /// jump the body to a clicked file in O(1).
+    first_row_of_file: Rc<Vec<usize>>,
+    /// Whether the in-diff file rail is revealed. Open by default for
+    /// multi-file diffs (it mirrors the reference combined-diff navigator); a
+    /// toolbar toggle flips it. Pure per-session view state — never
+    /// invalidates `prepared`.
+    rail_open: bool,
+    /// Rail directory rows the user has collapsed, by full path. A folder
+    /// whose path is present renders its chevron closed and hides its
+    /// subtree. Pure view state.
+    rail_collapsed_dirs: HashSet<PathBuf>,
+    /// Live filter for the rail's file list. Lazily created the first time
+    /// the rail renders (needs a `Window`); typing narrows the rows.
+    rail_filter: Option<Entity<InputState>>,
+    /// Re-render subscription on `rail_filter`'s change events.
+    _rail_filter_sub: Option<Subscription>,
     /// One-shot scroll target consumed on the next prepared rebuild — set by
     /// a hunk op so the post-stage reload restores the reader's position
     /// instead of snapping to the top. `None` when idle.
@@ -306,6 +329,11 @@ impl DiffView {
             expanded_folds: HashSet::new(),
             row_owner: Rc::new(Vec::new()),
             headers: Rc::new(Vec::new()),
+            first_row_of_file: Rc::new(Vec::new()),
+            rail_open: true,
+            rail_collapsed_dirs: HashSet::new(),
+            rail_filter: None,
+            _rail_filter_sub: None,
             pending_scroll_anchor: None,
         }
     }
@@ -379,6 +407,38 @@ impl DiffView {
         self.scroll_handle.scroll_to_item(row, ScrollStrategy::Top);
     }
 
+    /// Scroll the body so `file_idx`'s header sits at the top. Used by the
+    /// file-rail click-to-jump; a stale index (no matching row) is inert.
+    pub(crate) fn scroll_to_file(&self, file_idx: usize) {
+        if let Some(&row) = self.first_row_of_file.get(file_idx) {
+            self.scroll_to_row(row);
+        }
+    }
+
+    /// Reveal / hide the opt-in file rail. Pure view state — the body row set
+    /// is unchanged, so this never invalidates `prepared`.
+    fn toggle_rail(&mut self, cx: &mut Context<Self>) {
+        self.rail_open = !self.rail_open;
+        cx.notify();
+    }
+
+    /// Collapse / expand a rail directory row. Pure view state.
+    fn toggle_rail_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !self.rail_collapsed_dirs.remove(&dir) {
+            self.rail_collapsed_dirs.insert(dir);
+        }
+        cx.notify();
+    }
+
+    /// Clear rail folder-collapse + filter state on a fresh selection so a new
+    /// diff opens fully expanded and unfiltered (dropping the filter entity
+    /// re-creates it lazily). Called from every `load*` entry point.
+    fn reset_rail_state(&mut self) {
+        self.rail_collapsed_dirs.clear();
+        self.rail_filter = None;
+        self._rail_filter_sub = None;
+    }
+
     /// Flip inline ↔ side-by-side. Rebuilds the row set (the two modes differ
     /// in layout) and clears hover; cheap — the diff data is unchanged, only
     /// the flattening differs.
@@ -448,6 +508,7 @@ impl DiffView {
         // pre-expanded context runs from the prior file).
         self.collapsed.clear();
         self.expanded_folds.clear();
+        self.reset_rail_state();
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -553,6 +614,7 @@ impl DiffView {
         self._op_task = None;
         self.invalidate_prepared();
         self.expanded_folds.clear();
+        self.reset_rail_state();
         self.state = DiffViewState::CommitLoading {
             sha: sha.clone(),
             short_oid: short_oid.clone(),
@@ -646,6 +708,7 @@ impl DiffView {
         self._op_task = None;
         self.invalidate_prepared();
         self.expanded_folds.clear();
+        self.reset_rail_state();
         self.state = DiffViewState::RangeLoading {
             base: base.clone(),
             head: head.clone(),
@@ -739,6 +802,7 @@ impl DiffView {
         self.invalidate_prepared();
         self.collapsed.clear();
         self.expanded_folds.clear();
+        self.reset_rail_state();
         self.state = DiffViewState::CombinedLoading {
             scope: scope.clone(),
         };
@@ -1240,7 +1304,7 @@ impl Focusable for DiffView {
 }
 
 impl Render for DiffView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // When no file is selected, collapse to a zero-height placeholder so
         // the source-control panel flows directly from the staged-files list
         // into the commit graph. Earlier builds rendered a full-width
@@ -1346,6 +1410,12 @@ impl Render for DiffView {
                 .prepared
                 .as_ref()
                 .map(|r| Rc::new(collect_headers(r)))
+                .unwrap_or_default();
+            // First-row-of-file index for the file rail's click-to-jump.
+            self.first_row_of_file = self
+                .prepared
+                .as_ref()
+                .map(|r| Rc::new(build_first_row_of_file(r)))
                 .unwrap_or_default();
             // A hunk op left a position to restore — apply it once the
             // rebuilt rows actually exist (NOT during the intermediate
@@ -1489,16 +1559,50 @@ impl Render for DiffView {
                 | DiffViewState::RangeReady { .. }
                 | DiffViewState::CombinedReady { .. }
         );
+        // The file rail is a multi-file affordance only — a single-file diff
+        // has nothing to navigate, so the toggle and rail never appear.
+        let multi_file = has_body && self.headers.len() > 1;
+        let rail_open = self.rail_open;
         let toolbar = has_body.then(|| {
             let label = if split { "Inline" } else { "Side by side" };
             let hover_bg = self.theme.bg_panel_alt;
             let all_folded = self.all_folded();
             let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
+            // Leading rail toggle (multi-file only), pushed apart from the
+            // view controls by a flex spacer so it sits at the left edge.
+            let rail_toggle = multi_file.then(|| {
+                let active_bg = self.theme.bg_panel_alt;
+                let mut btn = div()
+                    .id("diff-rail-toggle")
+                    .flex()
+                    .items_center()
+                    .px(px(6.0))
+                    .py(px(1.0))
+                    .rounded(px(self.density.r_chip))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(active_bg))
+                    .on_click(cx.listener(|view, _: &gpui::ClickEvent, _window, cx| {
+                        view.toggle_rail(cx);
+                    }))
+                    .child(
+                        Icon::default()
+                            .path("icons/list-tree.svg")
+                            .xsmall()
+                            .text_color(if rail_open {
+                                self.theme.fg_base
+                            } else {
+                                self.theme.fg_subtle
+                            }),
+                    );
+                if rail_open {
+                    btn = btn.bg(active_bg);
+                }
+                btn
+            });
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_end()
                 .gap(px(self.density.gap_inline))
                 .flex_shrink_0()
                 .h(px(self.density.h_row))
@@ -1507,6 +1611,18 @@ impl Render for DiffView {
                 .bg(self.theme.bg_panel)
                 .border_b_1()
                 .border_color(self.theme.border_inactive)
+                .children(rail_toggle)
+                // Changed-file count, next to the rail toggle (multi-file only).
+                .children(multi_file.then(|| {
+                    let n = self.headers.len();
+                    div()
+                        .text_size(px(self.typography.t_body_sm))
+                        .text_color(self.theme.fg_muted)
+                        .child(format!("{n} changed files"))
+                }))
+                // Spacer pushes the view controls to the right edge while the
+                // rail toggle stays pinned left.
+                .child(div().flex_1())
                 .child(
                     // Collapse-all / Expand-all — folds every file to its
                     // header so a many-file diff reads as a tight index.
@@ -1550,6 +1666,88 @@ impl Render for DiffView {
                         .child(label),
                 )
         });
+        // The opt-in rail, built only when revealed for a multi-file diff.
+        // Active file = the one owning the row at the top of the viewport
+        // (same exact pixel-offset math the sticky header uses). Group tags
+        // (section headers) come from the combined view; commit / range
+        // diffs render a flat list.
+        // Lazily build the rail's filter input the first time the rail is
+        // shown (it needs a `Window`, unavailable in `new`). A change event
+        // re-renders so the filtered row set updates as the user types.
+        if multi_file && rail_open && self.rail_filter.is_none() {
+            let input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
+            self._rail_filter_sub = Some(cx.subscribe(
+                &input,
+                |_view, _input, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            ));
+            self.rail_filter = Some(input);
+        }
+        let rail = (multi_file && rail_open).then(|| {
+            let active_file_idx = self
+                .row_owner
+                .get(self.first_visible_row())
+                .copied()
+                .unwrap_or(0);
+            // Borrow the group tags directly from state — no per-frame clone.
+            let rail_groups: Option<&[FileGroup]> = match &self.state {
+                DiffViewState::CombinedReady { groups, .. } => Some(groups.as_slice()),
+                _ => None,
+            };
+            let filter = self
+                .rail_filter
+                .as_ref()
+                .map(|i| i.read(cx).value().to_lowercase())
+                .unwrap_or_default();
+            let weak_rail = cx.entity().downgrade();
+            let rows = file_rail(
+                RailContext {
+                    headers: &self.headers,
+                    groups: rail_groups,
+                    active_file_idx,
+                    collapsed_dirs: &self.rail_collapsed_dirs,
+                    filter: &filter,
+                    theme: self.theme,
+                    density: self.density,
+                },
+                &self.typography,
+                weak_rail,
+            );
+            // Rail = fixed-width column: filter box pinned on top, file tree
+            // scrolling beneath it.
+            let mut col = div()
+                .flex_shrink_0()
+                .w(px(RAIL_WIDTH))
+                .h_full()
+                .flex()
+                .flex_col()
+                .bg(self.theme.bg_panel)
+                .border_r_1()
+                .border_color(self.theme.border_inactive);
+            if let Some(input) = self.rail_filter.as_ref() {
+                col = col.child(
+                    div()
+                        .flex_shrink_0()
+                        .w_full()
+                        .p(px(6.0))
+                        .border_b_1()
+                        .border_color(self.theme.border_inactive)
+                        .child(Input::new(input).small()),
+                );
+            }
+            col.child(
+                div()
+                    .id("diff-rail-scroll")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(rows),
+            )
+        });
         // The body lives in a `flex_1 + min_h(0)` wrapper so the toolbar can
         // sit above it while the `uniform_list` inside still gets a DEFINITE
         // height (`h_full` of this wrapper) — preserving scroll-to-end.
@@ -1564,11 +1762,14 @@ impl Render for DiffView {
             // `relative` makes this the positioning context for the overview
             // ruler stacked on its right edge (added below).
             .relative()
+            // `flex_1` (grow 1, basis 0) fills the width the rail leaves in
+            // the content row; height stretches via the row's cross axis. No
+            // `w_full` here — on the horizontal main axis it would fight the
+            // rail's fixed width.
             .flex_1()
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .w_full()
             .on_hover(move |hovered, _window, cx: &mut App| {
                 if !*hovered {
                     let _ = weak_leave.update(cx, |view, cx| view.set_hover(None, None, cx));
@@ -1709,7 +1910,20 @@ impl Render for DiffView {
         if let Some(tb) = toolbar {
             root = root.child(tb);
         }
-        root = root.child(body_wrap);
+        // Below the toolbar: an opt-in left rail beside the body. The content
+        // row owns the remaining height; the body keeps `flex_1` so it fills
+        // whatever the rail leaves. Without a rail it's a thin pass-through.
+        let mut content = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full();
+        if let Some(rail) = rail {
+            content = content.child(rail);
+        }
+        content = content.child(body_wrap);
+        root = root.child(content);
         if let Some(o) = overlay {
             root = root.child(o);
         }

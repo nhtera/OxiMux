@@ -431,6 +431,11 @@ impl WorkspaceRoot {
                         cx,
                     )
                 }));
+                // The rebuild minted fresh SCM panel entities — re-point
+                // every source-control event subscription at them, or the
+                // "View all" / commit / branch / discard / stash actions
+                // would silently stop firing after a project switch.
+                this.rewire_scm_subscriptions(window, cx);
                 // Re-focus the active pane after the right_sidebar
                 // rebuild — the rebuild's `cx.notify` triggers a
                 // repaint that can land focus on a freshly-mounted
