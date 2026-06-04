@@ -57,17 +57,17 @@ pub struct TerminalSettings {
 impl Default for TerminalSettings {
     fn default() -> Self {
         // Defaults: scrollback 5000, blink 530ms, dim 0.7,
-        // unfocused 0.85 / cursor 0.3, grid 100x32. `unfocused_alpha` keeps
-        // inactive-pane text legible (a gentle de-emphasis); the active pane
-        // is marked positively by a border outline in split layouts, so the
-        // dim no longer has to carry the whole "which pane is focused" signal.
+        // unfocused 0.9 / cursor 0.3, grid 100x32. In a split, the inactive
+        // pane is distinguished ONLY by this dim (no active-pane outline box).
+        // A very gentle de-emphasis (matching the reference apps): inactive
+        // text stays bright and legible, just a hair softer than the active.
         Self {
             scrollback_lines: 5000,
             scroll_multiplier: 1.0,
             cursor_blink: true,
             blink_interval_ms: 530,
             dim_alpha: 0.7,
-            unfocused_alpha: 0.85,
+            unfocused_alpha: 0.9,
             unfocused_cursor_alpha: 0.3,
             osc52_clipboard: true,
             option_as_meta: true,
@@ -163,9 +163,9 @@ mod tests {
         assert_eq!(s.scrollback_lines, 5000);
         assert_eq!(s.blink_interval_ms, 530);
         assert_eq!(s.dim_alpha, 0.7);
-        // Inactive-pane text is only gently de-emphasized — the active-pane
-        // border carries the focus signal in splits.
-        assert_eq!(s.unfocused_alpha, 0.85);
+        // Inactive-pane text dim is the sole focus signal in splits (no
+        // active-pane outline) — a very gentle de-emphasis below 1.0.
+        assert_eq!(s.unfocused_alpha, 0.9);
         assert_eq!(s.unfocused_cursor_alpha, 0.3);
     }
 }

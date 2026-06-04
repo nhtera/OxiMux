@@ -1628,27 +1628,6 @@ impl PaneGroup {
         cx.notify();
     }
 
-    /// Activate tab `tab_idx` inside leaf `leaf_idx` of the active
-    /// terminal tab and focus it. Wired to per-pane tab-chip clicks.
-    pub(crate) fn set_active_leaf_tab(
-        &mut self,
-        leaf_idx: usize,
-        tab_idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(active_tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let PaneContent::Terminal(tree) = &mut active_tab.content else {
-            return;
-        };
-        tree.set_active_tab(leaf_idx, tab_idx);
-        if let Some(view) = tree.active_view() {
-            view.read(cx).focus_handle(cx).focus(window, cx);
-        }
-        cx.notify();
-    }
 
     pub(crate) fn on_close_tab(
         &mut self,

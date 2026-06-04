@@ -19,7 +19,7 @@ use gpui::{
 };
 use oximux_settings::Theme;
 
-use super::sub_pane::{LeafTabs, TerminalSplitTree};
+use super::sub_pane::TerminalSplitTree;
 use super::tab_drag::{TabDragPayload, TabDragPreview};
 use super::{PaneGroup, PaneGroupTab, PaneGroupTabKind, TabDragHover, TabInsertSide};
 use crate::actions::{
@@ -547,7 +547,7 @@ fn build_sub_pane_node(
 ) -> Option<AnyElement> {
     use crate::shell::pane_tree::{Axis, PaneTree};
     match node {
-        PaneTree::Leaf(idx) => render_leaf(*idx, tree, group.clone(), theme),
+        PaneTree::Leaf(idx) => render_leaf(*idx, tree),
         PaneTree::Split {
             axis,
             children,
@@ -644,123 +644,14 @@ fn build_sub_pane_node(
     }
 }
 
-/// Height of the compact per-pane (per-leaf) tab strip.
-const LEAF_TAB_BAR_HEIGHT_PX: f32 = 22.0;
-
-/// Render one split leaf. A leaf is a tab container; when it holds more
-/// than one tab — or the whole tab is split into multiple leaves — a
-/// compact per-pane tab strip is rendered above the active terminal so
-/// each pane region can carry its own set of terminals. The common
-/// single-leaf / single-tab case renders just the terminal (the
-/// workspace-level strip already covers it).
-fn render_leaf(
-    idx: usize,
-    tree: &TerminalSplitTree,
-    group: Entity<PaneGroup>,
-    theme: Theme,
-) -> Option<AnyElement> {
+/// Render one split leaf — exactly one terminal per pane (no per-pane tab
+/// strip). Returns the bare terminal view; the active pane is signalled by
+/// the terminal's own focus-flash rim (painted inside `TerminalView` on
+/// focus change) plus the inactive-pane dim, matching the reference app —
+/// no persistent outline box, so the split stays clean.
+fn render_leaf(idx: usize, tree: &TerminalSplitTree) -> Option<AnyElement> {
     let leaf = tree.leaf(idx)?;
-    let view = leaf.active_view().clone();
-    let is_split = tree.live_count() > 1;
-    let is_active_leaf = idx == tree.active();
-    let show_bar = is_split || leaf.len() > 1;
-    if !show_bar {
-        return Some(view.into_any_element());
-    }
-    let bar = render_leaf_tab_bar(idx, leaf, group, theme);
-    let mut container = div().flex().flex_col().size_full().overflow_hidden();
-    // Active-pane outline: in a split, the focused leaf gets a quiet
-    // `border_active` rim so "which pane is active" reads positively —
-    // inactive panes' text is only gently dimmed, so the border carries
-    // the focus signal. Width stays 1px in both states (transparent when
-    // unfocused) so toggling focus never reflows the split. A single
-    // (unsplit) pane never gets an outline.
-    if is_split {
-        container = container.border_1().border_color(if is_active_leaf {
-            theme.border_active
-        } else {
-            gpui::transparent_black()
-        });
-    }
-    Some(
-        container
-            .child(bar)
-            .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(view))
-            .into_any_element(),
-    )
-}
-
-/// Compact tab strip for a single split leaf: one chip per terminal tab
-/// plus a trailing `+` that spawns another terminal into this pane.
-fn render_leaf_tab_bar(
-    leaf_idx: usize,
-    leaf: &LeafTabs,
-    group: Entity<PaneGroup>,
-    theme: Theme,
-) -> AnyElement {
-    let active = leaf.active();
-    let mut bar = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(2.0))
-        .h(px(LEAF_TAB_BAR_HEIGHT_PX))
-        .w_full()
-        .px(px(4.0))
-        .flex_shrink_0()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border_inactive);
-
-    for t in 0..leaf.len() {
-        let is_active = t == active;
-        let click_group = group.clone();
-        let chip = div()
-            .id(("leaf-tab", leaf_idx * 4096 + t))
-            .flex()
-            .items_center()
-            .px(px(7.0))
-            .h_full()
-            .text_size(px(10.0))
-            .border_t_2()
-            .border_color(if is_active {
-                theme.focus_ring
-            } else {
-                gpui::transparent_black()
-            })
-            .text_color(if is_active {
-                theme.fg_base
-            } else {
-                theme.fg_muted
-            })
-            .cursor_pointer()
-            .when(!is_active, |s| {
-                s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
-            })
-            .child(SharedString::from(format!("{}", t + 1)))
-            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
-                click_group.update(cx, |g, cx| g.set_active_leaf_tab(leaf_idx, t, window, cx));
-            });
-        bar = bar.child(chip);
-    }
-
-    let add_group = group.clone();
-    let plus = div()
-        .id(("leaf-tab-add", leaf_idx))
-        .flex()
-        .items_center()
-        .justify_center()
-        .px(px(6.0))
-        .h_full()
-        .text_size(px(12.0))
-        .text_color(theme.fg_subtle)
-        .cursor_pointer()
-        .hover(|s| s.text_color(theme.fg_base))
-        .child(SharedString::from("+"))
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
-            add_group.update(cx, |g, cx| g.add_tab_to_leaf(leaf_idx, window, cx));
-        });
-    bar.child(plus).into_any_element()
+    Some(leaf.active_view().clone().into_any_element())
 }
 
 /// Hit-area padding around the visible 1 px stripe — matches the
@@ -789,10 +680,11 @@ impl Render for SubPaneDividerGhost {
     }
 }
 
-/// Build an interactive resize handle for a sub-pane divider. 1 px
-/// visible stripe + transparent 3 px hit-pad on each side; cursor flips
-/// to col/row-resize on hover; drag fires the shared on_drag_move on
-/// the parent split row.
+/// Build an interactive resize handle for a sub-pane divider. A flush 1 px
+/// hairline (only 1 px of layout, so panes stay edge-to-edge) plus a
+/// transparent hit overlay extended `SUB_PANE_DIVIDER_HIT_PAD_PX` past the
+/// line on each side; cursor flips to col/row-resize over it; drag fires the
+/// shared on_drag_move on the parent split row.
 fn sub_pane_divider(
     path: Vec<usize>,
     divider_idx: usize,
@@ -815,38 +707,40 @@ fn sub_pane_divider(
         axis,
         initial_weights: weights,
     };
-    let stripe = div().flex_shrink_0().bg(theme.border_active);
-    let stripe = match axis {
-        Axis::Horizontal => stripe.w(px(1.0)).h_full(),
-        Axis::Vertical => stripe.h(px(1.0)).w_full(),
+    let pad = SUB_PANE_DIVIDER_HIT_PAD_PX;
+    let span = px(1.0 + 2.0 * pad);
+    // A flush 1px hairline: it consumes only 1px of layout, so the two panes
+    // sit edge-to-edge with one subtle seam (the same `border_inactive` the
+    // workspace divider uses) instead of a wide bright gutter. The draggable
+    // region is a transparent overlay extended past the line on both sides,
+    // so the thin line stays easy to grab without widening the visible seam.
+    let line = div().relative().flex_shrink_0().bg(theme.border_inactive);
+    let line = match axis {
+        Axis::Horizontal => line.w(px(1.0)).h_full(),
+        Axis::Vertical => line.h(px(1.0)).w_full(),
     };
-    let mut handle = div()
+    let hot = div()
         .id(SharedString::from(id_string))
-        .flex()
-        .flex_shrink_0()
+        .absolute()
         .occlude();
-    handle = match axis {
-        Axis::Horizontal => handle
-            .flex_row()
-            .items_center()
-            .justify_center()
+    let hot = match axis {
+        Axis::Horizontal => hot
+            .top(px(0.0))
             .h_full()
-            .w(px(1.0 + 2.0 * SUB_PANE_DIVIDER_HIT_PAD_PX))
+            .left(px(-pad))
+            .w(span)
             .cursor_col_resize(),
-        Axis::Vertical => handle
-            .flex_col()
-            .items_center()
-            .justify_center()
+        Axis::Vertical => hot
+            .left(px(0.0))
             .w_full()
-            .h(px(1.0 + 2.0 * SUB_PANE_DIVIDER_HIT_PAD_PX))
+            .top(px(-pad))
+            .h(span)
             .cursor_row_resize(),
     };
-    handle
-        .child(stripe)
-        .on_drag(payload, |_payload, _offset, _window, cx| {
-            cx.new(|_| SubPaneDividerGhost)
-        })
-        .into_any_element()
+    line.child(hot.on_drag(payload, |_payload, _offset, _window, cx| {
+        cx.new(|_| SubPaneDividerGhost)
+    }))
+    .into_any_element()
 }
 
 /// Compute new sub-pane weights when divider `divider_idx` is dragged

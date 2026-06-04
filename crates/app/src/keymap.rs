@@ -8,7 +8,7 @@ use oximux_editor::SaveFile;
 
 use crate::actions::{
     CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
-    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewTabInPane, NewWindow, NextTab,
+    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewWindow, NextTab,
     OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
     PrevTab, RefreshSourceControl, Search, SelectExplorerTab, SelectSearchTab,
     SelectSourceControlTab, SendLastCommandOutputToAgent, SendTerminalSelectionToAgent,
@@ -41,9 +41,6 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         // cmd-shift-enter zooms the focused sub-pane; second press restores.
         KeyBinding::new("cmd-shift-enter", ToggleZoomSubPane, None),
         KeyBinding::new("cmd-t", NewTab, None),
-        // cmd-shift-t adds a tab to the active SPLIT pane's own strip
-        // (per-pane tabs), distinct from cmd-t's workspace-level tab.
-        KeyBinding::new("cmd-shift-t", NewTabInPane, None),
         // cmd-n opens a new top-level window (each with its own WorkspaceRoot).
         KeyBinding::new("cmd-n", NewWindow, None),
         // macOS strips `shift` and remaps the key to the shifted character

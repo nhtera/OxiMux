@@ -411,40 +411,10 @@ async fn tear_off_eligibility_blocks_multi_tab_and_multi_leaf(cx: &mut TestAppCo
 //
 // The tests above call handlers directly; these drive the PRODUCTION keymap
 // via `simulate_keystrokes`, so they also prove the binding itself is wired
-// (a regression that rebinds or drops cmd-shift-t / cmd-w would slip past a
-// direct-handler test but fail here). The bindings use a global (None)
-// context, and the action handlers sit on the PaneGroup root div — an
-// ancestor of the focused terminal view — so the action bubbles up to them.
-
-#[gpui::test]
-async fn keymap_cmd_shift_t_adds_per_pane_tab(cx: &mut TestAppContext) {
-    let (window, _dir) = make_group(cx);
-    // Install the production keymap so the keystroke routes for real.
-    cx.update(|cx| cx.bind_keys(default_key_bindings()));
-
-    // One terminal tab → one leaf with one per-pane tab; mounting focuses
-    // the terminal view (a descendant of the action-handling root div).
-    window
-        .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
-    cx.run_until_parked();
-
-    // Drive the real binding.
-    cx.simulate_keystrokes(window.into(), "cmd-shift-t");
-
-    cx.read(|app| {
-        let group = window.read(app).expect("PaneGroup alive");
-        let tab = group.active_tab().expect("active tab");
-        let PaneContent::Terminal(tree) = &tab.content else {
-            panic!("expected Terminal");
-        };
-        assert_eq!(
-            tree.active_leaf().expect("leaf").len(),
-            2,
-            "cmd-shift-t must add a per-pane tab through the keymap"
-        );
-    });
-}
+// (a regression that rebinds or drops cmd-w would slip past a direct-handler
+// test but fail here). The bindings use a global (None) context, and the
+// action handlers sit on the PaneGroup root div — an ancestor of the focused
+// terminal view — so the action bubbles up to them.
 
 #[gpui::test]
 async fn keymap_cmd_w_closes_per_pane_tab_first(cx: &mut TestAppContext) {

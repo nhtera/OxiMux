@@ -57,7 +57,7 @@ impl Default for Alphas {
     fn default() -> Self {
         Self {
             dim: 0.7,
-            unfocused: 0.85,
+            unfocused: 0.9,
             unfocused_cursor: 0.3,
         }
     }

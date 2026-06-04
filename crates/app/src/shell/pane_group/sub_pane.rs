@@ -108,13 +108,6 @@ impl LeafTabs {
         self.active
     }
 
-    /// Switch the active tab. No-op for out-of-range indices.
-    fn set_active(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
-            self.active = idx;
-        }
-    }
-
     /// Close the active tab. Returns `false` when it was the LAST tab
     /// (caller removes the whole leaf instead). On success the active
     /// index clamps to the previous tab.
@@ -329,15 +322,6 @@ impl TerminalSplitTree {
     ) -> Option<usize> {
         let leaf = self.panes.get_mut(self.active)?.as_mut()?;
         Some(leaf.push(new_view, new_observer))
-    }
-
-    /// Set the active TAB inside leaf `leaf_idx`, and make that leaf the
-    /// active sub-pane. No-op for closed/out-of-range leaves.
-    pub fn set_active_tab(&mut self, leaf_idx: usize, tab_idx: usize) {
-        if let Some(Some(leaf)) = self.panes.get_mut(leaf_idx) {
-            leaf.set_active(tab_idx);
-            self.active = leaf_idx;
-        }
     }
 
     /// Close the active TAB inside the active leaf. Returns `true` when a
