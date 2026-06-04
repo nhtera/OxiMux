@@ -24,8 +24,9 @@ use oximux_storage::{PaneBufferRepo, SettingsRepo};
 
 use crate::notifier::Notifier;
 use crate::persisted_terminals::{
-    PersistedAgentTab, PersistedTab, PersistedTabKind, PersistedTabs, WINDOWS_MANIFEST_KEY,
-    WindowsManifest, legacy_settings_key, settings_key,
+    PersistedAgentTab, PersistedAxis, PersistedSubPane, PersistedTab, PersistedTabKind,
+    PersistedTabs, PersistedTree, WINDOWS_MANIFEST_KEY, WindowsManifest, legacy_settings_key,
+    settings_key,
 };
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
@@ -33,7 +34,6 @@ use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{
     TerminalView, attach_pty_existing, relay_state_snapshot, spawn_local_pty,
-    spawn_local_pty_dormant,
 };
 use crate::workspace_root::WorkspaceRoot;
 
@@ -45,9 +45,19 @@ const DEFAULT_AGENT_ROWS: u16 = 32;
 /// with SGR runs.
 pub const PANE_BUFFER_MAX_BYTES: usize = 512 * 1024;
 
-/// Per-ordinal hint: "this leaf should attach to this surviving daemon
-/// PTY id instead of spawning fresh."
+/// Per-ordinal hint: "this tab should attach to this surviving daemon
+/// PTY id instead of spawning fresh." Used by the single-pane fast path,
+/// which only ever has one leaf/tab — its key is `(ordinal, 0, 0)`.
 pub type AttachHints = HashMap<u32, String>;
+
+/// Per-leaf-tab hint keyed `(ordinal, sub_pane, tab)`: "this split leaf /
+/// per-pane tab should re-attach to this surviving daemon PTY id instead
+/// of dormant-respawning." Drives the tree restore path.
+pub type LeafAttachHints = HashMap<(u32, u32, u32), String>;
+
+/// A persisted relay-id row: `(ordinal, sub_pane, tab, relay_pty_id,
+/// relay_session)` as returned by `PaneRelayIdRepo::get_all_for_project`.
+type RelayRow = (u32, u32, u32, String, String);
 
 /// F3.4 — per-sub-pane scrollback bytes keyed by `(tab_ordinal,
 /// sub_pane_ordinal)`. Replaces the pre-v4 flat `Vec<Vec<u8>>` so
@@ -56,20 +66,51 @@ pub type AttachHints = HashMap<u32, String>;
 /// migration), keeping single-sub-pane tabs identical to the old path.
 pub type PaneBuffersMap = HashMap<(u32, u32), Vec<u8>>;
 
-/// Pre-filter persisted (ordinal, relay_pty_id, relay_session) rows
-/// down to the ordinals that should re-attach.
+/// True when a persisted relay row still points at a live, same-session
+/// daemon PTY — i.e. it survived the restart and can be re-attached.
+fn relay_row_survives(
+    session: &str,
+    pty_id: &str,
+    live_external_ids: &HashSet<String>,
+    current_external_session: Option<&str>,
+) -> bool {
+    let session_ok = current_external_session.map(|s| s == session).unwrap_or(false);
+    session_ok && live_external_ids.contains(pty_id)
+}
+
+/// Pre-filter persisted relay rows down to the single-pane tabs (leaf 0,
+/// tab 0) that should re-attach, keyed by tab `ordinal`. Tree tabs use
+/// [`compute_leaf_attach_hints`] instead.
 pub fn compute_attach_hints(
-    pane_relay_ids: Vec<(u32, String, String)>,
+    pane_relay_ids: &[RelayRow],
     live_external_ids: &HashSet<String>,
     current_external_session: Option<&str>,
 ) -> AttachHints {
     pane_relay_ids
-        .into_iter()
-        .filter_map(|(ord, pty_id, session)| {
-            let session_ok = current_external_session
-                .map(|s| s == session)
-                .unwrap_or(false);
-            (session_ok && live_external_ids.contains(&pty_id)).then_some((ord, pty_id))
+        .iter()
+        .filter_map(|(ord, sub_pane, tab, pty_id, session)| {
+            (*sub_pane == 0
+                && *tab == 0
+                && relay_row_survives(session, pty_id, live_external_ids, current_external_session))
+            .then(|| (*ord, pty_id.clone()))
+        })
+        .collect()
+}
+
+/// Pre-filter persisted relay rows down to the surviving leaf-tabs that
+/// should re-attach, keyed `(ordinal, sub_pane, tab)`. Drives the tree
+/// restore path so split leaves / per-pane tabs adopt their live daemon
+/// PTYs instead of dormant-respawning.
+pub fn compute_leaf_attach_hints(
+    pane_relay_ids: &[RelayRow],
+    live_external_ids: &HashSet<String>,
+    current_external_session: Option<&str>,
+) -> LeafAttachHints {
+    pane_relay_ids
+        .iter()
+        .filter_map(|(ord, sub_pane, tab, pty_id, session)| {
+            relay_row_survives(session, pty_id, live_external_ids, current_external_session)
+                .then(|| ((*ord, *sub_pane, *tab), pty_id.clone()))
         })
         .collect()
 }
@@ -80,6 +121,7 @@ pub(crate) fn build_project_panes(
     snapshot: Option<PersistedTabs>,
     pane_buffers: PaneBuffersMap,
     attach_hints: AttachHints,
+    leaf_attach_hints: LeafAttachHints,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -119,6 +161,7 @@ pub(crate) fn build_project_panes(
             &tree,
             pane_buffers,
             attach_hints,
+            leaf_attach_hints,
             cwd,
             theme,
             density,
@@ -184,6 +227,7 @@ pub(crate) fn build_project_panes(
                         tab,
                         ordinal,
                         &mut pane_buffers,
+                        &leaf_attach_hints,
                         cwd.clone(),
                         theme,
                         density,
@@ -241,6 +285,7 @@ fn restore_multi_group(
     tree: &crate::persisted_terminals::PersistedTree,
     pane_buffers: PaneBuffersMap,
     attach_hints: AttachHints,
+    leaf_attach_hints: LeafAttachHints,
     cwd: PathBuf,
     theme: Theme,
     density: Density,
@@ -313,6 +358,7 @@ fn restore_multi_group(
                             tab,
                             ordinal,
                             &mut pane_buffers,
+                            &leaf_attach_hints,
                             cwd.clone(),
                             theme,
                             density,
@@ -540,11 +586,115 @@ fn needs_tree_restore(tab: &PersistedTab) -> bool {
     tab.sub_panes.len() > 1 || tab.sub_panes.iter().any(|sp| sp.tabs.len() > 1)
 }
 
+/// One terminal per pane (single-terminal-per-pane model): expand any persisted leaf that held
+/// more than one terminal (a legacy per-pane tab strip) into a horizontal
+/// split of single-terminal leaves. Leaves that already hold one terminal
+/// pass through unchanged, so a fully-migrated snapshot round-trips
+/// untouched (idempotent — safe to run on every restore). Returns the
+/// rewritten layout tree, the flattened one-terminal-per-leaf list (DFS
+/// order), and the remapped active-leaf DFS position.
+fn promote_per_pane_tabs(
+    tree: &PersistedTree,
+    sub_panes: &[PersistedSubPane],
+    active_sub_pane: usize,
+) -> (PersistedTree, Vec<PersistedSubPane>, usize) {
+    fn single(cwd: Option<String>, surface_id: String, tab_id: String) -> PersistedSubPane {
+        PersistedSubPane {
+            cwd,
+            surface_id,
+            tab_id,
+            tabs: Vec::new(),
+            active_tab: 0,
+        }
+    }
+    fn walk(
+        node: &PersistedTree,
+        sub_panes: &[PersistedSubPane],
+        next_old_leaf: &mut usize,
+        out: &mut Vec<PersistedSubPane>,
+        active_old_leaf: usize,
+        active_new_pos: &mut Option<usize>,
+    ) -> PersistedTree {
+        match node {
+            PersistedTree::Leaf => {
+                let old_idx = *next_old_leaf;
+                *next_old_leaf += 1;
+                let sp = sub_panes.get(old_idx).cloned().unwrap_or_default();
+                // Empty `tabs` = one implicit terminal carried by the leaf's
+                // top-level fields; otherwise one terminal per per-pane tab.
+                let terminals: Vec<PersistedSubPane> = if sp.tabs.is_empty() {
+                    vec![single(sp.cwd.clone(), sp.surface_id.clone(), sp.tab_id.clone())]
+                } else {
+                    sp.tabs
+                        .iter()
+                        .map(|t| single(t.cwd.clone(), t.surface_id.clone(), t.tab_id.clone()))
+                        .collect()
+                };
+                let base = out.len();
+                if old_idx == active_old_leaf {
+                    let at = if sp.tabs.is_empty() {
+                        0
+                    } else {
+                        sp.active_tab.min(terminals.len().saturating_sub(1))
+                    };
+                    *active_new_pos = Some(base + at);
+                }
+                let n = terminals.len();
+                out.extend(terminals);
+                if n <= 1 {
+                    PersistedTree::Leaf
+                } else {
+                    PersistedTree::Split {
+                        axis: PersistedAxis::Horizontal,
+                        children: (0..n).map(|_| PersistedTree::Leaf).collect(),
+                        weights: vec![1.0 / n as f32; n],
+                    }
+                }
+            }
+            PersistedTree::Split {
+                axis,
+                children,
+                weights,
+            } => PersistedTree::Split {
+                axis: *axis,
+                children: children
+                    .iter()
+                    .map(|c| {
+                        walk(
+                            c,
+                            sub_panes,
+                            next_old_leaf,
+                            out,
+                            active_old_leaf,
+                            active_new_pos,
+                        )
+                    })
+                    .collect(),
+                weights: weights.clone(),
+            },
+        }
+    }
+    let mut out = Vec::with_capacity(sub_panes.len());
+    let mut next_old_leaf = 0usize;
+    let mut active_new_pos = None;
+    let new_tree = walk(
+        tree,
+        sub_panes,
+        &mut next_old_leaf,
+        &mut out,
+        active_sub_pane,
+        &mut active_new_pos,
+    );
+    let active = active_new_pos.unwrap_or(0).min(out.len().saturating_sub(1));
+    (new_tree, out, active)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_multi_sub_pane_tree(
     tab: &PersistedTab,
     tab_ordinal: u32,
     pane_buffers: &mut PaneBuffersMap,
+    leaf_attach_hints: &LeafAttachHints,
     project_cwd: PathBuf,
     theme: Theme,
     density: Density,
@@ -553,8 +703,13 @@ fn build_multi_sub_pane_tree(
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<TerminalSplitTree> {
     type LeafSpec = (Vec<(Entity<TerminalView>, gpui::Subscription)>, usize);
-    let mut leaves: Vec<LeafSpec> = Vec::with_capacity(tab.sub_panes.len());
-    for (sub_pane_ordinal, sp) in tab.sub_panes.iter().enumerate() {
+    // single-terminal-per-pane model: one terminal per pane. Expand any legacy per-pane tab
+    // strip into split leaves before building views, so each pane carries a
+    // single terminal. Idempotent for already-single-terminal snapshots.
+    let (tree, sub_panes, active_sub_pane) =
+        promote_per_pane_tabs(&tab.tree, &tab.sub_panes, tab.active_sub_pane);
+    let mut leaves: Vec<LeafSpec> = Vec::with_capacity(sub_panes.len());
+    for (sub_pane_ordinal, sp) in sub_panes.iter().enumerate() {
         // A leaf's tabs come from its explicit `tabs` list (per-pane tab
         // strip), or — for legacy / single-tab leaves — a single tab built
         // from the top-level cwd/surface_id/tab_id fields.
@@ -567,40 +722,47 @@ fn build_multi_sub_pane_tree(
                 .collect()
         };
         let active_tab = sp.active_tab.min(leaf_tabs.len().saturating_sub(1));
-        // Only the leaf's ACTIVE tab inherits the captured scrollback
-        // (buffers are keyed per leaf, not per per-pane tab — finer-grained
-        // scrollback capture is a follow-up); other tabs start empty.
-        let active_prefill = pane_buffers
-            .remove(&(tab_ordinal, sub_pane_ordinal as u32))
-            .unwrap_or_default();
+        // Cold restore no longer replays a serialized grid — same rationale
+        // as the single-pane path: a saved grid reflows to the new pane size
+        // and scrambles full-screen TUIs, so content comes only from a live
+        // daemon re-attach. Drain the captured buffer so it doesn't linger.
+        let _ = pane_buffers.remove(&(tab_ordinal, sub_pane_ordinal as u32));
         let mut tab_views: Vec<(Entity<TerminalView>, gpui::Subscription)> =
             Vec::with_capacity(leaf_tabs.len());
         for (ti, (cwd_opt, surface_id, tab_id)) in leaf_tabs.into_iter().enumerate() {
             let leaf_cwd = resolve_cwd(cwd_opt.as_deref(), &project_cwd);
-            // F3.4 slice 2: spawn each tab DORMANT (grid emulator, no PTY
-            // child). First focus-in/keystroke wakes it via respawn.
-            let Some((backend, session_id)) = spawn_local_pty_dormant(80, 24) else {
-                tracing::warn!(label = %tab.label, "sub-pane spawn_dormant failed; dropping tab");
-                return None;
-            };
             let ids = SurfaceIds::restored(
                 project_cwd.to_string_lossy().into_owned(),
                 surface_id,
                 tab_id,
             );
-            let empty: Vec<u8> = Vec::new();
-            let prefill: &[u8] = if ti == active_tab {
-                &active_prefill
-            } else {
-                &empty
+            // Warm re-attach: if this leaf-tab's relay PTY survived the
+            // restart (same session, still live), adopt the running shell so
+            // the live tail + scrollback resume in place. Otherwise COLD
+            // restore via `spawn_local_pty`, which spawns through the relay
+            // when it's reachable (daemon-backed → survives the next quit and
+            // re-attaches on the launch after) and only falls back to an
+            // in-process PTY if the daemon is down. The fresh shell carries
+            // its OXIMUX_* env via `ids.env()`. Either way no dormant grid is
+            // built, so nothing probes the relay's unsupported dormant path.
+            let reattached = leaf_attach_hints
+                .get(&(tab_ordinal, sub_pane_ordinal as u32, ti as u32))
+                .and_then(|pty_id| attach_pty_existing(pty_id));
+            let (backend, session_id) = match reattached {
+                Some(pair) => pair,
+                None => {
+                    let Some(pair) = spawn_local_pty(leaf_cwd, ids.env()) else {
+                        tracing::warn!(label = %tab.label, "sub-pane cold spawn failed; dropping tab");
+                        return None;
+                    };
+                    pair
+                }
             };
             let view = cx.new(|cx| {
-                TerminalView::mount_dormant(
+                TerminalView::mount_background(
                     backend,
                     session_id,
                     ids,
-                    leaf_cwd,
-                    prefill,
                     theme,
                     density,
                     typography.clone(),
@@ -614,9 +776,9 @@ fn build_multi_sub_pane_tree(
         leaves.push((tab_views, active_tab));
     }
     Some(TerminalSplitTree::from_persisted(
-        &tab.tree,
+        &tree,
         leaves,
-        tab.active_sub_pane,
+        active_sub_pane,
     ))
 }
 
@@ -873,6 +1035,74 @@ mod tests {
         assert!(needs_tree_restore(&tab));
     }
 
+    // ── promote_per_pane_tabs: legacy per-pane tabs → split panes ───────────
+
+    fn leaf_tab(surface: &str, tab: &str) -> PersistedLeafTab {
+        PersistedLeafTab {
+            cwd: None,
+            surface_id: surface.into(),
+            tab_id: tab.into(),
+        }
+    }
+
+    #[test]
+    fn promote_single_tab_leaf_is_noop() {
+        // A single-terminal leaf round-trips unchanged — promotion is safe to
+        // run on every restore.
+        let sub_panes = vec![leaf_sub_pane("s0", "t0")];
+        let (tree, out, active) = promote_per_pane_tabs(&PersistedTree::Leaf, &sub_panes, 0);
+        assert!(matches!(tree, PersistedTree::Leaf));
+        assert_eq!(out.len(), 1);
+        assert_eq!(active, 0);
+        assert_eq!(out[0].surface_id, "s0");
+        assert!(out[0].tabs.is_empty());
+    }
+
+    #[test]
+    fn promote_multi_tab_leaf_becomes_split() {
+        // One leaf holding 2 per-pane tabs → a horizontal split of 2
+        // single-terminal leaves; the active tab maps to the active leaf.
+        let mut sp = leaf_sub_pane("s0", "t0");
+        sp.tabs = vec![leaf_tab("s0", "t0"), leaf_tab("s1", "t1")];
+        sp.active_tab = 1;
+        let (tree, out, active) = promote_per_pane_tabs(&PersistedTree::Leaf, &[sp], 0);
+        match tree {
+            PersistedTree::Split { children, .. } => assert_eq!(children.len(), 2),
+            PersistedTree::Leaf => panic!("multi-tab leaf must become a split"),
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].surface_id, "s0");
+        assert_eq!(out[1].surface_id, "s1");
+        assert!(out.iter().all(|sp| sp.tabs.is_empty()));
+        assert_eq!(active, 1, "active per-pane tab maps to the new active leaf");
+    }
+
+    #[test]
+    fn promote_mixed_split_expands_only_multi_tab_leaf() {
+        // Split[ leaf(1 tab), leaf(2 tabs) ] → Split[ Leaf, Split[Leaf,Leaf] ]
+        // with 3 single-terminal leaves total. Active leaf index shifts past
+        // the expanded sibling.
+        let mut multi = leaf_sub_pane("s1", "t1");
+        multi.tabs = vec![leaf_tab("s1", "t1"), leaf_tab("s2", "t2")];
+        let sub_panes = vec![leaf_sub_pane("s0", "t0"), multi];
+        let tree = PersistedTree::Split {
+            axis: PersistedAxis::Vertical,
+            children: vec![PersistedTree::Leaf, PersistedTree::Leaf],
+            weights: vec![0.5, 0.5],
+        };
+        // Active was the second (multi-tab) leaf, its tab 0.
+        let (new_tree, out, active) = promote_per_pane_tabs(&tree, &sub_panes, 1);
+        assert_eq!(out.len(), 3);
+        let PersistedTree::Split { children, .. } = &new_tree else {
+            panic!("root stays a split");
+        };
+        assert!(matches!(children[0], PersistedTree::Leaf));
+        assert!(
+            matches!(&children[1], PersistedTree::Split { children, .. } if children.len() == 2)
+        );
+        assert_eq!(active, 1, "first terminal of the expanded leaf is at index 1");
+    }
+
     #[test]
     fn resolve_cwd_keeps_existing_dir() {
         // The crate manifest dir is guaranteed to exist on disk.
@@ -930,18 +1160,23 @@ mod tests {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Build a persisted relay row `(ordinal, sub_pane, tab, pty, session)`.
+    fn row(ord: u32, sub_pane: u32, tab: u32, pty: &str, session: &str) -> RelayRow {
+        (ord, sub_pane, tab, pty.to_string(), session.to_string())
+    }
+
     #[test]
     fn attach_hints_keeps_live_survivor_with_matching_session() {
-        let persisted = vec![(0u32, "pty-A".to_string(), "sess-1".to_string())];
-        let hints = compute_attach_hints(persisted, &live_set(&["pty-A"]), Some("sess-1"));
+        let persisted = vec![row(0, 0, 0, "pty-A", "sess-1")];
+        let hints = compute_attach_hints(&persisted, &live_set(&["pty-A"]), Some("sess-1"));
         assert_eq!(hints.get(&0).map(String::as_str), Some("pty-A"));
     }
 
     #[test]
     fn attach_hints_drops_dead_pty() {
         // Session matches, but the daemon no longer lists this pty → respawn.
-        let persisted = vec![(0u32, "pty-A".to_string(), "sess-1".to_string())];
-        let hints = compute_attach_hints(persisted, &live_set(&[]), Some("sess-1"));
+        let persisted = vec![row(0, 0, 0, "pty-A", "sess-1")];
+        let hints = compute_attach_hints(&persisted, &live_set(&[]), Some("sess-1"));
         assert!(
             hints.is_empty(),
             "a dead pty must not yield a reattach hint"
@@ -953,26 +1188,26 @@ mod tests {
         // The id is live but belongs to a DIFFERENT daemon session (the relay
         // restarted): the match is coincidental, so respawn rather than bind
         // to an unrelated process.
-        let persisted = vec![(0u32, "pty-A".to_string(), "old-sess".to_string())];
-        let hints = compute_attach_hints(persisted, &live_set(&["pty-A"]), Some("new-sess"));
+        let persisted = vec![row(0, 0, 0, "pty-A", "old-sess")];
+        let hints = compute_attach_hints(&persisted, &live_set(&["pty-A"]), Some("new-sess"));
         assert!(hints.is_empty(), "a session mismatch must block reattach");
     }
 
     #[test]
     fn attach_hints_empty_when_no_current_session() {
-        let persisted = vec![(0u32, "pty-A".to_string(), "sess-1".to_string())];
-        let hints = compute_attach_hints(persisted, &live_set(&["pty-A"]), None);
+        let persisted = vec![row(0, 0, 0, "pty-A", "sess-1")];
+        let hints = compute_attach_hints(&persisted, &live_set(&["pty-A"]), None);
         assert!(hints.is_empty(), "no current session → nothing to reattach");
     }
 
     #[test]
     fn attach_hints_filters_mixed_set_to_live_survivors() {
         let persisted = vec![
-            (0u32, "pty-A".to_string(), "sess-1".to_string()), // live + match → keep
-            (1u32, "pty-B".to_string(), "sess-1".to_string()), // dead → drop
-            (2u32, "pty-C".to_string(), "other".to_string()),  // wrong session → drop
+            row(0, 0, 0, "pty-A", "sess-1"), // live + match → keep
+            row(1, 0, 0, "pty-B", "sess-1"), // dead → drop
+            row(2, 0, 0, "pty-C", "other"),  // wrong session → drop
         ];
-        let hints = compute_attach_hints(persisted, &live_set(&["pty-A", "pty-C"]), Some("sess-1"));
+        let hints = compute_attach_hints(&persisted, &live_set(&["pty-A", "pty-C"]), Some("sess-1"));
         assert_eq!(
             hints.len(),
             1,
@@ -981,5 +1216,53 @@ mod tests {
         assert_eq!(hints.get(&0).map(String::as_str), Some("pty-A"));
         assert!(!hints.contains_key(&1), "dead pty-B dropped");
         assert!(!hints.contains_key(&2), "wrong-session pty-C dropped");
+    }
+
+    #[test]
+    fn attach_hints_ignores_non_leaf_zero_rows() {
+        // The single-pane fast path only wants leaf 0 / tab 0 rows. A split
+        // leaf's row (sub_pane 1) must NOT leak into the ordinal-keyed map —
+        // that tab restores via the tree path instead.
+        let persisted = vec![
+            row(0, 0, 0, "pty-main", "sess-1"),
+            row(0, 1, 0, "pty-split", "sess-1"),
+        ];
+        let hints =
+            compute_attach_hints(&persisted, &live_set(&["pty-main", "pty-split"]), Some("sess-1"));
+        assert_eq!(hints.len(), 1, "only the (0,0,0) row maps to the ordinal");
+        assert_eq!(hints.get(&0).map(String::as_str), Some("pty-main"));
+    }
+
+    // ── compute_leaf_attach_hints: per-leaf-tab reattach for the tree path ──
+
+    #[test]
+    fn leaf_hints_key_each_surviving_leaf_tab() {
+        // A split tab (ordinal 0) with two leaves; leaf 1 has two per-pane
+        // tabs. Each live + session-matched leaf-tab keys its own hint.
+        let persisted = vec![
+            row(0, 0, 0, "pty-l0", "sess-1"),
+            row(0, 1, 0, "pty-l1t0", "sess-1"),
+            row(0, 1, 1, "pty-l1t1", "sess-1"),
+        ];
+        let live = live_set(&["pty-l0", "pty-l1t0", "pty-l1t1"]);
+        let hints = compute_leaf_attach_hints(&persisted, &live, Some("sess-1"));
+        assert_eq!(hints.len(), 3);
+        assert_eq!(hints.get(&(0, 0, 0)).map(String::as_str), Some("pty-l0"));
+        assert_eq!(hints.get(&(0, 1, 0)).map(String::as_str), Some("pty-l1t0"));
+        assert_eq!(hints.get(&(0, 1, 1)).map(String::as_str), Some("pty-l1t1"));
+    }
+
+    #[test]
+    fn leaf_hints_drop_dead_and_stale_session_per_tab() {
+        // Same session/live gate as the single-pane path, applied per leaf-tab:
+        // a dead pty and a wrong-session pty both drop; the live one survives.
+        let persisted = vec![
+            row(0, 0, 0, "pty-live", "sess-1"), // keep
+            row(0, 1, 0, "pty-dead", "sess-1"), // dead → drop
+            row(0, 1, 1, "pty-old", "old-sess"), // wrong session → drop
+        ];
+        let hints = compute_leaf_attach_hints(&persisted, &live_set(&["pty-live"]), Some("sess-1"));
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints.get(&(0, 0, 0)).map(String::as_str), Some("pty-live"));
     }
 }

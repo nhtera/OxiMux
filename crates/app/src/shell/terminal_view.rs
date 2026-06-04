@@ -409,10 +409,11 @@ impl TerminalView {
     pub fn set_opener(&mut self, opener: WeakEntity<PaneGroup>) {
         self.opener = Some(opener);
     }
-    /// Build a view around an already-spawned backend + session. The spawn
-    /// is done outside `cx.new` because the entity builder closure is
-    /// infallible; this keeps spawn errors at the caller where they can be
-    /// logged + fall back to a placeholder.
+    /// Build a view around an already-spawned backend + session, grabbing
+    /// focus so the user can type immediately. Use for interactive spawns
+    /// (new tab, live split). Restore paths use [`mount_background`] instead
+    /// so re-creating many panes doesn't ping-pong focus before the restore
+    /// orchestrator focuses the active one.
     #[allow(clippy::too_many_arguments)]
     pub fn mount(
         backend: SharedBackend,
@@ -421,6 +422,47 @@ impl TerminalView {
         theme: Theme,
         density: Density,
         typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::mount_inner(
+            backend, session_id, ids, theme, density, typography, true, window, cx,
+        )
+    }
+
+    /// Like [`mount`](Self::mount) but does NOT grab focus on construction.
+    /// Restore builds every split leaf with this so N panes don't each fire
+    /// a focus transition; the restore orchestrator (`focus_active`) sets the
+    /// final focus once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mount_background(
+        backend: SharedBackend,
+        session_id: TerminalSessionId,
+        ids: SurfaceIds,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::mount_inner(
+            backend, session_id, ids, theme, density, typography, false, window, cx,
+        )
+    }
+
+    /// The spawn is done outside `cx.new` because the entity builder closure
+    /// is infallible; this keeps spawn errors at the caller where they can be
+    /// logged + fall back to a placeholder. `grab_focus` gates the initial
+    /// `focus()` so restore can build panes without stealing focus.
+    #[allow(clippy::too_many_arguments)]
+    fn mount_inner(
+        backend: SharedBackend,
+        session_id: TerminalSessionId,
+        ids: SurfaceIds,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        grab_focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -455,8 +497,12 @@ impl TerminalView {
         .detach();
         // Grab focus on mount so the user can type into the shell immediately
         // without first clicking. Without this the window opens with no focus
-        // owner and keystrokes are dropped until the first click.
-        focus_handle.focus(window, cx);
+        // owner and keystrokes are dropped until the first click. Restore
+        // skips this (`grab_focus == false`) so building many split leaves
+        // doesn't ping-pong focus before `focus_active` sets it once.
+        if grab_focus {
+            focus_handle.focus(window, cx);
+        }
 
         let poll_task = Self::start_poll_task(cx);
         let blink_task = Self::start_blink_task(cx);

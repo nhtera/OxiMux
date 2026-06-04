@@ -50,8 +50,11 @@ pub struct Migration {
 /// drops the FK on `worktree_settings.workspace_id`: the SCM panel
 /// uses a worktree filesystem path as the key, not a `workspaces.id`
 /// UUID, so the FK was always violated on a freshly-opened project
-/// with no workspace row. Future migrations append; never reorder,
-/// never rewrite.
+/// with no workspace row. V008 widens the `pane_relay_ids` primary key
+/// with `sub_pane` + `tab` so every split leaf / per-pane tab persists
+/// its own relay PTY id and re-attaches independently across restart;
+/// legacy rows copy forward with sub_pane=0, tab=0. Future migrations
+/// append; never reorder, never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -87,6 +90,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "worktree_settings_drop_fk",
         sql: include_str!("../migrations/V007__worktree_settings_drop_fk.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "pane_relay_ids_leaf_key",
+        sql: include_str!("../migrations/V008__pane_relay_ids_leaf_key.sql"),
     },
 ];
 

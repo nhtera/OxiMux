@@ -19,7 +19,8 @@ use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::{ProjectRepo, StorageError, WorkspaceRepo};
 
 use crate::project_panes_factory::{
-    build_project_panes, compute_attach_hints, load_persisted_tabs, save_persisted_tabs,
+    build_project_panes, compute_attach_hints, compute_leaf_attach_hints, load_persisted_tabs,
+    save_persisted_tabs,
 };
 use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
@@ -322,7 +323,12 @@ impl WorkspaceRoot {
                 });
             let relay_snap = crate::shell::terminal_view::relay_state_snapshot();
             let attach_hints = compute_attach_hints(
-                pane_relay_ids,
+                &pane_relay_ids,
+                &relay_snap.live_external_ids,
+                relay_snap.session_id.as_deref(),
+            );
+            let leaf_attach_hints = compute_leaf_attach_hints(
+                &pane_relay_ids,
                 &relay_snap.live_external_ids,
                 relay_snap.session_id.as_deref(),
             );
@@ -331,6 +337,7 @@ impl WorkspaceRoot {
                 snapshot,
                 pane_buffers,
                 attach_hints,
+                leaf_attach_hints,
                 theme,
                 density,
                 typography,

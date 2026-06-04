@@ -1434,27 +1434,42 @@ impl ProjectPanes {
                 let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content else {
                     continue;
                 };
-                // One relay id per group tab (the active leaf's active
-                // view), keyed by tab ordinal. Split leaves and background
-                // per-pane tabs aren't individually keyed here — those tabs
-                // restore via the dormant tree path (no relay reattach), and
-                // any background PTYs left alive on quit are reaped by the
-                // daemon's idle-gc. Per-tab relay reattach would need an
-                // (ordinal, sub_pane, tab) key — a future enhancement.
-                let Some(view) = tree.active_view() else {
-                    continue;
-                };
-                if let Some(pty_id) = view.read(cx).external_id()
-                    && let Err(err) =
-                        repo.set(project_id, window_id, ordinal, &pty_id, relay_session_id)
-                {
-                    tracing::warn!(
-                        ?err,
-                        project_id,
-                        window_id,
-                        ordinal,
-                        "pane_relay_ids: set failed"
-                    );
+                // Persist a relay id for EVERY live leaf-tab, keyed
+                // (ordinal, sub_pane, tab), so split leaves and background
+                // per-pane tabs re-attach their surviving daemon PTYs
+                // independently on the next launch instead of dormant-
+                // respawning. `sub_pane` is the leaf's DFS position (same
+                // order `snapshot_sub_pane_tree` and `pane_buffers` use);
+                // `tab` is its per-pane tab index. Views with no relay id
+                // (in-process backend) are skipped — those leaves still
+                // dormant-respawn, unchanged.
+                for (sub_pane, slot) in tree.tree().in_order_leaves().into_iter().enumerate() {
+                    let Some(leaf) = tree.leaf(slot) else {
+                        continue;
+                    };
+                    for (tab_idx, lt) in leaf.tabs().iter().enumerate() {
+                        if let Some(pty_id) = lt.view().read(cx).external_id()
+                            && let Err(err) = repo.set(
+                                project_id,
+                                window_id,
+                                ordinal,
+                                sub_pane as u32,
+                                tab_idx as u32,
+                                &pty_id,
+                                relay_session_id,
+                            )
+                        {
+                            tracing::warn!(
+                                ?err,
+                                project_id,
+                                window_id,
+                                ordinal,
+                                sub_pane,
+                                tab_idx,
+                                "pane_relay_ids: set failed"
+                            );
+                        }
+                    }
                 }
                 ordinal += 1;
             }
