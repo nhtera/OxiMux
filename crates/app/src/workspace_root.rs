@@ -1592,6 +1592,7 @@ impl Render for WorkspaceRoot {
                 right_open,
                 None, // tab strip lives in its own row below — not in center_header
                 center_right_tabs,
+                has_tabs, // suppress header bottom border when the tab strip renders below
                 theme,
                 density,
                 typography,
@@ -1646,7 +1647,6 @@ impl Render for WorkspaceRoot {
         if let Some(col) = right_column {
             row = row.child(col);
         }
-        let _ = has_tabs;
 
         div()
             .track_focus(&self.focus_handle)

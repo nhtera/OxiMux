@@ -40,7 +40,7 @@ const ICON_SIZE: f32 = 16.0;
 /// draws macOS traffic lights centered at y=19 over the
 /// `TRAFFIC_LIGHT_GUTTER`, so the two visually align on a single row.
 pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
-    chrome_strip(theme, density).child(left_chrome_cluster(true, theme, typography))
+    chrome_strip(theme, density, true).child(left_chrome_cluster(true, theme, typography))
 }
 
 /// Header strip for the center column. Hosts any chrome bits whose
@@ -53,11 +53,15 @@ pub fn center_header(
     right_open: bool,
     center_zone: Option<AnyElement>,
     right_tabs: Option<AnyElement>,
+    // When the center column has a tab strip directly below this header,
+    // suppress the header's bottom border so the two don't stack into a
+    // doubled hairline — the tab strip owns the single separator.
+    has_tabs: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
-    let mut row = chrome_strip(theme, density);
+    let mut row = chrome_strip(theme, density, !has_tabs);
     if !left_open {
         // Left rail is collapsed — host the chrome cluster (toggle now uses
         // the "open" icon since clicking it expands the rail).
@@ -82,19 +86,25 @@ pub fn right_header(
     theme: Theme,
     density: Density,
 ) -> impl IntoElement {
-    chrome_strip(theme, density).child(right_chrome_cluster(true, right_tabs, theme))
+    chrome_strip(theme, density, true).child(right_chrome_cluster(true, right_tabs, theme))
 }
 
-fn chrome_strip(theme: Theme, density: Density) -> Div {
-    div()
+fn chrome_strip(theme: Theme, density: Density, bottom_border: bool) -> Div {
+    let mut strip = div()
         .flex()
         .flex_row()
         .items_center()
         .w_full()
         .h(px(density.h_top_bar))
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border_inactive)
+        .bg(theme.bg_panel);
+    // The center column suppresses this border when a tab strip renders
+    // directly below it — the tab strip owns the single separator, so a
+    // border here would double the hairline. Side columns (no tab strip
+    // below) keep it.
+    if bottom_border {
+        strip = strip.border_b_1().border_color(theme.border_inactive);
+    }
+    strip
         // Double-click on the chrome row → toggle window Zoom (the green
         // traffic-light action). With `appears_transparent: true` we paint
         // our own bar over the macOS title bar, which can suppress the
