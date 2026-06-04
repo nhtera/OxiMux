@@ -534,11 +534,12 @@ impl Render for CommitGraph {
             // the existing list painted. Reads `graph_height` (Phase 13)
             // so a user who shrank the section before quitting doesn't
             // see a tall placeholder on next launch.
-            GraphState::Loading => loading_placeholder_sized(
+            GraphState::Loading => placeholder_sized(
                 "Loading commits…",
                 f32::from(self.graph_height),
                 theme,
                 density,
+                typography,
             )
             .into_any_element(),
             GraphState::Failed(e) => {
@@ -719,34 +720,6 @@ fn placeholder(
     typography: &Typography,
 ) -> impl IntoElement {
     placeholder_sized(msg, 80.0, theme, density, typography)
-}
-
-/// Loading variant of [`placeholder_sized`]: the same height-matched
-/// placeholder prefixed with the shared rotating spinner so the
-/// initial-load arm reads as active work. Only the `Loading` state uses
-/// it — "No commits yet" and the `git log failed` arm stay static (a
-/// spinner there would imply a fetch is still running).
-fn loading_placeholder_sized(
-    msg: &str,
-    height_px: f32,
-    theme: Theme,
-    density: Density,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_center()
-        .gap(px(6.0))
-        .p(px(density.pad_panel))
-        .h(px(height_px))
-        .text_size(px(sc_style::BODY_TEXT))
-        .text_color(theme.fg_subtle)
-        .child(crate::ui::spinning_loader(
-            "graph-loading-spinner",
-            theme.fg_muted,
-        ))
-        .child(msg.to_string())
 }
 
 /// Variant of `placeholder` with a caller-controlled height. Used by the
