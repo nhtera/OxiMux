@@ -1,7 +1,7 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-05-29  
-**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete  
+**Updated**: 2026-06-05  
+**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete; left-rail rich worktree cards + live diff counts shipped  
 **Tests**: 375 app lib tests + storage/relay/relay-client/pty, 0 failures
 
 ---
@@ -40,6 +40,10 @@ src/
 │                           left_rail: Entity<LeftRail>; left_rail_open: bool (Cmd+B)
 │                           palette: Entity<PaletteModal> (Cmd+P / Cmd+Shift+P)
 │                           poll_state mirrored from RightSidebar for status bar
+│                           diff_counts: HashMap<PathBuf, NumstatCounts> — per-worktree
+│                             working-tree diff counts; refreshed by run_diff_refresh_round
+│                             (2s periodic, focus-gated, concurrent git diff --numstat
+│                             per worktree off-thread; pauses while window is unfocused)
 ├── window_registry.rs      WindowRegistry GPUI global — holds RegisteredWindow list (strong
 │                           Entity<WorkspaceRoot> + stable persist_id per window); mints
 │                           "main"/"w{n}" ids; PendingTearOff queue for cross-window tear-off;
@@ -49,15 +53,31 @@ src/
 │                           registers window in WindowRegistry; last-window quit gate
 └── shell/
     ├── mod.rs
+    ├── agent_presentation.rs AgentVerb struct + agent_verb() — single source of truth mapping
+    │                       AgentStatus + is_live flag to verb label + status-token color;
+    │                       used by both the left-rail dot and the rich card line 2
     ├── top_bar.rs          40px chrome: 56px traffic-light gutter + L/R panel toggles + wordmark
     ├── left_rail/          250px workspace + nav rail (replaces old sidebar stub)
-    │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state
+    │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state; snapshots diff_counts
     │   ├── nav_section.rs  NavItem (Tasks/Automations/Agents/Search) + pure bg/fg helpers
-    │   ├── workspace_list_render.rs  build_workspace_row_plan (pure) + render
+    │   ├── workspace_row.rs WorkspaceCardPlan + build_workspace_card_plan (pure) + sum_numstat;
+    │   │                   status_dot_color delegates to agent_verb for color parity
+    │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
+    │   │                   CARD_HEIGHT_MULT = 2.2 × h_row (design-guidelines approved exception)
+    │   ├── project_group.rs renders project groups; threads diff_counts snapshot into card builder
     │   └── toolbar.rs      Add Project + settings (stubs)
-    ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay
-    │   ├── mod.rs          PaletteModal entity (open/close/mode/query state)
-    │   ├── entry.rs        PALETTE_COMMANDS (11 actions, fn-ptr factories) + QUICK_OPEN_STUBS
+    ├── agents_dashboard/   all-agents view rendered when the Agents nav item is active
+    │   ├── model.rs        pure: AgentRow, attention_rank, sort_agent_rows, build_agent_rows,
+    │   │                   widest_row_index — assembled from LeftRail's pushed-down snapshot
+    │   ├── row_render.rs   single-row painter (project · branch · name · verb · diff)
+    │   └── mod.rs          render_agents_dashboard — virtualized uniform_list + empty state;
+    │                       row click → activate_workspace (cross-project focus)
+    ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay (interactive: type-to-filter,
+    │   │                   ↑/↓ nav, Enter/click dispatch, Esc close — mirrors project_picker)
+    │   ├── mod.rs          PaletteModal entity; activate_item (dispatch + close) shared by
+    │   │                   click + Enter; holds loaded custom commands; palette_filter (pure)
+    │   ├── entry.rs        PALETTE_COMMANDS fn-ptr catalog + PaletteItem/PaletteItemAction
+    │   │                   (Builtin fn | Custom prompt) + build_palette_items (merges customs)
     │   ├── match_engine.rs pure scorer: prefix > consecutive > subsequence (no external crate)
     │   └── palette_modal.rs pure render: card + header chip + result list
     ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)
@@ -69,7 +89,9 @@ src/
     ├── tabbed_pane.rs      TabbedPane entity: tab strip + active terminal
     ├── main_area.rs        thin dispatcher → welcome_view::view
     ├── status_bar.rs       left | center git zone | right metric strip (N TTY | N agents | N panes)
-    │                       pure helpers: tty_label / agent_label / pane_label / metric_color
+    │                       pure helpers: tty_label / agent_label / pane_label / metric_color;
+    │                       git zone mounts the SCM panel's cached PrimaryAction as a one-click
+    │                       smart button (click → SourceControlPanel::trigger_primary_action)
     ├── terminal_view.rs    TerminalView GPUI entity; poll task; blink; focus;
     │                       last_completed_command_output (P8 mark bracket → snapshot
     │                       rows_text band); send-to-agent action handlers dispatch
@@ -140,6 +162,8 @@ src/
     │   ├── mod.rs          StashPanel entity; refresh/apply/pop/request_drop
     │   └── list_render.rs  pure row label helper
     ├── pane_group/
+    │   ├── layout_presets.rs pure apply_preset(tree, Preset) → stacked / horizontal / bottom-terminal
+    │   │                   reshape over PaneTree (rebuilds from leaves; content preserved)
     │   ├── mod.rs          pane group tree entity
     │   ├── sub_pane.rs     TerminalSplitTree; each split leaf is a LeafTabs tab container;
     │   │                   compact chip strip (chips + '+') renders when leaf has > 1 tab;

@@ -161,6 +161,7 @@ on right now" — file tree's currently-open file is the canonical example.
 | `source_control::branch_picker::ROW_HEIGHT` | 28 (vs `h_overlay_item` 30) | Branch lists are long; more items in a tight popover |
 | `left_rail::row_menu::ROW_MENU_ITEM_H` | 28 (vs `h_overlay_item` 30) | Narrow rail context reads tighter at 28px |
 | `project_picker::ROW_HEIGHT` | 40 + `ROW_PAD_X` 16 | Modal-scale picker, not floating overlay |
+| `workspace_card::CARD_HEIGHT_MULT` | 2.2 × `h_row` | Two-line rich card (name + agent verb/diff); same local-exception pattern as `ROW_HEIGHT_MULT = 1.6` |
 
 ## Button Variants × Sizes
 

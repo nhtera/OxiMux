@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     AnyElement, AppContext, Context, DragMoveEvent, Entity, FocusHandle, InteractiveElement,
@@ -43,18 +44,24 @@ use oximux_settings::{Density, Theme, Typography};
 /// the library, and the two share no module today.
 pub(crate) const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 
+/// Cadence of the rail's per-worktree diff-count refresh. Deliberately slower
+/// than the SCM status poll: each round shells out `git diff --numstat` per
+/// worktree, so a tight interval would spawn many short-lived git processes.
+/// 2 s keeps the `+A −B` chips feeling live without churning the disk.
+const DIFF_REFRESH_TICK: Duration = Duration::from_millis(2000);
+
 use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    ActivateGroupTab, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
-    OpenAddProjectDialog, OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog,
-    OpenFileFromContextMenu, OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions,
-    OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
-    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
-    SelectSearchTab, SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt,
-    SplitHorizontal, SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    ActivateGroupTab, ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked,
+    CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow, OpenAddProjectDialog,
+    OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
+    OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
+    OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate,
+    RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
+    SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
+    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -76,7 +83,12 @@ use crate::shell::{
         PushStashRequested, StashPanel,
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
     },
-    left_rail::{LeftRail, project_menu::ProjectRowMenu, row_menu::WorkspaceRowMenu},
+    left_rail::{
+        LeftRail,
+        project_menu::ProjectRowMenu,
+        row_menu::WorkspaceRowMenu,
+        workspace_row::{DiffCounts, sum_numstat},
+    },
     main_area,
     openable_text_file::is_openable_text_file,
     pane_actions::{PaneActionsAnchor, PaneActionsMenu},
@@ -230,6 +242,22 @@ pub struct WorkspaceRoot {
     /// Fired by the branch section's "View all" CTA; opens a combined
     /// read-only range diff. Same lifetime contract as above.
     pub(crate) _show_branch_diff_all_subscription: Option<Subscription>,
+    /// Cached per-worktree diff line counts (keyed by worktree path).
+    /// Populated by a periodic, focus-gated, concurrent background refresh
+    /// (`run_diff_refresh_round`) and read in `refresh_left_rail`. Never
+    /// written inside `Render` — results flow in from background completions
+    /// via weak-entity update + cx.notify().
+    pub(crate) diff_counts: HashMap<String, DiffCounts>,
+    /// `true` while the window is active. The periodic diff refresh only runs
+    /// when focused so an inactive window does not churn `git` in the
+    /// background (mirrors the SCM status poller's pause-on-blur behavior).
+    pub(crate) diff_refresh_focused: bool,
+    /// Guards against overlapping refresh rounds — a slow round must finish
+    /// before the next tick starts one, so concurrent shellouts cannot pile up.
+    pub(crate) diff_refresh_in_flight: bool,
+    /// Owns the periodic refresh loop. Dropping it cancels the loop when the
+    /// window/root entity goes away.
+    _diff_refresh_task: Task<()>,
 }
 
 impl WorkspaceRoot {
@@ -338,7 +366,7 @@ impl WorkspaceRoot {
         left_rail.update(cx, |rail, _cx| {
             rail.init_layout(app_state.settings_repo.clone());
         });
-        let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
+        let palette = cx.new(|cx| PaletteModal::new(theme, density, typography.clone(), cx));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
         let tab_context_menu = cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
         let file_tree_context_menu =
@@ -439,14 +467,41 @@ impl WorkspaceRoot {
             build_add_project_dialog(theme, density, typography.clone(), pr, cx);
 
         // Pause status polling when the window blurs; force an immediate
-        // refresh on focus regain via StatusPoller::kick().
+        // refresh on focus regain via StatusPoller::kick(). The rail's
+        // diff-count refresh follows the same focus gating: paused while
+        // inactive, kicked once immediately on focus regain so chips are
+        // fresh the moment the user returns.
         let window_activation_observer =
             cx.observe_window_activation(window, |this, window, cx| {
                 let active = window.is_window_active();
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |sidebar, _cx| sidebar.set_polling_focused(active));
                 }
+                this.diff_refresh_focused = active;
+                if active {
+                    this.run_diff_refresh_round(cx);
+                }
             });
+
+        // Periodic diff-count refresh loop. Ticks every `DIFF_REFRESH_TICK`
+        // and, while the window is focused, kicks a concurrent per-worktree
+        // refresh round (self-guarded against overlap). Breaks when the root
+        // entity is gone.
+        let diff_refresh_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(DIFF_REFRESH_TICK).await;
+                let still_alive = weak
+                    .update(cx, |this, cx| {
+                        if this.diff_refresh_focused {
+                            this.run_diff_refresh_round(cx);
+                        }
+                    })
+                    .is_ok();
+                if !still_alive {
+                    break;
+                }
+            }
+        });
 
         // Click router: drains tab-ids posted by the macOS click watcher.
         // For each id, raise the window and activate the matching tab.
@@ -539,9 +594,131 @@ impl WorkspaceRoot {
             add_project_dialog,
             focus_handle,
             window_id,
+            diff_counts: HashMap::new(),
+            diff_refresh_focused: true,
+            diff_refresh_in_flight: false,
+            _diff_refresh_task: diff_refresh_task,
         };
         this.rewire_scm_subscriptions(window, cx);
+        // Load global custom commands on startup. No active project yet so
+        // only the global `commands.toml` is checked; project commands are
+        // loaded (and re-merged) on the first `set_active_project` call.
+        this.reload_custom_commands(cx);
         this
+    }
+
+    /// Collect every worktree path across all recent projects (the project
+    /// root plus each linked worktree). Same source the rail snapshot uses;
+    /// deduped so a project root that already has a workspace row is counted
+    /// once. Synchronous SQLite reads only — no git, safe to call per round.
+    fn all_worktree_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
+        for project in &self.app_state.recent_projects {
+            paths.push(project.root_path.clone());
+            if let Ok(list) = self.app_state.workspace_repo.list_for_project(&project.id) {
+                for w in list {
+                    if w.worktree_path != project.root_path {
+                        paths.push(w.worktree_path);
+                    }
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Run one concurrent diff-count refresh round. Self-guards against
+    /// overlap via `diff_refresh_in_flight`. Fans out all per-worktree
+    /// `git diff --numstat` shellouts concurrently (serial per-worktree
+    /// shellouts previously froze the rail), then writes the results back on
+    /// the main thread and evicts paths that no longer exist so the cache
+    /// cannot grow without bound.
+    ///
+    /// The numstat shellout spawns a child via `tokio::process`, which needs a
+    /// live Tokio reactor. GPUI's background executor has none, so the fan-out
+    /// runs on the app's Tokio runtime (entered on the main thread for the life
+    /// of the app) and results are ferried back over a oneshot to a GPUI task.
+    /// Called only from main-thread GPUI callbacks, where `Handle::try_current`
+    /// resolves to that runtime.
+    pub(crate) fn run_diff_refresh_round(&mut self, cx: &mut Context<Self>) {
+        if self.diff_refresh_in_flight {
+            return;
+        }
+        let paths = self.all_worktree_paths();
+        if paths.is_empty() {
+            return;
+        }
+        // Bail (leaving the flag clear) when no runtime is entered so a
+        // headless/test context degrades to "no live counts" instead of
+        // panicking inside the child-process spawn.
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::workspace_root",
+                    "no tokio runtime; worktree diff counts stay stale this round"
+                );
+                return;
+            }
+        };
+        self.diff_refresh_in_flight = true;
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<Vec<(String, Option<DiffCounts>)>>();
+        handle.spawn(async move {
+            let futs = paths.into_iter().map(|path| async move {
+                let counts = oximux_git::diff_numstat_head(std::path::Path::new(&path))
+                    .await
+                    .ok()
+                    .map(|map| sum_numstat(&map));
+                (path, counts)
+            });
+            let _ = tx.send(futures::future::join_all(futs).await);
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(results) = rx.await else {
+                // Sender dropped (runtime torn down) — clear the flag so a
+                // later round can retry rather than wedging in-flight.
+                let _ = weak.update(cx, |this, _| {
+                    this.diff_refresh_in_flight = false;
+                });
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                // Snapshot of paths seen this round drives eviction so removed
+                // worktrees age out of the cache.
+                let current: std::collections::HashSet<String> =
+                    results.iter().map(|(p, _)| p.clone()).collect();
+                for (path, counts) in results {
+                    // A failed fetch leaves the prior value intact rather than
+                    // blanking the chip on a transient git error.
+                    if let Some(counts) = counts {
+                        this.diff_counts.insert(path, counts);
+                    }
+                }
+                this.diff_counts.retain(|k, _| current.contains(k));
+                this.diff_refresh_in_flight = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Load global + active-project custom commands and push them into the
+    /// command palette. Safe to call with no active project (loads global
+    /// only, project file simply won't exist). Called on startup and
+    /// whenever `ReloadCustomCommands` fires.
+    pub(crate) fn reload_custom_commands(&self, cx: &mut Context<Self>) {
+        // `load_for_project` gracefully no-ops a missing project-level
+        // `.oximux/commands.toml`, so passing a non-existent root is fine.
+        let project_root = self
+            .active_project
+            .as_ref()
+            .map(|p| std::path::PathBuf::from(&p.root_path))
+            .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+        let commands = crate::custom_commands_loader::load_for_project(&project_root);
+        self.palette
+            .update(cx, |p, cx| p.set_custom_commands(commands, cx));
     }
 
     /// Open a fresh local-PTY tab in the active project's active pane group.
@@ -1405,6 +1582,22 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Reshape the active project's pane layout to `preset`. No-op when
+    /// no project is active.
+    fn reshape_active_project_layout(
+        &self,
+        preset: crate::shell::pane_group::layout_presets::Preset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        panes.update(cx, |p, cx| {
+            p.apply_layout_preset(preset, window, cx);
+        });
+    }
+
     /// Close the focused pane group in the active project. Manager
     /// returns `LastGroup` when no siblings exist; we swallow that so
     /// the keybind / menu item is a no-op rather than an error popup.
@@ -1744,16 +1937,19 @@ impl Render for WorkspaceRoot {
                     .detach();
                 },
             ))
-            .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
+            .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
                 // Mutex with every other full-window overlay (close-then-open).
                 this.close_modal_overlays(cx);
                 this.palette
-                    .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, cx));
+                    .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, window, cx));
             }))
-            .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.close_modal_overlays(cx);
                 this.palette
-                    .update(cx, |p, cx| p.open(PaletteMode::Commands, cx));
+                    .update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ReloadCustomCommands, _window, cx| {
+                this.reload_custom_commands(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
                 let projects = this.app_state.recent_projects.clone();
@@ -2332,6 +2528,18 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &SplitUp, window, cx| {
                 this.split_active_pane_group(Axis::Vertical, SplitInsert::Before, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ApplyLayoutStacked, window, cx| {
+                use crate::shell::pane_group::layout_presets::Preset;
+                this.reshape_active_project_layout(Preset::Stacked, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ApplyLayoutHorizontal, window, cx| {
+                use crate::shell::pane_group::layout_presets::Preset;
+                this.reshape_active_project_layout(Preset::Horizontal, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ApplyLayoutBottomTerminal, window, cx| {
+                use crate::shell::pane_group::layout_presets::Preset;
+                this.reshape_active_project_layout(Preset::BottomTerminal, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &CloseGroup, window, cx| {
                 this.close_active_pane_group(window, cx);
             }))
@@ -2451,15 +2659,36 @@ impl Render for WorkspaceRoot {
                 });
             }))
             .child(row)
-            .child(status_bar::view(
-                theme,
-                density,
-                typography,
-                pane_count,
-                tty_count,
-                agent_count,
-                git_state.as_ref(),
-            ))
+            .child({
+                // Fetch the SCM panel's cached primary action so the status
+                // bar renders the same resolved verb — no second resolver.
+                let scm_panel = self.right_sidebar.as_ref().and_then(|rs| {
+                    rs.read(cx).source_control.clone()
+                });
+                let primary = scm_panel
+                    .as_ref()
+                    .and_then(|sc| sc.read(cx).last_primary_action());
+                // Clone for the closure; the outer `window` is plumbed via
+                // `update` (not `update_in`) per the GPUI memory note.
+                let scm_for_click = scm_panel.clone();
+                status_bar::view(
+                    theme,
+                    density,
+                    typography,
+                    pane_count,
+                    tty_count,
+                    agent_count,
+                    git_state.as_ref(),
+                    primary,
+                    move |window, cx| {
+                        if let Some(sc) = scm_for_click.clone() {
+                            sc.update(cx, |panel, cx| {
+                                panel.trigger_primary_action(window, cx);
+                            });
+                        }
+                    },
+                )
+            })
             // Pane Actions dropdown — appended before the palette so the
             // palette (more rare, larger) wins z-order when both are open.
             .child(self.pane_actions.clone())

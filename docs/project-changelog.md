@@ -4,6 +4,82 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-06 — Custom commands + interactive command palette
+
+**Commits**: `e85b0cd`  
+**Touches**: `crates/settings/src/custom_commands.rs` (NEW), `crates/settings/src/lib.rs`, `crates/app/src/custom_commands_loader.rs` (NEW), `crates/app/src/lib.rs`, `crates/app/src/actions.rs`, `crates/app/src/shell/command_palette/{entry,mod,palette_modal}.rs`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/workspace_ops.rs`
+
+Two parts:
+
+- **Command palette is now interactive.** Previously a display-only mockup; it now has type-to-filter, ↑/↓ navigation, Enter/click dispatch (built-in actions and custom commands), and Esc to close — modelled on the project picker's focus/key handling. Click and keyboard share one `activate_item` path (dispatch + close).
+- **Custom commands.** Reusable prompt snippets defined in TOML, loaded from a global config (`~/Library/Application Support/dev.nhtera.oximux/commands.toml`) and a committable per-project `.oximux/commands.toml`, merged with name-keyed precedence (`load_and_merge`, pure + unit-tested). They appear in the palette under a "Custom" group; selecting one sends its prompt to the active agent via the existing `SendTextToActiveAgent` path (newline appended to auto-submit). Malformed config is skipped with a warning, never crashes load. A "Reload Custom Commands" entry and per-project-switch reload keep them fresh. No file watcher (intentional).
+
+---
+
+### 2026-06-06 — Pane layout presets (stacked / horizontal / bottom-terminal)
+
+**Commits**: `efc767d`  
+**Touches**: `crates/app/src/shell/pane_group/layout_presets.rs` (NEW), `crates/app/src/shell/pane_group/mod.rs`, `crates/app/src/shell/pane_group_manager.rs`, `crates/app/src/shell/project_panes/mod.rs`, `crates/app/src/actions.rs`, `crates/app/src/keymap.rs`, `crates/app/src/shell/command_palette/entry.rs`, `crates/app/src/workspace_root.rs`
+
+Three one-click presets reshape the active project's pane layout:
+
+- **Stacked** (panes top-to-bottom), **Horizontal** (side-by-side), **Bottom-terminal** (content on top, a terminal docked across the bottom).
+- Triggered from the command palette ("Layout: …") and `⌃⇧1 / ⌃⇧2 / ⌃⇧3`.
+- `apply_preset` is a pure transform over the `PaneTree<PaneGroupId>`: it rebuilds from the existing leaves, so all panes + tabs are preserved (reparent, not recreate). Active-pane focus is restored after reshape.
+- Bottom-terminal docks an existing terminal-bearing group at the bottom, or spawns a new terminal group when none exists.
+- Pure transform unit-tested (shapes, idempotency, leaf preservation); no new pane primitives.
+
+---
+
+### 2026-06-05 — Smart git button in the status bar
+
+**Commits**: `44b1131`  
+**Touches**: `crates/app/src/shell/source_control/mod.rs`, `crates/app/src/shell/status_bar.rs`, `crates/app/src/workspace_root.rs`
+
+Surfaces the Source Control primary-action state machine as a one-click "next git step" button in the status-bar git zone:
+
+- Renders the SAME resolved `PrimaryAction` the SCM side panel computes (cached on the panel; single resolver, surfaces never diverge).
+- Click executes the resolved op end-to-end via existing methods: Commit, Stage All (stages every unstaged file), Push, Pull, Sync, Publish — no new git logic, no merge.
+- Disabled/busy states come from the resolver (in-flight commit/remote ops gate the button); tooltip surfaces the resolver's context (commit counts / disabled reason).
+- Local-only — no remote-host/PR integration.
+
+---
+
+### 2026-06-05 — Agents dashboard (attention-sorted, all-projects)
+
+**Commits**: `bed677a`  
+**Touches**: `crates/app/src/shell/agents_dashboard/{mod,model,row_render}.rs` (NEW), `crates/app/src/shell/mod.rs`, `crates/app/src/shell/left_rail/mod.rs`
+
+Wires the previously-inert `Agents` nav item to a real all-agents dashboard:
+
+- One virtualized (`uniform_list`) row per live/status-bearing agent across **all** projects/worktrees; dormant workspaces excluded.
+- Sorted by **attention priority**: needs-input / waiting-for-approval float to the top, then running, then idle/live, then done/failed.
+- Each row shows project · branch · agent name · status verb · diff `+A −B`, reusing the rich-card `agent_verb` + `diff_counts` (no duplicated logic).
+- Clicking a row activates that project + workspace and focuses its agent tab via the existing `activate_workspace` path (cross-project switch).
+- Long rows scroll horizontally instead of clipping in the narrow rail (`with_width_from_item` at the widest row).
+
+Pure data layer (`model.rs`: `attention_rank`, `sort_agent_rows`, `build_agent_rows`, `widest_row_index`) is fully unit-tested.
+
+---
+
+### 2026-06-05 — Left-rail rich worktree cards + live diff counts
+
+**Commits**: `003e034`  
+**Touches**: `crates/app/src/shell/agent_presentation.rs` (NEW), `crates/app/src/shell/left_rail/workspace_card.rs` (NEW), `crates/app/src/shell/left_rail/workspace_row.rs`, `crates/app/src/shell/left_rail/{mod.rs,project_group.rs}`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/workspace_ops.rs`
+
+Replaces single-line workspace rows in the left rail with two-line rich cards:
+
+- **Line 1**: status dot + workspace name + primary/folder badge + git branch chip
+- **Line 2**: agent-state verb (colored) + working-tree diff counts (`+A −B`)
+
+**`agent_presentation.rs`** (new shared module) — `AgentVerb` struct + `agent_verb()` function; single source of truth mapping `AgentStatus` + `is_live` flag to verb label and status-token color. Both the status dot and the card line 2 delegate here; color parity is enforced by the shared function.
+
+**`workspace_card.rs`** (new card painter) — `render_workspace_card` consuming a `WorkspaceCardPlan`; `CARD_HEIGHT_MULT = 2.2 × h_row` (documented exception in `design-guidelines.md`).
+
+**Live diff counts** — `WorkspaceRoot` runs `run_diff_refresh_round` every 2s (focus-gated: pauses while window is unfocused); shells out `git diff --numstat` per worktree concurrently off-thread; coalesces results into `diff_counts` cache and notifies the rail. `workspace_ops.rs` reads the cached counts when refreshing the left rail.
+
+---
+
 ### 2026-05-30 — Terminal emulator richness — Phases 1–12 (slice 2 added)
 
 **Status**: code complete; 1163 workspace tests pass; clippy `-D warnings` clean  

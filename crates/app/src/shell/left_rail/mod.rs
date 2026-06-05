@@ -25,6 +25,7 @@ pub mod project_menu;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
+pub mod workspace_card;
 pub mod workspace_list_render;
 pub mod workspace_row;
 
@@ -32,15 +33,19 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
-    Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px, svg,
+    Render, StatefulInteractiveElement, Styled, UniformListScrollHandle, WeakEntity, Window, div,
+    px, svg,
 };
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
 
+use crate::shell::left_rail::workspace_row::DiffCounts;
+
 use crate::left_rail_layout;
 
 use crate::actions::OpenProjectPicker;
+use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
 use crate::shell::left_rail::toolbar::render_toolbar;
@@ -73,6 +78,11 @@ pub struct LeftRail {
     /// in this set reads as "live" (green idle dot) even before its
     /// session reports a concrete status.
     live_worktrees: HashSet<String>,
+    /// Cached per-worktree diff counts (keyed by worktree path). Populated
+    /// by `WorkspaceRoot`'s concurrent diff-fetch background tasks and pushed
+    /// down here via `set_sidebar_data`. `None` for a worktree means the
+    /// count is not yet available; the card omits the chip rather than blocking.
+    diff_counts: HashMap<String, DiffCounts>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -82,6 +92,9 @@ pub struct LeftRail {
     /// Project ids whose group is collapsed (workspace rows hidden).
     /// Persisted to settings so the collapsed view survives restart.
     collapsed: HashSet<String>,
+    /// Scroll position for the agents dashboard `uniform_list`. Stored on
+    /// `LeftRail` so it survives re-renders while the Agents nav is active.
+    agents_scroll: UniformListScrollHandle,
 }
 
 impl LeftRail {
@@ -101,9 +114,11 @@ impl LeftRail {
             workspaces_by_project: HashMap::new(),
             latest_status: HashMap::new(),
             live_worktrees: HashSet::new(),
+            diff_counts: HashMap::new(),
             width: px(density.w_left_rail),
             settings_repo: None,
             collapsed: HashSet::new(),
+            agents_scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -169,6 +184,7 @@ impl LeftRail {
 
     /// Push the latest sidebar snapshot. Called by
     /// `WorkspaceRoot::refresh_left_rail` at the top of each render.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_sidebar_data(
         &mut self,
         projects: Vec<Project>,
@@ -177,6 +193,7 @@ impl LeftRail {
         workspaces_by_project: HashMap<String, Vec<Workspace>>,
         latest_status: LatestStatusMap,
         live_worktrees: HashSet<String>,
+        diff_counts: HashMap<String, DiffCounts>,
         cx: &mut Context<Self>,
     ) {
         self.projects = projects;
@@ -185,6 +202,7 @@ impl LeftRail {
         self.workspaces_by_project = workspaces_by_project;
         self.latest_status = latest_status;
         self.live_worktrees = live_worktrees;
+        self.diff_counts = diff_counts;
         cx.notify();
     }
 
@@ -207,20 +225,47 @@ impl Render for LeftRail {
         let typography = self.typography.clone();
         let entity = cx.entity().clone();
 
-        let workspace_list = render_workspace_list(
-            self.projects.clone(),
-            self.active_project_id.clone(),
-            self.active_workspace_id.clone(),
-            self.collapsed.clone(),
-            entity.clone(),
-            self.workspaces_by_project.clone(),
-            self.latest_status.clone(),
-            self.live_worktrees.clone(),
-            self.weak_root.clone(),
-            theme,
-            density,
-            &typography,
-        );
+        // The flex-1 body slot changes depending on the active nav item.
+        // Agents → agents dashboard (uniform_list across all projects).
+        // All other nav items → the workspace list (existing behavior).
+        let content_body: gpui::AnyElement = if self.active_nav == NavItem::Agents {
+            render_agents_dashboard(
+                &self.projects,
+                &self.workspaces_by_project,
+                &self.latest_status,
+                &self.live_worktrees,
+                &self.diff_counts,
+                self.weak_root.clone(),
+                &self.agents_scroll,
+                theme,
+                density,
+                &typography,
+            )
+        } else {
+            let workspace_list = render_workspace_list(
+                self.projects.clone(),
+                self.active_project_id.clone(),
+                self.active_workspace_id.clone(),
+                self.collapsed.clone(),
+                entity.clone(),
+                self.workspaces_by_project.clone(),
+                self.latest_status.clone(),
+                self.live_worktrees.clone(),
+                self.diff_counts.clone(),
+                self.weak_root.clone(),
+                theme,
+                density,
+                &typography,
+            );
+            div()
+                .flex()
+                .flex_col()
+                .h_full()
+                .w_full()
+                .child(workspace_header(&entity, theme, density, &typography))
+                .child(div().flex_1().w_full().child(workspace_list))
+                .into_any_element()
+        };
 
         // Body fills the column minus the right-edge resize handle.
         let body = div()
@@ -238,8 +283,7 @@ impl Render for LeftRail {
                 &typography,
             ))
             .child(divider(theme))
-            .child(workspace_header(&entity, theme, density, &typography))
-            .child(div().flex_1().w_full().child(workspace_list))
+            .child(div().flex_1().w_full().child(content_body))
             .child(render_toolbar(theme, density, &typography));
 
         div()
@@ -264,6 +308,7 @@ fn render_workspace_list(
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
     live_worktrees: HashSet<String>,
+    diff_counts: HashMap<String, DiffCounts>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -314,6 +359,7 @@ fn render_workspace_list(
             latest_status_for,
             active_workspace_id.as_deref(),
             &live_worktrees,
+            &diff_counts,
             rail.clone(),
             weak_root.clone(),
             on_row_menu,

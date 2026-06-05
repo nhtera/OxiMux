@@ -16,6 +16,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::shell::pane_group::layout_presets::{Preset, apply_preset};
 use crate::shell::pane_tree::{Axis, GroupTree, PaneGroupId, PaneTree, SplitInsert};
 
 /// Outcome of a `split_active_group` call. The caller is expected to
@@ -197,6 +198,27 @@ impl PaneGroupManager {
         self.active_group_id = new_active;
         Ok(id)
     }
+
+    /// Reshape the workspace layout tree into `preset`. The active group is
+    /// restored after the reshape so focus doesn't jump unexpectedly.
+    ///
+    /// For `Preset::BottomTerminal`, pass `terminal` = the id of the group
+    /// that should be docked at the bottom. When `None`, the manager falls
+    /// back to Stacked (caller is responsible for resolving the terminal
+    /// group before calling; see `ProjectPanes::apply_layout_preset`).
+    pub fn apply_layout_preset(&mut self, preset: Preset, terminal: Option<PaneGroupId>) {
+        let active_before = self.active_group_id;
+        self.group_tree = apply_preset(&self.group_tree, preset, terminal);
+        // Restore focus: active group is still in the tree (leaves are
+        // preserved by apply_preset). Guard the invariant in debug builds so a
+        // future preset that drops a leaf is caught here rather than leaving a
+        // dangling active id.
+        debug_assert!(
+            self.group_tree.in_order_leaves().contains(&active_before),
+            "apply_preset must preserve all leaves; active group was lost"
+        );
+        self.active_group_id = active_before;
+    }
 }
 
 impl Default for PaneGroupManager {
@@ -228,6 +250,19 @@ mod tests {
         // editor convention for fresh splits).
         assert_eq!(mgr.active_group_id(), PaneGroupId(1));
         assert_eq!(mgr.in_order_groups(), vec![PaneGroupId(0), PaneGroupId(1)]);
+    }
+
+    #[test]
+    fn apply_layout_preset_restores_active_group() {
+        let mut mgr = PaneGroupManager::new();
+        mgr.split_active_group(Axis::Horizontal, SplitInsert::After);
+        mgr.split_active_group(Axis::Vertical, SplitInsert::After);
+        // Focus a group that is NOT the one a fresh split would leave active.
+        assert!(mgr.set_active(PaneGroupId(0)));
+        mgr.apply_layout_preset(Preset::Stacked, None);
+        // Reshape must preserve every group and keep focus where it was.
+        assert_eq!(mgr.active_group_id(), PaneGroupId(0));
+        assert_eq!(mgr.in_order_groups().len(), 3);
     }
 
     #[test]

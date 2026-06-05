@@ -7,6 +7,7 @@
 //! does NOT affect any other group's tab list.
 
 pub mod file_drag;
+pub mod layout_presets;
 pub mod render;
 pub mod sub_pane;
 pub mod tab_drag;

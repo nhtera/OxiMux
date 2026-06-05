@@ -99,11 +99,11 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 /// invoked here against `NSApplication` / its key window.
 #[cfg(target_os = "macos")]
 pub mod platform {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
     use std::ptr;
 
-    unsafe fn shared_app() -> *mut Object {
+    unsafe fn shared_app() -> *mut AnyObject {
         msg_send![class!(NSApplication), sharedApplication]
     }
 
@@ -113,37 +113,37 @@ pub mod platform {
         unsafe {
             let app = shared_app();
             let _: () = msg_send![app, activateIgnoringOtherApps: true];
-            let _: () = msg_send![app, orderFrontStandardAboutPanel: ptr::null_mut::<Object>()];
+            let _: () = msg_send![app, orderFrontStandardAboutPanel: ptr::null_mut::<AnyObject>()];
         }
     }
 
     pub fn hide() {
         unsafe {
             let app = shared_app();
-            let _: () = msg_send![app, hide: ptr::null_mut::<Object>()];
+            let _: () = msg_send![app, hide: ptr::null_mut::<AnyObject>()];
         }
     }
 
     pub fn hide_others() {
         unsafe {
             let app = shared_app();
-            let _: () = msg_send![app, hideOtherApplications: ptr::null_mut::<Object>()];
+            let _: () = msg_send![app, hideOtherApplications: ptr::null_mut::<AnyObject>()];
         }
     }
 
     pub fn show_all() {
         unsafe {
             let app = shared_app();
-            let _: () = msg_send![app, unhideAllApplications: ptr::null_mut::<Object>()];
+            let _: () = msg_send![app, unhideAllApplications: ptr::null_mut::<AnyObject>()];
         }
     }
 
     pub fn minimize() {
         unsafe {
             let app = shared_app();
-            let win: *mut Object = msg_send![app, keyWindow];
+            let win: *mut AnyObject = msg_send![app, keyWindow];
             if !win.is_null() {
-                let _: () = msg_send![win, performMiniaturize: ptr::null_mut::<Object>()];
+                let _: () = msg_send![win, performMiniaturize: ptr::null_mut::<AnyObject>()];
             }
         }
     }
@@ -151,9 +151,9 @@ pub mod platform {
     pub fn zoom() {
         unsafe {
             let app = shared_app();
-            let win: *mut Object = msg_send![app, keyWindow];
+            let win: *mut AnyObject = msg_send![app, keyWindow];
             if !win.is_null() {
-                let _: () = msg_send![win, performZoom: ptr::null_mut::<Object>()];
+                let _: () = msg_send![win, performZoom: ptr::null_mut::<AnyObject>()];
             }
         }
     }

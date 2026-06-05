@@ -1,16 +1,22 @@
 //! Status bar — 24px fixed-height bottom strip.
 //!
 //! Layout: `left | center | right`. Left zone shows brand + version. Center
-//! shows the git branch chip + dirty count when a repository is mounted.
-//! Right zone shows a metric strip: `N TTY | N agents | N panes`.
+//! shows the git branch chip + dirty count when a repository is mounted,
+//! plus a compact primary-action button when an SCM panel is active. Right
+//! zone shows a metric strip: `N TTY | N agents | N panes`.
 //!
-//! Pure helpers (`tty_label`, `agent_label`, `pane_label`, `metric_color`)
-//! drive the visible labels; tested without GPUI.
+//! Pure helpers (`tty_label`, `agent_label`, `pane_label`, `metric_color`,
+//! `primary_button_visible`) drive the visible labels; tested without GPUI.
 
-use gpui::{Hsla, IntoElement, ParentElement, Styled, div, px};
+use gpui::{
+    App, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, px,
+};
 use oximux_core::GitState;
 use oximux_git::PollState;
 use oximux_settings::{Density, Theme, Typography};
+
+use crate::shell::source_control::primary_action::PrimaryAction;
 
 /// Pure helper for the git zone text. Returns:
 ///   - `"<branch>  •  N changed"` (or `0 changed`) when Ready
@@ -81,7 +87,17 @@ fn separator(theme: Theme, typography: &Typography) -> impl IntoElement {
         .child(" | ")
 }
 
-pub fn view(
+/// Returns `true` when the primary-action button should be rendered in the
+/// git zone: requires both a mounted repo (git_state present) and a resolved
+/// primary action from the SCM panel.
+pub fn primary_button_visible(
+    git_state: Option<&PollState>,
+    primary: Option<&PrimaryAction>,
+) -> bool {
+    git_state.is_some() && primary.is_some()
+}
+
+pub fn view<F>(
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -89,8 +105,74 @@ pub fn view(
     tty_count: usize,
     agent_count: usize,
     git_state: Option<&PollState>,
-) -> impl IntoElement {
+    primary: Option<PrimaryAction>,
+    on_primary_click: F,
+) -> impl IntoElement
+where
+    F: Fn(&mut Window, &mut App) + 'static,
+{
     let git_label = git_zone_label(git_state);
+    let show_primary = primary_button_visible(git_state, primary.as_ref());
+
+    // Build the center git zone: branch label + optional primary-action button.
+    let git_zone = {
+        let mut zone = div()
+            .flex()
+            .flex_1()
+            .justify_center()
+            .items_center()
+            .gap(px(6.))
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.fg_muted)
+            .child(git_label);
+
+        if show_primary {
+            if let Some(action) = primary {
+                let label = action.label.clone();
+                let title = action.title.clone();
+                let disabled = action.disabled;
+                let fg = if disabled { theme.fg_subtle } else { theme.fg_muted };
+                let hover_bg = theme.bg_panel_alt;
+                let btn = div()
+                    .id("status-bar-git-primary")
+                    .flex()
+                    .items_center()
+                    .h(px(16.))
+                    .px(px(6.))
+                    .rounded(px(density.r_chip))
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(fg)
+                    .border_1()
+                    .border_color(if disabled {
+                        theme.border_inactive
+                    } else {
+                        theme.border_active
+                    })
+                    .child(label)
+                    // Surface the resolver's context (commit counts, or the
+                    // reason the next step is unavailable) on hover.
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx)
+                    });
+
+                // Wire click only when enabled.
+                let btn = if disabled {
+                    btn
+                } else {
+                    btn.cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |_: &MouseDownEvent, window, cx| {
+                                on_primary_click(window, cx);
+                            },
+                        )
+                };
+                zone = zone.child(btn);
+            }
+        }
+        zone
+    };
 
     div()
         .flex()
@@ -111,16 +193,7 @@ pub fn view(
                 .text_color(theme.fg_subtle)
                 .child(format!("OxiMux v{}", env!("CARGO_PKG_VERSION"))),
         )
-        .child(
-            div()
-                .flex()
-                .flex_1()
-                .justify_center()
-                .items_center()
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_muted)
-                .child(git_label),
-        )
+        .child(git_zone)
         .child(
             div()
                 .flex()
@@ -205,5 +278,40 @@ mod tests {
     fn metric_color_inactive_returns_fg_subtle() {
         let t = Theme::charcoal();
         assert_eq!(metric_color(0, 1, t), t.fg_subtle);
+    }
+
+    #[test]
+    fn primary_button_hidden_when_no_repo() {
+        use crate::shell::source_control::primary_action::{
+            PrimaryAction, PrimaryActionKind,
+        };
+        let action = PrimaryAction {
+            kind: PrimaryActionKind::Stage,
+            label: "Stage All".into(),
+            title: "Stage all changes".into(),
+            disabled: false,
+        };
+        assert!(!primary_button_visible(None, Some(&action)));
+    }
+
+    #[test]
+    fn primary_button_hidden_when_no_action() {
+        let state = oximux_git::PollState::Loading;
+        assert!(!primary_button_visible(Some(&state), None));
+    }
+
+    #[test]
+    fn primary_button_shown_when_repo_and_action_present() {
+        use crate::shell::source_control::primary_action::{
+            PrimaryAction, PrimaryActionKind,
+        };
+        let action = PrimaryAction {
+            kind: PrimaryActionKind::Push,
+            label: "Push".into(),
+            title: "Push 1 commit".into(),
+            disabled: false,
+        };
+        let state = oximux_git::PollState::Loading;
+        assert!(primary_button_visible(Some(&state), Some(&action)));
     }
 }

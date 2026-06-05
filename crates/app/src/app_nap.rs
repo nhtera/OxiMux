@@ -17,8 +17,8 @@
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
     use std::ffi::CString;
 
     // NSActivityUserInitiatedAllowingIdleSystemSleep: opt out of App Nap and
@@ -29,7 +29,7 @@ mod imp {
 
     /// Holds an `NSProcessInfo` activity for its lifetime; ends it on drop.
     pub struct PreventAppNapGuard {
-        activity: *mut Object,
+        activity: *mut AnyObject,
     }
 
     // The activity token returned by NSProcessInfo is documented as safe to
@@ -41,16 +41,16 @@ mod imp {
             unsafe {
                 let c_reason = CString::new(reason)
                     .unwrap_or_else(|_| CString::new("relay request").expect("static fallback"));
-                let process_info: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
-                let ns_reason: *mut Object =
+                let process_info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+                let ns_reason: *mut AnyObject =
                     msg_send![class!(NSString), stringWithUTF8String: c_reason.as_ptr()];
-                let activity: *mut Object = msg_send![
+                let activity: *mut AnyObject = msg_send![
                     process_info,
-                    beginActivityWithOptions: NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP
+                    beginActivityWithOptions: NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP,
                     reason: ns_reason
                 ];
                 // Retain so an autorelease-pool drain can't free it before drop.
-                let activity: *mut Object = msg_send![activity, retain];
+                let activity: *mut AnyObject = msg_send![activity, retain];
                 Self { activity }
             }
         }
@@ -60,7 +60,7 @@ mod imp {
         fn drop(&mut self) {
             unsafe {
                 // `processInfo` is a never-deallocated singleton; fetch it fresh.
-                let process_info: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
+                let process_info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
                 let _: () = msg_send![process_info, endActivity: self.activity];
                 let _: () = msg_send![self.activity, release];
             }
