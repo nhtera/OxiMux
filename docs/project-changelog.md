@@ -4,6 +4,24 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-05 — Left-rail rich worktree cards + live diff counts
+
+**Commits**: `e77c51e`  
+**Touches**: `crates/app/src/shell/agent_presentation.rs` (NEW), `crates/app/src/shell/left_rail/workspace_card.rs` (NEW), `crates/app/src/shell/left_rail/workspace_row.rs`, `crates/app/src/shell/left_rail/{mod.rs,project_group.rs}`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/workspace_ops.rs`
+
+Replaces single-line workspace rows in the left rail with two-line rich cards:
+
+- **Line 1**: status dot + workspace name + primary/folder badge + git branch chip
+- **Line 2**: agent-state verb (colored) + working-tree diff counts (`+A −B`)
+
+**`agent_presentation.rs`** (new shared module) — `AgentVerb` struct + `agent_verb()` function; single source of truth mapping `AgentStatus` + `is_live` flag to verb label and status-token color. Both the status dot and the card line 2 delegate here; color parity is enforced by the shared function.
+
+**`workspace_card.rs`** (new card painter) — `render_workspace_card` consuming a `WorkspaceCardPlan`; `CARD_HEIGHT_MULT = 2.2 × h_row` (documented exception in `design-guidelines.md`).
+
+**Live diff counts** — `WorkspaceRoot` runs `run_diff_refresh_round` every 2s (focus-gated: pauses while window is unfocused); shells out `git diff --numstat` per worktree concurrently off-thread; coalesces results into `diff_counts` cache and notifies the rail. `workspace_ops.rs` reads the cached counts when refreshing the left rail.
+
+---
+
 ### 2026-05-30 — Terminal emulator richness — Phases 1–12 (slice 2 added)
 
 **Status**: code complete; 1163 workspace tests pass; clippy `-D warnings` clean  

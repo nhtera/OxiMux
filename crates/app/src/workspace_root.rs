@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     AnyElement, AppContext, Context, DragMoveEvent, Entity, FocusHandle, InteractiveElement,
@@ -42,6 +43,12 @@ use oximux_settings::{Density, Theme, Typography};
 /// re-exported because `main.rs` is a binary and `workspace_root.rs` is
 /// the library, and the two share no module today.
 pub(crate) const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
+
+/// Cadence of the rail's per-worktree diff-count refresh. Deliberately slower
+/// than the SCM status poll: each round shells out `git diff --numstat` per
+/// worktree, so a tight interval would spawn many short-lived git processes.
+/// 2 s keeps the `+A −B` chips feeling live without churning the disk.
+const DIFF_REFRESH_TICK: Duration = Duration::from_millis(2000);
 
 use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
@@ -76,7 +83,12 @@ use crate::shell::{
         PushStashRequested, StashPanel,
         push_dialog::{CancelCallback, PushCallback, PushStashDialog, PushStashPrompt},
     },
-    left_rail::{LeftRail, project_menu::ProjectRowMenu, row_menu::WorkspaceRowMenu},
+    left_rail::{
+        LeftRail,
+        project_menu::ProjectRowMenu,
+        row_menu::WorkspaceRowMenu,
+        workspace_row::{DiffCounts, sum_numstat},
+    },
     main_area,
     openable_text_file::is_openable_text_file,
     pane_actions::{PaneActionsAnchor, PaneActionsMenu},
@@ -230,6 +242,22 @@ pub struct WorkspaceRoot {
     /// Fired by the branch section's "View all" CTA; opens a combined
     /// read-only range diff. Same lifetime contract as above.
     pub(crate) _show_branch_diff_all_subscription: Option<Subscription>,
+    /// Cached per-worktree diff line counts (keyed by worktree path).
+    /// Populated by a periodic, focus-gated, concurrent background refresh
+    /// (`run_diff_refresh_round`) and read in `refresh_left_rail`. Never
+    /// written inside `Render` — results flow in from background completions
+    /// via weak-entity update + cx.notify().
+    pub(crate) diff_counts: HashMap<String, DiffCounts>,
+    /// `true` while the window is active. The periodic diff refresh only runs
+    /// when focused so an inactive window does not churn `git` in the
+    /// background (mirrors the SCM status poller's pause-on-blur behavior).
+    pub(crate) diff_refresh_focused: bool,
+    /// Guards against overlapping refresh rounds — a slow round must finish
+    /// before the next tick starts one, so concurrent shellouts cannot pile up.
+    pub(crate) diff_refresh_in_flight: bool,
+    /// Owns the periodic refresh loop. Dropping it cancels the loop when the
+    /// window/root entity goes away.
+    _diff_refresh_task: Task<()>,
 }
 
 impl WorkspaceRoot {
@@ -439,14 +467,41 @@ impl WorkspaceRoot {
             build_add_project_dialog(theme, density, typography.clone(), pr, cx);
 
         // Pause status polling when the window blurs; force an immediate
-        // refresh on focus regain via StatusPoller::kick().
+        // refresh on focus regain via StatusPoller::kick(). The rail's
+        // diff-count refresh follows the same focus gating: paused while
+        // inactive, kicked once immediately on focus regain so chips are
+        // fresh the moment the user returns.
         let window_activation_observer =
             cx.observe_window_activation(window, |this, window, cx| {
                 let active = window.is_window_active();
                 if let Some(rs) = &this.right_sidebar {
                     rs.update(cx, |sidebar, _cx| sidebar.set_polling_focused(active));
                 }
+                this.diff_refresh_focused = active;
+                if active {
+                    this.run_diff_refresh_round(cx);
+                }
             });
+
+        // Periodic diff-count refresh loop. Ticks every `DIFF_REFRESH_TICK`
+        // and, while the window is focused, kicks a concurrent per-worktree
+        // refresh round (self-guarded against overlap). Breaks when the root
+        // entity is gone.
+        let diff_refresh_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(DIFF_REFRESH_TICK).await;
+                let still_alive = weak
+                    .update(cx, |this, cx| {
+                        if this.diff_refresh_focused {
+                            this.run_diff_refresh_round(cx);
+                        }
+                    })
+                    .is_ok();
+                if !still_alive {
+                    break;
+                }
+            }
+        });
 
         // Click router: drains tab-ids posted by the macOS click watcher.
         // For each id, raise the window and activate the matching tab.
@@ -539,9 +594,85 @@ impl WorkspaceRoot {
             add_project_dialog,
             focus_handle,
             window_id,
+            diff_counts: HashMap::new(),
+            diff_refresh_focused: true,
+            diff_refresh_in_flight: false,
+            _diff_refresh_task: diff_refresh_task,
         };
         this.rewire_scm_subscriptions(window, cx);
         this
+    }
+
+    /// Collect every worktree path across all recent projects (the project
+    /// root plus each linked worktree). Same source the rail snapshot uses;
+    /// deduped so a project root that already has a workspace row is counted
+    /// once. Synchronous SQLite reads only — no git, safe to call per round.
+    fn all_worktree_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
+        for project in &self.app_state.recent_projects {
+            paths.push(project.root_path.clone());
+            if let Ok(list) = self.app_state.workspace_repo.list_for_project(&project.id) {
+                for w in list {
+                    if w.worktree_path != project.root_path {
+                        paths.push(w.worktree_path);
+                    }
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Run one concurrent diff-count refresh round. Self-guards against
+    /// overlap via `diff_refresh_in_flight`. Spawns all per-worktree
+    /// `git diff --numstat` shellouts concurrently on the background pool
+    /// (serial per-worktree shellouts previously froze the rail), then writes
+    /// the results back on the main thread and evicts paths that no longer
+    /// exist so the cache cannot grow without bound.
+    pub(crate) fn run_diff_refresh_round(&mut self, cx: &mut Context<Self>) {
+        if self.diff_refresh_in_flight {
+            return;
+        }
+        let paths = self.all_worktree_paths();
+        if paths.is_empty() {
+            return;
+        }
+        self.diff_refresh_in_flight = true;
+        cx.spawn(async move |weak, cx| {
+            // Fan out all worktree diffs at once on the background executor;
+            // `join_all` waits for the whole batch without blocking the UI.
+            let results: Vec<(String, Option<DiffCounts>)> = cx
+                .background_spawn(async move {
+                    let futs = paths.into_iter().map(|path| async move {
+                        let counts = oximux_git::diff_numstat_head(std::path::Path::new(&path))
+                            .await
+                            .ok()
+                            .map(|map| sum_numstat(&map));
+                        (path, counts)
+                    });
+                    futures::future::join_all(futs).await
+                })
+                .await;
+
+            let _ = weak.update(cx, |this, cx| {
+                // Snapshot of paths seen this round drives eviction so removed
+                // worktrees age out of the cache.
+                let current: std::collections::HashSet<String> =
+                    results.iter().map(|(p, _)| p.clone()).collect();
+                for (path, counts) in results {
+                    // A failed fetch leaves the prior value intact rather than
+                    // blanking the chip on a transient git error.
+                    if let Some(counts) = counts {
+                        this.diff_counts.insert(path, counts);
+                    }
+                }
+                this.diff_counts.retain(|k, _| current.contains(k));
+                this.diff_refresh_in_flight = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Open a fresh local-PTY tab in the active project's active pane group.

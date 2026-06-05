@@ -1,7 +1,7 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-05-29  
-**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete  
+**Updated**: 2026-06-05  
+**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete; left-rail rich worktree cards + live diff counts shipped  
 **Tests**: 375 app lib tests + storage/relay/relay-client/pty, 0 failures
 
 ---
@@ -40,6 +40,10 @@ src/
 │                           left_rail: Entity<LeftRail>; left_rail_open: bool (Cmd+B)
 │                           palette: Entity<PaletteModal> (Cmd+P / Cmd+Shift+P)
 │                           poll_state mirrored from RightSidebar for status bar
+│                           diff_counts: HashMap<PathBuf, NumstatCounts> — per-worktree
+│                             working-tree diff counts; refreshed by run_diff_refresh_round
+│                             (2s periodic, focus-gated, concurrent git diff --numstat
+│                             per worktree off-thread; pauses while window is unfocused)
 ├── window_registry.rs      WindowRegistry GPUI global — holds RegisteredWindow list (strong
 │                           Entity<WorkspaceRoot> + stable persist_id per window); mints
 │                           "main"/"w{n}" ids; PendingTearOff queue for cross-window tear-off;
@@ -49,11 +53,18 @@ src/
 │                           registers window in WindowRegistry; last-window quit gate
 └── shell/
     ├── mod.rs
+    ├── agent_presentation.rs AgentVerb struct + agent_verb() — single source of truth mapping
+    │                       AgentStatus + is_live flag to verb label + status-token color;
+    │                       used by both the left-rail dot and the rich card line 2
     ├── top_bar.rs          40px chrome: 56px traffic-light gutter + L/R panel toggles + wordmark
     ├── left_rail/          250px workspace + nav rail (replaces old sidebar stub)
-    │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state
+    │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state; snapshots diff_counts
     │   ├── nav_section.rs  NavItem (Tasks/Automations/Agents/Search) + pure bg/fg helpers
-    │   ├── workspace_list_render.rs  build_workspace_row_plan (pure) + render
+    │   ├── workspace_row.rs WorkspaceCardPlan + build_workspace_card_plan (pure) + sum_numstat;
+    │   │                   status_dot_color delegates to agent_verb for color parity
+    │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
+    │   │                   CARD_HEIGHT_MULT = 2.2 × h_row (design-guidelines approved exception)
+    │   ├── project_group.rs renders project groups; threads diff_counts snapshot into card builder
     │   └── toolbar.rs      Add Project + settings (stubs)
     ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay
     │   ├── mod.rs          PaletteModal entity (open/close/mode/query state)

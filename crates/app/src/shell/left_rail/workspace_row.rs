@@ -5,8 +5,9 @@
 //!    no GPUI runtime, no IO. Unit-tested without a window.
 //! 2. `render_workspace_row` consumes a `WorkspaceRowPlan` and paints it.
 //!
-//! The status dot is a solid colored circle whose hue is derived from the
-//! workspace's latest agent session. Empty session list → muted dot.
+//! Rich-card extensions (`WorkspaceCardPlan`, `build_workspace_card_plan`)
+//! live in this same file; the card painter lives in `workspace_card.rs` to
+//! keep both files under the 200-LOC soft cap.
 
 use gpui::{
     Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -15,15 +16,58 @@ use gpui::{
 use oximux_core::{AgentStatus, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
-/// Side length of the colored status circle.
-const STATUS_DOT_SIZE: f32 = 8.0;
-/// Folder icon size (matches the workspace header icon).
-const FOLDER_ICON_SIZE: f32 = 14.0;
+use crate::shell::agent_presentation::{AgentVerb, agent_verb};
+
+/// Side length of the colored status circle. Shared with the card painter
+/// (`workspace_card.rs`) so the dot size cannot drift between the two.
+pub(crate) const STATUS_DOT_SIZE: f32 = 8.0;
+/// Folder icon size (matches the workspace header icon). Shared with the card.
+pub(crate) const FOLDER_ICON_SIZE: f32 = 14.0;
 /// Row vertical multiplier — slightly taller than nav rows so the
 /// two-line slug subtext fits without clipping.
 const ROW_HEIGHT_MULT: f32 = 1.6;
-/// Ellipsis trailing-button width.
-const TRAILING_BTN_SIZE: f32 = 18.0;
+/// Ellipsis trailing-button width. Shared with the card painter.
+pub(crate) const TRAILING_BTN_SIZE: f32 = 18.0;
+
+/// Working-tree diff line counts for one worktree (staged + unstaged vs HEAD).
+/// `None` when the diff count is unavailable or still being computed — the
+/// card degrades gracefully by omitting the chip rather than blocking render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffCounts {
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// Reserved placeholder for a future PR-state chip. The field is wired into
+/// the card plan so the painter can pattern-match on it, but it is never
+/// populated in this implementation (remote-host integration is out of scope).
+/// `allow(dead_code)` keeps the reserved shape without a warning until then.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct PrChip {
+    pub number: u32,
+    pub state: PrState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+/// Sum a numstat `path → (added, removed)` map into a single `DiffCounts`
+/// total. Pure + testable; used by the background diff-count refresh to
+/// collapse a per-file numstat result into the worktree-level chip value.
+pub(crate) fn sum_numstat(
+    map: &std::collections::HashMap<std::path::PathBuf, (u32, u32)>,
+) -> DiffCounts {
+    let (added, removed) = map
+        .values()
+        .fold((0u32, 0u32), |(a, r), &(na, nr)| (a + na, r + nr));
+    DiffCounts { added, removed }
+}
 
 /// Visual tokens for one Workspace row. Pure, testable.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,40 +90,36 @@ pub struct WorkspaceRowPlan {
     pub is_active: bool,
 }
 
+/// Extended plan for the rich two-line workspace card.
+///
+/// Adds branch chip, agent-verb line, and diff counts to `WorkspaceRowPlan`.
+/// Built by `build_workspace_card_plan`; painted by `workspace_card.rs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceCardPlan {
+    /// Resolved base row tokens (dot color, bg/fg, flags).
+    pub row: WorkspaceRowPlan,
+    /// Git branch name for the branch chip. `None` for folder projects or
+    /// when the workspace has no branch field.
+    pub branch: Option<String>,
+    /// Agent state verb + color. `None` only when the workspace has never
+    /// started a session and is not live — card omits the verb line.
+    pub agent_verb: Option<AgentVerb>,
+    /// Working-tree diff counts. `None` when not yet fetched or unavailable;
+    /// card omits the `+A −B` chip gracefully.
+    pub diff: Option<DiffCounts>,
+    /// Reserved for a future PR-state chip. Always `None` in this
+    /// implementation — GitHub integration is out of scope.
+    pub pr: Option<PrChip>,
+}
+
 /// Resolve the status-dot color for a workspace given its latest agent
 /// session status (or `None` when no sessions have ever started) and
 /// whether the workspace currently has a live (open) agent tab.
 ///
-/// Semantics:
-/// - No session / `Idle` + live  → `status_ok` (green; an open session,
-///   quiet but present — distinct from a dormant workspace)
-/// - No session / `Idle` + not live → `fg_subtle` (quiet grey)
-/// - `Running`             → `status_info` (active work in flight)
-/// - `WaitingForInput` or `NeedsApproval` → `status_warn` (needs attention)
-/// - `Done { code: 0 }`    → `status_ok` (clean exit)
-/// - `Done { code != 0 }` or `Failed` → `status_error`
-/// - `Interrupted`         → `status_muted` (last shutdown clipped it)
-///
-/// A concrete status always wins over the live flag — a `Running` agent
-/// in a live workspace still reads as in-flight, not merely "open".
+/// Delegates to `agent_verb` so the dot color and the card's verb line
+/// are always derived from the same mapping.
 pub fn status_dot_color(status: Option<&AgentStatus>, is_live: bool, theme: Theme) -> Hsla {
-    match status {
-        None | Some(AgentStatus::Idle) => {
-            if is_live {
-                theme.status_ok
-            } else {
-                theme.fg_subtle
-            }
-        }
-        Some(AgentStatus::Running) => theme.status_info,
-        Some(AgentStatus::WaitingForInput) | Some(AgentStatus::NeedsApproval(_)) => {
-            theme.status_warn
-        }
-        Some(AgentStatus::Done { code: Some(0) }) => theme.status_ok,
-        Some(AgentStatus::Done { .. }) => theme.status_error,
-        Some(AgentStatus::Failed(_)) => theme.status_error,
-        Some(AgentStatus::Interrupted) => theme.status_muted,
-    }
+    agent_verb(status, is_live, theme).color
 }
 
 /// Compute the visual plan for one Workspace row. `is_live` is `true`
@@ -112,6 +152,59 @@ pub fn build_workspace_row_plan(
         is_primary,
         is_folder,
         is_active,
+    }
+}
+
+/// Compute the rich card plan for one Workspace. Extends `build_workspace_row_plan`
+/// with branch, agent verb, and diff counts.
+///
+/// `diff` is pushed down from the cached concurrent diff-count fetch;
+/// `None` means the count is not yet available — the card renders without
+/// the `+A −B` chip rather than blocking.
+#[allow(clippy::too_many_arguments)]
+pub fn build_workspace_card_plan(
+    workspace: &Workspace,
+    is_active: bool,
+    is_primary: bool,
+    is_folder: bool,
+    is_live: bool,
+    latest_status: Option<&AgentStatus>,
+    diff: Option<DiffCounts>,
+    theme: Theme,
+) -> WorkspaceCardPlan {
+    let row = build_workspace_row_plan(
+        workspace,
+        is_active,
+        is_primary,
+        is_folder,
+        is_live,
+        latest_status,
+        theme,
+    );
+
+    // Folder projects carry no branch; linked worktrees always have one.
+    let branch = if is_folder || workspace.branch.is_empty() {
+        None
+    } else {
+        Some(workspace.branch.clone())
+    };
+
+    // Produce an agent verb for every workspace that has had any interaction
+    // (live or status-bearing). When neither is true, omit the verb line so
+    // the card stays compact for dormant workspaces.
+    let verb = agent_verb(latest_status, is_live, theme);
+    let agent_verb_opt = if latest_status.is_some() || is_live {
+        Some(verb)
+    } else {
+        None
+    };
+
+    WorkspaceCardPlan {
+        row,
+        branch,
+        agent_verb: agent_verb_opt,
+        diff,
+        pr: None, // GitHub integration is out of scope
     }
 }
 
@@ -275,6 +368,8 @@ mod tests {
         }
     }
 
+    // ── status_dot_color (delegates to agent_verb) ────────────────────────────
+
     #[test]
     fn dot_color_none_not_live_uses_fg_subtle() {
         let t = Theme::charcoal();
@@ -389,6 +484,8 @@ mod tests {
         );
     }
 
+    // ── WorkspaceRowPlan ──────────────────────────────────────────────────────
+
     #[test]
     fn row_plan_active_uses_panel_alt_bg() {
         let t = Theme::charcoal();
@@ -444,5 +541,154 @@ mod tests {
         assert!(primary.is_primary && !primary.is_folder);
         assert!(folder.is_primary && folder.is_folder);
         assert!(!linked.is_primary && !linked.is_folder);
+    }
+
+    // ── WorkspaceCardPlan ─────────────────────────────────────────────────────
+
+    fn ws_with_branch(name: &str, slug: &str, branch: &str) -> Workspace {
+        Workspace {
+            id: format!("id-{slug}"),
+            project_id: "proj".to_string(),
+            name: name.to_string(),
+            slug: slug.to_string(),
+            branch: branch.to_string(),
+            worktree_path: format!("/tmp/{slug}"),
+            status: "active".to_string(),
+            created_at: "2026-05-21T00:00:00Z".to_string(),
+            archived_at: None,
+        }
+    }
+
+    #[test]
+    fn card_plan_carries_branch_when_present() {
+        let t = Theme::charcoal();
+        let w = ws_with_branch("Feat", "feat", "oximux/feat");
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, t);
+        assert_eq!(plan.branch, Some("oximux/feat".to_string()));
+    }
+
+    #[test]
+    fn card_plan_branch_absent_for_folder_project() {
+        let t = Theme::charcoal();
+        let mut w = ws("Folder", "folder");
+        w.branch = String::new();
+        let plan = build_workspace_card_plan(&w, false, true, true, false, None, None, t);
+        assert!(plan.branch.is_none());
+    }
+
+    #[test]
+    fn card_plan_branch_absent_when_empty() {
+        let t = Theme::charcoal();
+        let w = ws_with_branch("Plain", "plain", "");
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, t);
+        assert!(plan.branch.is_none());
+    }
+
+    #[test]
+    fn card_plan_agent_verb_none_when_dormant() {
+        // No status, not live → no verb line (dormant workspace).
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, t);
+        assert!(plan.agent_verb.is_none());
+    }
+
+    #[test]
+    fn card_plan_agent_verb_present_when_live() {
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let plan = build_workspace_card_plan(&w, false, false, false, true, None, None, t);
+        let verb = plan.agent_verb.expect("live workspace must have verb");
+        assert_eq!(verb.label, "Ready");
+        assert_eq!(verb.color, t.status_ok);
+    }
+
+    #[test]
+    fn card_plan_agent_verb_present_when_status_set() {
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let plan = build_workspace_card_plan(
+            &w,
+            false,
+            false,
+            false,
+            false,
+            Some(&AgentStatus::Running),
+            None,
+            t,
+        );
+        let verb = plan.agent_verb.expect("status-bearing workspace must have verb");
+        assert_eq!(verb.label, "Running");
+        assert_eq!(verb.color, t.status_info);
+    }
+
+    #[test]
+    fn card_plan_diff_present_when_supplied() {
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let diff = Some(DiffCounts { added: 10, removed: 3 });
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, diff, t);
+        let d = plan.diff.expect("supplied diff must be carried through");
+        assert_eq!(d.added, 10);
+        assert_eq!(d.removed, 3);
+    }
+
+    #[test]
+    fn card_plan_diff_absent_when_not_supplied() {
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, t);
+        assert!(plan.diff.is_none());
+    }
+
+    #[test]
+    fn card_plan_pr_always_none() {
+        // GitHub integration is out of scope — field is reserved, never populated.
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, t);
+        assert!(plan.pr.is_none());
+    }
+
+    #[test]
+    fn card_plan_active_variant_uses_panel_alt_bg() {
+        let t = Theme::charcoal();
+        let w = ws("Active", "active");
+        let plan = build_workspace_card_plan(&w, true, false, false, false, None, None, t);
+        assert_eq!(plan.row.bg, t.bg_panel_alt);
+        assert!(plan.row.is_active);
+    }
+
+    #[test]
+    fn card_plan_primary_variant_sets_flag() {
+        let t = Theme::charcoal();
+        let w = ws("main", "main");
+        let plan = build_workspace_card_plan(&w, false, true, false, false, None, None, t);
+        assert!(plan.row.is_primary);
+        assert!(!plan.row.is_folder);
+    }
+
+    // ── sum_numstat ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sum_numstat_empty_map_is_zero() {
+        let map = std::collections::HashMap::new();
+        assert_eq!(sum_numstat(&map), DiffCounts { added: 0, removed: 0 });
+    }
+
+    #[test]
+    fn sum_numstat_single_file() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(std::path::PathBuf::from("a.rs"), (5u32, 2u32));
+        assert_eq!(sum_numstat(&map), DiffCounts { added: 5, removed: 2 });
+    }
+
+    #[test]
+    fn sum_numstat_multi_file_totals() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(std::path::PathBuf::from("a.rs"), (5u32, 2u32));
+        map.insert(std::path::PathBuf::from("b.rs"), (10u32, 1u32));
+        map.insert(std::path::PathBuf::from("c.rs"), (0u32, 7u32));
+        assert_eq!(sum_numstat(&map), DiffCounts { added: 15, removed: 10 });
     }
 }

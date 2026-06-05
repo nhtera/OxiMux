@@ -25,6 +25,7 @@ pub mod project_menu;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
+pub mod workspace_card;
 pub mod workspace_list_render;
 pub mod workspace_row;
 
@@ -37,6 +38,8 @@ use gpui::{
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
+
+use crate::shell::left_rail::workspace_row::DiffCounts;
 
 use crate::left_rail_layout;
 
@@ -73,6 +76,11 @@ pub struct LeftRail {
     /// in this set reads as "live" (green idle dot) even before its
     /// session reports a concrete status.
     live_worktrees: HashSet<String>,
+    /// Cached per-worktree diff counts (keyed by worktree path). Populated
+    /// by `WorkspaceRoot`'s concurrent diff-fetch background tasks and pushed
+    /// down here via `set_sidebar_data`. `None` for a worktree means the
+    /// count is not yet available; the card omits the chip rather than blocking.
+    diff_counts: HashMap<String, DiffCounts>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -101,6 +109,7 @@ impl LeftRail {
             workspaces_by_project: HashMap::new(),
             latest_status: HashMap::new(),
             live_worktrees: HashSet::new(),
+            diff_counts: HashMap::new(),
             width: px(density.w_left_rail),
             settings_repo: None,
             collapsed: HashSet::new(),
@@ -169,6 +178,7 @@ impl LeftRail {
 
     /// Push the latest sidebar snapshot. Called by
     /// `WorkspaceRoot::refresh_left_rail` at the top of each render.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_sidebar_data(
         &mut self,
         projects: Vec<Project>,
@@ -177,6 +187,7 @@ impl LeftRail {
         workspaces_by_project: HashMap<String, Vec<Workspace>>,
         latest_status: LatestStatusMap,
         live_worktrees: HashSet<String>,
+        diff_counts: HashMap<String, DiffCounts>,
         cx: &mut Context<Self>,
     ) {
         self.projects = projects;
@@ -185,6 +196,7 @@ impl LeftRail {
         self.workspaces_by_project = workspaces_by_project;
         self.latest_status = latest_status;
         self.live_worktrees = live_worktrees;
+        self.diff_counts = diff_counts;
         cx.notify();
     }
 
@@ -216,6 +228,7 @@ impl Render for LeftRail {
             self.workspaces_by_project.clone(),
             self.latest_status.clone(),
             self.live_worktrees.clone(),
+            self.diff_counts.clone(),
             self.weak_root.clone(),
             theme,
             density,
@@ -264,6 +277,7 @@ fn render_workspace_list(
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
     live_worktrees: HashSet<String>,
+    diff_counts: HashMap<String, DiffCounts>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -314,6 +328,7 @@ fn render_workspace_list(
             latest_status_for,
             active_workspace_id.as_deref(),
             &live_worktrees,
+            &diff_counts,
             rail.clone(),
             weak_root.clone(),
             on_row_menu,

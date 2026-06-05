@@ -14,7 +14,8 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::OpenWorkspaceCreate;
 use crate::shell::left_rail::LeftRail;
-use crate::shell::left_rail::workspace_row::{build_workspace_row_plan, render_workspace_row};
+use crate::shell::left_rail::workspace_card::render_workspace_card;
+use crate::shell::left_rail::workspace_row::{DiffCounts, build_workspace_card_plan};
 use crate::workspace_root::WorkspaceRoot;
 
 /// Chevron / folder glyph size in the header.
@@ -55,11 +56,14 @@ pub fn build_project_group_plan(
     }
 }
 
-/// Render one project group: header + its workspace rows.
+/// Render one project group: header + its workspace cards.
 ///
 /// `latest_status_for(workspace_id)` resolves the latest agent-session
 /// status for the dot color; the lookup is injected so the caller decides
 /// whether to query a HashMap (cached map) or call the repo directly.
+///
+/// `diff_counts` is keyed by worktree path; a missing entry means the count
+/// is not yet cached — the card renders without the diff chip.
 #[allow(clippy::too_many_arguments)]
 pub fn render_project_group(
     plan: ProjectGroupPlan,
@@ -68,6 +72,7 @@ pub fn render_project_group(
     latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
     active_workspace_id: Option<&str>,
     live_worktrees: &std::collections::HashSet<String>,
+    diff_counts: &std::collections::HashMap<String, DiffCounts>,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
@@ -108,13 +113,17 @@ pub fn render_project_group(
         let is_folder = is_primary && workspace.branch.is_empty();
         let is_live = live_worktrees.contains(&workspace.worktree_path);
         let latest = latest_status_for(&workspace.id);
-        let row_plan = build_workspace_row_plan(
+        // Diff counts are looked up from the pushed-down cache; `None` means
+        // not yet available — the card renders without the chip.
+        let diff = diff_counts.get(&workspace.worktree_path).cloned();
+        let card_plan = build_workspace_card_plan(
             &workspace,
             is_active,
             is_primary,
             is_folder,
             is_live,
             latest.as_ref(),
+            diff,
             theme,
         );
         let row_id: SharedString = format!("ws-row-{}", workspace.id).into();
@@ -133,7 +142,7 @@ pub fn render_project_group(
                 );
             };
 
-        // Clicking a row activates the workspace: switch to its project,
+        // Clicking a card activates the workspace: switch to its project,
         // select it (highlight), and focus the agent tab running in its
         // worktree. `update` + outer `window` — `update_in` returns Err
         // from a mouse-callback context.
@@ -146,8 +155,8 @@ pub fn render_project_group(
                     .update(cx, |root, cx| root.activate_workspace(workspace, window, cx));
             };
 
-        col = col.child(render_workspace_row(
-            row_plan,
+        col = col.child(render_workspace_card(
+            card_plan,
             row_id,
             row_group,
             !is_primary,
