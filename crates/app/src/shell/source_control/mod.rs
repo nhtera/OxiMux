@@ -65,7 +65,8 @@ use crate::shell::source_control::commit_area::CommitArea;
 use crate::shell::source_control::dropdown_items::DropdownInputs;
 use crate::shell::source_control::graph::CommitGraph;
 use crate::shell::source_control::primary_action::{
-    PrimaryAction, PrimaryActionInputs, RemoteOpKind, UpstreamStatus, resolve_primary_action,
+    PrimaryAction, PrimaryActionInputs, PrimaryActionKind, RemoteOpKind, UpstreamStatus,
+    resolve_primary_action,
 };
 use crate::shell::source_control::scope::SourceControlScope;
 use crate::shell::source_control::settings_persistence::load_initial_base_ref;
@@ -108,6 +109,12 @@ pub struct SourceControlPanel {
     /// (branch is diverged from its upstream). `false` while the first
     /// check is in flight or when the state isn't a lease candidate.
     force_push_with_lease: bool,
+
+    /// Cached resolved primary action from the last render. Read by the
+    /// status bar to show the same verb without running a second resolver.
+    /// Updated at the top of every render call so it lags by at most one
+    /// frame — acceptable for a status indicator.
+    last_primary_action: Option<PrimaryAction>,
 
     /// Per-worktree base ref override. `None` = use the repo's default
     /// branch as the diff base. Flows into the dropdown's "Rebase from
@@ -336,6 +343,7 @@ impl SourceControlPanel {
         Self {
             poll_state: initial,
             git_state,
+            last_primary_action: None,
             force_push_with_lease: false,
             base_ref: initial_base_ref,
             current_op: initial_op,
@@ -651,12 +659,75 @@ impl SourceControlPanel {
         resolve_primary_action(&self.build_primary_inputs(cx))
     }
 
+    /// Returns a clone of the last resolved primary action. The value is
+    /// written at the top of every render call, so callers see at most a
+    /// one-frame-old snapshot — acceptable for the status bar indicator.
+    pub fn last_primary_action(&self) -> Option<PrimaryAction> {
+        self.last_primary_action.clone()
+    }
+
+    /// Dispatch the current primary action, mapping each resolved kind to the
+    /// existing operation it names so the one-click button works end-to-end:
+    /// Commit routes through the commit path; Stage stages every unstaged file;
+    /// the remote verbs route through the standing push/pull/sync/publish ops.
+    /// Guards the disabled flag so rapid clicks can't double-submit, and busy
+    /// states are already disabled by the resolver.
+    pub fn trigger_primary_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let action = self.resolve_primary(cx);
+        if action.disabled {
+            return;
+        }
+        match action.kind {
+            PrimaryActionKind::Commit => {
+                self.commit_area
+                    .update(cx, |area, cx| area.submit(&action, window, cx));
+            }
+            PrimaryActionKind::Stage => {
+                let paths = self.unstaged_paths();
+                if !paths.is_empty() {
+                    self.git_panel
+                        .update(cx, |gp, cx| gp.stage_paths_bulk(paths, cx));
+                }
+            }
+            PrimaryActionKind::Push => self.commit_area.update(cx, |area, cx| area.push(cx)),
+            PrimaryActionKind::Pull => self.commit_area.update(cx, |area, cx| area.pull(cx)),
+            PrimaryActionKind::Sync => self.commit_area.update(cx, |area, cx| area.sync(cx)),
+            PrimaryActionKind::Publish => {
+                self.commit_area.update(cx, |area, cx| area.publish(cx))
+            }
+        }
+    }
+
+    /// Collect every unstaged (non-ignored) file path from the current git
+    /// state — the set "Stage All" would stage. Mirrors the staged/unstaged
+    /// filter in `build_primary_inputs` so the button stages exactly what the
+    /// resolver counted.
+    fn unstaged_paths(&self) -> Vec<std::path::PathBuf> {
+        use oximux_core::{IndexStatus, WorktreeStatus};
+        self.git_state
+            .as_ref()
+            .map(|s| {
+                s.files
+                    .iter()
+                    .filter(|f| {
+                        !matches!(f.index, IndexStatus::Ignored)
+                            && !matches!(f.worktree, WorktreeStatus::Ignored)
+                            && f.is_unstaged()
+                    })
+                    .map(|f| f.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
 }
 
 impl Render for SourceControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let action = self.resolve_primary(cx);
+        // Cache for the status bar — kept at most one frame behind render.
+        self.last_primary_action = Some(action.clone());
         let dropdown_inputs = self.build_dropdown_inputs(cx);
         // Snapshot the conflict flag before we move `dropdown_inputs`
         // into `commit_area_render` below — gates the composer

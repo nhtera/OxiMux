@@ -2582,15 +2582,36 @@ impl Render for WorkspaceRoot {
                 });
             }))
             .child(row)
-            .child(status_bar::view(
-                theme,
-                density,
-                typography,
-                pane_count,
-                tty_count,
-                agent_count,
-                git_state.as_ref(),
-            ))
+            .child({
+                // Fetch the SCM panel's cached primary action so the status
+                // bar renders the same resolved verb — no second resolver.
+                let scm_panel = self.right_sidebar.as_ref().and_then(|rs| {
+                    rs.read(cx).source_control.clone()
+                });
+                let primary = scm_panel
+                    .as_ref()
+                    .and_then(|sc| sc.read(cx).last_primary_action());
+                // Clone for the closure; the outer `window` is plumbed via
+                // `update` (not `update_in`) per the GPUI memory note.
+                let scm_for_click = scm_panel.clone();
+                status_bar::view(
+                    theme,
+                    density,
+                    typography,
+                    pane_count,
+                    tty_count,
+                    agent_count,
+                    git_state.as_ref(),
+                    primary,
+                    move |window, cx| {
+                        if let Some(sc) = scm_for_click.clone() {
+                            sc.update(cx, |panel, cx| {
+                                panel.trigger_primary_action(window, cx);
+                            });
+                        }
+                    },
+                )
+            })
             // Pane Actions dropdown — appended before the palette so the
             // palette (more rare, larger) wins z-order when both are open.
             .child(self.pane_actions.clone())

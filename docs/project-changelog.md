@@ -4,9 +4,23 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-06-05 — Agents dashboard (attention-sorted, all-projects)
+### 2026-06-05 — Smart git button in the status bar
 
 **Commits**: pending (this commit)  
+**Touches**: `crates/app/src/shell/source_control/mod.rs`, `crates/app/src/shell/status_bar.rs`, `crates/app/src/workspace_root.rs`
+
+Surfaces the Source Control primary-action state machine as a one-click "next git step" button in the status-bar git zone:
+
+- Renders the SAME resolved `PrimaryAction` the SCM side panel computes (cached on the panel; single resolver, surfaces never diverge).
+- Click executes the resolved op end-to-end via existing methods: Commit, Stage All (stages every unstaged file), Push, Pull, Sync, Publish — no new git logic, no merge.
+- Disabled/busy states come from the resolver (in-flight commit/remote ops gate the button); tooltip surfaces the resolver's context (commit counts / disabled reason).
+- Local-only — no remote-host/PR integration.
+
+---
+
+### 2026-06-05 — Agents dashboard (attention-sorted, all-projects)
+
+**Commits**: `bed677a`  
 **Touches**: `crates/app/src/shell/agents_dashboard/{mod,model,row_render}.rs` (NEW), `crates/app/src/shell/mod.rs`, `crates/app/src/shell/left_rail/mod.rs`
 
 Wires the previously-inert `Agents` nav item to a real all-agents dashboard:

@@ -86,7 +86,9 @@ src/
     ├── tabbed_pane.rs      TabbedPane entity: tab strip + active terminal
     ├── main_area.rs        thin dispatcher → welcome_view::view
     ├── status_bar.rs       left | center git zone | right metric strip (N TTY | N agents | N panes)
-    │                       pure helpers: tty_label / agent_label / pane_label / metric_color
+    │                       pure helpers: tty_label / agent_label / pane_label / metric_color;
+    │                       git zone mounts the SCM panel's cached PrimaryAction as a one-click
+    │                       smart button (click → SourceControlPanel::trigger_primary_action)
     ├── terminal_view.rs    TerminalView GPUI entity; poll task; blink; focus;
     │                       last_completed_command_output (P8 mark bracket → snapshot
     │                       rows_text band); send-to-agent action handlers dispatch
