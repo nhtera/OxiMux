@@ -366,7 +366,7 @@ impl WorkspaceRoot {
         left_rail.update(cx, |rail, _cx| {
             rail.init_layout(app_state.settings_repo.clone());
         });
-        let palette = cx.new(|_| PaletteModal::new(theme, density, typography.clone()));
+        let palette = cx.new(|cx| PaletteModal::new(theme, density, typography.clone(), cx));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
         let tab_context_menu = cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
         let file_tree_context_menu =
@@ -600,6 +600,10 @@ impl WorkspaceRoot {
             _diff_refresh_task: diff_refresh_task,
         };
         this.rewire_scm_subscriptions(window, cx);
+        // Load global custom commands on startup. No active project yet so
+        // only the global `commands.toml` is checked; project commands are
+        // loaded (and re-merged) on the first `set_active_project` call.
+        this.reload_custom_commands(cx);
         this
     }
 
@@ -673,6 +677,23 @@ impl WorkspaceRoot {
             });
         })
         .detach();
+    }
+
+    /// Load global + active-project custom commands and push them into the
+    /// command palette. Safe to call with no active project (loads global
+    /// only, project file simply won't exist). Called on startup and
+    /// whenever `ReloadCustomCommands` fires.
+    pub(crate) fn reload_custom_commands(&self, cx: &mut Context<Self>) {
+        // `load_for_project` gracefully no-ops a missing project-level
+        // `.oximux/commands.toml`, so passing a non-existent root is fine.
+        let project_root = self
+            .active_project
+            .as_ref()
+            .map(|p| std::path::PathBuf::from(&p.root_path))
+            .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+        let commands = crate::custom_commands_loader::load_for_project(&project_root);
+        self.palette
+            .update(cx, |p, cx| p.set_custom_commands(commands, cx));
     }
 
     /// Open a fresh local-PTY tab in the active project's active pane group.
@@ -1891,16 +1912,19 @@ impl Render for WorkspaceRoot {
                     .detach();
                 },
             ))
-            .on_action(cx.listener(|this, _: &OpenQuickOpen, _window, cx| {
+            .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
                 // Mutex with every other full-window overlay (close-then-open).
                 this.close_modal_overlays(cx);
                 this.palette
-                    .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, cx));
+                    .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, window, cx));
             }))
-            .on_action(cx.listener(|this, _: &OpenCommandPalette, _window, cx| {
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.close_modal_overlays(cx);
                 this.palette
-                    .update(cx, |p, cx| p.open(PaletteMode::Commands, cx));
+                    .update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ReloadCustomCommands, _window, cx| {
+                this.reload_custom_commands(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
                 let projects = this.app_state.recent_projects.clone();

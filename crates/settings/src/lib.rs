@@ -6,12 +6,14 @@
 //! Phase 0 ships dark-only. Light mode is a Phase 8+ decision.
 
 pub mod commit_message_ai;
+pub mod custom_commands;
 pub mod density;
 pub mod terminal;
 pub mod theme;
 pub mod typography;
 
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
+pub use custom_commands::{CustomCommand, CustomCommandsFile, load_and_merge};
 pub use density::Density;
 pub use terminal::{BellStyle, TerminalSettings};
 pub use theme::{GitDecorations, Theme};

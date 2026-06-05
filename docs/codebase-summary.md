@@ -72,9 +72,12 @@ src/
     │   ├── row_render.rs   single-row painter (project · branch · name · verb · diff)
     │   └── mod.rs          render_agents_dashboard — virtualized uniform_list + empty state;
     │                       row click → activate_workspace (cross-project focus)
-    ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay
-    │   ├── mod.rs          PaletteModal entity (open/close/mode/query state)
-    │   ├── entry.rs        PALETTE_COMMANDS (11 actions, fn-ptr factories) + QUICK_OPEN_STUBS
+    ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay (interactive: type-to-filter,
+    │   │                   ↑/↓ nav, Enter/click dispatch, Esc close — mirrors project_picker)
+    │   ├── mod.rs          PaletteModal entity; activate_item (dispatch + close) shared by
+    │   │                   click + Enter; holds loaded custom commands; palette_filter (pure)
+    │   ├── entry.rs        PALETTE_COMMANDS fn-ptr catalog + PaletteItem/PaletteItemAction
+    │   │                   (Builtin fn | Custom prompt) + build_palette_items (merges customs)
     │   ├── match_engine.rs pure scorer: prefix > consecutive > subsequence (no external crate)
     │   └── palette_modal.rs pure render: card + header chip + result list
     ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)

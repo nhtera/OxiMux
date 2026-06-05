@@ -256,12 +256,12 @@ pub struct OpenCommitContextMenuAt {
     pub short_sha: String,
 }
 
-/// Payload action carrying text from the focused terminal up to the
-/// workspace so it can resolve "the active agent session" and stream
-/// the bytes through its CLI runtime. Bubbles from `TerminalView` up
-/// to `WorkspaceRoot`. The text is sent verbatim (no trailing newline)
-/// so the agent's input buffer holds it ready for the user to review
-/// and press Enter.
+/// Payload action carrying text up to the workspace so it can resolve "the
+/// active agent session" and stream the bytes through its CLI runtime.
+/// `text` is sent verbatim — callers decide whether to append a trailing
+/// newline: `TerminalView` send-selection leaves it newline-free so the
+/// user reviews and presses Enter, while custom-command palette entries
+/// append `\n` so the prompt auto-submits.
 #[derive(Clone, Debug, Default, PartialEq, Action)]
 #[action(namespace = oximux, no_json)]
 pub struct SendTextToActiveAgent {
@@ -430,6 +430,11 @@ actions!(
         /// bottom. An existing terminal group is reused; when none exists a
         /// new terminal group is spawned. Tab content is preserved.
         ApplyLayoutBottomTerminal,
+        /// Re-read `commands.toml` from the global app data dir and the
+        /// active project's `.oximux/commands.toml`, merging them into the
+        /// palette's custom command list. No file watcher — reload is
+        /// manual via this palette entry.
+        ReloadCustomCommands,
     ]
 );
 

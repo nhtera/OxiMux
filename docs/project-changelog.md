@@ -4,9 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-06-06 — Pane layout presets (stacked / horizontal / bottom-terminal)
+### 2026-06-06 — Custom commands + interactive command palette
 
 **Commits**: pending (this commit)  
+**Touches**: `crates/settings/src/custom_commands.rs` (NEW), `crates/settings/src/lib.rs`, `crates/app/src/custom_commands_loader.rs` (NEW), `crates/app/src/lib.rs`, `crates/app/src/actions.rs`, `crates/app/src/shell/command_palette/{entry,mod,palette_modal}.rs`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/workspace_ops.rs`
+
+Two parts:
+
+- **Command palette is now interactive.** Previously a display-only mockup; it now has type-to-filter, ↑/↓ navigation, Enter/click dispatch (built-in actions and custom commands), and Esc to close — modelled on the project picker's focus/key handling. Click and keyboard share one `activate_item` path (dispatch + close).
+- **Custom commands.** Reusable prompt snippets defined in TOML, loaded from a global config (`~/Library/Application Support/dev.nhtera.oximux/commands.toml`) and a committable per-project `.oximux/commands.toml`, merged with name-keyed precedence (`load_and_merge`, pure + unit-tested). They appear in the palette under a "Custom" group; selecting one sends its prompt to the active agent via the existing `SendTextToActiveAgent` path (newline appended to auto-submit). Malformed config is skipped with a warning, never crashes load. A "Reload Custom Commands" entry and per-project-switch reload keep them fresh. No file watcher (intentional).
+
+---
+
+### 2026-06-06 — Pane layout presets (stacked / horizontal / bottom-terminal)
+
+**Commits**: `efc767d`  
 **Touches**: `crates/app/src/shell/pane_group/layout_presets.rs` (NEW), `crates/app/src/shell/pane_group/mod.rs`, `crates/app/src/shell/pane_group_manager.rs`, `crates/app/src/shell/project_panes/mod.rs`, `crates/app/src/actions.rs`, `crates/app/src/keymap.rs`, `crates/app/src/shell/command_palette/entry.rs`, `crates/app/src/workspace_root.rs`
 
 Three one-click presets reshape the active project's pane layout:

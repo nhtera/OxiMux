@@ -296,6 +296,9 @@ impl WorkspaceRoot {
             }
         }
         self.active_project = Some(project.clone());
+        // Reload custom commands for the new project so the palette reflects
+        // the incoming project's `.oximux/commands.toml` immediately.
+        self.reload_custom_commands(cx);
         let project_root = PathBuf::from(&project.root_path);
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`

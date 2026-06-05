@@ -8,6 +8,7 @@ pub mod actions;
 pub mod app_nap;
 pub mod assets;
 pub mod commit_message_ai_settings;
+pub mod custom_commands_loader;
 pub mod git_state_cache;
 pub mod keymap;
 pub mod left_rail_layout;
