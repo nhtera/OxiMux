@@ -6,7 +6,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ### 2026-06-06 — Custom commands + interactive command palette
 
-**Commits**: pending (this commit)  
+**Commits**: `e85b0cd`  
 **Touches**: `crates/settings/src/custom_commands.rs` (NEW), `crates/settings/src/lib.rs`, `crates/app/src/custom_commands_loader.rs` (NEW), `crates/app/src/lib.rs`, `crates/app/src/actions.rs`, `crates/app/src/shell/command_palette/{entry,mod,palette_modal}.rs`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/workspace_ops.rs`
 
 Two parts:
