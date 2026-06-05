@@ -34,6 +34,7 @@ use crate::persisted_terminals::{
     PersistedTabKind, PersistedTabs, PersistedTree, snapshot_tree,
 };
 use crate::shell::pane_content::PaneContent;
+use crate::shell::pane_group::layout_presets::Preset;
 use crate::shell::pane_group::tab_drag_zones::Zone;
 use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind};
 use crate::shell::pane_group_manager::{CloseGroupError, GroupSplitOutcome, PaneGroupManager};
@@ -516,6 +517,62 @@ impl ProjectPanes {
             }
             let _ = self.close_group_by_id(id, window, cx);
         }
+    }
+
+    /// Reshape the workspace pane layout into `preset`.
+    ///
+    /// For `Preset::BottomTerminal` this method walks the existing groups to
+    /// find the last group in DFS order that holds at least one terminal tab
+    /// and passes it to the pure transform as the bottom-docked leaf. If no
+    /// terminal group exists the method falls back to Stacked (no new group
+    /// is spawned — adding spawn here would require `Window` + `Context` and
+    /// entangle the pure reshape with side-effects; callers that want an
+    /// auto-spawned terminal can do so before calling this method).
+    ///
+    /// Focus is restored to whichever group was active before the reshape;
+    /// the caller should focus that group's active tab after this returns.
+    pub fn apply_layout_preset(
+        &mut self,
+        preset: Preset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // For BottomTerminal, find a terminal-bearing group to dock at bottom.
+        let terminal_id = if preset == Preset::BottomTerminal {
+            // Prefer the last terminal group in DFS order so a freshly-split
+            // pane ends up at the bottom (matches the "dock newest terminal"
+            // expectation).
+            let existing = self
+                .manager
+                .in_order_groups()
+                .into_iter()
+                .rev()
+                .find(|id| {
+                    self.groups
+                        .get(id)
+                        .map(|g| g.read(cx).tty_count() > 0)
+                        .unwrap_or(false)
+                });
+            match existing {
+                Some(id) => Some(id),
+                // No terminal group exists yet — spawn one. `split_active_group`
+                // creates a fresh group and opens a terminal tab in it; the
+                // returned id is then docked at the bottom by the reshape, so
+                // Bottom Terminal always lands on a real terminal.
+                None => self.split_active_group(Axis::Vertical, SplitInsert::After, window, cx),
+            }
+        } else {
+            None
+        };
+
+        self.manager.apply_layout_preset(preset, terminal_id);
+
+        // Re-focus the active group so the focused pane stays active.
+        let active_id = self.manager.active_group_id();
+        if let Some(group) = self.groups.get(&active_id) {
+            group.update(cx, |g, cx| g.focus_active(window, cx));
+        }
+        cx.notify();
     }
 
     pub fn open_or_activate_editor_tab(

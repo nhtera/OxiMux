@@ -54,14 +54,14 @@ use crate::notifier::{Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    ActivateGroupTab, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
-    OpenAddProjectDialog, OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog,
-    OpenFileFromContextMenu, OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions,
-    OpenPaneActionsAt, OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt,
-    OpenWorkspaceCreate, RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab,
-    SelectSearchTab, SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt,
-    SplitHorizontal, SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    ActivateGroupTab, ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked,
+    CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow, OpenAddProjectDialog,
+    OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
+    OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
+    OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate,
+    RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
+    SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
+    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -1536,6 +1536,22 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Reshape the active project's pane layout to `preset`. No-op when
+    /// no project is active.
+    fn reshape_active_project_layout(
+        &self,
+        preset: crate::shell::pane_group::layout_presets::Preset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        panes.update(cx, |p, cx| {
+            p.apply_layout_preset(preset, window, cx);
+        });
+    }
+
     /// Close the focused pane group in the active project. Manager
     /// returns `LastGroup` when no siblings exist; we swallow that so
     /// the keybind / menu item is a no-op rather than an error popup.
@@ -2462,6 +2478,18 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|this, _: &SplitUp, window, cx| {
                 this.split_active_pane_group(Axis::Vertical, SplitInsert::Before, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ApplyLayoutStacked, window, cx| {
+                use crate::shell::pane_group::layout_presets::Preset;
+                this.reshape_active_project_layout(Preset::Stacked, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ApplyLayoutHorizontal, window, cx| {
+                use crate::shell::pane_group::layout_presets::Preset;
+                this.reshape_active_project_layout(Preset::Horizontal, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ApplyLayoutBottomTerminal, window, cx| {
+                use crate::shell::pane_group::layout_presets::Preset;
+                this.reshape_active_project_layout(Preset::BottomTerminal, window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseGroup, window, cx| {
                 this.close_active_pane_group(window, cx);

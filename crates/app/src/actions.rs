@@ -419,6 +419,17 @@ actions!(
         /// to a no-op if fewer than two prompt marks are present. Bound
         /// to Cmd+Shift+O ("Output to agent").
         SendLastCommandOutputToAgent,
+        /// Reshape the active project's pane groups into a single vertical
+        /// stack (all panes top-to-bottom). Tab content is preserved.
+        ApplyLayoutStacked,
+        /// Reshape the active project's pane groups side-by-side in a
+        /// single horizontal row. Tab content is preserved.
+        ApplyLayoutHorizontal,
+        /// Reshape the active project's pane groups into a top-content /
+        /// bottom-terminal split, docking a terminal-bearing group at the
+        /// bottom. An existing terminal group is reused; when none exists a
+        /// new terminal group is spawned. Tab content is preserved.
+        ApplyLayoutBottomTerminal,
     ]
 );
 

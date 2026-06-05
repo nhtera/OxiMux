@@ -4,9 +4,24 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-06-05 — Smart git button in the status bar
+### 2026-06-06 — Pane layout presets (stacked / horizontal / bottom-terminal)
 
 **Commits**: pending (this commit)  
+**Touches**: `crates/app/src/shell/pane_group/layout_presets.rs` (NEW), `crates/app/src/shell/pane_group/mod.rs`, `crates/app/src/shell/pane_group_manager.rs`, `crates/app/src/shell/project_panes/mod.rs`, `crates/app/src/actions.rs`, `crates/app/src/keymap.rs`, `crates/app/src/shell/command_palette/entry.rs`, `crates/app/src/workspace_root.rs`
+
+Three one-click presets reshape the active project's pane layout:
+
+- **Stacked** (panes top-to-bottom), **Horizontal** (side-by-side), **Bottom-terminal** (content on top, a terminal docked across the bottom).
+- Triggered from the command palette ("Layout: …") and `⌃⇧1 / ⌃⇧2 / ⌃⇧3`.
+- `apply_preset` is a pure transform over the `PaneTree<PaneGroupId>`: it rebuilds from the existing leaves, so all panes + tabs are preserved (reparent, not recreate). Active-pane focus is restored after reshape.
+- Bottom-terminal docks an existing terminal-bearing group at the bottom, or spawns a new terminal group when none exists.
+- Pure transform unit-tested (shapes, idempotency, leaf preservation); no new pane primitives.
+
+---
+
+### 2026-06-05 — Smart git button in the status bar
+
+**Commits**: `44b1131`  
 **Touches**: `crates/app/src/shell/source_control/mod.rs`, `crates/app/src/shell/status_bar.rs`, `crates/app/src/workspace_root.rs`
 
 Surfaces the Source Control primary-action state machine as a one-click "next git step" button in the status-bar git zone:

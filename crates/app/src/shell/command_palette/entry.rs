@@ -6,8 +6,9 @@
 use gpui::Action;
 
 use crate::actions::{
-    CloseTab, NewTab, OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, Search,
-    SelectSourceControlTab, SplitHorizontal, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab, NewTab,
+    OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, Search, SelectSourceControlTab,
+    SplitHorizontal, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,21 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         keybinding: Some("⌘⇧P"),
         make_action: || Box::new(OpenCommandPalette),
     },
+    CommandEntry {
+        name: "Layout: Stacked",
+        keybinding: Some("⌃⇧1"),
+        make_action: || Box::new(ApplyLayoutStacked),
+    },
+    CommandEntry {
+        name: "Layout: Horizontal",
+        keybinding: Some("⌃⇧2"),
+        make_action: || Box::new(ApplyLayoutHorizontal),
+    },
+    CommandEntry {
+        name: "Layout: Bottom Terminal",
+        keybinding: Some("⌃⇧3"),
+        make_action: || Box::new(ApplyLayoutBottomTerminal),
+    },
 ];
 
 /// Quick Open stub data — replaced by a live file index in a later plan.
@@ -99,8 +115,8 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_eleven_entries() {
-        assert_eq!(PALETTE_COMMANDS.len(), 11);
+    fn palette_commands_has_fourteen_entries() {
+        assert_eq!(PALETTE_COMMANDS.len(), 14);
     }
 
     #[test]

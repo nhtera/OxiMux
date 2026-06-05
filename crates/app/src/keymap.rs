@@ -7,12 +7,13 @@ use gpui::KeyBinding;
 use oximux_editor::SaveFile;
 
 use crate::actions::{
-    CloseGroup, CloseTab, DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane,
-    FocusPrevSubPane, MruNext, MruPrev, NewAgent, NewTab, NewWindow, NextTab,
-    OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate,
-    PrevTab, RefreshSourceControl, Search, SelectExplorerTab, SelectSearchTab,
-    SelectSourceControlTab, SendLastCommandOutputToAgent, SendTerminalSelectionToAgent,
-    SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
+    ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
+    DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane, FocusPrevSubPane, MruNext,
+    MruPrev, NewAgent, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
+    OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, RefreshSourceControl, Search,
+    SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SendLastCommandOutputToAgent,
+    SendTerminalSelectionToAgent, SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar,
+    ToggleRightSidebar, ToggleZoomSubPane,
 };
 
 /// Build the default global key bindings. `main` installs these at boot via
@@ -82,5 +83,9 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-s", SaveFile, None),
         // Escape dismisses any open transient overlay (handled at WorkspaceRoot).
         KeyBinding::new("escape", DismissOverlay, None),
+        // Layout presets — ctrl-shift-1/2/3 are free of macOS system bindings.
+        KeyBinding::new("ctrl-shift-1", ApplyLayoutStacked, None),
+        KeyBinding::new("ctrl-shift-2", ApplyLayoutHorizontal, None),
+        KeyBinding::new("ctrl-shift-3", ApplyLayoutBottomTerminal, None),
     ]
 }

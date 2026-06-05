@@ -159,6 +159,8 @@ src/
     │   ├── mod.rs          StashPanel entity; refresh/apply/pop/request_drop
     │   └── list_render.rs  pure row label helper
     ├── pane_group/
+    │   ├── layout_presets.rs pure apply_preset(tree, Preset) → stacked / horizontal / bottom-terminal
+    │   │                   reshape over PaneTree (rebuilds from leaves; content preserved)
     │   ├── mod.rs          pane group tree entity
     │   ├── sub_pane.rs     TerminalSplitTree; each split leaf is a LeafTabs tab container;
     │   │                   compact chip strip (chips + '+') renders when leaf has > 1 tab;
