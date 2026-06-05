@@ -4461,7 +4461,7 @@ dependencies = [
  "libc",
  "mac-notification-sys",
  "notify-debouncer-full",
- "objc",
+ "objc2",
  "oximux-agents",
  "oximux-core",
  "oximux-editor",
