@@ -629,11 +629,18 @@ impl WorkspaceRoot {
     }
 
     /// Run one concurrent diff-count refresh round. Self-guards against
-    /// overlap via `diff_refresh_in_flight`. Spawns all per-worktree
-    /// `git diff --numstat` shellouts concurrently on the background pool
-    /// (serial per-worktree shellouts previously froze the rail), then writes
-    /// the results back on the main thread and evicts paths that no longer
-    /// exist so the cache cannot grow without bound.
+    /// overlap via `diff_refresh_in_flight`. Fans out all per-worktree
+    /// `git diff --numstat` shellouts concurrently (serial per-worktree
+    /// shellouts previously froze the rail), then writes the results back on
+    /// the main thread and evicts paths that no longer exist so the cache
+    /// cannot grow without bound.
+    ///
+    /// The numstat shellout spawns a child via `tokio::process`, which needs a
+    /// live Tokio reactor. GPUI's background executor has none, so the fan-out
+    /// runs on the app's Tokio runtime (entered on the main thread for the life
+    /// of the app) and results are ferried back over a oneshot to a GPUI task.
+    /// Called only from main-thread GPUI callbacks, where `Handle::try_current`
+    /// resolves to that runtime.
     pub(crate) fn run_diff_refresh_round(&mut self, cx: &mut Context<Self>) {
         if self.diff_refresh_in_flight {
             return;
@@ -642,23 +649,41 @@ impl WorkspaceRoot {
         if paths.is_empty() {
             return;
         }
+        // Bail (leaving the flag clear) when no runtime is entered so a
+        // headless/test context degrades to "no live counts" instead of
+        // panicking inside the child-process spawn.
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::workspace_root",
+                    "no tokio runtime; worktree diff counts stay stale this round"
+                );
+                return;
+            }
+        };
         self.diff_refresh_in_flight = true;
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<Vec<(String, Option<DiffCounts>)>>();
+        handle.spawn(async move {
+            let futs = paths.into_iter().map(|path| async move {
+                let counts = oximux_git::diff_numstat_head(std::path::Path::new(&path))
+                    .await
+                    .ok()
+                    .map(|map| sum_numstat(&map));
+                (path, counts)
+            });
+            let _ = tx.send(futures::future::join_all(futs).await);
+        });
         cx.spawn(async move |weak, cx| {
-            // Fan out all worktree diffs at once on the background executor;
-            // `join_all` waits for the whole batch without blocking the UI.
-            let results: Vec<(String, Option<DiffCounts>)> = cx
-                .background_spawn(async move {
-                    let futs = paths.into_iter().map(|path| async move {
-                        let counts = oximux_git::diff_numstat_head(std::path::Path::new(&path))
-                            .await
-                            .ok()
-                            .map(|map| sum_numstat(&map));
-                        (path, counts)
-                    });
-                    futures::future::join_all(futs).await
-                })
-                .await;
-
+            let Ok(results) = rx.await else {
+                // Sender dropped (runtime torn down) — clear the flag so a
+                // later round can retry rather than wedging in-flight.
+                let _ = weak.update(cx, |this, _| {
+                    this.diff_refresh_in_flight = false;
+                });
+                return;
+            };
             let _ = weak.update(cx, |this, cx| {
                 // Snapshot of paths seen this round drives eviction so removed
                 // worktrees age out of the cache.
