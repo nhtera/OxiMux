@@ -33,7 +33,8 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
-    Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px, svg,
+    Render, StatefulInteractiveElement, Styled, UniformListScrollHandle, WeakEntity, Window, div,
+    px, svg,
 };
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
@@ -44,6 +45,7 @@ use crate::shell::left_rail::workspace_row::DiffCounts;
 use crate::left_rail_layout;
 
 use crate::actions::OpenProjectPicker;
+use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
 use crate::shell::left_rail::toolbar::render_toolbar;
@@ -90,6 +92,9 @@ pub struct LeftRail {
     /// Project ids whose group is collapsed (workspace rows hidden).
     /// Persisted to settings so the collapsed view survives restart.
     collapsed: HashSet<String>,
+    /// Scroll position for the agents dashboard `uniform_list`. Stored on
+    /// `LeftRail` so it survives re-renders while the Agents nav is active.
+    agents_scroll: UniformListScrollHandle,
 }
 
 impl LeftRail {
@@ -113,6 +118,7 @@ impl LeftRail {
             width: px(density.w_left_rail),
             settings_repo: None,
             collapsed: HashSet::new(),
+            agents_scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -219,21 +225,47 @@ impl Render for LeftRail {
         let typography = self.typography.clone();
         let entity = cx.entity().clone();
 
-        let workspace_list = render_workspace_list(
-            self.projects.clone(),
-            self.active_project_id.clone(),
-            self.active_workspace_id.clone(),
-            self.collapsed.clone(),
-            entity.clone(),
-            self.workspaces_by_project.clone(),
-            self.latest_status.clone(),
-            self.live_worktrees.clone(),
-            self.diff_counts.clone(),
-            self.weak_root.clone(),
-            theme,
-            density,
-            &typography,
-        );
+        // The flex-1 body slot changes depending on the active nav item.
+        // Agents → agents dashboard (uniform_list across all projects).
+        // All other nav items → the workspace list (existing behavior).
+        let content_body: gpui::AnyElement = if self.active_nav == NavItem::Agents {
+            render_agents_dashboard(
+                &self.projects,
+                &self.workspaces_by_project,
+                &self.latest_status,
+                &self.live_worktrees,
+                &self.diff_counts,
+                self.weak_root.clone(),
+                &self.agents_scroll,
+                theme,
+                density,
+                &typography,
+            )
+        } else {
+            let workspace_list = render_workspace_list(
+                self.projects.clone(),
+                self.active_project_id.clone(),
+                self.active_workspace_id.clone(),
+                self.collapsed.clone(),
+                entity.clone(),
+                self.workspaces_by_project.clone(),
+                self.latest_status.clone(),
+                self.live_worktrees.clone(),
+                self.diff_counts.clone(),
+                self.weak_root.clone(),
+                theme,
+                density,
+                &typography,
+            );
+            div()
+                .flex()
+                .flex_col()
+                .h_full()
+                .w_full()
+                .child(workspace_header(&entity, theme, density, &typography))
+                .child(div().flex_1().w_full().child(workspace_list))
+                .into_any_element()
+        };
 
         // Body fills the column minus the right-edge resize handle.
         let body = div()
@@ -251,8 +283,7 @@ impl Render for LeftRail {
                 &typography,
             ))
             .child(divider(theme))
-            .child(workspace_header(&entity, theme, density, &typography))
-            .child(div().flex_1().w_full().child(workspace_list))
+            .child(div().flex_1().w_full().child(content_body))
             .child(render_toolbar(theme, density, &typography));
 
         div()

@@ -4,9 +4,26 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-05 — Agents dashboard (attention-sorted, all-projects)
+
+**Commits**: pending (this commit)  
+**Touches**: `crates/app/src/shell/agents_dashboard/{mod,model,row_render}.rs` (NEW), `crates/app/src/shell/mod.rs`, `crates/app/src/shell/left_rail/mod.rs`
+
+Wires the previously-inert `Agents` nav item to a real all-agents dashboard:
+
+- One virtualized (`uniform_list`) row per live/status-bearing agent across **all** projects/worktrees; dormant workspaces excluded.
+- Sorted by **attention priority**: needs-input / waiting-for-approval float to the top, then running, then idle/live, then done/failed.
+- Each row shows project · branch · agent name · status verb · diff `+A −B`, reusing the rich-card `agent_verb` + `diff_counts` (no duplicated logic).
+- Clicking a row activates that project + workspace and focuses its agent tab via the existing `activate_workspace` path (cross-project switch).
+- Long rows scroll horizontally instead of clipping in the narrow rail (`with_width_from_item` at the widest row).
+
+Pure data layer (`model.rs`: `attention_rank`, `sort_agent_rows`, `build_agent_rows`, `widest_row_index`) is fully unit-tested.
+
+---
+
 ### 2026-06-05 — Left-rail rich worktree cards + live diff counts
 
-**Commits**: `e77c51e`  
+**Commits**: `003e034`  
 **Touches**: `crates/app/src/shell/agent_presentation.rs` (NEW), `crates/app/src/shell/left_rail/workspace_card.rs` (NEW), `crates/app/src/shell/left_rail/workspace_row.rs`, `crates/app/src/shell/left_rail/{mod.rs,project_group.rs}`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/workspace_ops.rs`
 
 Replaces single-line workspace rows in the left rail with two-line rich cards:

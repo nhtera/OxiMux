@@ -66,6 +66,12 @@ src/
     │   │                   CARD_HEIGHT_MULT = 2.2 × h_row (design-guidelines approved exception)
     │   ├── project_group.rs renders project groups; threads diff_counts snapshot into card builder
     │   └── toolbar.rs      Add Project + settings (stubs)
+    ├── agents_dashboard/   all-agents view rendered when the Agents nav item is active
+    │   ├── model.rs        pure: AgentRow, attention_rank, sort_agent_rows, build_agent_rows,
+    │   │                   widest_row_index — assembled from LeftRail's pushed-down snapshot
+    │   ├── row_render.rs   single-row painter (project · branch · name · verb · diff)
+    │   └── mod.rs          render_agents_dashboard — virtualized uniform_list + empty state;
+    │                       row click → activate_workspace (cross-project focus)
     ├── command_palette/    Cmd+P / Cmd+Shift+P modal overlay
     │   ├── mod.rs          PaletteModal entity (open/close/mode/query state)
     │   ├── entry.rs        PALETTE_COMMANDS (11 actions, fn-ptr factories) + QUICK_OPEN_STUBS
