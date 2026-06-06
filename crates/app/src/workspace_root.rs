@@ -61,7 +61,8 @@ use crate::actions::{
     OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt, OpenWorkspaceCreate,
     RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
-    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleFloatingTerminal, ToggleLeftSidebar,
+    ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -175,6 +176,13 @@ pub struct WorkspaceRoot {
     /// terminal + AI settings that already round-trip to disk, plus
     /// read-only keybindings / appearance / about references.
     pub(crate) settings_modal: Entity<SettingsModal>,
+    /// In-window floating ("PiP") terminal. `None` until first toggled;
+    /// retained across hides (PTY persists) until the card's close button
+    /// drops it. `floating_terminal_visible` gates whether it renders.
+    pub(crate) floating_terminal: Option<Entity<crate::shell::floating_terminal::FloatingTerminal>>,
+    pub(crate) floating_terminal_visible: bool,
+    /// Subscription to the floating terminal's Close event.
+    pub(crate) _floating_terminal_sub: Option<Subscription>,
     /// Workspace create / rename dialog (Cmd+Shift+N + sidebar rename).
     pub(crate) workspace_dialog: Entity<WorkspaceDialog>,
     /// Active type-to-confirm dialog (per-request; `None` when idle).
@@ -589,6 +597,9 @@ impl WorkspaceRoot {
             push_stash_dialog: None,
             _push_stash_dialog_observer: None,
             _show_commit_subscription: None,
+            floating_terminal: None,
+            floating_terminal_visible: false,
+            _floating_terminal_sub: None,
             app_state,
             project_picker,
             settings_modal,
@@ -735,6 +746,64 @@ impl WorkspaceRoot {
             return;
         };
         panes.update(cx, |p, cx| p.open_terminal_tab_in_active_group(window, cx));
+    }
+
+    /// Toggle the in-window floating terminal. First dispatch lazily spawns it
+    /// at the active worktree cwd (the PTY then persists across hides); later
+    /// dispatches just flip its visibility. The card's close button drops the
+    /// entity (tearing the PTY down), so a later toggle spawns a fresh one.
+    fn toggle_floating_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.floating_terminal.is_some() {
+            self.floating_terminal_visible = !self.floating_terminal_visible;
+            cx.notify();
+            return;
+        }
+        // Spawn at the active pane group's cwd (the current worktree), falling
+        // back to the home dir when there's no active project.
+        let cwd = self
+            .active_project_panes()
+            .map(|p| p.read(cx).cwd().clone())
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let settings_repo = Some(self.app_state.settings_repo.clone());
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        // Spawn the PTY up front so we can bail before creating the entity when
+        // no backend is available (otherwise `cx.new` would build a card around
+        // a dead terminal).
+        let ids = crate::shell::context_env::SurfaceIds::fresh(cwd.to_string_lossy().into_owned());
+        let Some((backend, session_id)) =
+            crate::shell::terminal_view::spawn_local_pty(cwd, ids.env())
+        else {
+            tracing::warn!("floating terminal: PTY spawn failed; not showing");
+            return;
+        };
+        let entity = cx.new(|cx| {
+            crate::shell::floating_terminal::FloatingTerminal::new(
+                backend,
+                session_id,
+                ids,
+                settings_repo,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        self._floating_terminal_sub = Some(cx.subscribe(
+            &entity,
+            |this, _entity, _event: &crate::shell::floating_terminal::FloatingTerminalEvent, cx| {
+                this.floating_terminal = None;
+                this.floating_terminal_visible = false;
+                this._floating_terminal_sub = None;
+                cx.notify();
+            },
+        ));
+        self.floating_terminal = Some(entity);
+        self.floating_terminal_visible = true;
+        cx.notify();
     }
 
     /// Resolves the currently-visible `ProjectPanes` entity by reading
@@ -2000,6 +2069,9 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.settings_modal.update(cx, |m, cx| m.open(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &ToggleFloatingTerminal, window, cx| {
+                this.toggle_floating_terminal(window, cx);
+            }))
             .on_action(
                 cx.listener(|this, action: &RequestOpenAdapterPicker, window, cx| {
                     // Anchor precedence:
@@ -2716,6 +2788,14 @@ impl Render for WorkspaceRoot {
                     },
                 )
             })
+            // Floating ("PiP") terminal — sits above the workspace panels but
+            // below every popover / modal that follows. Retained across hides
+            // (the PTY persists); only rendered while `*_visible` is set.
+            .children(
+                self.floating_terminal_visible
+                    .then(|| self.floating_terminal.clone())
+                    .flatten(),
+            )
             // Pane Actions dropdown — appended before the palette so the
             // palette (more rare, larger) wins z-order when both are open.
             .child(self.pane_actions.clone())

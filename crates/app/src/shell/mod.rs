@@ -19,6 +19,7 @@ pub mod context_env;
 pub mod cwd_resolver;
 pub mod diff_view;
 pub mod file_explorer;
+pub mod floating_terminal;
 pub mod file_tree_context_menu;
 pub mod file_tree_view;
 pub mod git_panel;

@@ -13,8 +13,8 @@ use crate::actions::{
     OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenWorkspaceCreate, PrevTab,
     RefreshSourceControl, Search,
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SendLastCommandOutputToAgent,
-    SendTerminalSelectionToAgent, SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar,
-    ToggleRightSidebar, ToggleZoomSubPane,
+    SendTerminalSelectionToAgent, SplitSubPaneDown, SplitSubPaneRight, ToggleFloatingTerminal,
+    ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
 };
 
 /// Build the default global key bindings. `main` installs these at boot via
@@ -69,6 +69,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-o", OpenProjectPicker, None),
         // cmd-, opens the settings modal (macOS Preferences convention).
         KeyBinding::new("cmd-,", OpenSettings, None),
+        // cmd-shift-t toggles the in-window floating ("PiP") terminal.
+        KeyBinding::new("cmd-shift-t", ToggleFloatingTerminal, None),
         KeyBinding::new("cmd-shift-n", OpenWorkspaceCreate, None),
         // cmd-shift-a spawns a new agent tab using the first built-in adapter.
         KeyBinding::new("cmd-shift-a", NewAgent, None),
