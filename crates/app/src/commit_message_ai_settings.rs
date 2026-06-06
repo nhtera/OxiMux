@@ -92,6 +92,18 @@ fn apply(cx: &mut App, settings: CommitMessageAiSettings) {
     cx.set_global(settings);
 }
 
+/// Persist `settings` to `commit_message_ai.toml`. The live-reload
+/// watcher reparses and swaps the global, so callers MUST NOT also
+/// `set_global` (that would race the debouncer).
+pub fn save(settings: &CommitMessageAiSettings) -> std::io::Result<()> {
+    let path = settings_path()
+        .ok_or_else(|| std::io::Error::other("no app data dir for commit_message_ai.toml"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, settings.to_toml_string())
+}
+
 /// True when a debounced batch touched `commit_message_ai.toml`
 /// (ignoring the sibling files that share the data dir).
 fn batch_touches_settings(result: &DebounceEventResult) -> bool {

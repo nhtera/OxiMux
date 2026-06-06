@@ -37,6 +37,7 @@ pub mod project_picker;
 pub mod rename_tab_dialog;
 pub mod right_sidebar;
 pub mod search_panel;
+pub mod settings_modal;
 pub mod source_control;
 pub mod split_direction;
 pub mod stash_panel;

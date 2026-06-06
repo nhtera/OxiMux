@@ -1,6 +1,6 @@
 //! Bottom toolbar of the left rail — "Add Project" button + settings icon.
 //!
-//! Settings cog is still a TODO stub (lands with settings round-trip).
+//! The settings cog dispatches `OpenSettings`, opening the settings modal.
 
 use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -9,7 +9,7 @@ use gpui::{
 use gpui_component::tooltip::Tooltip;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::OpenAddProjectDialog;
+use crate::actions::{OpenAddProjectDialog, OpenSettings};
 
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const ICON_SIZE: f32 = 14.0;
@@ -59,7 +59,12 @@ fn settings_icon(theme: Theme) -> impl IntoElement {
     div()
         .id("left-rail-settings")
         .cursor_pointer()
+        .text_color(theme.fg_muted)
+        .hover(|s| s.text_color(theme.fg_base))
         .tooltip(|window, cx| Tooltip::new("Settings").build(window, cx))
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+            window.dispatch_action(Box::new(OpenSettings), cx);
+        })
         .child(
             svg()
                 .path("icons/settings.svg")

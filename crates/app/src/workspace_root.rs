@@ -58,7 +58,7 @@ use crate::actions::{
     CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow, OpenAddProjectDialog,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
-    OpenProjectPicker, OpenQuickOpen, OpenTabContextMenuAt, OpenWorkspaceCreate,
+    OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt, OpenWorkspaceCreate,
     RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
     SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
@@ -94,6 +94,7 @@ use crate::shell::{
     pane_actions::{PaneActionsAnchor, PaneActionsMenu},
     project_panes::ProjectPanes,
     project_picker::{OnPick, ProjectPickerModal},
+    settings_modal::SettingsModal,
     right_sidebar::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
     },
@@ -170,6 +171,10 @@ pub struct WorkspaceRoot {
     pub(crate) app_state: AppState,
     /// Project picker modal (Cmd+O).
     pub(crate) project_picker: Entity<ProjectPickerModal>,
+    /// Settings modal (Cmd+, or left-rail cog). Minimal panes wiring the
+    /// terminal + AI settings that already round-trip to disk, plus
+    /// read-only keybindings / appearance / about references.
+    pub(crate) settings_modal: Entity<SettingsModal>,
     /// Workspace create / rename dialog (Cmd+Shift+N + sidebar rename).
     pub(crate) workspace_dialog: Entity<WorkspaceDialog>,
     /// Active type-to-confirm dialog (per-request; `None` when idle).
@@ -433,6 +438,8 @@ impl WorkspaceRoot {
                 cx,
             )
         });
+        let settings_modal =
+            cx.new(|cx| SettingsModal::new(theme, density, typography.clone(), cx));
 
         // Workspace dialog: same weak-ref pattern. Submit payload carries
         // the mode (Create vs Rename) — `WorkspaceRoot` dispatches to
@@ -584,6 +591,7 @@ impl WorkspaceRoot {
             _show_commit_subscription: None,
             app_state,
             project_picker,
+            settings_modal,
             workspace_dialog,
             confirm_dialog: None,
             rename_tab_dialog: None,
@@ -1940,8 +1948,18 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
                 // Mutex with every other full-window overlay (close-then-open).
                 this.close_modal_overlays(cx);
-                this.palette
-                    .update(cx, |p, cx| p.open(PaletteMode::QuickOpen, window, cx));
+                let root = this
+                    .active_project
+                    .as_ref()
+                    .map(|p| std::path::PathBuf::from(&p.root_path));
+                this.palette.update(cx, |p, cx| {
+                    p.open(PaletteMode::QuickOpen, window, cx);
+                    // Lazily build the file index for the active project; the
+                    // call is a no-op when already loaded for this project.
+                    if let Some(root) = root {
+                        p.kick_file_index(root, cx);
+                    }
+                });
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.close_modal_overlays(cx);
@@ -1972,6 +1990,15 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.project_picker
                     .update(cx, |p, cx| p.open(projects, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                // Toggle: a second Cmd+, (or cog click) closes it.
+                if this.settings_modal.read(cx).is_open() {
+                    this.settings_modal.update(cx, |m, cx| m.close(cx));
+                    return;
+                }
+                this.close_modal_overlays(cx);
+                this.settings_modal.update(cx, |m, cx| m.open(window, cx));
             }))
             .on_action(
                 cx.listener(|this, action: &RequestOpenAdapterPicker, window, cx| {
@@ -2761,9 +2788,11 @@ impl Render for WorkspaceRoot {
                         .child(dialog),
                 )
             })
-            // Palette modal — appended last so it paints above all other
-            // children (last child = topmost z-layer in GPUI).
+            // Palette modal — appended above the rest of the chrome.
             .child(self.palette.clone())
+            // Settings modal — appended last so it paints above all other
+            // children (last child = topmost z-layer in GPUI).
+            .child(self.settings_modal.clone())
     }
 }
 

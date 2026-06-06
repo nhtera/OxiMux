@@ -1,0 +1,102 @@
+//! Left navigation for the settings modal: the pane enum + nav list.
+
+use gpui::{
+    AnyElement, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Styled,
+    div, prelude::FluentBuilder, px,
+};
+use oximux_settings::{Density, Theme, Typography};
+
+use super::SettingsModal;
+
+/// Width of the left nav column.
+const NAV_WIDTH: f32 = 184.0;
+
+/// Which settings pane is shown in the body. `Appearance` + `About` are
+/// read-only; `Terminal` + `Agents` round-trip to disk; `Keybindings`
+/// is a read-only reference list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPane {
+    Terminal,
+    Agents,
+    Keybindings,
+    Appearance,
+    About,
+}
+
+impl SettingsPane {
+    pub(super) const ALL: [SettingsPane; 5] = [
+        SettingsPane::Terminal,
+        SettingsPane::Agents,
+        SettingsPane::Keybindings,
+        SettingsPane::Appearance,
+        SettingsPane::About,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            SettingsPane::Terminal => "Terminal",
+            SettingsPane::Agents => "Agents / AI",
+            SettingsPane::Keybindings => "Keybindings",
+            SettingsPane::Appearance => "Appearance",
+            SettingsPane::About => "About",
+        }
+    }
+}
+
+/// Build the left nav column with a selected-row tint per the list-row
+/// convention in `docs/design-guidelines.md`.
+pub(super) fn render_nav(
+    selected: SettingsPane,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> impl IntoElement {
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .w(px(NAV_WIDTH))
+        .flex_none()
+        .h_full()
+        .py(px(density.pad_panel))
+        .px(px(density.pad_row))
+        .gap(px(2.0))
+        .border_r_1()
+        .border_color(theme.border_inactive)
+        .bg(theme.bg_panel);
+
+    for (idx, pane) in SettingsPane::ALL.into_iter().enumerate() {
+        col = col.child(nav_row(idx, pane, pane == selected, theme, density, typography, cx));
+    }
+    col
+}
+
+fn nav_row(
+    idx: usize,
+    pane: SettingsPane,
+    selected: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let fg = if selected { theme.fg_base } else { theme.fg_muted };
+    div()
+        .id(SharedString::from(format!("settings-nav-{idx}")))
+        .flex()
+        .items_center()
+        .h(px(density.h_action_row))
+        .px(px(density.pad_row))
+        .rounded(px(density.r_xs))
+        .text_size(px(typography.t_body_sm))
+        .text_color(fg)
+        .cursor_pointer()
+        .when(selected, |s| s.bg(theme.bg_panel_alt))
+        .when(!selected, |s| s.hover(|h| h.text_color(theme.fg_base)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, _window, cx| this.select_pane(pane, cx)),
+        )
+        .child(pane.label())
+        .into_any_element()
+}

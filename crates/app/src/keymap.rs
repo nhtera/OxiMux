@@ -10,7 +10,8 @@ use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
     DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane, FocusPrevSubPane, MruNext,
     MruPrev, NewAgent, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
-    OpenProjectPicker, OpenQuickOpen, OpenWorkspaceCreate, PrevTab, RefreshSourceControl, Search,
+    OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenWorkspaceCreate, PrevTab,
+    RefreshSourceControl, Search,
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SendLastCommandOutputToAgent,
     SendTerminalSelectionToAgent, SplitSubPaneDown, SplitSubPaneRight, ToggleLeftSidebar,
     ToggleRightSidebar, ToggleZoomSubPane,
@@ -66,6 +67,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-p", OpenQuickOpen, None),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
         KeyBinding::new("cmd-o", OpenProjectPicker, None),
+        // cmd-, opens the settings modal (macOS Preferences convention).
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-shift-n", OpenWorkspaceCreate, None),
         // cmd-shift-a spawns a new agent tab using the first built-in adapter.
         KeyBinding::new("cmd-shift-a", NewAgent, None),

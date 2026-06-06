@@ -15,8 +15,10 @@ use std::path::{Path, PathBuf};
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
 use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::{Repository, derive_slug, validate_slug};
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, ScriptKind, Theme, Typography};
 use oximux_storage::{ProjectRepo, StorageError, WorkspaceRepo};
+
+use crate::shell::left_rail::row_menu::ScriptAvail;
 
 use crate::project_panes_factory::{
     build_project_panes, compute_attach_hints, compute_leaf_attach_hints, load_persisted_tabs,
@@ -299,6 +301,10 @@ impl WorkspaceRoot {
         // Reload custom commands for the new project so the palette reflects
         // the incoming project's `.oximux/commands.toml` immediately.
         self.reload_custom_commands(cx);
+        // Drop the Quick Open file index so the next open re-scans the new
+        // project (prevents the previous project's files leaking through).
+        self.palette
+            .update(cx, |p, cx| p.invalidate_file_index(cx));
         let project_root = PathBuf::from(&project.root_path);
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
@@ -516,6 +522,7 @@ impl WorkspaceRoot {
         self.pane_actions.update(cx, |p, cx| p.close(cx));
         self.adapter_picker.update(cx, |p, cx| p.close(cx));
         self.project_picker.update(cx, |p, cx| p.close(cx));
+        self.settings_modal.update(cx, |m, cx| m.close(cx));
         self.workspace_dialog.update(cx, |d, cx| d.close(cx));
         self.row_menu.update(cx, |m, cx| m.close(cx));
         self.project_menu.update(cx, |m, cx| m.close(cx));
@@ -532,8 +539,53 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         self.close_modal_overlays(cx);
+        // Load lifecycle scripts so the menu only surfaces Run-* rows for
+        // scripts the project actually defines. The worktree carries the
+        // committed `.oximux/scripts.toml`, so load from its path.
+        // `run_workspace_script` re-reads the file on click so an edit made
+        // while the menu was open is still respected.
+        let scripts =
+            crate::project_scripts_loader::load_for_project(Path::new(&workspace.worktree_path));
+        let avail = ScriptAvail {
+            setup: scripts.script(ScriptKind::Setup).is_some(),
+            run: scripts.script(ScriptKind::Run).is_some(),
+            cleanup: scripts.script(ScriptKind::Cleanup).is_some(),
+        };
         self.row_menu
-            .update(cx, |m, cx| m.open(workspace, x, y, cx));
+            .update(cx, |m, cx| m.open(workspace, avail, x, y, cx));
+    }
+
+    /// Run a per-project lifecycle script (setup/run/cleanup) for `workspace`
+    /// in a real, interactive terminal tab rooted at its worktree. No-ops
+    /// (with a log) when the script is undefined — the menu shouldn't have
+    /// offered it, but stay defensive against a config that changed on disk
+    /// between menu-open and click.
+    pub(crate) fn run_workspace_script(
+        &mut self,
+        workspace: Workspace,
+        kind: ScriptKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = PathBuf::from(&workspace.worktree_path);
+        let scripts = crate::project_scripts_loader::load_for_project(&cwd);
+        let Some(script) = scripts.script(kind) else {
+            tracing::info!(
+                kind = kind.as_str(),
+                worktree = %workspace.worktree_path,
+                "run_workspace_script: script not defined; ignoring"
+            );
+            return;
+        };
+        let title = format!("{}: {}", kind.as_str(), workspace.name);
+        let script = script.to_string();
+        let Some(panes) = self.active_project_panes() else {
+            tracing::warn!("run_workspace_script: no active project panes");
+            return;
+        };
+        panes.update(cx, |p, cx| {
+            p.open_script_terminal_tab_in_active_group(cwd, title.into(), &script, window, cx);
+        });
     }
 
     /// Open the per-project-header action popover at the given screen
@@ -753,7 +805,17 @@ impl WorkspaceRoot {
                     let _ = weak.update_in(cx, |this, window, cx| {
                         cx.notify();
                         if let Some(kind) = agent {
-                            this.spawn_agent_tab(kind, agent_adapter_id(kind), cwd, window, cx);
+                            this.spawn_agent_tab(kind, agent_adapter_id(kind), cwd.clone(), window, cx);
+                        }
+                        // Opt-in: run the project's setup script in a terminal
+                        // tab right after the worktree exists. `auto_setup`
+                        // defaults off; the Setup row is always available
+                        // manually regardless of this flag. Opened after the
+                        // agent tab, so when both fire the setup tab is the
+                        // active one — the user opted into setup, so seeing it
+                        // run is the intended focus.
+                        if crate::project_scripts_loader::load_for_project(&cwd).auto_setup {
+                            this.run_workspace_script(workspace, ScriptKind::Setup, window, cx);
                         }
                     });
                 }

@@ -435,6 +435,11 @@ actions!(
         /// palette's custom command list. No file watcher — reload is
         /// manual via this palette entry.
         ReloadCustomCommands,
+        /// Open the settings modal (Cmd+,). Toggles closed on a second
+        /// dispatch. Surfaces the terminal + AI settings that already
+        /// round-trip to disk, a read-only keybindings list, and an
+        /// appearance/about pane. Also reachable via the left-rail cog.
+        OpenSettings,
     ]
 );
 

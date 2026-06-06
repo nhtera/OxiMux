@@ -94,6 +94,25 @@ fn apply(cx: &mut App, settings: TerminalSettings) {
     cx.set_global(settings);
 }
 
+/// Resolved app data dir (where `terminal.toml` + sibling configs live).
+/// Public so the settings UI can surface the path in its About pane.
+pub fn app_data_dir() -> Option<PathBuf> {
+    data_dir()
+}
+
+/// Persist `settings` to `terminal.toml`. The live-reload watcher then
+/// reparses and swaps the global, so callers MUST NOT also `set_global`
+/// (that would race the debouncer). Best-effort directory create so a
+/// fresh profile that never seeded the file still writes cleanly.
+pub fn save(settings: &TerminalSettings) -> std::io::Result<()> {
+    let path = settings_path()
+        .ok_or_else(|| std::io::Error::other("no app data dir for terminal.toml"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, settings.to_toml_string())
+}
+
 /// True when a debounced batch touched `terminal.toml` (ignoring the sqlite
 /// WAL/shm files that share the data dir).
 fn batch_touches_settings(result: &DebounceEventResult) -> bool {
