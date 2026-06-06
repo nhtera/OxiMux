@@ -15,8 +15,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, Styled, Window, div, px,
+    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Render, Styled, Window, div, px,
 };
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
@@ -110,6 +110,7 @@ impl ProjectPickerModal {
         self.projects.clear();
         self.selected_idx = 0;
         self.pending_folder_pick = false;
+        cx.emit(ProjectPickerEvent::Closed);
         cx.notify();
     }
 
@@ -221,6 +222,14 @@ pub fn wrap_index(current: usize, delta: isize, count: usize) -> usize {
     let wrapped = ((signed % modulus) + modulus) % modulus;
     wrapped as usize
 }
+
+/// Emitted when the picker closes, so `WorkspaceRoot` can reclaim keyboard
+/// focus (the picker focuses itself on open).
+pub enum ProjectPickerEvent {
+    Closed,
+}
+
+impl EventEmitter<ProjectPickerEvent> for ProjectPickerModal {}
 
 impl Focusable for ProjectPickerModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

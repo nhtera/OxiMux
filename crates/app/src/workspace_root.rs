@@ -68,7 +68,7 @@ use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
     adapter_picker::{AdapterPicker, AdapterSelection, OnSelect},
     add_project_dialog::AddProjectDialog,
-    command_palette::{PaletteModal, entry::PaletteMode},
+    command_palette::{PaletteEvent, PaletteModal, entry::PaletteMode},
     confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt},
     file_tree_context_menu::FileTreeContextMenu,
     git_panel::{
@@ -94,8 +94,8 @@ use crate::shell::{
     openable_text_file::is_openable_text_file,
     pane_actions::{PaneActionsAnchor, PaneActionsMenu},
     project_panes::ProjectPanes,
-    project_picker::{OnPick, ProjectPickerModal},
-    settings_modal::SettingsModal,
+    project_picker::{OnPick, ProjectPickerEvent, ProjectPickerModal},
+    settings_modal::{SettingsModal, SettingsModalEvent},
     right_sidebar::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
     },
@@ -183,6 +183,14 @@ pub struct WorkspaceRoot {
     pub(crate) floating_terminal_visible: bool,
     /// Subscription to the floating terminal's Close event.
     pub(crate) _floating_terminal_sub: Option<Subscription>,
+    /// Restores workspace focus when the settings modal closes, so global key
+    /// bindings (Cmd+,, etc.) keep dispatching instead of dying on an orphaned
+    /// focus handle.
+    pub(crate) _settings_modal_sub: Option<Subscription>,
+    /// Same focus-restore guard for the command palette and project picker
+    /// (both grab focus on open).
+    pub(crate) _palette_sub: Option<Subscription>,
+    pub(crate) _project_picker_sub: Option<Subscription>,
     /// Workspace create / rename dialog (Cmd+Shift+N + sidebar rename).
     pub(crate) workspace_dialog: Entity<WorkspaceDialog>,
     /// Active type-to-confirm dialog (per-request; `None` when idle).
@@ -448,6 +456,33 @@ impl WorkspaceRoot {
         });
         let settings_modal =
             cx.new(|cx| SettingsModal::new(theme, density, typography.clone(), cx));
+        // When the settings modal closes (×, Esc, click-outside, or toggle),
+        // return keyboard focus to the workspace root. The modal grabs focus
+        // for its search field on open; without this the handle stays focused
+        // after it hides and global shortcuts (Cmd+,) silently stop firing.
+        let settings_modal_sub = cx.subscribe_in(
+            &settings_modal,
+            window,
+            |root, _modal, _ev: &SettingsModalEvent, window, cx| {
+                root.focus_handle.focus(window, cx);
+            },
+        );
+        // The command palette and project picker grab focus on open too; restore
+        // workspace focus when they close so global shortcuts keep dispatching.
+        let palette_sub = cx.subscribe_in(
+            &palette,
+            window,
+            |root, _palette, _ev: &PaletteEvent, window, cx| {
+                root.focus_handle.focus(window, cx);
+            },
+        );
+        let project_picker_sub = cx.subscribe_in(
+            &project_picker,
+            window,
+            |root, _picker, _ev: &ProjectPickerEvent, window, cx| {
+                root.focus_handle.focus(window, cx);
+            },
+        );
 
         // Workspace dialog: same weak-ref pattern. Submit payload carries
         // the mode (Create vs Rename) — `WorkspaceRoot` dispatches to
@@ -600,6 +635,9 @@ impl WorkspaceRoot {
             floating_terminal: None,
             floating_terminal_visible: false,
             _floating_terminal_sub: None,
+            _settings_modal_sub: Some(settings_modal_sub),
+            _palette_sub: Some(palette_sub),
+            _project_picker_sub: Some(project_picker_sub),
             app_state,
             project_picker,
             settings_modal,

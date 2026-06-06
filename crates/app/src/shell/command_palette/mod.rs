@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, Render,
-    Task, Window, div,
+    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, Render, Task, Window, div,
 };
 use oximux_settings::{CustomCommand, Density, Theme, Typography};
 use tokio::sync::oneshot;
@@ -255,6 +255,7 @@ impl PaletteModal {
         self.open = false;
         self.query.clear();
         self.selected_idx = 0;
+        cx.emit(PaletteEvent::Closed);
         cx.notify();
     }
 
@@ -310,6 +311,14 @@ impl PaletteModal {
         }
     }
 }
+
+/// Emitted when the palette closes, so `WorkspaceRoot` can reclaim keyboard
+/// focus (the palette focuses its query field on open).
+pub enum PaletteEvent {
+    Closed,
+}
+
+impl EventEmitter<PaletteEvent> for PaletteModal {}
 
 impl Focusable for PaletteModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
