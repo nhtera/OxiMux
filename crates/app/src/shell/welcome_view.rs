@@ -2,30 +2,30 @@
 //! are mounted.
 //!
 //! Borderless, centered directly on the workspace background. Logo tile,
-//! wordmark, tagline, and a flat list of keyboard shortcuts — no card
-//! surround. `should_show_welcome` is the pure predicate used in tests;
-//! Phase 04 will extend it to also gate on workspace selection.
+//! wordmark, launch actions, and a compact keyboard strip — no full-screen
+//! marketing hero. `should_show_welcome` is the pure predicate used in tests.
 
 use gpui::{IntoElement, ParentElement, Styled, div, px, svg};
 use oximux_settings::{Density, Theme, Typography};
 
-const LOGO_TILE_SIZE: f32 = 96.0;
-const LOGO_GLYPH_SIZE: f32 = 56.0;
-const CONTENT_MAX_W: f32 = 520.0;
-const SECTION_GAP: f32 = 20.0;
+use crate::shell::welcome_actions;
+
+const LOGO_TILE_SIZE: f32 = 72.0;
+const LOGO_GLYPH_SIZE: f32 = 40.0;
+const CONTENT_MAX_W: f32 = 560.0;
+const SECTION_GAP: f32 = 16.0;
 const TAGLINE_GAP: f32 = 8.0;
 
 /// Static list of shortcut hint rows shown in the welcome screen. Each
 /// shortcut is an ordered slice of key glyphs — rendered as one chip per
 /// token with a small gap between, instead of a single "cmd-shift-p"
-/// pill. Items marked "(Phase 05)" land when the command palette ships.
+/// pill. The welcome state keeps only project-entry shortcuts because
+/// terminal and split-pane commands need an active workspace.
 pub const SHORTCUT_HINTS: &[(&[&str], &str)] = &[
     (&["\u{2318}", "O"], "Open a project"),
-    (&["\u{2318}", "T"], "New terminal"),
-    (&["\u{2318}", "D"], "Split pane horizontally"),
-    (&["\u{2318}", "L"], "Toggle right sidebar"),
-    (&["\u{2318}", "P"], "Quick Open (Phase 05)"),
-    (&["\u{2318}", "\u{21E7}", "P"], "Command Palette (Phase 05)"),
+    (&["\u{2318}", "\u{21E7}", "N"], "New workspace"),
+    (&["\u{2318}", "P"], "Quick Open"),
+    (&["\u{2318}", "\u{21E7}", "P"], "Command Palette"),
 ];
 
 /// Pure predicate — show welcome only when there are no live project panes.
@@ -54,6 +54,7 @@ fn content(theme: Theme, density: Density, typography: &Typography) -> impl Into
         .child(logo_tile(theme, density))
         .child(wordmark(theme, typography))
         .child(tagline(theme, typography))
+        .child(welcome_actions::launch_panel(theme, density, typography))
         .child(hints(theme, density, typography))
 }
 
@@ -94,7 +95,7 @@ fn tagline(theme: Theme, typography: &Typography) -> impl IntoElement {
     div()
         .text_size(px(typography.t_body_md))
         .text_color(theme.fg_subtle)
-        .child("Open a terminal to begin.")
+        .child("Open a project, create a workspace, then start an agent.")
 }
 
 fn hints(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
@@ -175,12 +176,12 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_hints_count_is_six() {
-        assert_eq!(SHORTCUT_HINTS.len(), 6);
+    fn shortcut_hints_count_is_four() {
+        assert_eq!(SHORTCUT_HINTS.len(), 4);
     }
 
     #[test]
-    fn content_max_width_is_520() {
-        const _: () = assert!(CONTENT_MAX_W == 520.0);
+    fn content_max_width_is_560() {
+        const _: () = assert!(CONTENT_MAX_W == 560.0);
     }
 }

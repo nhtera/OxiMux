@@ -53,6 +53,8 @@ pub mod terminal_search_overlay;
 pub mod terminal_search_state;
 pub mod terminal_view;
 pub mod top_bar;
+pub mod welcome_actions;
+pub mod welcome_flow;
 pub mod welcome_view;
 pub mod workspace_dialog;
 pub mod workspace_ops;
