@@ -198,6 +198,55 @@ fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
     )
 }
 
+/// Max time to wait for a per-project `cleanup` teardown before forcing the
+/// worktree removal anyway.
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run the project's `cleanup` script (from `.oximux/scripts.toml`) to
+/// completion at `worktree_path` BEFORE the worktree is removed, bounded by
+/// [`CLEANUP_TIMEOUT`]. Best-effort and non-blocking to deletion: a missing
+/// script, a non-zero exit, an exec failure, or a timeout are each logged and
+/// then ignored — teardown must never trap the user behind a failed remove.
+/// `kill_on_drop` ensures a hung child is killed when the timeout future is
+/// dropped (the force-remove escape). Output is discarded; this is a captured
+/// subprocess, distinct from the interactive "Run cleanup" terminal tab.
+async fn run_cleanup_before_remove(worktree_path: &Path) {
+    run_cleanup_bounded(worktree_path, CLEANUP_TIMEOUT).await;
+}
+
+/// Inner implementation with an injectable timeout so the force-escape (a hung
+/// cleanup must not block removal) can be unit-tested with a short bound.
+async fn run_cleanup_bounded(worktree_path: &Path, timeout: std::time::Duration) {
+    let scripts = crate::project_scripts_loader::load_for_project(worktree_path);
+    let Some(cleanup) = scripts.script(ScriptKind::Cleanup) else {
+        return;
+    };
+    let cleanup = cleanup.to_string();
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-lc")
+        .arg(&cleanup)
+        .current_dir(worktree_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let wt = worktree_path.display();
+    match tokio::time::timeout(timeout, cmd.status()).await {
+        Ok(Ok(status)) if status.success() => {
+            tracing::info!(worktree = %wt, "cleanup script completed before removal");
+        }
+        Ok(Ok(status)) => {
+            tracing::warn!(worktree = %wt, ?status, "cleanup script exited non-zero; removing anyway");
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(worktree = %wt, ?err, "cleanup script failed to start; removing anyway");
+        }
+        Err(_) => {
+            tracing::warn!(worktree = %wt, "cleanup script timed out; killed, removing anyway");
+        }
+    }
+}
+
 impl Focusable for WorkspaceRoot {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
@@ -927,6 +976,11 @@ impl WorkspaceRoot {
                 cx.notify();
             });
             cx.spawn(async move |cx| {
+                // Run the project's cleanup script (if any) to completion BEFORE
+                // touching the worktree, bounded by a timeout so a hung teardown
+                // can't trap the user — on timeout the child is killed and the
+                // removal proceeds regardless (the force-remove escape).
+                run_cleanup_before_remove(&worktree_path).await;
                 let repo = match Repository::open(&project_root).await {
                     Ok(r) => r,
                     Err(err) => {
@@ -1067,5 +1121,52 @@ impl WorkspaceRoot {
         ));
         self.confirm_dialog = Some(dialog);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::run_cleanup_bounded;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    fn write_cleanup(dir: &std::path::Path, body: &str) {
+        let oximux = dir.join(".oximux");
+        std::fs::create_dir_all(&oximux).unwrap();
+        let mut f = std::fs::File::create(oximux.join("scripts.toml")).unwrap();
+        writeln!(f, "cleanup = {body:?}").unwrap();
+    }
+
+    // The force-escape: a hung cleanup must not block beyond the timeout.
+    #[tokio::test]
+    async fn hung_cleanup_is_bounded_by_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cleanup(tmp.path(), "sleep 60");
+        let start = Instant::now();
+        run_cleanup_bounded(tmp.path(), Duration::from_millis(200)).await;
+        // Without the timeout this would block ~60s; the bound + kill_on_drop
+        // must return it well under that.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "cleanup should be killed at the timeout, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_cleanup_script_returns_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No .oximux/scripts.toml → no-op, no panic, near-instant.
+        let start = Instant::now();
+        run_cleanup_bounded(tmp.path(), Duration::from_secs(30)).await;
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn fast_cleanup_completes_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cleanup(tmp.path(), "true");
+        // Should complete (success arm) well within the timeout.
+        run_cleanup_bounded(tmp.path(), Duration::from_secs(10)).await;
     }
 }
