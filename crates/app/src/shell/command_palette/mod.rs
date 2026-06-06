@@ -4,21 +4,31 @@
 //! command dispatch. Focus management mirrors `project_picker.rs`.
 
 pub mod entry;
+pub mod file_index;
 pub mod match_engine;
 pub mod palette_modal;
 
+use std::path::PathBuf;
+use std::rc::Rc;
+
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, Render,
-    Window, div,
+    Task, Window, div,
 };
 use oximux_settings::{CustomCommand, Density, Theme, Typography};
+use tokio::sync::oneshot;
 
-use crate::actions::SendTextToActiveAgent;
+use crate::actions::{OpenFileFromContextMenu, SendTextToActiveAgent};
 use crate::shell::command_palette::entry::{
-    PaletteItem, PaletteItemAction, PaletteMode, QUICK_OPEN_STUBS, build_palette_items,
+    PaletteItem, PaletteItemAction, PaletteMode, build_palette_items,
 };
 use crate::shell::command_palette::match_engine::filter_and_rank;
 use crate::shell::command_palette::palette_modal::{ModalRenderInput, build_modal_layout};
+
+/// Max ranked file rows shown in Quick Open. The result column is not
+/// virtualized, so an empty-query match against a large index must be
+/// capped to keep the modal cheap to paint.
+const MAX_QUICK_OPEN_ROWS: usize = 50;
 
 /// Single entity hosts both palette modes. `open` controls visibility;
 /// `mode` selects between Quick Open and Command Palette.
@@ -30,6 +40,21 @@ pub struct PaletteModal {
     /// Custom commands loaded from global + project TOML. Updated via
     /// `set_custom_commands` on startup and project switch.
     custom_commands: Vec<CustomCommand>,
+    /// Live project file index for Quick Open. Built lazily on first open
+    /// per project, cleared on project switch. Paths are project-relative
+    /// (as `rg --files` emits them); joined with [`Self::index_root`] before
+    /// dispatching an open so the editor receives an absolute path.
+    file_index: Vec<String>,
+    /// Project root the index was built against. Used to resolve a relative
+    /// index entry to an absolute path at open time.
+    index_root: Option<PathBuf>,
+    index_loaded: bool,
+    scanning: bool,
+    /// Set when the last scan failed (e.g. `rg` missing) — surfaced as a
+    /// copyable hint row instead of a broken/empty list.
+    index_error: Option<String>,
+    /// Owns the in-flight scan-result bridge task; dropped on reuse/teardown.
+    _index_task: Option<Task<()>>,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -50,6 +75,17 @@ pub(crate) fn palette_filter(
     ranked.into_iter().map(|i| all_items[i].clone()).collect()
 }
 
+/// Resolve a project-relative Quick Open index entry to an absolute path
+/// string for the editor open action. Falls back to the relative path when
+/// no project root is known (degraded but never panics). Pure so the
+/// relative→absolute contract is unit-testable without a GPUI entity.
+fn resolve_index_path(root: Option<&std::path::Path>, rel: &str) -> String {
+    match root {
+        Some(root) => root.join(rel).to_string_lossy().into_owned(),
+        None => rel.to_string(),
+    }
+}
+
 impl PaletteModal {
     pub fn new(
         theme: Theme,
@@ -63,6 +99,12 @@ impl PaletteModal {
             query: String::new(),
             selected_idx: 0,
             custom_commands: Vec::new(),
+            file_index: Vec::new(),
+            index_root: None,
+            index_loaded: false,
+            scanning: false,
+            index_error: None,
+            _index_task: None,
             focus_handle: cx.focus_handle(),
             theme,
             density,
@@ -87,6 +129,116 @@ impl PaletteModal {
     pub fn set_custom_commands(&mut self, commands: Vec<CustomCommand>, cx: &mut Context<Self>) {
         self.custom_commands = commands;
         cx.notify();
+    }
+
+    /// Kick a background scan of `root` to populate the Quick Open file
+    /// index. No-op if already loaded or a scan is in flight — the index is
+    /// cached for the project's lifetime and invalidated on project switch.
+    pub fn kick_file_index(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.index_loaded || self.scanning {
+            return;
+        }
+        self.scanning = true;
+        self.index_error = None;
+        self.index_root = Some(root.clone());
+        cx.notify();
+
+        let (tx, rx) = oneshot::channel::<Result<Vec<String>, file_index::ScanError>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = tx.send(file_index::scan_files(root).await);
+                });
+            }
+            Err(_) => {
+                self.scanning = false;
+                self.index_error = Some("no async runtime available for file scan".to_string());
+                cx.notify();
+                return;
+            }
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(res) = rx.await else {
+                // The tokio scan task was dropped (panic / runtime teardown)
+                // before sending. Clear the scanning flag so a later open can
+                // retry instead of wedging on "Indexing…" forever.
+                let _ = this.update(cx, |p, cx| {
+                    p.scanning = false;
+                    p.index_error = Some("file scan ended unexpectedly".to_string());
+                    cx.notify();
+                });
+                return;
+            };
+            let _ = this.update(cx, |p, cx| p.apply_scan_result(res, cx));
+        });
+        self._index_task = Some(task);
+    }
+
+    fn apply_scan_result(
+        &mut self,
+        res: Result<Vec<String>, file_index::ScanError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.scanning = false;
+        match res {
+            Ok(files) => {
+                self.file_index = files;
+                self.index_loaded = true;
+                self.index_error = None;
+            }
+            Err(err) => {
+                self.index_error = Some(err.hint());
+                self.index_loaded = false;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Drop the cached index so the next Quick Open re-scans. Called on
+    /// project switch (the previous project's files must not leak through).
+    pub fn invalidate_file_index(&mut self, cx: &mut Context<Self>) {
+        self.file_index.clear();
+        self.index_root = None;
+        self.index_loaded = false;
+        self.scanning = false;
+        self.index_error = None;
+        self._index_task = None;
+        cx.notify();
+    }
+
+    /// Ranked, capped Quick Open file rows for the current query.
+    fn quick_open_matches(&self) -> Vec<String> {
+        if self.file_index.is_empty() {
+            return Vec::new();
+        }
+        let names: Vec<&str> = self.file_index.iter().map(String::as_str).collect();
+        filter_and_rank(&self.query, &names)
+            .into_iter()
+            .take(MAX_QUICK_OPEN_ROWS)
+            .map(|i| self.file_index[i].clone())
+            .collect()
+    }
+
+    /// Open the file at `idx` in the current Quick Open match list as an
+    /// editor tab, then close the palette. No-op when `idx` is out of range
+    /// (e.g. activating the hint row while the index is empty).
+    fn activate_file(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let matches = self.quick_open_matches();
+        let Some(rel_path) = matches.get(idx).cloned() else {
+            return;
+        };
+        // Index entries are project-relative (`rg --files`); the editor open
+        // action resolves against the process CWD, so join with the project
+        // root to hand it an absolute path.
+        let path = resolve_index_path(self.index_root.as_deref(), &rel_path);
+        self.close(cx);
+        window.dispatch_action(
+            Box::new(OpenFileFromContextMenu {
+                path,
+                split_right: false,
+            }),
+            cx,
+        );
     }
 
     /// Open the modal, snap focus into the palette input, and reset state.
@@ -246,9 +398,29 @@ impl Render for PaletteModal {
                 .into_any_element()
             }
             PaletteMode::QuickOpen => {
-                let ranked = filter_and_rank(&query, QUICK_OPEN_STUBS);
-                let file_rows: Vec<&str> = ranked.iter().map(|&i| QUICK_OPEN_STUBS[i]).collect();
-                let row_count = file_rows.len();
+                let matches = self.quick_open_matches();
+                // Empty result → a single non-actionable status/hint row
+                // (row_count stays 0 so nav + Enter are inert).
+                let (file_rows, row_count): (Vec<&str>, usize) = if matches.is_empty() {
+                    let hint = if let Some(err) = self.index_error.as_deref() {
+                        err
+                    } else if self.scanning {
+                        "Indexing project files…"
+                    } else if !self.index_loaded {
+                        "Open a project to search files"
+                    } else {
+                        "No matching files"
+                    };
+                    (vec![hint], 0)
+                } else {
+                    (matches.iter().map(String::as_str).collect(), matches.len())
+                };
+
+                let entity = cx.entity();
+                let on_activate_file: Rc<dyn Fn(usize, &mut Window, &mut App)> =
+                    Rc::new(move |idx, window, cx| {
+                        entity.update(cx, |p, cx| p.activate_file(idx, window, cx));
+                    });
 
                 build_modal_layout(ModalRenderInput {
                     mode,
@@ -256,7 +428,7 @@ impl Render for PaletteModal {
                     selected_idx,
                     palette_items: &[],
                     file_rows,
-                    on_activate: on_activate.clone(),
+                    on_activate: on_activate_file,
                     theme,
                     density,
                     typography: &typography,
@@ -268,8 +440,10 @@ impl Render for PaletteModal {
                         "escape" => this.close(cx),
                         "up" => this.move_selection(-1, row_count, cx),
                         "down" => this.move_selection(1, row_count, cx),
-                        // QuickOpen file selection — stub (no file index yet)
-                        "enter" => this.close(cx),
+                        "enter" => {
+                            let idx = this.selected_idx;
+                            this.activate_file(idx, window, cx);
+                        }
                         "backspace" => {
                             this.query.pop();
                             this.selected_idx = 0;
@@ -290,7 +464,6 @@ impl Render for PaletteModal {
                             }
                         }
                     }
-                    let _ = window; // QuickOpen is a stub; window unused here
                 }))
                 .into_any_element()
             }
@@ -387,6 +560,21 @@ mod tests {
         assert!(!open);
         assert!(query.is_empty());
         assert_eq!(selected_idx, 0);
+    }
+
+    #[test]
+    fn resolve_index_path_joins_relative_against_root() {
+        use std::path::Path;
+        // The core Quick Open contract: `rg --files` emits relative paths; the
+        // editor open action needs them absolute.
+        let abs = resolve_index_path(Some(Path::new("/home/u/proj")), "src/main.rs");
+        assert_eq!(abs, "/home/u/proj/src/main.rs");
+    }
+
+    #[test]
+    fn resolve_index_path_falls_back_without_root() {
+        let rel = resolve_index_path(None, "src/main.rs");
+        assert_eq!(rel, "src/main.rs");
     }
 
     #[test]

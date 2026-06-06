@@ -142,9 +142,6 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
     },
 ];
 
-/// Quick Open stub data — replaced by a live file index in a later plan.
-pub const QUICK_OPEN_STUBS: &[&str] = &["src/main.rs", "src/lib.rs", "Cargo.toml"];
-
 /// Build the unified candidate list from the static catalog plus loaded
 /// custom commands. Built-in entries come first under the "Commands" group;
 /// custom entries appear after under the "Custom" group.
@@ -186,11 +183,6 @@ mod tests {
     fn palette_commands_has_fifteen_entries() {
         // 14 original + 1 "Reload Custom Commands"
         assert_eq!(PALETTE_COMMANDS.len(), 15);
-    }
-
-    #[test]
-    fn quick_open_stubs_includes_main_rs() {
-        assert!(QUICK_OPEN_STUBS.contains(&"src/main.rs"));
     }
 
     #[test]
