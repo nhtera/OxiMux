@@ -106,11 +106,19 @@ impl ProjectPickerModal {
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        // Emit Closed only on a real open→closed transition. `close_modal_overlays`
+        // closes this picker before opening any overlay; an unconditional emit
+        // queues a workspace root-refocus that steals focus from a just-opened
+        // picker (Esc/arrows/typing then die). See the matching guard in
+        // `command_palette::PaletteModal::close`.
+        let was_open = self.open;
         self.open = false;
         self.projects.clear();
         self.selected_idx = 0;
         self.pending_folder_pick = false;
-        cx.emit(ProjectPickerEvent::Closed);
+        if was_open {
+            cx.emit(ProjectPickerEvent::Closed);
+        }
         cx.notify();
     }
 
@@ -286,9 +294,12 @@ impl Render for ProjectPickerModal {
             }
         }
 
-        let card = card.on_mouse_down(MouseButton::Left, |_event, _window, _cx| {
-            // Swallow press inside the card so it does not bubble up to
-            // the overlay's click-outside dismiss handler.
+        let card = card.on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+            // Stop presses inside the card from bubbling to the overlay's
+            // click-outside dismiss handler. An empty closure does NOT swallow
+            // — `stop_propagation` is required, else clicking the header
+            // dismisses the picker.
+            cx.stop_propagation();
         });
 
         div()

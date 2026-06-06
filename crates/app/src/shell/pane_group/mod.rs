@@ -31,7 +31,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
     CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab, PrevTab,
-    RequestOpenAdapterPicker, SplitSubPaneDown, SplitSubPaneRight, ToggleZoomSubPane,
+    RequestOpenAdapterPicker, Search, SplitSubPaneDown, SplitSubPaneRight, ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
 use crate::shell::agent_status_task::spawn_status_task;
@@ -1615,6 +1615,39 @@ impl PaneGroup {
 
     pub(crate) fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         self.open_terminal_tab(window, cx);
+    }
+
+    /// Open the scrollback search overlay on the active tab's active terminal
+    /// sub-pane. Used by the root-level Search fallback so the command palette
+    /// "Search Pane" entry works while the palette (not a terminal) has focus.
+    /// No-op when the active tab isn't terminal-backed.
+    pub(crate) fn open_search_active_terminal(
+        &mut self,
+        action: &Search,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let PaneContent::Terminal(tree) = &active_tab.content else {
+            return;
+        };
+        let Some(view) = tree.active_view().cloned() else {
+            return;
+        };
+        view.update(cx, |v, cx| v.on_search(action, window, cx));
+        // Re-home keyboard focus onto this terminal. The search overlay has no
+        // input of its own — its keystroke handler runs inside the terminal's
+        // `on_key_down`, which only fires while the terminal is focused. On the
+        // palette path the palette queues a refocus of the workspace root as it
+        // closes, so an inline focus here would be clobbered; defer it so it
+        // lands AFTER that refocus (same two-step focus race as
+        // `refocus_active_pane`). Without this the box paints but swallows no
+        // keys until the user clicks the terminal.
+        window.defer(cx, move |window, cx| {
+            view.read(cx).focus_handle(cx).focus(window, cx);
+        });
     }
 
     /// Cmd+Shift+T — add a terminal tab to the FOCUSED split pane's own

@@ -154,12 +154,19 @@ impl SettingsModal {
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        // Emit Closed only on a real open→closed transition. `close_modal_overlays`
+        // closes this modal before opening any overlay; an unconditional emit
+        // queues a workspace root-refocus that steals focus from a just-opened
+        // modal. See the matching guard in `command_palette::PaletteModal::close`.
+        let was_open = self.open;
         self.open = false;
         // Drop the search input so its focus handle can't keep window focus
         // orphaned after the modal is hidden.
         self.search_input = None;
         self._search_sub = None;
-        cx.emit(SettingsModalEvent::Closed);
+        if was_open {
+            cx.emit(SettingsModalEvent::Closed);
+        }
         cx.notify();
     }
 

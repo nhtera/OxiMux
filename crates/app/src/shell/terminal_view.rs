@@ -820,7 +820,7 @@ impl TerminalView {
         });
     }
 
-    fn on_search(&mut self, _: &Search, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_search(&mut self, _: &Search, _window: &mut Window, cx: &mut Context<Self>) {
         self.search.open();
         self.rerun_search();
         cx.notify();

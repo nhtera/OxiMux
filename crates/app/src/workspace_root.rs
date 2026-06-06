@@ -58,8 +58,9 @@ use crate::actions::{
     CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow, OpenAddProjectDialog,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
-    OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt, OpenWorkspaceCreate,
-    RequestOpenAdapterPicker, SelectExplorerTab, SelectFilesTab, SelectSearchTab,
+    NewTab, OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt,
+    OpenWorkspaceCreate, RequestOpenAdapterPicker, Search, SelectExplorerTab, SelectFilesTab,
+    SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
     SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleFloatingTerminal, ToggleLeftSidebar,
     ToggleRightSidebar,
@@ -2697,6 +2698,40 @@ impl Render for WorkspaceRoot {
                 panes.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
                         group.update(cx, |g, cx| g.on_close_tab(&CloseTab, window, cx));
+                    }
+                });
+            }))
+            // Root-level fallback for NewTab. Like CloseTab above, the primary
+            // listener lives on the active PaneGroup, which is NOT an ancestor
+            // of the focused node when a full-window overlay (command palette)
+            // holds focus. Dispatching NewTab from the palette would otherwise
+            // reach no handler. Routing through the active group from the root
+            // anchor makes the palette "New Tab" entry work; when a pane is
+            // focused the PaneGroup listener catches it first and stops
+            // propagation, so this fallback only fires when needed.
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                panes.update(cx, |p, cx| {
+                    if let Some(group) = p.active_group() {
+                        group.update(cx, |g, cx| g.on_new_tab(&NewTab, window, cx));
+                    }
+                });
+            }))
+            // Root-level fallback for Search (scrollback search overlay). The
+            // primary listener lives on the focused TerminalView, which is not
+            // on the dispatch path when the command palette holds focus. Route
+            // to the active group's active terminal so the palette "Search
+            // Pane" entry opens the overlay; a focused terminal consumes the
+            // action first when no overlay is up.
+            .on_action(cx.listener(|this, action: &Search, window, cx| {
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                panes.update(cx, |p, cx| {
+                    if let Some(group) = p.active_group() {
+                        group.update(cx, |g, cx| g.open_search_active_terminal(action, window, cx));
                     }
                 });
             }))

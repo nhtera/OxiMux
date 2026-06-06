@@ -7,9 +7,11 @@ pub mod entry;
 pub mod file_index;
 pub mod match_engine;
 pub mod palette_modal;
+pub mod row_render;
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -55,6 +57,12 @@ pub struct PaletteModal {
     index_error: Option<String>,
     /// Owns the in-flight scan-result bridge task; dropped on reuse/teardown.
     _index_task: Option<Task<()>>,
+    /// Blinking caret phase for the query field — toggled by `_caret_blink`.
+    /// Makes the header read as a live text input rather than a static label.
+    caret_on: bool,
+    /// Drives the caret blink. Runs for the entity's lifetime; only repaints
+    /// while the palette is open (idle when closed).
+    _caret_blink: Task<()>,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -105,11 +113,45 @@ impl PaletteModal {
             scanning: false,
             index_error: None,
             _index_task: None,
+            caret_on: true,
+            _caret_blink: Self::start_caret_blink(cx),
             focus_handle: cx.focus_handle(),
             theme,
             density,
             typography,
         }
+    }
+
+    /// Period of the query-caret blink. Matches the common text-cursor cadence.
+    const CARET_BLINK_MS: u64 = 530;
+
+    /// Toggle the caret on a fixed cadence so the query field reads as an
+    /// editable input. Runs for the entity's lifetime; only flips state +
+    /// repaints while the palette is open, so a closed palette costs nothing
+    /// but a bare timer tick.
+    fn start_caret_blink(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
+                else {
+                    return;
+                };
+                executor
+                    .timer(Duration::from_millis(Self::CARET_BLINK_MS))
+                    .await;
+                if this
+                    .update(cx, |p, cx| {
+                        if p.open {
+                            p.caret_on = !p.caret_on;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
     }
 
     pub fn is_open(&self) -> bool {
@@ -247,15 +289,26 @@ impl PaletteModal {
         self.open = true;
         self.query.clear();
         self.selected_idx = 0;
+        // Show the caret solid on open; the blink task takes over from here.
+        self.caret_on = true;
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        // Only signal Closed on a real open→closed transition. `close()` is
+        // also called pre-emptively on the already-closed palette (e.g.
+        // `close_modal_overlays` runs before `open`); emitting unconditionally
+        // would queue a workspace root-refocus that lands AFTER `open` focused
+        // the palette, stealing keyboard focus so Esc/arrows/typing never reach
+        // it. Guarding the emit keeps focus on a freshly opened palette.
+        let was_open = self.open;
         self.open = false;
         self.query.clear();
         self.selected_idx = 0;
-        cx.emit(PaletteEvent::Closed);
+        if was_open {
+            cx.emit(PaletteEvent::Closed);
+        }
         cx.notify();
     }
 
@@ -337,19 +390,25 @@ impl Render for PaletteModal {
         let mode = self.mode;
         let query = self.query.clone();
         let selected_idx = self.selected_idx;
+        let caret_on = self.caret_on;
 
         // Row clicks activate through the same path as keyboard Enter
         // (`activate_item` dispatches AND closes the modal), so a mouse click
         // can't leave the palette open. The entity is captured so the pure
         // render helper needs no direct access to private methods.
         let entity = cx.entity();
-        let on_activate: std::rc::Rc<dyn Fn(usize, &mut Window, &mut App)> =
-            std::rc::Rc::new(move |idx, window, cx| {
-                entity.update(cx, |p, cx| {
-                    let items = p.filtered_items();
-                    p.activate_item(idx, &items, window, cx);
-                });
+        let on_activate: row_render::ActivateFn = std::rc::Rc::new(move |idx, window, cx| {
+            entity.update(cx, |p, cx| {
+                let items = p.filtered_items();
+                p.activate_item(idx, &items, window, cx);
             });
+        });
+
+        // Backdrop click-outside dismiss — same close path as Esc.
+        let dismiss_entity = cx.entity();
+        let on_dismiss: palette_modal::DismissFn = std::rc::Rc::new(move |_window, cx| {
+            dismiss_entity.update(cx, |p, cx| p.close(cx));
+        });
 
         match mode {
             PaletteMode::Commands => {
@@ -362,7 +421,10 @@ impl Render for PaletteModal {
                     selected_idx,
                     palette_items: &filtered,
                     file_rows: Vec::new(),
+                    row_count,
+                    caret_on,
                     on_activate: on_activate.clone(),
+                    on_dismiss: on_dismiss.clone(),
                     theme,
                     density,
                     typography: &typography,
@@ -426,7 +488,7 @@ impl Render for PaletteModal {
                 };
 
                 let entity = cx.entity();
-                let on_activate_file: Rc<dyn Fn(usize, &mut Window, &mut App)> =
+                let on_activate_file: row_render::ActivateFn =
                     Rc::new(move |idx, window, cx| {
                         entity.update(cx, |p, cx| p.activate_file(idx, window, cx));
                     });
@@ -437,7 +499,10 @@ impl Render for PaletteModal {
                     selected_idx,
                     palette_items: &[],
                     file_rows,
+                    row_count,
+                    caret_on,
                     on_activate: on_activate_file,
+                    on_dismiss: on_dismiss.clone(),
                     theme,
                     density,
                     typography: &typography,
