@@ -6,7 +6,12 @@ use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use oximux_settings::{CommitMessageAiMode, Density, Theme, Typography};
 
 use super::SettingsModal;
-use super::controls::{setting_row, value_chip};
+use super::controls::value_chip;
+use super::layout::{SettingEntry, entries_card, entry};
+use super::segmented::{Segment, segmented};
+
+/// Agent CLIs the segmented picker exposes.
+const AGENTS: [&str; 3] = ["claude", "codex", "custom"];
 
 /// Model presets the model chip cycles through. The current value is kept
 /// as a stable anchor (prepended when not already a preset) so cycling
@@ -20,32 +25,72 @@ pub(super) fn render(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(entries_card(
+            theme,
+            density,
+            typography,
+            entries(modal, theme, density, typography, cx),
+        ))
+        .child(
+            div()
+                .pt(px(12.0))
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child(hint(modal.ai.mode)),
+        )
+        .into_any_element()
+}
+
+/// The Agents/AI pane's settings as reusable entries. Agent + Model rows only
+/// appear in Agent mode (they don't apply otherwise).
+pub(super) fn entries(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
     let ai = &modal.ai;
     let is_agent = ai.mode == CommitMessageAiMode::Agent;
 
-    let mode = value_chip(
+    let mode = segmented(
         "ai-mode",
-        mode_label(ai.mode),
+        [
+            CommitMessageAiMode::Off,
+            CommitMessageAiMode::Heuristic,
+            CommitMessageAiMode::Agent,
+        ]
+        .into_iter()
+        .map(|m| {
+            Segment::new(mode_label(m), ai.mode == m, move |this, _w, cx| {
+                this.ai.mode = m;
+                this.persist_ai(cx);
+            })
+        })
+        .collect(),
         theme,
         density,
         typography,
-        |this, _w, cx| {
-            this.ai.mode = next_mode(this.ai.mode);
-            this.persist_ai(cx);
-        },
         cx,
     );
 
-    let agent_id = value_chip(
+    let agent_id = segmented(
         "ai-agent",
-        ai.agent.agent_id.clone(),
+        AGENTS
+            .into_iter()
+            .map(|a| {
+                Segment::new(a, ai.agent.agent_id == a, move |this, _w, cx| {
+                    this.ai.agent.agent_id = a.to_string();
+                    this.persist_ai(cx);
+                })
+            })
+            .collect(),
         theme,
         density,
         typography,
-        |this, _w, cx| {
-            this.ai.agent.agent_id = next_agent(&this.ai.agent.agent_id).to_string();
-            this.persist_ai(cx);
-        },
         cx,
     );
 
@@ -62,25 +107,22 @@ pub(super) fn render(
         cx,
     );
 
-    let mut col = div()
-        .flex()
-        .flex_col()
-        .child(setting_row("Commit-message AI", mode, theme, typography));
+    let mut entries = vec![entry(
+        "Commit-message AI",
+        "How commit messages are generated from the staged diff.",
+        mode,
+    )];
 
     if is_agent {
-        col = col
-            .child(setting_row("Agent", agent_id, theme, typography))
-            .child(setting_row("Model", model, theme, typography));
+        entries.push(entry(
+            "Agent",
+            "Which agent CLI runs for agent-mode generation.",
+            agent_id,
+        ));
+        entries.push(entry("Model", "Model name passed to the agent CLI.", model));
     }
 
-    col.child(
-        div()
-            .pt(px(12.0))
-            .text_size(px(typography.t_body_sm))
-            .text_color(theme.fg_subtle)
-            .child(hint(modal.ai.mode)),
-    )
-    .into_any_element()
+    entries
 }
 
 fn hint(mode: CommitMessageAiMode) -> &'static str {
@@ -98,22 +140,6 @@ fn mode_label(mode: CommitMessageAiMode) -> &'static str {
         CommitMessageAiMode::Off => "Off",
         CommitMessageAiMode::Heuristic => "Heuristic",
         CommitMessageAiMode::Agent => "Agent",
-    }
-}
-
-fn next_mode(mode: CommitMessageAiMode) -> CommitMessageAiMode {
-    match mode {
-        CommitMessageAiMode::Off => CommitMessageAiMode::Heuristic,
-        CommitMessageAiMode::Heuristic => CommitMessageAiMode::Agent,
-        CommitMessageAiMode::Agent => CommitMessageAiMode::Off,
-    }
-}
-
-fn next_agent(current: &str) -> &'static str {
-    match current {
-        "claude" => "codex",
-        "codex" => "custom",
-        _ => "claude",
     }
 }
 
@@ -148,12 +174,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_cycles_off_heuristic_agent() {
-        assert_eq!(next_mode(CommitMessageAiMode::Off), CommitMessageAiMode::Heuristic);
-        assert_eq!(
-            next_mode(CommitMessageAiMode::Heuristic),
-            CommitMessageAiMode::Agent
-        );
-        assert_eq!(next_mode(CommitMessageAiMode::Agent), CommitMessageAiMode::Off);
+    fn mode_labels_cover_all_modes() {
+        assert_eq!(mode_label(CommitMessageAiMode::Off), "Off");
+        assert_eq!(mode_label(CommitMessageAiMode::Heuristic), "Heuristic");
+        assert_eq!(mode_label(CommitMessageAiMode::Agent), "Agent");
     }
 }

@@ -93,6 +93,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ),
     ("icons/codex.svg", include_bytes!("../assets/icons/codex.svg")),
     ("icons/aider.svg", include_bytes!("../assets/icons/aider.svg")),
+    (
+        "icons/keyboard.svg",
+        include_bytes!("../assets/icons/keyboard.svg"),
+    ),
 ];
 
 impl AssetSource for AppAssets {

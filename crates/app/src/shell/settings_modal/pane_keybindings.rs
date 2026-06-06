@@ -6,6 +6,8 @@
 use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
 use oximux_settings::{Density, Theme, Typography};
 
+use super::layout::{SettingEntry, entry};
+
 /// (chord, action description). Order follows `keymap.rs`.
 const BINDINGS: &[(&str, &str)] = &[
     ("⌘,", "Open settings"),
@@ -46,12 +48,48 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Esc", "Dismiss overlay"),
 ];
 
-pub(super) fn render(theme: Theme, _density: Density, typography: &Typography) -> AnyElement {
+pub(super) fn render(
+    query: &str,
+    theme: Theme,
+    _density: Density,
+    typography: &Typography,
+) -> AnyElement {
+    let q = query.to_lowercase();
     let mut col = div().flex().flex_col();
+    let mut shown = 0usize;
     for (chord, action) in BINDINGS {
+        if !q.is_empty() && !action.to_lowercase().contains(&q) && !chord.to_lowercase().contains(&q)
+        {
+            continue;
+        }
         col = col.child(row(chord, action, theme, typography));
+        shown += 1;
+    }
+    if shown == 0 {
+        col = col.child(
+            div()
+                .py(px(6.0))
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_subtle)
+                .child("No matching shortcuts."),
+        );
     }
     col.into_any_element()
+}
+
+/// Keybindings as reusable entries for global search: action label + the
+/// chord shown as the right-hand "control".
+pub(super) fn entries(theme: Theme, typography: &Typography) -> Vec<SettingEntry> {
+    BINDINGS
+        .iter()
+        .map(|(chord, action)| {
+            let chip = div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(SharedString::from(chord.to_string()));
+            entry(*action, "", chip)
+        })
+        .collect()
 }
 
 fn row(

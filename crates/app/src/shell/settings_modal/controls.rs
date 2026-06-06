@@ -17,31 +17,6 @@ use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
 
-/// One settings row: a left-aligned `label`, a flexible spacer, then the
-/// `control` pinned to the right edge.
-pub(super) fn setting_row(
-    label: impl Into<SharedString>,
-    control: impl IntoElement,
-    theme: Theme,
-    typography: &Typography,
-) -> AnyElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .w_full()
-        .py(px(8.0))
-        .child(
-            div()
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_muted)
-                .child(label.into()),
-        )
-        .child(div().flex_1())
-        .child(control)
-        .into_any_element()
-}
-
 /// A clickable value chip. Clicking fires `on_click` with a fresh
 /// `&mut SettingsModal`, so handlers read live state rather than a
 /// render-time snapshot.
@@ -75,6 +50,52 @@ pub(super) fn value_chip(
         )
         .child(text.into())
         .into_any_element()
+}
+
+/// An iOS-style pill toggle. The track tints to the accent when `value` is
+/// on and the knob slides to the corresponding edge. Clicking fires
+/// `on_click` with a live `&mut SettingsModal`.
+pub(super) fn toggle_switch(
+    id: impl Into<ElementId>,
+    value: bool,
+    theme: Theme,
+    on_click: impl Fn(&mut SettingsModal, &mut Window, &mut Context<SettingsModal>) + 'static,
+    cx: &mut Context<SettingsModal>,
+) -> AnyElement {
+    const TRACK_W: f32 = 36.0;
+    const TRACK_H: f32 = 20.0;
+    const KNOB: f32 = 14.0;
+    const PAD: f32 = 3.0;
+
+    let knob = div().size(px(KNOB)).rounded_full().bg(theme.fg_base);
+
+    let mut track = div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .w(px(TRACK_W))
+        .h(px(TRACK_H))
+        .rounded(px(TRACK_H / 2.0))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
+        );
+
+    // On: accent track, knob pinned right. Off: muted track + outline, knob
+    // pinned left.
+    track = if value {
+        track.bg(theme.status_info).justify_end().pr(px(PAD))
+    } else {
+        track
+            .bg(theme.bg_panel_alt)
+            .border_1()
+            .border_color(theme.border_inactive)
+            .justify_start()
+            .pl(px(PAD))
+    };
+
+    track.child(knob).into_any_element()
 }
 
 /// A `[−] value [+]` numeric stepper. `on_dec` / `on_inc` mutate + persist.

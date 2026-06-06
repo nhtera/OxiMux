@@ -6,8 +6,12 @@ use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use oximux_settings::{BellStyle, Density, Theme, Typography};
 
 use super::SettingsModal;
-use super::controls::{setting_row, stepper, value_chip};
+use super::controls::{stepper, toggle_switch};
+use super::layout::{SettingEntry, entries_card, entry};
+use super::segmented::{Segment, segmented};
 
+/// Render the Terminal pane: a borderless group of setting rows plus a quiet
+/// save-location caption.
 pub(super) fn render(
     modal: &SettingsModal,
     theme: Theme,
@@ -15,6 +19,34 @@ pub(super) fn render(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(entries_card(
+            theme,
+            density,
+            typography,
+            entries(modal, theme, density, typography, cx),
+        ))
+        .child(
+            div()
+                .pt(px(12.0))
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child("Changes save to terminal.toml and apply to open panes live."),
+        )
+        .into_any_element()
+}
+
+/// The Terminal pane's settings as reusable entries (label + description +
+/// live control). Used by the pane render and by global search.
+pub(super) fn entries(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
     let t = modal.terminal;
 
     let scrollback = stepper(
@@ -69,28 +101,28 @@ pub(super) fn render(
         cx,
     );
 
-    let bell = value_chip(
+    let bell = segmented(
         "term-bell",
-        bell_label(t.bell),
+        vec![
+            Segment::new("Off", t.bell == BellStyle::Off, |this, _w, cx| {
+                this.terminal.bell = BellStyle::Off;
+                this.persist_terminal(cx);
+            }),
+            Segment::new("Visual", t.bell == BellStyle::Visual, |this, _w, cx| {
+                this.terminal.bell = BellStyle::Visual;
+                this.persist_terminal(cx);
+            }),
+        ],
         theme,
         density,
         typography,
-        |this, _w, cx| {
-            this.terminal.bell = match this.terminal.bell {
-                BellStyle::Visual => BellStyle::Off,
-                BellStyle::Off => BellStyle::Visual,
-            };
-            this.persist_terminal(cx);
-        },
         cx,
     );
 
-    let cursor_blink = toggle(
+    let cursor_blink = toggle_switch(
         "term-cursorblink",
         t.cursor_blink,
         theme,
-        density,
-        typography,
         |this, _w, cx| {
             this.terminal.cursor_blink = !this.terminal.cursor_blink;
             this.persist_terminal(cx);
@@ -98,12 +130,10 @@ pub(super) fn render(
         cx,
     );
 
-    let osc52 = toggle(
+    let osc52 = toggle_switch(
         "term-osc52",
         t.osc52_clipboard,
         theme,
-        density,
-        typography,
         |this, _w, cx| {
             this.terminal.osc52_clipboard = !this.terminal.osc52_clipboard;
             this.persist_terminal(cx);
@@ -111,12 +141,10 @@ pub(super) fn render(
         cx,
     );
 
-    let option_meta = toggle(
+    let option_meta = toggle_switch(
         "term-optmeta",
         t.option_as_meta,
         theme,
-        density,
-        typography,
         |this, _w, cx| {
             this.terminal.option_as_meta = !this.terminal.option_as_meta;
             this.persist_terminal(cx);
@@ -124,55 +152,37 @@ pub(super) fn render(
         cx,
     );
 
-    div()
-        .flex()
-        .flex_col()
-        .child(setting_row("Scrollback (lines)", scrollback, theme, typography))
-        .child(setting_row("Scroll multiplier", scroll_mult, theme, typography))
-        .child(setting_row("Bell", bell, theme, typography))
-        .child(setting_row("Cursor blink", cursor_blink, theme, typography))
-        .child(setting_row("Blink interval", blink_interval, theme, typography))
-        .child(setting_row(
+    vec![
+        entry(
+            "Scrollback",
+            "Maximum lines kept in scrollback history.",
+            scrollback,
+        ),
+        entry(
+            "Scroll multiplier",
+            "Lines scrolled per mouse-wheel notch.",
+            scroll_mult,
+        ),
+        entry("Bell", "Visual flash on the terminal bell, or off.", bell),
+        entry(
+            "Cursor blink",
+            "Blink the cursor while the terminal is focused.",
+            cursor_blink,
+        ),
+        entry(
+            "Blink interval",
+            "Cursor blink period in milliseconds.",
+            blink_interval,
+        ),
+        entry(
             "Clipboard write (OSC 52)",
+            "Let programs set the system clipboard via OSC 52.",
             osc52,
-            theme,
-            typography,
-        ))
-        .child(setting_row("Option as Meta", option_meta, theme, typography))
-        .child(
-            div()
-                .pt(px(12.0))
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_subtle)
-                .child("Changes save to terminal.toml and apply to open panes live."),
-        )
-        .into_any_element()
-}
-
-fn bell_label(b: BellStyle) -> &'static str {
-    match b {
-        BellStyle::Off => "Off",
-        BellStyle::Visual => "Visual",
-    }
-}
-
-/// A boolean toggle chip showing On/Off.
-fn toggle(
-    id: &'static str,
-    value: bool,
-    theme: Theme,
-    density: Density,
-    typography: &Typography,
-    on_click: impl Fn(&mut SettingsModal, &mut gpui::Window, &mut gpui::Context<SettingsModal>) + 'static,
-    cx: &mut gpui::Context<SettingsModal>,
-) -> AnyElement {
-    value_chip(
-        id,
-        if value { "On" } else { "Off" },
-        theme,
-        density,
-        typography,
-        on_click,
-        cx,
-    )
+        ),
+        entry(
+            "Option as Meta",
+            "Send the macOS Option key as Meta/Alt to the shell.",
+            option_meta,
+        ),
+    ]
 }
