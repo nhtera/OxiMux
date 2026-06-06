@@ -12,6 +12,7 @@ pub mod branch_diff;
 pub mod commit;
 pub mod diff;
 pub mod error;
+pub mod gh;
 pub mod log;
 pub mod merge;
 pub mod numstat;
@@ -28,6 +29,7 @@ pub mod worktree;
 
 pub use diff::{DiffParseError, parse_unified_diff};
 pub use error::{GitError, Result};
+pub use gh::GhCmd;
 pub use numstat::{diff_numstat_commit, diff_numstat_head, parse_numstat_z};
 pub use poller::{DEFAULT_TICK, PollState, StatusPoller};
 pub use process::{GitCmd, Output, RawOutput};

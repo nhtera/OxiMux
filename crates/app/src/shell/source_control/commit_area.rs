@@ -87,6 +87,10 @@ pub enum CommitStatus {
     /// `git revert --no-edit <sha>` in flight. Same lifecycle as
     /// `CherryPicking` — conflict drops into the operation banner.
     Reverting,
+    /// `gh pr create` in flight. Reaches `Idle` on success (the PR opens in
+    /// the browser) or `Failed("create PR", …)` — most usefully when a PR for
+    /// the branch already exists.
+    CreatingPr,
     Failed(String, String),
 }
 
@@ -99,6 +103,11 @@ pub struct CommitArea {
     pub message_state: Entity<InputState>,
     pub status: CommitStatus,
     pub(in crate::shell::source_control) in_flight: Arc<AtomicBool>,
+    /// Set true after a successful `gh pr create` so the panel's state
+    /// observer forces an immediate PR-status refresh (otherwise the cached
+    /// `has_open_pr` would stay stale for up to the 30s throttle and the
+    /// button would wrongly re-offer Create PR). The observer reads + clears it.
+    pub(in crate::shell::source_control) pr_status_dirty: bool,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -205,6 +214,7 @@ impl CommitArea {
             message_state,
             status: CommitStatus::Idle,
             in_flight: Arc::new(AtomicBool::new(false)),
+            pr_status_dirty: false,
             theme,
             density,
             typography,
@@ -351,6 +361,12 @@ impl CommitArea {
     /// which uses the existing `Repository::publish_branch` backend.
     pub fn publish(&mut self, cx: &mut Context<Self>) {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Publish, cx);
+    }
+
+    /// Create a GitHub PR for the current branch via `gh pr create --fill`
+    /// (title + body from the branch's commits) and open it in the browser.
+    pub fn create_pr(&mut self, cx: &mut Context<Self>) {
+        super::pr_ops::run_create_pr(self, cx);
     }
 
     /// Apply a completed op result to the status surface. Called from
@@ -775,8 +791,9 @@ fn dispatch_dropdown(
         DropdownActionKind::Rebase => area.rebase_from_base(cx),
         DropdownActionKind::Fetch => area.fetch(cx),
         DropdownActionKind::Publish => area.publish(cx),
-        // PR rows ship disabled — dispatch should never be reached.
-        DropdownActionKind::CreatePr | DropdownActionKind::PushBeforePr => {}
+        DropdownActionKind::CreatePr => area.create_pr(cx),
+        // Compound push-then-PR not wired; the row ships disabled.
+        DropdownActionKind::PushBeforePr => {}
     }
 }
 
@@ -787,6 +804,7 @@ fn primary_icon_for(kind: PrimaryActionKind) -> Option<IconName> {
         PrimaryActionKind::Push | PrimaryActionKind::Publish => Some(IconName::ArrowUp),
         PrimaryActionKind::Pull => Some(IconName::ArrowDown),
         PrimaryActionKind::Sync => Some(IconName::ChevronsUpDown),
+        PrimaryActionKind::CreatePR => Some(IconName::Github),
     }
 }
 
@@ -808,6 +826,7 @@ fn render_status_row(
         CommitStatus::Fetching => (theme.fg_muted, "Fetching…".to_string()),
         CommitStatus::CherryPicking => (theme.fg_muted, "Cherry-picking…".to_string()),
         CommitStatus::Reverting => (theme.fg_muted, "Reverting…".to_string()),
+        CommitStatus::CreatingPr => (theme.fg_muted, "Creating pull request…".to_string()),
         CommitStatus::Failed(label, error) => (
             theme.status_error,
             // Title-case the verb so "Push failed: …" reads naturally;

@@ -168,19 +168,34 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
         push_disabled,
     ));
 
-    // 6. Create PR — disabled in v1; lands with the hosted-review adapter.
+    // 6. Create PR — enabled when the branch is published, in sync with its
+    //    GitHub upstream, and has no open PR yet (same gate as the primary
+    //    Create-PR rung). Runs `gh pr create --fill`.
+    let in_sync = has_upstream && ahead == 0 && behind == 0;
+    let create_pr_disabled = !p.is_github_remote
+        || p.has_open_pr
+        || !in_sync
+        || p.is_creating_pr
+        || p.is_committing
+        || p.is_remote_operation_active;
     out.push(item(
         DropdownActionKind::CreatePr,
         "Create PR".to_string(),
-        "Lands in v1.1".to_string(),
-        true,
+        if create_pr_disabled {
+            create_pr_disabled_reason(p, has_upstream, in_sync).to_string()
+        } else {
+            "Open a pull request for this branch".to_string()
+        },
+        create_pr_disabled,
     ));
 
-    // 7. Push before PR — disabled in v1; lands with the hosted-review adapter.
+    // 7. Push & Create PR — compound (push then create) not yet wired; the
+    //    two-step flow (Push, then Create PR) covers it. Kept as a disabled
+    //    row so the menu shape stays stable.
     out.push(item(
         DropdownActionKind::PushBeforePr,
         "Push & Create PR".to_string(),
-        "Lands in v1.1".to_string(),
+        "Push first, then use Create PR".to_string(),
         true,
     ));
 
@@ -343,6 +358,30 @@ fn push_disabled_reason(
         "Nothing to push"
     } else {
         "Cannot push"
+    }
+}
+
+fn create_pr_disabled_reason(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    in_sync: bool,
+) -> &'static str {
+    if p.is_creating_pr {
+        "Creating pull request…"
+    } else if p.is_committing {
+        "Commit in progress…"
+    } else if p.is_remote_operation_active {
+        "Remote operation in progress"
+    } else if !p.is_github_remote {
+        "Not a GitHub remote"
+    } else if !has_upstream {
+        "Publish the branch first"
+    } else if !in_sync {
+        "Push/pull so the branch is in sync, then create a PR"
+    } else if p.has_open_pr {
+        "This branch already has an open PR"
+    } else {
+        "Cannot create PR"
     }
 }
 

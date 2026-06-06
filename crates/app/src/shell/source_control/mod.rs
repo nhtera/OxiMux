@@ -30,6 +30,7 @@ pub mod filter;
 pub mod graph;
 pub mod graph_row;
 pub mod picker_wiring;
+pub mod pr_ops;
 pub mod primary_action;
 pub mod scope;
 pub mod settings_persistence;
@@ -109,6 +110,21 @@ pub struct SourceControlPanel {
     /// (branch is diverged from its upstream). `false` while the first
     /// check is in flight or when the state isn't a lease candidate.
     force_push_with_lease: bool,
+
+    /// `origin` is a GitHub remote — gates the Create-PR primary rung (the
+    /// `gh` CLI only speaks GitHub). Cached; refreshed by the state observer
+    /// alongside `has_open_pr` on a ~30s throttle when the branch is in sync.
+    is_github_remote: bool,
+
+    /// The current branch already has an open PR. Suppresses the Create-PR
+    /// rung so the button doesn't offer a redundant action. Refreshed on the
+    /// same ~30s throttle as `is_github_remote` (a `gh pr view` round-trip).
+    has_open_pr: bool,
+
+    /// Last time the GitHub PR status (`is_github_remote` + `has_open_pr`) was
+    /// refreshed. Throttles the `gh` round-trips to ~30s (GitHub rate limits)
+    /// and lets the button reflect a just-created PR within that window.
+    pr_status_checked_at: Option<std::time::Instant>,
 
     /// Cached resolved primary action from the last render. Read by the
     /// status bar to show the same verb without running a second resolver.
@@ -345,6 +361,9 @@ impl SourceControlPanel {
             git_state,
             last_primary_action: None,
             force_push_with_lease: false,
+            is_github_remote: false,
+            has_open_pr: false,
+            pr_status_checked_at: None,
             base_ref: initial_base_ref,
             current_op: initial_op,
             on_open_file,
@@ -491,6 +510,14 @@ impl SourceControlPanel {
                     PollState::Ready(s)
                         if s.upstream.is_some() && s.ahead > 0 && s.behind > 0
                 );
+                // The Create-PR rung only matters when the branch is published
+                // and fully in sync (the terminal "up to date" state). Gate the
+                // network `gh` round-trips on that — throttled to ~30s below.
+                let should_check_pr = matches!(
+                    &state,
+                    PollState::Ready(s)
+                        if s.upstream.is_some() && s.ahead == 0 && s.behind == 0
+                );
                 // Refresh the cached in-progress git op before the
                 // panel update so render sees the new value on the
                 // same tick. Stat-only — microsecond cost on APFS,
@@ -535,6 +562,25 @@ impl SourceControlPanel {
                             // freshly-pulled branch.
                             panel.force_push_with_lease = false;
                         }
+                        if !should_check_pr {
+                            // Left the in-sync window (new commits / a pull):
+                            // force a fresh PR check on the next re-entry so a
+                            // PR opened or merged meanwhile is reflected.
+                            panel.pr_status_checked_at = None;
+                        }
+                        // A just-created PR sets this flag; invalidate the
+                        // throttle so the refresh below fires this tick and the
+                        // button stops offering Create PR immediately.
+                        let pr_dirty = panel
+                            .commit_area
+                            .read(cx)
+                            .pr_status_dirty;
+                        if pr_dirty {
+                            panel.pr_status_checked_at = None;
+                            panel
+                                .commit_area
+                                .update(cx, |area, _| area.pr_status_dirty = false);
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -543,6 +589,18 @@ impl SourceControlPanel {
                 }
                 if should_check_lease {
                     refresh_force_push_with_lease(&repo, &this, cx).await;
+                }
+                if should_check_pr {
+                    let due = this
+                        .update(cx, |panel, _cx| {
+                            panel.pr_status_checked_at.is_none_or(|t| {
+                                t.elapsed() >= std::time::Duration::from_secs(30)
+                            })
+                        })
+                        .unwrap_or(false);
+                    if due {
+                        refresh_pr_status(&repo, &this, cx).await;
+                    }
                 }
             }
         })
@@ -637,6 +695,9 @@ impl SourceControlPanel {
             is_remote_operation_active: in_flight_remote_kind.is_some(),
             upstream_status: upstream,
             in_flight_remote_op_kind: in_flight_remote_kind,
+            is_github_remote: self.is_github_remote,
+            has_open_pr: self.has_open_pr,
+            is_creating_pr: matches!(commit_status, commit_area::CommitStatus::CreatingPr),
         }
     }
 
@@ -694,6 +755,9 @@ impl SourceControlPanel {
             PrimaryActionKind::Sync => self.commit_area.update(cx, |area, cx| area.sync(cx)),
             PrimaryActionKind::Publish => {
                 self.commit_area.update(cx, |area, cx| area.publish(cx))
+            }
+            PrimaryActionKind::CreatePR => {
+                self.commit_area.update(cx, |area, cx| area.create_pr(cx))
             }
         }
     }
@@ -934,6 +998,37 @@ async fn refresh_force_push_with_lease(
     let _ = this.update(cx, |panel, cx| {
         if panel.force_push_with_lease != lease_ok {
             panel.force_push_with_lease = lease_ok;
+            cx.notify();
+        }
+    });
+}
+
+/// Refresh the cached GitHub PR status (`is_github_remote` + `has_open_pr`)
+/// that gates the Create-PR primary rung. Called from the state observer only
+/// when the branch is published and in sync, throttled to ~30s by the caller.
+///
+/// Runs `git remote get-url origin` (local, fast) first and skips the `gh pr
+/// view` round-trip entirely for non-GitHub remotes. `gh` failures (absent /
+/// unauthenticated) resolve to `has_open_pr = false` so the button stays usable
+/// with guidance rather than silently disabling. Stamps `pr_status_checked_at`
+/// on every run so the throttle holds even when the values are unchanged.
+async fn refresh_pr_status(
+    repo: &Repository,
+    this: &gpui::WeakEntity<SourceControlPanel>,
+    cx: &mut gpui::AsyncApp,
+) {
+    let workdir = repo.workdir().to_path_buf();
+    let is_github = oximux_git::gh::is_github_remote(&workdir).await;
+    let has_pr = if is_github {
+        oximux_git::gh::has_open_pr(&workdir).await
+    } else {
+        false
+    };
+    let _ = this.update(cx, |panel, cx| {
+        panel.pr_status_checked_at = Some(std::time::Instant::now());
+        if panel.is_github_remote != is_github || panel.has_open_pr != has_pr {
+            panel.is_github_remote = is_github;
+            panel.has_open_pr = has_pr;
             cx.notify();
         }
     });

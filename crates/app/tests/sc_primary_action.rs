@@ -243,3 +243,69 @@ fn remote_op_mirror_wins_over_conflict_tooltip_when_kind_differs() {
     assert_eq!(act.kind, PrimaryActionKind::Sync);
     assert_eq!(act.title, "Sync in progress…");
 }
+
+// --- Create PR rung -------------------------------------------------------
+
+#[test]
+fn create_pr_offered_when_in_sync_github_no_open_pr() {
+    // Branch published, even with upstream, GitHub remote, no open PR.
+    let inputs = PrimaryActionInputs {
+        is_github_remote: true,
+        has_open_pr: false,
+        ..clean_with_upstream(0, 0)
+    };
+    let act = resolve_primary_action(&inputs);
+    assert_eq!(unpack(&act), (PrimaryActionKind::CreatePR, "Create PR", false));
+    assert_eq!(act.title, "Create a pull request for this branch");
+}
+
+#[test]
+fn create_pr_suppressed_when_open_pr_exists() {
+    let inputs = PrimaryActionInputs {
+        is_github_remote: true,
+        has_open_pr: true,
+        ..clean_with_upstream(0, 0)
+    };
+    let act = resolve_primary_action(&inputs);
+    // Falls through to the plain "up to date" disabled Commit frame.
+    assert_eq!(act.kind, PrimaryActionKind::Commit);
+    assert!(act.disabled);
+    assert_eq!(act.title, "Nothing to commit. Branch is up to date.");
+}
+
+#[test]
+fn create_pr_hidden_on_non_github_remote() {
+    let inputs = PrimaryActionInputs {
+        is_github_remote: false,
+        ..clean_with_upstream(0, 0)
+    };
+    let act = resolve_primary_action(&inputs);
+    assert_eq!(act.kind, PrimaryActionKind::Commit);
+    assert!(act.disabled);
+}
+
+#[test]
+fn push_wins_over_create_pr_when_ahead() {
+    // Unpushed commits steer the user to Push first, even on a GitHub remote.
+    let inputs = PrimaryActionInputs {
+        is_github_remote: true,
+        has_open_pr: false,
+        ..clean_with_upstream(2, 0)
+    };
+    let act = resolve_primary_action(&inputs);
+    assert_eq!(act.kind, PrimaryActionKind::Push);
+    assert!(!act.disabled);
+}
+
+#[test]
+fn creating_pr_in_flight_locks_primary() {
+    let inputs = PrimaryActionInputs {
+        is_creating_pr: true,
+        is_github_remote: true,
+        ..clean_with_upstream(0, 0)
+    };
+    let act = resolve_primary_action(&inputs);
+    assert_eq!(act.kind, PrimaryActionKind::CreatePR);
+    assert!(act.disabled);
+    assert_eq!(act.title, "Creating pull request…");
+}

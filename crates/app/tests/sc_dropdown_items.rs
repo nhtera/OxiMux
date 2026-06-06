@@ -261,14 +261,71 @@ fn unresolved_conflicts_block_commits_and_remotes() {
 }
 
 #[test]
-fn pr_rows_always_disabled_with_v1_1_tooltip() {
+fn create_pr_disabled_on_non_github_remote() {
+    // Default inputs have is_github_remote = false.
     let r = resolve(&DropdownInputs::default());
     let cpr = find(&r, DropdownActionKind::CreatePr);
     assert!(disabled_of(cpr));
-    assert_eq!(title_of(cpr), "Lands in v1.1");
+    assert_eq!(title_of(cpr), "Not a GitHub remote");
+}
+
+#[test]
+fn create_pr_enabled_when_github_in_sync_no_open_pr() {
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 0, 0),
+            is_github_remote: true,
+            has_open_pr: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(!disabled_of(cpr));
+    assert_eq!(title_of(cpr), "Open a pull request for this branch");
+}
+
+#[test]
+fn create_pr_disabled_when_open_pr_exists() {
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 0, 0),
+            is_github_remote: true,
+            has_open_pr: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(disabled_of(cpr));
+    assert_eq!(title_of(cpr), "This branch already has an open PR");
+}
+
+#[test]
+fn create_pr_disabled_when_branch_not_in_sync() {
+    // Ahead of upstream → must push first.
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 2, 0),
+            is_github_remote: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(disabled_of(cpr));
+    assert_eq!(
+        title_of(cpr),
+        "Push/pull so the branch is in sync, then create a PR"
+    );
+}
+
+#[test]
+fn push_before_pr_row_stays_disabled() {
+    let r = resolve(&DropdownInputs::default());
     let pbpr = find(&r, DropdownActionKind::PushBeforePr);
     assert!(disabled_of(pbpr));
-    assert_eq!(title_of(pbpr), "Lands in v1.1");
+    assert_eq!(title_of(pbpr), "Push first, then use Create PR");
 }
 
 #[test]

@@ -16,6 +16,9 @@ pub enum PrimaryActionKind {
     Pull,
     Sync,
     Publish,
+    /// Branch is published and in sync with its GitHub upstream and has no
+    /// open PR yet — offer one-click `gh pr create`.
+    CreatePR,
 }
 
 /// Remote operations that can be in flight. `Fetch` participates in the busy
@@ -72,6 +75,16 @@ pub struct PrimaryActionInputs {
     pub is_remote_operation_active: bool,
     pub upstream_status: Option<UpstreamStatus>,
     pub in_flight_remote_op_kind: Option<RemoteOpKind>,
+    /// `origin` is a GitHub remote (so `gh` can create a PR). Gates the
+    /// terminal Create-PR rung; non-GitHub remotes fall through to the
+    /// plain "up to date" frame.
+    pub is_github_remote: bool,
+    /// The current branch already has an open PR. Suppresses Create-PR so the
+    /// button doesn't offer a redundant action.
+    pub has_open_pr: bool,
+    /// A `gh pr create` is in flight — locks the primary to a disabled
+    /// "Creating PR…" frame, mirroring the remote-op busy treatment.
+    pub is_creating_pr: bool,
 }
 
 /// Resolve the primary split-button action. Priority ladder mirrors the
@@ -80,6 +93,16 @@ pub fn resolve_primary_action(inputs: &PrimaryActionInputs) -> PrimaryAction {
     // 1. Commit in flight — lock the primary regardless of other state.
     if inputs.is_committing {
         return disabled_commit("Commit in progress…");
+    }
+
+    // 1b. PR creation in flight — lock to a disabled Create-PR frame.
+    if inputs.is_creating_pr {
+        return PrimaryAction {
+            kind: PrimaryActionKind::CreatePR,
+            label: "Create PR".to_string(),
+            title: "Creating pull request…".to_string(),
+            disabled: true,
+        };
     }
 
     // 2. Remote op in flight — derive the candidate via a recursive call with
@@ -210,7 +233,21 @@ pub fn resolve_primary_action(inputs: &PrimaryActionInputs) -> PrimaryAction {
         };
     }
 
-    // 6f. Clean + tracked + in sync.
+    // 6f. Clean + tracked + in sync. The branch is pushed and even with its
+    //     upstream — the natural moment to open a PR. Offer Create PR when the
+    //     remote is GitHub and there's no open PR yet; otherwise the plain
+    //     "up to date" frame. Push/Sync/Pull rungs sit ahead of this, so a
+    //     branch with unpushed/unpulled commits is steered there first ("push
+    //     before PR").
+    if inputs.is_github_remote && !inputs.has_open_pr {
+        return PrimaryAction {
+            kind: PrimaryActionKind::CreatePR,
+            label: "Create PR".to_string(),
+            title: "Create a pull request for this branch".to_string(),
+            disabled: false,
+        };
+    }
+
     disabled_commit("Nothing to commit. Branch is up to date.")
 }
 
@@ -231,6 +268,7 @@ fn label_for_primary(kind: PrimaryActionKind) -> &'static str {
         PrimaryActionKind::Pull => "Pull",
         PrimaryActionKind::Sync => "Sync",
         PrimaryActionKind::Publish => "Publish Branch",
+        PrimaryActionKind::CreatePR => "Create PR",
     }
 }
 
