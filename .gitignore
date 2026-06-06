@@ -32,6 +32,7 @@ docs/journals
 
 # Claude Code harness state (session locks, scratch files)
 .claude/
+.agents/
 
 # repomix scratch dumps (regeneratable; not source-of-truth)
 repomix-output.xml
