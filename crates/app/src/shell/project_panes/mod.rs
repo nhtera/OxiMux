@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui::{App, AppContext, Context, Entity, FocusHandle, Focusable, Subscription, Window};
+use gpui::{
+    App, AppContext, Context, Entity, FocusHandle, Focusable, SharedString, Subscription, Window,
+};
 use oximux_agents::CliRuntime;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -764,6 +766,27 @@ impl ProjectPanes {
         group.update(cx, |g, cx| {
             g.set_next_terminal_n(n);
             g.open_terminal_tab(window, cx);
+        });
+    }
+
+    /// Open a lifecycle-script terminal tab (setup/run/cleanup) rooted at
+    /// `cwd` in the active group. Delegates to `PaneGroup` so the script runs
+    /// in a real, interactive PTY tab.
+    pub fn open_script_terminal_tab_in_active_group(
+        &mut self,
+        cwd: PathBuf,
+        title: SharedString,
+        script: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.active_group() else {
+            return;
+        };
+        let n = self.take_next_terminal_n(cx);
+        group.update(cx, |g, cx| {
+            g.set_next_terminal_n(n);
+            g.open_script_terminal_tab(cwd, title, script, window, cx);
         });
     }
 

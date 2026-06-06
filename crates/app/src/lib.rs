@@ -16,6 +16,7 @@ pub mod menu;
 pub mod notifier;
 pub mod persisted_terminals;
 pub mod project_panes_factory;
+pub mod project_scripts_loader;
 pub mod relay_supervisor;
 pub mod scm_layout_settings;
 pub mod shell;

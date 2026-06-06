@@ -11,9 +11,29 @@ use gpui::{
     Styled, WeakEntity, Window, div, px,
 };
 use oximux_core::Workspace;
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, ScriptKind, Theme, Typography};
 
 use crate::workspace_root::WorkspaceRoot;
+
+/// Which per-project lifecycle scripts are defined for the workspace under
+/// the menu — drives which Run-* rows appear. Computed at menu-open time by
+/// loading `.oximux/scripts.toml` so undefined scripts surface no row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScriptAvail {
+    pub setup: bool,
+    pub run: bool,
+    pub cleanup: bool,
+}
+
+impl ScriptAvail {
+    fn has(self, kind: ScriptKind) -> bool {
+        match kind {
+            ScriptKind::Setup => self.setup,
+            ScriptKind::Run => self.run,
+            ScriptKind::Cleanup => self.cleanup,
+        }
+    }
+}
 
 /// Width of the menu card.
 const MENU_WIDTH: f32 = 160.0;
@@ -30,6 +50,9 @@ const ANCHOR_Y_OFFSET: f32 = 4.0;
 /// Action the user picked from the row menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceRowAction {
+    RunSetup,
+    Run,
+    RunCleanup,
     Rename,
     Archive,
     Delete,
@@ -38,6 +61,9 @@ pub enum WorkspaceRowAction {
 impl WorkspaceRowAction {
     fn label(self) -> &'static str {
         match self {
+            Self::RunSetup => "Run setup",
+            Self::Run => "Run",
+            Self::RunCleanup => "Run cleanup",
             Self::Rename => "Rename",
             Self::Archive => "Archive",
             Self::Delete => "Delete",
@@ -47,8 +73,27 @@ impl WorkspaceRowAction {
     fn is_destructive(self) -> bool {
         matches!(self, Self::Delete)
     }
+
+    /// The lifecycle-script kind this action runs, if it is a script action.
+    fn script_kind(self) -> Option<ScriptKind> {
+        match self {
+            Self::RunSetup => Some(ScriptKind::Setup),
+            Self::Run => Some(ScriptKind::Run),
+            Self::RunCleanup => Some(ScriptKind::Cleanup),
+            _ => None,
+        }
+    }
 }
 
+/// Script actions, in surface order. Filtered to the ones actually defined
+/// for the workspace before rendering.
+const SCRIPT_ACTIONS: &[WorkspaceRowAction] = &[
+    WorkspaceRowAction::RunSetup,
+    WorkspaceRowAction::Run,
+    WorkspaceRowAction::RunCleanup,
+];
+
+/// Always-present management actions, rendered below any script actions.
 const ACTIONS: &[WorkspaceRowAction] = &[
     WorkspaceRowAction::Rename,
     WorkspaceRowAction::Archive,
@@ -56,9 +101,9 @@ const ACTIONS: &[WorkspaceRowAction] = &[
 ];
 
 pub struct WorkspaceRowMenu {
-    /// `None` when closed; `Some` carries both the target workspace and
-    /// the screen-pixel anchor point for the popover.
-    open_for: Option<(Workspace, f32, f32)>,
+    /// `None` when closed; `Some` carries the target workspace, which
+    /// lifecycle scripts are defined for it, and the screen-pixel anchor.
+    open_for: Option<(Workspace, ScriptAvail, f32, f32)>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -85,9 +130,18 @@ impl WorkspaceRowMenu {
         self.open_for.is_some()
     }
 
-    /// Open the menu anchored at (x, y) for the given workspace.
-    pub fn open(&mut self, workspace: Workspace, x: f32, y: f32, cx: &mut Context<Self>) {
-        self.open_for = Some((workspace, x, y + ANCHOR_Y_OFFSET));
+    /// Open the menu anchored at (x, y) for the given workspace. `avail`
+    /// is the set of lifecycle scripts defined for it (computed by the
+    /// caller from `.oximux/scripts.toml`).
+    pub fn open(
+        &mut self,
+        workspace: Workspace,
+        avail: ScriptAvail,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_for = Some((workspace, avail, x, y + ANCHOR_Y_OFFSET));
         cx.notify();
     }
 
@@ -100,22 +154,41 @@ impl WorkspaceRowMenu {
         let Some((workspace, ..)) = self.open_for.clone() else {
             return;
         };
-        let _ = self.weak_root.update(cx, |root, cx| match action {
-            WorkspaceRowAction::Rename => root.request_rename_workspace(workspace, window, cx),
-            WorkspaceRowAction::Archive => root.archive_workspace(workspace, cx),
-            WorkspaceRowAction::Delete => root.request_delete_workspace(workspace, window, cx),
+        let _ = self.weak_root.update(cx, |root, cx| {
+            if let Some(kind) = action.script_kind() {
+                root.run_workspace_script(workspace, kind, window, cx);
+                return;
+            }
+            match action {
+                WorkspaceRowAction::Rename => root.request_rename_workspace(workspace, window, cx),
+                WorkspaceRowAction::Archive => root.archive_workspace(workspace, cx),
+                WorkspaceRowAction::Delete => root.request_delete_workspace(workspace, window, cx),
+                // Script actions handled above.
+                WorkspaceRowAction::RunSetup
+                | WorkspaceRowAction::Run
+                | WorkspaceRowAction::RunCleanup => {}
+            }
         });
     }
 }
 
 impl Render for WorkspaceRowMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some((_, x, y)) = self.open_for.clone() else {
+        let Some((_, avail, x, y)) = self.open_for.clone() else {
             return div().into_any_element();
         };
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
+
+        // Surface only the script rows that are actually defined for this
+        // workspace, followed by the always-present management actions.
+        let actions: Vec<WorkspaceRowAction> = SCRIPT_ACTIONS
+            .iter()
+            .copied()
+            .filter(|a| a.script_kind().is_some_and(|k| avail.has(k)))
+            .chain(ACTIONS.iter().copied())
+            .collect();
 
         let mut card = div()
             .flex()
@@ -127,7 +200,7 @@ impl Render for WorkspaceRowMenu {
             .rounded(px(density.r_card))
             .shadow_lg();
 
-        for (ix, &action) in ACTIONS.iter().enumerate() {
+        for (ix, &action) in actions.iter().enumerate() {
             let fg = if action.is_destructive() {
                 theme.status_error
             } else {
@@ -205,5 +278,55 @@ mod tests {
                 WorkspaceRowAction::Delete,
             ]
         );
+    }
+
+    #[test]
+    fn script_actions_map_to_their_kind() {
+        assert_eq!(
+            WorkspaceRowAction::RunSetup.script_kind(),
+            Some(ScriptKind::Setup)
+        );
+        assert_eq!(WorkspaceRowAction::Run.script_kind(), Some(ScriptKind::Run));
+        assert_eq!(
+            WorkspaceRowAction::RunCleanup.script_kind(),
+            Some(ScriptKind::Cleanup)
+        );
+        assert_eq!(WorkspaceRowAction::Rename.script_kind(), None);
+        assert_eq!(WorkspaceRowAction::Delete.script_kind(), None);
+    }
+
+    #[test]
+    fn script_actions_are_not_destructive() {
+        assert!(!WorkspaceRowAction::RunSetup.is_destructive());
+        assert!(!WorkspaceRowAction::Run.is_destructive());
+        assert!(!WorkspaceRowAction::RunCleanup.is_destructive());
+    }
+
+    #[test]
+    fn avail_filters_to_defined_scripts_only() {
+        let avail = ScriptAvail {
+            setup: true,
+            run: false,
+            cleanup: true,
+        };
+        let surfaced: Vec<WorkspaceRowAction> = SCRIPT_ACTIONS
+            .iter()
+            .copied()
+            .filter(|a| a.script_kind().is_some_and(|k| avail.has(k)))
+            .collect();
+        assert_eq!(
+            surfaced,
+            vec![WorkspaceRowAction::RunSetup, WorkspaceRowAction::RunCleanup]
+        );
+    }
+
+    #[test]
+    fn avail_empty_surfaces_no_script_rows() {
+        let avail = ScriptAvail::default();
+        let count = SCRIPT_ACTIONS
+            .iter()
+            .filter(|a| a.script_kind().is_some_and(|k| avail.has(k)))
+            .count();
+        assert_eq!(count, 0);
     }
 }

@@ -667,6 +667,75 @@ impl PaneGroup {
         Some(self.active)
     }
 
+    /// Open a terminal tab rooted at `cwd` that runs `script` once, leaving
+    /// the interactive shell live afterward (so a short setup script's tab
+    /// stays usable and a long-running `run` stays attached). Used by the
+    /// per-project lifecycle scripts surface.
+    ///
+    /// The script is fed as if typed at the prompt + Enter rather than passed
+    /// as shell args: the relay spawn path honors only `shell` and drops extra
+    /// args, so feeding input is the one path that runs a command on both the
+    /// relay-backed and in-process backends. Input queues in the PTY master
+    /// and the shell consumes it once it starts reading stdin.
+    ///
+    /// Multi-line scripts work as written: each embedded `\n` is delivered to
+    /// the shell's line discipline as an Enter, so every line executes in
+    /// order. There is no single-line restriction.
+    pub fn open_script_terminal_tab(
+        &mut self,
+        cwd: PathBuf,
+        title: SharedString,
+        script: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let ids = SurfaceIds::fresh(cwd.to_string_lossy().into_owned());
+        let (backend, session_id) = spawn_local_pty(cwd, ids.env())?;
+        {
+            let mut guard = backend.lock().expect("shared backend poisoned");
+            // Trailing `\n` runs the (possibly multi-line) script. Each
+            // newline is an Enter to the shell's line discipline.
+            let line = format!("{}\n", script.trim());
+            if let Err(err) = guard.write(session_id, line.as_bytes()) {
+                // Keep the tab: a live interactive shell at the worktree cwd
+                // is still useful (the user can re-run the script by hand).
+                // Only the in-process fallback can fail here; the relay path
+                // enqueues without blocking.
+                tracing::warn!(?err, "failed to feed lifecycle script into pty");
+            }
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let view = cx.new(|cx| {
+            TerminalView::mount(
+                backend, session_id, ids, theme, density, typography, window, cx,
+            )
+        });
+        Self::wire_opener(&view, cx);
+        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+        let n = self.next_terminal_n;
+        self.next_terminal_n += 1;
+        let tab = PaneGroupTab {
+            label: SharedString::from(format!("Terminal {n}")),
+            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
+            kind: PaneGroupTabKind::Terminal,
+            color: None,
+            custom_title: Some(title),
+            pinned: false,
+            _observer: None,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        self.tab_order.push(self.tabs.len() - 1);
+        self.active = self.tabs.len() - 1;
+        self.bump_mru(self.active);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        Some(self.active)
+    }
+
     pub fn open_or_activate_editor_tab(
         &mut self,
         path: PathBuf,
