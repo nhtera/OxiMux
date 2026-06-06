@@ -183,15 +183,7 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             if row_idx < r0 || row_idx > r1 {
                 continue;
             }
-            let (cs, ce) = if r0 == r1 {
-                (c0.min(last_col), c1.min(last_col))
-            } else if row_idx == r0 {
-                (c0.min(last_col), last_col)
-            } else if row_idx == r1 {
-                (0, c1.min(last_col))
-            } else {
-                (0, last_col)
-            };
+            let (cs, ce) = row_selection_span(r0, c0, r1, c1, row_idx, last_col);
             // pad up to len matching row_idx so callers can index by
             // row_idx directly.
             while ranges.len() < row_idx + 1 {
@@ -269,7 +261,10 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
             && cs != usize::MAX
         {
             let x_left = (origin.x + cell_w * cs as f32).floor();
-            let width = (cell_w * (ce + 1 - cs) as f32).ceil();
+            // `saturating_sub` so a stray cs > ce can never underflow and abort
+            // the whole app from the paint path (the range builder normalizes,
+            // but render-path panics are unrecoverable — keep this defensive).
+            let width = (cell_w * (ce + 1).saturating_sub(cs) as f32).ceil();
             let rect = Bounds {
                 origin: point(x_left, row_y),
                 size: Size {
@@ -738,10 +733,72 @@ fn effective_fg_for_cell(
     fg
 }
 
+/// Inclusive `(start_col, end_col)` of the selection on `row_idx`. Assumes the
+/// caller has normalized `(r0,c0) <= (r1,c1)` and that `r0 <= row_idx <= r1`.
+///
+/// When the selection collapses onto a single row (`r0 == r1`) the column order
+/// is re-normalized: independent clamping of `r0`/`r1` to the grid's current
+/// height can fold a multi-row selection onto one row with `c0 > c1`, and the
+/// paint path's width math (`end + 1 - start`) underflows if start > end.
+fn row_selection_span(
+    r0: usize,
+    c0: usize,
+    r1: usize,
+    c1: usize,
+    row_idx: usize,
+    last_col: usize,
+) -> (usize, usize) {
+    if r0 == r1 {
+        let (lo, hi) = (c0.min(c1), c0.max(c1));
+        (lo.min(last_col), hi.min(last_col))
+    } else if row_idx == r0 {
+        (c0.min(last_col), last_col)
+    } else if row_idx == r1 {
+        (0, c1.min(last_col))
+    } else {
+        (0, last_col)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oximux_pty::{Cell, NamedColor16};
+
+    #[test]
+    fn span_single_row_normal_order() {
+        assert_eq!(row_selection_span(2, 3, 2, 7, 2, 79), (3, 7));
+    }
+
+    #[test]
+    fn span_collapsed_row_reorders_columns() {
+        // A multi-row selection whose rows both clamped to the same last row
+        // (r0 == r1) with c0 > c1 must still yield start <= end — the
+        // regression that panicked the paint path with a usize underflow.
+        let (cs, ce) = row_selection_span(8, 50, 8, 3, 8, 79);
+        assert!(cs <= ce, "got cs={cs} ce={ce}");
+        assert_eq!((cs, ce), (3, 50));
+    }
+
+    #[test]
+    fn span_multi_row_first_extends_to_last_col() {
+        assert_eq!(row_selection_span(2, 4, 5, 9, 2, 79), (4, 79));
+    }
+
+    #[test]
+    fn span_multi_row_last_starts_at_zero() {
+        assert_eq!(row_selection_span(2, 4, 5, 9, 5, 79), (0, 9));
+    }
+
+    #[test]
+    fn span_multi_row_middle_is_full_row() {
+        assert_eq!(row_selection_span(2, 4, 5, 9, 3, 79), (0, 79));
+    }
+
+    #[test]
+    fn span_clamps_to_last_col() {
+        assert_eq!(row_selection_span(0, 100, 0, 200, 0, 10), (10, 10));
+    }
 
     fn cell(ch: char, fg: CellColor, bg: CellColor) -> Cell {
         Cell {
