@@ -20,6 +20,7 @@ pub mod ai_generation;
 pub mod ai_overlay;
 pub mod branch_commits;
 pub mod branch_picker;
+pub mod ci_status;
 pub mod commit_area;
 pub mod commit_context_menu;
 pub mod commit_ops;
@@ -125,6 +126,16 @@ pub struct SourceControlPanel {
     /// refreshed. Throttles the `gh` round-trips to ~30s (GitHub rate limits)
     /// and lets the button reflect a just-created PR within that window.
     pr_status_checked_at: Option<std::time::Instant>,
+
+    /// Branch the cached PR status + CI checks belong to. Switching to a
+    /// different (also-in-sync) branch invalidates the throttle so the next
+    /// tick re-checks instead of showing the previous branch's PR/CI for 30s.
+    pr_status_checked_branch: Option<String>,
+
+    /// CI check runs for the current branch's PR (`gh pr checks`). Fetched on
+    /// the same throttle as the PR status, only while a PR is open. Empty when
+    /// there's no PR or no checks — the compact CI row then renders nothing.
+    ci_checks: Vec<oximux_git::gh::CheckRun>,
 
     /// Cached resolved primary action from the last render. Read by the
     /// status bar to show the same verb without running a second resolver.
@@ -364,6 +375,8 @@ impl SourceControlPanel {
             is_github_remote: false,
             has_open_pr: false,
             pr_status_checked_at: None,
+            pr_status_checked_branch: None,
+            ci_checks: Vec::new(),
             base_ref: initial_base_ref,
             current_op: initial_op,
             on_open_file,
@@ -518,6 +531,13 @@ impl SourceControlPanel {
                     PollState::Ready(s)
                         if s.upstream.is_some() && s.ahead == 0 && s.behind == 0
                 );
+                // The branch the (potential) PR/CI refresh would belong to —
+                // used to invalidate the throttle when the user switches to a
+                // different in-sync branch (its PR/CI differ).
+                let pr_branch = match &state {
+                    PollState::Ready(s) => s.branch.clone(),
+                    _ => None,
+                };
                 // Refresh the cached in-progress git op before the
                 // panel update so render sees the new value on the
                 // same tick. Stat-only — microsecond cost on APFS,
@@ -562,11 +582,13 @@ impl SourceControlPanel {
                             // freshly-pulled branch.
                             panel.force_push_with_lease = false;
                         }
-                        if !should_check_pr {
-                            // Left the in-sync window (new commits / a pull):
-                            // force a fresh PR check on the next re-entry so a
-                            // PR opened or merged meanwhile is reflected.
+                        if !should_check_pr || panel.pr_status_checked_branch != pr_branch {
+                            // Left the in-sync window (new commits / a pull), or
+                            // switched to a different in-sync branch: force a
+                            // fresh PR + CI check on the next tick so stale data
+                            // from the previous branch/state isn't shown.
                             panel.pr_status_checked_at = None;
+                            panel.pr_status_checked_branch = pr_branch.clone();
                         }
                         // A just-created PR sets this flag; invalidate the
                         // throttle so the refresh below fires this tick and the
@@ -866,6 +888,23 @@ impl Render for SourceControlPanel {
             }))
         };
 
+        // Compact CI-checks row for the branch's open PR. `ci_checks` is
+        // refreshed by the state observer (only while a PR exists), so this is
+        // a pure render; it collapses to nothing when there are no checks.
+        let ci_row: Option<AnyElement> =
+            ci_status::render_ci_row(
+                ci_status::CheckSummary::from_runs(&self.ci_checks),
+                theme,
+                &self.typography,
+            )
+            .map(|row| {
+                div()
+                    .px(px(self.density.pad_panel))
+                    .pb(px(self.density.gap_inline))
+                    .child(row)
+                    .into_any_element()
+            });
+
         // Filter wiring: helper `filter_files` is unit-tested in
         // `crates/app/tests/sc_filter.rs`; the changed-files list itself does
         // not consume the query yet — that wires through `GitPanel` in a
@@ -940,6 +979,7 @@ impl Render for SourceControlPanel {
             .children(conflict_card)
             .children(operation_banner)
             .children(commit_area_render)
+            .children(ci_row)
             .child(files_block)
             // Stash list docked above the graph (or at the very bottom
             // when the scope hides the graph). Always-mounted entity;
@@ -1024,11 +1064,22 @@ async fn refresh_pr_status(
     } else {
         false
     };
+    // Only pull CI checks when there's actually a PR — a second `gh` round-trip
+    // we don't want to spend otherwise. Empty list clears any stale CI row.
+    let checks = if has_pr {
+        oximux_git::gh::pr_checks(&workdir).await
+    } else {
+        Vec::new()
+    };
     let _ = this.update(cx, |panel, cx| {
         panel.pr_status_checked_at = Some(std::time::Instant::now());
-        if panel.is_github_remote != is_github || panel.has_open_pr != has_pr {
+        let changed = panel.is_github_remote != is_github
+            || panel.has_open_pr != has_pr
+            || panel.ci_checks != checks;
+        if changed {
             panel.is_github_remote = is_github;
             panel.has_open_pr = has_pr;
+            panel.ci_checks = checks;
             cx.notify();
         }
     });

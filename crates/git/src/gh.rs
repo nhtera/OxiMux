@@ -13,6 +13,7 @@
 //! non-zero when the branch has no open PR), so no JSON parser is pulled in.
 
 use crate::error::{GitError, Result};
+use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -191,9 +192,58 @@ pub async fn pr_create(cwd: impl AsRef<Path>) -> Result<String> {
     Ok(url)
 }
 
+/// One CI check run for the branch's PR, as reported by `gh pr checks --json`.
+/// `bucket` is gh's coarse category — one of `pass`, `fail`, `pending`,
+/// `skipping`, `cancel` — which is exactly the granularity the compact CI row
+/// needs (the per-provider `state` strings vary too much to switch on).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CheckRun {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub bucket: String,
+}
+
+/// Fetch the CI check runs for the current branch's PR via
+/// `gh pr checks --json name,bucket`. Returns an empty list (never an error)
+/// when there is no PR, no checks, `gh` is absent/unauthenticated, or the JSON
+/// can't be parsed — the CI row simply doesn't render in those cases. NB: `gh
+/// pr checks` exits non-zero when checks are pending/failing, so the JSON is
+/// parsed from stdout regardless of exit code.
+pub async fn pr_checks(cwd: impl AsRef<Path>) -> Vec<CheckRun> {
+    let Ok((_ok, stdout, _stderr)) = GhCmd::new(cwd)
+        .args(["pr", "checks", "--json", "name,bucket"])
+        // Shorter than the default: this runs on the SCM poll path right after
+        // has_open_pr, so cap the sequential worst case rather than stacking two
+        // 30s timeouts behind git-status updates.
+        .timeout(Duration::from_secs(10))
+        .run_raw()
+        .await
+    else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<CheckRun>>(stdout.trim()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_checks_json() {
+        let json = r#"[{"name":"build","bucket":"pass"},{"name":"test","bucket":"fail"}]"#;
+        let runs: Vec<CheckRun> = serde_json::from_str(json).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].name, "build");
+        assert_eq!(runs[1].bucket, "fail");
+    }
+
+    #[test]
+    fn checks_json_tolerates_unknown_fields() {
+        let json = r#"[{"name":"lint","bucket":"pending","link":"http://x","extra":1}]"#;
+        let runs: Vec<CheckRun> = serde_json::from_str(json).unwrap();
+        assert_eq!(runs[0].bucket, "pending");
+    }
 
     #[test]
     fn builder_accumulates_args() {
