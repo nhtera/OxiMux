@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-06 — Settings modal, Quick Open index, lifecycle scripts, Create PR + CI, floating PiP terminal
+
+**Commits**: `cdcbe65`, `0817caa`, `778160a`, `e5dc89f`, `d0c7ba1`, `a2a6c95`, `326464a`  
+**Touches**: `crates/app/src/shell/settings_modal/` (NEW), `crates/app/src/shell/command_palette/file_index.rs` (NEW), `crates/settings/src/project_scripts.rs` (NEW), `crates/app/src/project_scripts_loader.rs` (NEW), `crates/git/src/gh.rs` (NEW), `crates/app/src/shell/source_control/pr_ops.rs` (NEW), `crates/app/src/shell/source_control/ci_status.rs` (NEW), `crates/app/src/shell/floating_terminal.rs` (NEW)
+
+Five features shipped as a batch:
+
+- **Settings panel modal** (`Cmd+,` or left-rail cog). Five panes: Terminal, Agents, Keybindings (read-only display), Appearance, About. Terminal pane writes `terminal.toml`; Agents pane writes `commit_message_ai.toml`; the existing FSEvents file-watcher re-applies both — the modal never sets config on the global directly. `save()` and `app_data_dir()` added to both settings loaders.
+
+- **Quick Open file index** (`Cmd+P`). `file_index.rs` shells out `rg --files` asynchronously, caps at 20 000 results, ranks and trims to 50, then opens the selected path as an editor tab. Shows an install hint if `rg` is absent. Per-project cache is invalidated on project switch. Replaces 3 hardcoded stubs in the palette.
+
+- **Per-repo lifecycle scripts**. `ProjectScripts` + `ScriptKind` in `crates/settings/src/project_scripts.rs`; loader reads `.oximux/scripts.toml` per project (keys: `setup`, `run`, `cleanup`, `auto_setup` bool). Left-rail workspace "…" menu surfaces "Run setup / Run / Run cleanup" for defined script kinds — each spawns an interactive PTY tab at the worktree cwd (script fed via stdin, matching the relay spawn path). `auto_setup = true` triggers setup automatically after worktree create. Cleanup runs awaited before worktree delete, bounded 30 s with `kill_on_drop` force-escape.
+
+- **One-click Create PR + CI checks** (Source Control panel). New `crates/git/src/gh.rs` wraps `gh` CLI: `GhCmd`, `available`, `is_github_remote`, `has_open_pr`, `pr_create`, `pr_checks`, `CheckRun`. SCM primary-action gains a `CreatePR` rung gated on: branch in-sync + GitHub upstream + no open PR; Push/Sync-ahead rungs remain. `pr_ops.rs` is the tokio→GPUI bridge. `ci_status.rs` renders a compact `CI passing/running/failing ✓N ✗N ●N` row from `gh pr checks`, refreshed on a 30 s throttle inside the SCM state observer (only while a PR is open). `serde` + `serde_json` added to the `git` crate.
+
+- **Floating PiP terminal** (`Cmd+Shift+T`). `floating_terminal.rs` toggles an in-window draggable/resizable terminal card rooted at the active worktree cwd. Not a second OS window — rendered inside the GPUI layer. PTY persists across hide/show cycles; close tears it down. Window geometry is debounce-persisted to the settings repo as JSON.
+
+---
+
 ### 2026-06-06 — Custom commands + interactive command palette
 
 **Commits**: `e85b0cd`  

@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-05-29  
-**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete
+**Updated**: 2026-06-06  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal) shipped
 
 ---
 
@@ -16,17 +16,25 @@
 │                     each tab: PaneContent::Terminal  │
 │                             | PaneContent::Editor    │
 │                → RightSidebar (tab-switched panel)  │
-│                   Explorer tab: FileExplorer (uniform_list, lazy, git badges)│
-│                   Files tab:    FileTreeView (always visible; no repo gate)  │
-│                   Search tab:   SearchPanel                                  │
-│                   SourceControl tab: GitPanel+DiffView│
-│                → StatusBar (git zone)               │
+│                   Explorer tab: FileExplorer         │
+│                   Files tab:    FileTreeView         │
+│                   Search tab:   SearchPanel          │
+│                   SourceControl tab: GitPanel +      │
+│                     DiffView + pr_ops + ci_status    │
+│                → StatusBar (git zone + smart button) │
+│  Overlays (mounted last-child in WorkspaceRoot)      │
+│    PaletteModal   — Cmd+P / Cmd+Shift+P              │
+│    SettingsModal  — Cmd+,  / left-rail cog           │
+│    FloatingTerminal — Cmd+Shift+T (PiP, draggable)  │
 ├─────────────────────────────────────────────────────┤
 │  Domain / backend layer                             │
 │  crates/pty    — TerminalBackend + PortablePtyBackend│
-│  crates/git    — Repository, StatusPoller, git ops  │
+│  crates/git    — Repository, StatusPoller, git ops, │
+│                  GhCmd (gh CLI wrapper)              │
 │  crates/agents — AgentRuntime trait + CliRuntime    │
 │                  CliAgentAdapter + StatusMachine     │
+│  crates/settings — terminal.toml, commit_message_ai.toml,│
+│                    ProjectScripts (.oximux/scripts.toml)  │
 │  crates/core   — shared domain types (no deps)      │
 ├─────────────────────────────────────────────────────┤
 │  Async runtime                                      │
@@ -42,9 +50,13 @@
 WorkspaceRoot (GPUI entity)
 ├── fields
 │   ├── main_pane: Entity<MainPane>        ← grid of pane leaves (Terminal | Editor)
-│   └── right_sidebar: Option<Entity<RightSidebar>>   ← None when no git repo
-│       open_file_in_active_pane(path, window, cx)
-│         → MainPane::open_editor_in_focused_pane(path, window, cx)
+│   ├── right_sidebar: Option<Entity<RightSidebar>>   ← None when no git repo
+│   │     open_file_in_active_pane(path, window, cx)
+│   │       → MainPane::open_editor_in_focused_pane(path, window, cx)
+│   ├── palette: Entity<PaletteModal>      ← Cmd+P / Cmd+Shift+P overlay
+│   ├── settings_modal: Entity<SettingsModal> ← Cmd+, / left-rail cog overlay
+│   └── floating_terminal: Option<Entity<FloatingTerminal>> ← Cmd+Shift+T PiP overlay
+│         draggable/resizable; PTY persists across hide; geometry debounce-persisted
 │
 └── RightSidebar (GPUI entity, present only when cwd is a git repo)
     ├── active_tab: RightTab  (Explorer | Search | SourceControl | Files)
@@ -56,9 +68,13 @@ WorkspaceRoot (GPUI entity)
     │     5s tokio timeout per dir load; focus-regain refresh via observe_window_activation
     ├── file_tree_view: Entity<FileTreeView> ← shown on Files tab (always visible; no repo gate)
     │     on_open callback → WorkspaceRoot::open_file_in_active_pane
-    │     SelectFilesTab action bound to Cmd+Shift+T
-    ├── git_panel: Entity<GitPanel>        ← shown on SourceControl tab
-    └── diff_view: Entity<DiffView>        ← shown on SourceControl tab
+    ├── source_control: Entity<SourceControlPanel> ← shown on SourceControl tab
+    │     primary_action resolver: CreatePR (in-sync + GitHub + no open PR) /
+    │       Push / Sync-ahead / Commit / Stage All / Pull
+    │     pr_ops.rs: gh pr create --fill → opens browser
+    │     ci_status.rs: gh pr checks → ✓N ✗N ●N row; 30s throttle; only while PR open
+    ├── git_panel: Entity<GitPanel>        ← changed-files list
+    └── diff_view: Entity<DiffView>        ← hunk diff render
 ```
 
 `WorkspaceRoot::new` creates `RightSidebar::new(repo, …)` when `Repository::open` succeeds. `StatusPoller::spawn` wires the 500ms tick inside `RightSidebar`. Status bar reads `right_sidebar.read(cx).latest_poll_state()`. On each non-duplicate status delta, `cx.notify()` propagates to all subscribers including the status bar center zone.

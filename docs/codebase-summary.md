@@ -1,7 +1,7 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-06-05  
-**Phase**: 5 + multiplexer enhancements — mux-P3 (multi-window/tear-off) + mux-P4 (per-pane tabs + context env) code complete; left-rail rich worktree cards + live diff counts shipped  
+**Updated**: 2026-06-06  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open index, lifecycle scripts, Create PR + CI checks, floating PiP terminal) shipped to main  
 **Tests**: 375 app lib tests + storage/relay/relay-client/pty, 0 failures
 
 ---
@@ -78,8 +78,23 @@ src/
     │   │                   click + Enter; holds loaded custom commands; palette_filter (pure)
     │   ├── entry.rs        PALETTE_COMMANDS fn-ptr catalog + PaletteItem/PaletteItemAction
     │   │                   (Builtin fn | Custom prompt) + build_palette_items (merges customs)
+    │   ├── file_index.rs   Quick Open file index (Cmd+P); async rg --files, cap 20k, ranked+
+    │   │                   capped to 50; Enter opens editor tab; missing-rg hint; per-project
+    │   │                   cache invalidated on project switch; replaces 3 hardcoded stubs
     │   ├── match_engine.rs pure scorer: prefix > consecutive > subsequence (no external crate)
     │   └── palette_modal.rs pure render: card + header chip + result list
+    ├── settings_modal/     Cmd+, / left-rail cog — five-pane settings overlay
+    │   ├── mod.rs          SettingsModal entity; pane routing; open/close
+    │   ├── view.rs         top-level render: nav rail + active pane body
+    │   ├── controls.rs     shared form control helpers (toggle, text field, select)
+    │   ├── nav.rs          pane nav list (Terminal / Agents / Keybindings / Appearance / About)
+    │   ├── pane_terminal.rs terminal settings form; writes terminal.toml via save()
+    │   ├── pane_agents.rs  agent settings form; writes commit_message_ai.toml via save()
+    │   ├── pane_keybindings.rs read-only keybinding display
+    │   └── pane_about.rs   version + license info
+    ├── floating_terminal.rs Cmd+Shift+T — in-window draggable/resizable PiP terminal card;
+    │                       PTY persists across hide/show; close tears down; geometry
+    │                       debounce-persisted to settings repo as JSON; NOT a second OS window
     ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)
     ├── main_pane.rs        pane binary-tree; split/close/focus actions; each leaf holds
     │                       PaneContent enum (Terminal | Editor); open_editor_in_focused_pane
@@ -172,10 +187,23 @@ src/
     │   ├── file_drag.rs    FilePathDragPayload for file-drop into panes
     │   ├── tab_drag.rs     tab drag payload + state
     │   └── tab_drag_zones.rs drop-zone hit detection
+    ├── source_control/     Source Control panel (SourceControl tab of RightSidebar)
+    │   ├── mod.rs          SourceControlPanel entity; primary-action state machine
+    │   ├── primary_action.rs PrimaryAction resolver (CreatePR / Push / Sync / Commit / etc.)
+    │   ├── pr_ops.rs       tokio→GPUI bridge: gh pr create --fill, open PR in browser
+    │   ├── ci_status.rs    CI checks row from gh pr checks; compact ✓N ✗N ●N summary;
+    │   │                   30 s throttle refresh, only while a PR is open
+    │   ├── commit_area.rs  commit message input + submit
+    │   ├── branch_commits.rs branch commit log panel
+    │   ├── branch_picker.rs branch switch UI
+    │   └── [other SCM sub-modules]
     └── worktree_panel/
         ├── mod.rs          WorktreePanel entity; refresh/submit_create/pending_remove
         └── list_render.rs  pure label/suggest-path helpers
 ```
+
+Top-level entries in `crates/app/src/` also include:
+- `project_scripts_loader.rs` — reads `.oximux/scripts.toml` per project (`ProjectScripts`); wires left-rail "…" menu items ("Run setup / Run / Run cleanup") → spawns interactive PTY tab at worktree cwd; `auto_setup` hook after worktree create; cleanup awaited (30 s bound, `kill_on_drop`) before worktree delete
 
 ---
 
@@ -196,7 +224,10 @@ src/
 ├── stash.rs        push/list/apply/pop/drop + is_dirty precheck
 ├── branch.rs       list/create/switch
 ├── worktree.rs     add/list/remove (branch convention oximux/<slug>)
-└── merge.rs        merge with auto-stash recovery; MergeOutcome
+├── merge.rs        merge with auto-stash recovery; MergeOutcome
+└── gh.rs           GhCmd wrapper for gh CLI: available / is_github_remote / has_open_pr /
+                    pr_create (--fill, opens browser) / pr_checks / CheckRun;
+                    serde+serde_json used for CheckRun deserialization
 ```
 
 ---

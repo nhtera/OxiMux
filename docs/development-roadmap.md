@@ -1,6 +1,6 @@
 # OxiMux — Development Roadmap
 
-**Updated**: 2026-05-30  
+**Updated**: 2026-06-06  
 **Gate rule**: each phase ships only after ≥7 consecutive daily-driver days with zero panics (ADR-003). Tests-passing alone is not sufficient.
 
 ---
@@ -126,6 +126,20 @@ Closes the emulator-quality gap with the three GPUI reference terminals (all sha
 **Keybinds added**: Cmd+Shift+I sends terminal selection to active agent's input buffer; Cmd+Shift+O sends last completed command's output (bracketed by P8 marks).
 
 **Display-only backend seam (slice 2)**: `TerminalBackend::write_output(id, bytes)` lets an external producer stream bytes into a `spawn_dormant` session's grid without a PTY child. Live sessions are rejected to avoid racing the watcher thread on the parser mutex. No app-layer consumer wired yet — slice 3 (`block_below_cursor`) is the natural next consumer.
+
+---
+
+## UI/UX batch — shipped to main 2026-06-06
+
+Commits: `cdcbe65` `0817caa` `778160a` `e5dc89f` `d0c7ba1` `a2a6c95` `326464a`
+
+| Feature | Keybind / entry point | Status |
+|---|---|---|
+| Settings panel modal (Terminal / Agents / Keybindings / Appearance / About) | `Cmd+,` / left-rail cog | shipped |
+| Quick Open file index (`rg --files`, ranked top-50) | `Cmd+P` | shipped |
+| Per-repo lifecycle scripts (setup / run / cleanup + auto_setup) | `.oximux/scripts.toml` / left-rail "…" menu | shipped |
+| One-click Create PR + CI checks row (`gh` CLI) | SCM panel primary-action + status row | shipped |
+| Floating PiP terminal (draggable/resizable, in-window, PTY-persistent) | `Cmd+Shift+T` | shipped |
 
 ---
 
