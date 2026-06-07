@@ -219,8 +219,9 @@ item h  = density.h_overlay_item   (30px)
 
 Adopt for every new floating surface. Today's compliant surfaces:
 `pane_actions`, `adapter_picker`, `commit_context_menu`, `file_tree_context_menu`,
-`tab_context_menu`, `git_panel/row_context_menu`, `review_note_popover`. See the
-"approved exceptions" table above for the three surfaces that deliberately diverge.
+`tab_context_menu`, `git_panel/row_context_menu`, `review_note_popover`,
+`pr_dialog`. See the "approved exceptions" table above for the three surfaces
+that deliberately diverge.
 
 ## Diff review notes
 
@@ -251,6 +252,36 @@ inline and split mode (the prompt is built from the render plan, not the
 on-screen rows). Split mode does not yet paint the gutter markers (inline
 only) — a deliberate v1 boundary; notes added inline still send correctly
 while viewing split.
+
+## CI checks + pull requests
+
+The Source Control panel surfaces the branch's open-PR checks and PR actions —
+quiet by default, no chrome when there's no PR.
+
+- **Checks section** (`source_control/checks_section`) — replaces the one-line CI
+  summary with a per-check list (status glyph in `status_ok` / `status_error` /
+  `status_warning` + name + blurb) under a headline ("CI failing (4)") with
+  `Refresh` and, when something failed, a `Fix failing` chip. A failing check is
+  clickable: it expands an inline log peek (the run's `--log-failed` tail,
+  monospace, byte-capped, in a `bg_base` scroll box). `Fix failing` bundles the
+  failing logs into one markdown prompt and sends it to the active agent via
+  `SendTextToActiveAgent`. Check data rides the existing PR-status poll (no
+  dedicated cadence); the section collapses to nothing when there are no real
+  checks. This lives in the SCM panel, not a separate activity-bar tab — checks
+  belong with source control and reuse its poll.
+- **Create-PR dialog** (`pr_dialog`) — Floating Surface Chrome, centered modal.
+  Editable title + multi-line body + a draft toggle; `Draft from commits` fills
+  the fields from the branch's commit subjects. `⌘↵` creates, `Esc` cancels;
+  Create is disabled until the title is non-empty. Replaces the bare
+  commit-derived auto-create so the user reviews/edits before opening the PR.
+- **Merge** — when a PR is open, the SCM dropdown grows one row per method
+  (squash / merge commit / rebase), disabled while any op is in flight. Merging
+  never deletes the branch (the user's explicit choice). Remote PR ops show an
+  In-Flight status frame ("Creating/Merging pull request…").
+
+All forge calls (checks, log peek, create, merge) go through the `forge`
+provider seam (`ForgeProvider`, one `gh`-CLI impl today) — never the CLI
+directly — so a second host can slot in without touching these surfaces.
 
 ## Primitive-Picking Fork
 
