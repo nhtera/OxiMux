@@ -954,6 +954,7 @@ impl SourceControlPanel {
             is_github_remote: self.is_github_remote,
             has_open_pr: self.has_open_pr,
             is_creating_pr: matches!(commit_status, commit_area::CommitStatus::CreatingPr),
+            is_merging_pr: matches!(commit_status, commit_area::CommitStatus::MergingPr),
         }
     }
 

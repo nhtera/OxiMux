@@ -16,7 +16,7 @@ use gpui::Context;
 use tokio::sync::oneshot;
 
 use super::commit_area::{CommitArea, CommitStatus};
-use crate::shell::forge::{CreatePrOptions, ForgeProvider, GithubForge};
+use crate::shell::forge::{CreatePrOptions, ForgeProvider, GithubForge, MergeMethod};
 
 /// Create a PR for the current branch with the supplied options (empty title
 /// falls back to commit-derived fill). No-op if another op is already in flight
@@ -65,6 +65,58 @@ pub fn run_create_pr(area: &mut CommitArea, opts: CreatePrOptions, cx: &mut Cont
                 }
                 Err(err) => {
                     area.status = CommitStatus::Failed("create PR".to_string(), err);
+                }
+            }
+            cx.notify();
+        });
+    });
+    area._commit_task = Some(task);
+}
+
+/// Merge the current branch's open PR with `method`. No-op if another op is in
+/// flight (shared `in_flight` latch). On success the status row clears and the
+/// panel's next poll re-checks PR/CI (forced via `pr_status_dirty`); on failure
+/// the status row shows the forge's message (e.g. "not mergeable").
+pub fn run_merge_pr(area: &mut CommitArea, method: MergeMethod, cx: &mut Context<CommitArea>) {
+    if area.in_flight.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    area.status = CommitStatus::MergingPr;
+    let workdir = area.repo.workdir().to_path_buf();
+    let (tx, rx) = oneshot::channel::<Result<(), String>>();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let r = GithubForge
+                    .merge_pr(&workdir, method)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(r);
+            });
+        }
+        Err(_) => {
+            area.status =
+                CommitStatus::Failed("merge PR".to_string(), "no tokio runtime".to_string());
+            area.in_flight.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
+    let task = cx.spawn(async move |this, cx| {
+        let Ok(result) = rx.await else {
+            return;
+        };
+        let _ = this.update(cx, |area, cx| {
+            area.in_flight.store(false, Ordering::SeqCst);
+            match result {
+                Ok(()) => {
+                    area.status = CommitStatus::Idle;
+                    // Force the next observer tick to re-check PR status so the
+                    // merged PR's surface (checks, merge rows) clears promptly.
+                    area.pr_status_dirty = true;
+                    tracing::info!(target: "oximux_app::source_control", "pull request merged");
+                }
+                Err(err) => {
+                    area.status = CommitStatus::Failed("merge PR".to_string(), err);
                 }
             }
             cx.notify();

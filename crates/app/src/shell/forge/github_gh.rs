@@ -11,7 +11,7 @@ use std::path::Path;
 use oximux_git::Result;
 use oximux_git::gh;
 
-use super::{CheckRun, CreatePrOptions, ForgeProvider};
+use super::{CheckRun, CreatePrOptions, ForgeProvider, MergeMethod};
 
 /// Forge provider backed by the `gh` CLI. Carries no state — construct with
 /// `GithubForge`.
@@ -38,5 +38,9 @@ impl ForgeProvider for GithubForge {
     async fn check_log(&self, cwd: &Path, link: &str) -> Option<String> {
         let run_id = gh::run_id_from_link(link)?;
         gh::run_log(cwd, run_id).await
+    }
+
+    async fn merge_pr(&self, cwd: &Path, method: MergeMethod) -> Result<()> {
+        gh::pr_merge(cwd, method).await
     }
 }

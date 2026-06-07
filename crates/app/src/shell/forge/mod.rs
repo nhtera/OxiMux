@@ -24,6 +24,10 @@ pub use oximux_git::gh::CheckRun;
 /// dialog + call sites depend on the forge layer.
 pub use oximux_git::gh::CreatePrOptions;
 
+/// PR merge strategy. Re-exported from the transport so the menu + call sites
+/// depend on the forge layer.
+pub use oximux_git::gh::MergeMethod;
+
 pub use github_gh::GithubForge;
 
 /// A code-hosting forge's PR + CI operations, scoped to one working tree
@@ -60,4 +64,8 @@ pub trait ForgeProvider {
     /// status context with no run id, a run with no failed jobs, or the forge
     /// CLI is unavailable).
     async fn check_log(&self, cwd: &Path, link: &str) -> Option<String>;
+
+    /// Merge the current branch's open PR with the chosen method. Returns the
+    /// forge's error text on failure (not mergeable, checks pending, ...).
+    async fn merge_pr(&self, cwd: &Path, method: MergeMethod) -> Result<()>;
 }

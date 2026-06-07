@@ -85,6 +85,9 @@ pub struct PrimaryActionInputs {
     /// A `gh pr create` is in flight — locks the primary to a disabled
     /// "Creating PR…" frame, mirroring the remote-op busy treatment.
     pub is_creating_pr: bool,
+    /// A `gh pr merge` is in flight — disables the merge rows so the menu
+    /// doesn't offer a redundant action mid-merge.
+    pub is_merging_pr: bool,
 }
 
 /// Resolve the primary split-button action. Priority ladder mirrors the

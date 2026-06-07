@@ -10,6 +10,7 @@
 //! the menu shape consistent across releases so the user's muscle memory
 //! doesn't change post-upgrade.
 
+use crate::shell::forge::MergeMethod;
 use crate::shell::source_control::primary_action::PrimaryActionInputs;
 
 /// One row of the dropdown — either an actionable item or a separator line.
@@ -42,6 +43,9 @@ pub enum DropdownActionKind {
     CreatePr,
     /// Disabled in v1; lands with the hosted-review adapter in v1.1.
     PushBeforePr,
+    /// Merge the current branch's open PR with the chosen method. Only present
+    /// (one row per method) when a PR is open.
+    MergePr(MergeMethod),
     Pull,
     Sync,
     Rebase,
@@ -198,6 +202,43 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
         "Push first, then use Create PR".to_string(),
         true,
     ));
+
+    // 7b. Merge PR — one row per method, present only when a PR is open so the
+    //     menu stays uncluttered the rest of the time. Disabled while another
+    //     op is in flight to prevent overlapping remote actions.
+    if p.has_open_pr {
+        let merge_disabled = !p.is_github_remote
+            || p.is_committing
+            || p.is_remote_operation_active
+            || p.is_creating_pr
+            || p.is_merging_pr;
+        let merge_reason = |verb: &str| {
+            if merge_disabled {
+                "Another operation is in progress".to_string()
+            } else {
+                format!("Merge the open pull request ({verb})")
+            }
+        };
+        out.push(DropdownEntry::Separator);
+        out.push(item(
+            DropdownActionKind::MergePr(MergeMethod::Squash),
+            "Merge PR (squash)".to_string(),
+            merge_reason("squash"),
+            merge_disabled,
+        ));
+        out.push(item(
+            DropdownActionKind::MergePr(MergeMethod::Merge),
+            "Merge PR (merge commit)".to_string(),
+            merge_reason("merge commit"),
+            merge_disabled,
+        ));
+        out.push(item(
+            DropdownActionKind::MergePr(MergeMethod::Rebase),
+            "Merge PR (rebase)".to_string(),
+            merge_reason("rebase"),
+            merge_disabled,
+        ));
+    }
 
     // 8. Pull
     let pull_disabled = !has_upstream

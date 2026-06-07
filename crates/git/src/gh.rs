@@ -219,6 +219,45 @@ pub async fn pr_create(cwd: impl AsRef<Path>, opts: CreatePrOptions) -> Result<S
     Ok(url)
 }
 
+/// How to merge a PR — maps to the mutually-exclusive `gh pr merge` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    /// `--merge`: a merge commit.
+    Merge,
+    /// `--squash`: squash all commits into one.
+    Squash,
+    /// `--rebase`: rebase the commits onto the base.
+    Rebase,
+}
+
+impl MergeMethod {
+    fn flag(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "--merge",
+            MergeMethod::Squash => "--squash",
+            MergeMethod::Rebase => "--rebase",
+        }
+    }
+}
+
+/// Merge the current branch's open PR via `gh pr merge <method>`. Returns unit
+/// on success; the error carries `gh`'s stderr (e.g. "not mergeable", "required
+/// checks have not passed"). `--delete-branch` is intentionally NOT passed —
+/// branch cleanup is the user's call, not a silent side effect of merging.
+pub async fn pr_merge(cwd: impl AsRef<Path>, method: MergeMethod) -> Result<()> {
+    let (ok, _stdout, stderr) = GhCmd::new(cwd)
+        .args(["pr", "merge", method.flag()])
+        .run_raw()
+        .await?;
+    if !ok {
+        return Err(GitError::NonZero {
+            code: 1,
+            stderr: stderr.trim().to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// One CI check run for the branch's PR, as reported by `gh pr checks --json`.
 /// `bucket` is gh's coarse category — one of `pass`, `fail`, `pending`,
 /// `skipping`, `cancel` — which is exactly the granularity the compact CI row

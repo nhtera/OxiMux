@@ -91,6 +91,9 @@ pub enum CommitStatus {
     /// the browser) or `Failed("create PR", …)` — most usefully when a PR for
     /// the branch already exists.
     CreatingPr,
+    /// `gh pr merge <method>` in flight. Reaches `Idle` on success (the PR
+    /// merges) or `Failed("merge PR", …)` — e.g. not mergeable / checks pending.
+    MergingPr,
     Failed(String, String),
 }
 
@@ -379,6 +382,17 @@ impl CommitArea {
     /// renders in a small slot, so the panel mounts the modal instead.
     pub fn create_pr(&mut self, cx: &mut Context<Self>) {
         cx.emit(CommitAreaEvent::CreatePrRequested);
+    }
+
+    /// Merge the current branch's open PR with the chosen method via the forge.
+    /// On success the PR closes and the status row clears; the panel's next poll
+    /// flips the PR/CI surface (forced via `pr_status_dirty`).
+    pub fn merge_pr(
+        &mut self,
+        method: crate::shell::forge::MergeMethod,
+        cx: &mut Context<Self>,
+    ) {
+        super::pr_ops::run_merge_pr(self, method, cx);
     }
 
     /// Apply a completed op result to the status surface. Called from
@@ -804,6 +818,7 @@ fn dispatch_dropdown(
         DropdownActionKind::Fetch => area.fetch(cx),
         DropdownActionKind::Publish => area.publish(cx),
         DropdownActionKind::CreatePr => area.create_pr(cx),
+        DropdownActionKind::MergePr(method) => area.merge_pr(method, cx),
         // Compound push-then-PR not wired; the row ships disabled.
         DropdownActionKind::PushBeforePr => {}
     }
@@ -839,6 +854,7 @@ fn render_status_row(
         CommitStatus::CherryPicking => (theme.fg_muted, "Cherry-picking…".to_string()),
         CommitStatus::Reverting => (theme.fg_muted, "Reverting…".to_string()),
         CommitStatus::CreatingPr => (theme.fg_muted, "Creating pull request…".to_string()),
+        CommitStatus::MergingPr => (theme.fg_muted, "Merging pull request…".to_string()),
         CommitStatus::Failed(label, error) => (
             theme.status_error,
             // Title-case the verb so "Push failed: …" reads naturally;
