@@ -19,6 +19,7 @@ pub mod merge;
 pub mod numstat;
 pub mod operation;
 pub mod poller;
+pub mod pr_context;
 pub mod process;
 pub mod remote;
 pub mod repository;

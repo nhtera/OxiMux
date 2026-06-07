@@ -35,6 +35,7 @@ pub mod pane_content;
 pub mod pane_group;
 pub mod pane_group_manager;
 pub mod pane_tree;
+pub mod pr_dialog;
 pub mod project_panes;
 pub mod project_picker;
 pub mod rename_tab_dialog;

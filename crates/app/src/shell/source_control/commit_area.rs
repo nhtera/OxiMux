@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    Anchor, AppContext, ClickEvent, Context, Entity, FocusHandle, IntoElement, ParentElement,
-    Styled, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    Anchor, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, IntoElement,
+    ParentElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable as _,
@@ -94,6 +94,14 @@ pub enum CommitStatus {
     Failed(String, String),
 }
 
+/// Events the composer emits to its owning panel. The Create-PR flow needs a
+/// modal the composer's small render slot can't host, so it asks the panel to
+/// open one rather than acting itself.
+pub enum CommitAreaEvent {
+    /// User chose "Create PR" — the panel should open the compose dialog.
+    CreatePrRequested,
+}
+
 pub struct CommitArea {
     // `pub(in crate::shell::source_control)` on the fields the sibling
     // `commit_ops` module pokes. Restricting visibility this way (rather
@@ -150,6 +158,8 @@ pub struct CommitArea {
     /// stored flag — the task checks it before mutating the textarea.
     pub(in crate::shell::source_control) ai_state: AiState,
 }
+
+impl EventEmitter<CommitAreaEvent> for CommitArea {}
 
 impl CommitArea {
     pub fn new(
@@ -363,10 +373,12 @@ impl CommitArea {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Publish, cx);
     }
 
-    /// Create a GitHub PR for the current branch via `gh pr create --fill`
-    /// (title + body from the branch's commits) and open it in the browser.
+    /// Request the Create-PR dialog. Emits a `CreatePrRequested` event the
+    /// owning panel observes to open the compose dialog (which then runs the
+    /// forge `create_pr`). The composer doesn't own the dialog itself — it
+    /// renders in a small slot, so the panel mounts the modal instead.
     pub fn create_pr(&mut self, cx: &mut Context<Self>) {
-        super::pr_ops::run_create_pr(self, cx);
+        cx.emit(CommitAreaEvent::CreatePrRequested);
     }
 
     /// Apply a completed op result to the status surface. Called from

@@ -16,13 +16,14 @@ use gpui::Context;
 use tokio::sync::oneshot;
 
 use super::commit_area::{CommitArea, CommitStatus};
-use crate::shell::forge::{ForgeProvider, GithubForge};
+use crate::shell::forge::{CreatePrOptions, ForgeProvider, GithubForge};
 
-/// Run `gh pr create --fill` for the current branch. No-op if another op is
-/// already in flight (the shared `in_flight` latch). On success the PR opens
-/// in the browser and the status row clears; on failure the status row shows
-/// `gh`'s message (commonly "a pull request already exists").
-pub fn run_create_pr(area: &mut CommitArea, cx: &mut Context<CommitArea>) {
+/// Create a PR for the current branch with the supplied options (empty title
+/// falls back to commit-derived fill). No-op if another op is already in flight
+/// (the shared `in_flight` latch). On success the PR opens in the browser and
+/// the status row clears; on failure the status row shows the forge's message
+/// (commonly "a pull request already exists").
+pub fn run_create_pr(area: &mut CommitArea, opts: CreatePrOptions, cx: &mut Context<CommitArea>) {
     if area.in_flight.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -33,7 +34,7 @@ pub fn run_create_pr(area: &mut CommitArea, cx: &mut Context<CommitArea>) {
         Ok(handle) => {
             handle.spawn(async move {
                 let r = GithubForge
-                    .create_pr(&workdir)
+                    .create_pr(&workdir, opts)
                     .await
                     .map_err(|e| e.to_string());
                 let _ = tx.send(r);

@@ -165,15 +165,42 @@ pub async fn has_open_pr(cwd: impl AsRef<Path>) -> bool {
     }
 }
 
-/// Create a PR for the current branch via `gh pr create --fill` (title + body
-/// derived from the branch's commits). Returns the PR URL on success (the URL
-/// is the last non-empty line `gh` prints). Errors carry `gh`'s stderr — most
-/// usefully "a pull request for branch … already exists".
-pub async fn pr_create(cwd: impl AsRef<Path>) -> Result<String> {
-    let (ok, stdout, stderr) = GhCmd::new(cwd)
-        .args(["pr", "create", "--fill"])
-        .run_raw()
-        .await?;
+/// Options for [`pr_create`]. An empty `title` falls back to `gh pr create
+/// --fill` (title + body from the branch's commits); a non-empty `title` is
+/// passed explicitly along with `body`. `base` selects the target branch when
+/// `Some` (else `gh` auto-detects the default). `draft` opens the PR as a draft.
+#[derive(Debug, Clone, Default)]
+pub struct CreatePrOptions {
+    pub title: String,
+    pub body: String,
+    pub base: Option<String>,
+    pub draft: bool,
+}
+
+/// Create a PR for the current branch. With an empty title this is
+/// `gh pr create --fill` (title + body derived from the branch's commits);
+/// otherwise the supplied title/body/base/draft are passed explicitly. Returns
+/// the PR URL on success (the last non-empty `http` line `gh` prints). Errors
+/// carry `gh`'s stderr — most usefully "a pull request for branch … already
+/// exists".
+pub async fn pr_create(cwd: impl AsRef<Path>, opts: CreatePrOptions) -> Result<String> {
+    let mut args: Vec<String> = vec!["pr".into(), "create".into()];
+    if opts.title.trim().is_empty() {
+        args.push("--fill".into());
+    } else {
+        args.push("--title".into());
+        args.push(opts.title);
+        args.push("--body".into());
+        args.push(opts.body);
+    }
+    if let Some(base) = opts.base.filter(|b| !b.trim().is_empty()) {
+        args.push("--base".into());
+        args.push(base);
+    }
+    if opts.draft {
+        args.push("--draft".into());
+    }
+    let (ok, stdout, stderr) = GhCmd::new(cwd).args(args).run_raw().await?;
     if !ok {
         return Err(GitError::NonZero {
             code: 1,

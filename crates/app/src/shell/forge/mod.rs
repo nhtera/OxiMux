@@ -20,6 +20,10 @@ use oximux_git::Result;
 /// transport so call sites depend on the forge layer, not the CLI wrapper.
 pub use oximux_git::gh::CheckRun;
 
+/// Options for creating a pull request. Re-exported from the transport so the
+/// dialog + call sites depend on the forge layer.
+pub use oximux_git::gh::CreatePrOptions;
+
 pub use github_gh::GithubForge;
 
 /// A code-hosting forge's PR + CI operations, scoped to one working tree
@@ -46,9 +50,10 @@ pub trait ForgeProvider {
     /// there is no PR, no checks, or the forge CLI is unavailable.
     async fn list_checks(&self, cwd: &Path) -> Vec<CheckRun>;
 
-    /// Create a PR for the current branch, title + body filled from the
-    /// branch's commits. Returns the PR URL on success.
-    async fn create_pr(&self, cwd: &Path) -> Result<String>;
+    /// Create a PR for the current branch. With default (empty-title) options
+    /// the title + body are filled from the branch's commits; otherwise the
+    /// supplied title/body/base/draft apply. Returns the PR URL on success.
+    async fn create_pr(&self, cwd: &Path, opts: CreatePrOptions) -> Result<String>;
 
     /// Peek at the failed-job log for one check run, identified by its web
     /// `link`. `None` when the check has no associated run log (an external

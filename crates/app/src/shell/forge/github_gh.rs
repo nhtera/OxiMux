@@ -11,7 +11,7 @@ use std::path::Path;
 use oximux_git::Result;
 use oximux_git::gh;
 
-use super::{CheckRun, ForgeProvider};
+use super::{CheckRun, CreatePrOptions, ForgeProvider};
 
 /// Forge provider backed by the `gh` CLI. Carries no state — construct with
 /// `GithubForge`.
@@ -31,8 +31,8 @@ impl ForgeProvider for GithubForge {
         gh::pr_checks(cwd).await
     }
 
-    async fn create_pr(&self, cwd: &Path) -> Result<String> {
-        gh::pr_create(cwd).await
+    async fn create_pr(&self, cwd: &Path, opts: CreatePrOptions) -> Result<String> {
+        gh::pr_create(cwd, opts).await
     }
 
     async fn check_log(&self, cwd: &Path, link: &str) -> Option<String> {

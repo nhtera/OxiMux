@@ -60,9 +60,12 @@ use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::WorktreeSettingsRepo;
 use tokio::sync::watch;
 
+use std::rc::Rc;
+
 use crate::actions::SendTextToActiveAgent;
 use crate::shell::diff_view::DiffView;
 use crate::shell::forge::{ForgeProvider, GithubForge};
+use crate::shell::pr_dialog::{PrCreateDialog, PrDialogCallback, PrDialogOutcome};
 use crate::shell::git_panel::GitPanel;
 use crate::shell::source_control::branch_commits::BranchCommitsPanel;
 use crate::shell::source_control::branch_picker::{BranchPicker, OnPick, PickerMode};
@@ -151,6 +154,15 @@ pub struct SourceControlPanel {
 
     /// Holds the in-flight "fix failing checks" log-bundle + dispatch task.
     _fix_task: Option<gpui::Task<()>>,
+
+    /// Create-PR compose dialog, mounted per-request. `None` when closed.
+    pr_dialog: Option<Entity<crate::shell::pr_dialog::PrCreateDialog>>,
+    /// Observes the dialog so it self-dismisses (clears `pr_dialog`) on close.
+    _pr_dialog_observer: Option<Subscription>,
+    /// Holds the PR dialog's AI-draft generation task.
+    _pr_ai_task: Option<gpui::Task<()>>,
+    /// Subscription to the composer's `CreatePrRequested` event.
+    _commit_area_sub: Subscription,
 
     /// Cached resolved primary action from the last render. Read by the
     /// status bar to show the same verb without running a second resolver.
@@ -382,6 +394,18 @@ impl SourceControlPanel {
             )
         });
 
+        // Composer asks the panel to open the Create-PR dialog (the panel owns
+        // the modal; the composer's render slot is too small to host it).
+        let commit_area_sub = cx.subscribe_in(
+            &commit_area,
+            window,
+            move |panel, _area, event, window, cx| match event {
+                commit_area::CommitAreaEvent::CreatePrRequested => {
+                    panel.open_pr_dialog(window, cx);
+                }
+            },
+        );
+
         Self {
             poll_state: initial,
             git_state,
@@ -395,6 +419,10 @@ impl SourceControlPanel {
             checks: checks_section::ChecksSectionState::default(),
             _check_log_task: None,
             _fix_task: None,
+            pr_dialog: None,
+            _pr_dialog_observer: None,
+            _pr_ai_task: None,
+            _commit_area_sub: commit_area_sub,
             base_ref: initial_base_ref,
             current_op: initial_op,
             on_open_file,
@@ -624,6 +652,87 @@ impl SourceControlPanel {
         self._fix_task = None;
         self.checks.reset();
         cx.notify();
+    }
+
+    /// Open the Create-PR compose dialog. First-open-wins (re-entrant clicks are
+    /// ignored while one is mounted). Observes the dialog so it self-dismisses
+    /// when closed; focuses the title field so the user can type immediately.
+    fn open_pr_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pr_dialog.is_some() {
+            return;
+        }
+        let weak = cx.weak_entity();
+        let on_commit: PrDialogCallback = Rc::new(move |outcome, window, app| {
+            let _ = weak.update(app, |panel, cx| panel.on_pr_dialog_outcome(outcome, window, cx));
+        });
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog =
+            cx.new(|cx| PrCreateDialog::new(on_commit, theme, density, typography, window, cx));
+        let observer = cx.observe_in(&dialog, window, |panel, dlg, _window, cx| {
+            if dlg.read(cx).is_closed() {
+                panel.pr_dialog = None;
+                panel._pr_dialog_observer = None;
+                cx.notify();
+            }
+        });
+        let focus = dialog.read(cx).input_focus_handle(cx);
+        focus.focus(window, cx);
+        self.pr_dialog = Some(dialog);
+        self._pr_dialog_observer = Some(observer);
+        cx.notify();
+    }
+
+    /// Apply a Create-PR dialog outcome. Create runs the forge `create_pr`
+    /// through the composer's in-flight/status surface; DraftFromCommits fills
+    /// the dialog fields from the branch's commits; Cancel is inert (the dialog
+    /// already flagged itself closed, and the observer clears it).
+    fn on_pr_dialog_outcome(
+        &mut self,
+        outcome: PrDialogOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            PrDialogOutcome::Create(opts) => {
+                self.commit_area
+                    .update(cx, |area, cx| pr_ops::run_create_pr(area, opts, cx));
+            }
+            PrDialogOutcome::DraftFromCommits => self.draft_pr_from_commits(window, cx),
+            PrDialogOutcome::Cancel => {}
+        }
+    }
+
+    /// Fill the open PR dialog's title + body from the branch's commits
+    /// (off-thread). No-op when the dialog isn't open. On failure the dialog's
+    /// drafting flag is cleared so its button re-enables.
+    fn draft_pr_from_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.pr_dialog.clone() else {
+            return;
+        };
+        let workdir = self.repo.workdir().to_path_buf();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<(String, String)>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = tx.send(oximux_git::pr_context::draft_from_commits(&workdir).await);
+                });
+            }
+            Err(_) => {
+                dialog.update(cx, |d, cx| d.set_generating(false, cx));
+                return;
+            }
+        }
+        self._pr_ai_task = Some(cx.spawn_in(window, async move |_this, cx| {
+            let result = rx.await.ok().flatten();
+            let _ = cx.update(|window, app| {
+                dialog.update(app, |d, cx| match result {
+                    Some((title, body)) => d.apply_generated(title, body, window, cx),
+                    None => d.set_generating(false, cx),
+                });
+            });
+        }));
     }
 
     fn start_state_observer(
@@ -1118,6 +1227,20 @@ impl Render for SourceControlPanel {
                     .child(self.commit_graph.clone()),
             );
         }
+        // Create-PR dialog: a centered modal overlay over the panel, mounted
+        // only while open. Mirrors the diff-view review-note overlay placement.
+        let pr_overlay: Option<AnyElement> = self.pr_dialog.clone().map(|dlg| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(72.0))
+                .child(dlg)
+                .into_any_element()
+        });
+
         // `.relative()` makes the body the positioning ancestor for the
         // branch picker's full-overlay (`absolute().inset_0()` inside its
         // own render). That confines click-outside dismiss to the panel
@@ -1129,6 +1252,7 @@ impl Render for SourceControlPanel {
             .h_full()
             .child(body)
             .child(picker)
+            .children(pr_overlay)
     }
 }
 
