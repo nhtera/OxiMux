@@ -13,14 +13,18 @@ use gpui::{Context, SharedString, Task};
 use oximux_agents::AgentStatusStream;
 use oximux_core::AgentStatus;
 
-use crate::notifier::{Notifier, SuppressMap, TabId, should_notify_transition};
+use crate::notifier::{
+    NotificationKind, Notifier, SuppressMap, TabId, notification_kind_for_transition,
+};
 use crate::shell::pane_group::PaneGroup;
 
 /// Spawn a watcher on `status_rx` that
 ///  1. Wakes the parent `PaneGroup` on every status transition (badge repaint),
-///  2. Calls `notifier.notify_needs_approval` on the first edge into
-///     `NeedsApproval(_)` when the window is not active and the per-tab
-///     `SuppressMap` has not fired within the rate-limit window.
+///  2. Fires `notifier.notify(...)` on genuine lifecycle edges
+///     (`NeedsApproval` / `WaitingForInput` / `Done` / `Failed`) that pass the
+///     per-(tab, kind) `SuppressMap` rate limit. The per-kind enable + focus
+///     gate live inside the notifier's shared settings, so the task always
+///     passes the current focus state and lets the notifier decide.
 ///
 /// `window_active` is a shared `Arc<AtomicBool>` updated by the owning
 /// `ProjectPanes` window-activation observer, so every group watcher
@@ -53,18 +57,26 @@ pub fn spawn_status_task(
             {
                 return;
             }
+            // Fire on a genuine lifecycle edge; the notifier itself applies
+            // the per-kind enable + focus gate from shared settings, so we
+            // always pass the current focus state and let it decide.
             let window_active_now = window_active.load(Ordering::Relaxed);
-            if !window_active_now
-                && should_notify_transition(&prev_status, &new_status)
-                && let AgentStatus::NeedsApproval(reason) = &new_status
-                && suppress.should_fire(tab_id, Instant::now())
+            if let Some(kind) = notification_kind_for_transition(&prev_status, &new_status)
+                && suppress.should_fire(tab_id, kind, Instant::now())
             {
-                notifier.notify_needs_approval(tab_id, &label, reason);
+                let body = match &new_status {
+                    AgentStatus::NeedsApproval(reason) => reason.clone(),
+                    AgentStatus::Failed(msg) => msg.clone(),
+                    _ => String::new(),
+                };
+                notifier.notify(tab_id, kind, &label, &body, window_active_now);
             }
-            if matches!(prev_status, AgentStatus::NeedsApproval(_))
-                && !matches!(new_status, AgentStatus::NeedsApproval(_))
+            // Reset dedupe when leaving a notify-worthy state so re-entry can
+            // fire immediately rather than waiting out the rate-limit window.
+            if let Some(prev_kind) = NotificationKind::from_status(&prev_status)
+                && NotificationKind::from_status(&new_status) != Some(prev_kind)
             {
-                suppress.forget(tab_id);
+                suppress.forget(tab_id, prev_kind);
             }
             prev_status = new_status;
         }
