@@ -10,6 +10,7 @@
 //! of the helper.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
@@ -536,15 +537,27 @@ impl WorkspaceRoot {
         // is live before we search it for the worktree's tab.
         let already_active =
             self.active_project.as_ref().map(|p| p.id.as_str()) == Some(workspace.project_id.as_str());
-        if !already_active
-            && let Some(project) = self
+        if !already_active {
+            match self
                 .app_state
                 .recent_projects
                 .iter()
                 .find(|p| p.id == workspace.project_id)
                 .cloned()
-        {
-            self.set_active_project(project, window, cx);
+            {
+                Some(project) => self.set_active_project(project, window, cx),
+                // The owning project is gone (e.g. removed mid-session, or a
+                // stale jump-list entry). Without the switch the activation
+                // can't focus the tab — surface it rather than no-op silently.
+                None => {
+                    tracing::warn!(
+                        project_id = %workspace.project_id,
+                        workspace_id = %workspace.id,
+                        "activate_workspace: owning project not in recent_projects; skipping"
+                    );
+                    return;
+                }
+            }
         }
 
         self.active_workspace_id = Some(workspace.id.clone());
@@ -562,6 +575,135 @@ impl WorkspaceRoot {
             }
         }
         cx.notify();
+    }
+
+    /// A project's workspace rows, always including the synthesized "primary"
+    /// (repo-root) row as the first entry when no real workspace occupies the
+    /// root. Single source of the "a project is never an empty group"
+    /// invariant — shared by the left-rail snapshot and the Cmd+J jump list so
+    /// both surface the same rows (incl. the primary that is not a DB row).
+    pub(crate) fn workspaces_with_primary(&self, project: &Project) -> Vec<Workspace> {
+        let mut list = match self.app_state.workspace_repo.list_for_project(&project.id) {
+            Ok(list) => list,
+            Err(err) => {
+                tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
+                Vec::new()
+            }
+        };
+        let has_root_row = list.iter().any(|w| w.worktree_path == project.root_path);
+        if !has_root_row {
+            // Git repo → branch-based primary ("main"); plain folder → a single
+            // "Folder" row with empty branch. Synthesized for display only;
+            // identified later by `worktree_path == project.root_path`.
+            let is_git = Path::new(&project.root_path).join(".git").exists();
+            let (name, slug, branch) = if is_git {
+                (
+                    project.default_branch.clone(),
+                    project.default_branch.clone(),
+                    project.default_branch.clone(),
+                )
+            } else {
+                (project.name.clone(), String::new(), String::new())
+            };
+            list.insert(
+                0,
+                Workspace {
+                    id: format!("primary:{}", project.id),
+                    project_id: project.id.clone(),
+                    name,
+                    slug,
+                    branch,
+                    worktree_path: project.root_path.clone(),
+                    status: "active".to_string(),
+                    created_at: String::new(),
+                    archived_at: None,
+                },
+            );
+        }
+        list
+    }
+
+    /// Build the Cmd+J jump candidates: every workspace across all projects
+    /// (incl. synthesized primaries), labeled `Project · branch/slug` and
+    /// tagged with its `attention_rank` so action-needing ones float to the
+    /// top of the browse order.
+    pub(crate) fn build_workspace_jump_items(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Vec<crate::shell::command_palette::entry::WorkspaceJumpItem> {
+        use crate::shell::agents_dashboard::model::attention_rank;
+        use crate::shell::command_palette::entry::WorkspaceJumpItem;
+
+        let mut live: HashSet<String> = HashSet::new();
+        for panes in self.project_panes_by_project.values() {
+            live.extend(panes.read(cx).live_worktree_paths(cx));
+        }
+
+        let mut items = Vec::new();
+        for project in &self.app_state.recent_projects {
+            for w in self.workspaces_with_primary(project) {
+                let status = self
+                    .app_state
+                    .agent_session_repo
+                    .list_for_workspace(&w.id)
+                    .ok()
+                    .and_then(|mut s| s.drain(..).next().map(|s| s.status));
+                let is_live = live.contains(&w.worktree_path);
+                // A workspace with no agent session is ready-to-jump, not an
+                // error — keep dormant rows above the failed/interrupted tier
+                // (which is where `attention_rank(None, false)` would put them)
+                // so a fresh project's primary row never sinks below errors.
+                let attention = match status.as_ref() {
+                    Some(s) => attention_rank(Some(s), is_live),
+                    None if is_live => 2,
+                    None => 3,
+                };
+                let branch_or_slug = if !w.branch.is_empty() {
+                    w.branch.as_str()
+                } else {
+                    w.slug.as_str()
+                };
+                let label = if branch_or_slug.is_empty() {
+                    project.name.clone()
+                } else {
+                    format!("{} · {}", project.name, branch_or_slug)
+                };
+                items.push(WorkspaceJumpItem {
+                    workspace_id: w.id.clone(),
+                    project_id: w.project_id.clone(),
+                    worktree_path: w.worktree_path.clone(),
+                    label,
+                    attention,
+                });
+            }
+        }
+        items
+    }
+
+    /// Resolve a Cmd+J jump activation: build a minimal `Workspace` from the
+    /// carried identity (the only fields `activate_workspace` reads) and
+    /// activate it. Works for synthesized primary rows too, since their
+    /// `worktree_path` is the project root.
+    pub(crate) fn activate_workspace_from_jump(
+        &mut self,
+        workspace_id: String,
+        project_id: String,
+        worktree_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = Workspace {
+            id: workspace_id,
+            project_id,
+            name: String::new(),
+            slug: String::new(),
+            branch: String::new(),
+            worktree_path,
+            status: String::new(),
+            created_at: String::new(),
+            archived_at: None,
+        };
+        self.activate_workspace(workspace, window, cx);
     }
 
     /// Close every full-window modal overlay. Callers invoke this before
@@ -674,52 +816,9 @@ impl WorkspaceRoot {
             HashMap::with_capacity(projects.len());
         let mut latest_status: LatestStatusMap = HashMap::new();
         for project in &projects {
-            let mut list = match self.app_state.workspace_repo.list_for_project(&project.id) {
-                Ok(list) => list,
-                Err(err) => {
-                    tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
-                    Vec::new()
-                }
-            };
-            // Every project always surfaces its primary (main) worktree as
-            // the first row — the repo root checkout — matching the reference UX's
-            // invariant that a project is never an empty group. Synthesized
-            // for display (not a DB row); identified later by
-            // `worktree_path == project.root_path`. Skip if a real workspace
-            // already occupies the root (defensive against future schemas).
-            let has_root_row = list.iter().any(|w| w.worktree_path == project.root_path);
-            if !has_root_row {
-                // Git repo → branch-based primary ("main" + primary badge).
-                // Plain folder (no `.git` at root) → a single "Folder" row
-                // with an empty branch, which the renderer badges "Folder"
-                // and omits the primary marker (mirrors the reference UX's isFolderRepo).
-                let is_git = std::path::Path::new(&project.root_path)
-                    .join(".git")
-                    .exists();
-                let (name, slug, branch) = if is_git {
-                    (
-                        project.default_branch.clone(),
-                        project.default_branch.clone(),
-                        project.default_branch.clone(),
-                    )
-                } else {
-                    (project.name.clone(), String::new(), String::new())
-                };
-                list.insert(
-                    0,
-                    Workspace {
-                        id: format!("primary:{}", project.id),
-                        project_id: project.id.clone(),
-                        name,
-                        slug,
-                        branch,
-                        worktree_path: project.root_path.clone(),
-                        status: "active".to_string(),
-                        created_at: String::new(),
-                        archived_at: None,
-                    },
-                );
-            }
+            // Single source of the "project always shows its primary row"
+            // invariant (shared with the Cmd+J jump list).
+            let list = self.workspaces_with_primary(project);
             for workspace in &list {
                 let latest = match self
                     .app_state

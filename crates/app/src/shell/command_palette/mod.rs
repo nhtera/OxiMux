@@ -20,9 +20,9 @@ use gpui::{
 use oximux_settings::{CustomCommand, Density, Theme, Typography};
 use tokio::sync::oneshot;
 
-use crate::actions::{OpenFileFromContextMenu, SendTextToActiveAgent};
+use crate::actions::{ActivateWorkspaceFromJump, OpenFileFromContextMenu, SendTextToActiveAgent};
 use crate::shell::command_palette::entry::{
-    PaletteItem, PaletteItemAction, PaletteMode, build_palette_items,
+    PaletteItem, PaletteItemAction, PaletteMode, WorkspaceJumpItem, build_palette_items,
 };
 use crate::shell::command_palette::match_engine::filter_and_rank;
 use crate::shell::command_palette::palette_modal::{ModalRenderInput, build_modal_layout};
@@ -52,6 +52,9 @@ pub struct PaletteModal {
     index_root: Option<PathBuf>,
     index_loaded: bool,
     scanning: bool,
+    /// Workspace-jump (Cmd+J) candidates, pushed in by `WorkspaceRoot` each
+    /// time the jump palette opens (a fresh snapshot across all projects).
+    workspace_items: Vec<WorkspaceJumpItem>,
     /// Set when the last scan failed (e.g. `rg` missing) — surfaced as a
     /// copyable hint row instead of a broken/empty list.
     index_error: Option<String>,
@@ -83,6 +86,25 @@ pub(crate) fn palette_filter(
     ranked.into_iter().map(|i| all_items[i].clone()).collect()
 }
 
+/// Ranked indices into `items` for a workspace-jump query. Empty query =
+/// browse order (attention tier first, stable within tier so input order is
+/// preserved); non-empty = fuzzy rank on the labels (name-search intent
+/// dominates). Pure so the ordering contract is unit-testable without a GPUI
+/// entity.
+pub(crate) fn rank_workspace_items(query: &str, items: &[WorkspaceJumpItem]) -> Vec<usize> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if query.trim().is_empty() {
+        let mut idx: Vec<usize> = (0..items.len()).collect();
+        idx.sort_by_key(|&i| items[i].attention);
+        idx
+    } else {
+        let names: Vec<&str> = items.iter().map(|w| w.label.as_str()).collect();
+        filter_and_rank(query, &names)
+    }
+}
+
 /// Resolve a project-relative Quick Open index entry to an absolute path
 /// string for the editor open action. Falls back to the relative path when
 /// no project root is known (degraded but never panics). Pure so the
@@ -111,6 +133,7 @@ impl PaletteModal {
             index_root: None,
             index_loaded: false,
             scanning: false,
+            workspace_items: Vec::new(),
             index_error: None,
             _index_task: None,
             caret_on: true,
@@ -238,6 +261,8 @@ impl PaletteModal {
 
     /// Drop the cached index so the next Quick Open re-scans. Called on
     /// project switch (the previous project's files must not leak through).
+    /// `workspace_items` is intentionally NOT cleared here — it is rebuilt
+    /// fresh on every Cmd+J open, so stale rows are never shown.
     pub fn invalidate_file_index(&mut self, cx: &mut Context<Self>) {
         self.file_index.clear();
         self.index_root = None;
@@ -278,6 +303,46 @@ impl PaletteModal {
             Box::new(OpenFileFromContextMenu {
                 path,
                 split_right: false,
+            }),
+            cx,
+        );
+    }
+
+    /// Replace the workspace-jump candidate list. Called by `WorkspaceRoot`
+    /// immediately before opening the palette in `WorkspaceJump` mode, so the
+    /// list always reflects the current workspaces + their attention state.
+    pub fn set_workspace_items(&mut self, items: Vec<WorkspaceJumpItem>, cx: &mut Context<Self>) {
+        self.workspace_items = items;
+        cx.notify();
+    }
+
+    /// Ranked indices into `workspace_items` for the current query.
+    fn workspace_jump_ranked(&self) -> Vec<usize> {
+        rank_workspace_items(&self.query, &self.workspace_items)
+    }
+
+    /// Labels of the ranked workspace rows, for rendering.
+    fn workspace_jump_rows(&self) -> Vec<String> {
+        self.workspace_jump_ranked()
+            .into_iter()
+            .filter_map(|i| self.workspace_items.get(i).map(|w| w.label.clone()))
+            .collect()
+    }
+
+    /// Activate the workspace at `idx` in the ranked jump list: close the
+    /// palette and dispatch `ActivateWorkspaceFromJump` (resolved by
+    /// `WorkspaceRoot`). No-op when `idx` is out of range.
+    fn activate_workspace_jump(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let ranked = self.workspace_jump_ranked();
+        let Some(item) = ranked.get(idx).and_then(|&i| self.workspace_items.get(i)).cloned() else {
+            return;
+        };
+        self.close(cx);
+        window.dispatch_action(
+            Box::new(ActivateWorkspaceFromJump {
+                workspace_id: item.workspace_id,
+                project_id: item.project_id,
+                worktree_path: item.worktree_path,
             }),
             cx,
         );
@@ -541,6 +606,83 @@ impl Render for PaletteModal {
                 }))
                 .into_any_element()
             }
+            PaletteMode::WorkspaceJump => {
+                let rows = self.workspace_jump_rows();
+                // Empty → a single non-actionable hint (row_count 0 keeps
+                // nav + Enter inert), mirroring QuickOpen.
+                let (file_rows, row_count): (Vec<&str>, usize) = if rows.is_empty() {
+                    let hint = if self.workspace_items.is_empty() {
+                        "No workspaces yet"
+                    } else {
+                        "No matching workspaces"
+                    };
+                    (vec![hint], 0)
+                } else {
+                    (rows.iter().map(String::as_str).collect(), rows.len())
+                };
+
+                let entity = cx.entity();
+                let on_activate_ws: row_render::ActivateFn = Rc::new(move |idx, window, cx| {
+                    entity.update(cx, |p, cx| p.activate_workspace_jump(idx, window, cx));
+                });
+
+                build_modal_layout(ModalRenderInput {
+                    mode,
+                    query: &query,
+                    selected_idx,
+                    palette_items: &[],
+                    file_rows,
+                    row_count,
+                    caret_on,
+                    on_activate: on_activate_ws,
+                    on_dismiss: on_dismiss.clone(),
+                    theme,
+                    density,
+                    typography: &typography,
+                })
+                .track_focus(&self.focus_handle)
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    match key {
+                        "escape" => this.close(cx),
+                        // Recompute the row count from live state: a query
+                        // keystroke + nav can arrive in one event batch, so the
+                        // render-time `row_count` capture may be stale.
+                        "up" => {
+                            let n = this.workspace_jump_ranked().len();
+                            this.move_selection(-1, n, cx);
+                        }
+                        "down" => {
+                            let n = this.workspace_jump_ranked().len();
+                            this.move_selection(1, n, cx);
+                        }
+                        "enter" => {
+                            let idx = this.selected_idx;
+                            this.activate_workspace_jump(idx, window, cx);
+                        }
+                        "backspace" => {
+                            this.query.pop();
+                            this.selected_idx = 0;
+                            cx.notify();
+                        }
+                        _ => {
+                            if event.keystroke.modifiers.control
+                                || event.keystroke.modifiers.platform
+                                || event.keystroke.modifiers.alt
+                                || event.keystroke.modifiers.function
+                            {
+                                return;
+                            }
+                            if key.chars().count() == 1 {
+                                this.query.push_str(key);
+                                this.selected_idx = 0;
+                                cx.notify();
+                            }
+                        }
+                    }
+                }))
+                .into_any_element()
+            }
         }
     }
 }
@@ -649,6 +791,51 @@ mod tests {
     fn resolve_index_path_falls_back_without_root() {
         let rel = resolve_index_path(None, "src/main.rs");
         assert_eq!(rel, "src/main.rs");
+    }
+
+    fn jump_item(label: &str, attention: u8) -> WorkspaceJumpItem {
+        WorkspaceJumpItem {
+            workspace_id: format!("id-{label}"),
+            project_id: "p".to_string(),
+            worktree_path: format!("/w/{label}"),
+            label: label.to_string(),
+            attention,
+        }
+    }
+
+    #[test]
+    fn workspace_jump_empty_query_sorts_attention_first() {
+        // Browse order: lower attention rank floats up; ties keep input order.
+        let items = vec![
+            jump_item("idle-a", 2),
+            jump_item("needs-approval", 0),
+            jump_item("idle-b", 2),
+            jump_item("running", 1),
+        ];
+        let ranked = rank_workspace_items("", &items);
+        // First must be the rank-0 (needs-approval), then rank-1, then the two
+        // rank-2 in original order.
+        assert_eq!(ranked, vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn workspace_jump_query_filters_by_label() {
+        let items = vec![
+            jump_item("alpha", 2),
+            jump_item("beta", 0),
+            jump_item("gamma", 1),
+        ];
+        let ranked = rank_workspace_items("alph", &items);
+        // Only "alpha" subsequence-matches; attention is ignored once a query
+        // is present (name-search intent dominates).
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(items[ranked[0]].label, "alpha");
+    }
+
+    #[test]
+    fn workspace_jump_empty_items_is_empty() {
+        assert!(rank_workspace_items("", &[]).is_empty());
+        assert!(rank_workspace_items("x", &[]).is_empty());
     }
 
     #[test]

@@ -146,6 +146,18 @@ pub struct OpenFileFromContextMenu {
     pub split_right: bool,
 }
 
+/// Fired when a workspace-jump (Cmd+J) palette row is activated. Carries the
+/// minimal identity `WorkspaceRoot::activate_workspace` needs so the handler
+/// builds the target `Workspace` without re-resolving (synthesized "primary"
+/// rows are not DB rows). Dispatched at the workspace level.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct ActivateWorkspaceFromJump {
+    pub workspace_id: String,
+    pub project_id: String,
+    pub worktree_path: String,
+}
+
 /// Right-click in the empty area below the file tree. Carries the
 /// active project's root path so the menu can offer "New File" /
 /// "New Folder" at the workspace root without the path being inferred
@@ -393,6 +405,9 @@ actions!(
         OpenQuickOpen,
         /// Open the action Command Palette (Cmd+Shift+P). Phase 05.
         OpenCommandPalette,
+        /// Open the workspace-jump palette (Cmd+J): fuzzy-jump to any
+        /// workspace/worktree across every project.
+        OpenWorkspaceJump,
         /// Open the inline adapter-picker popover anchored to the `+`
         /// button. Cmd+Shift+A reroutes here so the keyboard and mouse
         /// paths converge on the same surface. A second dispatch while the

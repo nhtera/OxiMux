@@ -18,6 +18,23 @@ use crate::actions::{
 pub enum PaletteMode {
     QuickOpen,
     Commands,
+    /// Cmd+J: fuzzy-jump to any workspace/worktree across all projects.
+    WorkspaceJump,
+}
+
+/// One workspace row in the Cmd+J jump palette. Carries the minimal identity
+/// `WorkspaceRoot::activate_workspace` needs (`project_id` + `id` +
+/// `worktree_path`) so activation never has to re-resolve the row — important
+/// because the synthesized "primary" rows (id `primary:<project>`) are not DB
+/// rows. `attention` is the row's `attention_rank` (lower = more urgent),
+/// used to float action-needing workspaces to the top of the browse list.
+#[derive(Debug, Clone)]
+pub struct WorkspaceJumpItem {
+    pub workspace_id: String,
+    pub project_id: String,
+    pub worktree_path: String,
+    pub label: String,
+    pub attention: u8,
 }
 
 /// One actionable command shown in the Command Palette mode.

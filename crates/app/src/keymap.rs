@@ -10,7 +10,7 @@ use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
     DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane, FocusPrevSubPane, MruNext,
     MruPrev, NewAgent, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
-    OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenWorkspaceCreate, PrevTab,
+    OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab,
     RefreshSourceControl, Search,
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SendLastCommandOutputToAgent,
     SendTerminalSelectionToAgent, SplitSubPaneDown, SplitSubPaneRight, ToggleFloatingTerminal,
@@ -66,6 +66,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         // Command palette uses cmd-shift-p (cmd-k is the commit dialog).
         KeyBinding::new("cmd-p", OpenQuickOpen, None),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, None),
+        // cmd-j jumps to any workspace/worktree across all projects.
+        KeyBinding::new("cmd-j", OpenWorkspaceJump, None),
         KeyBinding::new("cmd-o", OpenProjectPicker, None),
         // cmd-, opens the settings modal (macOS Preferences convention).
         KeyBinding::new("cmd-,", OpenSettings, None),

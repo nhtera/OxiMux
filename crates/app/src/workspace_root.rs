@@ -54,12 +54,14 @@ use crate::notifier::{AgentNotifySettings, Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
-    ActivateGroupTab, ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked,
-    CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow, OpenAddProjectDialog,
+    ActivateGroupTab, ActivateWorkspaceFromJump, ApplyLayoutBottomTerminal, ApplyLayoutHorizontal,
+    ApplyLayoutStacked, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
+    OpenAddProjectDialog,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
     NewTab, OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt,
-    OpenWorkspaceCreate, RequestOpenAdapterPicker, Search, SelectExplorerTab, SelectFilesTab,
+    OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, Search, SelectExplorerTab,
+    SelectFilesTab,
     SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
     SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleFloatingTerminal, ToggleLeftSidebar,
@@ -2110,6 +2112,27 @@ impl Render for WorkspaceRoot {
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
             }))
+            .on_action(cx.listener(|this, _: &OpenWorkspaceJump, window, cx| {
+                this.close_modal_overlays(cx);
+                // Snapshot all workspaces + attention state, push into the
+                // palette, then open it in jump mode.
+                let items = this.build_workspace_jump_items(cx);
+                this.palette.update(cx, |p, cx| {
+                    p.set_workspace_items(items, cx);
+                    p.open(PaletteMode::WorkspaceJump, window, cx);
+                });
+            }))
+            .on_action(cx.listener(
+                |this, action: &ActivateWorkspaceFromJump, window, cx| {
+                    this.activate_workspace_from_jump(
+                        action.workspace_id.clone(),
+                        action.project_id.clone(),
+                        action.worktree_path.clone(),
+                        window,
+                        cx,
+                    );
+                },
+            ))
             .on_action(cx.listener(|this, _: &crate::actions::ReloadCustomCommands, _window, cx| {
                 this.reload_custom_commands(cx);
             }))
