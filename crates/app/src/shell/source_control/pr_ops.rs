@@ -16,6 +16,7 @@ use gpui::Context;
 use tokio::sync::oneshot;
 
 use super::commit_area::{CommitArea, CommitStatus};
+use crate::shell::forge::{ForgeProvider, GithubForge};
 
 /// Run `gh pr create --fill` for the current branch. No-op if another op is
 /// already in flight (the shared `in_flight` latch). On success the PR opens
@@ -31,7 +32,8 @@ pub fn run_create_pr(area: &mut CommitArea, cx: &mut Context<CommitArea>) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(async move {
-                let r = oximux_git::gh::pr_create(&workdir)
+                let r = GithubForge
+                    .create_pr(&workdir)
                     .await
                     .map_err(|e| e.to_string());
                 let _ = tx.send(r);

@@ -60,6 +60,7 @@ use oximux_storage::WorktreeSettingsRepo;
 use tokio::sync::watch;
 
 use crate::shell::diff_view::DiffView;
+use crate::shell::forge::{ForgeProvider, GithubForge};
 use crate::shell::git_panel::GitPanel;
 use crate::shell::source_control::branch_commits::BranchCommitsPanel;
 use crate::shell::source_control::branch_picker::{BranchPicker, OnPick, PickerMode};
@@ -135,7 +136,7 @@ pub struct SourceControlPanel {
     /// CI check runs for the current branch's PR (`gh pr checks`). Fetched on
     /// the same throttle as the PR status, only while a PR is open. Empty when
     /// there's no PR or no checks — the compact CI row then renders nothing.
-    ci_checks: Vec<oximux_git::gh::CheckRun>,
+    ci_checks: Vec<crate::shell::forge::CheckRun>,
 
     /// Cached resolved primary action from the last render. Read by the
     /// status bar to show the same verb without running a second resolver.
@@ -1058,16 +1059,17 @@ async fn refresh_pr_status(
     cx: &mut gpui::AsyncApp,
 ) {
     let workdir = repo.workdir().to_path_buf();
-    let is_github = oximux_git::gh::is_github_remote(&workdir).await;
+    let forge = GithubForge;
+    let is_github = forge.supports_repo(&workdir).await;
     let has_pr = if is_github {
-        oximux_git::gh::has_open_pr(&workdir).await
+        forge.has_open_pr(&workdir).await
     } else {
         false
     };
     // Only pull CI checks when there's actually a PR — a second `gh` round-trip
     // we don't want to spend otherwise. Empty list clears any stale CI row.
     let checks = if has_pr {
-        oximux_git::gh::pr_checks(&workdir).await
+        forge.list_checks(&workdir).await
     } else {
         Vec::new()
     };

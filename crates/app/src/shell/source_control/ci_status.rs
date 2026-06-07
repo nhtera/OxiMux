@@ -7,7 +7,7 @@
 //! summary + render, the panel owns the data + cadence.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
-use oximux_git::gh::CheckRun;
+use crate::shell::forge::CheckRun;
 use oximux_settings::{Theme, Typography};
 
 /// Pass / fail / pending tallies derived from a PR's check runs. `other`
