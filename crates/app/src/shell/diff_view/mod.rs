@@ -21,8 +21,10 @@
 pub mod file_header;
 pub mod file_rail;
 pub mod hunk_actions;
+pub mod note_repo_handle;
 pub mod paint;
 pub mod render;
+pub mod review_note_popover;
 pub mod review_notes;
 pub mod syntax;
 pub mod word_diff;
@@ -33,11 +35,16 @@ use crate::shell::diff_view::file_header::{
     StickyHeader, build_first_row_of_file, build_row_owner, collect_headers, sticky_header_overlay,
 };
 use crate::shell::diff_view::file_rail::{RAIL_WIDTH, RailContext, file_rail};
+use crate::shell::diff_view::note_repo_handle::note_repo;
 use crate::shell::diff_view::paint::{
-    FoldId, OverviewRun, PreparedRow, overview_ruler, overview_runs, prepare, prepare_split,
-    render_rows, staging_card_overlay, widest_row_chars, widest_row_index,
+    FoldId, OverviewRun, PreparedRow, mark_notes, overview_ruler, overview_runs, prepare,
+    prepare_split, render_rows, staging_card_overlay, widest_row_chars, widest_row_index,
 };
 use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
+use crate::shell::diff_view::review_note_popover::{
+    ReviewNoteCallback, ReviewNoteOutcome, ReviewNotePopover,
+};
+use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     ParentElement, Render, ScrollStrategy, StatefulInteractiveElement as _, Styled, Subscription,
@@ -296,6 +303,18 @@ pub struct DiffView {
     /// a hunk op so the post-stage reload restores the reader's position
     /// instead of snapping to the top. `None` when idle.
     pending_scroll_anchor: Option<usize>,
+    /// Review notes for the current diff scope, keyed by `(path, line, side)`.
+    /// Mirrored from SQLite on each `*Ready` load and written back through the
+    /// process-wide `DiffReviewNoteRepo`. The prepare pass reads it to mark
+    /// noted lines; empty for non-`Ready` states.
+    notes: ReviewNoteStore,
+    /// Active compose/edit popover (per-request; `None` when idle). Mounted
+    /// INSIDE this DiffView's render tree like `confirm_dialog` so it scopes
+    /// to the diff surface the user is reading.
+    note_popover: Option<Entity<ReviewNotePopover>>,
+    /// Per-mount observer on the active popover — clears the slot when the
+    /// popover closes. Reset each time a new popover mounts.
+    _note_popover_observer: Option<Subscription>,
 }
 
 impl DiffView {
@@ -336,6 +355,9 @@ impl DiffView {
             rail_filter: None,
             _rail_filter_sub: None,
             pending_scroll_anchor: None,
+            notes: ReviewNoteStore::new(),
+            note_popover: None,
+            _note_popover_observer: None,
         }
     }
 
@@ -510,6 +532,10 @@ impl DiffView {
         self.collapsed.clear();
         self.expanded_folds.clear();
         self.reset_rail_state();
+        // Drop the prior scope's notes immediately. `reload_notes` repopulates
+        // on the next `*Ready`; clearing here keeps `notes` empty during the
+        // Loading window so nothing reads stale anchors.
+        self.notes.clear();
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -547,6 +573,7 @@ impl DiffView {
             };
             let _ = this.update(cx, |view, cx| {
                 view.apply_load_result(path, staged, untracked, result);
+                view.reload_notes();
                 cx.notify();
             });
         });
@@ -616,6 +643,10 @@ impl DiffView {
         self.invalidate_prepared();
         self.expanded_folds.clear();
         self.reset_rail_state();
+        // Drop the prior scope's notes immediately. `reload_notes` repopulates
+        // on the next `*Ready`; clearing here keeps `notes` empty during the
+        // Loading window so nothing reads stale anchors.
+        self.notes.clear();
         self.state = DiffViewState::CommitLoading {
             sha: sha.clone(),
             short_oid: short_oid.clone(),
@@ -648,6 +679,7 @@ impl DiffView {
             };
             let _ = this.update(cx, |view, cx| {
                 view.apply_commit_load_result(sha, short_oid, subject, result);
+                view.reload_notes();
                 cx.notify();
             });
         });
@@ -710,6 +742,10 @@ impl DiffView {
         self.invalidate_prepared();
         self.expanded_folds.clear();
         self.reset_rail_state();
+        // Drop the prior scope's notes immediately. `reload_notes` repopulates
+        // on the next `*Ready`; clearing here keeps `notes` empty during the
+        // Loading window so nothing reads stale anchors.
+        self.notes.clear();
         self.state = DiffViewState::RangeLoading {
             base: base.clone(),
             head: head.clone(),
@@ -743,6 +779,7 @@ impl DiffView {
             };
             let _ = this.update(cx, |view, cx| {
                 view.apply_range_load_result(base, head, path, title, result);
+                view.reload_notes();
                 cx.notify();
             });
         });
@@ -804,6 +841,10 @@ impl DiffView {
         self.collapsed.clear();
         self.expanded_folds.clear();
         self.reset_rail_state();
+        // Drop the prior scope's notes immediately. `reload_notes` repopulates
+        // on the next `*Ready`; clearing here keeps `notes` empty during the
+        // Loading window so nothing reads stale anchors.
+        self.notes.clear();
         self.state = DiffViewState::CombinedLoading {
             scope: scope.clone(),
         };
@@ -834,6 +875,7 @@ impl DiffView {
             };
             let _ = this.update(cx, |view, cx| {
                 view.apply_combined_result(scope, result);
+                view.reload_notes();
                 cx.notify();
             });
         });
@@ -1296,6 +1338,153 @@ impl DiffView {
         self.retry(cx);
         cx.notify();
     }
+
+    /// Mirror the current scope's persisted review notes into the in-memory
+    /// store. Called after every `*Ready` load. Clears the store for
+    /// non-`Ready` states (no diff_ref → no notes). No-op when no repo handle
+    /// is installed (pure unit tests that never boot the app — notes degrade
+    /// to in-memory-only). Reads SQLite synchronously: the table is tiny (a
+    /// review is tens of notes) and local, so this stays off the async path.
+    fn reload_notes(&mut self) {
+        let Some(diff_ref) = diff_ref_for(&self.state) else {
+            self.notes.clear();
+            self.invalidate_prepared();
+            return;
+        };
+        let Some(repo) = note_repo() else {
+            return;
+        };
+        let scope = self.repo.workdir().to_string_lossy().to_string();
+        match repo.list_for_scope(&scope, &diff_ref) {
+            Ok(notes) => self.notes.load(notes),
+            Err(err) => {
+                tracing::warn!(
+                    target: "oximux_app::diff_view",
+                    %err,
+                    "review-note load failed"
+                );
+                self.notes.clear();
+            }
+        }
+        self.invalidate_prepared();
+    }
+
+    /// Open the compose/edit popover anchored to `anchor`. Pre-fills with the
+    /// existing note body (if any). First-open-wins: a re-click while a
+    /// popover is mounted is ignored so a half-typed note isn't replaced.
+    pub fn open_note_popover(
+        &mut self,
+        anchor: NoteAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.note_popover.is_some() {
+            return;
+        }
+        let existing = self.notes.get(&anchor).map(str::to_string);
+        let weak = cx.entity().downgrade();
+        let anchor_for_cb = anchor.clone();
+        let on_commit: ReviewNoteCallback = Rc::new(move |outcome, _window, cx| {
+            let _ = weak.update(cx, |view, cx| {
+                view.apply_note_outcome(anchor_for_cb.clone(), outcome, cx);
+            });
+        });
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let popover = cx.new(|cx| {
+            ReviewNotePopover::new(
+                anchor, existing, on_commit, theme, density, typography, window, cx,
+            )
+        });
+        // Focus the input so typing lands without a click first.
+        popover.read(cx).input_focus_handle(cx).focus(window, cx);
+        self._note_popover_observer =
+            Some(cx.observe_in(&popover, window, |view, pop, _window, cx| {
+                if pop.read(cx).is_closed() {
+                    view.note_popover = None;
+                    view._note_popover_observer = None;
+                    cx.notify();
+                }
+            }));
+        self.note_popover = Some(popover);
+        cx.notify();
+    }
+
+    /// Apply a popover dismissal: Save upserts the note, Delete (or an emptied
+    /// body) removes it, Cancel is inert. The store mirrors the DB write so
+    /// the gutter marker updates without a full reload.
+    fn apply_note_outcome(
+        &mut self,
+        anchor: NoteAnchor,
+        outcome: ReviewNoteOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            ReviewNoteOutcome::Save(body) => {
+                self.persist_note(&anchor, Some(&body));
+                self.notes.set(anchor, body);
+                self.invalidate_prepared();
+            }
+            ReviewNoteOutcome::Delete => {
+                self.persist_note(&anchor, None);
+                self.notes.remove(&anchor);
+                self.invalidate_prepared();
+            }
+            ReviewNoteOutcome::Cancel => {}
+        }
+        cx.notify();
+    }
+
+    /// Write one note through to SQLite — `Some(body)` upserts, `None`
+    /// deletes. No-op without a diff_ref (non-`Ready` state) or repo handle.
+    /// Errors are logged, not surfaced: the in-memory store still reflects the
+    /// user's edit, and the next load reconciles against the DB.
+    fn persist_note(&self, anchor: &NoteAnchor, body: Option<&str>) {
+        let Some(diff_ref) = diff_ref_for(&self.state) else {
+            return;
+        };
+        let Some(repo) = note_repo() else {
+            return;
+        };
+        let scope = self.repo.workdir().to_string_lossy().to_string();
+        let res = match body {
+            Some(b) => repo.upsert(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line, b),
+            None => repo.delete(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line),
+        };
+        if let Err(err) = res {
+            tracing::warn!(
+                target: "oximux_app::diff_view",
+                %err,
+                "review-note persist failed"
+            );
+        }
+    }
+}
+
+/// Derive the diff-scope identity used to key review notes, from the current
+/// view state. Pure (no I/O) so it's unit-testable. Returns `None` for
+/// non-`Ready` states — a loading/failed/empty view carries no notes.
+///
+/// Stable, human-legible keys: re-opening the same diff later (same staged
+/// side / commit / range / combined scope) re-attaches the same notes.
+/// Untracked files fold into `worktree:unstaged` — an untracked change is a
+/// not-yet-staged worktree edit, so its notes belong with the unstaged side.
+pub(crate) fn diff_ref_for(state: &DiffViewState) -> Option<String> {
+    match state {
+        DiffViewState::Ready { staged, .. } => Some(
+            if *staged {
+                "worktree:staged"
+            } else {
+                "worktree:unstaged"
+            }
+            .to_string(),
+        ),
+        DiffViewState::CommitReady { sha, .. } => Some(format!("commit:{sha}")),
+        DiffViewState::RangeReady { base, head, .. } => Some(format!("range:{base}..{head}")),
+        DiffViewState::CombinedReady { scope, .. } => Some(format!("combined:{}", scope.tab_key())),
+        _ => None,
+    }
 }
 
 impl Focusable for DiffView {
@@ -1360,7 +1549,7 @@ impl Render for DiffView {
                         density: self.density,
                         typography: &self.typography,
                     };
-                    let body = if self.split {
+                    let mut body = if self.split {
                         prepare_split(
                             &plan,
                             &regions,
@@ -1379,6 +1568,11 @@ impl Render for DiffView {
                             &rctx,
                         )
                     };
+                    // Bake each line's note marker once per rebuild (off the
+                    // per-frame path), parallel to the staged-sliver pass.
+                    let paths: Vec<String> =
+                        diffs.iter().map(|d| d.path.display().to_string()).collect();
+                    mark_notes(&mut body, &paths, &self.notes);
                     Some(Rc::new(body))
                 }
                 _ => None,
@@ -1896,6 +2090,18 @@ impl Render for DiffView {
                 .pt(px(96.0))
                 .child(dialog)
         });
+        // Review-note compose/edit popover — same centered-overlay shape as
+        // the confirm dialog, scoped to this diff tab.
+        let note_overlay = self.note_popover.clone().map(|popover| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(96.0))
+                .child(popover)
+        });
         let mut root = div()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_expand_diff))
@@ -1926,6 +2132,9 @@ impl Render for DiffView {
         content = content.child(body_wrap);
         root = root.child(content);
         if let Some(o) = overlay {
+            root = root.child(o);
+        }
+        if let Some(o) = note_overlay {
             root = root.child(o);
         }
         root.into_any_element()
@@ -2013,5 +2222,87 @@ fn failed_state(
                 )
                 .child("Retry"),
         )
+}
+
+#[cfg(test)]
+mod diff_ref_tests {
+    use super::*;
+    use oximux_core::CombinedDiffScope;
+
+    #[test]
+    fn non_ready_states_have_no_diff_ref() {
+        assert_eq!(diff_ref_for(&DiffViewState::Empty), None);
+        assert_eq!(
+            diff_ref_for(&DiffViewState::CombinedLoading {
+                scope: CombinedDiffScope::AllChanges
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn worktree_ready_keys_by_staged_side() {
+        let unstaged = DiffViewState::Ready {
+            path: PathBuf::from("a.rs"),
+            staged: false,
+            untracked: false,
+            diffs: vec![],
+            expanded: false,
+        };
+        assert_eq!(diff_ref_for(&unstaged).as_deref(), Some("worktree:unstaged"));
+        let staged = DiffViewState::Ready {
+            path: PathBuf::from("a.rs"),
+            staged: true,
+            untracked: false,
+            diffs: vec![],
+            expanded: false,
+        };
+        assert_eq!(diff_ref_for(&staged).as_deref(), Some("worktree:staged"));
+    }
+
+    #[test]
+    fn untracked_folds_into_unstaged() {
+        let untracked = DiffViewState::Ready {
+            path: PathBuf::from("new.rs"),
+            staged: false,
+            untracked: true,
+            diffs: vec![],
+            expanded: false,
+        };
+        assert_eq!(diff_ref_for(&untracked).as_deref(), Some("worktree:unstaged"));
+    }
+
+    #[test]
+    fn commit_range_combined_keys() {
+        let commit = DiffViewState::CommitReady {
+            sha: "abc123".into(),
+            short_oid: "abc1".into(),
+            subject: "msg".into(),
+            diffs: vec![],
+            expanded: false,
+        };
+        assert_eq!(diff_ref_for(&commit).as_deref(), Some("commit:abc123"));
+
+        let range = DiffViewState::RangeReady {
+            base: "main".into(),
+            head: "feat".into(),
+            path: PathBuf::from("a.rs"),
+            title: "a.rs".into(),
+            diffs: vec![],
+            expanded: false,
+        };
+        assert_eq!(diff_ref_for(&range).as_deref(), Some("range:main..feat"));
+
+        let combined = DiffViewState::CombinedReady {
+            scope: CombinedDiffScope::Staged,
+            diffs: vec![],
+            groups: vec![],
+            expanded: false,
+        };
+        assert_eq!(
+            diff_ref_for(&combined).as_deref(),
+            Some("combined:Staged Changes")
+        );
+    }
 }
 

@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use oximux_core::{AgentSession, AgentStatus, Project, Workspace};
 use oximux_storage::{
-    AgentLastParamsRepo, AgentSessionRepo, Db, PaneBufferRepo, PaneRelayIdRepo, PaneSessionRepo,
-    ProjectRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
+    AgentLastParamsRepo, AgentSessionRepo, Db, DiffReviewNoteRepo, PaneBufferRepo, PaneRelayIdRepo,
+    PaneSessionRepo, ProjectRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
 };
 
 /// Recent-projects fetch limit. The project picker (step 5) paginates if a
@@ -110,6 +110,11 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
     let settings_repo = SettingsRepo::new(db.clone());
     let agent_last_params_repo = AgentLastParamsRepo::new(db.clone());
     let worktree_settings_repo = WorktreeSettingsRepo::new(db.clone());
+
+    // Install the process-wide review-note repo handle so diff views (built
+    // deep in the pane/sidebar tree) can persist + rehydrate notes without
+    // threading a Db through every intermediate constructor.
+    crate::shell::diff_view::note_repo_handle::init_note_repo(DiffReviewNoteRepo::new(db.clone()));
 
     let agent_last_params: HashMap<String, (Option<String>, Option<String>)> =
         agent_last_params_repo

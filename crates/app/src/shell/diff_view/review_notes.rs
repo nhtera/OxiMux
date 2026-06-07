@@ -68,14 +68,10 @@ impl ReviewNoteStore {
     }
 
     /// Whether a specific line carries a note. Used by the prepare-time
-    /// marker pass (once per diff rebuild, not per frame).
+    /// marker pass (once per diff rebuild, not per frame). O(log n) on the
+    /// ordered map — the transient anchor is cheaper than scanning every key.
     pub fn has_note(&self, path: &str, line: u32, side: NoteSide) -> bool {
-        // Borrow-friendly probe: scan only the file's contiguous key range.
-        // The map is small (a review is tens of notes), so this stays cheap
-        // and avoids allocating an owned key per check.
-        self.notes
-            .keys()
-            .any(|a| a.line == line && a.side == side && a.path == path)
+        self.notes.contains_key(&NoteAnchor::new(path, line, side))
     }
 
     /// Insert or replace a note. An empty/whitespace body removes the note

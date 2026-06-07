@@ -48,8 +48,10 @@ use std::rc::Rc;
 use crate::shell::diff_view::file_header::file_header_row;
 use crate::shell::diff_view::hunk_actions::render_hunk_actions;
 use crate::shell::diff_view::render::{FilePlan, LinePlan, RenderCtx};
+use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore};
 use crate::shell::diff_view::word_diff::WordOp;
 use crate::shell::diff_view::{DiffView, HunkActionSide};
+use oximux_core::NoteSide;
 use gpui::{
     App, ClickEvent, HighlightStyle, Hsla, InteractiveElement, IntoElement,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ParentElement, SharedString,
@@ -187,6 +189,19 @@ pub struct PreparedLine {
     /// Overview-ruler classification (`None` for context — context rows put
     /// no tick on the ruler).
     pub mark: Option<RulerMark>,
+    /// 1-based old-side line number (carried from the plan), or `None` on
+    /// additions. Used by the note-marker pass to resolve the line's anchor.
+    pub old_line: Option<u32>,
+    /// 1-based new-side line number, or `None` on deletions.
+    pub new_line: Option<u32>,
+    /// Stable review-note anchor for this line (`None` for rows that can't be
+    /// annotated — e.g. no-newline hints). Baked once by `mark_notes` after
+    /// the row list is built, off the per-frame path; the gutter marker's
+    /// click handler clones it to open the compose popover.
+    pub note_anchor: Option<NoteAnchor>,
+    /// Whether a saved note exists at this line's anchor — drives the gutter
+    /// marker's filled-vs-faint glyph. Baked by `mark_notes`.
+    pub has_note: bool,
 }
 
 /// Index of the row whose laid-out width is largest, used as
@@ -554,6 +569,34 @@ fn apply_staged_slivers(rows: &mut [PreparedRow], staged_per_file: &[bool]) {
             }
             _ => {}
         }
+    }
+}
+
+/// Bake each body line's review-note anchor + `has_note` flag in one pass
+/// after the row list is built. Runs once per prepared rebuild (NOT per
+/// frame), keeping the store lookup off the scroll path — same discipline as
+/// `apply_staged_slivers`.
+///
+/// Anchor side: a pure removed line (old number, no new number) anchors to
+/// the OLD side; every other addressable line (added / context) anchors to
+/// the NEW side. No-newline hints (no line number either side) get no anchor,
+/// so they render no marker. `paths[file_idx]` supplies the file path; a
+/// missing index leaves the line un-anchored rather than panicking.
+pub fn mark_notes(rows: &mut [PreparedRow], paths: &[String], store: &ReviewNoteStore) {
+    for row in rows.iter_mut() {
+        let PreparedRow::Line(line) = row else {
+            continue;
+        };
+        let Some(path) = paths.get(line.file_idx) else {
+            continue;
+        };
+        let (side, lineno) = match (line.old_line, line.new_line) {
+            (Some(old), None) => (NoteSide::Old, old),
+            (_, Some(new)) => (NoteSide::New, new),
+            (None, None) => continue,
+        };
+        line.has_note = store.has_note(path, lineno, side);
+        line.note_anchor = Some(NoteAnchor::new(path.clone(), lineno, side));
     }
 }
 
@@ -1001,6 +1044,12 @@ fn prepare_line(
         region,
         region_anchor,
         mark: mark_for_kind(l.kind),
+        old_line: l.old_line,
+        new_line: l.new_line,
+        // Resolved later by `mark_notes` (needs the file path + note store,
+        // neither of which is in scope here). Default to "no anchor / no note".
+        note_anchor: None,
+        has_note: false,
     }
 }
 
@@ -1384,6 +1433,16 @@ fn line_row_el(
     // sliver widen) + this row (for the card's Y); entering context disarms.
     // Leave is ignored so the pointer can reach the floating staging card
     // without it vanishing.
+    // Gutter note marker — click opens the compose popover. Built before
+    // `weak` is moved into `on_hover` below (it needs its own clone).
+    let marker = note_marker_cell(
+        line.note_anchor.clone(),
+        line.has_note,
+        weak.clone(),
+        theme,
+        density,
+        typography,
+    );
     let target_region = line.region;
     let target_row = line.region.map(|_| row_index);
     let mut row = div()
@@ -1406,10 +1465,73 @@ fn line_row_el(
     if let Some(bg) = line.row_bg {
         row = row.bg(bg);
     }
-    row.child(strip_cell(line.strip, line.hollow, hovered, density.h_row))
+    row.child(marker)
+        .child(strip_cell(line.strip, line.hollow, hovered, density.h_row))
         .child(gutter)
         .child(sign)
         .child(content)
+}
+
+/// A fixed-width gutter cell carrying the review-note marker. Reserved on
+/// every line (so columns stay aligned) but only painted on annotatable
+/// lines: a filled glyph when a note exists, an otherwise-invisible glyph
+/// that reveals faintly on hover so the affordance is discoverable without
+/// peppering every line with a dot. Click opens the compose popover anchored
+/// to this line.
+fn note_marker_cell(
+    anchor: Option<NoteAnchor>,
+    has_note: bool,
+    weak: WeakEntity<DiffView>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> gpui::AnyElement {
+    let cell = div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .w(px(14.0))
+        .h(px(density.h_row));
+    let Some(anchor) = anchor else {
+        // Non-annotatable line (no-newline hint): reserved blank space.
+        return cell.into_any_element();
+    };
+    let id = gpui::ElementId::Name(
+        format!(
+            "diff-note-marker-{}-{}-{}",
+            anchor.line,
+            anchor.side.as_str(),
+            anchor.path
+        )
+        .into(),
+    );
+    let (glyph, base_color, hover_color) = if has_note {
+        ("●", theme.status_info, theme.status_info)
+    } else {
+        // Invisible until the marker cell is hovered, then a faint hint.
+        let transparent = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.0,
+            a: 0.0,
+        };
+        ("○", transparent, theme.fg_muted)
+    };
+    cell.id(id)
+        .cursor_pointer()
+        .font(typography.mono_font())
+        .text_size(px(typography.t_body_sm))
+        .text_color(base_color)
+        .hover(move |s| s.text_color(hover_color))
+        .child(glyph)
+        .on_mouse_down(MouseButton::Left, move |_ev, window, cx: &mut App| {
+            // Don't let the click also arm the region / staging card.
+            cx.stop_propagation();
+            let anchor = anchor.clone();
+            let _ = weak.update(cx, |view, cx| view.open_note_popover(anchor, window, cx));
+        })
+        .into_any_element()
 }
 
 /// The elevated Stage/Discard card — a raised surface + crisp border + soft
