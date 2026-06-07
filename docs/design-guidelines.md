@@ -219,8 +219,38 @@ item h  = density.h_overlay_item   (30px)
 
 Adopt for every new floating surface. Today's compliant surfaces:
 `pane_actions`, `adapter_picker`, `commit_context_menu`, `file_tree_context_menu`,
-`tab_context_menu`, `git_panel/row_context_menu`. See the "approved exceptions"
-table above for the three surfaces that deliberately diverge.
+`tab_context_menu`, `git_panel/row_context_menu`, `review_note_popover`. See the
+"approved exceptions" table above for the three surfaces that deliberately diverge.
+
+## Diff review notes
+
+Per-line review annotations in the diff viewer. Three surfaces, all quiet by
+default:
+
+- **Gutter marker** — a fixed-width cell reserved on every annotatable line so
+  columns never shift. A line with a saved note shows a filled glyph in
+  `status_info`; an un-noted line's glyph is transparent until the marker cell
+  is hovered, then a faint `fg_muted` hint — discoverable without peppering
+  every line with a dot. Click opens the compose popover. Markers are baked
+  once per prepared-rows rebuild (never per frame), like the staged slivers.
+- **Compose popover** (`review_note_popover`) — Floating Surface Chrome; a
+  multi-line `InputState`. `⌘↵` saves, `Esc` cancels, Delete removes. An
+  emptied body on Save deletes the note (clearing the text means "remove").
+- **Notes (count) cluster** — appears in the diff toolbar only when the scope
+  carries at least one note: a count label (`Notes (3)`) plus `Send` / `Copy` / `Clear`
+  text chips. Send formats all notes as one markdown prompt (file-grouped,
+  each note carrying its line's code as a fenced block) and dispatches it to
+  the active agent via `SendTextToActiveAgent`; Copy puts the same markdown on
+  the clipboard; Clear drops the scope's notes.
+
+Notes anchor to a stable `(repo, diff_ref, path, side, line)` coordinate — not a
+render-row index — so they re-attach to the right line across folds, scroll,
+split mode, and app restart. Persistence is SQLite (`diff_review_notes`); the
+diff view rehydrates on every load. Send/Copy include code context in both
+inline and split mode (the prompt is built from the render plan, not the
+on-screen rows). Split mode does not yet paint the gutter markers (inline
+only) — a deliberate v1 boundary; notes added inline still send correctly
+while viewing split.
 
 ## Primitive-Picking Fork
 

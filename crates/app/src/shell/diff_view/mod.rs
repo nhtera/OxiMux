@@ -29,7 +29,7 @@ pub mod review_notes;
 pub mod syntax;
 pub mod word_diff;
 
-use crate::actions::{ExpandDiff, RetryDiff};
+use crate::actions::{ExpandDiff, RetryDiff, SendTextToActiveAgent};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::diff_view::file_header::{
     StickyHeader, build_first_row_of_file, build_row_owner, collect_headers, sticky_header_overlay,
@@ -40,22 +40,22 @@ use crate::shell::diff_view::paint::{
     FoldId, OverviewRun, PreparedRow, mark_notes, overview_ruler, overview_runs, prepare,
     prepare_split, render_rows, staging_card_overlay, widest_row_chars, widest_row_index,
 };
-use crate::shell::diff_view::render::{RenderCtx, build_render_plan};
+use crate::shell::diff_view::render::{FilePlan, RenderCtx, build_render_plan};
 use crate::shell::diff_view::review_note_popover::{
     ReviewNoteCallback, ReviewNoteOutcome, ReviewNotePopover,
 };
-use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore};
+use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore, format_notes_markdown};
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollStrategy, StatefulInteractiveElement as _, Styled, Subscription,
-    Task, UniformListScrollHandle, Window, div, px,
+    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement as _, Styled,
+    Subscription, Task, UniformListScrollHandle, Window, div, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, Sizable as _};
-use oximux_core::{CombinedDiffScope, FileDiff, FileGroup};
+use oximux_core::{CombinedDiffScope, FileDiff, FileGroup, NoteSide};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::oneshot;
@@ -1354,7 +1354,7 @@ impl DiffView {
         let Some(repo) = note_repo() else {
             return;
         };
-        let scope = self.repo.workdir().to_string_lossy().to_string();
+        let scope = self.scope_key();
         match repo.list_for_scope(&scope, &diff_ref) {
             Ok(notes) => self.notes.load(notes),
             Err(err) => {
@@ -1447,7 +1447,7 @@ impl DiffView {
         let Some(repo) = note_repo() else {
             return;
         };
-        let scope = self.repo.workdir().to_string_lossy().to_string();
+        let scope = self.scope_key();
         let res = match body {
             Some(b) => repo.upsert(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line, b),
             None => repo.delete(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line),
@@ -1459,6 +1459,99 @@ impl DiffView {
                 "review-note persist failed"
             );
         }
+    }
+
+    /// Repository scope key for note rows — the worktree root path. Shared by
+    /// load / persist / clear so the column stays identical across writes.
+    fn scope_key(&self) -> String {
+        self.repo.workdir().to_string_lossy().to_string()
+    }
+
+    /// Map each annotatable line's anchor to its diff line text, so the
+    /// formatter can fence code context next to each note. Sourced from a
+    /// fresh `build_render_plan` (the SAME `LinePlan` line numbers `mark_notes`
+    /// anchors against) rather than from `self.prepared` — so it works
+    /// view-mode-independently (inline AND split, which carries no per-line
+    /// anchors) and before the first render. `expanded = true` so a collapsed
+    /// large-diff file still yields context for its lines.
+    fn note_context_map(&self) -> HashMap<NoteAnchor, String> {
+        let mut map = HashMap::new();
+        let diffs = match &self.state {
+            DiffViewState::Ready { diffs, .. }
+            | DiffViewState::CommitReady { diffs, .. }
+            | DiffViewState::RangeReady { diffs, .. }
+            | DiffViewState::CombinedReady { diffs, .. } => diffs,
+            _ => return map,
+        };
+        for fp in build_render_plan(diffs, true) {
+            let FilePlan::Hunked { path, hunks, .. } = fp else {
+                continue;
+            };
+            for hunk in &hunks {
+                for line in &hunk.rows {
+                    let (side, n) = match (line.old_line, line.new_line) {
+                        (Some(old), None) => (NoteSide::Old, old),
+                        (_, Some(new)) => (NoteSide::New, new),
+                        (None, None) => continue,
+                    };
+                    map.insert(NoteAnchor::new(path.clone(), n, side), line.content.clone());
+                }
+            }
+        }
+        map
+    }
+
+    /// Render the current scope's notes as a markdown prompt (file-grouped,
+    /// each note carrying its line's code as a fenced context block). Empty
+    /// string when there are no notes.
+    fn notes_markdown(&self) -> String {
+        let ctx = self.note_context_map();
+        format_notes_markdown(&self.notes, |anchor| ctx.get(anchor).cloned())
+    }
+
+    /// Send every note to the workspace's active agent as one markdown prompt,
+    /// via the same `SendTextToActiveAgent` action the terminal + palette use.
+    /// No-op when there are no notes.
+    fn send_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.notes_markdown();
+        if text.is_empty() {
+            return;
+        }
+        window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+    }
+
+    /// Copy the markdown prompt to the clipboard — a non-agent escape hatch.
+    fn copy_notes(&mut self, cx: &mut Context<Self>) {
+        let text = self.notes_markdown();
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Drop every note for the current scope, in memory and in SQLite.
+    fn clear_notes(&mut self, cx: &mut Context<Self>) {
+        if self.notes.is_empty() {
+            return;
+        }
+        if let Some(diff_ref) = diff_ref_for(&self.state)
+            && let Some(repo) = note_repo()
+        {
+            let scope = self.scope_key();
+            if let Err(err) = repo.clear_scope(&scope, &diff_ref) {
+                tracing::warn!(
+                    target: "oximux_app::diff_view",
+                    %err,
+                    "review-note clear failed"
+                );
+            }
+        }
+        // Clear the in-memory store even if the SQLite delete failed: the UI
+        // reflects the user's intent now, and the next load's `reload_notes`
+        // reconciles against the DB (a failed clear simply re-appears then).
+        self.notes.clear();
+        self.invalidate_prepared();
+        cx.notify();
     }
 }
 
@@ -1763,6 +1856,54 @@ impl Render for DiffView {
             let hover_bg = self.theme.bg_panel_alt;
             let all_folded = self.all_folded();
             let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
+            // Review-notes cluster — a count label + Send / Copy / Clear,
+            // shown only once the current scope carries at least one note.
+            // Send pipes the markdown prompt to the active agent; Copy is the
+            // clipboard escape hatch; Clear drops the scope's notes.
+            let notes_cluster = (!self.notes.is_empty()).then(|| {
+                let n = self.notes.len();
+                let t_sm = self.typography.t_body_sm;
+                let r_chip = self.density.r_chip;
+                let fg_muted = self.theme.fg_muted;
+                let action_chip = move |id: &'static str, text: &'static str| {
+                    div()
+                        .id(id)
+                        .px(px(8.0))
+                        .py(px(1.0))
+                        .rounded(px(r_chip))
+                        .text_size(px(t_sm))
+                        .text_color(fg_muted)
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .child(text)
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(t_sm))
+                            .text_color(self.theme.fg_subtle)
+                            .child(format!("Notes ({n})")),
+                    )
+                    .child(action_chip("diff-notes-send", "Send").on_click(cx.listener(
+                        |view, _: &gpui::ClickEvent, window, cx| {
+                            view.send_notes(window, cx);
+                        },
+                    )))
+                    .child(action_chip("diff-notes-copy", "Copy").on_click(cx.listener(
+                        |view, _: &gpui::ClickEvent, _window, cx| {
+                            view.copy_notes(cx);
+                        },
+                    )))
+                    .child(action_chip("diff-notes-clear", "Clear").on_click(cx.listener(
+                        |view, _: &gpui::ClickEvent, _window, cx| {
+                            view.clear_notes(cx);
+                        },
+                    )))
+            });
             // Leading rail toggle (multi-file only), pushed apart from the
             // view controls by a flex spacer so it sits at the left edge.
             let rail_toggle = multi_file.then(|| {
@@ -1818,6 +1959,7 @@ impl Render for DiffView {
                 // Spacer pushes the view controls to the right edge while the
                 // rail toggle stays pinned left.
                 .child(div().flex_1())
+                .children(notes_cluster)
                 .child(
                     // Collapse-all / Expand-all — folds every file to its
                     // header so a many-file diff reads as a tight index.
