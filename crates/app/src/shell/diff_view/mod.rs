@@ -23,6 +23,7 @@ pub mod file_rail;
 pub mod hunk_actions;
 pub mod paint;
 pub mod render;
+pub mod review_notes;
 pub mod syntax;
 pub mod word_diff;
 

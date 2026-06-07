@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// `new_line`); a note on a removed line anchors to the OLD side (its
 /// `old_line`). Keeping the side explicit means a note on a deleted line and
 /// a note on the line that replaced it never collide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum NoteSide {
     Old,
     New,
