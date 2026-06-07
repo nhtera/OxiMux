@@ -29,6 +29,7 @@ use crate::error::StorageError;
 
 mod agent_last_params;
 mod agent_session;
+mod diff_review_note;
 mod pane_buffer;
 mod pane_relay_id;
 mod pane_session;
@@ -39,6 +40,7 @@ mod worktree_settings;
 
 pub use agent_last_params::AgentLastParamsRepo;
 pub use agent_session::AgentSessionRepo;
+pub use diff_review_note::DiffReviewNoteRepo;
 pub use pane_buffer::PaneBufferRepo;
 pub use pane_relay_id::PaneRelayIdRepo;
 pub use pane_session::PaneSessionRepo;

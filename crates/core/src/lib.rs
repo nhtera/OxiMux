@@ -11,6 +11,7 @@
 
 pub mod agent_session;
 pub mod conflict_kind;
+pub mod diff_review_note;
 pub mod git_diff;
 pub mod git_ops;
 pub mod git_state;
@@ -20,6 +21,7 @@ pub mod workspace;
 
 pub use agent_session::{AgentSession, AgentSessionId, AgentStatus};
 pub use conflict_kind::ConflictKind;
+pub use diff_review_note::{DiffReviewNote, NoteSide};
 pub use git_diff::{
     ChangeRegion, CombinedDiff, CombinedDiffScope, DiffHunk, DiffLine, DiffLineKind, DiffStatus,
     FileDiff, FileGroup, HUNK_CONTEXT, LARGE_DIFF_LINE_THRESHOLD, change_regions,

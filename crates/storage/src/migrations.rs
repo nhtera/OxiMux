@@ -53,8 +53,13 @@ pub struct Migration {
 /// with no workspace row. V008 widens the `pane_relay_ids` primary key
 /// with `sub_pane` + `tab` so every split leaf / per-pane tab persists
 /// its own relay PTY id and re-attaches independently across restart;
-/// legacy rows copy forward with sub_pane=0, tab=0. Future migrations
-/// append; never reorder, never rewrite.
+/// legacy rows copy forward with sub_pane=0, tab=0. V009 adds
+/// `agent_last_params` — one row per agent adapter remembering the
+/// last-used model + reasoning-effort so the launch picker can
+/// preselect. V010 adds `diff_review_notes` — per-line diff review
+/// notes keyed by a `(repo, diff_ref, path, side, line)` anchor so a
+/// review survives tab close + restart. Future migrations append;
+/// never reorder, never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -100,6 +105,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "agent_last_params",
         sql: include_str!("../migrations/V009__agent_last_params.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "diff_review_notes",
+        sql: include_str!("../migrations/V010__diff_review_notes.sql"),
     },
 ];
 
