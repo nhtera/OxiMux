@@ -854,7 +854,25 @@ impl WorkspaceRoot {
                     let _ = weak.update_in(cx, |this, window, cx| {
                         cx.notify();
                         if let Some(kind) = agent {
-                            this.spawn_agent_tab(kind, agent_adapter_id(kind), cwd.clone(), window, cx);
+                            // Auto-spawn from the create dialog uses the
+                            // adapter's last-used params (or defaults when
+                            // none saved) — no picker step here.
+                            let id = agent_adapter_id(kind);
+                            let (model, effort) = this
+                                .app_state
+                                .agent_last_params
+                                .get(id)
+                                .cloned()
+                                .unwrap_or((None, None));
+                            this.spawn_agent_tab(
+                                kind,
+                                id,
+                                cwd.clone(),
+                                model,
+                                effort,
+                                window,
+                                cx,
+                            );
                         }
                         // Opt-in: run the project's setup script in a terminal
                         // tab right after the worktree exists. `auto_setup`

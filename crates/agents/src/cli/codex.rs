@@ -92,6 +92,12 @@ impl CliAgentAdapter for CodexAdapter {
     fn status_patterns(&self) -> &[StatusPattern] {
         EMPTY_PATTERNS
     }
+
+    fn models(&self) -> &'static [&'static str] {
+        // `-m <model>` slugs. No effort row — the codex CLI has no
+        // reasoning-effort analog (see `build_command` note).
+        &["gpt-5-codex", "o3"]
+    }
 }
 
 #[cfg(test)]

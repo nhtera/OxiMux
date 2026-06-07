@@ -92,6 +92,21 @@ pub trait CliAgentAdapter: Send + Sync + 'static {
     /// The runtime is responsible for the actual PTY launch.
     fn build_command(&self, cfg: &AgentSessionConfig) -> Result<CommandSpec>;
 
+    /// Concrete model selectors the launch picker offers for this adapter,
+    /// in display order. Empty (the default) hides the model row. List only
+    /// real models — the picker prepends its own "Default" option that maps
+    /// to `AgentSessionConfig::model = None` (no flag passed).
+    fn models(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Reasoning-effort selectors the picker offers, in display order. Empty
+    /// (the default) hides the effort row — e.g. Codex has no effort analog.
+    /// Same "Default"-prepend contract as [`models`](Self::models).
+    fn efforts(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Regex table for the status machine. Returned by reference so the
     /// machine can scan without cloning the patterns per session.
     fn status_patterns(&self) -> &[StatusPattern];

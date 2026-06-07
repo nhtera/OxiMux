@@ -54,6 +54,12 @@ pub struct RegistryEntry {
     /// always-on, like `Custom`). `false` when `detect()` returned `false`
     /// OR returned `Err` (logged at WARN; see module doc).
     pub available: bool,
+    /// Concrete model selectors the launch picker offers (adapter-declared,
+    /// `&'static`). Empty → no model row. The picker prepends a "Default"
+    /// option that maps to no `--model` flag.
+    pub models: &'static [&'static str],
+    /// Reasoning-effort selectors the picker offers. Empty → no effort row.
+    pub efforts: &'static [&'static str],
 }
 
 /// Internal pair: the runtime needs the `AgentAdapter` enum to key its
@@ -168,6 +174,8 @@ impl AdapterRegistry {
                 display_name,
                 adapter_enum: slot.kind,
                 available,
+                models: slot.adapter.models(),
+                efforts: slot.adapter.efforts(),
             });
         }
         entries

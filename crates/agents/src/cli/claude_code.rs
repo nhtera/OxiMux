@@ -122,6 +122,17 @@ impl CliAgentAdapter for ClaudeCodeAdapter {
     fn status_patterns(&self) -> &[StatusPattern] {
         patterns()
     }
+
+    fn models(&self) -> &'static [&'static str] {
+        // Documented `--model` aliases the CLI resolves to the latest of
+        // each tier. Aliases (not pinned IDs) so they keep tracking the
+        // newest model without a code change.
+        &["opus", "sonnet", "haiku"]
+    }
+
+    fn efforts(&self) -> &'static [&'static str] {
+        &["high", "medium", "low"]
+    }
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::error::StorageError;
 
+mod agent_last_params;
 mod agent_session;
 mod pane_buffer;
 mod pane_relay_id;
@@ -36,6 +37,7 @@ mod settings;
 mod workspace;
 mod worktree_settings;
 
+pub use agent_last_params::AgentLastParamsRepo;
 pub use agent_session::AgentSessionRepo;
 pub use pane_buffer::PaneBufferRepo;
 pub use pane_relay_id::PaneRelayIdRepo;

@@ -50,7 +50,7 @@ pub(crate) const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 /// 2 s keeps the `+A −B` chips feeling live without churning the disk.
 const DIFF_REFRESH_TICK: Duration = Duration::from_millis(2000);
 
-use crate::notifier::{Notifier, TabId};
+use crate::notifier::{AgentNotifySettings, Notifier, TabId};
 use crate::state::AppState;
 
 use crate::actions::{
@@ -159,6 +159,11 @@ pub struct WorkspaceRoot {
     /// per-project `ProjectPanes` entities built lazily via
     /// `set_active_project` share the same notifier the initial mount used.
     pub(crate) notifier: Arc<dyn Notifier>,
+    /// Live notification prefs shared with the notifier. The settings pane
+    /// flips these atomics; the notifier reads them on each dispatch.
+    /// `allow(dead_code)`: the read side is the settings-pane toggle wiring.
+    #[allow(dead_code)]
+    pub(crate) agent_notify_settings: Arc<AgentNotifySettings>,
     /// Cached registry of built-in adapters; resolves `AgentAdapter` at spawn.
     pub(crate) adapter_registry: Arc<AdapterRegistry>,
     /// Left rail visibility flag (Cmd+B).
@@ -326,9 +331,17 @@ impl WorkspaceRoot {
         // the receiver on the GPUI side. Non-mac builds plug in a no-op
         // notifier and the channel pair is unused.
         let (click_tx, mut click_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        // Live notification prefs (per-kind enable, sound, focus gate),
+        // hydrated from the flat settings store. Shared with the notifier;
+        // the settings pane flips the atomics at runtime.
+        let agent_notify_settings = Arc::new(AgentNotifySettings::from_getter(|k| {
+            app_state.settings_repo.get(k).ok().flatten()
+        }));
         #[cfg(target_os = "macos")]
-        let notifier: Arc<dyn Notifier> =
-            Arc::new(crate::notifier::mac::MacNotifier::new(click_tx));
+        let notifier: Arc<dyn Notifier> = Arc::new(crate::notifier::mac::MacNotifier::new(
+            click_tx,
+            agent_notify_settings.clone(),
+        ));
         #[cfg(not(target_os = "macos"))]
         let notifier: Arc<dyn Notifier> = {
             // Channel exists to keep type-shape consistent across cfg;
@@ -401,7 +414,25 @@ impl WorkspaceRoot {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
                 AdapterSelection::NewTerminal => this.spawn_local_terminal_tab(window, cx),
-                AdapterSelection::Adapter { kind, id } => {
+                AdapterSelection::Adapter {
+                    kind,
+                    id,
+                    model,
+                    effort,
+                } => {
+                    // Remember the choice so the next launch preselects it.
+                    if let Err(err) = this.app_state.agent_last_params_repo.upsert(
+                        id,
+                        model.as_deref(),
+                        effort.as_deref(),
+                    ) {
+                        tracing::warn!(?err, adapter = id, "persist last agent params failed");
+                    }
+                    // Keep the in-memory snapshot live so the create-dialog
+                    // auto-spawn path reflects this choice without a restart.
+                    this.app_state
+                        .agent_last_params
+                        .insert(id.to_string(), (model.clone(), effort.clone()));
                     // Root the agent at the active project (its panes' cwd),
                     // so the worktree the agent runs in matches a sidebar
                     // workspace row — that drives the live (green) status
@@ -419,7 +450,7 @@ impl WorkspaceRoot {
                             std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
-                    this.spawn_agent_tab(kind, id, cwd, window, cx)
+                    this.spawn_agent_tab(kind, id, cwd, model, effort, window, cx)
                 }
             });
         });
@@ -429,6 +460,7 @@ impl WorkspaceRoot {
                 density,
                 typography.clone(),
                 adapter_registry.clone(),
+                app_state.agent_last_params.clone(),
                 on_select,
             )
         });
@@ -607,6 +639,7 @@ impl WorkspaceRoot {
             typography,
             project_panes_by_project,
             notifier: notifier.clone(),
+            agent_notify_settings,
             right_sidebar,
             left_rail,
             palette,
@@ -1350,11 +1383,14 @@ impl WorkspaceRoot {
     ///
     /// If `update_in` errors (window/workspace dropped mid-spawn), cancels
     /// the half-mounted session so the PTY doesn't zombie.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_agent_tab(
         &self,
         adapter: AgentAdapter,
         adapter_id: &'static str,
         cwd: std::path::PathBuf,
+        model: Option<String>,
+        effort: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1363,8 +1399,6 @@ impl WorkspaceRoot {
         };
         let runtime = self.cli_runtime.clone();
         let cwd_for_tab = cwd.clone();
-        let model: Option<String> = None;
-        let effort: Option<String> = None;
 
         cx.spawn_in(window, async move |_root, cx| {
             // `adapter_id` arrives from the row the user clicked — the

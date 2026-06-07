@@ -96,6 +96,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "pane_relay_ids_leaf_key",
         sql: include_str!("../migrations/V008__pane_relay_ids_leaf_key.sql"),
     },
+    Migration {
+        version: 9,
+        name: "agent_last_params",
+        sql: include_str!("../migrations/V009__agent_last_params.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
