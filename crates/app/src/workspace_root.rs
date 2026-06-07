@@ -159,11 +159,6 @@ pub struct WorkspaceRoot {
     /// per-project `ProjectPanes` entities built lazily via
     /// `set_active_project` share the same notifier the initial mount used.
     pub(crate) notifier: Arc<dyn Notifier>,
-    /// Live notification prefs shared with the notifier. The settings pane
-    /// flips these atomics; the notifier reads them on each dispatch.
-    /// `allow(dead_code)`: the read side is the settings-pane toggle wiring.
-    #[allow(dead_code)]
-    pub(crate) agent_notify_settings: Arc<AgentNotifySettings>,
     /// Cached registry of built-in adapters; resolves `AgentAdapter` at spawn.
     pub(crate) adapter_registry: Arc<AdapterRegistry>,
     /// Left rail visibility flag (Cmd+B).
@@ -487,8 +482,16 @@ impl WorkspaceRoot {
                 cx,
             )
         });
-        let settings_modal =
-            cx.new(|cx| SettingsModal::new(theme, density, typography.clone(), cx));
+        let settings_modal = cx.new(|cx| {
+            SettingsModal::new(
+                theme,
+                density,
+                typography.clone(),
+                agent_notify_settings.clone(),
+                app_state.settings_repo.clone(),
+                cx,
+            )
+        });
         // When the settings modal closes (×, Esc, click-outside, or toggle),
         // return keyboard focus to the workspace root. The modal grabs focus
         // for its search field on open; without this the handle stays focused
@@ -639,7 +642,6 @@ impl WorkspaceRoot {
             typography,
             project_panes_by_project,
             notifier: notifier.clone(),
-            agent_notify_settings,
             right_sidebar,
             left_rail,
             palette,

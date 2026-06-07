@@ -1167,6 +1167,7 @@ impl PaneGroup {
             self.window_active.clone(),
             TabId::from(session_id),
             label.clone(),
+            view.downgrade(),
             cx,
         );
         // Agent tabs are terminal-backed: wrap the agent PTY view in a

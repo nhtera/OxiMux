@@ -10,7 +10,7 @@
 use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px};
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::agents_dashboard::model::AgentRow;
+use crate::shell::agents_dashboard::model::{AgentRow, attention_rank};
 use crate::shell::left_rail::workspace_row::STATUS_DOT_SIZE;
 
 /// Row height used for the `uniform_list` item height. Matches workspace rows
@@ -59,6 +59,25 @@ pub fn render_agent_row(
         .whitespace_nowrap()
         .child(row.verb.label);
 
+    // Review affordance: action-required rows (NeedsApproval / WaitingForInput)
+    // get a discoverable call-to-action. Clicking anywhere on the row already
+    // jumps to the agent's tab (the only place the user can act — approval is
+    // handled in the agent's own TUI, not programmatically); this chip just
+    // makes that affordance visible. Tinted with the verb color for urgency.
+    let review_chip = (attention_rank(row.status.as_ref(), row.is_live) == 0).then(|| {
+        div()
+            .flex_shrink_0()
+            .ml(px(density.gap_inline))
+            .px(px(density.gap_inline))
+            .rounded(px(density.r_chip))
+            .border_1()
+            .border_color(row.verb.color)
+            .text_size(px(typography.t_sub_label))
+            .text_color(row.verb.color)
+            .whitespace_nowrap()
+            .child("Review →")
+    });
+
     // Diff chip: "+A −B" — omitted when diff is absent or both counts are zero.
     let diff_chip = row.diff.as_ref().and_then(|d| {
         if d.added == 0 && d.removed == 0 {
@@ -89,5 +108,6 @@ pub fn render_agent_row(
         .child(dot)
         .child(loc_label)
         .child(verb_chip)
+        .children(review_chip)
         .children(diff_chip)
 }

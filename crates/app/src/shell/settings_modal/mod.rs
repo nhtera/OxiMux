@@ -21,12 +21,17 @@ mod view;
 
 pub use nav::SettingsPane;
 
+use std::sync::Arc;
+
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point,
     Subscription, Window, point, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use oximux_settings::{CommitMessageAiSettings, Density, TerminalSettings, Theme, Typography};
+use oximux_storage::SettingsRepo;
+
+use crate::notifier::AgentNotifySettings;
 
 /// Emitted when the modal closes (any path: ×, Esc, click-outside, toggle).
 /// `WorkspaceRoot` listens and returns keyboard focus to itself so global
@@ -53,6 +58,13 @@ pub struct SettingsModal {
     pub(crate) terminal: TerminalSettings,
     /// Working copy of the AI commit-message settings; same contract.
     pub(crate) ai: CommitMessageAiSettings,
+    /// Live notification prefs shared with the notifier. The Agents pane
+    /// toggles flip these atomics directly (interior mutability) so the
+    /// change takes effect on the next dispatch without a reload.
+    pub(crate) notify: Arc<AgentNotifySettings>,
+    /// Flat KV store the notification toggles persist into (keys in
+    /// [`crate::notifier::keys`]), so prefs survive a restart.
+    pub(crate) notify_repo: SettingsRepo,
     /// Top-left of the card. `None` until the user drags (or the first frame
     /// resolves it), at which point it holds the live, viewport-clamped
     /// position. Reset to `None` on each `open()` so the modal re-centers.
@@ -73,6 +85,8 @@ impl SettingsModal {
         theme: Theme,
         density: Density,
         typography: Typography,
+        notify: Arc<AgentNotifySettings>,
+        notify_repo: SettingsRepo,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -84,6 +98,8 @@ impl SettingsModal {
             typography,
             terminal: TerminalSettings::default(),
             ai: CommitMessageAiSettings::default(),
+            notify,
+            notify_repo,
             pos: None,
             drag_grab: None,
             search_input: None,
@@ -188,6 +204,17 @@ impl SettingsModal {
     pub(super) fn persist_ai(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::commit_message_ai_settings::save(&self.ai) {
             tracing::warn!(%err, "settings modal: failed to write commit_message_ai.toml");
+        }
+        cx.notify();
+    }
+
+    /// Persist one notification pref to the flat settings store as
+    /// `"true"`/`"false"`. The live atomic is flipped by the caller before
+    /// this runs; persistence only makes the choice survive a restart.
+    pub(super) fn persist_notify(&mut self, key: &str, value: bool, cx: &mut Context<Self>) {
+        let v = if value { "true" } else { "false" };
+        if let Err(err) = self.notify_repo.set(key, v) {
+            tracing::warn!(%err, key, "settings modal: failed to persist notification pref");
         }
         cx.notify();
     }

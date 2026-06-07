@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use gpui::{Context, SharedString, Task};
+use gpui::{Context, SharedString, Task, WeakEntity};
 use oximux_agents::AgentStatusStream;
 use oximux_core::AgentStatus;
 
@@ -17,6 +17,7 @@ use crate::notifier::{
     NotificationKind, Notifier, SuppressMap, TabId, notification_kind_for_transition,
 };
 use crate::shell::pane_group::PaneGroup;
+use crate::shell::terminal_view::TerminalView;
 
 /// Spawn a watcher on `status_rx` that
 ///  1. Wakes the parent `PaneGroup` on every status transition (badge repaint),
@@ -29,12 +30,14 @@ use crate::shell::pane_group::PaneGroup;
 /// `window_active` is a shared `Arc<AtomicBool>` updated by the owning
 /// `ProjectPanes` window-activation observer, so every group watcher
 /// reads the same flag without holding a back-reference up the tree.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_status_task(
     status_rx: AgentStatusStream,
     notifier: Arc<dyn Notifier>,
     window_active: Arc<AtomicBool>,
     tab_id: TabId,
     label: SharedString,
+    view: WeakEntity<TerminalView>,
     cx: &mut Context<PaneGroup>,
 ) -> Task<()> {
     let mut status_rx = status_rx;
@@ -61,15 +64,26 @@ pub fn spawn_status_task(
             // the per-kind enable + focus gate from shared settings, so we
             // always pass the current focus state and let it decide.
             let window_active_now = window_active.load(Ordering::Relaxed);
-            if let Some(kind) = notification_kind_for_transition(&prev_status, &new_status)
-                && suppress.should_fire(tab_id, kind, Instant::now())
-            {
-                let body = match &new_status {
-                    AgentStatus::NeedsApproval(reason) => reason.clone(),
-                    AgentStatus::Failed(msg) => msg.clone(),
-                    _ => String::new(),
-                };
-                notifier.notify(tab_id, kind, &label, &body, window_active_now);
+            if let Some(kind) = notification_kind_for_transition(&prev_status, &new_status) {
+                // Attention ring for action-required edges. Separate channel
+                // from the OS banner: independent of the banner rate-limit +
+                // focus gate (the view raises only when its pane is unfocused),
+                // so a backgrounded agent tab lights up even when banners are
+                // muted or suppressed.
+                if matches!(
+                    kind,
+                    NotificationKind::NeedsApproval | NotificationKind::WaitingForInput
+                ) {
+                    let _ = view.update(cx, |v, cx| v.raise_agent_attention(cx));
+                }
+                if suppress.should_fire(tab_id, kind, Instant::now()) {
+                    let body = match &new_status {
+                        AgentStatus::NeedsApproval(reason) => reason.clone(),
+                        AgentStatus::Failed(msg) => msg.clone(),
+                        _ => String::new(),
+                    };
+                    notifier.notify(tab_id, kind, &label, &body, window_active_now);
+                }
             }
             // Reset dedupe when leaving a notify-worthy state so re-entry can
             // fire immediately rather than waiting out the rate-limit window.

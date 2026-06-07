@@ -1578,6 +1578,19 @@ impl TerminalView {
         self.attention
     }
 
+    /// Raise the attention ring for an agent lifecycle edge (NeedsApproval /
+    /// WaitingForInput), the same channel a background BEL uses. Only fires on
+    /// an unfocused pane — a focused pane is already in view, so a ring would
+    /// be noise. Cleared on the next `on_focus`. Called by the per-tab agent
+    /// status watcher (`agent_status_task`) on a genuine status edge.
+    pub fn raise_agent_attention(&mut self, cx: &mut Context<Self>) {
+        if self.focused {
+            return;
+        }
+        self.attention = true;
+        cx.notify();
+    }
+
     fn maybe_resize(&mut self) {
         if self.target_grid == self.last_resize {
             return;
