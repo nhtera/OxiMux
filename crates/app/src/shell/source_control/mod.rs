@@ -20,6 +20,7 @@ pub mod ai_generation;
 pub mod ai_overlay;
 pub mod branch_commits;
 pub mod branch_picker;
+pub mod checks_section;
 pub mod ci_status;
 pub mod commit_area;
 pub mod commit_context_menu;
@@ -59,6 +60,7 @@ use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::WorktreeSettingsRepo;
 use tokio::sync::watch;
 
+use crate::actions::SendTextToActiveAgent;
 use crate::shell::diff_view::DiffView;
 use crate::shell::forge::{ForgeProvider, GithubForge};
 use crate::shell::git_panel::GitPanel;
@@ -137,6 +139,18 @@ pub struct SourceControlPanel {
     /// the same throttle as the PR status, only while a PR is open. Empty when
     /// there's no PR or no checks — the compact CI row then renders nothing.
     ci_checks: Vec<crate::shell::forge::CheckRun>,
+
+    /// View-state for the interactive checks section (which check is expanded,
+    /// fetched log peeks, fix-in-flight). Layered on top of `ci_checks`.
+    checks: checks_section::ChecksSectionState,
+
+    /// Holds the in-flight per-check log-peek fetch so it isn't dropped
+    /// mid-flight. Separate from the fix task so kicking off a "fix failing"
+    /// can't orphan a log fetch (leaving its spinner stuck).
+    _check_log_task: Option<gpui::Task<()>>,
+
+    /// Holds the in-flight "fix failing checks" log-bundle + dispatch task.
+    _fix_task: Option<gpui::Task<()>>,
 
     /// Cached resolved primary action from the last render. Read by the
     /// status bar to show the same verb without running a second resolver.
@@ -378,6 +392,9 @@ impl SourceControlPanel {
             pr_status_checked_at: None,
             pr_status_checked_branch: None,
             ci_checks: Vec::new(),
+            checks: checks_section::ChecksSectionState::default(),
+            _check_log_task: None,
+            _fix_task: None,
             base_ref: initial_base_ref,
             current_op: initial_op,
             on_open_file,
@@ -500,6 +517,113 @@ impl SourceControlPanel {
             });
         })
         .detach();
+    }
+
+    /// Toggle the inline log peek for a failing check. Collapses if already
+    /// expanded; otherwise expands and, on first open, fetches the failed-job
+    /// log peek for the check's run (async; cached by check name). No window
+    /// needed — this only mutates panel state.
+    fn toggle_check(&mut self, name: String, link: String, cx: &mut Context<Self>) {
+        if self.checks.expanded.as_deref() == Some(name.as_str()) {
+            self.checks.expanded = None;
+            cx.notify();
+            return;
+        }
+        self.checks.expanded = Some(name.clone());
+        if !self.checks.logs.contains_key(&name) {
+            if link.is_empty() {
+                self.checks
+                    .logs
+                    .insert(name, checks_section::LogPeek::Unavailable);
+            } else {
+                self.checks
+                    .logs
+                    .insert(name.clone(), checks_section::LogPeek::Loading);
+                let workdir = self.repo.workdir().to_path_buf();
+                self._check_log_task = Some(cx.spawn(async move |this, cx| {
+                    let log = GithubForge.check_log(&workdir, &link).await;
+                    let _ = this.update(cx, |panel, cx| {
+                        let peek = match log {
+                            Some(text) => checks_section::LogPeek::Ready(text),
+                            None => checks_section::LogPeek::Unavailable,
+                        };
+                        panel.checks.logs.insert(name, peek);
+                        cx.notify();
+                    });
+                }));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Bundle the failing checks' logs into one markdown prompt and send it to
+    /// the workspace's active agent via `SendTextToActiveAgent`. Fetches any
+    /// missing logs off-thread first, so it's async end-to-end; the `fixing`
+    /// latch suppresses re-entry while a bundle is being assembled.
+    fn fix_failing_checks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.checks.fixing {
+            return;
+        }
+        let failing: Vec<(String, String)> = self
+            .ci_checks
+            .iter()
+            .filter(|c| c.bucket == "fail")
+            .map(|c| (c.name.clone(), c.link.clone()))
+            .collect();
+        if failing.is_empty() {
+            return;
+        }
+        let workdir = self.repo.workdir().to_path_buf();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let mut sections = Vec::with_capacity(failing.len());
+                    for (name, link) in failing {
+                        let log = if link.is_empty() {
+                            None
+                        } else {
+                            GithubForge.check_log(&workdir, &link).await
+                        };
+                        sections.push((name, log));
+                    }
+                    let _ = tx.send(checks_section::format_fix_prompt(&sections));
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "oximux_app::source_control",
+                    "fix_failing_checks: no tokio runtime entered; skipping",
+                );
+                return;
+            }
+        }
+        self.checks.fixing = true;
+        cx.notify();
+        self._fix_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let prompt = rx.await.unwrap_or_default();
+            let _ = this.update(cx, |panel, cx| {
+                panel.checks.fixing = false;
+                cx.notify();
+            });
+            if !prompt.is_empty() {
+                let _ = cx.update(|window, app| {
+                    window.dispatch_action(Box::new(SendTextToActiveAgent { text: prompt }), app);
+                });
+            }
+        }));
+    }
+
+    /// Force the next poll tick to re-check PR/CI status (bypassing the 30s
+    /// throttle) and drop stale checks view-state.
+    fn refresh_checks(&mut self, cx: &mut Context<Self>) {
+        self.pr_status_checked_at = None;
+        // Cancel any in-flight log fetch / fix bundle so a stale dispatch can't
+        // land after the user asked for a fresh check.
+        self._check_log_task = None;
+        self._fix_task = None;
+        self.checks.reset();
+        cx.notify();
     }
 
     fn start_state_observer(
@@ -889,22 +1013,18 @@ impl Render for SourceControlPanel {
             }))
         };
 
-        // Compact CI-checks row for the branch's open PR. `ci_checks` is
-        // refreshed by the state observer (only while a PR exists), so this is
-        // a pure render; it collapses to nothing when there are no checks.
-        let ci_row: Option<AnyElement> =
-            ci_status::render_ci_row(
-                ci_status::CheckSummary::from_runs(&self.ci_checks),
-                theme,
-                &self.typography,
-            )
-            .map(|row| {
-                div()
-                    .px(px(self.density.pad_panel))
-                    .pb(px(self.density.gap_inline))
-                    .child(row)
-                    .into_any_element()
-            });
+        // Interactive CI-checks section for the branch's open PR. `ci_checks`
+        // is refreshed by the state observer (only while a PR exists); this
+        // render reads it plus the checks view-state (expanded check, fetched
+        // logs). Collapses to nothing when there are no checks.
+        let checks_row: Option<AnyElement> = checks_section::render_checks_section(
+            &self.ci_checks,
+            &self.checks,
+            theme,
+            self.density,
+            &self.typography,
+            cx.weak_entity(),
+        );
 
         // Filter wiring: helper `filter_files` is unit-tested in
         // `crates/app/tests/sc_filter.rs`; the changed-files list itself does
@@ -980,7 +1100,7 @@ impl Render for SourceControlPanel {
             .children(conflict_card)
             .children(operation_banner)
             .children(commit_area_render)
-            .children(ci_row)
+            .children(checks_row)
             .child(files_block)
             // Stash list docked above the graph (or at the very bottom
             // when the scope hides the graph). Always-mounted entity;
@@ -1075,12 +1195,18 @@ async fn refresh_pr_status(
     };
     let _ = this.update(cx, |panel, cx| {
         panel.pr_status_checked_at = Some(std::time::Instant::now());
-        let changed = panel.is_github_remote != is_github
-            || panel.has_open_pr != has_pr
-            || panel.ci_checks != checks;
+        let checks_changed = panel.ci_checks != checks;
+        let changed =
+            panel.is_github_remote != is_github || panel.has_open_pr != has_pr || checks_changed;
         if changed {
             panel.is_github_remote = is_github;
             panel.has_open_pr = has_pr;
+            if checks_changed {
+                // The check set moved (new run, status flip, PR closed) — drop
+                // the expanded/log view-state so a stale log can't linger under
+                // a now-different check.
+                panel.checks.reset();
+            }
             panel.ci_checks = checks;
             cx.notify();
         }

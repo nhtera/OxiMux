@@ -1,14 +1,12 @@
-//! Compact CI-checks summary row for the Source Control panel.
+//! CI-checks tallies for the Source Control panel.
 //!
-//! Renders a single line — "CI passing/running/failing  ✓N ✗N ●N" — derived
-//! from the PR's `gh pr checks` runs. The check runs are fetched (and the row
-//! refreshed) by the panel's state observer on the same ~30s throttle as the
-//! PR status, so there is no dedicated poll task here: this module is pure
-//! summary + render, the panel owns the data + cadence.
+//! `CheckSummary` reduces a PR's `gh pr checks` runs into pass / fail / pending
+//! / other counts and a worst-first headline. The check runs are fetched by the
+//! panel's state observer on the same ~30s throttle as the PR status; this
+//! module is pure summary, the panel owns the data + cadence and the
+//! `checks_section` module renders it.
 
-use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use crate::shell::forge::CheckRun;
-use oximux_settings::{Theme, Typography};
 
 /// Pass / fail / pending tallies derived from a PR's check runs. `other`
 /// absorbs gh's `skipping` and `cancel` buckets (and anything unrecognized)
@@ -57,61 +55,6 @@ impl CheckSummary {
             "CI passing"
         }
     }
-}
-
-/// Render the compact CI row, or `None` when there are no checks to show (no
-/// PR, or a PR with zero check runs) so the panel doesn't reserve dead space.
-pub fn render_ci_row(
-    summary: CheckSummary,
-    theme: Theme,
-    typography: &Typography,
-) -> Option<AnyElement> {
-    if !summary.is_renderable() {
-        return None;
-    }
-    let headline_color = if summary.fail > 0 {
-        theme.status_error
-    } else if summary.pending > 0 {
-        theme.status_warning
-    } else {
-        theme.status_ok
-    };
-
-    // Build the "✓N ✗N ●N" tallies, omitting any zero bucket.
-    let mut counts = div().flex().flex_row().items_center().gap(px(8.0));
-    if summary.pass > 0 {
-        counts = counts.child(
-            div()
-                .text_color(theme.status_ok)
-                .child(format!("✓{}", summary.pass)),
-        );
-    }
-    if summary.fail > 0 {
-        counts = counts.child(
-            div()
-                .text_color(theme.status_error)
-                .child(format!("✗{}", summary.fail)),
-        );
-    }
-    if summary.pending > 0 {
-        counts = counts.child(
-            div()
-                .text_color(theme.status_warning)
-                .child(format!("●{}", summary.pending)),
-        );
-    }
-
-    Some(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .text_size(px(typography.t_sub_label))
-            .child(div().text_color(headline_color).child(summary.headline()))
-            .child(counts)
-            .into_any_element(),
-    )
 }
 
 #[cfg(test)]
