@@ -49,4 +49,10 @@ pub trait ForgeProvider {
     /// Create a PR for the current branch, title + body filled from the
     /// branch's commits. Returns the PR URL on success.
     async fn create_pr(&self, cwd: &Path) -> Result<String>;
+
+    /// Peek at the failed-job log for one check run, identified by its web
+    /// `link`. `None` when the check has no associated run log (an external
+    /// status context with no run id, a run with no failed jobs, or the forge
+    /// CLI is unavailable).
+    async fn check_log(&self, cwd: &Path, link: &str) -> Option<String>;
 }

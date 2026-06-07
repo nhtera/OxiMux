@@ -196,23 +196,38 @@ pub async fn pr_create(cwd: impl AsRef<Path>) -> Result<String> {
 /// `bucket` is gh's coarse category — one of `pass`, `fail`, `pending`,
 /// `skipping`, `cancel` — which is exactly the granularity the compact CI row
 /// needs (the per-provider `state` strings vary too much to switch on).
+///
+/// `link` is the web URL of the run (used to open in a browser and to extract
+/// the run id for a log peek); `description` is gh's short human blurb (e.g.
+/// "Successful in 2m"). Both are `#[serde(default)]` so older / partial JSON
+/// still parses.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CheckRun {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
+    pub link: String,
+    #[serde(default)]
+    pub description: String,
 }
 
+/// Cap a check-run log peek so a multi-megabyte CI log can't blow the prompt
+/// budget or the panel. The tail is the most useful part of a failure log
+/// (the error + stack), so callers keep the trailing bytes.
+pub const CHECK_LOG_BYTE_BUDGET: usize = 16_000;
+
 /// Fetch the CI check runs for the current branch's PR via
-/// `gh pr checks --json name,bucket`. Returns an empty list (never an error)
-/// when there is no PR, no checks, `gh` is absent/unauthenticated, or the JSON
-/// can't be parsed — the CI row simply doesn't render in those cases. NB: `gh
-/// pr checks` exits non-zero when checks are pending/failing, so the JSON is
-/// parsed from stdout regardless of exit code.
+/// `gh pr checks --json name,bucket,link,description`. Returns an empty list
+/// (never an error) when there is no PR, no checks, `gh` is
+/// absent/unauthenticated, or the JSON can't be parsed — the CI row simply
+/// doesn't render in those cases. NB: `gh pr checks` exits non-zero when checks
+/// are pending/failing, so the JSON is parsed from stdout regardless of exit
+/// code.
 pub async fn pr_checks(cwd: impl AsRef<Path>) -> Vec<CheckRun> {
     let Ok((_ok, stdout, _stderr)) = GhCmd::new(cwd)
-        .args(["pr", "checks", "--json", "name,bucket"])
+        .args(["pr", "checks", "--json", "name,bucket,link,description"])
         // Shorter than the default: this runs on the SCM poll path right after
         // has_open_pr, so cap the sequential worst case rather than stacking two
         // 30s timeouts behind git-status updates.
@@ -223,6 +238,56 @@ pub async fn pr_checks(cwd: impl AsRef<Path>) -> Vec<CheckRun> {
         return Vec::new();
     };
     serde_json::from_str::<Vec<CheckRun>>(stdout.trim()).unwrap_or_default()
+}
+
+/// Extract the workflow-run id from a check run's `link` URL. GitHub Actions
+/// check links look like `https://github.com/o/r/actions/runs/<id>/job/<job>`;
+/// the `runs/<id>` segment is what `gh run view` needs. Returns `None` for
+/// non-Actions checks (external status contexts) whose links carry no run id.
+pub fn run_id_from_link(link: &str) -> Option<u64> {
+    let after = link.split("/runs/").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Fetch the failed-job log for one workflow run via
+/// `gh run view <run_id> --log-failed`, returning the trailing
+/// [`CHECK_LOG_BYTE_BUDGET`] bytes (the tail holds the actual error). Returns
+/// `None` when `gh` is absent, the run has no failed jobs, or the call times
+/// out — the caller then shows a "no log available" state rather than an error.
+pub async fn run_log(cwd: impl AsRef<Path>, run_id: u64) -> Option<String> {
+    let (ok, stdout, _stderr) = GhCmd::new(cwd)
+        .args(["run", "view", &run_id.to_string(), "--log-failed"])
+        .timeout(Duration::from_secs(20))
+        .run_raw()
+        .await
+        .ok()?;
+    // `gh run view --log-failed` exits non-zero when the run had failures —
+    // which is exactly when the log is worth showing — so the log is read from
+    // stdout regardless of exit code. Only a non-zero exit with *no* output
+    // (e.g. bad run id, no failed jobs) counts as "nothing to show".
+    if !ok && stdout.trim().is_empty() {
+        return None;
+    }
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(tail_bytes(trimmed, CHECK_LOG_BYTE_BUDGET))
+}
+
+/// Keep the last `budget` bytes of `s`, walking forward to a char boundary so
+/// the slice never splits a multi-byte codepoint. Prepends an elision marker
+/// when truncation happened.
+fn tail_bytes(s: &str, budget: usize) -> String {
+    if s.len() <= budget {
+        return s.to_string();
+    }
+    let mut start = s.len() - budget;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…(earlier log lines omitted)\n{}", &s[start..])
 }
 
 #[cfg(test)]
@@ -243,6 +308,61 @@ mod tests {
         let json = r#"[{"name":"lint","bucket":"pending","link":"http://x","extra":1}]"#;
         let runs: Vec<CheckRun> = serde_json::from_str(json).unwrap();
         assert_eq!(runs[0].bucket, "pending");
+        assert_eq!(runs[0].link, "http://x");
+    }
+
+    #[test]
+    fn checks_json_parses_link_and_description() {
+        let json = r#"[{"name":"build","bucket":"fail","link":"https://github.com/o/r/actions/runs/42/job/7","description":"Failing after 1m"}]"#;
+        let runs: Vec<CheckRun> = serde_json::from_str(json).unwrap();
+        assert_eq!(runs[0].description, "Failing after 1m");
+        assert!(runs[0].link.contains("/runs/42/"));
+    }
+
+    #[test]
+    fn run_id_parses_from_actions_link() {
+        assert_eq!(
+            run_id_from_link("https://github.com/o/r/actions/runs/123456/job/789"),
+            Some(123456)
+        );
+        assert_eq!(
+            run_id_from_link("https://github.com/o/r/actions/runs/42"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn run_id_none_for_non_actions_link() {
+        assert_eq!(run_id_from_link("https://example.com/status/build"), None);
+        assert_eq!(run_id_from_link(""), None);
+        // Malformed-but-plausible: `/runs/` present but no parseable id.
+        assert_eq!(run_id_from_link("https://github.com/o/r/actions/runs/"), None);
+        assert_eq!(
+            run_id_from_link("https://github.com/o/r/actions/runs/abc/job/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn tail_bytes_keeps_trailing_within_budget() {
+        assert_eq!(tail_bytes("short", 100), "short");
+    }
+
+    #[test]
+    fn tail_bytes_truncates_to_tail_with_marker() {
+        let s = "A".repeat(50);
+        let out = tail_bytes(&s, 10);
+        assert!(out.contains("omitted"));
+        assert!(out.ends_with(&"A".repeat(10)));
+    }
+
+    #[test]
+    fn tail_bytes_respects_utf8_boundary() {
+        // Each 'é' is 2 bytes; an odd budget must not split a codepoint.
+        let s = "é".repeat(100);
+        let out = tail_bytes(&s, 51);
+        // Must be valid UTF-8 (no panic on slicing) and carry the marker.
+        assert!(out.contains("omitted"));
     }
 
     #[test]

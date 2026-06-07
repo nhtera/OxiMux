@@ -122,6 +122,8 @@ mod tests {
         CheckRun {
             name: "c".into(),
             bucket: bucket.into(),
+            link: String::new(),
+            description: String::new(),
         }
     }
 

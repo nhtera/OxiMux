@@ -34,4 +34,9 @@ impl ForgeProvider for GithubForge {
     async fn create_pr(&self, cwd: &Path) -> Result<String> {
         gh::pr_create(cwd).await
     }
+
+    async fn check_log(&self, cwd: &Path, link: &str) -> Option<String> {
+        let run_id = gh::run_id_from_link(link)?;
+        gh::run_log(cwd, run_id).await
+    }
 }
