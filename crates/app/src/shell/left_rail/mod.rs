@@ -45,10 +45,12 @@ use crate::shell::left_rail::workspace_row::DiffCounts;
 use crate::left_rail_layout;
 
 use crate::actions::OpenProjectPicker;
+use crate::shell::agents_dashboard::model::attention_rank;
 use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
 use crate::shell::left_rail::toolbar::render_toolbar;
+use crate::shell::left_rail::workspace_list_render::{WorkspaceSortMode, sort_workspaces};
 use crate::workspace_root::WorkspaceRoot;
 
 const HEADER_ICON_SIZE: f32 = 14.0;
@@ -92,6 +94,9 @@ pub struct LeftRail {
     /// Project ids whose group is collapsed (workspace rows hidden).
     /// Persisted to settings so the collapsed view survives restart.
     collapsed: HashSet<String>,
+    /// How workspace rows are ordered within each project group. Persisted
+    /// so the choice survives restart.
+    sort_mode: WorkspaceSortMode,
     /// Scroll position for the agents dashboard `uniform_list`. Stored on
     /// `LeftRail` so it survives re-renders while the Agents nav is active.
     agents_scroll: UniformListScrollHandle,
@@ -118,6 +123,7 @@ impl LeftRail {
             width: px(density.w_left_rail),
             settings_repo: None,
             collapsed: HashSet::new(),
+            sort_mode: WorkspaceSortMode::default(),
             agents_scroll: UniformListScrollHandle::new(),
         }
     }
@@ -131,7 +137,24 @@ impl LeftRail {
         self.collapsed = left_rail_layout::load_collapsed_projects(&settings_repo)
             .into_iter()
             .collect();
+        self.sort_mode = left_rail_layout::load_sort_mode(&settings_repo);
         self.settings_repo = Some(settings_repo);
+    }
+
+    /// Current workspace sort mode. Test-only inspector.
+    #[doc(hidden)]
+    pub fn sort_mode(&self) -> WorkspaceSortMode {
+        self.sort_mode
+    }
+
+    /// Advance to the next sort mode (Smart → Recent → Manual → Smart),
+    /// persist it, and re-render.
+    pub(crate) fn cycle_sort_mode(&mut self, cx: &mut Context<Self>) {
+        self.sort_mode = self.sort_mode.next();
+        if let Some(repo) = &self.settings_repo {
+            left_rail_layout::save_sort_mode(repo, self.sort_mode);
+        }
+        cx.notify();
     }
 
     /// Collapse all groups, or expand all if every group is already
@@ -247,6 +270,7 @@ impl Render for LeftRail {
                 self.active_project_id.clone(),
                 self.active_workspace_id.clone(),
                 self.collapsed.clone(),
+                self.sort_mode,
                 entity.clone(),
                 self.workspaces_by_project.clone(),
                 self.latest_status.clone(),
@@ -262,7 +286,13 @@ impl Render for LeftRail {
                 .flex_col()
                 .h_full()
                 .w_full()
-                .child(workspace_header(&entity, theme, density, &typography))
+                .child(workspace_header(
+                    &entity,
+                    self.sort_mode,
+                    theme,
+                    density,
+                    &typography,
+                ))
                 .child(div().flex_1().w_full().child(workspace_list))
                 .into_any_element()
         };
@@ -304,6 +334,7 @@ fn render_workspace_list(
     active_project_id: Option<String>,
     active_workspace_id: Option<String>,
     collapsed: HashSet<String>,
+    sort_mode: WorkspaceSortMode,
     rail: gpui::Entity<LeftRail>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
@@ -324,6 +355,13 @@ fn render_workspace_list(
             .get(&project.id)
             .cloned()
             .unwrap_or_default();
+        // Order rows per the active sort mode. The attention tier reuses the
+        // same ranking the agents dashboard uses, so both surfaces agree on
+        // what "needs attention" means.
+        let workspaces = sort_workspaces(&workspaces, &project.root_path, sort_mode, |ws| {
+            let status = latest_status.get(&ws.id).cloned().flatten();
+            attention_rank(status.as_ref(), live_worktrees.contains(&ws.worktree_path))
+        });
         let is_active = active_project_id.as_deref() == Some(project.id.as_str());
         let is_collapsed = collapsed.contains(&project.id);
         let plan = build_project_group_plan(&project, &workspaces, is_active, is_collapsed);
@@ -398,6 +436,7 @@ fn divider(theme: Theme) -> impl IntoElement {
 
 fn workspace_header(
     rail: &gpui::Entity<LeftRail>,
+    sort_mode: WorkspaceSortMode,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -411,7 +450,7 @@ fn workspace_header(
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .child(
-            // "Projects" header label — matches the reference UX's section title.
+            // Section title.
             div()
                 .flex_1()
                 .text_size(px(typography.t_body_sm))
@@ -419,10 +458,40 @@ fn workspace_header(
                 .text_color(theme.fg_muted)
                 .child("Projects"),
         )
+        .child(sort_mode_chip(rail.clone(), sort_mode, theme, density, typography))
         .child(collapse_all_icon(rail.clone(), theme))
 }
 
-/// Collapse/expand-all toggle. Mirrors the reference UX's section-header control.
+/// Sort-order toggle. A compact text chip showing the active mode; clicking
+/// cycles Smart → Recent → Manual and persists the choice.
+fn sort_mode_chip(
+    rail: gpui::Entity<LeftRail>,
+    sort_mode: WorkspaceSortMode,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    div()
+        .id("workspaces-header-sort")
+        .px(px(6.0))
+        .py(px(1.0))
+        .rounded(px(density.r_xs))
+        .cursor_pointer()
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.fg_subtle)
+        .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+        .tooltip(|window, cx| {
+            gpui_component::tooltip::Tooltip::new("Sort: Smart → Recent → Manual")
+                .build(window, cx)
+        })
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
+            rail.update(cx, |r, cx| r.cycle_sort_mode(cx));
+        })
+        .child(sort_mode.label())
+}
+
+/// Collapse/expand-all toggle: one click collapses every project group, or
+/// expands all when they are already collapsed.
 fn collapse_all_icon(rail: gpui::Entity<LeftRail>, theme: Theme) -> impl IntoElement {
     div()
         .id("workspaces-header-collapse")

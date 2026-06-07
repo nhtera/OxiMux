@@ -10,6 +10,8 @@
 
 use oximux_storage::SettingsRepo;
 
+use crate::shell::left_rail::workspace_list_render::WorkspaceSortMode;
+
 /// Settings key holding the left-rail width in pixels.
 pub const KEY_LEFT_RAIL_WIDTH: &str = "left_rail_width";
 
@@ -82,6 +84,29 @@ pub fn save_collapsed_projects(repo: &SettingsRepo, ids: &[String]) {
         tracing::warn!(
             target: "oximux_app::left_rail_layout",
             "failed to persist left_rail_collapsed_projects: {err}"
+        );
+    }
+}
+
+/// Settings key holding the workspace sort mode for the left rail.
+pub const KEY_LEFT_RAIL_SORT_MODE: &str = "left_rail_sort_mode";
+
+/// Load the persisted workspace sort mode. Missing / unknown / error →
+/// `WorkspaceSortMode::default()`.
+pub fn load_sort_mode(repo: &SettingsRepo) -> WorkspaceSortMode {
+    match repo.get(KEY_LEFT_RAIL_SORT_MODE) {
+        Ok(Some(s)) => WorkspaceSortMode::from_key(&s),
+        _ => WorkspaceSortMode::default(),
+    }
+}
+
+/// Persist the workspace sort mode. Error is logged and swallowed — a layout
+/// preference shouldn't take down the app.
+pub fn save_sort_mode(repo: &SettingsRepo, mode: WorkspaceSortMode) {
+    if let Err(err) = repo.set(KEY_LEFT_RAIL_SORT_MODE, mode.as_key()) {
+        tracing::warn!(
+            target: "oximux_app::left_rail_layout",
+            "failed to persist left_rail_sort_mode: {err}"
         );
     }
 }

@@ -5,11 +5,104 @@
 //! tokens that `render_workspace_row` paints. No GPUI runtime needed.
 
 use gpui::{Hsla, IntoElement, ParentElement, Styled, div, px, svg};
-use oximux_core::WorktreeInfo;
+use oximux_core::{Workspace, WorktreeInfo};
 use oximux_settings::{Density, Theme, Typography};
 
 const ROW_ICON_SIZE: f32 = 14.0;
 const ROW_HEIGHT_MULT: f32 = 1.4;
+
+/// How workspace rows within a project group are ordered.
+///
+/// The primary row (the repo-root worktree) is always pinned first in every
+/// mode — it's the project's anchor. The remaining worktree rows are ordered
+/// per the active mode. The choice is persisted across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceSortMode {
+    /// Attention-weighted: workspaces needing action (approval / waiting) or
+    /// running float above idle / finished ones. Stable within a tier.
+    #[default]
+    Smart,
+    /// Most recently created first.
+    Recent,
+    /// Insertion order as stored — no reordering.
+    Manual,
+}
+
+impl WorkspaceSortMode {
+    /// Short label shown on the header toggle chip.
+    pub fn label(self) -> &'static str {
+        match self {
+            WorkspaceSortMode::Smart => "Smart",
+            WorkspaceSortMode::Recent => "Recent",
+            WorkspaceSortMode::Manual => "Manual",
+        }
+    }
+
+    /// Stable persistence key.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            WorkspaceSortMode::Smart => "smart",
+            WorkspaceSortMode::Recent => "recent",
+            WorkspaceSortMode::Manual => "manual",
+        }
+    }
+
+    /// Parse a persisted key; unknown / missing values fall back to default.
+    pub fn from_key(raw: &str) -> WorkspaceSortMode {
+        match raw.trim() {
+            "recent" => WorkspaceSortMode::Recent,
+            "manual" => WorkspaceSortMode::Manual,
+            _ => WorkspaceSortMode::Smart,
+        }
+    }
+
+    /// Next mode in the cycle: Smart → Recent → Manual → Smart.
+    pub fn next(self) -> WorkspaceSortMode {
+        match self {
+            WorkspaceSortMode::Smart => WorkspaceSortMode::Recent,
+            WorkspaceSortMode::Recent => WorkspaceSortMode::Manual,
+            WorkspaceSortMode::Manual => WorkspaceSortMode::Smart,
+        }
+    }
+}
+
+/// Order one project group's workspace rows for display.
+///
+/// The primary row (`worktree_path == project_root`) is pinned first; the
+/// remaining rows are sorted per `mode`. `attention_for` resolves a row's
+/// attention tier (lower = higher priority) — injected so this stays pure and
+/// free of the status / live-worktree maps. Sorts are stable, so equal-tier /
+/// equal-timestamp rows keep their input order.
+///
+/// Partition contract: if no row matches `project_root`, all rows fall into
+/// the sorted tail. If several rows match (not expected — the synthesized
+/// primary is unique), all are pinned first in their input order.
+pub fn sort_workspaces(
+    workspaces: &[Workspace],
+    project_root: &str,
+    mode: WorkspaceSortMode,
+    attention_for: impl Fn(&Workspace) -> u8,
+) -> Vec<Workspace> {
+    if mode == WorkspaceSortMode::Manual {
+        return workspaces.to_vec();
+    }
+
+    let (mut primary, mut rest): (Vec<Workspace>, Vec<Workspace>) = workspaces
+        .iter()
+        .cloned()
+        .partition(|ws| ws.worktree_path == project_root);
+
+    match mode {
+        // Stable sort by ascending attention tier floats action-needing rows up.
+        WorkspaceSortMode::Smart => rest.sort_by_key(|ws| attention_for(ws)),
+        // created_at is an RFC3339 UTC string; lexicographic desc = newest first.
+        WorkspaceSortMode::Recent => rest.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+        WorkspaceSortMode::Manual => unreachable!("handled by early return"),
+    }
+
+    primary.extend(rest);
+    primary
+}
 
 /// Visual tokens for one workspace row. Pure, testable.
 #[derive(Debug, Clone, PartialEq)]
@@ -228,5 +321,102 @@ mod tests {
         info.path = std::path::PathBuf::from("/tmp/oximux/");
         let plan = build_workspace_row_plan(&info, false, t);
         assert_eq!(plan.name, "oximux");
+    }
+
+    // `created_at` literals use the `+00:00` offset suffix to match what the
+    // storage layer actually writes (`Utc::now().to_rfc3339()`), so the
+    // Recent-sort comparison is exercised against the real value domain.
+    fn ws(id: &str, worktree_path: &str, created_at: &str) -> Workspace {
+        Workspace {
+            id: id.to_string(),
+            project_id: "p1".to_string(),
+            name: id.to_string(),
+            slug: id.to_string(),
+            branch: format!("oximux/{id}"),
+            worktree_path: worktree_path.to_string(),
+            status: "active".to_string(),
+            created_at: created_at.to_string(),
+            archived_at: None,
+        }
+    }
+
+    #[test]
+    fn sort_mode_round_trips_through_key() {
+        for mode in [
+            WorkspaceSortMode::Smart,
+            WorkspaceSortMode::Recent,
+            WorkspaceSortMode::Manual,
+        ] {
+            assert_eq!(WorkspaceSortMode::from_key(mode.as_key()), mode);
+        }
+    }
+
+    #[test]
+    fn sort_mode_unknown_key_falls_back_to_default() {
+        assert_eq!(WorkspaceSortMode::from_key("bogus"), WorkspaceSortMode::Smart);
+        assert_eq!(WorkspaceSortMode::default(), WorkspaceSortMode::Smart);
+    }
+
+    #[test]
+    fn sort_mode_cycle_wraps() {
+        assert_eq!(WorkspaceSortMode::Smart.next(), WorkspaceSortMode::Recent);
+        assert_eq!(WorkspaceSortMode::Recent.next(), WorkspaceSortMode::Manual);
+        assert_eq!(WorkspaceSortMode::Manual.next(), WorkspaceSortMode::Smart);
+    }
+
+    #[test]
+    fn manual_sort_preserves_input_order() {
+        let root = "/tmp/p1";
+        let list = vec![
+            ws("primary", root, "2026-01-01T00:00:00+00:00"),
+            ws("b", "/tmp/p1/b", "2026-03-01T00:00:00+00:00"),
+            ws("a", "/tmp/p1/a", "2026-02-01T00:00:00+00:00"),
+        ];
+        let out = sort_workspaces(&list, root, WorkspaceSortMode::Manual, |_| 0);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["primary", "b", "a"]);
+    }
+
+    #[test]
+    fn smart_sort_pins_primary_then_floats_by_attention() {
+        let root = "/tmp/p1";
+        let list = vec![
+            ws("primary", root, "2026-01-01T00:00:00+00:00"),
+            ws("idle", "/tmp/p1/idle", "2026-02-01T00:00:00+00:00"),
+            ws("needs", "/tmp/p1/needs", "2026-03-01T00:00:00+00:00"),
+        ];
+        // Tier 0 for "needs", tier 2 for everything else.
+        let attention = |w: &Workspace| if w.id == "needs" { 0 } else { 2 };
+        let out = sort_workspaces(&list, root, WorkspaceSortMode::Smart, attention);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        // Primary stays first; "needs" floats above "idle".
+        assert_eq!(ids, ["primary", "needs", "idle"]);
+    }
+
+    #[test]
+    fn recent_sort_pins_primary_then_newest_first() {
+        let root = "/tmp/p1";
+        let list = vec![
+            ws("primary", root, "2026-01-01T00:00:00+00:00"),
+            ws("old", "/tmp/p1/old", "2026-02-01T00:00:00+00:00"),
+            ws("new", "/tmp/p1/new", "2026-05-01T00:00:00+00:00"),
+        ];
+        let out = sort_workspaces(&list, root, WorkspaceSortMode::Recent, |_| 0);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["primary", "new", "old"]);
+    }
+
+    #[test]
+    fn smart_sort_without_primary_still_orders_rest() {
+        // Defensive: if no row matches the root, all are treated as rest.
+        let root = "/tmp/p1";
+        let list = vec![
+            ws("idle", "/tmp/p1/idle", "2026-02-01T00:00:00+00:00"),
+            ws("needs", "/tmp/p1/needs", "2026-03-01T00:00:00+00:00"),
+        ];
+        let attention = |w: &Workspace| if w.id == "needs" { 0 } else { 2 };
+        let out = sort_workspaces(&list, root, WorkspaceSortMode::Smart, attention);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["needs", "idle"]);
     }
 }

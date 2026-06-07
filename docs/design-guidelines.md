@@ -151,6 +151,21 @@ The hover/selected distinction is the 1px outline: hover is the soft prelude;
 selected commits to a click. Active is reserved for "this is what you're focused
 on right now" — file tree's currently-open file is the canonical example.
 
+### Left-rail workspace ordering
+
+Workspace rows within a project group obey a persisted sort mode, cycled from a
+text chip in the "Projects" header (`r_xs` radius, `t_sub_label`, `fg_subtle` →
+`fg_base` on hover — no new tokens):
+
+- **Smart** (default): rows needing action (approval / waiting) and running
+  agents float to the top, reusing the same attention tiers as the agents
+  dashboard so both surfaces agree on priority. Stable within a tier.
+- **Recent**: newest workspace first.
+- **Manual**: stored insertion order, unchanged.
+
+The primary (repo-root) row is pinned first in every mode — it is the project's
+anchor; only the worktree tail reorders.
+
 ### Approved exceptions (documented locally; do not refactor without paired UX call)
 
 | Surface | Height | Reason |
