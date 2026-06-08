@@ -460,6 +460,12 @@ actions!(
         /// dispatches show/hide it (the PTY persists across hides). The card's
         /// close button tears the PTY down.
         ToggleFloatingTerminal,
+        /// Navigate BACK through the per-window workspace-activation history
+        /// (browser-style). Bound to Cmd+Alt+Left. No-op at the oldest entry.
+        NavWorkspaceBack,
+        /// Navigate FORWARD through the workspace-activation history. Bound to
+        /// Cmd+Alt+Right. No-op at the newest entry.
+        NavWorkspaceForward,
     ]
 );
 

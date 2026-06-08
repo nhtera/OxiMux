@@ -9,9 +9,9 @@ use oximux_editor::SaveFile;
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
     DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane, FocusPrevSubPane, MruNext,
-    MruPrev, NewAgent, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
-    OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab,
-    RefreshSourceControl, Search,
+    MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent, NewTab, NewWindow, NextTab,
+    OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenSettings,
+    OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl, Search,
     SelectExplorerTab, SelectSearchTab, SelectSourceControlTab, SendLastCommandOutputToAgent,
     SendTerminalSelectionToAgent, SplitSubPaneDown, SplitSubPaneRight, ToggleFloatingTerminal,
     ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
@@ -90,6 +90,10 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-s", SaveFile, None),
         // Escape dismisses any open transient overlay (handled at WorkspaceRoot).
         KeyBinding::new("escape", DismissOverlay, None),
+        // cmd-alt-left/right step back/forward through this window's
+        // workspace-activation history (browser-style).
+        KeyBinding::new("cmd-alt-left", NavWorkspaceBack, None),
+        KeyBinding::new("cmd-alt-right", NavWorkspaceForward, None),
         // Layout presets — ctrl-shift-1/2/3 are free of macOS system bindings.
         KeyBinding::new("ctrl-shift-1", ApplyLayoutStacked, None),
         KeyBinding::new("ctrl-shift-2", ApplyLayoutHorizontal, None),

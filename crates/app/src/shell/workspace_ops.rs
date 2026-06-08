@@ -31,6 +31,44 @@ use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
 
+/// A back/forward history entry: a workspace identified by its owning project
+/// id plus its workspace id. Refs (not full `Workspace` clones) so navigation
+/// re-resolves against the live store and a deleted workspace fails gracefully.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceNavRef {
+    pub project_id: String,
+    pub workspace_id: String,
+}
+
+/// Upper bound on the back/forward history depth per window. Oldest entries
+/// drop once exceeded.
+const MAX_NAV_HISTORY: usize = 64;
+
+/// Pure core of [`WorkspaceRoot::record_nav`]: applies browser-style
+/// truncate-forward, append, then cap on `history` at `cursor`, returning the
+/// new cursor. Dedupes against the current cursor entry (returns `cursor`
+/// unchanged). Pure so the history semantics are unit-testable without GPUI.
+fn push_nav_entry(
+    history: &mut Vec<WorkspaceNavRef>,
+    cursor: usize,
+    entry: WorkspaceNavRef,
+    max: usize,
+) -> usize {
+    if history.get(cursor) == Some(&entry) {
+        return cursor;
+    }
+    // Drop any forward history past the current cursor before appending.
+    if !history.is_empty() {
+        history.truncate(cursor + 1);
+    }
+    history.push(entry);
+    if history.len() > max {
+        let excess = history.len() - max;
+        history.drain(0..excess);
+    }
+    history.len() - 1
+}
+
 /// Build the Add-Project dialog entity. Wires the `on_pick` callback to
 /// route the chosen project through `WorkspaceRoot::set_active_project`.
 /// Lives here (not in `workspace_root.rs`) to keep that file under the
@@ -575,6 +613,7 @@ impl WorkspaceRoot {
         }
 
         self.active_workspace_id = Some(workspace.id.clone());
+        self.record_nav(&workspace.project_id, &workspace.id);
 
         let worktree_path = PathBuf::from(&workspace.worktree_path);
         if let Some(panes) = self.active_project_panes() {
@@ -722,6 +761,85 @@ impl WorkspaceRoot {
             tint: None,
         };
         self.activate_workspace(workspace, window, cx);
+    }
+
+    /// Record a workspace activation in this window's back/forward history.
+    /// Browser semantics: a fresh activation truncates any forward entries,
+    /// then appends. Skipped while replaying a back/forward step, and
+    /// deduped against the current cursor entry so re-activating the same
+    /// workspace doesn't grow the stack.
+    pub(crate) fn record_nav(&mut self, project_id: &str, workspace_id: &str) {
+        if self.nav_replaying {
+            return;
+        }
+        let entry = WorkspaceNavRef {
+            project_id: project_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+        };
+        self.nav_cursor =
+            push_nav_entry(&mut self.nav_history, self.nav_cursor, entry, MAX_NAV_HISTORY);
+    }
+
+    /// Step back one entry in the workspace-activation history. No-op at the
+    /// oldest entry. If the target entry is stale (workspace deleted), the
+    /// cursor is reverted so it stays anchored to the displayed workspace.
+    pub(crate) fn nav_workspace_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav_cursor == 0 {
+            return;
+        }
+        self.nav_cursor -= 1;
+        if !self.navigate_to_nav_cursor(window, cx) {
+            self.nav_cursor += 1;
+        }
+    }
+
+    /// Step forward one entry. No-op at the newest entry. Reverts the cursor on
+    /// a stale target (see `nav_workspace_back`).
+    pub(crate) fn nav_workspace_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav_cursor + 1 >= self.nav_history.len() {
+            return;
+        }
+        self.nav_cursor += 1;
+        if !self.navigate_to_nav_cursor(window, cx) {
+            self.nav_cursor -= 1;
+        }
+    }
+
+    /// Resolve the entry at the current cursor and activate it without
+    /// recording (the cursor already moved). Returns `true` when activation
+    /// happened, `false` when the entry is stale (workspace since deleted) so
+    /// the caller can revert the cursor and keep it anchored to the workspace
+    /// actually on screen.
+    fn navigate_to_nav_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(entry) = self.nav_history.get(self.nav_cursor).cloned() else {
+            return false;
+        };
+        let Some(workspace) = self.workspace_by_nav_ref(&entry) else {
+            tracing::info!(
+                project_id = %entry.project_id,
+                workspace_id = %entry.workspace_id,
+                "nav history entry no longer resolvable; skipping"
+            );
+            return false;
+        };
+        self.nav_replaying = true;
+        self.activate_workspace(workspace, window, cx);
+        self.nav_replaying = false;
+        true
+    }
+
+    /// Resolve a history ref to a live `Workspace`, including the synthesized
+    /// "primary" row. `None` when the project or workspace is gone.
+    fn workspace_by_nav_ref(&self, entry: &WorkspaceNavRef) -> Option<Workspace> {
+        let project = self
+            .app_state
+            .recent_projects
+            .iter()
+            .find(|p| p.id == entry.project_id)
+            .cloned()?;
+        self.workspaces_with_primary(&project)
+            .into_iter()
+            .find(|w| w.id == entry.workspace_id)
     }
 
     /// Close every full-window modal overlay. Callers invoke this before
@@ -1301,6 +1419,57 @@ impl WorkspaceRoot {
         ));
         self.confirm_dialog = Some(dialog);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod nav_history_tests {
+    use super::{WorkspaceNavRef, push_nav_entry};
+
+    fn r(id: &str) -> WorkspaceNavRef {
+        WorkspaceNavRef {
+            project_id: "p".to_string(),
+            workspace_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn append_advances_cursor() {
+        let mut h = Vec::new();
+        let c = push_nav_entry(&mut h, 0, r("a"), 64);
+        assert_eq!(c, 0);
+        let c = push_nav_entry(&mut h, c, r("b"), 64);
+        assert_eq!(c, 1);
+        assert_eq!(h, vec![r("a"), r("b")]);
+    }
+
+    #[test]
+    fn dedupes_current_entry() {
+        let mut h = vec![r("a"), r("b")];
+        let c = push_nav_entry(&mut h, 1, r("b"), 64);
+        assert_eq!(c, 1);
+        assert_eq!(h, vec![r("a"), r("b")]);
+    }
+
+    #[test]
+    fn truncates_forward_on_new_activation() {
+        // At cursor 0 of [a,b,c], activating d discards the forward b,c.
+        let mut h = vec![r("a"), r("b"), r("c")];
+        let c = push_nav_entry(&mut h, 0, r("d"), 64);
+        assert_eq!(c, 1);
+        assert_eq!(h, vec![r("a"), r("d")]);
+    }
+
+    #[test]
+    fn caps_at_max_dropping_oldest() {
+        let mut h = Vec::new();
+        let mut c = 0;
+        for i in 0..5 {
+            c = push_nav_entry(&mut h, c, r(&i.to_string()), 3);
+        }
+        // Only the 3 newest survive; cursor pins to the last.
+        assert_eq!(h, vec![r("2"), r("3"), r("4")]);
+        assert_eq!(c, 2);
     }
 }
 

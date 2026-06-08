@@ -108,7 +108,7 @@ use crate::shell::{
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS},
     top_bar,
     workspace_dialog::{OnSubmit as OnWorkspaceSubmit, WorkspaceDialog},
-    workspace_ops::build_add_project_dialog,
+    workspace_ops::{WorkspaceNavRef, build_add_project_dialog},
 };
 use std::rc::Rc;
 
@@ -211,6 +211,17 @@ pub struct WorkspaceRoot {
     /// active-row highlight. `None` until the user clicks a workspace.
     /// Window-local UI selection, not persisted.
     pub(crate) active_workspace_id: Option<String>,
+    /// Browser-style back/forward history of workspace activations for this
+    /// window (Cmd+Alt+←/→). Entries are `(project_id, workspace_id)` refs
+    /// re-resolved on navigation so a deleted workspace fails gracefully.
+    pub(crate) nav_history: Vec<WorkspaceNavRef>,
+    /// Index into `nav_history` of the current position. Back decrements,
+    /// forward increments; a fresh activation truncates everything after it.
+    pub(crate) nav_cursor: usize,
+    /// Set while a back/forward navigation is replaying so the resulting
+    /// `activate_workspace` doesn't record a new history entry (which would
+    /// corrupt the stack).
+    pub(crate) nav_replaying: bool,
     /// Sidebar Rename/Archive/Delete popover (mounted at root for full-window backdrop).
     pub(crate) row_menu: Entity<WorkspaceRowMenu>,
     /// Sidebar per-project-header action popover (Reveal/Copy/Remove).
@@ -699,6 +710,9 @@ impl WorkspaceRoot {
             rename_tab_dialog: None,
             active_project: None,
             active_workspace_id: None,
+            nav_history: Vec::new(),
+            nav_cursor: 0,
+            nav_replaying: false,
             row_menu,
             project_menu,
             add_project_dialog,
@@ -2167,6 +2181,16 @@ impl Render for WorkspaceRoot {
                         window,
                         cx,
                     );
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::NavWorkspaceBack, window, cx| {
+                    this.nav_workspace_back(window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::NavWorkspaceForward, window, cx| {
+                    this.nav_workspace_forward(window, cx);
                 },
             ))
             .on_action(cx.listener(|this, _: &crate::actions::ReloadCustomCommands, _window, cx| {
