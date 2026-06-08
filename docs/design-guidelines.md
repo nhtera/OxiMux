@@ -329,7 +329,9 @@ contract holds.
   contrasting ring.
 - **Appearance allowlist (accent only, ≤2px, never a fill or text background):**
   - ✅ the workspace's left-rail row — a 2px left-edge bar.
-  - ✅ (planned) that workspace's active tab-strip edge.
+  - ✅ the active workspace's tab-strip — the active tab's top edge takes the
+    tint (replacing the focus-ring blue); workspace-level, so every group's
+    active tab in a split wears it.
   - 🚫 no full-panel washes, no tinted backgrounds, no tinted text.
 - Contrast: the swatch is a theme-independent hex used only as a thin accent, so
   it never fights the charcoal surfaces or the single status-accent layer.
