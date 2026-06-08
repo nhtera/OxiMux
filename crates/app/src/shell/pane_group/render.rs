@@ -57,27 +57,37 @@ impl Render for PaneGroup {
         self.ensure_mru_focus_out_sub(window, cx);
 
         // Push on-screen state down to every TerminalView so hidden tabs can
-        // throttle their PTY poll. A view is visible only when it's a per-leaf
-        // active view in THIS group's active tab; every other view (other
-        // tabs, background leaf sub-tabs) is hidden. `set_visible` is a no-op
-        // when unchanged, so this is cheap on a steady frame.
-        for (t, tab) in self.tabs.iter().enumerate() {
-            let PaneContent::Terminal(tree) = &tab.content else {
-                continue;
-            };
-            let visible_ids: std::collections::HashSet<gpui::EntityId> = if t != self.active {
-                std::collections::HashSet::new()
-            } else if let Some(zoomed) = tree.zoomed() {
-                // A zoomed leaf fills the body; the other split leaves are
-                // off-screen, so only the zoomed view is visible.
-                tree.get(zoomed).map(|v| v.entity_id()).into_iter().collect()
-            } else {
-                tree.iter_live().map(|(_, v)| v.entity_id()).collect()
-            };
-            for (_, _, view) in tree.iter_all_views() {
-                let visible = visible_ids.contains(&view.entity_id());
-                view.update(cx, |v, vcx| v.set_visible(visible, vcx));
+        // throttle their PTY poll. The shown set = the per-leaf active views of
+        // THIS group's active tab (or just the zoomed leaf when one is zoomed);
+        // every other view is hidden. Computing that set is cheap (a few
+        // leaves); the per-view sweep only runs when the shown set actually
+        // changes (tab/leaf-tab switch, split, zoom) — not on every
+        // steady-state PTY-output frame.
+        let desired: std::collections::HashSet<gpui::EntityId> = match self
+            .tabs
+            .get(self.active)
+            .map(|tab| &tab.content)
+        {
+            Some(PaneContent::Terminal(tree)) => {
+                if let Some(zoomed) = tree.zoomed() {
+                    tree.get(zoomed).map(|v| v.entity_id()).into_iter().collect()
+                } else {
+                    tree.iter_live().map(|(_, v)| v.entity_id()).collect()
+                }
             }
+            _ => std::collections::HashSet::new(),
+        };
+        if desired != self.last_visible_ids {
+            for tab in self.tabs.iter() {
+                let PaneContent::Terminal(tree) = &tab.content else {
+                    continue;
+                };
+                for (_, _, view) in tree.iter_all_views() {
+                    let visible = desired.contains(&view.entity_id());
+                    view.update(cx, |v, vcx| v.set_visible(visible, vcx));
+                }
+            }
+            self.last_visible_ids = desired;
         }
 
         let entity = cx.entity().clone();

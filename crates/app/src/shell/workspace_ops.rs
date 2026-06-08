@@ -69,6 +69,34 @@ fn push_nav_entry(
     history.len() - 1
 }
 
+/// Walk indices from `cursor` in the chosen direction, returning the first one
+/// for which `live(idx)` holds (skipping stale entries), or `None` at the
+/// boundary. Pure so the skip-stale traversal is unit-testable without GPUI.
+fn next_live_index(
+    len: usize,
+    cursor: usize,
+    forward: bool,
+    live: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let mut idx = cursor;
+    loop {
+        if forward {
+            if idx + 1 >= len {
+                return None;
+            }
+            idx += 1;
+        } else {
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+        }
+        if live(idx) {
+            return Some(idx);
+        }
+    }
+}
+
 /// Build the Add-Project dialog entity. Wires the `on_pick` callback to
 /// route the chosen project through `WorkspaceRoot::set_active_project`.
 /// Lives here (not in `workspace_root.rs`) to keep that file under the
@@ -784,48 +812,41 @@ impl WorkspaceRoot {
     /// oldest entry. If the target entry is stale (workspace deleted), the
     /// cursor is reverted so it stays anchored to the displayed workspace.
     pub(crate) fn nav_workspace_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.nav_cursor == 0 {
-            return;
-        }
-        self.nav_cursor -= 1;
-        if !self.navigate_to_nav_cursor(window, cx) {
-            self.nav_cursor += 1;
-        }
+        self.nav_step(false, window, cx);
     }
 
-    /// Step forward one entry. No-op at the newest entry. Reverts the cursor on
-    /// a stale target (see `nav_workspace_back`).
+    /// Step forward to the next live entry. No-op at the newest live entry.
     pub(crate) fn nav_workspace_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.nav_cursor + 1 >= self.nav_history.len() {
-            return;
-        }
-        self.nav_cursor += 1;
-        if !self.navigate_to_nav_cursor(window, cx) {
-            self.nav_cursor -= 1;
-        }
+        self.nav_step(true, window, cx);
     }
 
-    /// Resolve the entry at the current cursor and activate it without
-    /// recording (the cursor already moved). Returns `true` when activation
-    /// happened, `false` when the entry is stale (workspace since deleted) so
-    /// the caller can revert the cursor and keep it anchored to the workspace
-    /// actually on screen.
-    fn navigate_to_nav_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(entry) = self.nav_history.get(self.nav_cursor).cloned() else {
-            return false;
+    /// Walk the history in `forward` direction from the cursor to the first
+    /// entry that still resolves to a live workspace, skipping stale entries
+    /// (workspaces deleted since they were recorded). Lands the cursor on that
+    /// entry and activates it without re-recording; no-op (cursor unchanged) if
+    /// only stale entries or the boundary lie ahead. Skipping (vs reverting on
+    /// the first stale hit) is what keeps a deleted mid-history workspace from
+    /// permanently walling off everything beyond it.
+    fn nav_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((idx, workspace)) = self.find_live_nav_target(forward) else {
+            return;
         };
-        let Some(workspace) = self.workspace_by_nav_ref(&entry) else {
-            tracing::info!(
-                project_id = %entry.project_id,
-                workspace_id = %entry.workspace_id,
-                "nav history entry no longer resolvable; skipping"
-            );
-            return false;
-        };
+        self.nav_cursor = idx;
         self.nav_replaying = true;
         self.activate_workspace(workspace, window, cx);
         self.nav_replaying = false;
-        true
+    }
+
+    /// Find the first live history entry from the cursor in `forward` direction,
+    /// returning its index + resolved workspace. `None` at the boundary.
+    fn find_live_nav_target(&self, forward: bool) -> Option<(usize, Workspace)> {
+        let idx = next_live_index(self.nav_history.len(), self.nav_cursor, forward, |i| {
+            self.nav_history
+                .get(i)
+                .is_some_and(|e| self.workspace_by_nav_ref(e).is_some())
+        })?;
+        let workspace = self.workspace_by_nav_ref(self.nav_history.get(idx)?)?;
+        Some((idx, workspace))
     }
 
     /// Resolve a history ref to a live `Workspace`, including the synthesized
@@ -1470,6 +1491,29 @@ mod nav_history_tests {
         // Only the 3 newest survive; cursor pins to the last.
         assert_eq!(h, vec![r("2"), r("3"), r("4")]);
         assert_eq!(c, 2);
+    }
+
+    #[test]
+    fn next_live_index_skips_stale_mid_history() {
+        use super::next_live_index;
+        // History [A, B(stale), C], cursor at C(2). Back must SKIP B and reach
+        // A — not wall at B.
+        let live = |i: usize| i != 1; // index 1 = B is deleted
+        assert_eq!(next_live_index(3, 2, false, live), Some(0));
+        // From A(0), forward skips B and reaches C(2).
+        assert_eq!(next_live_index(3, 0, true, live), Some(2));
+    }
+
+    #[test]
+    fn next_live_index_boundaries_and_all_stale() {
+        use super::next_live_index;
+        let all_live = |_: usize| true;
+        assert_eq!(next_live_index(3, 0, false, all_live), None); // at oldest, back
+        assert_eq!(next_live_index(3, 2, true, all_live), None); // at newest, forward
+        assert_eq!(next_live_index(0, 0, false, all_live), None); // empty history
+        // Everything ahead is stale → no live target, no move.
+        let none_live = |_: usize| false;
+        assert_eq!(next_live_index(3, 2, false, none_live), None);
     }
 }
 

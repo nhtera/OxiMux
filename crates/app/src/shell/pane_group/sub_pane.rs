@@ -345,6 +345,13 @@ impl TerminalSplitTree {
             return false;
         }
         let closed = self.active;
+        // If the leaf being closed is the zoomed one, drop the zoom — a stale
+        // `zoomed` index points at a now-empty slot, which makes both the
+        // render short-circuit and the visibility sync resolve to nothing
+        // (the latter would then throttle the surviving on-screen terminal).
+        if self.zoomed == Some(closed) {
+            self.zoomed = None;
+        }
         // Drop the leaf (views + observers) first so PTYs wind down
         // before we mutate the tree (avoids re-render seeing an orphan
         // leaf).

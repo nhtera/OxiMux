@@ -220,6 +220,11 @@ pub struct PaneGroup {
     /// drag leaves the strip.
     drag_hover: Option<TabDragHover>,
     active: usize,
+    /// Last set of on-screen terminal view ids pushed to `set_visible(true)`.
+    /// Render diffs against this so the per-view visibility sweep only runs
+    /// when the shown set actually changes (tab/leaf-tab switch, split, zoom),
+    /// not on every steady-state PTY-output frame.
+    last_visible_ids: std::collections::HashSet<gpui::EntityId>,
     focus_handle: FocusHandle,
     /// Monotonic counter for default terminal labels. `ProjectPanes`
     /// overrides this via `set_next_terminal_n` before each spawn so the
@@ -291,6 +296,7 @@ impl PaneGroup {
             tab_order: Vec::new(),
             drag_hover: None,
             active: 0,
+            last_visible_ids: std::collections::HashSet::new(),
             focus_handle: cx.focus_handle(),
             next_terminal_n: 1,
             theme,
