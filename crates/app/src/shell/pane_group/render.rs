@@ -56,6 +56,30 @@ impl Render for PaneGroup {
         // are idempotent.
         self.ensure_mru_focus_out_sub(window, cx);
 
+        // Push on-screen state down to every TerminalView so hidden tabs can
+        // throttle their PTY poll. A view is visible only when it's a per-leaf
+        // active view in THIS group's active tab; every other view (other
+        // tabs, background leaf sub-tabs) is hidden. `set_visible` is a no-op
+        // when unchanged, so this is cheap on a steady frame.
+        for (t, tab) in self.tabs.iter().enumerate() {
+            let PaneContent::Terminal(tree) = &tab.content else {
+                continue;
+            };
+            let visible_ids: std::collections::HashSet<gpui::EntityId> = if t != self.active {
+                std::collections::HashSet::new()
+            } else if let Some(zoomed) = tree.zoomed() {
+                // A zoomed leaf fills the body; the other split leaves are
+                // off-screen, so only the zoomed view is visible.
+                tree.get(zoomed).map(|v| v.entity_id()).into_iter().collect()
+            } else {
+                tree.iter_live().map(|(_, v)| v.entity_id()).collect()
+            };
+            for (_, _, view) in tree.iter_all_views() {
+                let visible = visible_ids.contains(&view.entity_id());
+                view.update(cx, |v, vcx| v.set_visible(visible, vcx));
+            }
+        }
+
         let entity = cx.entity().clone();
         let focus_handle = self.focus_handle_clone();
         let theme = self.theme;

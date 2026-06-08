@@ -53,6 +53,20 @@ use crate::shell::terminal_search_state::{SearchKeyOutcome, SearchState};
 /// `< 16 ms PTY → render latency` plan target without over-spending CPU on
 /// idle.
 const POLL_INTERVAL_MS: u64 = 16;
+/// Drain cadence for a hidden (non-visible) tab. Output isn't lost — it
+/// buffers in the PTY/relay channel and drains in larger batches; we just wake
+/// far less often so N background agents don't each schedule a 60fps repaint.
+const BACKGROUND_POLL_INTERVAL_MS: u64 = 100;
+
+/// PTY-drain cadence for a view given its on-screen state. Visible tabs drain
+/// at ~60fps; hidden tabs drain far less often (output buffers, not dropped).
+const fn poll_interval_ms(visible: bool) -> u64 {
+    if visible {
+        POLL_INTERVAL_MS
+    } else {
+        BACKGROUND_POLL_INTERVAL_MS
+    }
+}
 
 /// Default grid size on spawn. Parent-driven resize takes over on the first
 /// render.
@@ -320,6 +334,14 @@ pub struct TerminalView {
     /// `mount`. When `false`, the blink task skips `cx.notify()` so unfocused
     /// panes don't burn a repaint every 530 ms.
     focused: bool,
+    /// Whether this view's body is currently on screen (the active tab of its
+    /// group, in the active leaf of any split). Pushed down by the owning
+    /// `PaneGroup` each render. Hidden tabs still drain their PTY (so the
+    /// snapshot stays current and device-query replies / bells are answered)
+    /// but poll on a slower cadence and skip the repaint for plain output —
+    /// the win that keeps tab switching fast under many concurrent agents.
+    /// Defaults to `true` so a view always polls fast until told otherwise.
+    visible: bool,
     /// Set when an UNFOCUSED pane raises a signal — today a terminal BEL
     /// (`TerminalEvent::Bell`); later also agent WaitingForInput/NeedsApproval
     /// and `oximux notify`. Drives the blue attention ring overlay; cleared
@@ -524,6 +546,7 @@ impl TerminalView {
             // Multiple panes constructed in the same effect run will each see
             // their focus() call land, last one wins, on_blur clears the rest.
             focused: false,
+            visible: true,
             attention: false,
             search: SearchState::new(),
             title: None,
@@ -616,6 +639,7 @@ impl TerminalView {
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
             focused: false,
+            visible: true,
             attention: false,
             search: SearchState::new(),
             title: None,
@@ -680,13 +704,15 @@ impl TerminalView {
     fn start_poll_task(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
-                else {
+                // Read the cadence live each iteration: a hidden tab drains on
+                // the slow interval, a visible one at ~60fps. An edit to
+                // visibility takes effect on the next wake.
+                let Ok((executor, interval)) = this.read_with(cx, |view, cx| {
+                    (cx.background_executor().clone(), poll_interval_ms(view.visible))
+                }) else {
                     return;
                 };
-                executor
-                    .timer(Duration::from_millis(POLL_INTERVAL_MS))
-                    .await;
+                executor.timer(Duration::from_millis(interval)).await;
                 if this.update(cx, |view, cx| view.tick(cx)).is_err() {
                     return;
                 }
@@ -757,6 +783,20 @@ impl TerminalView {
     /// date by the `cx.on_focus` / `cx.on_blur` observers in `mount`).
     pub fn focused(&self) -> bool {
         self.focused
+    }
+
+    /// Push the on-screen state down from the owning `PaneGroup`. Becoming
+    /// visible repaints immediately so the just-shown tab reflects any output
+    /// that landed while it was throttled; the poll loop picks up the faster
+    /// cadence on its next iteration.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if visible {
+            cx.notify();
+        }
     }
 
     /// Backend's external identifier for this pane's session (e.g.,
@@ -1511,7 +1551,13 @@ impl TerminalView {
                 tracing::warn!(?err, "pty reply write failed");
             }
         }
-        cx.notify();
+        // Repaint when visible. A hidden tab skips the repaint for plain output
+        // (its snapshot is already updated above, so it's current the instant
+        // it's shown) but still repaints on an attention edge (bell / error
+        // progress) so a background tab's chip can light up.
+        if self.visible || got_bell {
+            cx.notify();
+        }
     }
 
     /// Fold a shell-integration command mark into the gutter-badge list. A
@@ -1588,6 +1634,9 @@ impl TerminalView {
             return;
         }
         self.attention = true;
+        // Notify unconditionally — deliberately NOT gated on `visible` (unlike
+        // `tick`'s plain-output repaint). A background tab's attention edge
+        // MUST reach the group so its chip can light up even while hidden.
         cx.notify();
     }
 
@@ -2205,6 +2254,18 @@ fn build_scroll_indicator(theme: &Theme, offset: usize) -> gpui::Div {
         .border_color(theme.border_inactive)
         // `↑` = U+2191 Upwards Arrow.
         .child(format!("↑ {offset} lines"))
+}
+
+#[cfg(test)]
+mod poll_interval_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_tab_polls_slower_than_visible() {
+        assert_eq!(poll_interval_ms(true), POLL_INTERVAL_MS);
+        assert_eq!(poll_interval_ms(false), BACKGROUND_POLL_INTERVAL_MS);
+        assert!(poll_interval_ms(false) > poll_interval_ms(true));
+    }
 }
 
 #[cfg(test)]
