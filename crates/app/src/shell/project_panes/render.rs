@@ -150,7 +150,8 @@ impl ProjectPanes {
             };
             let frac = weight / sum;
             let is_focused = id == active_id;
-            let strip = build_tab_strip_for(entity, id, is_focused, true, theme, cx);
+            let strip =
+                build_tab_strip_for(entity, id, is_focused, true, theme, self.workspace_tint, cx);
             row = row.child(
                 div()
                     .w(gpui::relative(frac))
@@ -253,9 +254,17 @@ fn render_tree(
                 if hoisted.contains(id) {
                     slot.child(group_body).into_any_element()
                 } else {
-                    slot.child(build_tab_strip_for(group, *id, is_focused, true, theme, cx))
-                        .child(group_body)
-                        .into_any_element()
+                    slot.child(build_tab_strip_for(
+                        group,
+                        *id,
+                        is_focused,
+                        true,
+                        theme,
+                        panes.workspace_tint,
+                        cx,
+                    ))
+                    .child(group_body)
+                    .into_any_element()
                 }
             }
             // Leaf in the tree but no entity registered — shouldn't

@@ -155,6 +155,7 @@ pub fn build_tab_strip_for(
     is_focused: bool,
     show_pane_actions: bool,
     theme: Theme,
+    workspace_tint: Option<super::TabColor>,
     cx: &App,
 ) -> AnyElement {
     let group = entity.read(cx);
@@ -187,6 +188,7 @@ pub fn build_tab_strip_for(
         is_focused,
         show_pane_actions,
         theme,
+        workspace_tint,
         scroll_handle,
     )
 }
@@ -288,6 +290,7 @@ fn build_tab_strip_from_headers(
     is_focused: bool,
     show_pane_actions: bool,
     theme: Theme,
+    workspace_tint: Option<super::TabColor>,
     scroll_handle: gpui::ScrollHandle,
 ) -> AnyElement {
     let entity_id = entity.entity_id();
@@ -438,6 +441,7 @@ fn build_tab_strip_from_headers(
             header.color,
             header.pinned,
             theme,
+            workspace_tint,
             entity.clone(),
         ));
     }
@@ -800,6 +804,7 @@ fn render_tab_chip(
     color_tag: Option<super::TabColor>,
     is_pinned: bool,
     theme: Theme,
+    workspace_tint: Option<super::TabColor>,
     entity: Entity<PaneGroup>,
 ) -> impl IntoElement {
     let icon_path = match marker {
@@ -819,8 +824,15 @@ fn render_tab_chip(
     } else {
         theme.fg_muted
     };
+    // The active tab's top edge carries the active workspace's tint when one is
+    // set (a workspace identifier), falling back to the focus ring otherwise.
+    // The tint is workspace-level, so in a split every group's active tab wears
+    // it — deliberate (it identifies the workspace, not the focused pane).
     let top_accent = if is_active {
-        theme.focus_ring
+        match workspace_tint {
+            Some(c) => gpui::rgb(c.rgb()).into(),
+            None => theme.focus_ring,
+        }
     } else {
         gpui::transparent_black()
     };

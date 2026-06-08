@@ -1862,6 +1862,14 @@ impl Render for WorkspaceRoot {
             panes.update(cx, |p, cx| p.set_chrome_width(chrome, cx));
         }
 
+        // Push the active workspace's tint down so its tab strip's active-tab
+        // edge carries the identifier hue. Resolved from the (already-refreshed)
+        // left-rail snapshot, so no separately-cached copy can desync.
+        let ws_tint = self.left_rail.read(cx).active_workspace_tint();
+        if let Some(panes) = active_panes.as_ref() {
+            panes.update(cx, |p, _cx| p.set_workspace_tint(ws_tint));
+        }
+
         // Top-row pane groups hoist their per-group strips INTO the
         // top-bar row (mirroring tree column widths). Lower vertical-
         // split rows render their strips inline above their bodies.

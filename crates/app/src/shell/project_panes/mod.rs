@@ -85,6 +85,9 @@ pub struct ProjectPanes {
     /// Surrounding chrome width. Forwarded to every group on set so
     /// PTY grid math stays current.
     chrome_w_px: f32,
+    /// Active workspace's identifier tint, pushed down each render by
+    /// `WorkspaceRoot`. Drives the active tab's edge accent. `None` = default.
+    workspace_tint: Option<crate::shell::pane_group::TabColor>,
     /// Hovered drop target during a cross-group tab drag (Phase D).
     /// `None` whenever no drag is active OR the cursor sits outside every
     /// pane body. The body's `on_drag_move` sets it to (group, zone) and
@@ -149,6 +152,7 @@ impl ProjectPanes {
             _window_activation_observer: observer,
             save_callback: None,
             chrome_w_px: density.w_left_rail,
+            workspace_tint: None,
             hovered_drop_target: None,
             next_terminal_n: 1,
         }
@@ -249,6 +253,13 @@ impl ProjectPanes {
         for group in self.groups.values() {
             group.update(cx, |g, cx| g.set_chrome_width(chrome, cx));
         }
+    }
+
+    /// Set the active workspace's tint (read at tab-strip render time for the
+    /// active-tab edge accent). Stored only — the next render reads the field;
+    /// pushed down by `WorkspaceRoot` alongside `set_chrome_width`.
+    pub fn set_workspace_tint(&mut self, tint: Option<crate::shell::pane_group::TabColor>) {
+        self.workspace_tint = tint;
     }
 
     pub fn set_active_group(

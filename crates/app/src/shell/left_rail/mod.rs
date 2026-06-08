@@ -265,6 +265,23 @@ impl LeftRail {
         self.projects.iter().find(|p| &p.id == id).cloned()
     }
 
+    /// Resolve the active workspace's tint swatch from the current snapshot.
+    /// `WorkspaceRoot` reads this each render to accent the active tab strip,
+    /// so the tint stays in sync without a separately-cached copy.
+    pub(crate) fn active_workspace_tint(
+        &self,
+    ) -> Option<crate::shell::pane_group::TabColor> {
+        let ws_id = self.active_workspace_id.as_ref()?;
+        let proj_id = self.active_project_id.as_ref()?;
+        self.workspaces_by_project
+            .get(proj_id)?
+            .iter()
+            .find(|w| &w.id == ws_id)?
+            .tint
+            .as_deref()
+            .and_then(crate::shell::pane_group::TabColor::from_slug)
+    }
+
     /// Return to the home view (workspace list, no nav highlighted). Used after
     /// creating a workspace from the Tasks page so the new row is visible.
     pub(crate) fn go_home(&mut self, cx: &mut Context<Self>) {
