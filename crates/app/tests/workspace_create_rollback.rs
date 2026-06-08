@@ -71,6 +71,7 @@ async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
         "Fix Login",
         slug,
         &worktree_path,
+        None,
         &workspace_repo,
     )
     .await;
@@ -122,6 +123,7 @@ async fn create_workspace_happy_path_inserts_row_and_keeps_worktree() {
         "New Feat",
         slug,
         &worktree_path,
+        None,
         &workspace_repo,
     )
     .await;

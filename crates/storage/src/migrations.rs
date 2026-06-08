@@ -111,6 +111,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "diff_review_notes",
         sql: include_str!("../migrations/V010__diff_review_notes.sql"),
     },
+    Migration {
+        version: 11,
+        name: "workspace_linked_issue",
+        sql: include_str!("../migrations/V011__workspace_linked_issue.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

@@ -110,6 +110,9 @@ pub struct WorkspaceCardPlan {
     /// Reserved for a future PR-state chip. Always `None` in this
     /// implementation — GitHub integration is out of scope.
     pub pr: Option<PrChip>,
+    /// GitHub issue/PR reference (e.g. `"#42"`) this workspace was created
+    /// from, shown as a small badge. `None` for manually-created workspaces.
+    pub linked_issue: Option<String>,
 }
 
 /// Resolve the status-dot color for a workspace given its latest agent
@@ -205,6 +208,7 @@ pub fn build_workspace_card_plan(
         agent_verb: agent_verb_opt,
         diff,
         pr: None, // GitHub integration is out of scope
+        linked_issue: workspace.linked_issue.clone(),
     }
 }
 
@@ -365,6 +369,7 @@ mod tests {
             status: "active".to_string(),
             created_at: "2026-05-21T00:00:00Z".to_string(),
             archived_at: None,
+            linked_issue: None,
         }
     }
 
@@ -556,6 +561,7 @@ mod tests {
             status: "active".to_string(),
             created_at: "2026-05-21T00:00:00Z".to_string(),
             archived_at: None,
+            linked_issue: None,
         }
     }
 

@@ -18,6 +18,11 @@ pub struct Workspace {
     pub status: String,
     pub created_at: String,
     pub archived_at: Option<String>,
+    /// GitHub issue/PR reference this workspace was created from (e.g. `"#42"`),
+    /// or `None` for a manually-created workspace. `#[serde(default)]` so
+    /// snapshots written before this field still deserialize.
+    #[serde(default)]
+    pub linked_issue: Option<String>,
 }
 
 /// Per-worktree SCM scratch state, persisted in the V006

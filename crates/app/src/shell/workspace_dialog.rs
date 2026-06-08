@@ -527,6 +527,7 @@ mod tests {
             status: "active".to_string(),
             created_at: "now".to_string(),
             archived_at: None,
+            linked_issue: None,
         }
     }
 

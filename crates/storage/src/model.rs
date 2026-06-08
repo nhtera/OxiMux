@@ -57,6 +57,7 @@ pub struct WorkspaceRow {
     pub status: String,
     pub created_at: String,
     pub archived_at: Option<String>,
+    pub linked_issue: Option<String>,
 }
 
 impl WorkspaceRow {
@@ -71,6 +72,7 @@ impl WorkspaceRow {
             status: row.get("status")?,
             created_at: row.get("created_at")?,
             archived_at: row.get("archived_at")?,
+            linked_issue: row.get("linked_issue")?,
         })
     }
 }
@@ -87,6 +89,7 @@ impl From<WorkspaceRow> for Workspace {
             status: r.status,
             created_at: r.created_at,
             archived_at: r.archived_at,
+            linked_issue: r.linked_issue,
         }
     }
 }

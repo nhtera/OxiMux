@@ -138,6 +138,7 @@ pub(super) fn render_task_row(
         .child(open_action(item.url.clone(), theme, density, typography))
         .child(create_action(
             workspace_name_for(kind, item),
+            format!("#{}", item.number),
             weak_root,
             project,
             theme,
@@ -175,9 +176,11 @@ fn open_action(url: String, theme: Theme, density: Density, typography: &Typogra
         .into_any_element()
 }
 
-/// "Create workspace from this" action chip → `create_workspace_async`.
+/// "Create workspace from this" action chip → `create_workspace_async`, seeded
+/// with the issue/PR reference (e.g. `"#42"`) and activating the new workspace.
 fn create_action(
     name: String,
+    linked_issue: String,
     weak_root: WeakEntity<WorkspaceRoot>,
     project: Project,
     theme: Theme,
@@ -196,7 +199,15 @@ fn create_action(
             MouseButton::Left,
             move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                 let _ = weak_root.update(cx, |root, cx| {
-                    root.create_workspace_async(project.clone(), name.clone(), None, window, cx);
+                    root.create_workspace_async(
+                        project.clone(),
+                        name.clone(),
+                        None,
+                        Some(linked_issue.clone()),
+                        true,
+                        window,
+                        cx,
+                    );
                 });
             },
         )

@@ -42,6 +42,30 @@ fn workspace_get_by_id() {
 }
 
 #[test]
+fn workspace_set_linked_issue_round_trips() {
+    let (project_id, workspaces, _, _) = project_and_repos();
+    let w = workspaces
+        .insert(&project_id, "Fix", "fix", "oximux/fix", "/wt/fix")
+        .expect("insert");
+    // Fresh inserts have no linked issue.
+    assert!(w.linked_issue.is_none());
+
+    workspaces
+        .set_linked_issue(&w.id, Some("#42"))
+        .expect("set linked issue");
+    let fetched = workspaces.get_by_id(&w.id).expect("get").expect("present");
+    assert_eq!(fetched.linked_issue.as_deref(), Some("#42"));
+    // It also surfaces through the project listing.
+    let listed = workspaces.list_for_project(&project_id).expect("list");
+    assert_eq!(listed[0].linked_issue.as_deref(), Some("#42"));
+
+    // Clearing it round-trips back to None.
+    workspaces.set_linked_issue(&w.id, None).expect("clear");
+    let cleared = workspaces.get_by_id(&w.id).expect("get").expect("present");
+    assert!(cleared.linked_issue.is_none());
+}
+
+#[test]
 fn workspace_list_for_project_excludes_archived() {
     let (project_id, workspaces, _, _) = project_and_repos();
     let a = workspaces

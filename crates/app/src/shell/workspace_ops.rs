@@ -97,6 +97,7 @@ pub async fn create_workspace_with_rollback(
     name: &str,
     slug: &str,
     worktree_path: &Path,
+    linked_issue: Option<&str>,
     workspace_repo: &WorkspaceRepo,
 ) -> CreateOutcome {
     let branch = format!("oximux/{slug}");
@@ -109,7 +110,20 @@ pub async fn create_workspace_with_rollback(
     }
     let path_str = worktree_path.to_string_lossy().to_string();
     match workspace_repo.insert(project_id, name, slug, &branch, &path_str) {
-        Ok(workspace) => CreateOutcome::Created(workspace),
+        Ok(mut workspace) => {
+            // Best-effort metadata write — the worktree + row already exist, so
+            // a failure here only loses the issue badge, not the workspace. The
+            // in-memory field is set ONLY on a confirmed write.
+            if let Some(issue) = linked_issue {
+                match workspace_repo.set_linked_issue(&workspace.id, Some(issue)) {
+                    Ok(()) => workspace.linked_issue = Some(issue.to_string()),
+                    Err(err) => {
+                        tracing::warn!(?err, workspace_id = %workspace.id, "set_linked_issue failed")
+                    }
+                }
+            }
+            CreateOutcome::Created(workspace)
+        }
         Err(insert_error) => {
             // Rollback: best-effort. If either step errors, we surface
             // a dirty-state outcome so the call site can log loudly.
@@ -617,6 +631,7 @@ impl WorkspaceRoot {
                     status: "active".to_string(),
                     created_at: String::new(),
                     archived_at: None,
+                    linked_issue: None,
                 },
             );
         }
@@ -702,6 +717,7 @@ impl WorkspaceRoot {
             status: String::new(),
             created_at: String::new(),
             archived_at: None,
+            linked_issue: None,
         };
         self.activate_workspace(workspace, window, cx);
     }
@@ -880,7 +896,15 @@ impl WorkspaceRoot {
                 if !same_active {
                     self.set_active_project(project.clone(), window, cx);
                 }
-                self.create_workspace_async(project, submit.name, submit.agent, window, cx);
+                self.create_workspace_async(
+                    project,
+                    submit.name,
+                    submit.agent,
+                    None,
+                    false,
+                    window,
+                    cx,
+                );
             }
             WorkspaceDialogMode::Rename(workspace) => {
                 self.rename_workspace_now(*workspace, submit.name, cx);
@@ -891,11 +915,14 @@ impl WorkspaceRoot {
     /// Create-workspace flow: derive slug → orchestrate via
     /// [`create_workspace_with_rollback`]. The helper is pure-async so
     /// the rollback path can be unit-tested without a GPUI context.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_workspace_async(
         &mut self,
         project: Project,
         name: String,
         agent: Option<AgentAdapter>,
+        linked_issue: Option<String>,
+        activate_after: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -939,6 +966,7 @@ impl WorkspaceRoot {
                 &name_trimmed,
                 &slug,
                 &worktree_path,
+                linked_issue.as_deref(),
                 &workspace_repo,
             )
             .await;
@@ -952,6 +980,18 @@ impl WorkspaceRoot {
                     let cwd = PathBuf::from(&workspace.worktree_path);
                     let _ = weak.update_in(cx, |this, window, cx| {
                         cx.notify();
+                        // Land on the new workspace (e.g. created from a task):
+                        // select it and return the rail to the home list so it's
+                        // visible. Manual dialog creates pass `false` to keep the
+                        // prior behavior. `go_home` runs AFTER activate_workspace
+                        // (which switches project but never touches `active_nav`),
+                        // so the rail reliably ends on the home view. The Tasks
+                        // path always passes its currently-active project, so
+                        // activate_workspace's recent-projects lookup resolves.
+                        if activate_after {
+                            this.activate_workspace(workspace.clone(), window, cx);
+                            this.left_rail.update(cx, |rail, cx| rail.go_home(cx));
+                        }
                         if let Some(kind) = agent {
                             // Auto-spawn from the create dialog uses the
                             // adapter's last-used params (or defaults when

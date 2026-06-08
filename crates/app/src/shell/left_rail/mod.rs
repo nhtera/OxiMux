@@ -265,6 +265,15 @@ impl LeftRail {
         self.projects.iter().find(|p| &p.id == id).cloned()
     }
 
+    /// Return to the home view (workspace list, no nav highlighted). Used after
+    /// creating a workspace from the Tasks page so the new row is visible.
+    pub(crate) fn go_home(&mut self, cx: &mut Context<Self>) {
+        if self.active_nav.is_some() {
+            self.active_nav = None;
+            cx.notify();
+        }
+    }
+
     /// Toggle a nav page. Clicking the active page returns to the home view
     /// (workspace list). Opening the Tasks page seeds it with the active
     /// project and triggers a fetch (cheap if already loaded).

@@ -106,6 +106,21 @@ pub fn render_workspace_card(
             .child(branch.clone())
     });
 
+    // Linked-issue badge: shown when the workspace was created from a task
+    // (e.g. "#42"). Tinted status_info to distinguish it from the branch chip.
+    let issue_chip = plan.linked_issue.as_ref().map(|issue| {
+        div()
+            .flex()
+            .items_center()
+            .px(px(5.0))
+            .h(px(15.0))
+            .rounded(px(density.r_chip))
+            .bg(theme.bg_panel_alt)
+            .text_size(px(typography.t_sub_label))
+            .text_color(theme.status_info)
+            .child(issue.clone())
+    });
+
     // "Folder" pill for non-git folder projects — shown in line 1 subtext slot.
     let folder_pill = plan.row.is_folder.then(|| {
         div()
@@ -133,6 +148,7 @@ pub fn render_workspace_card(
         )
         .children(primary_badge)
         .children(branch_chip)
+        .children(issue_chip)
         .children(folder_pill);
 
     // Line 2 — agent verb + diff chip. Both are optional; when absent the

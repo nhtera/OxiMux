@@ -174,6 +174,7 @@ mod tests {
             status: "active".to_string(),
             created_at: "2026-06-01T00:00:00Z".to_string(),
             archived_at: None,
+            linked_issue: None,
         }
     }
 
