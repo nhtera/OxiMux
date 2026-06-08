@@ -453,7 +453,7 @@ mod tests {
         let big = "Y".repeat(STAGED_SUMMARY_BYTE_BUDGET + 50);
         let out = limit_section(&big, STAGED_SUMMARY_BYTE_BUDGET);
         assert!(out.contains("[truncated:"));
-        assert!(out.contains("50 characters omitted"));
+        assert!(out.contains("50 bytes omitted"));
     }
 
     #[test]
