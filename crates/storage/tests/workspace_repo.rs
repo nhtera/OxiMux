@@ -66,6 +66,26 @@ fn workspace_set_linked_issue_round_trips() {
 }
 
 #[test]
+fn workspace_set_tint_round_trips() {
+    let (project_id, workspaces, _, _) = project_and_repos();
+    let w = workspaces
+        .insert(&project_id, "Tint", "tint", "oximux/tint", "/wt/tint")
+        .expect("insert");
+    assert!(w.tint.is_none());
+
+    workspaces.set_tint(&w.id, Some("blue")).expect("set tint");
+    let fetched = workspaces.get_by_id(&w.id).expect("get").expect("present");
+    assert_eq!(fetched.tint.as_deref(), Some("blue"));
+    // The live rail render reads via list_for_project — verify it carries tint.
+    let listed = workspaces.list_for_project(&project_id).expect("list");
+    assert_eq!(listed[0].tint.as_deref(), Some("blue"));
+
+    workspaces.set_tint(&w.id, None).expect("clear");
+    let cleared = workspaces.get_by_id(&w.id).expect("get").expect("present");
+    assert!(cleared.tint.is_none());
+}
+
+#[test]
 fn workspace_list_for_project_excludes_archived() {
     let (project_id, workspaces, _, _) = project_and_repos();
     let a = workspaces

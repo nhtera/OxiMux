@@ -23,6 +23,11 @@ pub struct Workspace {
     /// snapshots written before this field still deserialize.
     #[serde(default)]
     pub linked_issue: Option<String>,
+    /// Optional identifier hue — a tab-color swatch slug (e.g. `"blue"`), or
+    /// `None` for the default (pure charcoal). `#[serde(default)]` for
+    /// back-compat with pre-field snapshots.
+    #[serde(default)]
+    pub tint: Option<String>,
 }
 
 /// Per-worktree SCM scratch state, persisted in the V006

@@ -55,7 +55,23 @@ impl WorkspaceRepo {
             created_at,
             archived_at: None,
             linked_issue: None,
+            tint: None,
         })
+    }
+
+    /// Set (or clear) a workspace's identifier-hue swatch slug (e.g. `"blue"`).
+    /// `None` clears the tint back to the default. Warns if no row matched.
+    pub fn set_tint(&self, id: &str, tint: Option<&str>) -> Result<(), StorageError> {
+        let affected = self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE workspaces SET tint = ?1 WHERE id = ?2",
+                params![tint, id],
+            )
+        })?;
+        if affected == 0 {
+            tracing::warn!(workspace_id = %id, "set_tint matched no workspace row");
+        }
+        Ok(())
     }
 
     /// Set (or clear) the GitHub issue/PR reference a workspace links back to.
@@ -83,7 +99,7 @@ impl WorkspaceRepo {
     pub fn get_by_id(&self, id: &str) -> Result<Option<Workspace>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint \
                  FROM workspaces WHERE id = ?1",
                 [id],
                 WorkspaceRow::from_row,
@@ -97,7 +113,7 @@ impl WorkspaceRepo {
     pub fn list_for_project(&self, project_id: &str) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NULL \
                  ORDER BY created_at DESC",

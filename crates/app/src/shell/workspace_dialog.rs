@@ -528,6 +528,7 @@ mod tests {
             created_at: "now".to_string(),
             archived_at: None,
             linked_issue: None,
+            tint: None,
         }
     }
 

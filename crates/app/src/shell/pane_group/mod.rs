@@ -128,6 +128,19 @@ pub enum TabColor {
 }
 
 impl TabColor {
+    /// All swatches in palette order — drives the color pickers.
+    pub const ALL: [TabColor; 9] = [
+        TabColor::Blue,
+        TabColor::Purple,
+        TabColor::Pink,
+        TabColor::Red,
+        TabColor::Orange,
+        TabColor::Yellow,
+        TabColor::Green,
+        TabColor::Teal,
+        TabColor::Gray,
+    ];
+
     /// Resolve to a concrete hex (`u32` RGB). Theme-independent so the
     /// user's color choice stays recognizable across light/dark modes.
     pub fn rgb(self) -> u32 {
@@ -141,6 +154,39 @@ impl TabColor {
             TabColor::Green => 0x22C55E,
             TabColor::Teal => 0x14B8A6,
             TabColor::Gray => 0x9CA3AF,
+        }
+    }
+
+    /// Stable lowercase slug for persistence (matches the swatch picker
+    /// labels). Round-trips through [`TabColor::from_slug`].
+    pub fn slug(self) -> &'static str {
+        match self {
+            TabColor::Blue => "blue",
+            TabColor::Purple => "purple",
+            TabColor::Pink => "pink",
+            TabColor::Red => "red",
+            TabColor::Orange => "orange",
+            TabColor::Yellow => "yellow",
+            TabColor::Green => "green",
+            TabColor::Teal => "teal",
+            TabColor::Gray => "gray",
+        }
+    }
+
+    /// Parse a persisted slug back to a swatch. `None` for an unknown slug
+    /// (forward-compat: an unrecognized value degrades to "no tint").
+    pub fn from_slug(s: &str) -> Option<TabColor> {
+        match s {
+            "blue" => Some(TabColor::Blue),
+            "purple" => Some(TabColor::Purple),
+            "pink" => Some(TabColor::Pink),
+            "red" => Some(TabColor::Red),
+            "orange" => Some(TabColor::Orange),
+            "yellow" => Some(TabColor::Yellow),
+            "green" => Some(TabColor::Green),
+            "teal" => Some(TabColor::Teal),
+            "gray" => Some(TabColor::Gray),
+            _ => None,
         }
     }
 }

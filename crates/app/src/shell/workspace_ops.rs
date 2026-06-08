@@ -632,6 +632,7 @@ impl WorkspaceRoot {
                     created_at: String::new(),
                     archived_at: None,
                     linked_issue: None,
+                    tint: None,
                 },
             );
         }
@@ -718,6 +719,7 @@ impl WorkspaceRoot {
             created_at: String::new(),
             archived_at: None,
             linked_issue: None,
+            tint: None,
         };
         self.activate_workspace(workspace, window, cx);
     }
@@ -1091,6 +1093,22 @@ impl WorkspaceRoot {
     pub(crate) fn archive_workspace(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
         if let Err(err) = self.app_state.workspace_repo.mark_archived(&workspace.id) {
             tracing::warn!(?err, workspace_id = %workspace.id, "mark_archived failed");
+        }
+        cx.notify();
+    }
+
+    /// Set (or clear) a workspace's identifier-hue swatch. Persists the slug;
+    /// `cx.notify()` drives the next render's `refresh_left_rail` to re-read it.
+    pub(crate) fn set_workspace_tint(
+        &mut self,
+        workspace_id: &str,
+        tint: Option<crate::shell::pane_group::TabColor>,
+        cx: &mut Context<Self>,
+    ) {
+        let slug = tint.map(|c| c.slug());
+        if let Err(err) = self.app_state.workspace_repo.set_tint(workspace_id, slug) {
+            tracing::warn!(?err, workspace_id, "set_workspace_tint failed");
+            return;
         }
         cx.notify();
     }

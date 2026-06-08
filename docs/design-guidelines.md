@@ -314,6 +314,26 @@ home. Agents (dashboard) and Tasks are the implemented pages.
 
 Open-in-browser uses the shared `shell/open_url` helper (`open <url>`).
 
+## Per-workspace tint
+
+The **only** chrome customization in v1: an optional per-workspace identifier
+hue, so parallel workspaces are distinguishable at a glance. It reads as an
+*identifier*, not decoration — the dark-only "brand IS the absence of accent"
+contract holds.
+
+- **Vocabulary:** reuse the existing 9-swatch tab-color palette (`TabColor`) —
+  no second color set, no new tokens. Persisted as a slug (`"blue"`) in the
+  `workspaces.tint` column; `None` = default (pure charcoal).
+- **Set via** the workspace row's "…" menu → a "Color" swatch row (clear + 9),
+  dispatching `WorkspaceRoot::set_workspace_tint`. The current swatch gets a
+  contrasting ring.
+- **Appearance allowlist (accent only, ≤2px, never a fill or text background):**
+  - ✅ the workspace's left-rail row — a 2px left-edge bar.
+  - ✅ (planned) that workspace's active tab-strip edge.
+  - 🚫 no full-panel washes, no tinted backgrounds, no tinted text.
+- Contrast: the swatch is a theme-independent hex used only as a thin accent, so
+  it never fights the charcoal surfaces or the single status-accent layer.
+
 ## Primitive-Picking Fork
 
 When a control has multiple plausible primitives, use this fork:

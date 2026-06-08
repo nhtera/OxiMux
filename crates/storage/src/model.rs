@@ -58,6 +58,7 @@ pub struct WorkspaceRow {
     pub created_at: String,
     pub archived_at: Option<String>,
     pub linked_issue: Option<String>,
+    pub tint: Option<String>,
 }
 
 impl WorkspaceRow {
@@ -73,6 +74,7 @@ impl WorkspaceRow {
             created_at: row.get("created_at")?,
             archived_at: row.get("archived_at")?,
             linked_issue: row.get("linked_issue")?,
+            tint: row.get("tint")?,
         })
     }
 }
@@ -90,6 +92,7 @@ impl From<WorkspaceRow> for Workspace {
             created_at: r.created_at,
             archived_at: r.archived_at,
             linked_issue: r.linked_issue,
+            tint: r.tint,
         }
     }
 }

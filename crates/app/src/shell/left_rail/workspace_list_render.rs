@@ -338,6 +338,7 @@ mod tests {
             created_at: created_at.to_string(),
             archived_at: None,
             linked_issue: None,
+            tint: None,
         }
     }
 

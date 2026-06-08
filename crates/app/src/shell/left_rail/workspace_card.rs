@@ -204,6 +204,20 @@ pub fn render_workspace_card(
         .gap(px(density.gap_inline))
         .cursor_pointer();
 
+    // Thin (2px) left-edge identifier hue — the only per-workspace chrome
+    // tint, drawn as an accent, never a fill (design contract). Painted on an
+    // outer wrapper (below) so it pins to the same rail-left for every row,
+    // whether or not the active row is inset by its margin.
+    let tint_bar = plan.tint.map(|c| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .w(px(2.0))
+            .bg(gpui::rgb(c.rgb()))
+    });
+
     let shell = if plan.row.is_active {
         base.mx(px(density.gap_inline))
             .rounded(px(density.r_xs))
@@ -214,7 +228,7 @@ pub fn render_workspace_card(
         base.bg(plan.row.bg).hover(|s| s.bg(theme.bg_panel_alt))
     };
 
-    shell
+    let card = shell
         .child(
             div()
                 .size(px(STATUS_DOT_SIZE))
@@ -233,5 +247,13 @@ pub fn render_workspace_card(
                 .child(line2),
         )
         .children(trailing_btn)
-        .on_mouse_down(MouseButton::Left, on_row_click)
+        .on_mouse_down(MouseButton::Left, on_row_click);
+
+    // Outer wrapper carries the tint accent so it sits at a consistent
+    // rail-left for every row (the active card's own margin doesn't shift it).
+    div()
+        .relative()
+        .w_full()
+        .children(tint_bar)
+        .child(card)
 }

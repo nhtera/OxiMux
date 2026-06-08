@@ -17,6 +17,7 @@ use oximux_core::{AgentStatus, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agent_presentation::{AgentVerb, agent_verb};
+use crate::shell::pane_group::TabColor;
 
 /// Side length of the colored status circle. Shared with the card painter
 /// (`workspace_card.rs`) so the dot size cannot drift between the two.
@@ -113,6 +114,9 @@ pub struct WorkspaceCardPlan {
     /// GitHub issue/PR reference (e.g. `"#42"`) this workspace was created
     /// from, shown as a small badge. `None` for manually-created workspaces.
     pub linked_issue: Option<String>,
+    /// Optional identifier hue, resolved from the workspace's stored swatch
+    /// slug. Painted as a thin left-edge accent on the row. `None` = default.
+    pub tint: Option<TabColor>,
 }
 
 /// Resolve the status-dot color for a workspace given its latest agent
@@ -209,6 +213,7 @@ pub fn build_workspace_card_plan(
         diff,
         pr: None, // GitHub integration is out of scope
         linked_issue: workspace.linked_issue.clone(),
+        tint: workspace.tint.as_deref().and_then(TabColor::from_slug),
     }
 }
 
@@ -370,6 +375,7 @@ mod tests {
             created_at: "2026-05-21T00:00:00Z".to_string(),
             archived_at: None,
             linked_issue: None,
+            tint: None,
         }
     }
 
@@ -562,6 +568,7 @@ mod tests {
             created_at: "2026-05-21T00:00:00Z".to_string(),
             archived_at: None,
             linked_issue: None,
+            tint: None,
         }
     }
 

@@ -13,6 +13,7 @@ use gpui::{
 use oximux_core::Workspace;
 use oximux_settings::{Density, ScriptKind, Theme, Typography};
 
+use crate::shell::pane_group::TabColor;
 use crate::workspace_root::WorkspaceRoot;
 
 /// Which per-project lifecycle scripts are defined for the workspace under
@@ -170,6 +171,84 @@ impl WorkspaceRowMenu {
             }
         });
     }
+
+    /// A "Color" swatch row (clear + the 9-swatch palette) for tagging the
+    /// workspace with an identifier hue. Each swatch dispatches
+    /// `set_workspace_tint` and closes the menu. The current tint gets a
+    /// contrasting ring.
+    fn render_color_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some((workspace, ..)) = self.open_for.clone() else {
+            return div().into_any_element();
+        };
+        // Synthesized "primary:<proj>" rows aren't real workspace rows — tinting
+        // them would no-op against the DB, so omit the picker entirely.
+        if workspace.id.starts_with("primary:") {
+            return div().into_any_element();
+        }
+        let theme = self.theme;
+        let current = workspace.tint.as_deref().and_then(TabColor::from_slug);
+        let id = workspace.id.clone();
+
+        let label = div()
+            .px(px(ROW_PADDING_X))
+            .py(px(4.0))
+            .text_size(px(self.typography.t_sub_label))
+            .text_color(theme.fg_subtle)
+            .child("Color");
+
+        let mut choices: Vec<Option<TabColor>> = vec![None];
+        choices.extend(TabColor::ALL.iter().copied().map(Some));
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(ROW_PADDING_X))
+            .py(px(4.0));
+        for (index, choice) in choices.into_iter().enumerate() {
+            let selected = current == choice;
+            let id_for = id.clone();
+            let mut swatch = div()
+                .id(("ws-tint-swatch", index))
+                .w(px(14.0))
+                .h(px(14.0))
+                .rounded_full()
+                .cursor_pointer()
+                .border_1();
+            swatch = match choice {
+                Some(c) => {
+                    let col = gpui::rgb(c.rgb());
+                    let border = if selected {
+                        theme.fg_base
+                    } else {
+                        gpui::Hsla::from(col)
+                    };
+                    swatch.bg(col).border_color(border)
+                }
+                None => swatch.border_color(if selected {
+                    theme.fg_base
+                } else {
+                    theme.border_active
+                }),
+            };
+            row = row.child(swatch.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    let _ = this
+                        .weak_root
+                        .update(cx, |root, cx| root.set_workspace_tint(&id_for, choice, cx));
+                    this.close(cx);
+                }),
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .child(label)
+            .child(row)
+            .into_any_element()
+    }
 }
 
 impl Render for WorkspaceRowMenu {
@@ -228,6 +307,7 @@ impl Render for WorkspaceRowMenu {
                 );
             card = card.child(row);
         }
+        card = card.child(self.render_color_row(cx));
 
         div()
             .absolute()
