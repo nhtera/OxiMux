@@ -28,6 +28,10 @@ pub use oximux_git::gh::CreatePrOptions;
 /// depend on the forge layer.
 pub use oximux_git::gh::MergeMethod;
 
+/// Issue/PR listing types. Re-exported so the Tasks page depends on the forge
+/// layer, not the CLI wrapper.
+pub use oximux_git::gh::{ForgeAssignee, ForgeItem, ForgeLabel, ForgeListFilter, ForgeState};
+
 pub use github_gh::GithubForge;
 
 /// A code-hosting forge's PR + CI operations, scoped to one working tree
@@ -68,4 +72,13 @@ pub trait ForgeProvider {
     /// Merge the current branch's open PR with the chosen method. Returns the
     /// forge's error text on failure (not mergeable, checks pending, ...).
     async fn merge_pr(&self, cwd: &Path, method: MergeMethod) -> Result<()>;
+
+    /// List the repo's issues for the Tasks page. Empty (never an error) when
+    /// the forge CLI is unavailable, the repo isn't hosted there, or nothing
+    /// matches — the page then shows an empty/guidance state.
+    async fn list_issues(&self, cwd: &Path, filter: ForgeListFilter) -> Vec<ForgeItem>;
+
+    /// List the repo's pull requests for the Tasks page. Same graceful-
+    /// degradation contract as [`ForgeProvider::list_issues`].
+    async fn list_prs(&self, cwd: &Path, filter: ForgeListFilter) -> Vec<ForgeItem>;
 }

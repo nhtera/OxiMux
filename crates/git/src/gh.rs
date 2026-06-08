@@ -356,6 +356,110 @@ fn tail_bytes(s: &str, budget: usize) -> String {
     format!("…(earlier log lines omitted)\n{}", &s[start..])
 }
 
+/// A GitHub label on an issue/PR, from `gh ... list --json labels`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ForgeLabel {
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A GitHub assignee, from `gh ... list --json assignees`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ForgeAssignee {
+    #[serde(default)]
+    pub login: String,
+}
+
+/// One issue or pull request row from `gh issue list` / `gh pr list`. The
+/// queried JSON fields are shared between the two, so a single struct covers
+/// both kinds; `state` is `OPEN` / `CLOSED` (PRs also report `MERGED`). Every
+/// field is `#[serde(default)]` so partial / older JSON still parses.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ForgeItem {
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub labels: Vec<ForgeLabel>,
+    #[serde(default)]
+    pub assignees: Vec<ForgeAssignee>,
+}
+
+/// Which state to list. Maps to `gh --state <open|closed|all>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForgeState {
+    #[default]
+    Open,
+    Closed,
+    All,
+}
+
+impl ForgeState {
+    fn flag(self) -> &'static str {
+        match self {
+            ForgeState::Open => "open",
+            ForgeState::Closed => "closed",
+            ForgeState::All => "all",
+        }
+    }
+}
+
+/// Filter for an issue/PR listing. `mine` adds `--assignee @me`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ForgeListFilter {
+    pub state: ForgeState,
+    pub mine: bool,
+}
+
+/// JSON fields requested for both listings — kept in one place so the two
+/// queries stay in lockstep with [`ForgeItem`]'s fields.
+const FORGE_LIST_FIELDS: &str = "number,title,state,url,labels,assignees";
+
+/// Cap on rows fetched per listing: a generous single page that keeps the JSON
+/// small and the list responsive without paginating.
+const FORGE_LIST_LIMIT: &str = "50";
+
+/// List issues for the repo at `cwd` via `gh issue list --json ...`. Returns an
+/// empty list (never an error) when `gh` is absent/unauthenticated, the repo
+/// isn't a GitHub remote, or the JSON can't be parsed — the Tasks page then
+/// shows an empty/guidance state rather than a broken control.
+pub async fn issue_list(cwd: impl AsRef<Path>, filter: ForgeListFilter) -> Vec<ForgeItem> {
+    forge_list(cwd, "issue", filter).await
+}
+
+/// List pull requests for the repo at `cwd` via `gh pr list --json ...`. Same
+/// graceful-degradation contract as [`issue_list`].
+pub async fn pr_list(cwd: impl AsRef<Path>, filter: ForgeListFilter) -> Vec<ForgeItem> {
+    forge_list(cwd, "pr", filter).await
+}
+
+async fn forge_list(cwd: impl AsRef<Path>, kind: &str, filter: ForgeListFilter) -> Vec<ForgeItem> {
+    let mut cmd = GhCmd::new(cwd)
+        .args([
+            kind,
+            "list",
+            "--json",
+            FORGE_LIST_FIELDS,
+            "--state",
+            filter.state.flag(),
+            "--limit",
+            FORGE_LIST_LIMIT,
+        ])
+        .timeout(Duration::from_secs(15));
+    if filter.mine {
+        cmd = cmd.args(["--assignee", "@me"]);
+    }
+    let Ok((_ok, stdout, _stderr)) = cmd.run_raw().await else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<ForgeItem>>(stdout.trim()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +559,49 @@ mod tests {
         // No repo, or `gh` absent → non-zero/err → false, never panics.
         let tmp = tempfile::tempdir().unwrap();
         assert!(!has_open_pr(tmp.path()).await);
+    }
+
+    #[test]
+    fn parses_forge_items_json() {
+        let json = r#"[
+            {"number":42,"title":"Fix crash","state":"OPEN","url":"https://x/42",
+             "labels":[{"name":"bug"},{"name":"p1"}],"assignees":[{"login":"alice"}]},
+            {"number":7,"title":"Docs","state":"CLOSED","url":"https://x/7",
+             "labels":[],"assignees":[]}
+        ]"#;
+        let items: Vec<ForgeItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, 42);
+        assert_eq!(items[0].title, "Fix crash");
+        assert_eq!(items[0].state, "OPEN");
+        assert_eq!(items[0].labels.len(), 2);
+        assert_eq!(items[0].labels[1].name, "p1");
+        assert_eq!(items[0].assignees[0].login, "alice");
+        assert!(items[1].assignees.is_empty());
+    }
+
+    #[test]
+    fn forge_items_json_tolerates_missing_fields() {
+        // Partial JSON (only number+title) still parses via serde defaults.
+        let json = r#"[{"number":3,"title":"bare"}]"#;
+        let items: Vec<ForgeItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(items[0].number, 3);
+        assert!(items[0].url.is_empty());
+        assert!(items[0].labels.is_empty());
+    }
+
+    #[test]
+    fn forge_state_flag_maps_to_gh_values() {
+        assert_eq!(ForgeState::Open.flag(), "open");
+        assert_eq!(ForgeState::Closed.flag(), "closed");
+        assert_eq!(ForgeState::All.flag(), "all");
+        assert_eq!(ForgeState::default(), ForgeState::Open);
+    }
+
+    #[tokio::test]
+    async fn issue_list_empty_outside_repo() {
+        // No repo / no `gh` → graceful empty list, never panics.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(issue_list(tmp.path(), ForgeListFilter::default()).await.is_empty());
     }
 }
