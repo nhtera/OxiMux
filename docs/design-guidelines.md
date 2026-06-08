@@ -419,6 +419,11 @@ or `WorkspaceRoot::push_toast` when the call site already holds the root.
   than a different bg.
 - **Selection ≠ focus.** `selection` is for text and the active-current row.
   `border_active` + `focus_ring` is for the focused pane.
+- **Focus-gain flash (splits only).** When focus moves between pane groups in a
+  split, the newly-focused leaf gets a brief `focus_ring` rim (≤2px, ~0.28s,
+  ease-out to transparent). It's a transient locator, not a state — the steady
+  focus marker stays the tab strip's bottom border. Single-group layouts don't
+  flash (no ambiguity). Reuses `focus_ring`; no new token.
 - **No drop shadows** on dark UI. They look muddy. Use a 1px border in `border_active`
   instead.
 - **No gradients** outside of the focus ring.

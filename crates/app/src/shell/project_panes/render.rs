@@ -2,15 +2,17 @@
 //! emits a flex layout where Split nodes become divider-separated rows
 //! / columns and Leaf nodes become `PaneGroup` entities.
 //!
-//! Pure view construction — no mutation. Drag-resize between sibling
-//! groups is deferred to a later slice (OQ2 in the step-06 plan); for
-//! v1 splits render at fixed 50/50.
+//! View construction is otherwise pure; the one exception is two render-phase
+//! fields (`rim_flash_token`, `last_active_group`) updated in place to detect a
+//! cross-group focus move for the focused-pane rim flash. Those updates never
+//! call `notify()`, so they can't re-trigger a render.
 
 use gpui::{
-    AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, prelude::FluentBuilder, px,
+    Animation, AnimationExt, AnyElement, App, AppContext, Context, DragMoveEvent, ElementId, Entity,
+    ExternalPaths, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
+use std::time::Duration;
 
 use std::collections::HashSet;
 
@@ -194,6 +196,22 @@ impl Render for ProjectPanes {
         let theme = self.theme;
         let tree = self.manager().group_tree().clone();
         let active_group_id = self.manager().active_group_id();
+
+        // Focused-pane rim flash: when focus moves to a *different* group while
+        // the layout is split, bump the flash token so the newly focused leaf
+        // replays a brief focus_ring rim. Single-group layouts don't flash —
+        // there's no ambiguity about where focus is. The very first focus
+        // (no prior group) is skipped so a fresh window doesn't flash on open.
+        let is_split = self.manager().in_order_groups().len() > 1;
+        self.rim_flash_token = advance_rim_flash(
+            self.last_active_group,
+            active_group_id,
+            is_split,
+            self.rim_flash_token,
+        );
+        self.last_active_group = Some(active_group_id);
+        let rim_flash = is_split.then_some(self.rim_flash_token);
+
         let hovered = self.hovered_drop_target();
         let entity = cx.entity().clone();
         // Top-row leaves hoist their strip into the workspace's top bar
@@ -204,6 +222,7 @@ impl Render for ProjectPanes {
             &tree,
             self,
             active_group_id,
+            rim_flash,
             hovered,
             entity,
             theme,
@@ -220,6 +239,7 @@ fn render_tree(
     node: &PaneTree<PaneGroupId>,
     panes: &ProjectPanes,
     active_group_id: PaneGroupId,
+    rim_flash: Option<u64>,
     hovered: Option<TabDragHoveredTarget>,
     project_panes_entity: Entity<ProjectPanes>,
     theme: oximux_settings::Theme,
@@ -236,6 +256,7 @@ fn render_tree(
                     .size_full()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
+                    .relative()
                     .overflow_hidden();
                 let is_focused = *id == active_group_id;
                 let body_zone = hovered.and_then(|h| (h.group_id == *id).then_some(h.zone));
@@ -247,12 +268,20 @@ fn render_tree(
                     theme,
                     is_focused,
                 );
+                // Brief focus-ring rim when this leaf just gained focus in a
+                // split. `rim_flash` carries the per-focus token (None when not
+                // split); only the focused leaf paints it.
+                let flash = rim_flash
+                    .filter(|_| is_focused)
+                    .map(|token| rim_flash_overlay(*id, token, theme));
                 // Hoisted leaves render BARE bodies — their strip is
                 // already painted in the workspace top bar (see
                 // `topmost_tab_strip`). Non-hoisted leaves (e.g. a
                 // vertical-split's bottom row) keep their strip inline.
                 if hoisted.contains(id) {
-                    slot.child(group_body).into_any_element()
+                    slot.child(group_body)
+                        .when_some(flash, |s, f| s.child(f))
+                        .into_any_element()
                 } else {
                     slot.child(build_tab_strip_for(
                         group,
@@ -264,6 +293,7 @@ fn render_tree(
                         cx,
                     ))
                     .child(group_body)
+                    .when_some(flash, |s, f| s.child(f))
                     .into_any_element()
                 }
             }
@@ -358,6 +388,7 @@ fn render_tree(
                     child,
                     panes,
                     active_group_id,
+                    rim_flash,
                     hovered,
                     project_panes_entity.clone(),
                     theme,
@@ -378,6 +409,47 @@ fn render_tree(
             row.into_any_element()
         }
     }
+}
+
+/// Decide the next rim-flash token. Bumps only when focus actually moved to a
+/// different group while the layout is split AND there was a prior focused
+/// group (so a freshly opened window doesn't flash on first render). A bumped
+/// token restarts the flash animation; an unchanged token lets the current
+/// flash settle. Pure so the trigger rule is unit-testable without GPUI.
+fn advance_rim_flash(
+    prev: Option<PaneGroupId>,
+    current: PaneGroupId,
+    is_split: bool,
+    token: u64,
+) -> u64 {
+    if is_split && prev.is_some() && prev != Some(current) {
+        token.wrapping_add(1)
+    } else {
+        token
+    }
+}
+
+/// Quick focus-ring rim drawn over a leaf the instant it gains focus in a
+/// split. Animates from a visible ring to fully transparent (~0.28s) so it
+/// reads as a flash and leaves no residue — the persistent focus marker stays
+/// the tab strip's bottom border. `token` keys the animation id so every fresh
+/// focus replays it; a stable token lets a continuously-focused leaf settle at
+/// transparent rather than re-flashing each frame.
+fn rim_flash_overlay(id: PaneGroupId, token: u64, theme: oximux_settings::Theme) -> AnyElement {
+    let ring = theme.focus_ring;
+    div()
+        .absolute()
+        .inset_0()
+        .border_2()
+        .border_color(ring)
+        .with_animation(
+            ElementId::Name(format!("pane-rim-flash-{}-{}", id.0, token).into()),
+            // ease-out so the rim drops fast then settles — reads as a flash,
+            // not a lingering fade.
+            Animation::new(Duration::from_secs_f32(0.28)).with_easing(gpui::ease_out_quint()),
+            move |el, delta| el.border_color(Hsla { a: 1.0 - delta, ..ring }),
+        )
+        .into_any_element()
 }
 
 /// Compute new weights when the user drags divider `divider_idx` to
@@ -675,6 +747,20 @@ fn zone_overlay(zone: Zone, theme: oximux_settings::Theme) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rim_flash_bumps_only_on_cross_group_move_while_split() {
+        let a = PaneGroupId(0);
+        let b = PaneGroupId(1);
+        // First focus (no prior): never flash, even though "split".
+        assert_eq!(advance_rim_flash(None, a, true, 0), 0);
+        // Same group re-rendered: no bump.
+        assert_eq!(advance_rim_flash(Some(a), a, true, 5), 5);
+        // Focus moved a -> b while split: bump.
+        assert_eq!(advance_rim_flash(Some(a), b, true, 5), 6);
+        // Focus moved but NOT split (single group): no bump.
+        assert_eq!(advance_rim_flash(Some(a), b, false, 5), 5);
+    }
 
     #[test]
     fn redistribute_two_pane_at_midpoint_is_half() {

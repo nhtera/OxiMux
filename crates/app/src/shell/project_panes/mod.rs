@@ -97,6 +97,14 @@ pub struct ProjectPanes {
     /// every shell spawn (initial group, split-spawn, +-new-tab) so
     /// labels stay unique across panes (global, not per-group).
     next_terminal_n: u64,
+    /// Active group at the last render, so a focus move between groups can be
+    /// detected and trigger the focused-pane rim flash. `None` until first
+    /// render.
+    last_active_group: Option<PaneGroupId>,
+    /// Bumped each time focus moves to a different group while split. Keys the
+    /// rim-flash animation id so a fresh focus restarts the flash; a stable
+    /// token lets it settle (the animation ends transparent).
+    rim_flash_token: u64,
 }
 
 impl ProjectPanes {
@@ -155,6 +163,8 @@ impl ProjectPanes {
             workspace_tint: None,
             hovered_drop_target: None,
             next_terminal_n: 1,
+            last_active_group: None,
+            rim_flash_token: 0,
         }
     }
 
