@@ -255,6 +255,20 @@ enum ResolvedMode {
     BadConfig(String),
 }
 
+/// Resolve the configured AI agent when (and only when) the user picked Agent
+/// mode and the config is valid. `None` for Off / Heuristic / malformed config
+/// — callers (e.g. the PR-draft path) fall back to a deterministic generator
+/// rather than spawning a CLI. Shares the single settings→mode resolution in
+/// [`mode_from_settings`] so the commit-message and PR-draft paths agree.
+pub(in crate::shell::source_control) fn agent_config_from_settings(
+    cx: &gpui::App,
+) -> Option<AgentConfig> {
+    match mode_from_settings(cx) {
+        ResolvedMode::Ok(Mode::Agent(config)) => Some(config),
+        _ => None,
+    }
+}
+
 /// Read the user's `commit_message_ai.toml` settings (or the
 /// in-memory default if the global isn't installed — defensive for
 /// the test harness) and convert to the agents-crate [`Mode`].

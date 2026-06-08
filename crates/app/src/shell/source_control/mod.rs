@@ -32,6 +32,7 @@ pub mod filter;
 pub mod graph;
 pub mod graph_row;
 pub mod picker_wiring;
+pub mod pr_draft;
 pub mod pr_ops;
 pub mod primary_action;
 pub mod scope;
@@ -48,6 +49,7 @@ pub mod tree;
 pub use settings_persistence::{load_initial_commit_draft, merge_base_ref_into_settings};
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled,
@@ -161,6 +163,10 @@ pub struct SourceControlPanel {
     _pr_dialog_observer: Option<Subscription>,
     /// Holds the PR dialog's AI-draft generation task.
     _pr_ai_task: Option<gpui::Task<()>>,
+    /// Shared cancel flag for an in-flight agent PR draft. Flipped when the
+    /// dialog is dismissed so the agent CLI is killed mid-run instead of
+    /// orphaned (the deterministic draft path ignores it).
+    _pr_draft_cancel: Option<Arc<AtomicBool>>,
     /// Subscription to the composer's `CreatePrRequested` event.
     _commit_area_sub: Subscription,
 
@@ -422,6 +428,7 @@ impl SourceControlPanel {
             pr_dialog: None,
             _pr_dialog_observer: None,
             _pr_ai_task: None,
+            _pr_draft_cancel: None,
             _commit_area_sub: commit_area_sub,
             base_ref: initial_base_ref,
             current_op: initial_op,
@@ -672,8 +679,18 @@ impl SourceControlPanel {
             cx.new(|cx| PrCreateDialog::new(on_commit, theme, density, typography, window, cx));
         let observer = cx.observe_in(&dialog, window, |panel, dlg, _window, cx| {
             if dlg.read(cx).is_closed() {
+                // Abort any in-flight agent draft so a dismissed dialog kills
+                // the CLI mid-run rather than leaving it orphaned.
+                if let Some(cancel) = &panel._pr_draft_cancel {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                // Drop the GPUI draft task too: its `rx.await` then errors out
+                // and resolves to `None` rather than applying a late result to
+                // the now-closed dialog entity (which the task keeps alive).
+                panel._pr_ai_task = None;
                 panel.pr_dialog = None;
                 panel._pr_dialog_observer = None;
+                panel._pr_draft_cancel = None;
                 cx.notify();
             }
         });
@@ -704,19 +721,42 @@ impl SourceControlPanel {
         }
     }
 
-    /// Fill the open PR dialog's title + body from the branch's commits
-    /// (off-thread). No-op when the dialog isn't open. On failure the dialog's
-    /// drafting flag is cleared so its button re-enables.
+    /// Fill the open PR dialog's title + body (off-thread). When the user has
+    /// the commit-message AI in Agent mode, drafts via the agent over the
+    /// branch-range diff; otherwise (and on any agent failure) falls back to the
+    /// deterministic commit-subject draft. No-op when the dialog isn't open. On
+    /// total failure the dialog's drafting flag is cleared so its button
+    /// re-enables.
     fn draft_pr_from_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = self.pr_dialog.clone() else {
             return;
         };
         let workdir = self.repo.workdir().to_path_buf();
+        let agent_config = ai_generation::agent_config_from_settings(cx);
+        // Signal any prior in-flight draft to abort before replacing the flag,
+        // so a re-invocation can't leave an older agent run racing to deliver.
+        if let Some(old) = self._pr_draft_cancel.take() {
+            old.store(true, Ordering::SeqCst);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self._pr_draft_cancel = Some(cancel.clone());
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<(String, String)>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let _ = tx.send(oximux_git::pr_context::draft_from_commits(&workdir).await);
+                    let result = match agent_config {
+                        Some(config) => {
+                            match pr_draft::generate_pr_draft(config, workdir.clone(), cancel).await
+                            {
+                                Some(draft) => Some(draft),
+                                // Agent unavailable/failed — fall back so the
+                                // button still fills something useful.
+                                None => oximux_git::pr_context::draft_from_commits(&workdir).await,
+                            }
+                        }
+                        None => oximux_git::pr_context::draft_from_commits(&workdir).await,
+                    };
+                    let _ = tx.send(result);
                 });
             }
             Err(_) => {

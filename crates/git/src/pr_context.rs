@@ -84,6 +84,85 @@ pub async fn draft_from_commits(workdir: &Path) -> Option<(String, String)> {
     format_draft(&commit_subjects(workdir).await)
 }
 
+/// The branch-range diff context an AI drafter reasons over: the same shape as
+/// the staged-diff context, but measured across `<base>..HEAD` (the commits the
+/// PR will contain) instead of the index. Best-effort — `None` when no base
+/// resolves (a purely local branch), when the range is empty, or on any git
+/// failure, so the caller can fall back to the deterministic commit draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeContext {
+    /// Current branch name, or `None` when HEAD is detached.
+    pub branch: Option<String>,
+    /// `git diff --name-status <base>..HEAD` output (trimmed).
+    pub summary: String,
+    /// `git diff --patch <base>..HEAD` output.
+    pub patch: String,
+}
+
+/// Fetch the `<base>..HEAD` diff context for AI PR drafting. `None` when no
+/// base resolves, the range has no changes, or git fails — agent drafting
+/// requires a resolvable base, and the caller degrades to the commit-subject
+/// draft otherwise. Base resolution mirrors [`draft_from_commits`].
+pub async fn fetch_range_context(workdir: &Path) -> Option<RangeContext> {
+    let base = resolve_base(workdir).await?;
+    let range = format!("{base}..HEAD");
+
+    let summary_raw = GitCmd::new(workdir)
+        .args(["diff", "--name-status", &range])
+        .run_raw()
+        .await
+        .ok()?;
+    if !summary_raw.status.success() {
+        return None;
+    }
+    let summary = String::from_utf8_lossy(&summary_raw.stdout)
+        .trim_end()
+        .to_string();
+    if summary.is_empty() {
+        return None;
+    }
+
+    let patch_raw = GitCmd::new(workdir)
+        .args([
+            "diff",
+            "--patch",
+            "--minimal",
+            "--no-color",
+            "--no-ext-diff",
+            &range,
+        ])
+        .run_raw()
+        .await
+        .ok()?;
+    if !patch_raw.status.success() {
+        return None;
+    }
+    let patch = String::from_utf8_lossy(&patch_raw.stdout).to_string();
+
+    let branch_raw = GitCmd::new(workdir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .run_raw()
+        .await
+        .ok();
+    let branch = branch_raw.and_then(|raw| {
+        if !raw.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&raw.stdout).trim().to_string();
+        if name.is_empty() || name == "HEAD" {
+            None
+        } else {
+            Some(name)
+        }
+    });
+
+    Some(RangeContext {
+        branch,
+        summary,
+        patch,
+    })
+}
+
 /// Pure title/body shaping from commit subjects (oldest first). Split out for
 /// unit testing; see [`draft_from_commits`] for the I/O entry point.
 fn format_draft(subjects: &[String]) -> Option<(String, String)> {
@@ -103,10 +182,76 @@ fn format_draft(subjects: &[String]) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        for args in [
+            &["init", "--initial-branch=main"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("git setup");
+        }
+        dir
+    }
+
+    fn run_git(workdir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .status()
+            .expect("git run");
+        assert!(status.success(), "git {args:?} failed");
+    }
 
     #[test]
     fn no_commits_yields_none() {
         assert!(format_draft(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn range_context_none_without_base() {
+        // A local-only repo with no upstream / origin ref has no resolvable
+        // base, so agent drafting is unavailable and the caller falls back.
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "base").expect("write");
+        run_git(dir.path(), &["add", "a.txt"]);
+        run_git(dir.path(), &["commit", "-m", "base: initial"]);
+        assert!(fetch_range_context(dir.path()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn range_context_spans_base_to_head() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "base\n").expect("write");
+        run_git(dir.path(), &["add", "a.txt"]);
+        run_git(dir.path(), &["commit", "-m", "base: initial"]);
+        // Stand in for a pushed base branch so resolve_base finds origin/main.
+        run_git(dir.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(dir.path().join("b.txt"), "feature line\n").expect("write");
+        run_git(dir.path(), &["add", "b.txt"]);
+        run_git(dir.path(), &["commit", "-m", "feat: add b"]);
+
+        let ctx = fetch_range_context(dir.path())
+            .await
+            .expect("range context present");
+        assert_eq!(ctx.branch.as_deref(), Some("main"));
+        assert!(ctx.summary.contains("b.txt"), "summary names the new file");
+        assert!(
+            !ctx.summary.contains("a.txt"),
+            "base file is outside the range"
+        );
+        assert!(
+            ctx.patch.contains("feature line"),
+            "patch carries the range diff"
+        );
     }
 
     #[test]
