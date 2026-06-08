@@ -32,9 +32,9 @@ pub mod workspace_row;
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
-    Render, StatefulInteractiveElement, Styled, UniformListScrollHandle, WeakEntity, Window, div,
-    px, svg,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, UniformListScrollHandle,
+    WeakEntity, Window, div, px, svg,
 };
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
@@ -51,6 +51,7 @@ use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
 use crate::shell::left_rail::toolbar::render_toolbar;
 use crate::shell::left_rail::workspace_list_render::{WorkspaceSortMode, sort_workspaces};
+use crate::shell::tasks_view::TasksView;
 use crate::workspace_root::WorkspaceRoot;
 
 const HEADER_ICON_SIZE: f32 = 14.0;
@@ -60,7 +61,9 @@ const HEADER_ICON_SIZE: f32 = 14.0;
 pub type LatestStatusMap = HashMap<String, Option<AgentStatus>>;
 
 pub struct LeftRail {
-    active_nav: NavItem,
+    /// Which nav page is open, or `None` for the home view (workspace list,
+    /// no nav row highlighted). Clicking the active nav toggles back to home.
+    active_nav: Option<NavItem>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -100,19 +103,27 @@ pub struct LeftRail {
     /// Scroll position for the agents dashboard `uniform_list`. Stored on
     /// `LeftRail` so it survives re-renders while the Agents nav is active.
     agents_scroll: UniformListScrollHandle,
+    /// Tasks page entity (GitHub issue/PR browser), mounted when the Tasks nav
+    /// is active. Owns its own async fetch + filter state.
+    tasks_view: Entity<TasksView>,
 }
 
 impl LeftRail {
     /// Default-construct theme/density/typography. WorkspaceRoot uses the
     /// same constants in its own `new`, so the rail and root always agree.
-    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, cx: &mut Context<Self>) -> Self {
         let density = Density::cockpit();
+        let theme = Theme::charcoal();
+        let typography = Typography::cockpit();
+        let tasks_view = cx.new(|cx| {
+            TasksView::new(weak_root.clone(), theme, density, typography.clone(), cx)
+        });
         Self {
-            active_nav: NavItem::Tasks,
+            active_nav: None,
             weak_root,
-            theme: Theme::charcoal(),
+            theme,
             density,
-            typography: Typography::cockpit(),
+            typography,
             projects: Vec::new(),
             active_project_id: None,
             active_workspace_id: None,
@@ -125,6 +136,7 @@ impl LeftRail {
             collapsed: HashSet::new(),
             sort_mode: WorkspaceSortMode::default(),
             agents_scroll: UniformListScrollHandle::new(),
+            tasks_view,
         }
     }
 
@@ -219,6 +231,7 @@ impl LeftRail {
         diff_counts: HashMap<String, DiffCounts>,
         cx: &mut Context<Self>,
     ) {
+        let project_changed = self.active_project_id != active_project_id;
         self.projects = projects;
         self.active_project_id = active_project_id;
         self.active_workspace_id = active_workspace_id;
@@ -226,17 +239,48 @@ impl LeftRail {
         self.latest_status = latest_status;
         self.live_worktrees = live_worktrees;
         self.diff_counts = diff_counts;
+
+        // Keep the Tasks page's project in sync; re-fetch only when the active
+        // project actually changes while the page is open.
+        let active = self.active_project();
+        let tasks_open = self.active_nav == Some(NavItem::Tasks);
+        self.tasks_view.update(cx, |tv, cx| {
+            tv.set_project(active, cx);
+            if project_changed && tasks_open {
+                tv.refresh(cx);
+            }
+        });
         cx.notify();
     }
 
-    /// Test-only inspector for the currently-active nav item.
+    /// Test-only inspector for the currently-active nav item (`None` = home).
     #[doc(hidden)]
-    pub fn active_nav(&self) -> NavItem {
+    pub fn active_nav(&self) -> Option<NavItem> {
         self.active_nav
     }
 
+    /// Resolve the active `Project` from the current snapshot, if any.
+    fn active_project(&self) -> Option<oximux_core::Project> {
+        let id = self.active_project_id.as_ref()?;
+        self.projects.iter().find(|p| &p.id == id).cloned()
+    }
+
+    /// Toggle a nav page. Clicking the active page returns to the home view
+    /// (workspace list). Opening the Tasks page seeds it with the active
+    /// project and triggers a fetch (cheap if already loaded).
     pub fn select_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
-        self.active_nav = item;
+        self.active_nav = if self.active_nav == Some(item) {
+            None
+        } else {
+            Some(item)
+        };
+        if self.active_nav == Some(NavItem::Tasks) {
+            let active = self.active_project();
+            self.tasks_view.update(cx, |tv, cx| {
+                tv.set_project(active, cx);
+                tv.activate(cx);
+            });
+        }
         cx.notify();
     }
 }
@@ -248,10 +292,10 @@ impl Render for LeftRail {
         let typography = self.typography.clone();
         let entity = cx.entity().clone();
 
-        // The flex-1 body slot changes depending on the active nav item.
-        // Agents → agents dashboard (uniform_list across all projects).
-        // All other nav items → the workspace list (existing behavior).
-        let content_body: gpui::AnyElement = if self.active_nav == NavItem::Agents {
+        // The flex-1 body slot changes depending on the active nav page.
+        // Agents → agents dashboard; Tasks → issue/PR browser; home (None) and
+        // the not-yet-built shells → the workspace list.
+        let content_body: gpui::AnyElement = if self.active_nav == Some(NavItem::Agents) {
             render_agents_dashboard(
                 &self.projects,
                 &self.workspaces_by_project,
@@ -264,6 +308,14 @@ impl Render for LeftRail {
                 density,
                 &typography,
             )
+        } else if self.active_nav == Some(NavItem::Tasks) {
+            div()
+                .flex()
+                .flex_col()
+                .h_full()
+                .w_full()
+                .child(self.tasks_view.clone())
+                .into_any_element()
         } else {
             let workspace_list = render_workspace_list(
                 self.projects.clone(),

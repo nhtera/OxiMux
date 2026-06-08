@@ -51,18 +51,20 @@ impl NavItem {
     }
 }
 
-/// Background for an active vs inactive nav row. Pure — unit-testable.
-pub fn nav_row_bg(item: NavItem, active: NavItem, theme: Theme) -> Hsla {
-    if item == active {
+/// Background for a nav row. `active` is `None` when the home (workspace list)
+/// body is showing, so no nav row is highlighted. Pure — unit-testable.
+pub fn nav_row_bg(item: NavItem, active: Option<NavItem>, theme: Theme) -> Hsla {
+    if active == Some(item) {
         theme.bg_panel_alt
     } else {
         theme.bg_panel
     }
 }
 
-/// Foreground (icon + label) color for an active vs inactive nav row.
-pub fn nav_row_fg(item: NavItem, active: NavItem, theme: Theme) -> Hsla {
-    if item == active {
+/// Foreground (icon + label) color for a nav row. See [`nav_row_bg`] for the
+/// `active == None` (home) case.
+pub fn nav_row_fg(item: NavItem, active: Option<NavItem>, theme: Theme) -> Hsla {
+    if active == Some(item) {
         theme.fg_base
     } else {
         theme.fg_muted
@@ -70,7 +72,7 @@ pub fn nav_row_fg(item: NavItem, active: NavItem, theme: Theme) -> Hsla {
 }
 
 pub fn render_nav_section(
-    active: NavItem,
+    active: Option<NavItem>,
     rail: &Entity<LeftRail>,
     theme: Theme,
     density: Density,
@@ -92,7 +94,7 @@ pub fn render_nav_section(
 
 fn render_nav_row(
     item: NavItem,
-    active: NavItem,
+    active: Option<NavItem>,
     rail: Entity<LeftRail>,
     theme: Theme,
     density: Density,
@@ -140,7 +142,7 @@ mod tests {
     fn active_tasks_returns_bg_panel_alt() {
         let t = Theme::charcoal();
         assert_eq!(
-            nav_row_bg(NavItem::Tasks, NavItem::Tasks, t),
+            nav_row_bg(NavItem::Tasks, Some(NavItem::Tasks), t),
             t.bg_panel_alt
         );
     }
@@ -148,14 +150,25 @@ mod tests {
     #[test]
     fn inactive_tasks_returns_bg_panel() {
         let t = Theme::charcoal();
-        assert_eq!(nav_row_bg(NavItem::Tasks, NavItem::Agents, t), t.bg_panel);
+        assert_eq!(
+            nav_row_bg(NavItem::Tasks, Some(NavItem::Agents), t),
+            t.bg_panel
+        );
+    }
+
+    #[test]
+    fn home_state_highlights_no_row() {
+        // active == None => home (workspace list) showing, nothing highlighted.
+        let t = Theme::charcoal();
+        assert_eq!(nav_row_bg(NavItem::Tasks, None, t), t.bg_panel);
+        assert_eq!(nav_row_fg(NavItem::Tasks, None, t), t.fg_muted);
     }
 
     #[test]
     fn active_automations_returns_bg_panel_alt() {
         let t = Theme::charcoal();
         assert_eq!(
-            nav_row_bg(NavItem::Automations, NavItem::Automations, t),
+            nav_row_bg(NavItem::Automations, Some(NavItem::Automations), t),
             t.bg_panel_alt
         );
     }
@@ -164,7 +177,7 @@ mod tests {
     fn active_agents_returns_bg_panel_alt() {
         let t = Theme::charcoal();
         assert_eq!(
-            nav_row_bg(NavItem::Agents, NavItem::Agents, t),
+            nav_row_bg(NavItem::Agents, Some(NavItem::Agents), t),
             t.bg_panel_alt
         );
     }
@@ -173,7 +186,7 @@ mod tests {
     fn active_search_returns_bg_panel_alt() {
         let t = Theme::charcoal();
         assert_eq!(
-            nav_row_bg(NavItem::Search, NavItem::Search, t),
+            nav_row_bg(NavItem::Search, Some(NavItem::Search), t),
             t.bg_panel_alt
         );
     }
@@ -181,19 +194,28 @@ mod tests {
     #[test]
     fn inactive_search_returns_bg_panel() {
         let t = Theme::charcoal();
-        assert_eq!(nav_row_bg(NavItem::Search, NavItem::Tasks, t), t.bg_panel);
+        assert_eq!(
+            nav_row_bg(NavItem::Search, Some(NavItem::Tasks), t),
+            t.bg_panel
+        );
     }
 
     #[test]
     fn active_row_uses_fg_base() {
         let t = Theme::charcoal();
-        assert_eq!(nav_row_fg(NavItem::Tasks, NavItem::Tasks, t), t.fg_base);
+        assert_eq!(
+            nav_row_fg(NavItem::Tasks, Some(NavItem::Tasks), t),
+            t.fg_base
+        );
     }
 
     #[test]
     fn inactive_row_uses_fg_muted() {
         let t = Theme::charcoal();
-        assert_eq!(nav_row_fg(NavItem::Tasks, NavItem::Agents, t), t.fg_muted);
+        assert_eq!(
+            nav_row_fg(NavItem::Tasks, Some(NavItem::Agents), t),
+            t.fg_muted
+        );
     }
 
     #[test]

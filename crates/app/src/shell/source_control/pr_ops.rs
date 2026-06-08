@@ -60,7 +60,7 @@ pub fn run_create_pr(area: &mut CommitArea, opts: CreatePrOptions, cx: &mut Cont
                     // status so the button stops offering Create PR right away
                     // instead of after the 30s throttle.
                     area.pr_status_dirty = true;
-                    open_in_browser(&url);
+                    crate::shell::open_url::open_url(&url);
                     tracing::info!(target: "oximux_app::source_control", url = %url, "pull request created");
                 }
                 Err(err) => {
@@ -125,14 +125,3 @@ pub fn run_merge_pr(area: &mut CommitArea, method: MergeMethod, cx: &mut Context
     area._commit_task = Some(task);
 }
 
-/// Open `url` in the default browser. macOS-only app, so `open <url>` is the
-/// portable launcher. Best-effort: a spawn failure is logged, not surfaced —
-/// the PR already exists; the URL is also in the tracing log.
-fn open_in_browser(url: &str) {
-    if url.is_empty() {
-        return;
-    }
-    if let Err(err) = std::process::Command::new("open").arg(url).spawn() {
-        tracing::warn!(target: "oximux_app::source_control", ?err, "failed to open PR url in browser");
-    }
-}
