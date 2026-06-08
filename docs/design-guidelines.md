@@ -380,6 +380,38 @@ Reference: `source_control::commit_ops::run_remote` and `run_commit_verb` both
 encode this contract via a single-flight `in_flight: Arc<AtomicBool>` flag +
 status-row label updates.
 
+## Toasts (transient feedback)
+
+Quiet, transient, bottom-right. For *fleeting cross-surface events that have no
+permanent home* — agent finished/failed, commit/push failed, PR opened, clipboard
+copies. The status bar carries persistent repo/agent *state*; a toast carries the
+one-shot "this just happened" beat that would otherwise be silent or buried in a
+panel the user has scrolled away from.
+
+Appearance (honor the floating-surface contract):
+
+- `bg_overlay` card, 1px `border_active`, **no shadow, no gradient**.
+- A single 2px left accent bar in the status hue — `status_ok` (success),
+  `status_error` (error), `status_info` (info). Text stays `fg_base`. One accent
+  per card; the bar *is* the accent.
+- Auto-dismiss after a few seconds; stack capped (oldest trims) so a burst can't
+  grow without bound. Non-interactive — never steals clicks from beneath.
+
+When NOT to toast:
+
+- **Routine fast local ops** (0–100ms per In-Flight Feedback) — no toast; the
+  result is its own feedback.
+- **Persistent state** that belongs in the status bar or a panel — toasts are for
+  events, not status.
+- **Approval / waiting-for-input** agent edges — those already raise the in-pane
+  attention ring + OS banner; a toast on top is noise. Only terminal edges
+  (finished / failed) toast.
+
+Implementation: `shell::toast::ToastLayer` (per-window, mounted topmost so it
+shows over modals). Events route via the free `shell::toast::toast(cx, kind, text)`
+to the active window's layer (`ToastBus` global, refreshed on window activation),
+or `WorkspaceRoot::push_toast` when the call site already holds the root.
+
 ## Composition rules
 
 - **One accent per surface.** A row uses `status_warn` *or* `status_info`, not both.

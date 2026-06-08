@@ -104,6 +104,7 @@ use crate::shell::{
     },
     status_bar,
     tab_context_menu::TabContextMenu,
+    toast::{ToastKind, ToastLayer},
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS},
     top_bar,
     workspace_dialog::{OnSubmit as OnWorkspaceSubmit, WorkspaceDialog},
@@ -179,6 +180,10 @@ pub struct WorkspaceRoot {
     /// terminal + AI settings that already round-trip to disk, plus
     /// read-only keybindings / appearance / about references.
     pub(crate) settings_modal: Entity<SettingsModal>,
+    /// Quiet transient toast stack (bottom-right). Surfaces fleeting
+    /// cross-surface events (agent done, commit failed, PR opened, clipboard)
+    /// that the status bar's persistent state doesn't cover.
+    pub(crate) toast_layer: Entity<ToastLayer>,
     /// In-window floating ("PiP") terminal. `None` until first toggled;
     /// retained across hides (PTY persists) until the card's close button
     /// drops it. `floating_terminal_visible` gates whether it renders.
@@ -494,6 +499,10 @@ impl WorkspaceRoot {
                 cx,
             )
         });
+        let toast_layer = cx.new(|_| ToastLayer::new(theme, density, typography.clone()));
+        // Register this window's layer as the active toast surface up front so
+        // toasts work before the first window-activation event arrives.
+        crate::shell::toast::set_active_toast_layer(cx, toast_layer.downgrade());
         // When the settings modal closes (×, Esc, click-outside, or toggle),
         // return keyboard focus to the workspace root. The modal grabs focus
         // for its search field on open; without this the handle stays focused
@@ -567,6 +576,11 @@ impl WorkspaceRoot {
                 }
                 this.diff_refresh_focused = active;
                 if active {
+                    // Route toasts to whichever window the user is looking at.
+                    crate::shell::toast::set_active_toast_layer(
+                        cx,
+                        this.toast_layer.downgrade(),
+                    );
                     this.run_diff_refresh_round(cx);
                 }
             });
@@ -679,6 +693,7 @@ impl WorkspaceRoot {
             app_state,
             project_picker,
             settings_modal,
+            toast_layer,
             workspace_dialog,
             confirm_dialog: None,
             rename_tab_dialog: None,
@@ -1763,6 +1778,13 @@ impl WorkspaceRoot {
             let _ = p.close_active_group(window, cx);
         });
     }
+
+    /// Surface a quiet transient toast (bottom-right). The one entry point for
+    /// fleeting cross-surface events; routes to the owned `ToastLayer`.
+    pub(crate) fn push_toast(&self, kind: ToastKind, text: impl Into<String>, cx: &mut Context<Self>) {
+        let text = text.into();
+        self.toast_layer.update(cx, |layer, cx| layer.push(kind, text, cx));
+    }
 }
 
 // `build_project_panes` + restore helpers live in
@@ -1777,6 +1799,12 @@ impl Render for WorkspaceRoot {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
+
+        // Refresh toast tokens each render (same push-down doctrine as the
+        // rail/pane surfaces); store-only, no notify.
+        self.toast_layer.update(cx, |layer, _| {
+            layer.set_tokens(theme, density, typography.clone());
+        });
 
         // Status-bar pane count = visible pane-group leaves in the active
         // project (1 when no splits, N after Cmd+D).
@@ -3013,6 +3041,11 @@ impl Render for WorkspaceRoot {
             // Settings modal — appended last so it paints above all other
             // children (last child = topmost z-layer in GPUI).
             .child(self.settings_modal.clone())
+            // Toasts paint above even the modals so a transient event (commit
+            // failed, agent done) is never hidden behind an open dialog. The
+            // layer is non-interactive and bottom-right, so it doesn't steal
+            // clicks from whatever is beneath it.
+            .child(self.toast_layer.clone())
     }
 }
 

@@ -1220,6 +1220,11 @@ impl WorkspaceRoot {
     /// Copy the project's root path to the system clipboard.
     pub(crate) fn copy_project_path(&self, project: &Project, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(project.root_path.clone()));
+        self.push_toast(
+            crate::shell::toast::ToastKind::Success,
+            "Copied project path",
+            cx,
+        );
     }
 
     /// Open the plain confirm dialog for removing a project from the

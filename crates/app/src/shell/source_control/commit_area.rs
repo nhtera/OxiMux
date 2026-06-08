@@ -434,7 +434,17 @@ impl CommitArea {
                     self.schedule_draft_save(String::new(), cx);
                 }
             }
-            Err((label, error)) => self.status = CommitStatus::Failed(label.to_string(), error),
+            Err((label, error)) => {
+                // Transient cross-surface alert in addition to the inline
+                // status row, so a failure that scrolls off or happens while
+                // the panel is unfocused still registers.
+                crate::shell::toast::toast(
+                    cx,
+                    crate::shell::toast::ToastKind::Error,
+                    format!("{label} failed"),
+                );
+                self.status = CommitStatus::Failed(label.to_string(), error);
+            }
         }
     }
 

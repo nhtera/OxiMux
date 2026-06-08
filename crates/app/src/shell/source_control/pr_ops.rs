@@ -61,9 +61,19 @@ pub fn run_create_pr(area: &mut CommitArea, opts: CreatePrOptions, cx: &mut Cont
                     // instead of after the 30s throttle.
                     area.pr_status_dirty = true;
                     crate::shell::open_url::open_url(&url);
+                    crate::shell::toast::toast(
+                        cx,
+                        crate::shell::toast::ToastKind::Success,
+                        "Pull request opened",
+                    );
                     tracing::info!(target: "oximux_app::source_control", url = %url, "pull request created");
                 }
                 Err(err) => {
+                    crate::shell::toast::toast(
+                        cx,
+                        crate::shell::toast::ToastKind::Error,
+                        "PR creation failed",
+                    );
                     area.status = CommitStatus::Failed("create PR".to_string(), err);
                 }
             }

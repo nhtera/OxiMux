@@ -84,6 +84,18 @@ pub fn spawn_status_task(
                     };
                     notifier.notify(tab_id, kind, &label, &body, window_active_now);
                 }
+                // In-app toast for terminal lifecycle edges (finished /
+                // failed), independent of the OS banner's focus gate so the
+                // user also sees it inside the active window. Deliberately
+                // outside the `should_fire` rate limiter: the transition
+                // detector already yields one edge per genuine state change, so
+                // the toast can't spam, and it serves as the in-window fallback
+                // exactly when the banner is being suppressed.
+                if let Some((tk, text)) = toast_for_kind(kind, &label) {
+                    let _ = weak.update(cx, |_group, cx| {
+                        crate::shell::toast::toast(cx, tk, text);
+                    });
+                }
             }
             // Reset dedupe when leaving a notify-worthy state so re-entry can
             // fire immediately rather than waiting out the rate-limit window.
@@ -95,4 +107,45 @@ pub fn spawn_status_task(
             prev_status = new_status;
         }
     })
+}
+
+/// In-app toast for a terminal agent edge. Only the genuine lifecycle
+/// endpoints (finished / failed) get a toast — approval / input edges already
+/// raise the attention ring and OS banner, so toasting them too would be
+/// noise. Pure so the mapping is unit-testable without GPUI.
+fn toast_for_kind(
+    kind: NotificationKind,
+    label: &str,
+) -> Option<(crate::shell::toast::ToastKind, String)> {
+    match kind {
+        NotificationKind::Done => Some((
+            crate::shell::toast::ToastKind::Success,
+            format!("{label} finished"),
+        )),
+        NotificationKind::Failed => Some((
+            crate::shell::toast::ToastKind::Error,
+            format!("{label} failed"),
+        )),
+        NotificationKind::NeedsApproval | NotificationKind::WaitingForInput => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::toast::ToastKind;
+
+    #[test]
+    fn toast_only_for_done_and_failed() {
+        assert!(matches!(
+            toast_for_kind(NotificationKind::Done, "Claude"),
+            Some((ToastKind::Success, _))
+        ));
+        assert!(matches!(
+            toast_for_kind(NotificationKind::Failed, "Claude"),
+            Some((ToastKind::Error, _))
+        ));
+        assert!(toast_for_kind(NotificationKind::NeedsApproval, "Claude").is_none());
+        assert!(toast_for_kind(NotificationKind::WaitingForInput, "Claude").is_none());
+    }
 }
