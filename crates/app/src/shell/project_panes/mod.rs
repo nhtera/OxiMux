@@ -272,6 +272,17 @@ impl ProjectPanes {
         self.workspace_tint = tint;
     }
 
+    /// Throttle every terminal in this (now-inactive) project by marking all
+    /// views hidden. Called by `WorkspaceRoot` on a project switch because an
+    /// inactive project's `PaneGroup::render` never runs to push visibility.
+    /// The views still drain (output buffered); they just poll slower until
+    /// the project is re-activated and its render re-syncs visibility.
+    pub fn hide_all_terminals(&self, cx: &mut Context<Self>) {
+        for group in self.groups.values() {
+            group.update(cx, |g, gcx| g.hide_all_terminals(gcx));
+        }
+    }
+
     pub fn set_active_group(
         &mut self,
         id: PaneGroupId,

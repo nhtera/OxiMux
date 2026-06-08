@@ -384,6 +384,28 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Push hidden-state to every project's terminals except `active_id`, so a
+    /// background project's tabs throttle their PTY poll even though their
+    /// `ProjectPanes` is no longer in the render tree (the per-render
+    /// visibility sweep can't reach them). The active project re-syncs itself
+    /// on its next render.
+    ///
+    /// Invariant: every terminal-spawn path routes through
+    /// `active_project_panes()`, so a freshly spawned terminal always lands in
+    /// the active (visible) project. Any future path that spawns directly into
+    /// a non-active project must call this afterwards to keep it throttled.
+    fn hide_inactive_project_terminals(&self, active_id: &str, cx: &mut Context<Self>) {
+        let inactive: Vec<_> = self
+            .project_panes_by_project
+            .iter()
+            .filter(|(id, _)| id.as_str() != active_id)
+            .map(|(_, panes)| panes.clone())
+            .collect();
+        for panes in inactive {
+            panes.update(cx, |p, pcx| p.hide_all_terminals(pcx));
+        }
+    }
+
     /// Set the currently active project. Stores it on `self`, triggers
     /// a re-render so the left rail picks up the new workspaces, and
     /// asynchronously rebuilds the right sidebar (Explorer / Source
@@ -428,6 +450,12 @@ impl WorkspaceRoot {
             }
         }
         self.active_project = Some(project.clone());
+        // Throttle every other project's terminals: only the active project's
+        // ProjectPanes renders, so inactive projects' PaneGroups never run the
+        // visibility sweep and would otherwise keep polling at the foreground
+        // cadence. Push hidden-state to them here on the switch; the incoming
+        // project self-corrects on its own next render.
+        self.hide_inactive_project_terminals(&project.id, cx);
         // Reload custom commands for the new project so the palette reflects
         // the incoming project's `.oximux/commands.toml` immediately.
         self.reload_custom_commands(cx);

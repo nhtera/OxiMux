@@ -669,6 +669,25 @@ impl PaneGroup {
         self.next_terminal_n = n;
     }
 
+    /// Mark every terminal view in this group hidden (background-project
+    /// throttle). Output keeps draining; only the poll cadence + repaints drop.
+    /// Clears the visibility cache so the next render reconciles back to the
+    /// real shown-set when this group is on screen again.
+    pub fn hide_all_terminals(&mut self, cx: &mut Context<Self>) {
+        for tab in self.tabs.iter() {
+            if let PaneContent::Terminal(tree) = &tab.content {
+                for (_, _, view) in tree.iter_all_views() {
+                    view.update(cx, |v, vcx| v.set_visible(false, vcx));
+                }
+            }
+        }
+        // No cx.notify() — this group is off-screen, so a repaint would be
+        // wasted. Clearing the cache guarantees the post-reactivation render's
+        // `desired != last_visible_ids` check is true, so the sweep re-shows
+        // the real set instead of skipping on a stale-equal cache.
+        self.last_visible_ids.clear();
+    }
+
     /// Peek at the next-terminal seed (without mutating). Used by
     /// `ProjectPanes::take_next_terminal_n` to compute the workspace-wide
     /// floor across every group's local counter.
