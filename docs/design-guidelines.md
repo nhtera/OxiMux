@@ -283,6 +283,37 @@ All forge calls (checks, log peek, create, merge) go through the `forge`
 provider seam (`ForgeProvider`, one `gh`-CLI impl today) — never the CLI
 directly — so a second host can slot in without touching these surfaces.
 
+## Tasks page (issue/PR browser)
+
+The left rail's nav rows are body-replacing **pages**, not just shells. The
+workspace list is the **home** view: `active_nav` is `Option<NavItem>` where
+`None` = home (nothing highlighted), so the app cold-starts on the workspace
+list. Clicking a nav opens its page; clicking the active nav again toggles back
+home. Agents (dashboard) and Tasks are the implemented pages.
+
+- **Tasks body** (`tasks_view`) — a GitHub issue/PR browser for the active
+  project's repo, fetched through the `ForgeProvider` seam. A two-row header of
+  text chips (mirroring the sort-mode chip: `r_xs`, active = `bg_panel_alt` +
+  `fg_base`, inactive = `bg_panel` + `fg_muted`): `Issues`/`PRs`, then
+  `Open`/`Closed`/`All` + `Mine` + `Refresh`. The body is a virtualized
+  `uniform_list` (constrained sizing → rows fit-and-truncate the rail width, not
+  horizontal-scroll). Loading / empty / no-project states render a centered
+  `fg_subtle` hint; the empty state names the gh-auth requirement rather than
+  implying a bug.
+- **Task row** — two lines: `#<n> <title>` (title `overflow_hidden` +
+  `whitespace_nowrap`) + a state chip (`status_ok` open / `status_info` merged /
+  `fg_muted` closed); second line is a truncating cluster (label chips +
+  `@assignee`) plus a fixed right-side actions cluster that always stays visible:
+  `↗` (open in browser) and `+ Workspace`.
+- **Create workspace from a task** — reuses `create_workspace_async`; the branch
+  is `oximux/<slug>` derived from `"{issue|pr} {n} {title}"` so the number is
+  legible. The workspace persists a `linked_issue` (`#<n>`, V011 column) shown as
+  a `status_info`-tinted badge on its card after the branch chip, and the rail
+  auto-activates it (selects + returns home). Manually-created workspaces have no
+  linked issue and don't auto-activate.
+
+Open-in-browser uses the shared `shell/open_url` helper (`open <url>`).
+
 ## Primitive-Picking Fork
 
 When a control has multiple plausible primitives, use this fork:
