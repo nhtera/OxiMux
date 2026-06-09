@@ -500,17 +500,29 @@ fn restore_agent_tab(
         // they were, identical to plain-terminal restore. `None` falls
         // through to a fresh respawn (which also routes through the daemon,
         // so a cold-restored agent survives the NEXT quit).
+        // Both relay calls are blocking daemon round-trips; run them on the
+        // background executor — this async closure itself executes on the
+        // main thread (same discipline as `spawn_attach_reconcile`).
         let reattached = {
-            let snap = relay_state_snapshot();
-            let session_ok = matches!(
-                (&persisted_clone.relay_session, &snap.session_id),
-                (Some(s), Some(c)) if s == c
-            );
-            persisted_clone.relay_external_id.as_deref().and_then(|ext| {
-                (session_ok && snap.live_external_ids.contains(ext))
-                    .then(|| attach_pty_existing(ext))
-                    .flatten()
-            })
+            let Ok(executor) = cx.update(|_, cx| cx.background_executor().clone()) else {
+                return;
+            };
+            let relay_session = persisted_clone.relay_session.clone();
+            let relay_external_id = persisted_clone.relay_external_id.clone();
+            executor
+                .spawn(async move {
+                    let snap = relay_state_snapshot();
+                    let session_ok = matches!(
+                        (&relay_session, &snap.session_id),
+                        (Some(s), Some(c)) if s == c
+                    );
+                    relay_external_id.as_deref().and_then(|ext| {
+                        (session_ok && snap.live_external_ids.contains(ext))
+                            .then(|| attach_pty_existing(ext))
+                            .flatten()
+                    })
+                })
+                .await
         };
 
         let attached = if let Some((backend, term_id)) = reattached {
