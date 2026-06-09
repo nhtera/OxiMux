@@ -70,6 +70,12 @@ pub struct DropdownInputs {
     /// Configured base ref for the worktree (e.g. `origin/main`). Drives
     /// the "Rebase from <base>" label; `None` disables the Rebase row.
     pub base_ref: Option<String>,
+    /// True when the branch has at least one commit beyond its base
+    /// (i.e. `GitState.branch_committed` is non-empty). Drives the Publish
+    /// row's label/enablement: an unpublished branch with no branch commits
+    /// has nothing to publish, so the row reads "No Branch Changes" /
+    /// "Commit Changes First" (when dirty) instead of "Publish Branch".
+    pub has_branch_commits: bool,
     /// True when a hosted-review-creation backend op is in flight. Disables
     /// Create PR / Push before PR rows to prevent re-entry. Always false
     /// in v1 — the hosted-review adapter ships in v1.1.
@@ -135,7 +141,7 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     out.push(item(
         cp_kind,
         cp_label,
-        compound_tooltip(p, has_staged, has_upstream, "Commit and push", lease, cp_disabled),
+        commit_push_tooltip(p, can_commit_base, has_staged, has_upstream, lease, behind),
         cp_disabled,
     ));
 
@@ -145,7 +151,7 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     out.push(item(
         DropdownActionKind::CommitSync,
         "Commit & Sync".to_string(),
-        compound_tooltip(p, has_staged, has_upstream, "Commit, then pull and push", false, cs_disabled),
+        commit_sync_tooltip(p, can_commit_base, has_staged, has_upstream, lease, behind),
         cs_disabled,
     ));
 
@@ -188,7 +194,10 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     //    Create-PR rung). Runs `gh pr create --fill`.
     let in_sync = has_upstream && ahead == 0 && behind == 0;
     let create_pr_disabled = !p.is_github_remote
+        || p.is_detached_head
+        || p.on_default_branch
         || p.has_open_pr
+        || p.pr_merged
         || !in_sync
         || p.is_creating_pr
         || p.is_committing
@@ -197,9 +206,9 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
         DropdownActionKind::CreatePr,
         "Create PR".to_string(),
         if create_pr_disabled {
-            create_pr_disabled_reason(p, has_upstream, in_sync).to_string()
+            create_pr_disabled_reason(p, has_upstream, ahead, behind, lease).to_string()
         } else {
-            "Open a pull request for this branch".to_string()
+            "Create a pull request for this branch".to_string()
         },
         create_pr_disabled,
     ));
@@ -209,7 +218,11 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     //    row so the menu shape stays stable.
     out.push(item(
         DropdownActionKind::PushBeforePr,
-        "Push before PR".to_string(),
+        if lease {
+            "Force Push before PR".to_string()
+        } else {
+            "Push before PR".to_string()
+        },
         "Push first, then use Create PR".to_string(),
         true,
     ));
@@ -335,25 +348,53 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
         if fetch_disabled {
             "Another operation is in progress".to_string()
         } else {
-            "Fetch all remotes".to_string()
+            "Fetch from remote without merging".to_string()
         },
         fetch_disabled,
     ));
 
     // 12. Publish — only meaningful when the branch lacks an upstream;
     //     stays in the menu (disabled) when an upstream already exists so
-    //     the row order is stable across states.
-    let publish_disabled = has_upstream || p.is_committing || p.is_remote_operation_active;
+    //     the row order is stable across states. The label adapts to WHY
+    //     publish is unavailable so the row is self-explanatory:
+    //       - "PR Status"           — unpublished, but the branch's PR is
+    //                                  already merged (don't re-publish)
+    //       - "Commit Changes First" — unpublished, no commits, dirty changes
+    //                                  the user likely means to commit first
+    //       - "No Branch Changes"    — unpublished, no commits, clean
+    //       - "Publish Branch"       — ready (has branch commits, no upstream)
+    let busy = p.is_committing || p.is_remote_operation_active;
+    let dirty = p.staged_count > 0 || p.has_unstaged_changes;
+    let merged_pr = !has_upstream && p.pr_merged;
+    let no_branch_commits = !has_upstream && !merged_pr && !inputs.has_branch_commits;
+    let uncommitted_changes = no_branch_commits && dirty;
+    let publish_label = if merged_pr {
+        "PR Status"
+    } else if uncommitted_changes {
+        "Commit Changes First"
+    } else if no_branch_commits {
+        "No Branch Changes"
+    } else {
+        "Publish Branch"
+    };
+    let publish_title = if has_upstream {
+        "Branch is already published"
+    } else if busy {
+        "An operation is already in progress"
+    } else if merged_pr {
+        "PR is already merged"
+    } else if uncommitted_changes {
+        "Commit changes before publishing the branch"
+    } else if no_branch_commits {
+        "Nothing to publish"
+    } else {
+        "Publish this branch to origin"
+    };
+    let publish_disabled = has_upstream || busy || merged_pr || no_branch_commits;
     out.push(item(
         DropdownActionKind::Publish,
-        "Publish Branch".to_string(),
-        if has_upstream {
-            "Branch is already published".to_string()
-        } else if publish_disabled {
-            "An operation is already in progress".to_string()
-        } else {
-            "Publish this branch to origin".to_string()
-        },
+        publish_label.to_string(),
+        publish_title.to_string(),
         publish_disabled,
     ));
 
@@ -412,10 +453,18 @@ fn push_disabled_reason(
     }
 }
 
+/// Precise "why is Create PR disabled" reason, in severity order. The
+/// `!in_sync` case is split into needs-push (only ahead) vs needs-sync
+/// (behind — pull or force-push first), and detached-HEAD / default-branch
+/// get their own actionable steers. (the reference UX additionally has an
+/// `auth_required` → "Run gh auth login" reason; OxiMux doesn't poll
+/// `gh auth status`, so that case isn't distinguished here.)
 fn create_pr_disabled_reason(
     p: &PrimaryActionInputs,
     has_upstream: bool,
-    in_sync: bool,
+    ahead: u32,
+    behind: u32,
+    lease: bool,
 ) -> &'static str {
     if p.is_creating_pr {
         "Creating pull request…"
@@ -425,12 +474,26 @@ fn create_pr_disabled_reason(
         "Remote operation in progress"
     } else if !p.is_github_remote {
         "Not a GitHub remote"
-    } else if !has_upstream {
-        "Publish the branch first"
-    } else if !in_sync {
-        "Push/pull so the branch is in sync, then create a PR"
+    } else if p.is_detached_head {
+        "Check out a branch first"
+    } else if p.on_default_branch {
+        "Switch to a feature branch"
+    } else if p.pr_merged {
+        "This branch's PR is already merged"
     } else if p.has_open_pr {
         "This branch already has an open PR"
+    } else if !has_upstream {
+        "Publish the branch first"
+    } else if behind > 0 {
+        // Behind upstream — a plain push is rejected; pull (or force-push if
+        // the local history was rewritten) before opening the PR.
+        if lease {
+            "Force Push first, then create a PR"
+        } else {
+            "Sync first, then create a PR"
+        }
+    } else if ahead > 0 {
+        "Push first, then create a PR"
     } else {
         "Cannot create PR"
     }
@@ -496,27 +559,50 @@ fn rebase_disabled_reason(
     }
 }
 
-/// Tooltip text shared by Commit & Push / Commit & Force Push / Commit & Sync.
-/// Returns the "what will happen" line when enabled, or the most relevant
-/// disabled reason when disabled.
-fn compound_tooltip(
+/// Tooltip for Commit & Push / Commit & Force Push. Priority mirrors the
+/// benchmark menu: publish-first, then commit blockers, then the lease /
+/// divergence steer, else the plain "what will happen" line.
+fn commit_push_tooltip(
     p: &PrimaryActionInputs,
+    can_commit: bool,
     has_staged: bool,
     has_upstream: bool,
-    verb: &str,
     lease: bool,
-    disabled: bool,
+    behind: u32,
 ) -> String {
-    if disabled {
-        if !has_upstream {
-            return "Publish the branch first".to_string();
-        }
-        return commit_disabled_reason(p, has_staged).to_string();
-    }
-    if lease {
-        format!("{verb} (with lease)")
+    if !has_upstream {
+        "Publish the branch first to push commits".to_string()
+    } else if !can_commit {
+        commit_disabled_reason(p, has_staged).to_string()
+    } else if lease {
+        "Commit staged changes and force push with lease".to_string()
+    } else if behind > 0 {
+        "Use Commit & Sync to pull remote changes before pushing".to_string()
     } else {
-        verb.to_string()
+        "Commit staged changes and push".to_string()
+    }
+}
+
+/// Tooltip for Commit & Sync. A lease rewrite or a level branch steers the
+/// user to the correct sibling verb before the commit blockers are consulted.
+fn commit_sync_tooltip(
+    p: &PrimaryActionInputs,
+    can_commit: bool,
+    has_staged: bool,
+    has_upstream: bool,
+    lease: bool,
+    behind: u32,
+) -> String {
+    if !has_upstream {
+        "Publish the branch first to sync commits".to_string()
+    } else if lease {
+        "Use Commit & Force Push — the remote only has older copies of local commits".to_string()
+    } else if behind == 0 {
+        "Nothing to pull — use Commit & Push instead".to_string()
+    } else if !can_commit {
+        commit_disabled_reason(p, has_staged).to_string()
+    } else {
+        "Commit, then pull and push".to_string()
     }
 }
 

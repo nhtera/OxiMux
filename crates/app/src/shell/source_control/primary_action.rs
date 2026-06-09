@@ -82,12 +82,31 @@ pub struct PrimaryActionInputs {
     /// The current branch already has an open PR. Suppresses Create-PR so the
     /// button doesn't offer a redundant action.
     pub has_open_pr: bool,
+    /// The current branch's PR was merged. Also suppresses Create-PR — a new
+    /// PR for already-merged work would be a duplicate — with a distinct
+    /// "already merged" reason rather than the generic "open PR exists".
+    pub pr_merged: bool,
     /// A `gh pr create` is in flight — locks the primary to a disabled
     /// "Creating PR…" frame, mirroring the remote-op busy treatment.
     pub is_creating_pr: bool,
     /// A `gh pr merge` is in flight — disables the merge rows so the menu
     /// doesn't offer a redundant action mid-merge.
     pub is_merging_pr: bool,
+    /// True when the branch has commits beyond its base. Gates the
+    /// Publish primary: an unpublished branch with no branch commits has
+    /// nothing to publish, so the button disables itself (kept consistent
+    /// with the dropdown's "No Branch Changes" row rather than offering an
+    /// enabled Publish that would push a branch identical to its base).
+    pub has_branch_commits: bool,
+    /// HEAD is detached (no current branch). A PR can't be created from a
+    /// detached HEAD, so the Create-PR reason steers "Check out a branch
+    /// first" rather than a sync message.
+    pub is_detached_head: bool,
+    /// The current branch IS the PR base branch (e.g. on `main`, base
+    /// `origin/main`). A PR from a branch to itself is invalid, so Create-PR
+    /// is suppressed with "Switch to a feature branch" — without this an
+    /// in-sync default branch would wrongly offer an enabled Create PR.
+    pub on_default_branch: bool,
 }
 
 /// Resolve the primary split-button action. Priority ladder mirrors the
@@ -196,13 +215,20 @@ pub fn resolve_primary_action(inputs: &PrimaryActionInputs) -> PrimaryAction {
         return disabled_commit("Stage at least one file to commit");
     };
 
-    // 6b. Branch never published.
+    // 6b. Branch never published. Disabled when there are no branch commits
+    //     to publish — pushing a branch identical to its base is pointless,
+    //     and an enabled button here would contradict the dropdown's
+    //     "No Branch Changes" row for the same action.
     if !upstream.has_upstream {
         return PrimaryAction {
             kind: PrimaryActionKind::Publish,
             label: "Publish Branch".to_string(),
-            title: "Publish this branch to origin".to_string(),
-            disabled: false,
+            title: if inputs.has_branch_commits {
+                "Publish this branch to origin".to_string()
+            } else {
+                "Nothing to publish".to_string()
+            },
+            disabled: !inputs.has_branch_commits,
         };
     }
 
@@ -241,8 +267,14 @@ pub fn resolve_primary_action(inputs: &PrimaryActionInputs) -> PrimaryAction {
     //     remote is GitHub and there's no open PR yet; otherwise the plain
     //     "up to date" frame. Push/Sync/Pull rungs sit ahead of this, so a
     //     branch with unpushed/unpulled commits is steered there first ("push
-    //     before PR").
-    if inputs.is_github_remote && !inputs.has_open_pr {
+    //     before PR"). A merged PR or the default branch suppresses the offer
+    //     too — a new PR for already-merged work, or from the base branch to
+    //     itself, would be invalid.
+    if inputs.is_github_remote
+        && !inputs.has_open_pr
+        && !inputs.pr_merged
+        && !inputs.on_default_branch
+    {
         return PrimaryAction {
             kind: PrimaryActionKind::CreatePR,
             label: "Create PR".to_string(),

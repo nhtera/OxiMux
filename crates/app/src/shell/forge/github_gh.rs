@@ -27,6 +27,10 @@ impl ForgeProvider for GithubForge {
         gh::has_open_pr(cwd).await
     }
 
+    async fn pr_state(&self, cwd: &Path) -> oximux_core::PrState {
+        gh::pr_state(cwd).await
+    }
+
     async fn list_checks(&self, cwd: &Path) -> Vec<CheckRun> {
         gh::pr_checks(cwd).await
     }

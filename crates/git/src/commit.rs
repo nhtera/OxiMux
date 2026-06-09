@@ -104,6 +104,33 @@ impl Repository {
         Ok(())
     }
 
+    /// `git rebase <base>` — replay the current branch's commits on top of
+    /// `base`. `base` is a ref the caller already has locally (typically a
+    /// remote-tracking ref like `origin/main` resolved from the worktree's
+    /// configured base); this does NOT fetch first, so a stale base rebases
+    /// onto stale data. The menu offers a separate Fetch row for refreshing.
+    ///
+    /// Same conflict + status surfacing as `cherry_pick` / `revert_commit`:
+    /// a conflicted rebase leaves the worktree in `rebase-merge/` /
+    /// `rebase-apply/` state, which `Repository::current_operation()` picks
+    /// up on the next poll to drive the operation banner. Raw stderr rides
+    /// the `Err` for the status row.
+    ///
+    /// The caller is responsible for gating on a clean worktree — git
+    /// refuses to rebase with unstaged changes, but the dropdown disables
+    /// the row on `has_unstaged_changes` so the user sees the reason up
+    /// front rather than as a raw git error.
+    pub async fn rebase_onto(&self, base: &str) -> Result<()> {
+        if base.trim().is_empty() {
+            return Err(GitError::invalid_input("rebase base ref is empty"));
+        }
+        GitCmd::new(self.workdir())
+            .args(["rebase", base])
+            .run()
+            .await?;
+        Ok(())
+    }
+
     /// Full HEAD SHA. Tiny helper used by `commit` / `commit_paths` to surface
     /// the freshly-minted commit. `git rev-parse HEAD` is locale-stable and
     /// doesn't depend on the noisy `git commit` stdout format.

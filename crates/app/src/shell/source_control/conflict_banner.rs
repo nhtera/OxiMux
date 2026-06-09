@@ -22,6 +22,7 @@
 //! a panel-side method, keeping the banner module free of
 //! GPUI-entity coupling.
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{ClickEvent, IntoElement, ParentElement, Styled, Window, div, px};
 use gpui_component::{
     Disableable, Icon, Sizable as _,
@@ -117,19 +118,41 @@ where
 }
 
 /// Render the amber "X in progress" banner for an in-flight git
-/// operation. No buttons — Phase 08 only surfaces the state; resolve
-/// / abort affordances land later. Returns `None` when `op` is
-/// `None` so the caller can `.children(iter)` the result.
-pub fn render_operation_banner(
+/// operation, with recovery buttons:
+///
+/// - **Abort** (always) — `on_abort` discards the partial operation and
+///   returns the worktree to its pre-op state.
+/// - **Continue** (only when `op.supports_continue()`) — `on_continue`
+///   resumes a paused rebase/cherry-pick/revert. Disabled while
+///   `continue_enabled` is false (unstaged conflicts remain), since git
+///   rejects a continue past unresolved markers; the tooltip explains why.
+///
+/// Returns `None` when `op` is `None` so the caller can `.children(iter)`
+/// the result.
+pub fn render_operation_banner<A, C>(
     op: Option<GitOperation>,
     theme: Theme,
-) -> Option<impl IntoElement> {
+    continue_enabled: bool,
+    on_abort: A,
+    on_continue: C,
+) -> Option<impl IntoElement>
+where
+    A: Fn(&mut Window, &mut gpui::App) + 'static,
+    C: Fn(&mut Window, &mut gpui::App) + 'static,
+{
     let op = op?;
+    let show_continue = op.supports_continue();
+    let continue_tooltip = if continue_enabled {
+        "Resume the operation with your staged resolutions"
+    } else {
+        "Resolve and stage all conflicts first"
+    };
     Some(
         div()
             .flex()
             .flex_row()
             .items_center()
+            .justify_between()
             .flex_shrink_0()
             .w_full()
             .px(px(sc_style::PAD_H))
@@ -138,14 +161,50 @@ pub fn render_operation_banner(
             .border_color(theme.status_warning)
             .text_size(px(sc_style::BODY_TEXT))
             .text_color(theme.fg_base)
-            .gap(px(sc_style::PAD_V))
             .child(
-                Icon::default()
-                    .path("icons/git-merge.svg")
-                    .size(px(sc_style::ICON))
-                    .text_color(theme.status_warning),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(sc_style::PAD_V))
+                    .child(
+                        Icon::default()
+                            .path("icons/git-merge.svg")
+                            .size(px(sc_style::ICON))
+                            .text_color(theme.status_warning),
+                    )
+                    .child(op.banner_label()),
             )
-            .child(op.banner_label()),
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(sc_style::PAD_V))
+                    .when(show_continue, |row| {
+                        row.child(
+                            Button::new("sc-op-continue")
+                                .ghost()
+                                .xsmall()
+                                .label("Continue")
+                                .tooltip(continue_tooltip)
+                                .disabled(!continue_enabled)
+                                .on_click(move |_: &ClickEvent, window, cx| {
+                                    on_continue(window, cx);
+                                }),
+                        )
+                    })
+                    .child(
+                        Button::new("sc-op-abort")
+                            .ghost()
+                            .xsmall()
+                            .label("Abort")
+                            .tooltip("Discard the in-progress operation")
+                            .on_click(move |_: &ClickEvent, window, cx| {
+                                on_abort(window, cx);
+                            }),
+                    ),
+            ),
     )
 }
 

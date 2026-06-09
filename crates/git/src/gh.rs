@@ -13,6 +13,7 @@
 //! non-zero when the branch has no open PR), so no JSON parser is pulled in.
 
 use crate::error::{GitError, Result};
+use oximux_core::PrState;
 use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -155,14 +156,37 @@ pub async fn is_github_remote(cwd: impl AsRef<Path>) -> bool {
 /// emits `{"state":"OPEN"}` for an open PR. A spawn/timeout/no-PR result maps to
 /// `false` (treat "can't tell" as "no PR" so the button stays usable).
 pub async fn has_open_pr(cwd: impl AsRef<Path>) -> bool {
+    pr_state(cwd).await.is_open()
+}
+
+/// Full PR lifecycle state for the current branch (`OPEN` / `MERGED` /
+/// `CLOSED` / none). Same single `gh pr view --json state` round-trip as
+/// [`has_open_pr`] — that bool is now derived from this — so callers that
+/// need the merged distinction (suppress duplicate Create-PR, Publish
+/// "PR Status" variant) pay no extra cost. A spawn/timeout/no-PR result
+/// maps to [`PrState::None`] (treat "can't tell" as "no PR").
+pub async fn pr_state(cwd: impl AsRef<Path>) -> PrState {
     match GhCmd::new(cwd)
         .args(["pr", "view", "--json", "state"])
         .run_raw()
         .await
     {
-        Ok((true, stdout, _)) => stdout.contains("\"OPEN\""),
-        _ => false,
+        Ok((true, stdout, _)) => parse_pr_state(&stdout),
+        _ => PrState::None,
     }
+}
+
+/// Extract the PR state from the `gh pr view --json state` JSON
+/// (`{"state":"OPEN"}`). Scans for the known state tokens rather than
+/// pulling a JSON parser for one field — the same lightweight approach the
+/// old `has_open_pr` used for `"OPEN"`, generalised to all states.
+fn parse_pr_state(stdout: &str) -> PrState {
+    for token in ["OPEN", "MERGED", "CLOSED"] {
+        if stdout.contains(&format!("\"{token}\"")) {
+            return PrState::from_gh_state(token);
+        }
+    }
+    PrState::None
 }
 
 /// Options for [`pr_create`]. An empty `title` falls back to `gh pr create

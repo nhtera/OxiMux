@@ -139,4 +139,33 @@ impl GitOperation {
             GitOperation::Bisect => "Bisect in progress",
         }
     }
+
+    /// Whether the operation has a `--continue` step that resumes it after
+    /// the user resolves conflicts. The sequencer operations (rebase,
+    /// cherry-pick, revert) replay one commit at a time and pause on
+    /// conflict, so they continue. A merge has no `--continue` (completing
+    /// it is just a normal commit), and bisect is a search session with no
+    /// resume-after-conflict semantics — both offer Abort only.
+    pub fn supports_continue(self) -> bool {
+        matches!(
+            self,
+            GitOperation::Rebase | GitOperation::CherryPick | GitOperation::Revert
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitOperation;
+
+    #[test]
+    fn only_sequencer_ops_support_continue() {
+        // Sequencer ops replay commit-by-commit and pause on conflict →
+        // resumable. Merge/Bisect have no --continue step → Abort only.
+        assert!(GitOperation::Rebase.supports_continue());
+        assert!(GitOperation::CherryPick.supports_continue());
+        assert!(GitOperation::Revert.supports_continue());
+        assert!(!GitOperation::Merge.supports_continue());
+        assert!(!GitOperation::Bisect.supports_continue());
+    }
 }

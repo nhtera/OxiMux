@@ -161,13 +161,14 @@ fn upstream_status_none_keeps_stable_disabled_commit_frame() {
 }
 
 #[test]
-fn unpublished_branch_promotes_publish() {
+fn unpublished_branch_with_commits_promotes_publish() {
     let inputs = PrimaryActionInputs {
         upstream_status: Some(UpstreamStatus {
             has_upstream: false,
             ahead: 0,
             behind: 0,
         }),
+        has_branch_commits: true,
         ..PrimaryActionInputs::default()
     };
     let act = resolve_primary_action(&inputs);
@@ -175,6 +176,29 @@ fn unpublished_branch_promotes_publish() {
         unpack(&act),
         (PrimaryActionKind::Publish, "Publish Branch", false)
     );
+    assert_eq!(act.title, "Publish this branch to origin");
+}
+
+#[test]
+fn unpublished_branch_without_commits_disables_publish() {
+    // Fresh branch, no commits beyond base → nothing to publish. The button
+    // still reads "Publish Branch" but disabled, consistent with the
+    // dropdown's "No Branch Changes" row for the same action.
+    let inputs = PrimaryActionInputs {
+        upstream_status: Some(UpstreamStatus {
+            has_upstream: false,
+            ahead: 0,
+            behind: 0,
+        }),
+        has_branch_commits: false,
+        ..PrimaryActionInputs::default()
+    };
+    let act = resolve_primary_action(&inputs);
+    assert_eq!(
+        unpack(&act),
+        (PrimaryActionKind::Publish, "Publish Branch", true)
+    );
+    assert_eq!(act.title, "Nothing to publish");
 }
 
 #[test]
@@ -257,6 +281,36 @@ fn create_pr_offered_when_in_sync_github_no_open_pr() {
     let act = resolve_primary_action(&inputs);
     assert_eq!(unpack(&act), (PrimaryActionKind::CreatePR, "Create PR", false));
     assert_eq!(act.title, "Create a pull request for this branch");
+}
+
+#[test]
+fn create_pr_suppressed_when_pr_already_merged() {
+    // Merged PR: has_open_pr is false but a new PR would duplicate merged
+    // work, so the offer is suppressed — falls through to "up to date".
+    let inputs = PrimaryActionInputs {
+        is_github_remote: true,
+        has_open_pr: false,
+        pr_merged: true,
+        ..clean_with_upstream(0, 0)
+    };
+    let act = resolve_primary_action(&inputs);
+    assert_eq!(act.kind, PrimaryActionKind::Commit);
+    assert!(act.disabled);
+}
+
+#[test]
+fn create_pr_suppressed_on_default_branch() {
+    // On the base branch (e.g. main): in sync, github, no PR — but a PR from
+    // the branch to itself is invalid, so the offer is suppressed.
+    let inputs = PrimaryActionInputs {
+        is_github_remote: true,
+        has_open_pr: false,
+        on_default_branch: true,
+        ..clean_with_upstream(0, 0)
+    };
+    let act = resolve_primary_action(&inputs);
+    assert_eq!(act.kind, PrimaryActionKind::Commit);
+    assert!(act.disabled);
 }
 
 #[test]

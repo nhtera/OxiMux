@@ -88,6 +88,18 @@ pub enum CommitStatus {
     /// `git revert --no-edit <sha>` in flight. Same lifecycle as
     /// `CherryPicking` — conflict drops into the operation banner.
     Reverting,
+    /// `git rebase <base>` in flight. Same lifecycle as `CherryPicking` —
+    /// a conflicted rebase drops into the operation banner via
+    /// `current_op`.
+    Rebasing,
+    /// `git <op> --abort` in flight (operation-banner recovery). Reaches
+    /// `Idle` on success — the next poll clears `current_op` and the banner
+    /// disappears.
+    Aborting,
+    /// `git <op> --continue` in flight (operation-banner recovery). Reaches
+    /// `Idle` on success or `Failed("continue", …)` when conflicts remain
+    /// unstaged.
+    Continuing,
     /// `gh pr create` in flight. Reaches `Idle` on success (the PR opens in
     /// the browser) or `Failed("create PR", …)` — most usefully when a PR for
     /// the branch already exists.
@@ -155,6 +167,15 @@ pub struct CommitArea {
     /// gate enablement and by the generation task to feed the
     /// heuristic. Empty when nothing is staged.
     pub(in crate::shell::source_control) staged_snapshot: Vec<FileStatus>,
+
+    /// Resolved base ref for the Rebase dropdown row (e.g. `origin/main`),
+    /// pushed in by the panel's state observer alongside `staged_snapshot`.
+    /// The dropdown LABEL resolves its own base ref per-render from the
+    /// panel; this mirror exists only so `rebase_from_base` — dispatched
+    /// from inside `CommitArea` where the panel's `base_ref` isn't reachable
+    /// — knows which ref to rebase onto. `None` when no base is configured
+    /// (the row is disabled in that case, so the op never fires).
+    pub(in crate::shell::source_control) rebase_base: Option<String>,
 
     /// AI generation lifecycle for the sparkles button. `Idle` until
     /// the user clicks; `Generating` while the spawned task is
@@ -238,6 +259,7 @@ impl CommitArea {
             _draft_debounce: None,
             _draft_subscription,
             staged_snapshot: Vec::new(),
+            rebase_base: None,
             ai_state: AiState::Idle,
         }
     }
@@ -302,20 +324,20 @@ impl CommitArea {
         if action.disabled || action.kind != PrimaryActionKind::Commit {
             return;
         }
-        super::commit_ops::run_commit(self, false, false, window, cx);
+        super::commit_ops::run_commit(self, super::commit_ops::CommitFollowup::None, window, cx);
     }
 
     /// Commit-then-push convenience used by the dropdown's "Commit & Push"
     /// item. Push only fires on a successful commit; partial failure
     /// surfaces via `CommitStatus::Failed("commit"/"push", …)`.
     pub fn commit_and_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        super::commit_ops::run_commit(self, true, false, window, cx);
+        super::commit_ops::run_commit(self, super::commit_ops::CommitFollowup::Push, window, cx);
     }
 
     /// Commit-then-sync (pull + push). Same single-flight + status surface
     /// as `commit_and_push`.
     pub fn commit_and_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        super::commit_ops::run_commit(self, false, true, window, cx);
+        super::commit_ops::run_commit(self, super::commit_ops::CommitFollowup::Sync, window, cx);
     }
 
     /// Standalone `git push` — used by the dropdown's Push item and the
@@ -348,34 +370,46 @@ impl CommitArea {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Fetch, cx);
     }
 
-    /// Force-push (with lease). Stubbed: the backend lands alongside the
-    /// upstream-rewrite-detection feature; until then the user sees a
-    /// "Not yet implemented" message in the status row rather than the
-    /// menu item silently doing nothing.
+    /// Standalone `git push --force-with-lease`. The lease guard aborts the
+    /// push (rather than overwriting) if the remote moved since the last
+    /// fetch, so a teammate's surprise upstream commits surface as a
+    /// rejection in the status row instead of being silently discarded.
     pub fn force_push(&mut self, cx: &mut Context<Self>) {
-        self.status =
-            CommitStatus::Failed("force push".to_string(), "Not yet implemented".to_string());
-        cx.notify();
+        super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::ForcePush, cx);
     }
 
     /// Commit-then-force-push convenience used by the dropdown's
-    /// "Commit & Force Push" item when an upstream rewrite is needed.
-    /// Stubbed for the same reason as `force_push`.
-    pub fn commit_and_force_push(&mut self, cx: &mut Context<Self>) {
-        self.status = CommitStatus::Failed(
-            "commit & force push".to_string(),
-            "Not yet implemented".to_string(),
+    /// "Commit & Force Push" item when the local branch has rewritten
+    /// history a plain push would reject. Force-push only fires on a
+    /// successful commit; partial failure surfaces via
+    /// `CommitStatus::Failed("commit"/"force push", …)`.
+    pub fn commit_and_force_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        super::commit_ops::run_commit(
+            self,
+            super::commit_ops::CommitFollowup::ForcePush,
+            window,
+            cx,
         );
-        cx.notify();
     }
 
-    /// Rebase the current branch onto the configured base ref. Stubbed:
-    /// rebase backend wiring lands in a later phase; the dropdown row
-    /// exists now so the menu shape stays stable across versions.
+    /// Rebase the current branch onto the configured base ref
+    /// (`git rebase <base>`). Reads the base from `rebase_base` — the panel's
+    /// state observer mirrors the resolved value in. A conflicted rebase
+    /// leaves the worktree in rebase state and surfaces through the
+    /// operation banner (same lifecycle as cherry-pick / revert).
+    ///
+    /// The dropdown disables the Rebase row when no base is configured, so
+    /// `rebase_base` is normally `Some` here; the `None` guard is defensive
+    /// (e.g. a click racing a base-ref clear) and surfaces a clear reason
+    /// rather than a raw git error.
     pub fn rebase_from_base(&mut self, cx: &mut Context<Self>) {
-        self.status =
-            CommitStatus::Failed("rebase".to_string(), "Not yet implemented".to_string());
-        cx.notify();
+        let Some(base) = self.rebase_base.clone() else {
+            self.status =
+                CommitStatus::Failed("rebase".to_string(), "No base ref configured".to_string());
+            cx.notify();
+            return;
+        };
+        super::commit_ops::run_commit_verb(self, super::commit_ops::CommitVerb::Rebase(base), cx);
     }
 
     /// Publish the current branch by pushing it with `-u origin <branch>`.
@@ -402,6 +436,29 @@ impl CommitArea {
         cx: &mut Context<Self>,
     ) {
         super::pr_ops::run_merge_pr(self, method, cx);
+    }
+
+    /// Abort the in-progress git operation (from the operation banner's
+    /// Abort button). Discards the partial merge/rebase/cherry-pick/revert
+    /// and returns the worktree to its pre-op state; the next poll clears
+    /// the banner.
+    pub fn abort_operation(&mut self, op: oximux_core::GitOperation, cx: &mut Context<Self>) {
+        super::commit_ops::run_op_recovery(
+            self,
+            super::commit_ops::OperationRecovery::Abort(op),
+            cx,
+        );
+    }
+
+    /// Continue the in-progress sequencer operation after the user staged
+    /// their conflict resolutions (from the operation banner's Continue
+    /// button). Only wired for ops where `supports_continue()` is true.
+    pub fn continue_operation(&mut self, op: oximux_core::GitOperation, cx: &mut Context<Self>) {
+        super::commit_ops::run_op_recovery(
+            self,
+            super::commit_ops::OperationRecovery::Continue(op),
+            cx,
+        );
     }
 
     /// Apply a completed op result to the status surface. Called from
@@ -755,9 +812,9 @@ impl CommitArea {
 /// `DropdownActionKind` to the matching `CommitArea` method and turns
 /// `Separator` into a divider line.
 ///
-/// Items whose backend hasn't landed yet (force-push variants, rebase)
-/// dispatch to stub methods on `CommitArea` that surface a "Not yet
-/// implemented" message in the status row.
+/// Every actionable row wires to a real backend op on `CommitArea`. The
+/// two review verbs (Create PR / Push before PR) are intentionally inert
+/// in v1 — their dispatch arms no-op until the hosted-review adapter lands.
 fn build_commit_menu(
     mut menu: gpui_component::menu::PopupMenu,
     window: &mut Window,
@@ -898,7 +955,7 @@ fn dispatch_dropdown(
             area.submit(&synthetic, window, cx);
         }
         DropdownActionKind::CommitPush => area.commit_and_push(window, cx),
-        DropdownActionKind::CommitForcePush => area.commit_and_force_push(cx),
+        DropdownActionKind::CommitForcePush => area.commit_and_force_push(window, cx),
         DropdownActionKind::CommitSync => area.commit_and_sync(window, cx),
         DropdownActionKind::Push => area.push(cx),
         DropdownActionKind::ForcePush => area.force_push(cx),
@@ -944,6 +1001,9 @@ fn render_status_row(
         CommitStatus::Fetching => (theme.fg_muted, "Fetching…".to_string()),
         CommitStatus::CherryPicking => (theme.fg_muted, "Cherry-picking…".to_string()),
         CommitStatus::Reverting => (theme.fg_muted, "Reverting…".to_string()),
+        CommitStatus::Rebasing => (theme.fg_muted, "Rebasing…".to_string()),
+        CommitStatus::Aborting => (theme.fg_muted, "Aborting…".to_string()),
+        CommitStatus::Continuing => (theme.fg_muted, "Continuing…".to_string()),
         CommitStatus::CreatingPr => (theme.fg_muted, "Creating pull request…".to_string()),
         CommitStatus::MergingPr => (theme.fg_muted, "Merging pull request…".to_string()),
         CommitStatus::Failed(label, error) => (

@@ -79,6 +79,26 @@ impl Repository {
         Ok(())
     }
 
+    /// `git push --force-with-lease` against the configured upstream.
+    /// Safer than a bare `--force`: the push is rejected if the remote ref
+    /// moved since the local remote-tracking ref was last fetched, so a
+    /// teammate's pushed work is never silently clobbered. The dropdown only
+    /// surfaces this verb when the branch is ahead of upstream; `lease_status`
+    /// separately tells the UI whether the "behind" commits are
+    /// patch-equivalent (safe) or genuine upstream drift (a warning case).
+    ///
+    /// Caller must ensure the branch HAS an upstream — `--force-with-lease`
+    /// needs a remote-tracking ref to lease against. On an unpublished
+    /// branch use `publish_branch` instead.
+    pub async fn force_push(&self) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["push", "--force-with-lease"])
+            .timeout(REMOTE_TIMEOUT)
+            .run()
+            .await?;
+        Ok(())
+    }
+
     /// `git pull --ff-only`. Fast-forward only so the user never lands an
     /// implicit merge commit; if pull would create a merge they need to run
     /// the merge UI explicitly (out of scope for v1).

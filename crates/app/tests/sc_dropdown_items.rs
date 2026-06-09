@@ -286,7 +286,7 @@ fn create_pr_enabled_when_github_in_sync_no_open_pr() {
     });
     let cpr = find(&r, DropdownActionKind::CreatePr);
     assert!(!disabled_of(cpr));
-    assert_eq!(title_of(cpr), "Open a pull request for this branch");
+    assert_eq!(title_of(cpr), "Create a pull request for this branch");
 }
 
 #[test]
@@ -306,8 +306,46 @@ fn create_pr_disabled_when_open_pr_exists() {
 }
 
 #[test]
-fn create_pr_disabled_when_branch_not_in_sync() {
-    // Ahead of upstream → must push first.
+fn create_pr_disabled_when_pr_already_merged() {
+    // Merged PR + in sync: has_open_pr is false, so without the merged gate
+    // Create PR would wrongly re-enable, offering a duplicate PR.
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 0, 0),
+            is_github_remote: true,
+            has_open_pr: false,
+            pr_merged: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(disabled_of(cpr));
+    assert_eq!(title_of(cpr), "This branch's PR is already merged");
+}
+
+#[test]
+fn publish_reads_pr_status_when_unpublished_branch_pr_merged() {
+    // Unpublished branch whose PR was merged → don't re-publish; surface the
+    // PR state instead.
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(false, 0, 0),
+            pr_merged: true,
+            ..Default::default()
+        },
+        has_branch_commits: true,
+        ..Default::default()
+    });
+    let pub_row = find(&r, DropdownActionKind::Publish);
+    assert!(disabled_of(pub_row));
+    assert_eq!(label_of(pub_row), "PR Status");
+    assert_eq!(title_of(pub_row), "PR is already merged");
+}
+
+#[test]
+fn create_pr_disabled_needs_push_when_only_ahead() {
+    // Ahead of upstream, not behind → push first.
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 2, 0),
@@ -318,10 +356,74 @@ fn create_pr_disabled_when_branch_not_in_sync() {
     });
     let cpr = find(&r, DropdownActionKind::CreatePr);
     assert!(disabled_of(cpr));
-    assert_eq!(
-        title_of(cpr),
-        "Push/pull so the branch is in sync, then create a PR"
-    );
+    assert_eq!(title_of(cpr), "Push first, then create a PR");
+}
+
+#[test]
+fn create_pr_disabled_needs_sync_when_behind() {
+    // Behind upstream → pull/sync first (a plain push would be rejected).
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 0, 3),
+            is_github_remote: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(disabled_of(cpr));
+    assert_eq!(title_of(cpr), "Sync first, then create a PR");
+}
+
+#[test]
+fn create_pr_disabled_force_push_when_behind_with_lease() {
+    // Behind but the local history was rewritten (lease) → force-push first.
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 1, 2),
+            is_github_remote: true,
+            ..Default::default()
+        },
+        force_push_with_lease: true,
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(disabled_of(cpr));
+    assert_eq!(title_of(cpr), "Force Push first, then create a PR");
+}
+
+#[test]
+fn create_pr_disabled_on_default_branch() {
+    // On the base branch (PR to itself is invalid) — in sync, github, no PR,
+    // but still disabled with an actionable steer.
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 0, 0),
+            is_github_remote: true,
+            on_default_branch: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(disabled_of(cpr));
+    assert_eq!(title_of(cpr), "Switch to a feature branch");
+}
+
+#[test]
+fn create_pr_disabled_on_detached_head() {
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(true, 0, 0),
+            is_github_remote: true,
+            is_detached_head: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let cpr = find(&r, DropdownActionKind::CreatePr);
+    assert!(disabled_of(cpr));
+    assert_eq!(title_of(cpr), "Check out a branch first");
 }
 
 #[test]
@@ -347,17 +449,56 @@ fn publish_disabled_when_branch_already_has_upstream() {
 }
 
 #[test]
-fn publish_enabled_when_branch_has_no_upstream() {
+fn publish_enabled_when_unpublished_branch_has_commits() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(false, 0, 0),
             ..Default::default()
         },
+        has_branch_commits: true,
         ..Default::default()
     });
     let pub_row = find(&r, DropdownActionKind::Publish);
     assert!(!disabled_of(pub_row));
+    assert_eq!(label_of(pub_row), "Publish Branch");
     assert_eq!(title_of(pub_row), "Publish this branch to origin");
+}
+
+#[test]
+fn publish_reads_no_branch_changes_when_clean_with_no_commits() {
+    // Unpublished branch, no commits beyond base, clean worktree → nothing
+    // to publish. Row stays in the menu (stable order) but disabled.
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(false, 0, 0),
+            ..Default::default()
+        },
+        has_branch_commits: false,
+        ..Default::default()
+    });
+    let pub_row = find(&r, DropdownActionKind::Publish);
+    assert!(disabled_of(pub_row));
+    assert_eq!(label_of(pub_row), "No Branch Changes");
+    assert_eq!(title_of(pub_row), "Nothing to publish");
+}
+
+#[test]
+fn publish_reads_commit_changes_first_when_dirty_with_no_commits() {
+    // Unpublished, no branch commits, but dirty working changes → steer the
+    // user to commit first rather than just saying "nothing to publish".
+    let r = resolve(&DropdownInputs {
+        primary: PrimaryActionInputs {
+            upstream_status: upstream(false, 0, 0),
+            has_unstaged_changes: true,
+            ..Default::default()
+        },
+        has_branch_commits: false,
+        ..Default::default()
+    });
+    let pub_row = find(&r, DropdownActionKind::Publish);
+    assert!(disabled_of(pub_row));
+    assert_eq!(label_of(pub_row), "Commit Changes First");
+    assert_eq!(title_of(pub_row), "Commit changes before publishing the branch");
 }
 
 #[test]
@@ -395,6 +536,7 @@ fn idempotent_resolution() {
         },
         base_ref: Some("origin/main".to_string()),
         force_push_with_lease: true,
+        has_branch_commits: true,
         is_pr_operation_active: false,
     };
     assert_eq!(resolve(&inputs), resolve(&inputs));

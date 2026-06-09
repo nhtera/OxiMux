@@ -109,6 +109,16 @@ impl CommitArea {
         cx.notify();
     }
 
+    /// Mirror the panel-resolved rebase base ref into the commit area so
+    /// `rebase_from_base` (dispatched from inside this widget) knows which
+    /// ref to rebase onto. Pushed once per poll tick alongside the staged
+    /// snapshot. No `cx.notify` — this field never affects `CommitArea`'s
+    /// own render (the Rebase row LABEL is resolved by the panel), it's
+    /// only read at dispatch time.
+    pub fn set_rebase_base(&mut self, base: Option<String>) {
+        self.rebase_base = base;
+    }
+
     /// True when the heuristic generator is currently running.
     pub fn is_generating_ai(&self) -> bool {
         self.ai_state.is_generating()

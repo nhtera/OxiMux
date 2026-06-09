@@ -54,6 +54,19 @@ pub trait ForgeProvider {
     /// result maps to false so the Create-PR control stays usable.
     async fn has_open_pr(&self, cwd: &Path) -> bool;
 
+    /// Full PR lifecycle state for the current branch (open / merged / closed
+    /// / none). Distinguishes a **merged** PR from "no PR" so the Create-PR
+    /// surface can suppress a duplicate-PR offer and the Publish row can show
+    /// its "PR Status" variant. Default derives from [`has_open_pr`] (open vs
+    /// none) for providers that don't implement the richer query.
+    async fn pr_state(&self, cwd: &Path) -> oximux_core::PrState {
+        if self.has_open_pr(cwd).await {
+            oximux_core::PrState::Open
+        } else {
+            oximux_core::PrState::None
+        }
+    }
+
     /// CI check runs for the current branch's PR. Empty (never an error) when
     /// there is no PR, no checks, or the forge CLI is unavailable.
     async fn list_checks(&self, cwd: &Path) -> Vec<CheckRun>;

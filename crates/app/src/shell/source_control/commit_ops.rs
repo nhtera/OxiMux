@@ -24,6 +24,11 @@ use crate::shell::source_control::commit_area::{CommitArea, CommitStatus};
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RemoteVerb {
     Push,
+    /// `git push --force-with-lease`. Surfaced when the branch is ahead of
+    /// upstream and a plain push would be rejected (non-fast-forward). The
+    /// `--force-with-lease` guard means a teammate's surprise upstream work
+    /// aborts the push instead of being overwritten.
+    ForcePush,
     Pull,
     Sync,
     Fetch,
@@ -38,6 +43,7 @@ impl RemoteVerb {
     pub fn label(self) -> &'static str {
         match self {
             RemoteVerb::Push => "push",
+            RemoteVerb::ForcePush => "force push",
             RemoteVerb::Pull => "pull",
             RemoteVerb::Sync => "sync",
             RemoteVerb::Fetch => "fetch",
@@ -48,6 +54,8 @@ impl RemoteVerb {
     pub fn in_flight_status(self) -> CommitStatus {
         match self {
             RemoteVerb::Push => CommitStatus::Pushing,
+            // A force-push is still a push from the status row's POV.
+            RemoteVerb::ForcePush => CommitStatus::Pushing,
             RemoteVerb::Pull => CommitStatus::Pulling,
             RemoteVerb::Sync => CommitStatus::Syncing,
             RemoteVerb::Fetch => CommitStatus::Fetching,
@@ -59,8 +67,24 @@ impl RemoteVerb {
     }
 }
 
-/// Run the commit pipeline with optional follow-up push/sync.
-/// `followup_push` ⊕ `followup_sync` are mutually exclusive (asserted).
+/// Optional remote step run after a successful commit. Mutually
+/// exclusive by construction (an enum, not a set of bools), so the
+/// "commit then push AND sync" impossible state can't be expressed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CommitFollowup {
+    /// Commit only — no network step.
+    None,
+    /// Commit then `git push`.
+    Push,
+    /// Commit then `git pull --ff-only && git push`.
+    Sync,
+    /// Commit then `git push --force-with-lease`. Used when the local
+    /// branch has rewritten history (amend/rebase) that a plain push
+    /// would reject.
+    ForcePush,
+}
+
+/// Run the commit pipeline with an optional follow-up remote step.
 ///
 /// `window` is plumbed through so the completion task can root its
 /// `cx.spawn_in(window, …)` — that's what gives the success-arm
@@ -68,12 +92,10 @@ impl RemoteVerb {
 /// auto-clear (`InputState::set_value`) requires.
 pub fn run_commit(
     area: &mut CommitArea,
-    followup_push: bool,
-    followup_sync: bool,
+    followup: CommitFollowup,
     window: &mut Window,
     cx: &mut Context<CommitArea>,
 ) {
-    debug_assert!(!(followup_push && followup_sync));
     if area.in_flight.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -99,18 +121,28 @@ pub fn run_commit(
                         return;
                     }
                 };
-                if followup_push {
-                    let _ = match repo.push().await {
-                        Ok(_) => tx.send(Ok("push")),
-                        Err(e) => tx.send(Err(("push", e.to_string()))),
-                    };
-                } else if followup_sync {
-                    let _ = match repo.sync().await {
-                        Ok(_) => tx.send(Ok("sync")),
-                        Err(e) => tx.send(Err(("sync", e.to_string()))),
-                    };
-                } else {
-                    let _ = tx.send(Ok("commit"));
+                match followup {
+                    CommitFollowup::Push => {
+                        let _ = match repo.push().await {
+                            Ok(_) => tx.send(Ok("push")),
+                            Err(e) => tx.send(Err(("push", e.to_string()))),
+                        };
+                    }
+                    CommitFollowup::Sync => {
+                        let _ = match repo.sync().await {
+                            Ok(_) => tx.send(Ok("sync")),
+                            Err(e) => tx.send(Err(("sync", e.to_string()))),
+                        };
+                    }
+                    CommitFollowup::ForcePush => {
+                        let _ = match repo.force_push().await {
+                            Ok(_) => tx.send(Ok("force push")),
+                            Err(e) => tx.send(Err(("force push", e.to_string()))),
+                        };
+                    }
+                    CommitFollowup::None => {
+                        let _ = tx.send(Ok("commit"));
+                    }
                 }
             });
         }
@@ -139,6 +171,10 @@ pub fn run_commit(
 pub enum CommitVerb {
     CherryPick(String),
     Revert(String),
+    /// `git rebase <base>`. Carries the base ref (e.g. `origin/main`)
+    /// rather than a commit SHA, but shares the same conflict→operation-banner
+    /// lifecycle as cherry-pick / revert, so it rides the same machinery.
+    Rebase(String),
 }
 
 impl CommitVerb {
@@ -146,6 +182,7 @@ impl CommitVerb {
         match self {
             CommitVerb::CherryPick(_) => "cherry-pick",
             CommitVerb::Revert(_) => "revert",
+            CommitVerb::Rebase(_) => "rebase",
         }
     }
 
@@ -153,6 +190,7 @@ impl CommitVerb {
         match self {
             CommitVerb::CherryPick(_) => CommitStatus::CherryPicking,
             CommitVerb::Revert(_) => CommitStatus::Reverting,
+            CommitVerb::Rebase(_) => CommitStatus::Rebasing,
         }
     }
 }
@@ -181,6 +219,73 @@ pub fn run_commit_verb(area: &mut CommitArea, verb: CommitVerb, cx: &mut Context
                 let r = match verb_for_task {
                     CommitVerb::CherryPick(sha) => repo.cherry_pick(&sha).await,
                     CommitVerb::Revert(sha) => repo.revert_commit(&sha).await,
+                    CommitVerb::Rebase(base) => repo.rebase_onto(&base).await,
+                };
+                let _ = match r {
+                    Ok(_) => tx.send(Ok(label)),
+                    Err(e) => tx.send(Err((label, e.to_string()))),
+                };
+            });
+        }
+        Err(_) => {
+            area.status = CommitStatus::Failed(label.to_string(), "no tokio runtime".to_string());
+            area.in_flight.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
+    spawn_completion(area, rx, cx);
+}
+
+/// Operation-banner recovery verbs: abort or continue the in-progress
+/// merge / rebase / cherry-pick / revert / bisect. Carries the
+/// `GitOperation` so the git layer dispatches the right `--abort` /
+/// `--continue` command. Distinct from `CommitVerb` (which extends
+/// history) — these resolve a *paused* operation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OperationRecovery {
+    Abort(oximux_core::GitOperation),
+    Continue(oximux_core::GitOperation),
+}
+
+impl OperationRecovery {
+    fn label(self) -> &'static str {
+        match self {
+            OperationRecovery::Abort(_) => "abort",
+            OperationRecovery::Continue(_) => "continue",
+        }
+    }
+
+    fn in_flight_status(self) -> CommitStatus {
+        match self {
+            OperationRecovery::Abort(_) => CommitStatus::Aborting,
+            OperationRecovery::Continue(_) => CommitStatus::Continuing,
+        }
+    }
+}
+
+/// Run an operation-banner recovery (abort / continue). Single-flight on
+/// the shared `in_flight` flag, same completion path as the remote verbs.
+/// On success the next poll tick re-reads `current_operation()`; an aborted
+/// or completed op clears the banner. A failed continue (conflicts still
+/// unstaged) surfaces `Failed("continue", …)` in the status row.
+pub fn run_op_recovery(
+    area: &mut CommitArea,
+    recovery: OperationRecovery,
+    cx: &mut Context<CommitArea>,
+) {
+    if area.in_flight.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    area.status = recovery.in_flight_status();
+    let repo = area.repo.clone();
+    let label = recovery.label();
+    let (tx, rx) = oneshot::channel::<Result<&'static str, (&'static str, String)>>();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let r = match recovery {
+                    OperationRecovery::Abort(op) => repo.abort_operation(op).await,
+                    OperationRecovery::Continue(op) => repo.continue_operation(op).await,
                 };
                 let _ = match r {
                     Ok(_) => tx.send(Ok(label)),
@@ -212,6 +317,7 @@ pub fn run_remote(area: &mut CommitArea, verb: RemoteVerb, cx: &mut Context<Comm
             handle.spawn(async move {
                 let r = match verb {
                     RemoteVerb::Push => repo.push().await,
+                    RemoteVerb::ForcePush => repo.force_push().await,
                     RemoteVerb::Pull => repo.pull().await,
                     RemoteVerb::Sync => repo.sync().await,
                     RemoteVerb::Fetch => repo.fetch().await,

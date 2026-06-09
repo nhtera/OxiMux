@@ -16,6 +16,7 @@ pub mod git_diff;
 pub mod git_ops;
 pub mod git_state;
 pub mod pane_session;
+pub mod pr_state;
 pub mod project;
 pub mod workspace;
 
@@ -32,6 +33,7 @@ pub use git_state::{
     RenameInfo, RenameKind, WorktreeStatus,
 };
 pub use pane_session::PaneSession;
+pub use pr_state::PrState;
 pub use project::Project;
 pub use workspace::{ViewMode, Workspace, WorktreeSettings};
 

@@ -130,6 +130,12 @@ pub struct SourceControlPanel {
     /// same ~30s throttle as `is_github_remote` (a `gh pr view` round-trip).
     has_open_pr: bool,
 
+    /// The current branch's PR was **merged**. Suppresses Create-PR (so the
+    /// user can't open a duplicate PR for already-merged work) and drives the
+    /// Publish row's "PR Status" variant. Derived from the same `gh pr view
+    /// --json state` round-trip as `has_open_pr`.
+    pr_merged: bool,
+
     /// Last time the GitHub PR status (`is_github_remote` + `has_open_pr`) was
     /// refreshed. Throttles the `gh` round-trips to ~30s (GitHub rate limits)
     /// and lets the button reflect a just-created PR within that window.
@@ -320,6 +326,17 @@ impl SourceControlPanel {
                     .collect();
                 area.set_staged_snapshot(staged, cx);
             }
+            // Seed the rebase base too (same first-render-correctness reason)
+            // so a Rebase click landing before the first poll tick dispatches
+            // onto the right ref instead of failing "No base ref configured".
+            // Mirrors `resolve_rebase_base`: pinned ref, else git-resolved base.
+            let initial_rebase_base = initial_base_ref.clone().or_else(|| {
+                git_state
+                    .as_ref()
+                    .and_then(|s| s.branch_range.as_ref())
+                    .map(|r| r.base_ref.clone())
+            });
+            area.set_rebase_base(initial_rebase_base);
             area
         });
         // Phase 13: load persisted graph height now so the section
@@ -419,6 +436,7 @@ impl SourceControlPanel {
             force_push_with_lease: false,
             is_github_remote: false,
             has_open_pr: false,
+            pr_merged: false,
             pr_status_checked_at: None,
             pr_status_checked_branch: None,
             ci_checks: Vec::new(),
@@ -835,9 +853,15 @@ impl SourceControlPanel {
                                 .filter(|f| f.is_staged())
                                 .cloned()
                                 .collect();
+                            // Mirror the resolved rebase base in too, so the
+                            // Rebase dropdown row dispatches onto the same ref
+                            // its label shows. Computed after `git_state` is
+                            // set above so `resolve_rebase_base` sees fresh data.
+                            let rebase_base = panel.resolve_rebase_base();
                             let commit_area = panel.commit_area.clone();
                             commit_area.update(cx, |area, cx| {
-                                area.set_staged_snapshot(staged, cx)
+                                area.set_staged_snapshot(staged, cx);
+                                area.set_rebase_base(rebase_base);
                             });
                             // Feed the "Committed on Branch" section.
                             let branch_commits = panel.branch_commits.clone();
@@ -993,9 +1017,36 @@ impl SourceControlPanel {
             in_flight_remote_op_kind: in_flight_remote_kind,
             is_github_remote: self.is_github_remote,
             has_open_pr: self.has_open_pr,
+            pr_merged: self.pr_merged,
             is_creating_pr: matches!(commit_status, commit_area::CommitStatus::CreatingPr),
             is_merging_pr: matches!(commit_status, commit_area::CommitStatus::MergingPr),
+            has_branch_commits: self.has_branch_commits(),
+            is_detached_head: self.is_detached_head(),
+            on_default_branch: self.on_default_branch(),
         }
+    }
+
+    /// HEAD is detached when git status reports `(detached)` → `branch` is
+    /// `None` while a git state exists. (A `None` git state means the panel
+    /// hasn't polled yet, not a detached HEAD.)
+    fn is_detached_head(&self) -> bool {
+        self.git_state
+            .as_ref()
+            .is_some_and(|s| s.branch.is_none())
+    }
+
+    /// The current branch is the PR base branch (creating a PR from it would
+    /// target itself). Compares the branch name against the resolved base ref
+    /// both bare (`main`) and remote-qualified (`origin/main`), so it matches
+    /// whether the base is stored with or without a remote prefix.
+    fn on_default_branch(&self) -> bool {
+        let Some(branch) = self.git_state.as_ref().and_then(|s| s.branch.as_deref()) else {
+            return false;
+        };
+        let Some(base) = self.resolve_rebase_base() else {
+            return false;
+        };
+        base == branch || base.split_once('/').map(|(_, rest)| rest) == Some(branch)
     }
 
     /// Build the dropdown-only inputs wrapper. `force_push_with_lease`
@@ -1004,22 +1055,47 @@ impl SourceControlPanel {
     /// upstream. `base_ref` is None until a configurable base ref lands;
     /// the PR-operation flag stays false until a hosted-review backend
     /// exists.
-    fn build_dropdown_inputs(&self, cx: &Context<Self>) -> DropdownInputs {
-        // Rebase base: the user's pinned ref if set, else the git-resolved base
-        // the branch diverged from (e.g. `origin/main`). Naming a real branch —
-        // not a generic "Base" placeholder — lets the Rebase row read like the
-        // benchmark menu and surfaces the right disabled reason (dirty worktree)
-        // instead of "configure a base ref first".
-        let base_ref = self.base_ref.clone().or_else(|| {
+    /// Rebase base: the user's pinned ref if set, else the git-resolved base
+    /// the branch diverged from (e.g. `origin/main`). Naming a real branch —
+    /// not a generic "Base" placeholder — lets the Rebase row read like the
+    /// benchmark menu and surfaces the right disabled reason (dirty worktree)
+    /// instead of "configure a base ref first".
+    ///
+    /// Single source of truth for both the dropdown LABEL (`build_dropdown_inputs`)
+    /// and the dispatch-time base the commit area rebases onto (mirrored in via
+    /// the state observer), so the two can never disagree about which ref the
+    /// row acts on.
+    /// True when the branch has at least one commit beyond its base
+    /// (`branch_committed` lists files changed in those commits). On an
+    /// unpublished branch `ahead`/`behind` are 0, so this is the only signal
+    /// for "is there anything to publish". Shared by the primary-action and
+    /// dropdown input builders so the Publish button and its menu row agree.
+    fn has_branch_commits(&self) -> bool {
+        self.git_state
+            .as_ref()
+            .map(|s| !s.branch_committed.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn resolve_rebase_base(&self) -> Option<String> {
+        self.base_ref.clone().or_else(|| {
             self.git_state
                 .as_ref()
                 .and_then(|s| s.branch_range.as_ref())
                 .map(|r| r.base_ref.clone())
-        });
+        })
+    }
+
+    fn build_dropdown_inputs(&self, cx: &Context<Self>) -> DropdownInputs {
+        // Branch has commits to publish when `branch_committed` (files changed
+        // in commits beyond the base) is non-empty. On an unpublished branch
+        // `ahead`/`behind` are 0 (no upstream), so this is the only signal for
+        // "is there anything to publish" — it drives the Publish row variants.
         DropdownInputs {
             primary: self.build_primary_inputs(cx),
             force_push_with_lease: self.force_push_with_lease,
-            base_ref,
+            base_ref: self.resolve_rebase_base(),
+            has_branch_commits: self.has_branch_commits(),
             is_pr_operation_active: false,
         }
     }
@@ -1158,9 +1234,30 @@ impl Render for SourceControlPanel {
             },
         )
         .map(IntoElement::into_any_element);
-        let operation_banner: Option<AnyElement> =
-            conflict_banner::render_operation_banner(current_op, theme)
-                .map(IntoElement::into_any_element);
+        // Operation-banner recovery: Abort always, Continue only when the op
+        // supports it AND conflicts are resolved (git rejects a continue past
+        // unstaged markers). Both route through the commit area's single-flight
+        // status surface. `current_op` is Some whenever the banner renders, so
+        // the closures unwrap it defensively.
+        let continue_enabled = conflict_count == 0;
+        let op_abort_area = self.commit_area.clone();
+        let op_continue_area = self.commit_area.clone();
+        let operation_banner: Option<AnyElement> = conflict_banner::render_operation_banner(
+            current_op,
+            theme,
+            continue_enabled,
+            move |_window, app| {
+                if let Some(op) = current_op {
+                    op_abort_area.update(app, |area, cx| area.abort_operation(op, cx));
+                }
+            },
+            move |_window, app| {
+                if let Some(op) = current_op {
+                    op_continue_area.update(app, |area, cx| area.continue_operation(op, cx));
+                }
+            },
+        )
+        .map(IntoElement::into_any_element);
         // Suppress the composer entirely under unresolved conflicts.
         // Committing on top of conflict markers would persist them
         // into the tree; the ConflictSummaryCard above explains why
@@ -1357,13 +1454,18 @@ async fn refresh_pr_status(
     let workdir = repo.workdir().to_path_buf();
     let forge = GithubForge;
     let is_github = forge.supports_repo(&workdir).await;
-    let has_pr = if is_github {
-        forge.has_open_pr(&workdir).await
+    // One `gh pr view --json state` round-trip yields the full lifecycle
+    // state; `has_open_pr` and `pr_merged` both derive from it.
+    let pr_state = if is_github {
+        forge.pr_state(&workdir).await
     } else {
-        false
+        oximux_core::PrState::None
     };
-    // Only pull CI checks when there's actually a PR — a second `gh` round-trip
-    // we don't want to spend otherwise. Empty list clears any stale CI row.
+    let has_pr = pr_state.is_open();
+    let pr_merged = pr_state.is_merged();
+    // Only pull CI checks when there's actually an open PR — a second `gh`
+    // round-trip we don't want to spend otherwise. Empty list clears any
+    // stale CI row.
     let checks = if has_pr {
         forge.list_checks(&workdir).await
     } else {
@@ -1372,11 +1474,14 @@ async fn refresh_pr_status(
     let _ = this.update(cx, |panel, cx| {
         panel.pr_status_checked_at = Some(std::time::Instant::now());
         let checks_changed = panel.ci_checks != checks;
-        let changed =
-            panel.is_github_remote != is_github || panel.has_open_pr != has_pr || checks_changed;
+        let changed = panel.is_github_remote != is_github
+            || panel.has_open_pr != has_pr
+            || panel.pr_merged != pr_merged
+            || checks_changed;
         if changed {
             panel.is_github_remote = is_github;
             panel.has_open_pr = has_pr;
+            panel.pr_merged = pr_merged;
             if checks_changed {
                 // The check set moved (new run, status flip, PR closed) — drop
                 // the expanded/log view-state so a stale log can't linger under

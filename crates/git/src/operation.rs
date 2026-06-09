@@ -20,6 +20,8 @@
 
 use oximux_core::GitOperation;
 
+use crate::error::{GitError, Result};
+use crate::process::GitCmd;
 use crate::repository::Repository;
 
 impl Repository {
@@ -68,5 +70,53 @@ impl Repository {
             return Some(GitOperation::Bisect);
         }
         None
+    }
+
+    /// Abort the in-progress operation, returning the worktree to its
+    /// pre-operation state. Each op has its own escape hatch:
+    /// `git merge/rebase/cherry-pick/revert --abort`, and `git bisect reset`
+    /// for bisect (which has no `--abort`). Always safe to offer — abort
+    /// discards the partial operation rather than the user's prior commits.
+    pub async fn abort_operation(&self, op: GitOperation) -> Result<()> {
+        let args: &[&str] = match op {
+            GitOperation::Merge => &["merge", "--abort"],
+            GitOperation::Rebase => &["rebase", "--abort"],
+            GitOperation::CherryPick => &["cherry-pick", "--abort"],
+            GitOperation::Revert => &["revert", "--abort"],
+            GitOperation::Bisect => &["bisect", "reset"],
+        };
+        GitCmd::new(self.workdir()).args(args).run().await?;
+        Ok(())
+    }
+
+    /// Resume a paused sequencer operation after the user staged their
+    /// conflict resolutions (`git rebase/cherry-pick/revert --continue`).
+    ///
+    /// `-c core.editor=true` accepts the prepared commit message without
+    /// opening an interactive editor — the GUI has no TTY to host one, so
+    /// the default `core.editor` would hang the command. Operations without
+    /// a continue step (`Merge`, `Bisect`) return `InvalidInput`; callers
+    /// gate on [`GitOperation::supports_continue`] so this is only reached
+    /// defensively.
+    ///
+    /// If conflicts remain unstaged, git rejects the continue and the raw
+    /// stderr rides the `Err` to the status row — the operation stays paused
+    /// rather than advancing past unresolved markers.
+    pub async fn continue_operation(&self, op: GitOperation) -> Result<()> {
+        let verb = match op {
+            GitOperation::Rebase => "rebase",
+            GitOperation::CherryPick => "cherry-pick",
+            GitOperation::Revert => "revert",
+            GitOperation::Merge | GitOperation::Bisect => {
+                return Err(GitError::invalid_input(
+                    "operation has no --continue step",
+                ));
+            }
+        };
+        GitCmd::new(self.workdir())
+            .args(["-c", "core.editor=true", verb, "--continue"])
+            .run()
+            .await?;
+        Ok(())
     }
 }
