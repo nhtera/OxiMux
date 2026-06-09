@@ -148,9 +148,26 @@ fn main() {
         // focus accent — same tokens, single source of truth.
         {
             let palette = oximux_settings::Theme::charcoal();
+            // Read the OS auto-hide preference before taking the mutable global
+            // borrow below (can't call `cx` methods while `component_theme`
+            // holds it). A user who set "Always show scrollbars" (an
+            // accessibility choice some low-vision users rely on) reports
+            // `false` here.
+            let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
             let component_theme = gpui_component::Theme::global_mut(cx);
             component_theme.colors.input = palette.border_inactive;
             component_theme.colors.ring = palette.focus_ring;
+            // List scrollbars stay invisible until the pointer enters the
+            // scroll region, then reveal thumb-only — quiet at rest, no
+            // persistent rail chrome. The library default (`Scrolling`) only
+            // shows the bar mid-scroll; `Hover` matches the benchmark's calmer
+            // "appears on approach" behavior. One global = every
+            // `vertical_scrollbar` call site inherits it. Skip the override
+            // when the user asked for always-visible scrollbars — leave the
+            // appearance gpui-component already synced from the system.
+            if auto_hide_scrollbars {
+                component_theme.scrollbar_show = gpui_component::scroll::ScrollbarShow::Hover;
+            }
         }
         // Load user terminal settings into a global + start the live-reload
         // watcher BEFORE any window opens so the first pane reads real values.
@@ -160,6 +177,10 @@ fn main() {
         // first click after launch sees the user's configured mode (heuristic
         // by default; agent when configured).
         oximux_app::commit_message_ai_settings::install(cx);
+        // Resolve the reduced-motion preference once and install the Motion
+        // global before any window opens, so the first animated surface reads
+        // the right durations.
+        oximux_app::motion_settings::install(cx);
         // Process-wide last-known-`GitState` cache. Registered before any
         // window opens so the first SCM panel can seed from it (no-op on a
         // cold start; populated as each project's poller produces a sample,

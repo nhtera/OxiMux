@@ -274,7 +274,9 @@ pub(super) fn row(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .overflow_hidden()
+                // Ellipsis (…) rather than a hard clip so a deep path reads as
+                // truncated, not broken mid-word, when the panel is narrow.
+                .truncate()
                 .text_size(px(sc_style::GRAPH_META_TEXT))
                 .text_color(rctx.theme.fg_subtle)
                 .child(parent),

@@ -1005,10 +1005,21 @@ impl SourceControlPanel {
     /// the PR-operation flag stays false until a hosted-review backend
     /// exists.
     fn build_dropdown_inputs(&self, cx: &Context<Self>) -> DropdownInputs {
+        // Rebase base: the user's pinned ref if set, else the git-resolved base
+        // the branch diverged from (e.g. `origin/main`). Naming a real branch —
+        // not a generic "Base" placeholder — lets the Rebase row read like the
+        // benchmark menu and surfaces the right disabled reason (dirty worktree)
+        // instead of "configure a base ref first".
+        let base_ref = self.base_ref.clone().or_else(|| {
+            self.git_state
+                .as_ref()
+                .and_then(|s| s.branch_range.as_ref())
+                .map(|r| r.base_ref.clone())
+        });
         DropdownInputs {
             primary: self.build_primary_inputs(cx),
             force_push_with_lease: self.force_push_with_lease,
-            base_ref: self.base_ref.clone(),
+            base_ref,
             is_pr_operation_active: false,
         }
     }

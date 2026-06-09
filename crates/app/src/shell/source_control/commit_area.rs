@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    Anchor, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, IntoElement,
-    ParentElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
+    Anchor, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable as _,
@@ -328,6 +329,14 @@ impl CommitArea {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Pull, cx);
     }
 
+    /// Fast-forward-only pull. Shares the `--ff-only` backend with [`Self::pull`]
+    /// — the dropdown surfaces it as its own row (enabled only when the branch
+    /// can fast-forward), but the underlying op is identical until a
+    /// merge/rebase pull path lands.
+    pub fn fast_forward(&mut self, cx: &mut Context<Self>) {
+        super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Pull, cx);
+    }
+
     /// Standalone `git pull --ff-only && git push`.
     pub fn sync(&mut self, cx: &mut Context<Self>) {
         super::commit_ops::run_remote(self, super::commit_ops::RemoteVerb::Sync, cx);
@@ -609,12 +618,17 @@ impl CommitArea {
         // `.small()` brings the chunky default-size pill down to ~32px tall
         // so it sits proportional to the textarea above.
         //
-        // Variant switch: a `.primary()` button retains its bright fill even
-        // when disabled, which reads as "active" to the eye. Fall back to
-        // `.secondary()` when disabled so the button matches the dimmed
-        // visual treatment users expect (a gray disabled-Commit
-        // state). Enabled state keeps `.primary()` so the affirmative action
-        // still pops.
+        // Variant switch, keyed on the resolved action kind so weight tracks
+        // meaning:
+        //   - Disabled → `.secondary()`. A `.primary()` button keeps its bright
+        //     fill even when disabled, reading as "active"; the dimmed
+        //     secondary matches the gray disabled-Commit state users expect.
+        //   - Commit (enabled) → `.primary()`. Solid fill is reserved for the
+        //     single true affirmative of the flow, so it still pops.
+        //   - Every other verb (Stage / Push / Pull / Sync / Publish / Create
+        //     PR) → `.outline()`. These are frequent, non-terminal steps; a
+        //     solid-white box per verb made the panel shout. Quiet outline
+        //     keeps them present without dominating.
         let mut primary = DropdownButton::new("sc-commit-split")
             .button(inner_button)
             .small()
@@ -622,12 +636,25 @@ impl CommitArea {
             .w_full();
         primary = if submit_disabled {
             primary.secondary()
-        } else {
+        } else if action.kind == PrimaryActionKind::Commit {
             primary.primary()
+        } else {
+            primary.outline()
         };
+        // Captured for the dropdown rows so enabled verbs read at full weight
+        // and disabled verbs recede with their reason as a quiet hint.
+        let menu_theme = theme;
+        let menu_label_weight = typography.w_medium;
         let primary =
             primary.dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _cx| {
-                build_commit_menu(menu, window, &action_view, &resolved_entries)
+                build_commit_menu(
+                    menu,
+                    window,
+                    &action_view,
+                    &resolved_entries,
+                    menu_theme,
+                    menu_label_weight,
+                )
             });
 
         // Conventional-prefix shortcut row + subject character counter
@@ -736,6 +763,8 @@ fn build_commit_menu(
     window: &mut Window,
     view: &Entity<CommitArea>,
     entries: &[DropdownEntry],
+    theme: Theme,
+    label_weight: FontWeight,
 ) -> gpui_component::menu::PopupMenu {
     menu = menu.min_w(px(224.0));
     for entry in entries {
@@ -749,19 +778,34 @@ fn build_commit_menu(
                 title,
                 disabled,
             } => {
-                menu = menu.item(build_menu_item(window, view, *kind, label, title, *disabled));
+                menu = menu.item(build_menu_item(
+                    window,
+                    view,
+                    *kind,
+                    label,
+                    title,
+                    *disabled,
+                    theme,
+                    label_weight,
+                ));
             }
         }
     }
     menu
 }
 
-/// Map one resolved entry into a `PopupMenuItem`.
+/// Map one resolved entry into a styled `PopupMenuItem`.
 ///
-/// The menu component has no per-row hover-tooltip API, so we encode the
-/// disabled-reason copy inline in the label (`"Push — Nothing to push"`).
-/// Surfaces the "why not" without hover and keeps the menu shape stable.
-/// Enabled rows render the bare label.
+/// Hierarchy (modeled on VS Code / the reference UX git menus):
+/// - **Enabled** verbs carry a medium weight and the menu's default bright
+///   foreground (no explicit color, so hover still recolors them) — the
+///   actionable rows are the visual focus. Counts ride inline in the label
+///   (`Push (1)`, `Sync (↓0 ↑1)`) from the resolver.
+/// - **Disabled** verbs recede to `fg_muted`; the "why not" rides a hover
+///   **tooltip** rather than crowding every row. The two review verbs (Create
+///   PR / Push before PR) are the exception — their path-to-enable isn't
+///   obvious from the label, so the reason also shows as an inline `fg_subtle`
+///   sub-line.
 fn build_menu_item(
     window: &mut Window,
     view: &Entity<CommitArea>,
@@ -769,15 +813,51 @@ fn build_menu_item(
     label: &str,
     title: &str,
     disabled: bool,
+    theme: Theme,
+    label_weight: FontWeight,
 ) -> PopupMenuItem {
-    let composed = if disabled && !title.is_empty() {
-        format!("{label} — {title}")
-    } else {
-        label.to_string()
-    };
-    let item = PopupMenuItem::new(composed).disabled(disabled);
-    // Disabled rows still need an on_click slot for the menu's click
-    // dispatcher; the gate happens at `PopupMenuItem.disabled` and the
+    let label = label.to_string();
+    let title = title.to_string();
+    // Only the review verbs surface their reason inline; every other row keeps
+    // the menu clean and explains itself on hover.
+    let show_inline_hint = disabled
+        && !title.is_empty()
+        && matches!(
+            kind,
+            DropdownActionKind::CreatePr | DropdownActionKind::PushBeforePr
+        );
+    let row_id = SharedString::from(format!("sc-menu-{kind:?}"));
+    let item = PopupMenuItem::element(move |_window, _cx| {
+        let tip = title.clone();
+        let row = if !disabled {
+            div().font_weight(label_weight).child(label.clone())
+        } else if show_inline_hint {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(div().text_color(theme.fg_muted).child(label.clone()))
+                .child(
+                    div()
+                        .text_size(px(sc_style::GRAPH_META_TEXT))
+                        .text_color(theme.fg_subtle)
+                        .child(title.clone()),
+                )
+        } else {
+            div().text_color(theme.fg_muted).child(label.clone())
+        };
+        // Every row explains its current state on hover — enabled verbs
+        // describe what they'll do, disabled verbs say why they can't. The
+        // tooltip API needs a stable element id; the row is otherwise inert
+        // (no click handler / stop_propagation) so the menu's own row click
+        // still dispatches.
+        row.id(row_id.clone()).tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        })
+    })
+    .disabled(disabled);
+    // Disabled rows still carry the click slot for the menu's dispatcher; the
+    // gate is `PopupMenuItem.disabled` (the row skips its on_click) and the
     // dispatch table no-ops on PR kinds so a wired click never escapes.
     let view_for_click = view.clone();
     item.on_click(window.listener_for(&view_for_click, move |area, _, window, cx| {
@@ -823,6 +903,7 @@ fn dispatch_dropdown(
         DropdownActionKind::Push => area.push(cx),
         DropdownActionKind::ForcePush => area.force_push(cx),
         DropdownActionKind::Pull => area.pull(cx),
+        DropdownActionKind::FastForward => area.fast_forward(cx),
         DropdownActionKind::Sync => area.sync(cx),
         DropdownActionKind::Rebase => area.rebase_from_base(cx),
         DropdownActionKind::Fetch => area.fetch(cx),

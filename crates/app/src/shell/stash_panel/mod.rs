@@ -33,6 +33,12 @@ use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 use tokio::sync::oneshot;
 
+/// Resting opacity of a stash row's Apply/Pop/Drop cluster — ghosted enough to
+/// calm the row, present enough that the actions are always discoverable and
+/// clickable (the panel has no context-menu fallback). Lifts to full on
+/// row-hover.
+const STASH_ACTION_REST_OPACITY: f32 = 0.45;
+
 #[derive(Debug)]
 pub enum StashListState {
     Idle,
@@ -382,30 +388,37 @@ impl StashPanel {
         let apply_ref = entry.stash_ref.clone();
         let pop_ref = entry.stash_ref.clone();
         let drop_ref = entry.stash_ref.clone();
-        div()
+        // Hover scope for the progressive-disclosure cluster below.
+        let group_name = format!("stash-row-{index}");
+        // Apply / Pop / Drop all sit at the same xsmall (22px) height so the
+        // row reads as one action cluster — the destructive verb doesn't
+        // dominate by being larger than its siblings.
+        let actions = div()
             .flex()
             .flex_row()
             .items_center()
-            .h(px(density.h_action_row))
-            .px(px(density.pad_panel))
+            // Pin the action cluster: it must never shrink or clip — a narrow
+            // panel truncates the label instead (the canonical SCM-row collapse
+            // priority). Without this, a long stash message pushed the cluster
+            // off the right edge and clipped "Drop".
+            .flex_shrink_0()
             .gap(px(density.gap_inline))
-            .border_b_1()
-            .border_color(theme.border_inactive)
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(theme.fg_base)
-                    .child(label),
-            )
-            // Apply / Pop / Drop all sit at the same xsmall (22px) height so
-            // the row reads as one action cluster — the destructive verb
-            // doesn't dominate by being larger than its siblings.
+            // Progressive disclosure: the cluster rests ghosted and lifts to
+            // full on row-hover, so a calm row at rest but every verb is one
+            // hover away. NOT fully hidden on purpose — the stash panel has no
+            // context menu, so a hidden cluster would leave Drop (destructive)
+            // with no alternative invocation path. Ghost-at-rest keeps every
+            // action reachable at all times (documented exception to the
+            // fully-hidden row-action convention used where a context-menu
+            // backup exists).
+            .opacity(STASH_ACTION_REST_OPACITY)
+            .group_hover(group_name.clone(), |s| s.opacity(1.0))
             .child(
                 Button::new(("stash-apply", index))
                     .ghost()
                     .xsmall()
                     .label("Apply")
+                    .tooltip("Apply stash (keep it in the list)")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
                         panel.apply(apply_ref.clone(), cx);
                         cx.notify();
@@ -416,6 +429,7 @@ impl StashPanel {
                     .ghost()
                     .xsmall()
                     .label("Pop")
+                    .tooltip("Apply stash and remove it (reversible via reflog)")
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _window, cx| {
                         panel.pop(pop_ref.clone(), cx);
                         cx.notify();
@@ -431,7 +445,29 @@ impl StashPanel {
                     panel.request_drop(drop_ref.clone());
                     cx.notify();
                 }),
-            ))
+            ));
+        div()
+            .group(group_name)
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(density.h_action_row))
+            .px(px(density.pad_panel))
+            .gap(px(density.gap_inline))
+            .border_b_1()
+            .border_color(theme.border_inactive)
+            .child(
+                div()
+                    .flex_1()
+                    // Shrink-to-fit + ellipsis so a long stash subject collapses
+                    // gracefully instead of shoving the action cluster off-panel.
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.fg_base)
+                    .child(label),
+            )
+            .child(actions)
     }
 }
 

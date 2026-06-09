@@ -13,6 +13,7 @@ pub mod git_state_cache;
 pub mod keymap;
 pub mod left_rail_layout;
 pub mod menu;
+pub mod motion_settings;
 pub mod notifier;
 pub mod persisted_terminals;
 pub mod project_panes_factory;

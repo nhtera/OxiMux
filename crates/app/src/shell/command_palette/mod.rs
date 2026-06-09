@@ -451,6 +451,7 @@ impl Render for PaletteModal {
         }
         let theme = self.theme;
         let density = self.density;
+        let motion = crate::motion_settings::active(cx);
         let typography = self.typography.clone();
         let mode = self.mode;
         let query = self.query.clone();
@@ -493,6 +494,7 @@ impl Render for PaletteModal {
                     theme,
                     density,
                     typography: &typography,
+                    motion,
                 })
                 .track_focus(&self.focus_handle)
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
@@ -571,6 +573,7 @@ impl Render for PaletteModal {
                     theme,
                     density,
                     typography: &typography,
+                    motion,
                 })
                 .track_focus(&self.focus_handle)
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
@@ -639,6 +642,7 @@ impl Render for PaletteModal {
                     theme,
                     density,
                     typography: &typography,
+                    motion,
                 })
                 .track_focus(&self.focus_handle)
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {

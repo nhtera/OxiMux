@@ -492,6 +492,7 @@ impl Render for GitPanel {
                 let rctx = RenderCtx {
                     theme: self.theme,
                     density: self.density,
+                    motion: crate::motion_settings::active(cx),
                     typography: &self.typography,
                     selected: &self.selected,
                     collapsed: &self.collapsed_sections,

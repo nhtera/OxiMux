@@ -6,11 +6,12 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement,
-    Styled, Window, div, hsla, prelude::FluentBuilder, px,
+    Animation, AnimationExt, App, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, ease_out_quint, hsla, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::{Icon, IconName};
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, Motion, Theme, Typography};
 
 use crate::ui::FloatingSurface;
 
@@ -56,6 +57,7 @@ pub struct ModalRenderInput<'a> {
     pub theme: Theme,
     pub density: Density,
     pub typography: &'a Typography,
+    pub motion: Motion,
 }
 
 /// Build the full modal: a dimmed backdrop that dismisses on click-outside,
@@ -63,6 +65,7 @@ pub struct ModalRenderInput<'a> {
 /// `.on_key_down` on the returned element.
 pub fn build_modal_layout(input: ModalRenderInput<'_>) -> gpui::Div {
     let dismiss = input.on_dismiss.clone();
+    let motion = input.motion;
 
     let card = card_container(input.theme, input.density)
         // Stop presses inside the card from reaching the backdrop's
@@ -94,7 +97,20 @@ pub fn build_modal_layout(input: ModalRenderInput<'_>) -> gpui::Div {
             MouseButton::Left,
             move |_event, window, cx| dismiss(window, cx),
         )
-        .child(card)
+        // Enter animation: the card fades in and rises 6px to rest. GPUI's
+        // `div` exposes `opacity` but no transform-scale (that lives on
+        // `svg`/`img` only), so the reference "0.98→1.0 scale" pop is
+        // approximated with an opacity + vertical-offset settle — same
+        // perceptual beat, only div-supported props. Keyed on a stable id so
+        // it plays once on mount (the modal is unmounted while closed, so every
+        // open re-mounts and replays) and settles across the in-flight
+        // re-renders from typing / caret-blink rather than restarting. Reduced
+        // motion collapses `m_overlay` to ~instant, so the card simply appears.
+        .child(card.with_animation(
+            "palette-enter",
+            Animation::new(motion.m_overlay).with_easing(ease_out_quint()),
+            |el, delta| el.opacity(delta).mt(px(6.0 * (1.0 - delta))),
+        ))
 }
 
 fn card_container(theme: Theme, density: Density) -> gpui::Div {

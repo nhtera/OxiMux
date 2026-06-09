@@ -17,8 +17,9 @@
 use crate::shell::file_explorer::file_icon::icon_for_name;
 use crate::shell::source_control::style as sc_style;
 use gpui::{
-    ClickEvent, Context, EventEmitter, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement as _, Styled, Window, div, px, svg,
+    Animation, AnimationExt, ClickEvent, Context, EventEmitter, Hsla, InteractiveElement,
+    IntoElement, ParentElement, Render, StatefulInteractiveElement as _, Styled, Window, div,
+    ease_out_quint, px, svg,
 };
 use gpui_component::{Icon, IconName};
 use oximux_core::{BranchCommittedFile, BranchRange, DiffStatus};
@@ -171,9 +172,20 @@ impl Render for BranchCommitsPanel {
             .pt(px(self.density.pad_panel))
             .child(header);
         if !self.collapsed {
+            // Same expand-fade convention as the file sections: wrap the row
+            // set in one opacity layer, keyed on a stable id so it replays on
+            // each expand (body unmounts while collapsed) but settles across
+            // re-renders. Opacity-only — no geometry shift on this list.
+            let motion = crate::motion_settings::active(cx);
+            let mut body = div().flex().flex_col().w_full();
             for f in &self.files {
-                col = col.child(self.row(f, cx));
+                body = body.child(self.row(f, cx));
             }
+            col = col.child(body.with_animation(
+                "branch-commits-body",
+                Animation::new(motion.m_collapse).with_easing(ease_out_quint()),
+                |el, delta| el.opacity(delta),
+            ));
         }
         col.into_any_element()
     }
@@ -215,7 +227,7 @@ impl BranchCommitsPanel {
         let range = self.range.clone();
         let path = f.path.clone();
 
-        let mut row = div()
+        let row = div()
             .id(id)
             .flex()
             .flex_row()
@@ -237,21 +249,34 @@ impl BranchCommitsPanel {
                 }
             }))
             .child(icon_el)
-            .child(div().child(leaf));
-        if let Some(parent) = parent {
-            row = row.child(
+            .child(
+                // Name + parent path share a shrinkable cluster: the path
+                // truncates with an ellipsis instead of pushing the trailing
+                // counts/badge off a narrow panel. Same collapse priority as
+                // the changed-files rows (row_renderer) this section mirrors.
                 div()
-                    .text_size(px(sc_style::GRAPH_META_TEXT))
-                    .text_color(theme.fg_subtle)
-                    .child(parent),
-            );
-        }
-        // Push counts + status badge to the trailing edge.
-        row = row
-            .child(div().flex_1())
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(6.0))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .child(div().flex_shrink_0().child(leaf))
+                    .children(parent.map(|parent| {
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(sc_style::GRAPH_META_TEXT))
+                            .text_color(theme.fg_subtle)
+                            .child(parent)
+                    })),
+            )
+            // Counts + status badge pinned to the trailing edge (never shrink).
             .child(line_counts(f.added, f.removed, &theme))
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_size(px(sc_style::GRAPH_META_TEXT))
                     .text_color(badge_color)
                     .child(badge),
@@ -266,6 +291,7 @@ fn line_counts(added: u32, removed: u32, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
+        .flex_shrink_0()
         .gap(px(sc_style::LINE_COUNT_GAP))
         .text_size(px(sc_style::GRAPH_META_TEXT))
         .child(

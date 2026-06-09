@@ -152,6 +152,35 @@ The hover/selected distinction is the 1px outline: hover is the soft prelude;
 selected commits to a click. Active is reserved for "this is what you're focused
 on right now" — file tree's currently-open file is the canonical example.
 
+**Narrow-width collapse priority.** A row's *content* (name, path, message)
+yields before its *controls* (counts, status badge, action cluster). The
+flexible content column takes `.flex_1().min_w(px(0.0)).truncate()` so a long
+value ellipsizes (`…`); the trailing controls take `.flex_shrink_0()` so they
+stay fully visible at any panel width. Without `min_w(0)` a flex child refuses
+to shrink below its content and shoves the controls off the panel edge (the
+classic clipped-`Drop`-on-a-narrow-stash-row bug). Canonical refs:
+`git_panel::row_renderer` (file rows), `source_control::graph_row` (commit
+rows), `stash_panel` (stash rows).
+
+### Progressive disclosure (secondary row actions)
+
+Secondary, row-scoped actions stay hidden until the row is hovered, so dense
+surfaces read calm at rest and reveal their verbs on approach. Identity/content
+(name, status badge, counts) is always visible; only the *action* chrome ghosts
+out.
+
+- **Mechanism:** `.group(row_id)` on the row + `.invisible()` (or
+  `.opacity(0.0)`) on the action, lifted with `.group_hover(row_id, |s|
+  s.visible())`. The row id is the hover scope — it must be stable and unique
+  per row.
+- **Canonical surfaces:** tab-strip close `×` (also shown while the tab is
+  active), left-rail workspace-card trailing `…`, SCM file-row action cluster
+  (Stage / Unstage / Discard — the status badge cross-fades to the actions).
+- **Never hide the only path.** A fully-hidden action MUST have an alternative
+  invocation (context menu + tooltip). Where a surface has no context-menu
+  fallback, ghost the cluster to a low resting opacity instead of hiding it
+  outright, so every verb stays reachable — see the stash-panel exception below.
+
 ### Left-rail workspace ordering
 
 Workspace rows within a project group obey a persisted sort mode, cycled from a
@@ -178,14 +207,15 @@ anchor; only the worktree tail reorders.
 | `left_rail::row_menu::ROW_MENU_ITEM_H` | 28 (vs `h_overlay_item` 30) | Narrow rail context reads tighter at 28px |
 | `project_picker::ROW_HEIGHT` | 40 + `ROW_PAD_X` 16 | Modal-scale picker, not floating overlay |
 | `workspace_card::CARD_HEIGHT_MULT` | 2.2 × `h_row` | Two-line rich card (name + agent verb/diff); same local-exception pattern as `ROW_HEIGHT_MULT = 1.6` |
+| `stash_panel::STASH_ACTION_REST_OPACITY` | cluster ghosted to 0.45 at rest (vs fully hidden) | No context-menu fallback for stash rows, so Apply/Pop/Drop must never fully hide — ghost-at-rest keeps every verb reachable while still calming the row |
 
 ## Button Variants × Sizes
 
 | Variant | When to use | Notes |
 |---|---|---|
 | `default` (primary) | The single affirmative action of a flow | Commit, Confirm |
-| `secondary` | Lower-emphasis sibling to a primary | Cancel of a non-destructive flow |
-| `outline` | Toolbar / standalone where filled feels heavy | Sparingly |
+| `secondary` | Lower-emphasis sibling to a primary | Cancel of a non-destructive flow; also the *disabled* primary frame |
+| `outline` | Frequent non-terminal verbs; toolbar / standalone where filled feels heavy | SCM Publish / Stage / Push / Pull / Sync / Create PR |
 | `ghost` | Icon buttons, row-row triggers, anywhere chrome should disappear | The default in compact surfaces |
 | `danger` | Destructive **modal confirm** button | Reserved for ConfirmDialog primary |
 | `danger_ghost` | **Row-level destructive verb** | Stash Drop, Worktree Remove — `ui::danger_ghost()` |
@@ -194,6 +224,47 @@ anchor; only the worktree tail reorders.
 Sizes: `default` (32px), `small` (28px), `xsmall` (22px), `icon` variants.
 **Match the size to the surrounding row height** — a `default` button in a 28px
 toolbar reads as a layout bug.
+
+### Rule: solid `default` is the single affirmative only
+
+Reserve the solid-white `default`/`.primary()` fill for the *one* true affirmative
+of a flow — **Commit** (and modal **Confirm**). Frequent, non-terminal SCM verbs —
+**Publish Branch / Stage All / Push / Pull / Sync / Create PR** — use `outline`: a
+solid-white box per verb makes the panel shout one bright box at a time. The
+SCM primary split-button keys its variant on the resolved `PrimaryActionKind` in
+one place (`commit_area.rs`): `Commit → .primary()`, disabled `→ .secondary()`,
+every other kind `→ .outline()`.
+
+### Rule: action-menu hierarchy — focus the actionable, recede the unavailable
+
+A verb menu (the SCM commit split-button dropdown is the canonical case) reads
+top-down as "what can I do right now?". Render the rows to make that scannable
+(modeled on VS Code / the reference UX git menus):
+
+- **Enabled / actionable** rows carry `w_medium` weight and the menu's default
+  bright foreground — *no* explicit color, so the hover highlight still recolors
+  them. These are the focus; counts ride inline in the label (`Push (1)`,
+  `Sync (↓0 ↑1)`, `Pull (3)`).
+- **Disabled** rows recede to `fg_muted`. Their "why not" rides a hover
+  **tooltip** rather than crowding every line — never an inline em-dash, which
+  turns every row into a sentence and flattens the hierarchy.
+- **Exception — review verbs** (Create PR / Push before PR): the path to
+  enabling them isn't obvious from the label, so the reason also shows as an
+  inline `fg_subtle` sub-line beneath the label (in addition to the tooltip).
+
+Built with `PopupMenuItem::element(...)` (per-row custom render) in
+`commit_area::build_menu_item`; the tooltip needs a stable `.id()` on the row,
+which stays inert (no click handler) so the menu's own row dispatch still fires.
+
+**Stable per-verb rows.** Every verb keeps its own always-present row rather than
+one slot swapping labels by state — Push *and* Force Push, Pull *and*
+Fast-forward are distinct rows; the state only changes which are enabled. The
+menu shape never shifts under the cursor, so muscle memory holds. Order
+(`source_control::dropdown_items::resolve`): Commit · Commit & Push · Commit &
+Sync · ─ · Push · Force Push · Create PR · Push before PR · Pull · Fast-forward ·
+Sync · Rebase · Fetch · Publish. Disabled logic steers between siblings:
+a diverged branch disables Push (→ Sync), a lease rewrite disables Push/Pull/Sync
+(→ Force Push), local commits disable Fast-forward (→ Pull).
 
 ### Rule: row-level destructive verbs use `danger_ghost`, not `danger`
 
@@ -397,6 +468,52 @@ When a control has multiple plausible primitives, use this fork:
 If you find yourself styling around a primitive (a context menu acting like a dialog,
 or vice versa), stop — the dispatch semantics differ and a future contributor will
 be misled by the mismatch.
+
+## Motion
+
+Disciplined, sub-200ms easing on **state changes** — enough to read as "alive,"
+never enough to read as lag. Source of truth: `oximux_settings::Motion`
+(`crates/settings/src/motion.rs`); every animated surface reads the same tokens,
+so reduced-motion is a single switch.
+
+| Token | Duration | Surface |
+|---|---|---|
+| `m_hover` | 120ms | hover cross-fade (only where affordable — see below) |
+| `m_overlay` | 180ms | overlay / picker / modal enter (command palette) |
+| `m_collapse` | 190ms | collapsible section expand |
+| `m_toast_in` | 180ms | toast enter |
+| `m_toast_out` | 140ms | toast exit (crisper than enter) |
+
+Easing is `gpui::ease_out_quint()` at the call site — fast out of the gate, gentle
+settle (close to the reference `cubic-bezier(0.16, 1, 0.3, 1)`).
+
+**Rules**
+
+- **Bake once per state change, never per frame.** Wrap the element in
+  `with_animation` keyed on a *stable* id that changes only when the state that
+  triggers the animation changes. A per-frame rebuild that re-creates the
+  animation each tick re-arms it and pins the CPU. Surfaces that unmount while
+  inactive (palette while closed, section body while collapsed, toast before
+  push) replay automatically on re-mount with a stable id.
+- **Reduced motion is required, not optional.** Set `OXIMUX_REDUCE_MOTION=1` (the
+  seam a future OS `accessibilityDisplayShouldReduceMotion` query or settings
+  toggle plugs into) → the `Motion` global resolves to `Motion::reduced()`, which
+  collapses every duration to a 1ms floor (instant, but not `Duration::ZERO` — a
+  zero duration risks a divide-by-zero delta in the animator). Call sites don't
+  change; they read the resolved global.
+
+**Known GPUI constraints (documented, not faked)**
+
+- **No transform-scale on `div`.** GPUI's `scale`/`rotate`/`translate`
+  transforms live on `svg`/`img` only, not on a styled `div`. The reference
+  "0.98→1.0 scale" overlay pop is therefore approximated with an opacity +
+  vertical-offset (`mt`) settle — same perceptual beat, div-supported props only.
+- **`.hover()` swaps instantly — no built-in hover transition.** Animating a
+  hover bg/fg cross-fade would require tracking per-element hover state +
+  `with_animation` *per row*, which is exactly the per-frame rebuild trap on a
+  dense list. `m_hover` exists for the rare affordable single-element case;
+  list-row hover stays an instant swap by design rather than forcing per-row
+  state churn.
 
 ## In-Flight Feedback
 

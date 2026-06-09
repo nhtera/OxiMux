@@ -158,7 +158,7 @@ fn diverged_shows_arrow_counts_on_sync() {
 }
 
 #[test]
-fn lease_swaps_push_to_force_in_both_slots() {
+fn lease_enables_force_push_and_disables_push_and_sync() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 4, 0),
@@ -167,24 +167,25 @@ fn lease_swaps_push_to_force_in_both_slots() {
         force_push_with_lease: true,
         ..Default::default()
     });
-    // No `Push` kind when lease is on — both slots emit ForcePush.
+    // Every verb keeps its own row; the lease state just changes which are
+    // enabled. Force Push is the single actionable push affordance.
     let force_rows: Vec<_> = r
         .iter()
         .filter(|e| matches!(e, DropdownEntry::Item { kind: DropdownActionKind::ForcePush, .. }))
         .collect();
-    assert_eq!(force_rows.len(), 2, "expected ForcePush in Push AND Sync slots");
-    for row in &force_rows {
-        assert_eq!(label_of(row), "Force Push (4)");
-    }
+    assert_eq!(force_rows.len(), 1, "exactly one Force Push row");
+    assert_eq!(label_of(force_rows[0]), "Force Push (4)");
+    assert!(!disabled_of(force_rows[0]), "Force Push is the lease escape hatch");
+    // Plain Push stays present but disabled (steers to Force Push).
+    let push = find(&r, DropdownActionKind::Push);
+    assert_eq!(label_of(push), "Push (4)");
+    assert!(disabled_of(push), "plain Push is unsafe under a lease rewrite");
+    // Sync also stays present but disabled under a lease.
+    let sync = find(&r, DropdownActionKind::Sync);
+    assert!(disabled_of(sync), "Sync is unsafe under a lease rewrite");
     // Commit & Push flips to Commit & Force Push.
     let cp = find(&r, DropdownActionKind::CommitForcePush);
     assert_eq!(label_of(cp), "Commit & Force Push");
-    // Plain Sync is gone in lease mode.
-    assert!(
-        !r.iter()
-            .any(|e| matches!(e, DropdownEntry::Item { kind: DropdownActionKind::Sync, .. })),
-        "Sync kind should not appear when lease is on"
-    );
 }
 
 #[test]
@@ -220,7 +221,10 @@ fn rebase_blocked_by_unstaged_changes() {
     });
     let rebase = find(&r, DropdownActionKind::Rebase);
     assert!(disabled_of(rebase));
-    assert_eq!(title_of(rebase), "Commit or stash changes before rebasing");
+    assert_eq!(
+        title_of(rebase),
+        "Commit or stash local changes before rebasing"
+    );
 }
 
 #[test]
@@ -405,7 +409,8 @@ fn stable_row_order_with_default_inputs() {
             kinds.push(*kind);
         }
     }
-    // Default (no lease) — Sync slot is Sync, not ForcePush.
+    // Every verb has its own always-present row (the benchmark menu shape):
+    // Push and Force Push are distinct rows, as are Pull and Fast-forward.
     assert_eq!(
         kinds,
         vec![
@@ -413,9 +418,11 @@ fn stable_row_order_with_default_inputs() {
             DropdownActionKind::CommitPush,
             DropdownActionKind::CommitSync,
             DropdownActionKind::Push,
+            DropdownActionKind::ForcePush,
             DropdownActionKind::CreatePr,
             DropdownActionKind::PushBeforePr,
             DropdownActionKind::Pull,
+            DropdownActionKind::FastForward,
             DropdownActionKind::Sync,
             DropdownActionKind::Rebase,
             DropdownActionKind::Fetch,

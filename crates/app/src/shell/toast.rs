@@ -11,10 +11,10 @@
 use std::time::Duration;
 
 use gpui::{
-    App, Context, Global, Hsla, IntoElement, ParentElement, Render, Styled, WeakEntity, Window,
-    div, px,
+    Animation, AnimationExt, App, Context, ElementId, Global, Hsla, IntoElement, ParentElement,
+    Render, Styled, WeakEntity, Window, div, ease_out_quint, px,
 };
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, Motion, Theme, Typography};
 
 use crate::ui::FloatingSurface;
 
@@ -48,6 +48,10 @@ struct Toast {
     id: u64,
     kind: ToastKind,
     text: String,
+    /// True once the dismiss has begun: the card plays its fade-out and a
+    /// short timer removes it after `m_toast_out`. Lets the exit animate
+    /// instead of the card vanishing the instant its TTL fires.
+    exiting: bool,
 }
 
 /// Bottom-right transient toast stack. Owned at the workspace root and mounted
@@ -89,6 +93,7 @@ impl ToastLayer {
             id,
             kind,
             text: text.into(),
+            exiting: false,
         });
         if self.toasts.len() > MAX_VISIBLE {
             self.toasts.remove(0);
@@ -102,9 +107,32 @@ impl ToastLayer {
         .detach();
     }
 
-    /// Remove a toast by id (timer fire or, later, manual dismiss). No-op if it
-    /// was already trimmed.
+    /// Begin dismissing a toast (TTL fire or manual). Two-phase so the exit
+    /// can animate: mark it `exiting` (which swaps the card to its fade-out)
+    /// and arm a short timer that actually removes it after `m_toast_out`.
+    /// Idempotent — a second dismiss on an already-exiting toast is ignored so
+    /// the remove timer isn't double-armed.
     fn dismiss(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if toast.exiting {
+            return;
+        }
+        toast.exiting = true;
+        cx.notify();
+
+        let out = crate::motion_settings::active(cx).m_toast_out;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(out).await;
+            let _ = this.update(cx, |layer, cx| layer.remove(id, cx));
+        })
+        .detach();
+    }
+
+    /// Drop a toast from the stack after its exit animation has played. No-op
+    /// if it was already trimmed.
+    fn remove(&mut self, id: u64, cx: &mut Context<Self>) {
         let before = self.toasts.len();
         self.toasts.retain(|t| t.id != id);
         if self.toasts.len() != before {
@@ -112,9 +140,9 @@ impl ToastLayer {
         }
     }
 
-    fn render_card(&self, toast: &Toast) -> impl IntoElement {
+    fn render_card(&self, toast: &Toast, motion: Motion) -> impl IntoElement {
         let accent = toast.kind.accent(&self.theme);
-        div()
+        let card = div()
             .flex()
             .items_stretch()
             .max_w(px(360.0))
@@ -129,17 +157,43 @@ impl ToastLayer {
                     .text_size(px(self.typography.t_body_sm))
                     .text_color(self.theme.fg_base)
                     .child(toast.text.clone()),
-            )
+            );
+        // Enter: fade + rise 8px to rest. Exit: fade out in place. Keyed on a
+        // phase-specific id so the enter→exit transition starts the fade-out
+        // fresh (from full opacity) rather than continuing the enter curve.
+        // Reduced motion collapses both durations to ~instant.
+        let exiting = toast.exiting;
+        let (anim_id, dur) = if exiting {
+            (format!("toast-exit-{}", toast.id), motion.m_toast_out)
+        } else {
+            (format!("toast-enter-{}", toast.id), motion.m_toast_in)
+        };
+        card.with_animation(
+            ElementId::Name(anim_id.into()),
+            Animation::new(dur).with_easing(ease_out_quint()),
+            move |el, delta| {
+                if exiting {
+                    el.opacity(1.0 - delta)
+                } else {
+                    el.opacity(delta).mt(px(8.0 * (1.0 - delta)))
+                }
+            },
+        )
     }
 }
 
 impl Render for ToastLayer {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Nothing queued → render an inert empty node (no overlay, no hit area).
         if self.toasts.is_empty() {
             return div();
         }
-        let cards: Vec<_> = self.toasts.iter().map(|t| self.render_card(t)).collect();
+        let motion = crate::motion_settings::active(cx);
+        let cards: Vec<_> = self
+            .toasts
+            .iter()
+            .map(|t| self.render_card(t, motion))
+            .collect();
         div()
             .absolute()
             .inset_0()

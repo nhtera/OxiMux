@@ -10,15 +10,16 @@ use crate::shell::git_panel::discard_confirm::DiscardAllArea;
 use crate::shell::git_panel::row_renderer::{RowKind, row};
 use crate::shell::source_control::style as sc_style;
 use gpui::{
-    AnyElement, ClickEvent, Context, EventEmitter, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Styled, div, px,
+    AnyElement, Animation, AnimationExt, ClickEvent, Context, ElementId, EventEmitter,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled, div,
+    ease_out_quint, px,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
 use oximux_core::{CombinedDiffScope, FileStatus, IndexStatus, ViewMode, WorktreeStatus};
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, Motion, Theme, Typography};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -125,6 +126,10 @@ pub enum RowKindForActions {
 pub struct RenderCtx<'a> {
     pub theme: Theme,
     pub density: Density,
+    /// Animation tokens for the section expand fade. Snapshotted from the
+    /// `Motion` global at render time (Copy), so a reduced-motion launch makes
+    /// the body appear instantly.
+    pub motion: Motion,
     pub typography: &'a Typography,
     /// Multi-select path set. The row renderer paints the selection
     /// background for every path that lands in this set; Phase 02's
@@ -335,10 +340,19 @@ fn section(
     }
     col = col.child(header);
     if !is_collapsed {
+        // Section body lives in its own column so the expand fade applies to
+        // the whole row set as one opacity layer (cheap — no per-row state).
+        // Opacity-only on purpose: the SCM panel is selection/range-click
+        // heavy, so the body must not shift geometry mid-animation the way a
+        // slide would. Keyed on the section title: the body is unmounted while
+        // collapsed, so each expand re-mounts and replays; a stable id lets it
+        // settle across the panel's frequent status re-renders instead of
+        // restarting every frame.
+        let mut body = div().flex().flex_col().w_full();
         match rctx.view_mode {
             ViewMode::Flat => {
                 for f in rows {
-                    col = col.child(row(f, kind, rctx, cx));
+                    body = body.child(row(f, kind, rctx, cx));
                 }
             }
             ViewMode::Tree => {
@@ -368,7 +382,7 @@ fn section(
                     rctx.collapsed_dirs,
                 );
                 for flat_row in flat_rows {
-                    col = col.child(
+                    body = body.child(
                         crate::shell::git_panel::tree_render::render_tree_row(
                             flat_row, &tree, rows, kind, rctx, cx,
                         ),
@@ -376,6 +390,11 @@ fn section(
                 }
             }
         }
+        col = col.child(body.with_animation(
+            ElementId::Name(format!("git-section-body-{title}").into()),
+            Animation::new(rctx.motion.m_collapse).with_easing(ease_out_quint()),
+            |el, delta| el.opacity(delta),
+        ));
     }
     col.into_any_element()
 }

@@ -47,6 +47,11 @@ pub enum DropdownActionKind {
     /// (one row per method) when a PR is open.
     MergePr(MergeMethod),
     Pull,
+    /// Fast-forward-only pull (`git pull --ff-only`). Distinct menu row from
+    /// `Pull` so the user sees both affordances (matching the benchmark menu);
+    /// enabled only when behind with no local commits ahead. Shares the
+    /// ff-only backend op with `Pull` until a merge-pull path lands.
+    FastForward,
     Sync,
     Rebase,
     Fetch,
@@ -74,8 +79,9 @@ pub struct DropdownInputs {
 /// Build the dropdown menu rows for the given inputs.
 ///
 /// Returns entries in the stable order:
-/// Commit · Commit & Push · Commit & Sync · ─ · Push · Create PR ·
-/// Push & Create PR · Pull · Sync · Rebase · Fetch · Publish.
+/// Commit · Commit & Push · Commit & Sync · ─ · Push · Force Push · Create PR ·
+/// Push before PR · Pull · Fast-forward · Sync · Rebase · Fetch · Publish.
+/// (Merge-PR rows are inserted after Push before PR only when a PR is open.)
 ///
 /// Result is purely a function of `inputs` — calling twice with the same
 /// inputs yields equal `Vec`s. This invariant powers the unit tests below
@@ -123,7 +129,9 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     } else {
         "Commit & Push".to_string()
     };
-    let cp_disabled = !can_commit_base || !has_upstream;
+    // Diverged (behind without a lease rewrite) → steer to Commit & Sync so the
+    // push isn't rejected for being behind.
+    let cp_disabled = !can_commit_base || !has_upstream || (behind > 0 && !lease);
     out.push(item(
         cp_kind,
         cp_label,
@@ -131,8 +139,9 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
         cp_disabled,
     ));
 
-    // 3. Commit & Sync
-    let cs_disabled = !can_commit_base || !has_upstream;
+    // 3. Commit & Sync — only meaningful when behind (there's something to pull
+    //    before pushing); a lease rewrite routes through Commit & Force Push.
+    let cs_disabled = !can_commit_base || !has_upstream || lease || behind == 0;
     out.push(item(
         DropdownActionKind::CommitSync,
         "Commit & Sync".to_string(),
@@ -142,34 +151,36 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
 
     out.push(DropdownEntry::Separator);
 
-    // 5. Push (or Force Push when lease). Gating is identical for both —
-    //    needs upstream + something ahead + no conflicts + no in-flight op.
+    // Push — clean push only. A diverged branch (behind) routes to Sync and a
+    //    lease rewrite routes to Force Push; Push stays its own stable row in
+    //    every state so the menu shape never shifts under the cursor.
     let push_disabled = !has_upstream
+        || ahead == 0
+        || lease
+        || behind > 0
+        || p.has_unresolved_conflicts
+        || p.is_committing
+        || p.is_remote_operation_active;
+    out.push(item(
+        DropdownActionKind::Push,
+        format!("Push{}", suffix_ahead(ahead)),
+        push_tooltip(p, has_upstream, ahead, behind, lease, push_disabled),
+        push_disabled,
+    ));
+
+    // Force Push (with lease) — always visible so the escape hatch for a
+    //    rewritten history stays discoverable; enabled whenever the branch is
+    //    ahead of a known upstream.
+    let force_push_disabled = !has_upstream
         || ahead == 0
         || p.has_unresolved_conflicts
         || p.is_committing
         || p.is_remote_operation_active;
-    let push_kind = if lease {
-        DropdownActionKind::ForcePush
-    } else {
-        DropdownActionKind::Push
-    };
-    let push_label = if lease {
-        format!("Force Push{}", suffix_ahead(ahead))
-    } else {
-        format!("Push{}", suffix_ahead(ahead))
-    };
     out.push(item(
-        push_kind,
-        push_label,
-        if push_disabled {
-            push_disabled_reason(p, has_upstream, ahead).to_string()
-        } else if lease {
-            format!("Force-push (with lease) {ahead} commit{}", plural(ahead))
-        } else {
-            format!("Push {ahead} commit{}", plural(ahead))
-        },
-        push_disabled,
+        DropdownActionKind::ForcePush,
+        format!("Force Push{}", suffix_ahead(ahead)),
+        force_push_tooltip(p, has_upstream, ahead, force_push_disabled),
+        force_push_disabled,
     ));
 
     // 6. Create PR — enabled when the branch is published, in sync with its
@@ -198,7 +209,7 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     //    row so the menu shape stays stable.
     out.push(item(
         DropdownActionKind::PushBeforePr,
-        "Push & Create PR".to_string(),
+        "Push before PR".to_string(),
         "Push first, then use Create PR".to_string(),
         true,
     ));
@@ -240,55 +251,54 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
         ));
     }
 
-    // 8. Pull
+    // Pull — fetch + integrate remote commits. A lease rewrite means the
+    //    remote only holds older copies of local commits, so there's nothing to
+    //    pull; that state disables the row.
     let pull_disabled = !has_upstream
         || behind == 0
+        || lease
         || p.has_unresolved_conflicts
         || p.is_committing
         || p.is_remote_operation_active;
     out.push(item(
         DropdownActionKind::Pull,
         format!("Pull{}", suffix_behind(behind)),
-        if pull_disabled {
-            pull_disabled_reason(p, has_upstream, behind).to_string()
-        } else {
-            format!("Pull {behind} commit{}", plural(behind))
-        },
+        pull_tooltip(p, has_upstream, behind, lease, pull_disabled),
         pull_disabled,
     ));
 
-    // 9. Sync — replaced by a second Force Push row when lease is needed
-    //    (both Push and Sync would be unsafe; redirect both to force-push so
-    //    the user sees the dangerous-action variant regardless of which
-    //    slot they clicked).
-    if lease {
-        out.push(item(
-            DropdownActionKind::ForcePush,
-            format!("Force Push{}", suffix_ahead(ahead)),
-            if push_disabled {
-                push_disabled_reason(p, has_upstream, ahead).to_string()
-            } else {
-                format!("Force-push (with lease) {ahead} commit{}", plural(ahead))
-            },
-            push_disabled,
-        ));
-    } else {
-        let sync_disabled = !has_upstream
-            || (ahead == 0 && behind == 0)
-            || p.has_unresolved_conflicts
-            || p.is_committing
-            || p.is_remote_operation_active;
-        out.push(item(
-            DropdownActionKind::Sync,
-            format!("Sync{}", suffix_diverged(ahead, behind)),
-            if sync_disabled {
-                sync_disabled_reason(p, has_upstream, ahead, behind).to_string()
-            } else {
-                format!("Pull {behind}, push {ahead}")
-            },
-            sync_disabled,
-        ));
-    }
+    // Fast-forward — advance the branch only when it can move without a merge
+    //    (behind, with no local commits ahead). Its own row so the safe
+    //    fast-path sits next to the general Pull.
+    let fast_forward_disabled = !has_upstream
+        || behind == 0
+        || ahead > 0
+        || lease
+        || p.has_unresolved_conflicts
+        || p.is_committing
+        || p.is_remote_operation_active;
+    out.push(item(
+        DropdownActionKind::FastForward,
+        format!("Fast-forward{}", suffix_behind(behind)),
+        fast_forward_tooltip(p, has_upstream, ahead, behind, lease, fast_forward_disabled),
+        fast_forward_disabled,
+    ));
+
+    // Sync — pull then push. Disabled when the branch is level or when a lease
+    //    rewrite is needed (Force Push is the correct path there, and it has its
+    //    own row above).
+    let sync_disabled = !has_upstream
+        || lease
+        || (ahead == 0 && behind == 0)
+        || p.has_unresolved_conflicts
+        || p.is_committing
+        || p.is_remote_operation_active;
+    out.push(item(
+        DropdownActionKind::Sync,
+        format!("Sync{}", suffix_diverged(ahead, behind)),
+        sync_tooltip(p, has_upstream, ahead, behind, lease, sync_disabled),
+        sync_disabled,
+    ));
 
     // 10. Rebase from <base>. Label adapts to the configured base ref;
     //     missing base ref or a dirty worktree disable the row.
@@ -308,7 +318,7 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
             rebase_disabled_reason(p, inputs.base_ref.as_deref()).to_string()
         } else {
             format!(
-                "Rebase current branch onto {}",
+                "Rebase current branch with latest commits from {}",
                 inputs.base_ref.as_deref().unwrap_or("")
             )
         },
@@ -478,7 +488,7 @@ fn rebase_disabled_reason(
     } else if p.has_unresolved_conflicts {
         "Resolve conflicts before rebasing"
     } else if p.has_unstaged_changes {
-        "Commit or stash changes before rebasing"
+        "Commit or stash local changes before rebasing"
     } else if base_ref.is_none() {
         "Configure a base ref first"
     } else {
@@ -510,6 +520,122 @@ fn compound_tooltip(
     }
 }
 
+// --- Per-row tooltips --------------------------------------------------------
+//
+// Each returns the hover-tooltip text: a "what will happen" line when the row
+// is enabled, or the most relevant "why not" reason when disabled. The wording
+// steers the user toward the correct sibling verb (Sync on divergence, Force
+// Push on a lease rewrite) so the menu explains itself on hover.
+
+fn push_tooltip(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    ahead: u32,
+    behind: u32,
+    lease: bool,
+    disabled: bool,
+) -> String {
+    if !disabled {
+        return format!("Push {ahead} commit{}", plural(ahead));
+    }
+    if !has_upstream {
+        "Publish the branch first to push commits".to_string()
+    } else if lease {
+        "Use Force Push — the remote only has older copies of local commits".to_string()
+    } else if behind > 0 && ahead > 0 {
+        "Sync first to pull remote changes before pushing".to_string()
+    } else if ahead == 0 {
+        "Nothing to push".to_string()
+    } else {
+        push_disabled_reason(p, has_upstream, ahead).to_string()
+    }
+}
+
+fn force_push_tooltip(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    ahead: u32,
+    disabled: bool,
+) -> String {
+    if !disabled {
+        return format!("Force-push {ahead} commit{} with lease", plural(ahead));
+    }
+    if !has_upstream {
+        "Publish the branch first to force push commits".to_string()
+    } else if ahead == 0 {
+        "Nothing to force push".to_string()
+    } else {
+        push_disabled_reason(p, has_upstream, ahead).to_string()
+    }
+}
+
+fn pull_tooltip(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    behind: u32,
+    lease: bool,
+    disabled: bool,
+) -> String {
+    if !disabled {
+        return format!("Pull {behind} commit{}", plural(behind));
+    }
+    if !has_upstream {
+        "Publish the branch first to pull commits".to_string()
+    } else if lease {
+        "Nothing new to pull — the remote only has older copies of local commits".to_string()
+    } else if behind == 0 {
+        "Nothing to pull".to_string()
+    } else {
+        pull_disabled_reason(p, has_upstream, behind).to_string()
+    }
+}
+
+fn fast_forward_tooltip(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    ahead: u32,
+    behind: u32,
+    lease: bool,
+    disabled: bool,
+) -> String {
+    if !disabled {
+        return format!("Fast-forward {behind} commit{}", plural(behind));
+    }
+    if !has_upstream {
+        "Publish the branch first to fast-forward".to_string()
+    } else if lease {
+        "Nothing new to fast-forward — the remote only has older copies of local commits".to_string()
+    } else if behind == 0 {
+        "Nothing to fast-forward".to_string()
+    } else if ahead > 0 {
+        "Local commits prevent a fast-forward — use Pull or Sync".to_string()
+    } else {
+        pull_disabled_reason(p, has_upstream, behind).to_string()
+    }
+}
+
+fn sync_tooltip(
+    p: &PrimaryActionInputs,
+    has_upstream: bool,
+    ahead: u32,
+    behind: u32,
+    lease: bool,
+    disabled: bool,
+) -> String {
+    if !disabled {
+        return format!("Pull {behind}, push {ahead}");
+    }
+    if !has_upstream {
+        "Publish the branch first to sync commits".to_string()
+    } else if lease {
+        "Use Force Push — the remote only has older copies of local commits".to_string()
+    } else if ahead == 0 && behind == 0 {
+        "Branch is up to date".to_string()
+    } else {
+        sync_disabled_reason(p, has_upstream, ahead, behind).to_string()
+    }
+}
+
 // --- Label suffix helpers ----------------------------------------------------
 
 fn suffix_ahead(ahead: u32) -> String {
@@ -529,7 +655,11 @@ fn suffix_behind(behind: u32) -> String {
 }
 
 fn suffix_diverged(ahead: u32, behind: u32) -> String {
-    if ahead > 0 && behind > 0 {
+    // Show the directional counts whenever the branch isn't level with its
+    // upstream — `(↓behind ↑ahead)` — so Sync reads its scope inline (e.g.
+    // `Sync (↓0 ↑1)`), matching the benchmark git menu. Level (0/0) Sync is
+    // disabled anyway, so an empty suffix there is never user-visible.
+    if ahead > 0 || behind > 0 {
         format!(" (↓{behind} ↑{ahead})")
     } else {
         String::new()
