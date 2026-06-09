@@ -18,7 +18,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{ToggleLeftSidebar, ToggleRightSidebar};
+use crate::actions::{OpenQuickOpen, ToggleLeftSidebar, ToggleRightSidebar};
 
 /// Width reserved on the left for macOS traffic lights (12px inset +
 /// 3 × ~14px buttons with ~6px gaps + comfortable breathing room before
@@ -216,6 +216,90 @@ fn right_chrome_cluster(
 
 fn spacer_zone() -> impl IntoElement {
     div().flex().flex_1().h_full().min_w(px(0.0))
+}
+
+/// Width of the command-center field at its widest. Below this the field
+/// shrinks with the window (`w_full` + `max_w`); the flanking space stays a
+/// window-drag region.
+const COMMAND_CENTER_MAX_W: f32 = 520.0;
+
+/// Glyph size for the command-center search icon and the `⌘P` hint scale.
+const COMMAND_CENTER_ICON: f32 = 12.0;
+
+/// VS Code–style "Command Center": a centered, fixed-max-width field hosted in
+/// the center chrome zone that opens Quick Open on click.
+///
+/// Deliberately NOT the reference editor's draggable tab strip in the title
+/// bar: chip drag-reorder breaks inside AppKit's title-bar drag zone (`y < 28`)
+/// — see the layout note in `workspace_root.rs`. A command center is a plain
+/// click target (no drag source, no drop target), so it lives here safely,
+/// exactly like the toggle buttons. The wrapper is `flex_1` and only the field
+/// itself takes mouse-down, so the empty flanks keep dragging the window.
+pub fn command_center(
+    project_label: Option<String>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    let label = project_label.unwrap_or_else(|| "Search".to_string());
+
+    let field = div()
+        .id("command-center")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .h(px(22.0))
+        .w_full()
+        .max_w(px(COMMAND_CENTER_MAX_W))
+        .px(px(8.0))
+        .rounded(px(density.r_xs))
+        .bg(theme.bg_panel_alt)
+        .border_1()
+        .border_color(theme.border_inactive)
+        .cursor_pointer()
+        .hover(|s| s.border_color(theme.border_active))
+        .on_mouse_down(
+            MouseButton::Left,
+            |_: &MouseDownEvent, window: &mut Window, cx: &mut gpui::App| {
+                window.dispatch_action(Box::new(OpenQuickOpen), cx);
+            },
+        )
+        .child(
+            svg()
+                .path("icons/search.svg")
+                .size(px(COMMAND_CENTER_ICON))
+                .flex_shrink_0()
+                .text_color(theme.fg_subtle),
+        )
+        .child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(label),
+        )
+        // Spacer pushes the keyboard hint to the trailing edge (search input
+        // convention): icon + label lead, `⌘P` trails.
+        .child(div().flex_1().h_full().min_w(px(0.0)))
+        .child(
+            div()
+                .text_size(px(typography.t_label_xs))
+                .text_color(theme.fg_subtle)
+                .child("⌘P"),
+        );
+
+    // `flex_1` + `justify_center` centers the field and leaves the flanks as
+    // plain (draggable) chrome. `px` breathing room keeps the field clear of
+    // any collapsed-rail chrome cluster prepended before it.
+    div()
+        .flex()
+        .flex_1()
+        .h_full()
+        .items_center()
+        .justify_center()
+        .px(px(8.0))
+        .min_w(px(0.0))
+        .child(field)
 }
 
 #[derive(Clone, Copy)]

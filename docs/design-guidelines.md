@@ -336,6 +336,26 @@ contract holds.
 - Contrast: the swatch is a theme-independent hex used only as a thin accent, so
   it never fights the charcoal surfaces or the single status-accent layer.
 
+## Top-bar command center
+
+The center chrome zone hosts a single VS Code–style command center — a
+centered, clickable field that opens Quick Open. It deliberately does **not**
+follow the reference editor's draggable tab strip in the title bar: chip
+drag-reorder breaks inside AppKit's title-bar drag zone (`y < 28`), so the
+title bar carries only plain click targets (toggles, this field), never drag
+sources/targets.
+
+- **Field recipe:** `bg_panel_alt`, 1px `border_inactive` → `border_active` on
+  hover, `r_xs` corner, 22px tall, `max_w` 520px, centered. Content: a
+  `search.svg` glyph (`fg_subtle`) + the active project name (`fg_muted`,
+  `t_body_sm`) + a trailing `⌘P` hint (`fg_subtle`, `t_label_xs`). No active
+  project → label "Search".
+- **Behavior:** click dispatches `OpenQuickOpen`. Only the field takes
+  mouse-down; the `flex_1` flanks stay window-drag regions, so the window is
+  still draggable by the empty space on either side.
+- Lives in `top_bar::command_center`, passed as the `center_header` center zone
+  from `workspace_root`.
+
 ## Primitive-Picking Fork
 
 When a control has multiple plausible primitives, use this fork:
