@@ -110,15 +110,25 @@ impl FileTree {
         let mut open_dirs = HashMap::new();
         open_dirs.insert(root.clone(), root_id);
 
-        // Spawn watcher loop. The debouncer is constructed on the spawn
-        // task (it does a blocking watch registration internally) and
-        // handed back to `self` via `weak.update`. While that handoff is
-        // in flight, watcher events queue in the mpsc buffer — none lost.
+        // Spawn watcher loop. Registering the recursive FSEvents watch makes
+        // notify_debouncer_full build a `FileIdMap` by `stat()`-ing EVERY
+        // file under `root` — on a repo with a populated `target/` /
+        // `node_modules/` that's hundreds of thousands of syscalls, several
+        // seconds of blocking I/O. `cx.spawn`'s body runs on the FOREGROUND
+        // (main) executor, so doing that inline froze the UI for seconds at
+        // first paint (a beachball over the already-rendered window). Run the
+        // blocking registration on the BACKGROUND executor and only hand the
+        // finished `Debouncer` back to `self` on the foreground. Events queue
+        // in the mpsc buffer during the handoff — none lost.
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<notify_debouncer_full::DebounceEventResult>();
         let watcher_root = root.clone();
         cx.spawn(async move |weak, cx| {
-            let debouncer = match watcher::spawn_watcher(&watcher_root, tx) {
+            let setup = cx
+                .background_executor()
+                .spawn(async move { watcher::spawn_watcher(&watcher_root, tx) })
+                .await;
+            let debouncer = match setup {
                 Ok(d) => d,
                 Err(e) => {
                     weak.update(cx, |_this, cx| {
