@@ -165,7 +165,13 @@ fn main() {
         // cold start; populated as each project's poller produces a sample,
         // then read back when the user switches between already-visited
         // projects to paint the prior snapshot instead of "Loading…").
-        cx.set_global(oximux_app::git_state_cache::GitStateCache::default());
+        // Rehydrate the last-known git states from disk so the first SCM
+        // poller seeds from them (stale-while-revalidate) — the prior state
+        // paints instantly on open instead of "loading git…". On a fresh
+        // install the blob is absent → empty cache → normal Loading flash.
+        cx.set_global(oximux_app::git_state_cache::GitStateCache::load_from(
+            app_state.settings_repo(),
+        ));
         cx.bind_keys(oximux_app::keymap::default_key_bindings());
         // Install the application menu so the macOS menu bar reads "OxiMux"
         // (not the launching process's name) and carries the standard
@@ -250,10 +256,19 @@ fn install_app_lifecycle(
     // `TerminalView::drop` leaves relay PTYs alive in the daemon for
     // next-launch reattach, then capture EVERY open window's layout +
     // scrollback + relay ids. Runs synchronously inside GPUI's grace window.
+    let quit_settings_repo = app_state.settings_repo().clone();
     cx.on_app_quit(move |cx| {
         oximux_app::shell::terminal_view::APP_QUITTING
             .store(true, std::sync::atomic::Ordering::SeqCst);
         window_registry::capture_session(cx);
+        // Persist the last-known git states so the next launch seeds from
+        // them instead of flashing "loading git…". Best-effort: a write
+        // error only costs one Loading flash next time.
+        if let Some(cache) =
+            cx.try_global::<oximux_app::git_state_cache::GitStateCache>()
+        {
+            cache.save_to(&quit_settings_repo);
+        }
         async {}
     })
     .detach();

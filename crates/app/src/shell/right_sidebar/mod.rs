@@ -19,6 +19,7 @@ use oximux_git::{PollState, Repository, StatusPoller};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::{SettingsRepo, WorktreeSettingsRepo};
 
+use crate::git_state_cache::GitStateCache;
 use crate::scm_layout_settings;
 use crate::shell::diff_view::DiffView;
 use crate::shell::file_explorer::FileExplorer;
@@ -138,7 +139,18 @@ impl RightSidebar {
         // `rx.changed()`, which is fine for an idle file explorer.
         let (poller, bar_rx, explorer_rx, sc_rx, panel_rx, initial) = match &repo {
             Some(repo) => {
-                let p = Arc::new(StatusPoller::spawn(repo.clone()));
+                // Stale-while-revalidate: seed the poller from the last-known
+                // `GitState` (in-session cache, persisted across launches) so
+                // the status bar + SCM panel paint the prior snapshot instantly
+                // instead of "loading git…". A cache miss seeds `Loading` and
+                // behaves exactly as before. The first poll still fires right
+                // away and overwrites the seed ~one `status()` later.
+                let seed = cx
+                    .try_global::<GitStateCache>()
+                    .and_then(|c| c.get(repo.workdir()))
+                    .map(PollState::Ready)
+                    .unwrap_or(PollState::Loading);
+                let p = Arc::new(StatusPoller::spawn_seeded(repo.clone(), seed));
                 let bar = p.subscribe();
                 let ex = p.subscribe();
                 let sc = p.subscribe();

@@ -58,8 +58,26 @@ impl StatusPoller {
         Self::spawn_with_interval(repo, DEFAULT_TICK)
     }
 
+    /// Spawn with the watch channel pre-seeded to `initial` instead of
+    /// `Loading`. Used at boot/project-switch to paint the last-known
+    /// `GitState` immediately (stale-while-revalidate): subscribers see the
+    /// prior snapshot on attach, and the first poll — which still fires
+    /// right away — overwrites it ~one `status()` later. A cache miss passes
+    /// `PollState::Loading` and behaves exactly like `spawn`.
+    pub fn spawn_seeded(repo: Repository, initial: PollState) -> Self {
+        Self::spawn_with_interval_seeded(repo, DEFAULT_TICK, initial)
+    }
+
     pub fn spawn_with_interval(repo: Repository, tick: Duration) -> Self {
-        let (state_tx, state_rx) = watch::channel::<PollState>(PollState::Loading);
+        Self::spawn_with_interval_seeded(repo, tick, PollState::Loading)
+    }
+
+    pub fn spawn_with_interval_seeded(
+        repo: Repository,
+        tick: Duration,
+        initial: PollState,
+    ) -> Self {
+        let (state_tx, state_rx) = watch::channel::<PollState>(initial);
         let (focus_tx, focus_rx) = watch::channel::<bool>(true);
         let (kick_tx, kick_rx) = watch::channel::<u64>(0);
         let task = tokio::spawn(poll_loop(repo, tick, state_tx, focus_rx, kick_rx));
