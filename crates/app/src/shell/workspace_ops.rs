@@ -449,6 +449,19 @@ impl WorkspaceRoot {
                 );
             }
         }
+        // Carry the sidebar open/collapsed state across the switch (it's a
+        // global UI preference, not per-project) and pause the outgoing
+        // sidebar's status poller so only the active project polls git —
+        // otherwise every cached sidebar would keep ticking its own
+        // `git status` in the background.
+        let prior_open = self
+            .right_sidebar
+            .as_ref()
+            .map(|s| s.read(cx).open)
+            .unwrap_or(true);
+        if let Some(outgoing_sidebar) = self.right_sidebar.as_ref() {
+            outgoing_sidebar.read(cx).set_polling_focused(false);
+        }
         self.active_project = Some(project.clone());
         // Throttle every other project's terminals: only the active project's
         // ProjectPanes renders, so inactive projects' PaneGroups never run the
@@ -532,6 +545,26 @@ impl WorkspaceRoot {
             defer_focus_active(window, cx, panes);
         }
         cx.notify();
+
+        // Fast path: reuse a sidebar already built for this project this
+        // session (cache-and-revalidate, like the terminal panes above)
+        // instead of tearing it down and rebuilding. Carry the global open
+        // state, resume its poller (kicks an immediate git revalidation),
+        // re-point the SCM subscriptions at its live panels, refocus — done.
+        // No repo re-open, no commit-graph reload, no file-tree rescan, no
+        // "Loading…" flash. First activation of a project falls through to the
+        // async build below, which inserts the new sidebar into the cache.
+        if let Some(cached) = self.right_sidebar_by_project.get(&project.id).cloned() {
+            cached.update(cx, |s, _| s.open = prior_open);
+            cached.read(cx).set_polling_focused(true);
+            self.right_sidebar = Some(cached);
+            self.rewire_scm_subscriptions(window, cx);
+            refocus_active_pane(self, window, cx);
+            cx.notify();
+            return;
+        }
+
+        let project_id_for_cache = project.id.clone();
         cx.spawn_in(window, async move |weak, cx| {
             // Repo presence is optional now — Repository::open may fail for
             // non-git folders. Build the sidebar in either mode: with git
@@ -588,7 +621,7 @@ impl WorkspaceRoot {
                     initial_width: Some(initial_width),
                     settings_repo: Some(settings_repo),
                 };
-                this.right_sidebar = Some(cx.new(|cx| {
+                let built = cx.new(|cx| {
                     crate::shell::right_sidebar::RightSidebar::new(
                         repo,
                         project_root.clone(),
@@ -604,7 +637,13 @@ impl WorkspaceRoot {
                         window,
                         cx,
                     )
-                }));
+                });
+                // Cache the freshly built sidebar so a later switch back to
+                // this project reuses it (fast path above) instead of
+                // rebuilding from scratch.
+                this.right_sidebar_by_project
+                    .insert(project_id_for_cache, built.clone());
+                this.right_sidebar = Some(built);
                 // The rebuild minted fresh SCM panel entities — re-point
                 // every source-control event subscription at them, or the
                 // "View all" / commit / branch / discard / stash actions
@@ -1419,9 +1458,11 @@ impl WorkspaceRoot {
                     cx.notify();
                     return;
                 }
-                // Drop the in-memory panes + observer for the gone project so
-                // a stale entity can't keep rendering or saving.
+                // Drop the in-memory panes + observer + cached sidebar for the
+                // gone project so a stale entity can't keep rendering, saving,
+                // or polling git in the background.
                 this.project_panes_by_project.remove(&project_id);
+                this.right_sidebar_by_project.remove(&project_id);
                 if this.active_project.as_ref().map(|p| p.id.as_str()) == Some(project_id.as_str())
                 {
                     this.active_project = None;

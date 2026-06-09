@@ -128,6 +128,17 @@ pub struct WorkspaceRoot {
     /// `active_project_panes()` resolves the current entity via
     /// `active_project.id`.
     pub(crate) project_panes_by_project: HashMap<String, Entity<ProjectPanes>>,
+    /// `right_sidebar` is the ACTIVE sidebar (the one rendered + wired to SCM
+    /// subscriptions). This map keeps the previously-built sidebar for every
+    /// visited project so a switch-back reuses the live entity instead of
+    /// tearing it down and rebuilding (which re-opened the repo, respawned the
+    /// status poller, re-ran `git log` for the commit graph, and rescanned the
+    /// file tree — every one a "Loading…" flash). Mirrors
+    /// `project_panes_by_project`: lazy-built on first activation, reused after.
+    /// Only the active project's poller ticks; inactive sidebars are paused via
+    /// `set_polling_focused(false)` so N cached sidebars don't run N concurrent
+    /// status polls.
+    pub(crate) right_sidebar_by_project: HashMap<String, Entity<RightSidebar>>,
     pub(crate) right_sidebar: Option<Entity<RightSidebar>>,
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
@@ -367,6 +378,7 @@ impl WorkspaceRoot {
         // the first `set_active_project` call. Boot renders the welcome view
         // until the project-restore path (or user open) supplies one.
         let project_panes_by_project: HashMap<String, Entity<ProjectPanes>> = HashMap::new();
+        let right_sidebar_by_project: HashMap<String, Entity<RightSidebar>> = HashMap::new();
         let project_panes_observer: Option<Subscription> = None;
         // Shared weak self-handle: LeftRail + picker callbacks route through it.
         // Built before the right-sidebar so the Files-tab `OnOpenFile` callback
@@ -668,6 +680,7 @@ impl WorkspaceRoot {
             density,
             typography,
             project_panes_by_project,
+            right_sidebar_by_project,
             notifier: notifier.clone(),
             right_sidebar,
             left_rail,
