@@ -472,6 +472,32 @@ LeafTabs
 
 ---
 
+## Post-paint PTY attach on restore
+
+Restored terminal tabs no longer gate first paint behind daemon round-trips. The window-open path mounts every restored tab as a **pending** view over an in-process dormant grid (`spawn_pending_placeholder_grid` — never touches the relay), paints, then a detached reconcile task swaps live sessions in:
+
+```
+set_active_project (pre-paint, zero relay RPCs)
+  └── build_project_panes → Vec<PendingAttach>     ← TerminalView::mount_pending per tab
+        └── spawn_attach_reconcile (cx.spawn_in, detached)
+              1. relay_state_snapshot()             ← ONE ListPtys, background executor
+              2. compute_attach_hints / compute_leaf_attach_hints (unchanged liveness gate)
+              3. per tab: attach_pty_existing(hint) | spawn_local_pty(cwd, env)
+                   ← each RPC on the background executor (blocking Handle::block_on)
+              4. TerminalView::adopt_live_session    ← main-thread delivery, per tab
+```
+
+**Invariants:**
+- Every blocking relay call (`Handle::block_on` against the relay runtime) runs on the background executor; only `adopt_live_session` delivery touches the main thread.
+- Input to a pending view is dropped quietly; `external_id()` reports `None` while pending (tear-off stays disabled) but `relay_id_for_capture()` answers with the persisted hint so a quit-save racing the reconcile keeps the row.
+- Undeliverable sessions (tab closed mid-reconcile): re-attached PTYs are **detached** (daemon keeps them), fresh spawns are **closed**; both skipped under `APP_QUITTING`.
+- The boot relay supervisor handshake stays intentionally blocking pre-paint (warm path ≈ 1 ms; the daemon survives quit, so cold spawns are reboot-only).
+- Restored panes paint blank until the daemon's raw-byte replay arrives — serialized-grid replay was deliberately removed (reflow scrambles full-screen TUIs).
+
+Boot timing is logged on every launch: `boot: db open + state hydrate`, `boot: relay supervisor handshake`, `project panes built (pre-paint, no relay RPCs)`, `post-paint pty attach reconcile done`.
+
+---
+
 ## Shell context env — SurfaceIds (mux-P4)
 
 Every spawned terminal receives an `OXIMUX_*` env block minted at spawn time:
