@@ -37,6 +37,20 @@ impl PrState {
         }
     }
 
+    /// Parse the `state` value GitLab reports for a merge request
+    /// (`opened` / `merged` / `closed` / `locked`). GitLab says `opened`
+    /// (not `open`) and adds `locked`; both `closed` and `locked` map to
+    /// [`PrState::Closed`] since neither is mergeable nor open. Unknown /
+    /// empty → `None`.
+    pub fn from_gitlab_state(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "opened" => PrState::Open,
+            "merged" => PrState::Merged,
+            "closed" | "locked" => PrState::Closed,
+            _ => PrState::None,
+        }
+    }
+
     /// True only for an open PR — the existing `has_open_pr` semantics.
     pub fn is_open(self) -> bool {
         matches!(self, PrState::Open)
@@ -63,6 +77,18 @@ mod tests {
     fn unknown_or_empty_is_none() {
         assert_eq!(PrState::from_gh_state(""), PrState::None);
         assert_eq!(PrState::from_gh_state("DRAFT"), PrState::None);
+    }
+
+    #[test]
+    fn parses_gitlab_states() {
+        // GitLab says "opened" (not "open") and adds "locked".
+        assert_eq!(PrState::from_gitlab_state("opened"), PrState::Open);
+        assert_eq!(PrState::from_gitlab_state("MERGED"), PrState::Merged);
+        assert_eq!(PrState::from_gitlab_state("closed"), PrState::Closed);
+        assert_eq!(PrState::from_gitlab_state("locked"), PrState::Closed);
+        assert_eq!(PrState::from_gitlab_state(""), PrState::None);
+        // GitHub's "open" spelling is NOT a GitLab state.
+        assert_eq!(PrState::from_gitlab_state("open"), PrState::None);
     }
 
     #[test]

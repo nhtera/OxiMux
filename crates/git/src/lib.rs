@@ -14,6 +14,7 @@ pub mod commit;
 pub mod diff;
 pub mod error;
 pub mod gh;
+pub mod glab;
 pub mod log;
 pub mod merge;
 pub mod numstat;
