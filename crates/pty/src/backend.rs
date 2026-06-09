@@ -144,6 +144,18 @@ pub trait TerminalBackend: Send + 'static {
         Vec::new()
     }
 
+    /// Local session ids this backend currently tracks. Used by the
+    /// daemon-crash recovery path: when a dead relay backend is swapped
+    /// for a fresh one in place, the replacement is seeded with these
+    /// ids so it can emit one synthetic `Exit` per orphaned session —
+    /// otherwise consumers polling those ids (agent status machines)
+    /// would drain nothing forever and report a live status for a dead
+    /// process. Default returns empty — single-owner in-process
+    /// backends are dropped with their view, never swapped under it.
+    fn live_session_ids(&self) -> Vec<TerminalSessionId> {
+        Vec::new()
+    }
+
     /// Opaque session-identity string for the backend's remote source
     /// (e.g., the relay daemon's `HelloAck.session_id`). Used by phase
     /// 06 to detect "remote restarted, persisted ids are stale." None

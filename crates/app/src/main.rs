@@ -712,7 +712,7 @@ fn boot_relay_supervisor(
         }
     };
 
-    let supervisor = RelaySupervisor::new(runtime_dir, log_dir);
+    let supervisor = RelaySupervisor::new(runtime_dir.clone(), log_dir.clone());
     // Run the handshake on `relay_rt` from a thread with NO runtime
     // entered (the caller's thread has the git/db runtime entered via
     // `_rt_guard`). A scoped thread lets `ensure_running` spawn the
@@ -752,15 +752,14 @@ fn boot_relay_supervisor(
     let client_arc = std::sync::Arc::new(client);
 
     if let Some(pid) = supervisor.read_pid() {
-        let repo_for_death = pane_relay_id_repo;
-        let session_for_death = server_session_id.clone();
-        let _enter = relay_rt.handle().enter();
-        // JoinHandle dropped intentionally: the heartbeat task exits
-        // by itself when the daemon dies, and we have no way to call
-        // back into the GPUI window from this boot frame anyway.
-        std::mem::drop(supervisor.watch_pid(pid, move || {
-            on_relay_died(repo_for_death, session_for_death);
-        }));
+        arm_relay_heartbeat(
+            pid,
+            runtime_dir.clone(),
+            log_dir.clone(),
+            pane_relay_id_repo,
+            server_session_id.clone(),
+            relay_rt.handle().clone(),
+        );
     } else {
         tracing::warn!("relay PID file missing; crash heartbeat disabled");
     }
@@ -778,22 +777,159 @@ fn boot_relay_supervisor(
     Some(relay_rt)
 }
 
-// Invoked once when the supervisor's heartbeat sees the relay PID go
-// ESRCH. Both the SQLite delete and the macOS AppKit notify call are
-// blocking, so off-load to `spawn_blocking`; the heartbeat caller is
-// a regular async tokio task and must not stall the runtime worker.
-fn on_relay_died(repo: oximux_storage::PaneRelayIdRepo, session_id: String) {
-    tracing::warn!(session_id, "relay daemon died mid-session");
-    tokio::task::spawn_blocking(move || {
-        if let Err(err) = repo.delete_for_session(&session_id) {
-            tracing::warn!(?err, "pruning pane_relay_ids for dead session failed");
+// Watch the relay daemon's PID and recover when it dies: prune the dead
+// session's persisted rows, respawn the daemon, swap a fresh backend into
+// `SHARED_BACKEND` in place, and re-arm the watch on the new PID. The
+// heartbeat fires `on_death` exactly once, so recovery is single-flight by
+// construction; the chain ends (no retry storm) if a respawn fails.
+fn arm_relay_heartbeat(
+    pid: u32,
+    runtime_dir: PathBuf,
+    log_dir: PathBuf,
+    repo: oximux_storage::PaneRelayIdRepo,
+    session_id: String,
+    handle: tokio::runtime::Handle,
+) {
+    let supervisor = RelaySupervisor::new(runtime_dir.clone(), log_dir.clone());
+    let spawn_handle = handle.clone();
+    let _enter = handle.enter();
+    // JoinHandle dropped intentionally: the heartbeat task exits by
+    // itself after firing `on_death` once.
+    std::mem::drop(supervisor.watch_pid(pid, move || {
+        // `on_death` is a sync FnOnce on the heartbeat task; the respawn
+        // needs async (ensure_running). Boxed so the future type doesn't
+        // recursively contain itself through the re-arm closure.
+        spawn_handle.clone().spawn(respawn_relay_after_death_boxed(
+            runtime_dir,
+            log_dir,
+            repo,
+            session_id,
+            spawn_handle,
+        ));
+    }));
+}
+
+// Type-erased wrapper: `respawn → arm_relay_heartbeat → watch closure →
+// respawn` would otherwise make the async fn's future type contain itself.
+fn respawn_relay_after_death_boxed(
+    runtime_dir: PathBuf,
+    log_dir: PathBuf,
+    repo: oximux_storage::PaneRelayIdRepo,
+    dead_session_id: String,
+    handle: tokio::runtime::Handle,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(respawn_relay_after_death(
+        runtime_dir,
+        log_dir,
+        repo,
+        dead_session_id,
+        handle,
+    ))
+}
+
+// Daemon-death recovery. Runs on the relay runtime. Ordering matters:
+// prune rows first (a quit during recovery must not persist hints that
+// point at the dead daemon's PTYs), then respawn + swap, then re-arm.
+async fn respawn_relay_after_death(
+    runtime_dir: PathBuf,
+    log_dir: PathBuf,
+    repo: oximux_storage::PaneRelayIdRepo,
+    dead_session_id: String,
+    handle: tokio::runtime::Handle,
+) {
+    tracing::warn!(
+        session_id = %dead_session_id,
+        "relay daemon died mid-session; attempting respawn"
+    );
+    {
+        // SQLite delete is blocking — keep it off the runtime worker.
+        let repo = repo.clone();
+        let dead = dead_session_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = repo.delete_for_session(&dead) {
+                tracing::warn!(?err, "pruning pane_relay_ids for dead session failed");
+            }
+        })
+        .await;
+    }
+    // The app is tearing down — views are dropping and the next launch
+    // runs a full supervisor boot anyway. Don't race it with a respawn.
+    // Best-effort check: a quit that STARTS after this load lets the
+    // respawn run during teardown — accepted; worst case is a swapped-in
+    // backend nobody reads plus one stray notification, and runtime drop
+    // waits out the re-armed heartbeat tick (~1s) at exit.
+    if oximux_app::shell::terminal_view::APP_QUITTING.load(Ordering::SeqCst) {
+        tracing::info!("app quitting; skipping relay respawn");
+        return;
+    }
+    let supervisor = RelaySupervisor::new(runtime_dir.clone(), log_dir.clone());
+    match supervisor.ensure_running().await {
+        Ok(client) => {
+            let new_session_id = client.server_session_id().to_owned();
+            let backend = RelayBackend::new(std::sync::Arc::new(client), handle.clone());
+            match oximux_app::shell::terminal_view::shared_backend() {
+                Some(shared) => {
+                    let mut guard = shared.lock().expect("shared backend poisoned");
+                    // Seed BEFORE the swap publishes the new backend:
+                    // orphaned sessions get one synthetic Exit each, and
+                    // the id floor moves past them so no live view's id
+                    // is ever re-minted.
+                    backend.seed_synthetic_exits(guard.live_session_ids());
+                    *guard = Box::new(backend);
+                }
+                None => {
+                    // Unreachable in practice: the heartbeat is only armed
+                    // when boot installed a backend. Log rather than install
+                    // — consumers cached `None` at boot and won't re-check.
+                    tracing::warn!("relay respawned but no shared backend was installed at boot");
+                    return;
+                }
+            }
+            if let Some(pid) = supervisor.read_pid() {
+                arm_relay_heartbeat(
+                    pid,
+                    runtime_dir,
+                    log_dir,
+                    repo,
+                    new_session_id.clone(),
+                    handle,
+                );
+            } else {
+                tracing::warn!("respawned relay PID file missing; crash heartbeat disabled");
+            }
+            tracing::info!(
+                session_id = %new_session_id,
+                "relay daemon respawned; shared backend swapped in place"
+            );
+            notify_user(
+                "OxiMux relay restarted",
+                "Terminal sessions from before the crash have ended. \
+                 New terminals are daemon-backed again.",
+            );
         }
+        Err(err) => {
+            tracing::warn!(?err, "relay respawn failed; PTYs fall back to in-process");
+            notify_user(
+                "OxiMux relay could not be restarted",
+                "New terminals will run in-process (no quit-survival) until you relaunch OxiMux.",
+            );
+        }
+    }
+}
+
+// AppKit notification call is blocking — keep it off the runtime worker.
+fn notify_user(title: &'static str, message: &'static str) {
+    tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "macos")]
         {
             let _ = mac_notification_sys::Notification::new()
-                .title("OxiMux relay restarted")
-                .message("Your terminals were reset. Relaunch OxiMux to recover.")
+                .title(title)
+                .message(message)
                 .send();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (title, message);
         }
     });
 }

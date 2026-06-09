@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent};
+use oximux_pty::{
+    PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId,
+};
 use oximux_relay::server::{ServerConfig, run_server};
 use oximux_relay_client::{RelayBackend, RelayClient};
 use tempfile::TempDir;
@@ -494,4 +496,57 @@ fn attach_existing_replays_into_local_state() {
 
     fx.backend.close(attached_id).expect("close");
     fx.backend.close(original_id).expect("close");
+}
+
+// Crash-recovery swap contract: a fresh backend seeded with a dead
+// predecessor's session ids must (a) emit exactly one synthetic Exit per
+// inherited id, (b) emit nothing for them afterwards, and (c) never mint
+// a fresh session id at or below the inherited floor — a live
+// TerminalView still holds the old id, and aliasing it would cross-wire
+// two panes' event queues.
+#[test]
+fn seeded_synthetic_exits_fire_once_and_floor_fresh_ids() {
+    let mut fx = boot_fixture();
+    fx.backend
+        .seed_synthetic_exits(vec![TerminalSessionId(3), TerminalSessionId(7)]);
+
+    // (a) one synthetic Exit per inherited id, on the per-session drain…
+    let ev = fx.backend.drain_events_for(TerminalSessionId(3));
+    assert!(
+        matches!(
+            ev.as_slice(),
+            [TerminalEvent::Exit { id, code: None }] if *id == TerminalSessionId(3)
+        ),
+        "expected one synthetic Exit for id 3, got {ev:?}"
+    );
+    // (b) …and only once.
+    assert!(
+        fx.backend.drain_events_for(TerminalSessionId(3)).is_empty(),
+        "synthetic Exit must not repeat"
+    );
+    // The unfiltered drain flushes the remaining inherited id.
+    let rest = fx.backend.drain_events();
+    assert!(
+        rest.iter().any(|e| matches!(
+            e,
+            TerminalEvent::Exit { id, code: None } if *id == TerminalSessionId(7)
+        )),
+        "unfiltered drain must flush remaining inherited ids, got {rest:?}"
+    );
+
+    // (c) fresh spawns clear the inherited floor.
+    let cfg = SpawnConfig {
+        shell: "/bin/sh".into(),
+        cwd: PathBuf::from("/tmp"),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    let id = fx.backend.spawn(cfg).expect("spawn");
+    assert!(
+        id.0 > 7,
+        "fresh id {} must clear the inherited floor of 7",
+        id.0
+    );
+    let _ = fx.backend.close(id);
 }

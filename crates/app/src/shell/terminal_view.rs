@@ -1860,7 +1860,14 @@ impl Drop for TerminalView {
         let backend = self.backend.clone();
         std::thread::spawn(move || match backend.lock() {
             Ok(mut be) => {
-                let _ = be.drain_events();
+                // Per-session drain (NOT the global `drain_events`): on the
+                // shared relay backend a global drain would also consume
+                // OTHER sessions' queued events — including the one-shot
+                // synthetic Exits seeded after a daemon-crash backend swap,
+                // silently starving an agent status poller of its
+                // termination signal. The unblock effect for THIS session's
+                // teardown is identical.
+                let _ = be.drain_events_for(id);
                 if let Err(err) = be.close(id) {
                     tracing::warn!(
                         ?err,

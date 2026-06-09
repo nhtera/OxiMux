@@ -53,6 +53,12 @@ pub struct RelayBackend {
     sessions: Mutex<HashMap<TerminalSessionId, Session>>,
     next_session_id: AtomicU64,
     event_queues: SessionEventQueues,
+    /// Session ids inherited from a predecessor backend that died with
+    /// the old daemon (crash-recovery swap). Each id yields exactly one
+    /// synthetic `Exit { code: None }` from `drain_events[_for]`, so
+    /// pollers of the orphaned sessions (agent status machines) learn
+    /// the process is gone instead of draining nothing forever.
+    inherited_dead_sessions: Mutex<std::collections::HashSet<TerminalSessionId>>,
 }
 
 impl RelayBackend {
@@ -68,7 +74,30 @@ impl RelayBackend {
             sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             event_queues: Arc::new(Mutex::new(HashMap::new())),
+            inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Crash-recovery seeding: record the dead predecessor backend's
+    /// session ids so each yields one synthetic `Exit` on its next
+    /// drain. Also start `next_session_id` past the inherited ids —
+    /// the swapped-in backend must never mint an id that a live
+    /// `TerminalView` still holds from the old backend, or the two
+    /// would alias one event queue.
+    pub fn seed_synthetic_exits(&self, ids: Vec<TerminalSessionId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let max_inherited = ids.iter().map(|id| id.0).max().unwrap_or(0);
+        // `fetch_max` keeps the floor monotonic even if seeding ever
+        // raced a concurrent mint (it can't today — seeding happens
+        // before the swap publishes the backend).
+        self.next_session_id
+            .fetch_max(max_inherited + 1, Ordering::Relaxed);
+        self.inherited_dead_sessions
+            .lock()
+            .expect("inherited sessions poisoned")
+            .extend(ids);
     }
 
     // Borrow the underlying client. Used by phase-06 reconciliation
@@ -502,15 +531,46 @@ impl TerminalBackend for RelayBackend {
         for q in map.values_mut() {
             out.extend(q.drain(..));
         }
+        // Crash-recovery: flush every inherited dead session as one
+        // synthetic Exit each (see `seed_synthetic_exits`).
+        let mut inherited = self
+            .inherited_dead_sessions
+            .lock()
+            .expect("inherited sessions poisoned");
+        out.extend(
+            inherited
+                .drain()
+                .map(|id| TerminalEvent::Exit { id, code: None }),
+        );
         out
     }
 
     fn drain_events_for(&mut self, id: TerminalSessionId) -> Vec<TerminalEvent> {
+        // Crash-recovery: an inherited dead session yields exactly one
+        // synthetic Exit so its poller (agent status machine, pane tick)
+        // learns the process died with the old daemon.
+        if self
+            .inherited_dead_sessions
+            .lock()
+            .expect("inherited sessions poisoned")
+            .remove(&id)
+        {
+            return vec![TerminalEvent::Exit { id, code: None }];
+        }
         let mut map = self.event_queues.lock().expect("event queues poisoned");
         match map.get_mut(&id) {
             Some(q) => q.drain(..).collect(),
             None => Vec::new(),
         }
+    }
+
+    fn live_session_ids(&self) -> Vec<TerminalSessionId> {
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .keys()
+            .copied()
+            .collect()
     }
 
     fn close(&mut self, id: TerminalSessionId) -> Result<()> {
