@@ -16,7 +16,7 @@ use gpui::Context;
 use tokio::sync::oneshot;
 
 use super::commit_area::{CommitArea, CommitStatus};
-use crate::shell::forge::{CreatePrOptions, ForgeProvider, GithubForge, MergeMethod};
+use crate::shell::forge::{CreatePrOptions, Forge, ForgeProvider, MergeMethod};
 
 /// Create a PR for the current branch with the supplied options (empty title
 /// falls back to commit-derived fill). No-op if another op is already in flight
@@ -33,10 +33,13 @@ pub fn run_create_pr(area: &mut CommitArea, opts: CreatePrOptions, cx: &mut Cont
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(async move {
-                let r = GithubForge
-                    .create_pr(&workdir, opts)
-                    .await
-                    .map_err(|e| e.to_string());
+                let r = match Forge::detect(&workdir).await {
+                    Some(forge) => forge
+                        .create_pr(&workdir, opts)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    None => Err("origin is not a supported forge (GitHub or GitLab)".to_string()),
+                };
                 let _ = tx.send(r);
             });
         }
@@ -97,10 +100,13 @@ pub fn run_merge_pr(area: &mut CommitArea, method: MergeMethod, cx: &mut Context
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(async move {
-                let r = GithubForge
-                    .merge_pr(&workdir, method)
-                    .await
-                    .map_err(|e| e.to_string());
+                let r = match Forge::detect(&workdir).await {
+                    Some(forge) => forge
+                        .merge_pr(&workdir, method)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    None => Err("origin is not a supported forge (GitHub or GitLab)".to_string()),
+                };
                 let _ = tx.send(r);
             });
         }

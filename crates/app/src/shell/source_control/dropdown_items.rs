@@ -190,10 +190,10 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     ));
 
     // 6. Create PR — enabled when the branch is published, in sync with its
-    //    GitHub upstream, and has no open PR yet (same gate as the primary
-    //    Create-PR rung). Runs `gh pr create --fill`.
+    //    upstream, and has no open PR yet (same gate as the primary Create-PR
+    //    rung). Runs `gh pr create --fill` / `glab mr create --fill`.
     let in_sync = has_upstream && ahead == 0 && behind == 0;
-    let create_pr_disabled = !p.is_github_remote
+    let create_pr_disabled = !p.forge_supports_pr
         || p.is_detached_head
         || p.on_default_branch
         || p.has_open_pr
@@ -231,7 +231,7 @@ pub fn resolve(inputs: &DropdownInputs) -> Vec<DropdownEntry> {
     //     menu stays uncluttered the rest of the time. Disabled while another
     //     op is in flight to prevent overlapping remote actions.
     if p.has_open_pr {
-        let merge_disabled = !p.is_github_remote
+        let merge_disabled = !p.forge_supports_pr
             || p.is_committing
             || p.is_remote_operation_active
             || p.is_creating_pr
@@ -472,8 +472,8 @@ fn create_pr_disabled_reason(
         "Commit in progress…"
     } else if p.is_remote_operation_active {
         "Remote operation in progress"
-    } else if !p.is_github_remote {
-        "Not a GitHub remote"
+    } else if !p.forge_supports_pr {
+        "No GitHub or GitLab remote"
     } else if p.is_detached_head {
         "Check out a branch first"
     } else if p.on_default_branch {

@@ -66,7 +66,7 @@ use std::rc::Rc;
 
 use crate::actions::SendTextToActiveAgent;
 use crate::shell::diff_view::DiffView;
-use crate::shell::forge::{ForgeProvider, GithubForge};
+use crate::shell::forge::{Forge, ForgeProvider};
 use crate::shell::pr_dialog::{PrCreateDialog, PrDialogCallback, PrDialogOutcome};
 use crate::shell::git_panel::GitPanel;
 use crate::shell::source_control::branch_commits::BranchCommitsPanel;
@@ -120,14 +120,15 @@ pub struct SourceControlPanel {
     /// check is in flight or when the state isn't a lease candidate.
     force_push_with_lease: bool,
 
-    /// `origin` is a GitHub remote — gates the Create-PR primary rung (the
-    /// `gh` CLI only speaks GitHub). Cached; refreshed by the state observer
-    /// alongside `has_open_pr` on a ~30s throttle when the branch is in sync.
-    is_github_remote: bool,
+    /// `origin` points at a forge whose CLI can open a PR/MR for this repo
+    /// (GitHub via `gh`, or GitLab via `glab`) — gates the Create-PR primary
+    /// rung. Cached; refreshed by the state observer alongside `has_open_pr`
+    /// on a ~30s throttle when the branch is in sync.
+    forge_supports_pr: bool,
 
-    /// The current branch already has an open PR. Suppresses the Create-PR
+    /// The current branch already has an open PR/MR. Suppresses the Create-PR
     /// rung so the button doesn't offer a redundant action. Refreshed on the
-    /// same ~30s throttle as `is_github_remote` (a `gh pr view` round-trip).
+    /// same ~30s throttle as `forge_supports_pr` (a `pr/mr view` round-trip).
     has_open_pr: bool,
 
     /// The current branch's PR was **merged**. Suppresses Create-PR (so the
@@ -136,8 +137,8 @@ pub struct SourceControlPanel {
     /// --json state` round-trip as `has_open_pr`.
     pr_merged: bool,
 
-    /// Last time the GitHub PR status (`is_github_remote` + `has_open_pr`) was
-    /// refreshed. Throttles the `gh` round-trips to ~30s (GitHub rate limits)
+    /// Last time the forge PR/MR status (`forge_supports_pr` + `has_open_pr`)
+    /// was refreshed. Throttles the forge round-trips to ~30s (rate limits)
     /// and lets the button reflect a just-created PR within that window.
     pr_status_checked_at: Option<std::time::Instant>,
 
@@ -434,7 +435,7 @@ impl SourceControlPanel {
             git_state,
             last_primary_action: None,
             force_push_with_lease: false,
-            is_github_remote: false,
+            forge_supports_pr: false,
             has_open_pr: false,
             pr_merged: false,
             pr_status_checked_at: None,
@@ -594,7 +595,10 @@ impl SourceControlPanel {
                     .insert(name.clone(), checks_section::LogPeek::Loading);
                 let workdir = self.repo.workdir().to_path_buf();
                 self._check_log_task = Some(cx.spawn(async move |this, cx| {
-                    let log = GithubForge.check_log(&workdir, &link).await;
+                    let log = match Forge::detect(&workdir).await {
+                        Some(f) => f.check_log(&workdir, &link).await,
+                        None => None,
+                    };
                     let _ = this.update(cx, |panel, cx| {
                         let peek = match log {
                             Some(text) => checks_section::LogPeek::Ready(text),
@@ -631,12 +635,12 @@ impl SourceControlPanel {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    let forge = Forge::detect(&workdir).await;
                     let mut sections = Vec::with_capacity(failing.len());
                     for (name, link) in failing {
-                        let log = if link.is_empty() {
-                            None
-                        } else {
-                            GithubForge.check_log(&workdir, &link).await
+                        let log = match (&forge, link.is_empty()) {
+                            (Some(f), false) => f.check_log(&workdir, &link).await,
+                            _ => None,
                         };
                         sections.push((name, log));
                     }
@@ -1015,7 +1019,7 @@ impl SourceControlPanel {
             is_remote_operation_active: in_flight_remote_kind.is_some(),
             upstream_status: upstream,
             in_flight_remote_op_kind: in_flight_remote_kind,
-            is_github_remote: self.is_github_remote,
+            forge_supports_pr: self.forge_supports_pr,
             has_open_pr: self.has_open_pr,
             pr_merged: self.pr_merged,
             is_creating_pr: matches!(commit_status, commit_area::CommitStatus::CreatingPr),
@@ -1437,12 +1441,13 @@ async fn refresh_force_push_with_lease(
     });
 }
 
-/// Refresh the cached GitHub PR status (`is_github_remote` + `has_open_pr`)
+/// Refresh the cached forge PR/MR status (`forge_supports_pr` + `has_open_pr`)
 /// that gates the Create-PR primary rung. Called from the state observer only
 /// when the branch is published and in sync, throttled to ~30s by the caller.
 ///
-/// Runs `git remote get-url origin` (local, fast) first and skips the `gh pr
-/// view` round-trip entirely for non-GitHub remotes. `gh` failures (absent /
+/// [`Forge::detect`] sniffs `origin` (local `git remote get-url`, fast) to pick
+/// the GitHub or GitLab backend, then `supports_repo` decides whether to spend
+/// the `pr/mr view` round-trip at all. Forge-CLI failures (absent /
 /// unauthenticated) resolve to `has_open_pr = false` so the button stays usable
 /// with guidance rather than silently disabling. Stamps `pr_status_checked_at`
 /// on every run so the throttle holds even when the values are unchanged.
@@ -1452,34 +1457,34 @@ async fn refresh_pr_status(
     cx: &mut gpui::AsyncApp,
 ) {
     let workdir = repo.workdir().to_path_buf();
-    let forge = GithubForge;
-    let is_github = forge.supports_repo(&workdir).await;
-    // One `gh pr view --json state` round-trip yields the full lifecycle
+    // One classification of `origin` selects the provider AND gates the PR
+    // surface (`is_some`); no separate `supports_repo` shell-out.
+    let forge = Forge::detect(&workdir).await;
+    let forge_supports = forge.is_some();
+    // One `pr/mr view --json state` round-trip yields the full lifecycle
     // state; `has_open_pr` and `pr_merged` both derive from it.
-    let pr_state = if is_github {
-        forge.pr_state(&workdir).await
-    } else {
-        oximux_core::PrState::None
+    let pr_state = match &forge {
+        Some(f) => f.pr_state(&workdir).await,
+        None => oximux_core::PrState::None,
     };
     let has_pr = pr_state.is_open();
     let pr_merged = pr_state.is_merged();
-    // Only pull CI checks when there's actually an open PR — a second `gh`
+    // Only pull CI checks when there's actually an open PR — a second forge
     // round-trip we don't want to spend otherwise. Empty list clears any
     // stale CI row.
-    let checks = if has_pr {
-        forge.list_checks(&workdir).await
-    } else {
-        Vec::new()
+    let checks = match (&forge, has_pr) {
+        (Some(f), true) => f.list_checks(&workdir).await,
+        _ => Vec::new(),
     };
     let _ = this.update(cx, |panel, cx| {
         panel.pr_status_checked_at = Some(std::time::Instant::now());
         let checks_changed = panel.ci_checks != checks;
-        let changed = panel.is_github_remote != is_github
+        let changed = panel.forge_supports_pr != forge_supports
             || panel.has_open_pr != has_pr
             || panel.pr_merged != pr_merged
             || checks_changed;
         if changed {
-            panel.is_github_remote = is_github;
+            panel.forge_supports_pr = forge_supports;
             panel.has_open_pr = has_pr;
             panel.pr_merged = pr_merged;
             if checks_changed {

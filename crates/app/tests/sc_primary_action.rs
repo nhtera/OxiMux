@@ -274,7 +274,7 @@ fn remote_op_mirror_wins_over_conflict_tooltip_when_kind_differs() {
 fn create_pr_offered_when_in_sync_github_no_open_pr() {
     // Branch published, even with upstream, GitHub remote, no open PR.
     let inputs = PrimaryActionInputs {
-        is_github_remote: true,
+        forge_supports_pr: true,
         has_open_pr: false,
         ..clean_with_upstream(0, 0)
     };
@@ -288,7 +288,7 @@ fn create_pr_suppressed_when_pr_already_merged() {
     // Merged PR: has_open_pr is false but a new PR would duplicate merged
     // work, so the offer is suppressed — falls through to "up to date".
     let inputs = PrimaryActionInputs {
-        is_github_remote: true,
+        forge_supports_pr: true,
         has_open_pr: false,
         pr_merged: true,
         ..clean_with_upstream(0, 0)
@@ -303,7 +303,7 @@ fn create_pr_suppressed_on_default_branch() {
     // On the base branch (e.g. main): in sync, github, no PR — but a PR from
     // the branch to itself is invalid, so the offer is suppressed.
     let inputs = PrimaryActionInputs {
-        is_github_remote: true,
+        forge_supports_pr: true,
         has_open_pr: false,
         on_default_branch: true,
         ..clean_with_upstream(0, 0)
@@ -316,7 +316,7 @@ fn create_pr_suppressed_on_default_branch() {
 #[test]
 fn create_pr_suppressed_when_open_pr_exists() {
     let inputs = PrimaryActionInputs {
-        is_github_remote: true,
+        forge_supports_pr: true,
         has_open_pr: true,
         ..clean_with_upstream(0, 0)
     };
@@ -330,7 +330,7 @@ fn create_pr_suppressed_when_open_pr_exists() {
 #[test]
 fn create_pr_hidden_on_non_github_remote() {
     let inputs = PrimaryActionInputs {
-        is_github_remote: false,
+        forge_supports_pr: false,
         ..clean_with_upstream(0, 0)
     };
     let act = resolve_primary_action(&inputs);
@@ -342,7 +342,7 @@ fn create_pr_hidden_on_non_github_remote() {
 fn push_wins_over_create_pr_when_ahead() {
     // Unpushed commits steer the user to Push first, even on a GitHub remote.
     let inputs = PrimaryActionInputs {
-        is_github_remote: true,
+        forge_supports_pr: true,
         has_open_pr: false,
         ..clean_with_upstream(2, 0)
     };
@@ -355,7 +355,7 @@ fn push_wins_over_create_pr_when_ahead() {
 fn creating_pr_in_flight_locks_primary() {
     let inputs = PrimaryActionInputs {
         is_creating_pr: true,
-        is_github_remote: true,
+        forge_supports_pr: true,
         ..clean_with_upstream(0, 0)
     };
     let act = resolve_primary_action(&inputs);

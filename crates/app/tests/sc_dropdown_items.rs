@@ -265,12 +265,12 @@ fn unresolved_conflicts_block_commits_and_remotes() {
 }
 
 #[test]
-fn create_pr_disabled_on_non_github_remote() {
-    // Default inputs have is_github_remote = false.
+fn create_pr_disabled_on_unsupported_remote() {
+    // Default inputs have forge_supports_pr = false.
     let r = resolve(&DropdownInputs::default());
     let cpr = find(&r, DropdownActionKind::CreatePr);
     assert!(disabled_of(cpr));
-    assert_eq!(title_of(cpr), "Not a GitHub remote");
+    assert_eq!(title_of(cpr), "No GitHub or GitLab remote");
 }
 
 #[test]
@@ -278,7 +278,7 @@ fn create_pr_enabled_when_github_in_sync_no_open_pr() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 0, 0),
-            is_github_remote: true,
+            forge_supports_pr: true,
             has_open_pr: false,
             ..Default::default()
         },
@@ -294,7 +294,7 @@ fn create_pr_disabled_when_open_pr_exists() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 0, 0),
-            is_github_remote: true,
+            forge_supports_pr: true,
             has_open_pr: true,
             ..Default::default()
         },
@@ -312,7 +312,7 @@ fn create_pr_disabled_when_pr_already_merged() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 0, 0),
-            is_github_remote: true,
+            forge_supports_pr: true,
             has_open_pr: false,
             pr_merged: true,
             ..Default::default()
@@ -349,7 +349,7 @@ fn create_pr_disabled_needs_push_when_only_ahead() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 2, 0),
-            is_github_remote: true,
+            forge_supports_pr: true,
             ..Default::default()
         },
         ..Default::default()
@@ -365,7 +365,7 @@ fn create_pr_disabled_needs_sync_when_behind() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 0, 3),
-            is_github_remote: true,
+            forge_supports_pr: true,
             ..Default::default()
         },
         ..Default::default()
@@ -381,7 +381,7 @@ fn create_pr_disabled_force_push_when_behind_with_lease() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 1, 2),
-            is_github_remote: true,
+            forge_supports_pr: true,
             ..Default::default()
         },
         force_push_with_lease: true,
@@ -399,7 +399,7 @@ fn create_pr_disabled_on_default_branch() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 0, 0),
-            is_github_remote: true,
+            forge_supports_pr: true,
             on_default_branch: true,
             ..Default::default()
         },
@@ -415,7 +415,7 @@ fn create_pr_disabled_on_detached_head() {
     let r = resolve(&DropdownInputs {
         primary: PrimaryActionInputs {
             upstream_status: upstream(true, 0, 0),
-            is_github_remote: true,
+            forge_supports_pr: true,
             is_detached_head: true,
             ..Default::default()
         },

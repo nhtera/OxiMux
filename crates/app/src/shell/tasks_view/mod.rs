@@ -17,7 +17,7 @@ use gpui::{
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::forge::{ForgeItem, ForgeListFilter, ForgeProvider, ForgeState, GithubForge};
+use crate::shell::forge::{Forge, ForgeItem, ForgeListFilter, ForgeProvider, ForgeState};
 use crate::shell::tasks_view::row::render_task_row;
 use crate::workspace_root::WorkspaceRoot;
 
@@ -144,10 +144,14 @@ impl TasksView {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let forge = GithubForge;
-                    let items = match kind {
-                        TaskKind::Issues => forge.list_issues(&cwd, filter).await,
-                        TaskKind::Prs => forge.list_prs(&cwd, filter).await,
+                    // Unsupported remote (neither GitHub nor GitLab) → empty
+                    // list without firing a forge CLI against a foreign host.
+                    let items = match Forge::detect(&cwd).await {
+                        Some(forge) => match kind {
+                            TaskKind::Issues => forge.list_issues(&cwd, filter).await,
+                            TaskKind::Prs => forge.list_prs(&cwd, filter).await,
+                        },
+                        None => Vec::new(),
                     };
                     let _ = tx.send(items);
                 });

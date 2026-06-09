@@ -11,6 +11,7 @@
 //! this layer is the contract the app depends on.
 
 pub mod github_gh;
+pub mod gitlab_glab;
 
 use std::path::Path;
 
@@ -33,6 +34,7 @@ pub use oximux_git::gh::MergeMethod;
 pub use oximux_git::gh::{ForgeAssignee, ForgeItem, ForgeLabel, ForgeListFilter, ForgeState};
 
 pub use github_gh::GithubForge;
+pub use gitlab_glab::GitlabForge;
 
 /// A code-hosting forge's PR + CI operations, scoped to one working tree
 /// (passed per call as `cwd`).
@@ -94,4 +96,104 @@ pub trait ForgeProvider {
     /// List the repo's pull requests for the Tasks page. Same graceful-
     /// degradation contract as [`ForgeProvider::list_issues`].
     async fn list_prs(&self, cwd: &Path, filter: ForgeListFilter) -> Vec<ForgeItem>;
+}
+
+/// Host-detecting forge dispatcher: the single entry point the UI constructs
+/// instead of naming a concrete provider. [`Forge::detect`] sniffs `origin`
+/// (a local `git remote get-url`, no network) and routes every
+/// [`ForgeProvider`] call to the matching backend.
+///
+/// An enum (not a `Box<dyn>`) so the trait's `async fn` methods stay usable —
+/// the trait is intentionally not dyn-compatible.
+#[derive(Debug, Clone, Copy)]
+pub enum Forge {
+    Github(GithubForge),
+    Gitlab(GitlabForge),
+}
+
+impl Forge {
+    /// Pick the provider for the repo at `cwd` from its `origin` URL, or
+    /// `None` when `origin` is neither a GitHub nor a GitLab host (or absent).
+    ///
+    /// GitHub is tested **first**: a `github.com` URL can carry `gitlab` in its
+    /// path (e.g. `github.com/gitlab-tools/x`), which the GitLab substring
+    /// match would otherwise mis-claim. Returning `None` for an unsupported
+    /// remote lets callers skip the forge CLI entirely instead of firing `gh`
+    /// against, say, a Bitbucket repo. This single classification also replaces
+    /// the old `detect` + `supports_repo` pair (two identical `git remote`
+    /// shell-outs) — `detect().is_some()` is the gate.
+    pub async fn detect(cwd: &Path) -> Option<Self> {
+        if oximux_git::gh::is_github_remote(cwd).await {
+            Some(Forge::Github(GithubForge))
+        } else if oximux_git::glab::is_gitlab_remote(cwd).await {
+            Some(Forge::Gitlab(GitlabForge))
+        } else {
+            None
+        }
+    }
+}
+
+impl ForgeProvider for Forge {
+    async fn supports_repo(&self, cwd: &Path) -> bool {
+        match self {
+            Forge::Github(f) => f.supports_repo(cwd).await,
+            Forge::Gitlab(f) => f.supports_repo(cwd).await,
+        }
+    }
+
+    async fn has_open_pr(&self, cwd: &Path) -> bool {
+        match self {
+            Forge::Github(f) => f.has_open_pr(cwd).await,
+            Forge::Gitlab(f) => f.has_open_pr(cwd).await,
+        }
+    }
+
+    async fn pr_state(&self, cwd: &Path) -> oximux_core::PrState {
+        match self {
+            Forge::Github(f) => f.pr_state(cwd).await,
+            Forge::Gitlab(f) => f.pr_state(cwd).await,
+        }
+    }
+
+    async fn list_checks(&self, cwd: &Path) -> Vec<CheckRun> {
+        match self {
+            Forge::Github(f) => f.list_checks(cwd).await,
+            Forge::Gitlab(f) => f.list_checks(cwd).await,
+        }
+    }
+
+    async fn create_pr(&self, cwd: &Path, opts: CreatePrOptions) -> Result<String> {
+        match self {
+            Forge::Github(f) => f.create_pr(cwd, opts).await,
+            Forge::Gitlab(f) => f.create_pr(cwd, opts).await,
+        }
+    }
+
+    async fn check_log(&self, cwd: &Path, link: &str) -> Option<String> {
+        match self {
+            Forge::Github(f) => f.check_log(cwd, link).await,
+            Forge::Gitlab(f) => f.check_log(cwd, link).await,
+        }
+    }
+
+    async fn merge_pr(&self, cwd: &Path, method: MergeMethod) -> Result<()> {
+        match self {
+            Forge::Github(f) => f.merge_pr(cwd, method).await,
+            Forge::Gitlab(f) => f.merge_pr(cwd, method).await,
+        }
+    }
+
+    async fn list_issues(&self, cwd: &Path, filter: ForgeListFilter) -> Vec<ForgeItem> {
+        match self {
+            Forge::Github(f) => f.list_issues(cwd, filter).await,
+            Forge::Gitlab(f) => f.list_issues(cwd, filter).await,
+        }
+    }
+
+    async fn list_prs(&self, cwd: &Path, filter: ForgeListFilter) -> Vec<ForgeItem> {
+        match self {
+            Forge::Github(f) => f.list_prs(cwd, filter).await,
+            Forge::Gitlab(f) => f.list_prs(cwd, filter).await,
+        }
+    }
 }

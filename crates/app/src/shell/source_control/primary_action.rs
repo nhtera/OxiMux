@@ -75,10 +75,10 @@ pub struct PrimaryActionInputs {
     pub is_remote_operation_active: bool,
     pub upstream_status: Option<UpstreamStatus>,
     pub in_flight_remote_op_kind: Option<RemoteOpKind>,
-    /// `origin` is a GitHub remote (so `gh` can create a PR). Gates the
-    /// terminal Create-PR rung; non-GitHub remotes fall through to the
-    /// plain "up to date" frame.
-    pub is_github_remote: bool,
+    /// `origin` points at a forge whose CLI can open a PR/MR (GitHub via `gh`,
+    /// GitLab via `glab`). Gates the terminal Create-PR rung; unsupported
+    /// remotes fall through to the plain "up to date" frame.
+    pub forge_supports_pr: bool,
     /// The current branch already has an open PR. Suppresses Create-PR so the
     /// button doesn't offer a redundant action.
     pub has_open_pr: bool,
@@ -264,13 +264,13 @@ pub fn resolve_primary_action(inputs: &PrimaryActionInputs) -> PrimaryAction {
 
     // 6f. Clean + tracked + in sync. The branch is pushed and even with its
     //     upstream — the natural moment to open a PR. Offer Create PR when the
-    //     remote is GitHub and there's no open PR yet; otherwise the plain
-    //     "up to date" frame. Push/Sync/Pull rungs sit ahead of this, so a
-    //     branch with unpushed/unpulled commits is steered there first ("push
-    //     before PR"). A merged PR or the default branch suppresses the offer
-    //     too — a new PR for already-merged work, or from the base branch to
-    //     itself, would be invalid.
-    if inputs.is_github_remote
+    //     remote is a supported forge (GitHub/GitLab) and there's no open PR
+    //     yet; otherwise the plain "up to date" frame. Push/Sync/Pull rungs sit
+    //     ahead of this, so a branch with unpushed/unpulled commits is steered
+    //     there first ("push before PR"). A merged PR or the default branch
+    //     suppresses the offer too — a new PR for already-merged work, or from
+    //     the base branch to itself, would be invalid.
+    if inputs.forge_supports_pr
         && !inputs.has_open_pr
         && !inputs.pr_merged
         && !inputs.on_default_branch
