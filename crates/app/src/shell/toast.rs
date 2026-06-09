@@ -16,6 +16,8 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 /// How long a toast stays before it auto-dismisses.
 const TOAST_TTL: Duration = Duration::from_secs(4);
 /// Cap the visible stack; an older toast is dropped when a new one overflows.
@@ -116,10 +118,7 @@ impl ToastLayer {
             .flex()
             .items_stretch()
             .max_w(px(360.0))
-            .bg(self.theme.bg_overlay)
-            .border_1()
-            .border_color(self.theme.border_active)
-            .rounded(px(self.density.r_card))
+            .floating_chrome(&self.theme, &self.density)
             .overflow_hidden()
             // 2px status-hue left accent bar — the only color on the card.
             .child(div().w(px(2.0)).bg(accent))

@@ -15,6 +15,8 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 use crate::actions::{MoveTabToNewWindow, RequestRenameTabAt, SplitGroupAt, TogglePinTabAt};
 use crate::shell::pane_group::{PaneGroup, TabColor};
 use crate::shell::pane_tree::PaneGroupId;
@@ -170,10 +172,7 @@ impl Render for TabContextMenu {
             .flex()
             .flex_col()
             .p(px(density.pad_overlay))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg();
 
         // Four-direction split actions — per-tab context-menu splits.

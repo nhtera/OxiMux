@@ -21,6 +21,8 @@ use oximux_agents::{AdapterRegistry, RegistryEntry};
 use oximux_core::AgentAdapter;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 use crate::shell::adapter_picker_params::{self, ParamsStage};
 
 /// Last-used `(model, effort)` for one adapter slug. `None` == "Default"
@@ -332,10 +334,7 @@ pub(super) fn card_container(theme: Theme, density: Density) -> Div {
         .flex()
         .flex_col()
         .p(px(density.pad_overlay))
-        .bg(theme.bg_overlay)
-        .border_1()
-        .border_color(theme.border_active)
-        .rounded(px(density.r_card))
+        .floating_chrome(&theme, &density)
         .shadow_lg()
         .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _window, cx| {
             cx.stop_propagation()

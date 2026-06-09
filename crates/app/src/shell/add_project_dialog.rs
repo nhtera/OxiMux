@@ -28,6 +28,8 @@ use gpui_component::{
 };
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
+
+use crate::ui::FloatingSurface;
 use oximux_storage::ProjectRepo;
 use tokio::sync::oneshot;
 
@@ -320,10 +322,7 @@ impl Render for AddProjectDialog {
             .gap(px(density.gap_inline * 1.5))
             .w(px(MODAL_WIDTH))
             .p(px(density.pad_panel * 2.0))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {

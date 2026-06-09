@@ -21,6 +21,8 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 /// Width of the dropdown card. Matches `TabContextMenu::MENU_WIDTH`.
 pub const MENU_WIDTH: f32 = 200.0;
 const ROW_PADDING_X: f32 = 10.0;
@@ -124,10 +126,7 @@ impl Render for FileTreeContextMenu {
             .flex()
             .flex_col()
             .p(px(density.pad_overlay))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg();
 
         let card = match target {

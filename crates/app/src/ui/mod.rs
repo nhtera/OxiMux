@@ -5,5 +5,7 @@
 //! the design system stays single-sourced.
 
 pub mod buttons;
+pub mod overlay;
 
 pub use buttons::danger_ghost;
+pub use overlay::FloatingSurface;

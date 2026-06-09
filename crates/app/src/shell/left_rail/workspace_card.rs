@@ -220,7 +220,7 @@ pub fn render_workspace_card(
 
     let shell = if plan.row.is_active {
         base.mx(px(density.gap_inline))
-            .rounded(px(density.r_xs))
+            .rounded(px(density.r_card))
             .border_1()
             .border_color(theme.border_inactive)
             .bg(plan.row.bg)

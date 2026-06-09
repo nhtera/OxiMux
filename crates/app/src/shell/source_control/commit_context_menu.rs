@@ -19,6 +19,8 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 use crate::shell::source_control::commit_area::CommitArea;
 use crate::shell::source_control::commit_ops::{CommitVerb, run_commit_verb};
 
@@ -109,10 +111,7 @@ impl Render for CommitContextMenu {
             .flex()
             .flex_col()
             .p(px(density.pad_overlay))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg();
 
         // ── 1. History ops. Cherry-pick first (additive — most-asked-for

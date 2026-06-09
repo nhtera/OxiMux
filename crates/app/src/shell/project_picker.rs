@@ -20,6 +20,8 @@ use gpui::{
 };
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
+
+use crate::ui::FloatingSurface;
 use oximux_storage::ProjectRepo;
 
 /// Width of the modal card.
@@ -323,10 +325,7 @@ fn card_container(theme: Theme, density: Density) -> gpui::Div {
         .flex()
         .flex_col()
         .w(px(MODAL_WIDTH))
-        .bg(theme.bg_overlay)
-        .border_1()
-        .border_color(theme.border_active)
-        .rounded(px(density.r_card))
+        .floating_chrome(&theme, &density)
 }
 
 fn header(theme: Theme, typography: &Typography) -> impl IntoElement {

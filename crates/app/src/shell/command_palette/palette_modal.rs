@@ -12,6 +12,8 @@ use gpui::{
 use gpui_component::{Icon, IconName};
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 use crate::shell::command_palette::entry::{PaletteGroup, PaletteItem, PaletteMode};
 use crate::shell::command_palette::row_render::{
     ActivateFn, ROW_HEIGHT, file_row, group_label, palette_row,
@@ -100,10 +102,7 @@ fn card_container(theme: Theme, density: Density) -> gpui::Div {
         .flex()
         .flex_col()
         .w(px(MODAL_WIDTH))
-        .bg(theme.bg_overlay)
-        .border_1()
-        .border_color(theme.border_active)
-        .rounded(px(density.r_card))
+        .floating_chrome(&theme, &density)
         // Rounded corners must clip the scrollable list; shadow lifts the card
         // off the workspace to match the other floating overlays.
         .overflow_hidden()

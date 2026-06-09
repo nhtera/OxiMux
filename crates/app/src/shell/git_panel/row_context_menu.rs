@@ -32,6 +32,8 @@ use gpui::{
     Styled, WeakEntity, Window, div, px,
 };
 use oximux_settings::{Density, Theme, Typography};
+
+use crate::ui::FloatingSurface;
 use std::path::PathBuf;
 
 /// Card width. Slightly wider than `FileTreeContextMenu::MENU_WIDTH`
@@ -157,10 +159,7 @@ impl Render for GitRowContextMenu {
             .flex()
             .flex_col()
             .p(px(density.pad_overlay))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg();
 
         let card = match target {

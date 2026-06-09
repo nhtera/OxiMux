@@ -37,8 +37,9 @@ in the UI. This keeps the eye on the diff, terminal, and agent output — not ch
 | `fg_base` | `#E6E8EB` | Body text |
 | `fg_muted` | `#9AA0A6` | Labels, secondary text, inactive tabs |
 | `fg_subtle` | `#6B7177` | Disabled, placeholder, gutter numbers, chevrons |
-| `border_inactive` | `#26292E` | Pane dividers, card edges |
-| `border_active` | `#3A4047` | Focused pane border, popover outline |
+| `border_inactive` | white @ 8% alpha | Pane dividers, card edges — composites over any layer as a hairline catching light, not a flat grey line |
+| `border_active` | `#3A4047` | Focused pane border, popover outline (solid — focus must stay unambiguous against the faint dividers) |
+| `edge_highlight` | white @ 6% alpha | 1px top inner-highlight on floating surfaces — reads as elevation without a shadow |
 | `selection` | `#2D3A4D` | Text selection background; also "currently-open" row tint |
 | `focus_ring` | `#4A6E9C` | Keyboard focus outline |
 | `match_bg_current` | `#D9A441` | Cycled "you-are-here" search match (Cmd+F) |
@@ -215,13 +216,34 @@ border = 1px theme.border_active
 corner = density.r_card
 padding = density.pad_overlay      (6px)
 item h  = density.h_overlay_item   (30px)
+top edge = 1px theme.edge_highlight (white @ 6%, inset by the corner radius)
 ```
 
-Adopt for every new floating surface. Today's compliant surfaces:
-`pane_actions`, `adapter_picker`, `commit_context_menu`, `file_tree_context_menu`,
-`tab_context_menu`, `git_panel/row_context_menu`, `review_note_popover`,
-`pr_dialog`. See the "approved exceptions" table above for the three surfaces
-that deliberately diverge.
+The **top inner-highlight** is the only way a no-shadow / no-blur surface can
+read as *elevated* rather than flat: a 1px white-at-6% line catching light along
+the top edge. It is non-interactive (a plain child div, no handlers) and painted
+under the surface's content, so it never eats clicks. Keep it ≤6% alpha or it
+stops reading as a hint and becomes a drawn line.
+
+The chrome — background, border, radius, positioning context, and the
+top-highlight — is single-sourced in `ui::FloatingSurface::floating_chrome`
+(`crates/app/src/ui/overlay.rs`). Apply it in-chain where a surface sets its
+size/padding; do **not** re-hand-roll `bg_overlay` + `border_active` + `r_card`.
+Surface-specific padding, width, and content stay caller-owned.
+
+Adopt for every new floating surface via `floating_chrome`. Today's compliant
+surfaces: `pane_actions`, `adapter_picker`, `commit_context_menu`,
+`file_tree_context_menu`, `tab_context_menu`, `git_panel/row_context_menu`,
+`review_note_popover`, `pr_dialog`, `add_project_dialog`, `workspace_dialog`,
+`project_picker`, `rename_tab_dialog`, `branch_picker`, `toast`,
+`command_palette/palette_modal`, `stash_panel/push_dialog`.
+
+**Chrome exception — `settings_modal/view`:** its card is `absolute`-positioned
+at a computed anchor (`.absolute().left(x).top(y)`), so it cannot use
+`floating_chrome` (which sets `relative` and would clobber the absolute
+position). It keeps the hand-rolled `bg_overlay` + `border_active` + `r_card`
+recipe and is not given the top-highlight. Migrating it would require applying
+`.absolute()` after the chrome or reworking the helper to not force `relative`.
 
 ## Diff review notes
 

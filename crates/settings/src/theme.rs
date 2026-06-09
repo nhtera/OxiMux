@@ -26,6 +26,13 @@ pub struct Theme {
     pub selection: Hsla,
     pub focus_ring: Hsla,
 
+    /// Non-interactive 1px top edge painted on floating surfaces (popovers,
+    /// pickers, dialogs, menus, toasts). White at very low alpha so it reads
+    /// as a physical edge catching light — conveying elevation without a
+    /// shadow or blur. Kept under ~6% or it stops reading as a hint and
+    /// becomes a drawn line.
+    pub edge_highlight: Hsla,
+
     // Search match highlight. `current` is the cycled / "you are here" match
     // (bright amber, dark fg for high contrast). `other` is every other
     // match in scrollback (dim amber, default fg) — visible enough to scan
@@ -84,10 +91,20 @@ impl Theme {
             fg_muted: rgb(0x9AA0A6).into(),
             fg_subtle: rgb(0x6B7177).into(),
 
-            border_inactive: rgb(0x26292E).into(),
+            // Dividers and inactive card/panel edges are white at low alpha
+            // rather than a solid grey hex. An alpha-over-white edge composites
+            // against whatever background sits under it (`bg_base`, `bg_panel`,
+            // `bg_panel_alt`), so the same token reads as a hairline catching
+            // light on every layer instead of a flat drawn line. Tuned to the
+            // lowest alpha that stays visible on near-black `bg_base` (the worst
+            // case). `border_active` stays a solid hex below so focus/selection
+            // edges remain unambiguous against these faint dividers.
+            border_inactive: Hsla { h: 0., s: 0., l: 1., a: 0.08 },
             border_active: rgb(0x3A4047).into(),
             selection: rgb(0x2D3A4D).into(),
             focus_ring: rgb(0x4A6E9C).into(),
+
+            edge_highlight: Hsla { h: 0., s: 0., l: 1., a: 0.06 },
 
             match_bg_current: rgb(0xD9A441).into(),
             match_bg_other: rgb(0x5A5358).into(),

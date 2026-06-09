@@ -19,6 +19,8 @@ use gpui_component::{
     input::{Input, InputState},
 };
 use oximux_settings::{Density, Theme, Typography};
+
+use crate::ui::FloatingSurface;
 use std::rc::Rc;
 
 /// Outcome passed to the host callback when the user dismisses the
@@ -159,10 +161,7 @@ impl Render for RenameTabDialog {
             .flex_col()
             .w(px(420.0))
             .p(px(density.pad_panel * 2.0))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .gap(px(density.gap_inline))
             .child(
                 div()

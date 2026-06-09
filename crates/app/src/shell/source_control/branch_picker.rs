@@ -25,6 +25,8 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 /// Width of the popover card. Wide enough for `origin/release-2026-Q2`
 /// without truncation but narrow enough to fit beside the toolbar.
 const CARD_WIDTH: f32 = 280.0;
@@ -398,10 +400,7 @@ impl Render for BranchPicker {
             .w(px(CARD_WIDTH))
             .max_h(px(CARD_MAX_HEIGHT))
             .p(px(density.pad_overlay))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg()
             .track_focus(&self.focus_handle)
             // Capture arrows / Enter / Escape at the bubble phase. The

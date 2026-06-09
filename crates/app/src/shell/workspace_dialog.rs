@@ -24,6 +24,8 @@ use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::derive_slug;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 const MODAL_WIDTH: f32 = 480.0;
 const MODAL_TOP_OFFSET: f32 = 96.0;
 const FIELD_HEIGHT: f32 = 32.0;
@@ -253,10 +255,7 @@ impl Render for WorkspaceDialog {
             .flex_col()
             .w(px(MODAL_WIDTH))
             .p(px(density.pad_panel * 2.0))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .gap(px(density.gap_inline))
             .child(
                 div()

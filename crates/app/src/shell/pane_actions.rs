@@ -15,6 +15,8 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::ui::FloatingSurface;
+
 use crate::actions::CloseGroup;
 use crate::shell::split_direction::{SplitDirection, split_icon};
 
@@ -101,10 +103,7 @@ impl Render for PaneActionsMenu {
             .flex()
             .flex_col()
             .p(px(density.pad_overlay))
-            .bg(theme.bg_overlay)
-            .border_1()
-            .border_color(theme.border_active)
-            .rounded(px(density.r_card))
+            .floating_chrome(&theme, &density)
             .shadow_lg();
         for (ix, dir) in dirs.iter().copied().enumerate() {
             let icon = svg()
