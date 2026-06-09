@@ -1560,7 +1560,12 @@ impl ProjectPanes {
                         continue;
                     };
                     for (tab_idx, lt) in leaf.tabs().iter().enumerate() {
-                        if let Some(pty_id) = lt.view().read(cx).external_id()
+                        // `relay_id_for_capture` (not `external_id`): a view
+                        // still awaiting its post-paint attach answers with
+                        // the persisted hint, so a quit that races the
+                        // reconcile keeps the row instead of orphaning the
+                        // daemon PTY.
+                        if let Some(pty_id) = lt.view().read(cx).relay_id_for_capture()
                             && let Err(err) = repo.set(
                                 project_id,
                                 window_id,

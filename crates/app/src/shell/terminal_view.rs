@@ -150,8 +150,11 @@ pub fn relay_state_snapshot() -> RelayStateSnapshot {
             session_id: None,
         };
     };
-    // `list_external_ids` is a synchronous daemon round-trip; hold off App
-    // Nap so the system can't wedge the main thread while it's in flight.
+    // `list_external_ids` is a synchronous daemon round-trip on whichever
+    // thread calls it (the post-paint reconcile runs it on the background
+    // executor; the project-switch capture path still calls it from the
+    // main thread). Hold off App Nap so the system can't wedge the calling
+    // thread while it's in flight.
     let _nap = crate::app_nap::prevent("relay list ptys");
     let guard = shared.lock().expect("shared backend poisoned");
     RelayStateSnapshot {
@@ -165,8 +168,9 @@ pub fn relay_state_snapshot() -> RelayStateSnapshot {
 /// (caller falls back to spawn + visual prefill).
 pub fn attach_pty_existing(external_id: &str) -> Option<(SharedBackend, TerminalSessionId)> {
     let shared = SHARED_BACKEND.get()?;
-    // Attach is a synchronous daemon round-trip on the main thread during
-    // restore — the original freeze window. Hold off App Nap for its duration.
+    // Attach is a synchronous daemon round-trip on the calling thread
+    // (background executor from the restore reconcile; main thread from
+    // tear-off). Hold off App Nap for its duration.
     let _nap = crate::app_nap::prevent("relay attach");
     let mut guard = shared.lock().expect("shared backend poisoned");
     match guard.attach_existing(external_id) {
@@ -204,8 +208,10 @@ pub fn spawn_local_pty(
             scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
-        // Spawn is a synchronous daemon round-trip on the main thread; hold
-        // off App Nap so it can't wedge mid-request.
+        // Spawn is a synchronous daemon round-trip on the calling thread
+        // (background executor from the restore reconcile; main thread for
+        // interactive new-tab/split spawns). Hold off App Nap so it can't
+        // wedge mid-request.
         let _nap = crate::app_nap::prevent("relay spawn");
         let mut guard = shared.lock().expect("shared backend poisoned");
         match guard.spawn(cfg) {
@@ -271,6 +277,25 @@ pub fn spawn_local_pty_dormant(cols: u16, rows: u16) -> Option<(SharedBackend, T
         Ok(id) => id,
         Err(err) => {
             tracing::warn!(?err, "spawn_dormant failed");
+            return None;
+        }
+    };
+    let boxed: Box<dyn TerminalBackend> = Box::new(backend);
+    Some((Arc::new(Mutex::new(boxed)), session_id))
+}
+
+/// In-process dormant grid used as the paint-first restore placeholder:
+/// zero daemon round-trips, no PTY child. The post-paint reconcile pass
+/// (`project_panes_factory::spawn_attach_reconcile`) later swaps in the
+/// real session via [`TerminalView::adopt_live_session`]. Deliberately
+/// never touches `SHARED_BACKEND` — the whole point is that nothing here
+/// can block on the relay socket.
+pub fn spawn_pending_placeholder_grid() -> Option<(SharedBackend, TerminalSessionId)> {
+    let mut backend = PortablePtyBackend::new();
+    let session_id = match backend.spawn_dormant(DEFAULT_COLS, DEFAULT_ROWS) {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(?err, "pending placeholder spawn_dormant failed");
             return None;
         }
     };
@@ -411,6 +436,17 @@ pub struct TerminalView {
     /// and re-injected verbatim when a dormant pane respawns its shell so
     /// the ids survive an app quit -> reattach for the same surface.
     ids: SurfaceIds,
+    /// True while this view awaits the post-paint attach reconcile: it
+    /// renders an empty placeholder grid (no daemon round-trips happened
+    /// at construction) until [`adopt_live_session`](Self::adopt_live_session)
+    /// swaps in the real relay/spawned session. Input is dropped while
+    /// pending — the shell it would reach doesn't exist yet.
+    pending_attach: bool,
+    /// The persisted relay PTY id this slot pointed at, carried so a
+    /// quit-save that fires mid-reconcile re-persists the hint instead of
+    /// dropping the row (which would orphan the daemon PTY on next boot).
+    /// Read only by [`relay_id_for_capture`](Self::relay_id_for_capture).
+    pending_relay_hint: Option<String>,
 }
 
 impl TerminalView {
@@ -561,7 +597,91 @@ impl TerminalView {
             hovered_link: None,
             command_marks: Vec::new(),
             progress: None,
+            pending_attach: false,
+            pending_relay_hint: None,
         }
+    }
+
+    /// Paint-first restore placeholder: a view over an in-process dormant
+    /// grid (from [`spawn_pending_placeholder_grid`]) that issued ZERO
+    /// daemon round-trips at construction. It renders an empty terminal
+    /// surface — the same blank canvas a freshly-spawned shell shows for
+    /// its first frames — until the post-paint reconcile delivers the real
+    /// session via [`adopt_live_session`](Self::adopt_live_session).
+    ///
+    /// Unlike [`mount_dormant`](Self::mount_dormant), focus-in/keystrokes
+    /// do NOT wake anything here (`dormant_cwd` stays `None`): waking the
+    /// placeholder would spawn an in-process shell racing the reconcile's
+    /// relay attach. Input during the pending window is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mount_pending(
+        backend: SharedBackend,
+        session_id: TerminalSessionId,
+        ids: SurfaceIds,
+        relay_hint: Option<String>,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::mount_inner(
+            backend, session_id, ids, theme, density, typography, false, window, cx,
+        );
+        view.pending_attach = true;
+        view.pending_relay_hint = relay_hint;
+        // No live session to drain yet — `adopt_live_session` arms the poll
+        // task once the real session arrives. Dropping the just-armed task
+        // cancels it before its first 16 ms tick fires.
+        view._poll_task = None;
+        view
+    }
+
+    /// True while the view awaits its post-paint session delivery.
+    pub fn is_pending_attach(&self) -> bool {
+        self.pending_attach
+    }
+
+    /// Swap the pending placeholder grid for the live session the
+    /// reconcile pass attached/spawned: re-snapshot, force the next
+    /// render's `maybe_resize` to push the already-painted pane size to
+    /// the new session, and arm the drain task. Returns `false` (and
+    /// does nothing) when the view is not pending — the caller must then
+    /// close the delivered session itself or it leaks.
+    pub fn adopt_live_session(
+        &mut self,
+        backend: SharedBackend,
+        session_id: TerminalSessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.pending_attach {
+            return false;
+        }
+        self.pending_attach = false;
+        self.pending_relay_hint = None;
+        let old_backend = std::mem::replace(&mut self.backend, backend);
+        let old_id = std::mem::replace(&mut self.session_id, session_id);
+        // The placeholder owns no child process, but close it anyway so the
+        // in-process backend's session map doesn't accumulate dead entries.
+        // Detached thread mirrors `Drop` — close may briefly block.
+        std::thread::spawn(move || {
+            if let Ok(mut be) = old_backend.lock() {
+                let _ = be.close(old_id);
+            }
+        });
+        self.snapshot = self
+            .backend
+            .lock()
+            .expect("pty backend mutex poisoned")
+            .snapshot(session_id)
+            .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS));
+        // The session was attached/spawned at its own size; (0,0) can never
+        // equal a real canvas grid, so the next render always resizes it to
+        // the painted bounds.
+        self.last_resize = (0, 0);
+        self._poll_task = Some(Self::start_poll_task(cx));
+        cx.notify();
+        true
     }
 
     /// F3.4: build a view backed by a DORMANT session — grid emulator
@@ -654,6 +774,8 @@ impl TerminalView {
             hovered_link: None,
             command_marks: Vec::new(),
             progress: None,
+            pending_attach: false,
+            pending_relay_hint: None,
         }
     }
 
@@ -801,10 +923,26 @@ impl TerminalView {
 
     /// Backend's external identifier for this pane's session (e.g.,
     /// the relay daemon's PTY id), if any. Used by the phase-06
-    /// reconciliation capture path. `None` for in-process backends.
+    /// reconciliation capture path. `None` for in-process backends —
+    /// including the pending-attach placeholder, which deliberately
+    /// reports `None` here so tear-off (and anything else gating on a
+    /// live relay id) stays disabled until the real session arrives.
     pub fn external_id(&self) -> Option<String> {
         let id = self.session_id;
         self.with_backend(|be| be.external_id_of(id))
+    }
+
+    /// Relay id to PERSIST for this pane. Same as [`external_id`]
+    /// (Self::external_id) for live views, but a still-pending view
+    /// answers with its persisted hint — so a quit-save racing the
+    /// post-paint reconcile re-persists the original row instead of
+    /// dropping it (which would orphan the daemon PTY: alive, but no
+    /// row points at it on the next boot).
+    pub fn relay_id_for_capture(&self) -> Option<String> {
+        if self.pending_attach {
+            return self.pending_relay_hint.clone();
+        }
+        self.external_id()
     }
 
     /// Detach the relay session so the daemon PTY survives without an active
@@ -1344,6 +1482,13 @@ impl TerminalView {
 
     fn send_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if bytes.is_empty() {
+            return;
+        }
+        // Pending-attach window: the real shell doesn't exist yet, so input
+        // has nowhere meaningful to go. Drop it quietly (the window is
+        // typically a few ms after first paint) instead of spamming
+        // "pty write failed" per keystroke against the placeholder grid.
+        if self.pending_attach {
             return;
         }
         // F3.4: paste / cmd-shortcut paths bypass the focus-in respawn

@@ -22,7 +22,7 @@ use oximux_storage::{ProjectRepo, StorageError, WorkspaceRepo};
 use crate::shell::left_rail::row_menu::ScriptAvail;
 
 use crate::project_panes_factory::{
-    build_project_panes, compute_attach_hints, compute_leaf_attach_hints, load_persisted_tabs,
+    build_project_panes, load_persisted_tabs,
     save_persisted_tabs,
 };
 use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
@@ -501,28 +501,33 @@ impl WorkspaceRoot {
                     tracing::warn!(?err, project_id = %project.id, "load pane_relay_ids failed");
                     Vec::new()
                 });
-            let relay_snap = crate::shell::terminal_view::relay_state_snapshot();
-            let attach_hints = compute_attach_hints(
-                &pane_relay_ids,
-                &relay_snap.live_external_ids,
-                relay_snap.session_id.as_deref(),
-            );
-            let leaf_attach_hints = compute_leaf_attach_hints(
-                &pane_relay_ids,
-                &relay_snap.live_external_ids,
-                relay_snap.session_id.as_deref(),
-            );
-            let panes = build_project_panes(
+            // NO daemon round-trips on this path: the panes build mounts
+            // pending placeholders only, so first paint isn't gated behind
+            // per-tab attach/spawn RPCs. The reconcile spawned below does
+            // the relay work after paint and swaps live sessions in.
+            let build_started = std::time::Instant::now();
+            let (panes, pending_attaches) = build_project_panes(
                 project_root.clone(),
                 snapshot,
                 pane_buffers,
-                attach_hints,
-                leaf_attach_hints,
+                pane_relay_ids.clone(),
                 theme,
                 density,
                 typography,
                 cli_runtime,
                 notifier,
+                window,
+                cx,
+            );
+            tracing::info!(
+                project_id = %project.id,
+                pending = pending_attaches.len(),
+                elapsed_ms = build_started.elapsed().as_millis() as u64,
+                "project panes built (pre-paint, no relay RPCs)"
+            );
+            crate::project_panes_factory::spawn_attach_reconcile(
+                pane_relay_ids,
+                pending_attaches,
                 window,
                 cx,
             );

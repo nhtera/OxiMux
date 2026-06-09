@@ -103,6 +103,7 @@ fn main() {
     // closure's `Db` mutex is poisoned — but the `exit(1)` in the
     // `JoinError` arm makes that path unreachable, so retry callers
     // would need to reopen `Db` from scratch.
+    let hydrate_started = std::time::Instant::now();
     let db = open_db_or_exit();
     let app_state = rt.block_on(async {
         tokio::task::spawn_blocking(move || state::hydrate(db))
@@ -119,6 +120,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    tracing::info!(
+        elapsed_ms = hydrate_started.elapsed().as_millis() as u64,
+        "boot: db open + state hydrate"
+    );
 
     // Try to bring up the relay daemon. On success, install a shared
     // `RelayBackend` so every PTY spawn goes through the daemon and
@@ -128,7 +133,18 @@ fn main() {
     // Held for the whole process: dropping the relay runtime would tear
     // down the client's reader/writer tasks and wedge every PTY. Kept
     // alongside `rt` until `app.run` returns on graceful quit.
+    // This handshake is the one intentionally-blocking pre-paint step
+    // (warm path: socket probe + hello; cold path: daemon spawn + poll).
+    // Per-tab attach/spawn no longer happens pre-paint — see
+    // `spawn_attach_reconcile` — so this timing line plus the panes-build
+    // and reconcile lines bracket the whole boot cost story.
+    let relay_boot_started = std::time::Instant::now();
     let _relay_rt = boot_relay_supervisor(app_state.pane_relay_id_repo().clone());
+    tracing::info!(
+        elapsed_ms = relay_boot_started.elapsed().as_millis() as u64,
+        relay_up = _relay_rt.is_some(),
+        "boot: relay supervisor handshake"
+    );
 
     // `with_assets` registers our composite SVG source: local app icons
     // (e.g. `icons/git-branch.svg`) first, falling through to gpui-component's

@@ -34,6 +34,7 @@ use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{
     TerminalView, attach_pty_existing, relay_state_snapshot, spawn_local_pty,
+    spawn_pending_placeholder_grid,
 };
 use crate::workspace_root::WorkspaceRoot;
 
@@ -65,6 +66,35 @@ type RelayRow = (u32, u32, u32, String, String);
 /// for pre-v4 rows resolve to `sub_pane_ordinal = 0` (via the V004
 /// migration), keeping single-sub-pane tabs identical to the old path.
 pub type PaneBuffersMap = HashMap<(u32, u32), Vec<u8>>;
+
+/// Which restore slot a pending terminal view occupies, so the reconcile
+/// pass can look up its survival hint in the maps `compute_attach_hints` /
+/// `compute_leaf_attach_hints` produce.
+pub(crate) enum PendingSlot {
+    /// Single-pane fast path, keyed by tab ordinal (leaf 0 / tab 0 row).
+    SingleTab(u32),
+    /// Tree path, keyed `(ordinal, sub_pane, tab)`.
+    LeafTab(u32, u32, u32),
+}
+
+/// One restored terminal surface awaiting its post-paint session: the
+/// pending view to deliver into, the slot for hint lookup, and the
+/// cwd/env a fresh spawn needs when no daemon PTY survived.
+pub(crate) struct PendingAttach {
+    pub view: WeakEntity<TerminalView>,
+    pub slot: PendingSlot,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+/// Raw (unvalidated) persisted relay id for a slot — what the pending view
+/// carries for the quit-save capture fallback. Liveness/session validation
+/// happens in the reconcile pass against a fresh daemon snapshot.
+fn raw_relay_hint(rows: &[RelayRow], ord: u32, sub_pane: u32, tab: u32) -> Option<String> {
+    rows.iter()
+        .find(|(o, s, t, _, _)| *o == ord && *s == sub_pane && *t == tab)
+        .map(|(_, _, _, pty_id, _)| pty_id.clone())
+}
 
 /// True when a persisted relay row still points at a live, same-session
 /// daemon PTY — i.e. it survived the restart and can be re-attached.
@@ -115,13 +145,20 @@ pub fn compute_leaf_attach_hints(
         .collect()
 }
 
+/// Build the per-project panes entity from the persisted snapshot WITHOUT
+/// touching the relay daemon: every restored terminal mounts as a
+/// pending placeholder (in-process dormant grid, zero round-trips) and is
+/// returned in the `Vec<PendingAttach>` for the caller to hand to
+/// [`spawn_attach_reconcile`] AFTER the window has painted. This is what
+/// keeps N restored tabs from gating first paint behind N sequential
+/// daemon RPCs — the window shows the restored layout immediately and
+/// each pane's content streams in as its session attaches.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_project_panes(
     cwd: PathBuf,
     snapshot: Option<PersistedTabs>,
     pane_buffers: PaneBuffersMap,
-    attach_hints: AttachHints,
-    leaf_attach_hints: LeafAttachHints,
+    pane_relay_ids: Vec<RelayRow>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -129,7 +166,8 @@ pub(crate) fn build_project_panes(
     notifier: Arc<dyn Notifier>,
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
-) -> Entity<ProjectPanes> {
+) -> (Entity<ProjectPanes>, Vec<PendingAttach>) {
+    let mut pending: Vec<PendingAttach> = Vec::new();
     let panes_entity = cx.new(|cx| {
         ProjectPanes::new(
             cwd.clone(),
@@ -146,7 +184,7 @@ pub(crate) fn build_project_panes(
     let restore = snapshot.filter(|s| !s.tabs.is_empty());
     let Some(snap) = restore else {
         panes_entity.update(cx, |p, cx| p.seed_default_terminal(window, cx));
-        return panes_entity;
+        return (panes_entity, pending);
     };
 
     // v3 path: multi-group restore when `group_tree` + `groups` are
@@ -155,13 +193,13 @@ pub(crate) fn build_project_panes(
     // helper while still moving `snap` for the per-group iteration.
     if snap.group_tree.is_some() && !snap.groups.is_empty() {
         let tree = snap.group_tree.clone().expect("group_tree just checked");
-        return restore_multi_group(
+        let entity = restore_multi_group(
             panes_entity,
             snap,
             &tree,
             pane_buffers,
-            attach_hints,
-            leaf_attach_hints,
+            &pane_relay_ids,
+            &mut pending,
             cwd,
             theme,
             density,
@@ -170,6 +208,7 @@ pub(crate) fn build_project_panes(
             window,
             cx,
         );
+        return (entity, pending);
     }
 
     // Legacy v2 single-group path. Flat tab list, every tab lands in
@@ -219,15 +258,14 @@ pub(crate) fn build_project_panes(
                         cx,
                     );
                 } else if needs_tree_restore(tab) {
-                    // Multi-sub-pane restore — spawn one fresh PTY per
-                    // leaf at the captured cwd (no relay attach). Every
-                    // sub-pane gets its own scrollback bytes from the
-                    // pane_buffers map, keyed by `(ordinal, sub_pane_ord)`.
+                    // Multi-sub-pane restore — every leaf mounts pending;
+                    // the reconcile pass attaches/spawns post-paint.
                     if let Some(tree) = build_multi_sub_pane_tree(
                         tab,
                         ordinal,
                         &mut pane_buffers,
-                        &leaf_attach_hints,
+                        &pane_relay_ids,
+                        &mut pending,
                         cwd.clone(),
                         theme,
                         density,
@@ -240,9 +278,10 @@ pub(crate) fn build_project_panes(
                         });
                         ordinal += 1;
                     }
-                } else if let Some(view) = build_terminal_view_for_tab(
+                } else if let Some(view) = build_pending_terminal_view(
                     cwd.clone(),
-                    &attach_hints,
+                    &pane_relay_ids,
+                    &mut pending,
                     ordinal,
                     single_leaf_ids(tab, &cwd),
                     theme,
@@ -252,8 +291,8 @@ pub(crate) fn build_project_panes(
                     cx,
                 ) {
                     // Content restore comes ONLY from a live daemon reattach
-                    // (handled inside `build_terminal_view_for_tab`). When no
-                    // live PTY exists, the tab opens a clean fresh shell — we
+                    // (delivered by the post-paint reconcile). When no live
+                    // PTY exists, the tab opens a clean fresh shell — we
                     // do NOT replay a serialized grid here. Grid replay had to
                     // reflow to the new pane size and scrambled full-screen
                     // TUIs; the reference app likewise prunes local scrollback
@@ -271,7 +310,7 @@ pub(crate) fn build_project_panes(
     panes_entity.update(cx, |p, cx| {
         p.apply_restored_state(snap.active, snap.next_label_n, tab_order, window, cx);
     });
-    panes_entity
+    (panes_entity, pending)
 }
 
 /// v3 multi-group restore. Walks `snap.groups` in DFS order, distributing
@@ -284,8 +323,8 @@ fn restore_multi_group(
     snap: PersistedTabs,
     tree: &crate::persisted_terminals::PersistedTree,
     pane_buffers: PaneBuffersMap,
-    attach_hints: AttachHints,
-    leaf_attach_hints: LeafAttachHints,
+    pane_relay_ids: &[RelayRow],
+    pending: &mut Vec<PendingAttach>,
     cwd: PathBuf,
     theme: Theme,
     density: Density,
@@ -358,7 +397,8 @@ fn restore_multi_group(
                             tab,
                             ordinal,
                             &mut pane_buffers,
-                            &leaf_attach_hints,
+                            pane_relay_ids,
+                            pending,
                             cwd.clone(),
                             theme,
                             density,
@@ -376,9 +416,10 @@ fn restore_multi_group(
                             });
                             ordinal += 1;
                         }
-                    } else if let Some(view) = build_terminal_view_for_tab(
+                    } else if let Some(view) = build_pending_terminal_view(
                         cwd.clone(),
-                        &attach_hints,
+                        pane_relay_ids,
+                        pending,
                         ordinal,
                         single_leaf_ids(tab, &cwd),
                         theme,
@@ -694,7 +735,8 @@ fn build_multi_sub_pane_tree(
     tab: &PersistedTab,
     tab_ordinal: u32,
     pane_buffers: &mut PaneBuffersMap,
-    leaf_attach_hints: &LeafAttachHints,
+    pane_relay_ids: &[RelayRow],
+    pending: &mut Vec<PendingAttach>,
     project_cwd: PathBuf,
     theme: Theme,
     density: Density,
@@ -736,39 +778,37 @@ fn build_multi_sub_pane_tree(
                 surface_id,
                 tab_id,
             );
-            // Warm re-attach: if this leaf-tab's relay PTY survived the
-            // restart (same session, still live), adopt the running shell so
-            // the live tail + scrollback resume in place. Otherwise COLD
-            // restore via `spawn_local_pty`, which spawns through the relay
-            // when it's reachable (daemon-backed → survives the next quit and
-            // re-attaches on the launch after) and only falls back to an
-            // in-process PTY if the daemon is down. The fresh shell carries
-            // its OXIMUX_* env via `ids.env()`. Either way no dormant grid is
-            // built, so nothing probes the relay's unsupported dormant path.
-            let reattached = leaf_attach_hints
-                .get(&(tab_ordinal, sub_pane_ordinal as u32, ti as u32))
-                .and_then(|pty_id| attach_pty_existing(pty_id));
-            let (backend, session_id) = match reattached {
-                Some(pair) => pair,
-                None => {
-                    let Some(pair) = spawn_local_pty(leaf_cwd, ids.env()) else {
-                        tracing::warn!(label = %tab.label, "sub-pane cold spawn failed; dropping tab");
-                        return None;
-                    };
-                    pair
-                }
+            // Every leaf mounts as a pending placeholder — zero daemon
+            // round-trips here. The post-paint reconcile decides warm
+            // re-attach (relay PTY survived: same session, still live) vs
+            // cold spawn per leaf and delivers the session via
+            // `adopt_live_session`. The fresh-spawn path carries the leaf's
+            // OXIMUX_* env via the `PendingAttach` entry.
+            let slot = (tab_ordinal, sub_pane_ordinal as u32, ti as u32);
+            let relay_hint = raw_relay_hint(pane_relay_ids, slot.0, slot.1, slot.2);
+            let Some((backend, session_id)) = spawn_pending_placeholder_grid() else {
+                tracing::warn!(label = %tab.label, "sub-pane placeholder grid failed; dropping tab");
+                return None;
             };
+            let env = ids.env();
             let view = cx.new(|cx| {
-                TerminalView::mount_background(
+                TerminalView::mount_pending(
                     backend,
                     session_id,
                     ids,
+                    relay_hint,
                     theme,
                     density,
                     typography.clone(),
                     window,
                     cx,
                 )
+            });
+            pending.push(PendingAttach {
+                view: view.downgrade(),
+                slot: PendingSlot::LeafTab(slot.0, slot.1, slot.2),
+                cwd: leaf_cwd,
+                env,
             });
             let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
             tab_views.push((view, observer));
@@ -813,10 +853,14 @@ fn single_leaf_ids(tab: &PersistedTab, cwd: &std::path::Path) -> SurfaceIds {
     )
 }
 
+/// Single-pane fast-path restore: mount a pending placeholder (zero
+/// daemon round-trips) and register it for the post-paint reconcile,
+/// which decides warm re-attach vs cold spawn off the paint path.
 #[allow(clippy::too_many_arguments)]
-fn build_terminal_view_for_tab(
+fn build_pending_terminal_view(
     cwd: PathBuf,
-    attach_hints: &AttachHints,
+    pane_relay_ids: &[RelayRow],
+    pending: &mut Vec<PendingAttach>,
     ordinal: u32,
     ids: SurfaceIds,
     theme: Theme,
@@ -825,20 +869,141 @@ fn build_terminal_view_for_tab(
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<Entity<TerminalView>> {
-    let (backend, session_id) = if let Some(relay_pty_id) = attach_hints.get(&ordinal)
-        && let Some(result) = attach_pty_existing(relay_pty_id)
-    {
-        // Reattach to a surviving daemon PTY: the live shell already
-        // carries its original OXIMUX_* env, so no env is injected here.
-        result
-    } else {
-        spawn_local_pty(cwd, ids.env())?
-    };
-    Some(cx.new(|cx| {
-        TerminalView::mount(
-            backend, session_id, ids, theme, density, typography, window, cx,
+    let relay_hint = raw_relay_hint(pane_relay_ids, ordinal, 0, 0);
+    let (backend, session_id) = spawn_pending_placeholder_grid()?;
+    let env = ids.env();
+    let view = cx.new(|cx| {
+        TerminalView::mount_pending(
+            backend,
+            session_id,
+            ids,
+            relay_hint,
+            theme,
+            density,
+            typography,
+            window,
+            cx,
         )
-    }))
+    });
+    pending.push(PendingAttach {
+        view: view.downgrade(),
+        slot: PendingSlot::SingleTab(ordinal),
+        cwd,
+        env,
+    });
+    Some(view)
+}
+
+/// Post-paint attach reconcile: ONE `ListPtys` round-trip validates the
+/// persisted hints against the live daemon, then each pending view gets
+/// its session — warm re-attach when its PTY survived, cold spawn
+/// otherwise — delivered via `adopt_live_session`. Every daemon RPC runs
+/// on the background executor (each is a `Handle::block_on` against the
+/// relay runtime and must stay off the main thread); only the per-view
+/// delivery hops back to the main thread. Tabs go live one by one, the
+/// UI stays interactive throughout.
+pub(crate) fn spawn_attach_reconcile(
+    pane_relay_ids: Vec<RelayRow>,
+    pending: Vec<PendingAttach>,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceRoot>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    cx.spawn_in(window, async move |_root, cx| {
+        let started = std::time::Instant::now();
+        let total = pending.len();
+        let Ok(executor) = cx.update(|_, cx| cx.background_executor().clone()) else {
+            return;
+        };
+        let snap = executor
+            .spawn(async move { relay_state_snapshot() })
+            .await;
+        let attach_hints =
+            compute_attach_hints(&pane_relay_ids, &snap.live_external_ids, snap.session_id.as_deref());
+        let leaf_attach_hints = compute_leaf_attach_hints(
+            &pane_relay_ids,
+            &snap.live_external_ids,
+            snap.session_id.as_deref(),
+        );
+        let mut attached = 0usize;
+        let mut spawned = 0usize;
+        for entry in pending {
+            let hint = match &entry.slot {
+                PendingSlot::SingleTab(ord) => attach_hints.get(ord).cloned(),
+                PendingSlot::LeafTab(ord, sub, tab) => {
+                    leaf_attach_hints.get(&(*ord, *sub, *tab)).cloned()
+                }
+            };
+            let was_attach = hint.is_some();
+            let cwd = entry.cwd;
+            let env = entry.env;
+            let result = executor
+                .spawn(async move {
+                    // Warm re-attach first; a failed attach (PTY died between
+                    // snapshot and now) falls back to a cold spawn, which
+                    // itself falls back to an in-process PTY when the relay
+                    // is unreachable.
+                    hint.as_deref()
+                        .and_then(attach_pty_existing)
+                        .or_else(|| spawn_local_pty(cwd, env))
+                })
+                .await;
+            let Some((backend, session_id)) = result else {
+                tracing::warn!("attach reconcile: spawn failed; pane stays empty");
+                continue;
+            };
+            let delivered = entry.view.update(cx, |view, cx| {
+                view.adopt_live_session(backend.clone(), session_id, cx)
+            });
+            match delivered {
+                Ok(true) => {
+                    if was_attach {
+                        attached += 1;
+                    } else {
+                        spawned += 1;
+                    }
+                }
+                Ok(false) | Err(_) => {
+                    // View gone (tab closed / quit mid-reconcile) or already
+                    // live. A re-ATTACHED session must be detached, not
+                    // closed: its daemon PTY predates this boot and the user
+                    // expects it to survive (a quit-race capture re-persists
+                    // its hint via `relay_id_for_capture`). A fresh SPAWN was
+                    // never visible — close it so the daemon doesn't
+                    // accumulate orphans. Skipped entirely during app quit
+                    // (mirrors `TerminalView::drop`): the daemon outlives the
+                    // GUI and the next launch re-reconciles. Detached thread:
+                    // either call can block briefly and this loop runs on the
+                    // main thread.
+                    if crate::shell::terminal_view::APP_QUITTING
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        continue;
+                    }
+                    std::thread::spawn(move || {
+                        if let Ok(mut be) = backend.lock() {
+                            let _ = be.drain_events();
+                            if was_attach {
+                                let _ = be.detach(session_id);
+                            } else {
+                                let _ = be.close(session_id);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        tracing::info!(
+            total,
+            attached,
+            spawned,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "post-paint pty attach reconcile done"
+        );
+    })
+    .detach();
 }
 
 pub(crate) fn load_persisted_tabs(
