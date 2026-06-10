@@ -48,6 +48,21 @@ async fn checkpoint_written_on_tick_and_removed_on_close() {
         "meta seeded at spawn so even a pre-tick crash is identifiable"
     );
 
+    // The spawn-seeded meta must carry the live shell child's pid (the
+    // app resolves split-inherit cwd from it kernel-side). Gated: every
+    // Unix target reports a child pid, but a target without process ids
+    // legitimately stores None and must not hard-fail the suite.
+    let meta: oximux_relay::checkpoint::CheckpointMeta =
+        serde_json::from_slice(&std::fs::read(pty_dir.join("meta.json")).expect("read meta"))
+            .expect("parse meta");
+    #[cfg(unix)]
+    assert!(meta.pid.is_some(), "child pid recorded at spawn");
+    #[cfg(target_os = "macos")]
+    assert!(
+        meta.pid.and_then(oximux_proc_cwd::cwd_of_pid).is_some(),
+        "recorded pid must be a live process with a resolvable cwd"
+    );
+
     // The shell prints a prompt to the PTY; once bytes land in the ring
     // a checkpoint pass must persist them.
     wait_until("scrollback checkpoint to appear", || {

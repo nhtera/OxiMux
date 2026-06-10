@@ -40,13 +40,15 @@ const ALT_SCREEN_ON: &[u8] = b"\x1b[?1049h";
 const ALT_SCREEN_OFF: &[u8] = b"\x1b[?1049l";
 
 /// Mirror of the daemon's checkpoint meta. Only the restorability
-/// marker and the recovered cwd are needed here; unknown fields are
-/// ignored.
+/// marker, the recovered cwd, and the child pid are needed here;
+/// unknown fields are ignored.
 #[derive(Deserialize)]
 struct CheckpointMeta {
     #[serde(default)]
     cwd: String,
     ended_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pid: Option<u32>,
 }
 
 /// What a dead PTY left behind, ready to apply to its replacement.
@@ -105,6 +107,26 @@ pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRes
         .then(|| PathBuf::from(meta.cwd))
         .filter(|p| p.is_absolute() && p.is_dir());
     Some(ColdRestore { bytes: out, cwd })
+}
+
+/// The shell child's OS pid for a LIVE daemon PTY, read from the same
+/// checkpoint meta (the daemon seeds it at spawn). The daemon and its
+/// children run on the same host, so the caller can feed this straight
+/// into the kernel cwd lookup — giving daemon-backed panes the same
+/// split-cwd inheritance as in-process ones, with no wire round-trip.
+///
+/// Caveat: if the shell died with the daemon and the pane stayed frozen
+/// long enough for the OS to recycle the pid, the value can point at an
+/// unrelated process — a downstream cwd lookup would then yield a wrong
+/// (but harmless) directory. Dead, un-recycled pids resolve to `None`
+/// downstream, which is the common case.
+pub fn read_checkpoint_pid(checkpoints_dir: &Path, pty_id: &str) -> Option<u32> {
+    if !is_safe_pty_id(pty_id) {
+        return None;
+    }
+    let meta_path = checkpoints_dir.join(pty_id).join("meta.json");
+    let meta: CheckpointMeta = serde_json::from_slice(&std::fs::read(meta_path).ok()?).ok()?;
+    meta.pid
 }
 
 /// Delete a consumed checkpoint so the same crash isn't restored twice.
@@ -277,6 +299,34 @@ mod tests {
             let restore = read_cold_restore(&base, id).expect("scrollback still restorable");
             assert_eq!(restore.cwd, None, "cwd must be dropped for {id}");
         }
+    }
+
+    #[test]
+    fn checkpoint_pid_read_and_backward_compat() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("checkpoints");
+
+        let with_pid = base.join("pty-pid");
+        std::fs::create_dir_all(&with_pid).unwrap();
+        std::fs::write(
+            with_pid.join("meta.json"),
+            br#"{"cwd":"/","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null,"pid":777}"#,
+        )
+        .unwrap();
+        assert_eq!(read_checkpoint_pid(&base, "pty-pid"), Some(777));
+
+        // Meta written by a pre-pid daemon build: field absent → None.
+        let legacy = base.join("pty-legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("meta.json"),
+            br#"{"cwd":"/","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#,
+        )
+        .unwrap();
+        assert_eq!(read_checkpoint_pid(&base, "pty-legacy"), None);
+
+        assert_eq!(read_checkpoint_pid(&base, "../escape"), None);
+        assert_eq!(read_checkpoint_pid(&base, "pty-missing"), None);
     }
 
     #[test]

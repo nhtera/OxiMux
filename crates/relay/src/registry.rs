@@ -220,10 +220,12 @@ impl PtyRegistry {
 
         // Seed the on-disk checkpoint dir up front so even a crash
         // before the first scrollback tick leaves an identifiable
-        // session behind. Best-effort: disk trouble must not block
-        // the spawn.
+        // session behind. The child pid rides along so the app can
+        // resolve the shell's live cwd kernel-side (split inheritance)
+        // without a wire round-trip. Best-effort: disk trouble must
+        // not block the spawn.
         if let Some(store) = &self.checkpoints {
-            if let Err(e) = store.open(&pty_id, &args.cwd, args.cols, args.rows) {
+            if let Err(e) = store.open(&pty_id, &args.cwd, args.cols, args.rows, pid) {
                 tracing::warn!(?e, pty_id, "checkpoint open failed");
             }
         }

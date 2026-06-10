@@ -968,13 +968,23 @@ impl TerminalView {
         });
     }
 
-    /// OS pid of the shell child the backend spawned for this session.
-    /// `None` for remote/relay backends and for already-exited shells.
-    /// Sub-pane split path uses this to query the current shell CWD
-    /// via libproc and inherit it for the new pane.
+    /// OS pid of the shell child driving this session. Sub-pane split
+    /// path uses this to query the current shell CWD via libproc and
+    /// inherit it for the new pane.
+    ///
+    /// In-process backends answer directly. Daemon-backed sessions get
+    /// a fallback: the daemon seeds the child pid into its checkpoint
+    /// meta at spawn, and daemon + child run on the same host as the
+    /// app, so the kernel cwd lookup downstream is just as valid. A
+    /// pre-checkpoint daemon (no meta) or an exited shell yields `None`
+    /// and callers fall back exactly as before.
     pub fn os_pid(&self) -> Option<u32> {
         let id = self.session_id;
-        self.with_backend(|be| be.os_pid(id))
+        self.with_backend(|be| be.os_pid(id)).or_else(|| {
+            let pty_id = self.external_id()?;
+            let dir = crate::relay_cold_restore::default_checkpoints_dir()?;
+            crate::relay_cold_restore::read_checkpoint_pid(&dir, &pty_id)
+        })
     }
 
     /// F4.7: shell-tracked CWD via OSC 7. Returns `None` when the shell

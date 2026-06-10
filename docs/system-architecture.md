@@ -504,6 +504,8 @@ The wire protocol is untouched: the app reads checkpoints straight off disk. Whe
 
 Each checkpoint also refreshes `meta.cwd` with the shell child's **live working directory**, resolved kernel-side from the child pid (`oximux-proc-cwd`, the shared `proc_pidinfo`/`PROC_PIDVNODEPATHINFO` resolver also used for split-pane cwd inheritance) — no OSC 7 cooperation from the shell required. The cold-spawn path revives the replacement shell at that recovered cwd (validated to still exist; falls back to the persisted layout cwd), so a crash puts the user back in the directory they were actually in.
 
+The same meta carries the shell child's **OS pid** (seeded at spawn). Because the daemon and its children run on the same host as the app, `TerminalView::os_pid` falls back to reading it for daemon-backed sessions — giving splits from relay panes (and layout-snapshot cwd capture) the same kernel-true cwd inheritance as in-process panes, again with zero wire-protocol involvement.
+
 This path is distinct from routine restore, which stays replay-free (the no-grid-replay invariant above is unchanged): cold restore trades reflow perfection for not losing the scrollback entirely, and the marker makes clear the content is history, not live state. `prefill_grid` ends with `clear_collected`, so query auto-replies recorded in the crashed session can't reach the new shell's stdin.
 
 ---

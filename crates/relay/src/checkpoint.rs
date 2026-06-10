@@ -25,6 +25,11 @@ use serde::{Deserialize, Serialize};
 /// `None` for as long as the session lives; a clean end removes the
 /// whole directory instead of setting it, so the field doubles as a
 /// safety check for readers (`Some` = not restorable).
+///
+/// `pid` is the shell child's OS pid. The daemon and its children run
+/// on the same host as the app, so the app reads it to resolve the
+/// LIVE working directory kernel-side (split-pane cwd inheritance for
+/// daemon-owned panes) without any wire-protocol involvement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMeta {
     pub cwd: String,
@@ -32,6 +37,8 @@ pub struct CheckpointMeta {
     pub rows: u16,
     pub started_at_epoch_secs: u64,
     pub ended_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 pub struct CheckpointStore {
@@ -50,7 +57,14 @@ impl CheckpointStore {
     /// Create the PTY's checkpoint dir and seed its meta. Called at
     /// spawn so a crash before the first scrollback tick still leaves
     /// an identifiable (if empty) session on disk.
-    pub fn open(&self, pty_id: &str, cwd: &Path, cols: u16, rows: u16) -> Result<()> {
+    pub fn open(
+        &self,
+        pty_id: &str,
+        cwd: &Path,
+        cols: u16,
+        rows: u16,
+        pid: Option<u32>,
+    ) -> Result<()> {
         let dir = self.dir_for(pty_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let meta = CheckpointMeta {
@@ -59,6 +73,7 @@ impl CheckpointStore {
             rows,
             started_at_epoch_secs: epoch_secs(),
             ended_at_epoch_secs: None,
+            pid,
         };
         write_atomic(&dir.join("meta.json"), &serde_json::to_vec(&meta)?)
     }
@@ -88,6 +103,7 @@ impl CheckpointStore {
                 rows,
                 started_at_epoch_secs: epoch_secs(),
                 ended_at_epoch_secs: None,
+                pid: None,
             });
         meta.cols = cols;
         meta.rows = rows;
@@ -174,7 +190,7 @@ mod tests {
     fn open_write_read_roundtrip() {
         let (_guard, store) = store();
         store
-            .open("pty-a", Path::new("/tmp/work"), 80, 24)
+            .open("pty-a", Path::new("/tmp/work"), 80, 24, Some(4242))
             .expect("open");
         store
             .write_scrollback("pty-a", b"hello scrollback", 120, 40, None)
@@ -189,6 +205,8 @@ mod tests {
         // write_scrollback refreshed the dims to the latest effective size.
         assert_eq!((meta.cols, meta.rows), (120, 40));
         assert_eq!(meta.ended_at_epoch_secs, None);
+        // The spawn-time child pid survives scrollback rewrites.
+        assert_eq!(meta.pid, Some(4242));
         assert_eq!(
             std::fs::read(dir.join("scrollback.bin")).expect("scrollback"),
             b"hello scrollback"
@@ -222,7 +240,7 @@ mod tests {
     fn remove_is_idempotent() {
         let (_guard, store) = store();
         store
-            .open("pty-c", Path::new("/"), 80, 24)
+            .open("pty-c", Path::new("/"), 80, 24, Some(4242))
             .expect("open");
         store.remove("pty-c").expect("first remove");
         store.remove("pty-c").expect("second remove is a no-op");
@@ -233,10 +251,10 @@ mod tests {
     fn gc_removes_only_old_dirs() {
         let (_guard, store) = store();
         store
-            .open("pty-fresh", Path::new("/"), 80, 24)
+            .open("pty-fresh", Path::new("/"), 80, 24, Some(4242))
             .expect("open");
         store
-            .open("pty-stale", Path::new("/"), 80, 24)
+            .open("pty-stale", Path::new("/"), 80, 24, Some(4242))
             .expect("open");
         // Backdate the stale dir's meta mtime well past the cutoff.
         let stale_meta = store.dir_for("pty-stale").join("meta.json");
