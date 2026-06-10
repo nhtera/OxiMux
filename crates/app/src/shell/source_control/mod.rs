@@ -52,8 +52,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled,
-    Subscription, Window, div, px,
+    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Render, Styled, Subscription, Window, div, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use oximux_core::GitState;
@@ -1386,6 +1386,7 @@ impl Render for SourceControlPanel {
             div()
                 .absolute()
                 .inset_0()
+                .occlude()
                 .flex()
                 .flex_col()
                 .items_center()

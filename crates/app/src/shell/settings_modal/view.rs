@@ -252,6 +252,7 @@ impl Render for SettingsModal {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _window, cx| this.close(cx)),

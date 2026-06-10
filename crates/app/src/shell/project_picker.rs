@@ -307,6 +307,7 @@ impl Render for ProjectPickerModal {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .flex_col()
             .items_center()

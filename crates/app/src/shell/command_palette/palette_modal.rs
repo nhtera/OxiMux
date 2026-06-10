@@ -88,6 +88,7 @@ pub fn build_modal_layout(input: ModalRenderInput<'_>) -> gpui::Div {
     div()
         .absolute()
         .inset_0()
+        .occlude()
         .flex()
         .flex_col()
         .items_center()

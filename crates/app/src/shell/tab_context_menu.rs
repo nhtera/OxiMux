@@ -477,6 +477,7 @@ impl Render for TabContextMenu {
             .absolute()
             .inset_0()
             .size_full()
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {

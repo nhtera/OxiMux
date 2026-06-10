@@ -1355,6 +1355,7 @@ fn render_mru_hud(
     div()
         .absolute()
         .inset_0()
+        .occlude()
         .flex()
         .items_start()
         .justify_center()

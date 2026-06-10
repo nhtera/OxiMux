@@ -22,7 +22,9 @@ use gpui::{
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
     Styled, Subscription, Window, div, px,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{
+    Enter as InputEnter, Escape as InputEscape, Input, InputEvent, InputState, MoveDown, MoveUp,
+};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::ui::FloatingSurface;
@@ -320,7 +322,11 @@ impl BranchPicker {
         self.query_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.query.clear();
-        window.focus(&self.focus_handle, cx);
+        // Focus the filter INPUT, not the card: typing must land in the
+        // input, and the card's `on_key_down` still sees arrows/Enter/
+        // Escape on the bubble path (same contract as `confirm_dialog`).
+        let input_focus = self.query_input.read(cx).focus_handle(cx);
+        window.focus(&input_focus, cx);
         cx.notify();
     }
 
@@ -403,10 +409,38 @@ impl Render for BranchPicker {
             .floating_chrome(&theme, &density)
             .shadow_lg()
             .track_focus(&self.focus_handle)
-            // Capture arrows / Enter / Escape at the bubble phase. The
-            // `Input` widget below handles text + backspace and lets
-            // navigation keys pass through to this handler — same
-            // pattern documented in `confirm_dialog::on_key_down`.
+            // Keyboard plumbing. The focused `Input` converts nav keys into
+            // its own ACTIONS before raw key listeners on ancestors run, so
+            // `on_key_down` alone never hears them while the input is
+            // focused:
+            //   - Escape / Enter: the single-line input propagates these
+            //     actions → handle them at the bubble phase.
+            //   - Up / Down: the input swallows them (no propagate) →
+            //     intercept at the CAPTURE phase and stop propagation.
+            // The raw `on_key_down` stays for the no-input focus path
+            // (e.g. focus on the card handle after a row click).
+            // Known trade-off: capturing Escape preempts the input's own
+            // IME-unmark path, so Escape mid-IME-composition closes the
+            // picker instead of cancelling the composition. Accepted: the
+            // bubble-phase alternative never receives the action in
+            // practice (verified live), and a closed picker beats dead
+            // keys for the common case.
+            .capture_action(cx.listener(|this, _: &InputEscape, _window, cx| {
+                cx.stop_propagation();
+                this.close(cx);
+            }))
+            .capture_action(cx.listener(|this, _: &InputEnter, window, cx| {
+                cx.stop_propagation();
+                this.confirm(window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &MoveUp, _window, cx| {
+                cx.stop_propagation();
+                this.move_selection(-1, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, _window, cx| {
+                cx.stop_propagation();
+                this.move_selection(1, cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "down" => this.move_selection(1, cx),
@@ -449,6 +483,10 @@ impl Render for BranchPicker {
             .absolute()
             .inset_0()
             .size_full()
+            // Occlusion is load-bearing: without it GPUI hover hit-testing
+            // passes through the dismiss layer and rows underneath keep
+            // reacting (hover tint + revealed actions) while the picker is open.
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {

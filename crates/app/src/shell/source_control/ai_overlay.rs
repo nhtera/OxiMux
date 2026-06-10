@@ -24,8 +24,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, ClickEvent, IntoElement, ParentElement, Styled, Transformation,
-    Window, div, ease_in_out, percentage, px,
+    Animation, AnimationExt, ClickEvent, InteractiveElement, IntoElement, ParentElement, Styled,
+    Transformation, Window, div, ease_in_out, percentage, px,
 };
 use gpui_component::{
     Icon, Sizable as _,
@@ -102,6 +102,7 @@ where
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .flex_row()
             .items_center()
