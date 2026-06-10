@@ -265,7 +265,7 @@ fn build_header(
         .px(px(6.0))
         .py(px(1.0))
         .rounded(px(density.r_xs))
-        .bg(theme.bg_panel_alt)
+        .bg(theme.bg_overlay)
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_subtle)
         .child(plan.workspace_count.to_string());

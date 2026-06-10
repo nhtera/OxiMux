@@ -69,7 +69,7 @@ pub(super) fn render_task_row(
     let state = chip(
         item.state.to_ascii_lowercase(),
         state_color(&item.state, theme),
-        theme.bg_panel_alt,
+        theme.bg_overlay,
         density,
         typography,
     );
@@ -114,7 +114,7 @@ pub(super) fn render_task_row(
         left = left.child(chip(
             label.name.clone(),
             theme.fg_muted,
-            theme.bg_panel_alt,
+            theme.bg_overlay,
             density,
             typography,
         ));
@@ -165,7 +165,7 @@ fn open_action(url: String, theme: Theme, density: Density, typography: &Typogra
         .flex_none()
         .px(px(5.0))
         .rounded(px(density.r_chip))
-        .bg(theme.bg_panel_alt)
+        .bg(theme.bg_overlay)
         .text_size(px(typography.t_label_xs))
         .text_color(theme.fg_muted)
         .cursor_pointer()
@@ -191,7 +191,7 @@ fn create_action(
         .flex_none()
         .px(px(5.0))
         .rounded(px(density.r_chip))
-        .bg(theme.bg_panel_alt)
+        .bg(theme.bg_overlay)
         .text_size(px(typography.t_label_xs))
         .text_color(theme.fg_base)
         .cursor_pointer()

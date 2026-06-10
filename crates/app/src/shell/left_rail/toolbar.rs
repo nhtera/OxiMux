@@ -25,7 +25,7 @@ pub fn render_toolbar(theme: Theme, density: Density, typography: &Typography) -
         .gap(px(density.gap_inline))
         .border_t_1()
         .border_color(theme.border_inactive)
-        .bg(theme.bg_panel)
+        .bg(theme.bg_rail)
         .child(add_project_button(theme, density, typography))
         .child(div().flex_1())
         .child(settings_icon(theme))

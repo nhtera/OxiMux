@@ -382,7 +382,7 @@ impl Render for LeftRail {
             .h_full()
             .flex_1()
             .min_w_0()
-            .bg(theme.bg_panel)
+            .bg(theme.bg_rail)
             .child(render_nav_section(
                 self.active_nav,
                 &entity,

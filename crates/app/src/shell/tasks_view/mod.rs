@@ -181,10 +181,13 @@ impl TasksView {
         cx: &mut Context<Self>,
         handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> AnyElement {
+        // One tier above the rail surface when active; inactive chips sit
+        // as a faint ghost just under it (the rail lift re-leveled this
+        // view's host background).
         let (fg, bg) = if active {
-            (self.theme.fg_base, self.theme.bg_panel_alt)
+            (self.theme.fg_base, self.theme.bg_overlay)
         } else {
-            (self.theme.fg_muted, self.theme.bg_panel)
+            (self.theme.fg_muted, self.theme.bg_panel_alt)
         };
         div()
             .flex_none()

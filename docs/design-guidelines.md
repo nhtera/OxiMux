@@ -33,7 +33,8 @@ in the UI. This keeps the eye on the diff, terminal, and agent output — not ch
 | `bg_base` | `#0E0F11` | Window background, dock empty area |
 | `bg_panel` | `#15171A` | Sidebar, status bar, panel backgrounds |
 | `bg_panel_alt` | `#1B1E22` | Selected row, nested panel (persistent fills — transient hover moved to `hover_overlay`) |
-| `bg_overlay` | `#22262B` | Tooltip, popover, command palette, context menu |
+| `bg_overlay` | `#22262B` | Tooltip, popover, command palette, context menu; ALSO the raised/active fill on the lifted rail (`bg_panel_alt` sits below `bg_rail` and would read pressed-in there) |
+| `bg_rail` | `#1D2024` | Left-rail surface — deliberately lighter than `bg_panel` so the rail reads as a raised slab beside the near-black content canvas. Rail-scoped: do NOT re-level `bg_panel`, the global panel < panel_alt < overlay ladder depends on it |
 | `fg_base` | `#E6E8EB` | Body text |
 | `fg_muted` | `#9AA0A6` | Labels, secondary text, inactive tabs |
 | `fg_subtle` | `#6B7177` | Disabled, placeholder, gutter numbers, chevrons |
@@ -124,7 +125,8 @@ for a new hex value.
 | Role | Token | Where it lands |
 |---|---|---|
 | Canvas | `bg_base` | Window background only |
-| Panel surface | `bg_panel` | Sidebar, file tree, SCM panel, status bar |
+| Panel surface | `bg_panel` | File tree, SCM panel, status bar, chrome strips |
+| Rail surface (lifted) | `bg_rail` | Left rail only — header strip, nav rows, list, toolbar; its raised/active fills use `bg_overlay` |
 | Raised (persistent) | `bg_panel_alt` | Alternating rows, selected row, nested panel fills |
 | Hover (transient) | `hover_overlay` | Row/card/menu-item hover on every surface tier |
 | Floating surface | `bg_overlay` | Pickers, context menus, dialogs |

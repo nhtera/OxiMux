@@ -55,9 +55,11 @@ impl NavItem {
 /// body is showing, so no nav row is highlighted. Pure — unit-testable.
 pub fn nav_row_bg(item: NavItem, active: Option<NavItem>, theme: Theme) -> Hsla {
     if active == Some(item) {
-        theme.bg_panel_alt
+        // One tier above the rail surface — `bg_panel_alt` sits below
+        // `bg_rail` and would read pressed-in instead of lit.
+        theme.bg_overlay
     } else {
-        theme.bg_panel
+        theme.bg_rail
     }
 }
 
@@ -139,20 +141,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_tasks_returns_bg_panel_alt() {
+    fn active_tasks_returns_bg_overlay() {
         let t = Theme::charcoal();
         assert_eq!(
             nav_row_bg(NavItem::Tasks, Some(NavItem::Tasks), t),
-            t.bg_panel_alt
+            t.bg_overlay
         );
     }
 
     #[test]
-    fn inactive_tasks_returns_bg_panel() {
+    fn inactive_tasks_returns_bg_rail() {
         let t = Theme::charcoal();
         assert_eq!(
             nav_row_bg(NavItem::Tasks, Some(NavItem::Agents), t),
-            t.bg_panel
+            t.bg_rail
         );
     }
 
@@ -160,43 +162,43 @@ mod tests {
     fn home_state_highlights_no_row() {
         // active == None => home (workspace list) showing, nothing highlighted.
         let t = Theme::charcoal();
-        assert_eq!(nav_row_bg(NavItem::Tasks, None, t), t.bg_panel);
+        assert_eq!(nav_row_bg(NavItem::Tasks, None, t), t.bg_rail);
         assert_eq!(nav_row_fg(NavItem::Tasks, None, t), t.fg_muted);
     }
 
     #[test]
-    fn active_automations_returns_bg_panel_alt() {
+    fn active_automations_returns_bg_overlay() {
         let t = Theme::charcoal();
         assert_eq!(
             nav_row_bg(NavItem::Automations, Some(NavItem::Automations), t),
-            t.bg_panel_alt
+            t.bg_overlay
         );
     }
 
     #[test]
-    fn active_agents_returns_bg_panel_alt() {
+    fn active_agents_returns_bg_overlay() {
         let t = Theme::charcoal();
         assert_eq!(
             nav_row_bg(NavItem::Agents, Some(NavItem::Agents), t),
-            t.bg_panel_alt
+            t.bg_overlay
         );
     }
 
     #[test]
-    fn active_search_returns_bg_panel_alt() {
+    fn active_search_returns_bg_overlay() {
         let t = Theme::charcoal();
         assert_eq!(
             nav_row_bg(NavItem::Search, Some(NavItem::Search), t),
-            t.bg_panel_alt
+            t.bg_overlay
         );
     }
 
     #[test]
-    fn inactive_search_returns_bg_panel() {
+    fn inactive_search_returns_bg_rail() {
         let t = Theme::charcoal();
         assert_eq!(
             nav_row_bg(NavItem::Search, Some(NavItem::Tasks), t),
-            t.bg_panel
+            t.bg_rail
         );
     }
 

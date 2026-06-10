@@ -15,6 +15,15 @@ pub struct Theme {
     pub bg_panel_alt: Hsla,
     pub bg_overlay: Hsla,
 
+    /// Left-rail surface — deliberately LIGHTER than `bg_panel` so the
+    /// rail reads as a raised, intentional slab beside the near-black
+    /// content canvas (terminal/diff). Without the lift, the rail's
+    /// empty tail under the project list reads as dead space instead of
+    /// surface. Rail-scoped on purpose: re-leveling `bg_panel` itself
+    /// would flatten the global panel < panel_alt < overlay ladder that
+    /// every other surface depends on.
+    pub bg_rail: Hsla,
+
     // Foregrounds
     pub fg_base: Hsla,
     pub fg_muted: Hsla,
@@ -96,6 +105,11 @@ impl Theme {
             bg_panel: rgb(0x15171A).into(),
             bg_panel_alt: rgb(0x1B1E22).into(),
             bg_overlay: rgb(0x22262B).into(),
+
+            // Between `bg_panel_alt` and `bg_overlay`: high enough to
+            // clearly separate from the content canvas, low enough that
+            // overlay cards still float above it.
+            bg_rail: rgb(0x1D2024).into(),
 
             fg_base: rgb(0xE6E8EB).into(),
             fg_muted: rgb(0x9AA0A6).into(),

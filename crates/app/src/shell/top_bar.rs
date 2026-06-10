@@ -40,7 +40,11 @@ const ICON_SIZE: f32 = 16.0;
 /// draws macOS traffic lights centered at y=19 over the
 /// `TRAFFIC_LIGHT_GUTTER`, so the two visually align on a single row.
 pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
-    chrome_strip(theme, density, true).child(left_chrome_cluster(true, theme, typography))
+    // The left column's header sits on the lifted rail surface — match it
+    // so the rail reads as one continuous slab from titlebar to toolbar.
+    chrome_strip(theme, density, true)
+        .bg(theme.bg_rail)
+        .child(left_chrome_cluster(true, theme, typography))
 }
 
 /// Header strip for the center column. Hosts any chrome bits whose

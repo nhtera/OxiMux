@@ -148,9 +148,9 @@ pub fn build_workspace_row_plan(
         .unwrap_or_else(|| "(detached)".to_string());
 
     let (bg, fg, icon) = if is_active {
-        (theme.bg_panel_alt, theme.fg_base, theme.fg_base)
+        (theme.bg_overlay, theme.fg_base, theme.fg_base)
     } else {
-        (theme.bg_panel, theme.fg_base, theme.fg_muted)
+        (theme.bg_rail, theme.fg_base, theme.fg_muted)
     };
 
     WorkspaceRowPlan {
@@ -260,18 +260,18 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_active_uses_bg_panel_alt() {
+    fn build_plan_active_uses_bg_overlay() {
         let t = Theme::charcoal();
         let plan = build_workspace_row_plan(&info("/tmp/x", Some("main"), true), true, t);
-        assert_eq!(plan.bg, t.bg_panel_alt);
+        assert_eq!(plan.bg, t.bg_overlay);
         assert_eq!(plan.folder_icon_color, t.fg_base);
     }
 
     #[test]
-    fn build_plan_inactive_uses_bg_panel() {
+    fn build_plan_inactive_uses_bg_rail() {
         let t = Theme::charcoal();
         let plan = build_workspace_row_plan(&info("/tmp/x", Some("main"), true), false, t);
-        assert_eq!(plan.bg, t.bg_panel);
+        assert_eq!(plan.bg, t.bg_rail);
         assert_eq!(plan.folder_icon_color, t.fg_muted);
     }
 

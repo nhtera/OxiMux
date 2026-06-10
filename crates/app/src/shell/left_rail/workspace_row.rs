@@ -142,12 +142,14 @@ pub fn build_workspace_row_plan(
     theme: Theme,
 ) -> WorkspaceRowPlan {
     let dot_color = status_dot_color(latest_status, is_live, theme);
-    // Active rows become an inset card (lighter panel surface); inactive
-    // rows sit flat on the rail background and only lift on hover.
+    // Active rows become an inset card raised one tier above the rail
+    // (`bg_overlay` — `bg_panel_alt` sits BELOW `bg_rail` and would read
+    // pressed-in); inactive rows sit flat on the rail surface and only
+    // lift on hover.
     let (bg, fg) = if is_active {
-        (theme.bg_panel_alt, theme.fg_base)
+        (theme.bg_overlay, theme.fg_base)
     } else {
-        (theme.bg_panel, theme.fg_base)
+        (theme.bg_rail, theme.fg_base)
     };
     WorkspaceRowPlan {
         name: workspace.name.clone(),
@@ -287,7 +289,7 @@ pub fn render_workspace_row(
             .px(px(5.0))
             .h(px(15.0))
             .rounded(px(density.r_xs))
-            .bg(theme.bg_panel_alt)
+            .bg(theme.bg_overlay)
             .text_size(px(typography.t_sub_label))
             .text_color(theme.fg_subtle)
             .child("Folder")
@@ -498,21 +500,21 @@ mod tests {
     // ── WorkspaceRowPlan ──────────────────────────────────────────────────────
 
     #[test]
-    fn row_plan_active_uses_panel_alt_bg() {
+    fn row_plan_active_uses_overlay_bg() {
         let t = Theme::charcoal();
         let w = ws("Fix Login", "fix-login");
         let plan = build_workspace_row_plan(&w, true, false, false, false, None, t);
-        assert_eq!(plan.bg, t.bg_panel_alt);
+        assert_eq!(plan.bg, t.bg_overlay);
         assert_eq!(plan.fg, t.fg_base);
         assert!(plan.is_active);
     }
 
     #[test]
-    fn row_plan_inactive_uses_panel_bg() {
+    fn row_plan_inactive_uses_rail_bg() {
         let t = Theme::charcoal();
         let w = ws("Fix Login", "fix-login");
         let plan = build_workspace_row_plan(&w, false, false, false, false, None, t);
-        assert_eq!(plan.bg, t.bg_panel);
+        assert_eq!(plan.bg, t.bg_rail);
         assert!(!plan.is_active);
     }
 
@@ -664,11 +666,11 @@ mod tests {
     }
 
     #[test]
-    fn card_plan_active_variant_uses_panel_alt_bg() {
+    fn card_plan_active_variant_uses_overlay_bg() {
         let t = Theme::charcoal();
         let w = ws("Active", "active");
         let plan = build_workspace_card_plan(&w, true, false, false, false, None, None, t);
-        assert_eq!(plan.row.bg, t.bg_panel_alt);
+        assert_eq!(plan.row.bg, t.bg_overlay);
         assert!(plan.row.is_active);
     }
 
