@@ -425,7 +425,12 @@ impl PtyRegistry {
             let bytes = e.ring.lock().expect("ring poisoned").snapshot();
             let cols = *e.cols.lock().expect("cols poisoned");
             let rows = *e.rows.lock().expect("rows poisoned");
-            match store.write_scrollback(&e.pty_id, &bytes, cols, rows) {
+            // Live cwd straight from the kernel (one proc_pidinfo per
+            // ACTIVE pty per tick) — shells don't reliably announce cwd
+            // changes in-band, and the cold-restore consumer wants the
+            // directory the user was actually in when the daemon died.
+            let live_cwd = e.pid.and_then(oximux_proc_cwd::cwd_of_pid);
+            match store.write_scrollback(&e.pty_id, &bytes, cols, rows, live_cwd.as_deref()) {
                 // Store the pre-snapshot counter: output that landed
                 // mid-write is picked up by the next pass.
                 Ok(()) => e.checkpointed_bytes_out.store(seen, Ordering::Relaxed),

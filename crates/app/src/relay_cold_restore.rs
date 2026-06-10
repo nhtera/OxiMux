@@ -40,10 +40,25 @@ const ALT_SCREEN_ON: &[u8] = b"\x1b[?1049h";
 const ALT_SCREEN_OFF: &[u8] = b"\x1b[?1049l";
 
 /// Mirror of the daemon's checkpoint meta. Only the restorability
-/// marker is needed here; unknown fields are ignored.
+/// marker and the recovered cwd are needed here; unknown fields are
+/// ignored.
 #[derive(Deserialize)]
 struct CheckpointMeta {
+    #[serde(default)]
+    cwd: String,
     ended_at_epoch_secs: Option<u64>,
+}
+
+/// What a dead PTY left behind, ready to apply to its replacement.
+pub struct ColdRestore {
+    /// Composed prefill payload: clear screen + recovered scrollback +
+    /// restored marker + mode reset.
+    pub bytes: Vec<u8>,
+    /// The shell child's last known working directory (live-resolved by
+    /// the daemon at checkpoint time). `None` when the meta carried no
+    /// cwd or the directory no longer exists — the caller then spawns
+    /// at its own fallback cwd.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Where the daemon keeps its checkpoints: `<runtime dir>/checkpoints`,
@@ -53,10 +68,10 @@ pub fn default_checkpoints_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("dev.nhtera.oximux").join("checkpoints"))
 }
 
-/// Read and compose the cold-restore prefill bytes for a dead PTY id.
-/// Returns `None` when there is nothing (or nothing safe) to restore —
-/// the pane then comes up as a plain fresh spawn, exactly like today.
-pub fn read_cold_restore_bytes(checkpoints_dir: &Path, pty_id: &str) -> Option<Vec<u8>> {
+/// Read and compose the cold restore for a dead PTY id. Returns `None`
+/// when there is nothing (or nothing safe) to restore — the pane then
+/// comes up as a plain fresh spawn, exactly like today.
+pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRestore> {
     if !is_safe_pty_id(pty_id) {
         return None;
     }
@@ -83,7 +98,13 @@ pub fn read_cold_restore_bytes(checkpoints_dir: &Path, pty_id: &str) -> Option<V
     out.extend_from_slice(usable);
     out.extend_from_slice(RESTORED_MARKER);
     out.extend_from_slice(MODE_RESET);
-    Some(out)
+    // The recovered cwd must still exist (the directory may have been a
+    // worktree or temp path deleted since the crash) — a fresh shell
+    // spawned into a missing dir fails outright on some shells.
+    let cwd = (!meta.cwd.is_empty())
+        .then(|| PathBuf::from(meta.cwd))
+        .filter(|p| p.is_absolute() && p.is_dir());
+    Some(ColdRestore { bytes: out, cwd })
 }
 
 /// Delete a consumed checkpoint so the same crash isn't restored twice.
@@ -219,18 +240,43 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("scrollback.bin"), b"recovered output").unwrap();
 
-        let bytes = read_cold_restore_bytes(&base, "pty-1").expect("restorable");
-        let s = String::from_utf8_lossy(&bytes);
+        let restore = read_cold_restore(&base, "pty-1").expect("restorable");
+        let s = String::from_utf8_lossy(&restore.bytes);
         assert!(s.contains("recovered output"));
         assert!(s.contains("--- session restored ---"));
         assert!(s.starts_with("\x1b[2J"), "clears before replaying");
+        assert_eq!(restore.cwd.as_deref(), Some(Path::new("/")));
 
         consume_checkpoint(&base, "pty-1");
         assert!(!dir.exists(), "consumed checkpoint removed");
         assert!(
-            read_cold_restore_bytes(&base, "pty-1").is_none(),
+            read_cold_restore(&base, "pty-1").is_none(),
             "second read finds nothing"
         );
+    }
+
+    #[test]
+    fn recovered_cwd_dropped_when_missing_or_relative() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("checkpoints");
+        for (id, cwd) in [
+            ("pty-gone", "/nonexistent-dir-for-cold-restore-test"),
+            ("pty-rel", "relative/dir"),
+            ("pty-none", ""),
+        ] {
+            let dir = base.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"cwd":"{cwd}","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("scrollback.bin"), b"bytes").unwrap();
+            let restore = read_cold_restore(&base, id).expect("scrollback still restorable");
+            assert_eq!(restore.cwd, None, "cwd must be dropped for {id}");
+        }
     }
 
     #[test]
@@ -245,7 +291,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(ended.join("scrollback.bin"), b"bytes").unwrap();
-        assert!(read_cold_restore_bytes(&base, "pty-ended").is_none());
+        assert!(read_cold_restore(&base, "pty-ended").is_none());
 
         let empty = base.join("pty-empty");
         std::fs::create_dir_all(&empty).unwrap();
@@ -255,6 +301,6 @@ mod tests {
         )
         .unwrap();
         std::fs::write(empty.join("scrollback.bin"), b"").unwrap();
-        assert!(read_cold_restore_bytes(&base, "pty-empty").is_none());
+        assert!(read_cold_restore(&base, "pty-empty").is_none());
     }
 }

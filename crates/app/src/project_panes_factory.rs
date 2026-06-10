@@ -978,12 +978,20 @@ pub(crate) fn spawn_attach_reconcile(
                     // scrollback here (disk I/O stays off the main thread).
                     let cold = match (&ckpt_dir, raw_hint.as_deref()) {
                         (Some(dir), Some(id)) => {
-                            crate::relay_cold_restore::read_cold_restore_bytes(dir, id)
-                                .map(|bytes| (bytes, id.to_owned()))
+                            crate::relay_cold_restore::read_cold_restore(dir, id)
+                                .map(|restore| (restore, id.to_owned()))
                         }
                         _ => None,
                     };
-                    spawn_local_pty(cwd, env).map(|session| (session, cold))
+                    // The checkpoint's cwd is the dead shell's LIVE working
+                    // directory (kernel-resolved by the daemon each tick) —
+                    // fresher than the persisted layout cwd, so the revived
+                    // shell lands where the user actually was.
+                    let spawn_cwd = cold
+                        .as_ref()
+                        .and_then(|(restore, _)| restore.cwd.clone())
+                        .unwrap_or(cwd);
+                    spawn_local_pty(spawn_cwd, env).map(|session| (session, cold))
                 })
                 .await;
             let Some(((backend, session_id), cold)) = result else {
@@ -993,11 +1001,11 @@ pub(crate) fn spawn_attach_reconcile(
             let delivered = entry.view.update(cx, |view, cx| {
                 let adopted = view.adopt_live_session(backend.clone(), session_id, cx);
                 if adopted {
-                    if let Some((bytes, _)) = &cold {
+                    if let Some((restore, _)) = &cold {
                         // Prefill BEFORE the first poll tick drains the fresh
                         // shell's prompt: recovered history paints first, the
                         // live prompt then appends below the restored marker.
-                        view.prefill_grid(bytes);
+                        view.prefill_grid(&restore.bytes);
                     }
                 }
                 adopted

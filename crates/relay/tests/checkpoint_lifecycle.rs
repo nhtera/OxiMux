@@ -76,6 +76,52 @@ async fn checkpoint_written_on_tick_and_removed_on_close() {
     wait_until("checkpoint dir removal after close", || !pty_dir.exists()).await;
 }
 
+/// The checkpoint meta must track the shell child's LIVE working
+/// directory (kernel-resolved each tick), not the spawn-time cwd —
+/// that's what lets a cold restore revive the user where they actually
+/// were. macOS-only: the cwd resolver returns None elsewhere.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn checkpoint_meta_tracks_live_shell_cwd() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("checkpoints");
+    let store = Arc::new(CheckpointStore::new(base.clone()));
+    let registry = PtyRegistry::with_checkpoints(Some(store));
+
+    let target = TempDir::new().expect("target dir");
+    // The kernel reports the canonical path (tempdirs sit behind a
+    // /var → /private/var symlink), so compare canonicalized.
+    let want = target
+        .path()
+        .canonicalize()
+        .expect("canonicalize target")
+        .to_string_lossy()
+        .into_owned();
+
+    let pty_id = registry.spawn(spawn_args()).expect("spawn");
+    let meta_path = base.join(&pty_id).join("meta.json");
+    registry
+        .write(&pty_id, format!("cd '{}'\n", target.path().display()).as_bytes())
+        .expect("write cd");
+
+    wait_until("checkpoint meta to pick up the live cwd", || {
+        registry.checkpoint_all();
+        std::fs::read(&meta_path)
+            .ok()
+            .and_then(|raw| {
+                serde_json::from_slice::<oximux_relay::checkpoint::CheckpointMeta>(&raw).ok()
+            })
+            .map(|meta| meta.cwd == want)
+            .unwrap_or(false)
+    })
+    .await;
+
+    registry
+        .close(&pty_id, Duration::from_millis(500))
+        .await
+        .expect("close");
+}
+
 #[tokio::test]
 async fn natural_shell_exit_removes_checkpoint() {
     let dir = TempDir::new().expect("tempdir");

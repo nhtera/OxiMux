@@ -65,8 +65,18 @@ impl CheckpointStore {
 
     /// Persist one ring snapshot. Refreshes the meta's grid dims to the
     /// PTY's current effective size so the consumer replays at the
-    /// geometry the bytes were produced for.
-    pub fn write_scrollback(&self, pty_id: &str, bytes: &[u8], cols: u16, rows: u16) -> Result<()> {
+    /// geometry the bytes were produced for, and — when the caller could
+    /// resolve it — the shell child's LIVE working directory, so a cold
+    /// restore revives the replacement shell where the user actually
+    /// was, not where the session started.
+    pub fn write_scrollback(
+        &self,
+        pty_id: &str,
+        bytes: &[u8],
+        cols: u16,
+        rows: u16,
+        live_cwd: Option<&Path>,
+    ) -> Result<()> {
         let dir = self.dir_for(pty_id);
         let meta_path = dir.join("meta.json");
         let mut meta: CheckpointMeta = std::fs::read(&meta_path)
@@ -81,6 +91,9 @@ impl CheckpointStore {
             });
         meta.cols = cols;
         meta.rows = rows;
+        if let Some(cwd) = live_cwd {
+            meta.cwd = cwd.to_string_lossy().into_owned();
+        }
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         write_atomic(&dir.join("scrollback.bin"), bytes)?;
         write_atomic(&meta_path, &serde_json::to_vec(&meta)?)
@@ -164,13 +177,14 @@ mod tests {
             .open("pty-a", Path::new("/tmp/work"), 80, 24)
             .expect("open");
         store
-            .write_scrollback("pty-a", b"hello scrollback", 120, 40)
+            .write_scrollback("pty-a", b"hello scrollback", 120, 40, None)
             .expect("write");
 
         let dir = store.dir_for("pty-a");
         let meta: CheckpointMeta =
             serde_json::from_slice(&std::fs::read(dir.join("meta.json")).expect("meta"))
                 .expect("parse meta");
+        // No live cwd resolved → the spawn-time cwd is retained.
         assert_eq!(meta.cwd, "/tmp/work");
         // write_scrollback refreshed the dims to the latest effective size.
         assert_eq!((meta.cols, meta.rows), (120, 40));
@@ -179,13 +193,23 @@ mod tests {
             std::fs::read(dir.join("scrollback.bin")).expect("scrollback"),
             b"hello scrollback"
         );
+
+        // A resolved live cwd supersedes the spawn-time cwd: the user
+        // cd'd somewhere and a cold restore should revive them there.
+        store
+            .write_scrollback("pty-a", b"more", 120, 40, Some(Path::new("/tmp/elsewhere")))
+            .expect("write with live cwd");
+        let meta: CheckpointMeta =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).expect("meta"))
+                .expect("parse meta");
+        assert_eq!(meta.cwd, "/tmp/elsewhere");
     }
 
     #[test]
     fn write_without_open_seeds_meta() {
         let (_guard, store) = store();
         store
-            .write_scrollback("pty-b", b"orphan bytes", 100, 30)
+            .write_scrollback("pty-b", b"orphan bytes", 100, 30, None)
             .expect("write");
         let dir = store.dir_for("pty-b");
         let meta: CheckpointMeta =

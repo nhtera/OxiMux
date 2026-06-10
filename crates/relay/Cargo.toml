@@ -15,6 +15,7 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+oximux-proc-cwd = { workspace = true }
 oximux-relay-proto = { workspace = true }
 anyhow = { workspace = true }
 dashmap = { workspace = true }

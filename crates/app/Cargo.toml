@@ -16,6 +16,7 @@ oximux-agents = { workspace = true }
 oximux-core = { workspace = true }
 oximux-editor = { workspace = true }
 oximux-git = { workspace = true }
+oximux-proc-cwd = { workspace = true }
 oximux-pty = { workspace = true }
 oximux-relay-client = { workspace = true }
 oximux-relay-proto = { workspace = true }

@@ -502,6 +502,8 @@ The relay daemon checkpoints each PTY's replay ring to `<runtime dir>/checkpoint
 
 The wire protocol is untouched: the app reads checkpoints straight off disk. When the reconcile's warm attach fails and a slot cold-spawns, the background executor looks up the raw persisted hint's checkpoint and, after `adopt_live_session`, prefills the pane grid with: clear screen → alt-screen-truncated scrollback tail (≤ 512 KiB) → dim `--- session restored ---` marker → terminal mode reset (`relay_cold_restore.rs`). The checkpoint is deleted only after successful delivery, so a quit mid-reconcile can still restore on the next launch; orphans fall to the daemon's 7-day boot GC.
 
+Each checkpoint also refreshes `meta.cwd` with the shell child's **live working directory**, resolved kernel-side from the child pid (`oximux-proc-cwd`, the shared `proc_pidinfo`/`PROC_PIDVNODEPATHINFO` resolver also used for split-pane cwd inheritance) — no OSC 7 cooperation from the shell required. The cold-spawn path revives the replacement shell at that recovered cwd (validated to still exist; falls back to the persisted layout cwd), so a crash puts the user back in the directory they were actually in.
+
 This path is distinct from routine restore, which stays replay-free (the no-grid-replay invariant above is unchanged): cold restore trades reflow perfection for not losing the scrollback entirely, and the marker makes clear the content is history, not live state. `prefill_grid` ends with `clear_collected`, so query auto-replies recorded in the crashed session can't reach the new shell's stdin.
 
 ---

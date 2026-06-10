@@ -12,6 +12,7 @@ members = [
     "crates/relay-proto",
     "crates/relay",
     "crates/relay-client",
+    "crates/proc-cwd",
     "xtask",
 ]
 
@@ -36,6 +37,7 @@ oximux-settings = { path = "crates/settings" }
 oximux-relay-proto = { path = "crates/relay-proto" }
 oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }
+oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
 # upstream `longbridge/gpui-component` workspace pins `gpui` to the default

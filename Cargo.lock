@@ -4466,6 +4466,7 @@ dependencies = [
  "oximux-core",
  "oximux-editor",
  "oximux-git",
+ "oximux-proc-cwd",
  "oximux-pty",
  "oximux-relay-client",
  "oximux-relay-proto",
@@ -4528,6 +4529,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-proc-cwd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "oximux-pty"
 version = "0.1.0"
 dependencies = [
@@ -4545,6 +4553,7 @@ dependencies = [
  "anyhow",
  "dashmap",
  "nix 0.25.1",
+ "oximux-proc-cwd",
  "oximux-relay-proto",
  "portable-pty",
  "serde",
