@@ -13,6 +13,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
+use crate::checkpoint::CheckpointStore;
 use crate::ring_buffer::RingBuffer;
 
 // Bounded per-subscriber channel. The session writer task drains it;
@@ -102,6 +103,10 @@ struct Entry {
     bytes_in: AtomicU64,
     bytes_out: Arc<AtomicU64>,
     started_at: Instant,
+    // `bytes_out` value at the last disk checkpoint. The checkpoint tick
+    // compares against the live counter and skips PTYs with no new
+    // output, so idle shells cost zero disk writes.
+    checkpointed_bytes_out: AtomicU64,
 }
 
 pub struct PtyRegistry {
@@ -109,6 +114,10 @@ pub struct PtyRegistry {
     // Process-wide monotonic source of attachment ids. Unique across all
     // PTYs (simpler than a per-entry counter; the id space is u64).
     next_attachment_id: AtomicU64,
+    // Disk-checkpoint sink. None disables checkpointing (unit tests,
+    // explicit opt-out). All store calls are best-effort: a failing
+    // disk must never take down a live PTY.
+    checkpoints: Option<Arc<CheckpointStore>>,
 }
 
 impl Default for PtyRegistry {
@@ -119,9 +128,14 @@ impl Default for PtyRegistry {
 
 impl PtyRegistry {
     pub fn new() -> Self {
+        Self::with_checkpoints(None)
+    }
+
+    pub fn with_checkpoints(checkpoints: Option<Arc<CheckpointStore>>) -> Self {
         Self {
             entries: DashMap::new(),
             next_attachment_id: AtomicU64::new(1),
+            checkpoints,
         }
     }
 
@@ -187,6 +201,7 @@ impl PtyRegistry {
         let subs_for_reader = Arc::clone(&subscribers);
         let exited_for_reader = Arc::clone(&child_exited);
         let bytes_out_for_reader = Arc::clone(&bytes_out);
+        let checkpoints_for_reader = self.checkpoints.clone();
         std::thread::Builder::new()
             .name(format!("relay-pty-{pty_id}"))
             .spawn(move || {
@@ -198,9 +213,20 @@ impl PtyRegistry {
                     subs_for_reader,
                     exited_for_reader,
                     bytes_out_for_reader,
+                    checkpoints_for_reader,
                 )
             })
             .context("spawn reader thread")?;
+
+        // Seed the on-disk checkpoint dir up front so even a crash
+        // before the first scrollback tick leaves an identifiable
+        // session behind. Best-effort: disk trouble must not block
+        // the spawn.
+        if let Some(store) = &self.checkpoints {
+            if let Err(e) = store.open(&pty_id, &args.cwd, args.cols, args.rows) {
+                tracing::warn!(?e, pty_id, "checkpoint open failed");
+            }
+        }
 
         let entry = Arc::new(Entry {
             pty_id: pty_id.clone(),
@@ -221,6 +247,7 @@ impl PtyRegistry {
             bytes_in: AtomicU64::new(0),
             bytes_out,
             started_at: Instant::now(),
+            checkpointed_bytes_out: AtomicU64::new(0),
         });
         self.entries.insert(pty_id.clone(), entry);
         Ok(pty_id)
@@ -372,7 +399,39 @@ impl PtyRegistry {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let _ = entry.killer.lock().expect("killer poisoned").kill();
+        // Deliberate kill — nothing to cold-restore. The reader thread
+        // also removes on its way out; remove is idempotent.
+        if let Some(store) = &self.checkpoints {
+            let _ = store.remove(pty_id);
+        }
         Ok(())
+    }
+
+    /// One disk-checkpoint pass over every live PTY: snapshot the replay
+    /// ring and persist it, skipping PTYs whose `bytes_out` hasn't moved
+    /// since the last pass. Driven by the server's periodic tick (and
+    /// once more on graceful shutdown) from a blocking thread — each
+    /// write is a small (≤ ring capacity) atomic file replace.
+    pub fn checkpoint_all(&self) {
+        let Some(store) = &self.checkpoints else {
+            return;
+        };
+        for kv in self.entries.iter() {
+            let e = kv.value();
+            let seen = e.bytes_out.load(Ordering::Relaxed);
+            if seen == e.checkpointed_bytes_out.load(Ordering::Relaxed) {
+                continue;
+            }
+            let bytes = e.ring.lock().expect("ring poisoned").snapshot();
+            let cols = *e.cols.lock().expect("cols poisoned");
+            let rows = *e.rows.lock().expect("rows poisoned");
+            match store.write_scrollback(&e.pty_id, &bytes, cols, rows) {
+                // Store the pre-snapshot counter: output that landed
+                // mid-write is picked up by the next pass.
+                Ok(()) => e.checkpointed_bytes_out.store(seen, Ordering::Relaxed),
+                Err(err) => tracing::warn!(?err, pty_id = e.pty_id, "checkpoint write failed"),
+            }
+        }
     }
 
     pub fn list(&self) -> Vec<PtyDescriptor> {
@@ -523,6 +582,7 @@ fn reader_loop(
     subscribers: Arc<Mutex<Vec<Sender<Notification>>>>,
     child_exited: Arc<AtomicBool>,
     bytes_out: Arc<AtomicU64>,
+    checkpoints: Option<Arc<CheckpointStore>>,
 ) {
     let mut buf = [0u8; READ_CHUNK_BYTES];
     loop {
@@ -554,6 +614,12 @@ fn reader_loop(
     // Release-ordered so the corresponding Acquire load in `close`
     // observes the flag flip without sequencing the fan_out below.
     child_exited.store(true, Ordering::Release);
+    // Natural child exit is a clean end — drop the disk checkpoint so
+    // an exited shell never cold-restores on the next launch. (The
+    // `close` path removes too; remove is idempotent.)
+    if let Some(store) = &checkpoints {
+        let _ = store.remove(&pty_id);
+    }
     fan_out(
         &subscribers,
         Notification::Exit {

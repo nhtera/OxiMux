@@ -530,6 +530,8 @@ async fn idle_gc_shuts_down_when_no_clients_and_no_ptys() {
         pid_path: None,
         idle_timeout: Some(Duration::from_millis(200)),
         idle_tick_interval: Some(Duration::from_millis(40)),
+        checkpoint_dir: None,
+        checkpoint_tick_interval: None,
     };
     let handle = tokio::spawn(async move { run_server(cfg).await });
 
@@ -554,6 +556,8 @@ async fn pid_file_is_written_and_removed_on_clean_exit() {
         pid_path: Some(pid_path.clone()),
         idle_timeout: Some(Duration::from_millis(80)),
         idle_tick_interval: Some(Duration::from_millis(20)),
+        checkpoint_dir: None,
+        checkpoint_tick_interval: None,
     };
     let handle = tokio::spawn(async move { run_server(cfg).await });
 

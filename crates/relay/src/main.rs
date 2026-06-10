@@ -20,6 +20,7 @@ fn parse_args() -> Result<ParsedArgs> {
     let mut token_file: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
     let mut log_dir: Option<PathBuf> = None;
+    let mut checkpoint_dir: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -33,6 +34,10 @@ fn parse_args() -> Result<ParsedArgs> {
             "--log-dir" => {
                 log_dir = Some(args.next().context("--log-dir expects a path")?.into());
             }
+            "--checkpoint-dir" => {
+                checkpoint_dir =
+                    Some(args.next().context("--checkpoint-dir expects a path")?.into());
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -42,6 +47,14 @@ fn parse_args() -> Result<ParsedArgs> {
     }
     let socket = socket.context("--socket <path> is required")?;
     let token_file = token_file.context("--token <path> is required")?;
+    // Checkpointing defaults ON, rooted next to the socket — the
+    // supervisor that spawns this daemon doesn't need to know the flag
+    // exists. An explicit `--checkpoint-dir` overrides.
+    let checkpoint_dir = checkpoint_dir.or_else(|| {
+        socket
+            .parent()
+            .map(|runtime_dir| runtime_dir.join("checkpoints"))
+    });
     Ok(ParsedArgs {
         cfg: ServerConfig {
             socket_path: socket,
@@ -49,6 +62,8 @@ fn parse_args() -> Result<ParsedArgs> {
             pid_path: pid_file,
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             idle_tick_interval: None,
+            checkpoint_dir,
+            checkpoint_tick_interval: None,
         },
         log_dir,
     })
@@ -58,9 +73,9 @@ fn print_help() {
     println!(
         "oximux-relay — PTY-owning daemon for OxiMux\n\
          \n\
-         USAGE:\n    oximux-relay --socket <path> --token <path> [--pid-file <path>] [--log-dir <path>]\n\
+         USAGE:\n    oximux-relay --socket <path> --token <path> [--pid-file <path>] [--log-dir <path>] [--checkpoint-dir <path>]\n\
          \n\
-         FLAGS:\n  --socket   <path>   unix-domain socket to bind\n  --token    <path>   token file (0600) for client auth\n  --pid-file <path>   write own PID for supervisor liveness probes\n  --log-dir  <path>   write daily-rotated JSON logs to this directory"
+         FLAGS:\n  --socket   <path>   unix-domain socket to bind\n  --token    <path>   token file (0600) for client auth\n  --pid-file <path>   write own PID for supervisor liveness probes\n  --log-dir  <path>   write daily-rotated JSON logs to this directory\n  --checkpoint-dir <path>  disk scrollback checkpoints root (default: <socket dir>/checkpoints)"
     );
 }
 

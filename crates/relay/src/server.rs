@@ -11,6 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
+use crate::checkpoint::CheckpointStore;
 use crate::codec::{CodecError, read_frame, write_frame};
 use crate::registry::{PtyRegistry, RegistryError, SUBSCRIBER_QUEUE, SpawnArgs};
 
@@ -19,6 +20,15 @@ use crate::registry::{PtyRegistry, RegistryError, SUBSCRIBER_QUEUE, SpawnArgs};
 // `ServerConfig.idle_timeout`.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
 const DEFAULT_IDLE_TICK: Duration = Duration::from_secs(60);
+
+// Disk-checkpoint cadence: each tick persists every PTY's replay ring
+// (skipping PTYs with no new output). 5s bounds the scrollback lost to
+// a daemon crash while keeping disk I/O at one small write per active
+// PTY per tick.
+const CHECKPOINT_TICK: Duration = Duration::from_secs(5);
+// Checkpoint dirs untouched this long are orphans (their pane was
+// dropped from every layout while no daemon was around to clean up).
+const CHECKPOINT_GC_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
 pub struct ServerConfig {
     pub socket_path: PathBuf,
@@ -31,6 +41,12 @@ pub struct ServerConfig {
     // None uses `DEFAULT_IDLE_TICK`. Tests can pick a sub-second tick
     // so the idle timer reaches its threshold quickly.
     pub idle_tick_interval: Option<Duration>,
+    // Root directory for per-PTY disk scrollback checkpoints. None
+    // disables checkpointing entirely (in-process tests).
+    pub checkpoint_dir: Option<PathBuf>,
+    // None uses `CHECKPOINT_TICK`. Tests pick sub-second ticks so a
+    // checkpoint lands without multi-second sleeps.
+    pub checkpoint_tick_interval: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -41,6 +57,8 @@ impl ServerConfig {
             pid_path: None,
             idle_timeout: None,
             idle_tick_interval: None,
+            checkpoint_dir: None,
+            checkpoint_tick_interval: None,
         }
     }
 }
@@ -87,7 +105,24 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
         None
     };
 
-    let registry = Arc::new(PtyRegistry::new());
+    // Disk-checkpoint store: GC stale orphans at boot (recent dirs are
+    // someone's pending cold-restore data — left alone), then arm the
+    // periodic tick. The tick runs `checkpoint_all` on a blocking
+    // thread; each write is a small atomic file replace.
+    let checkpoints = cfg.checkpoint_dir.map(|dir| Arc::new(CheckpointStore::new(dir)));
+    if let Some(store) = checkpoints.clone() {
+        // Blocking thread: the sweep walks the checkpoints dir on disk
+        // and must not stall the accept loop coming up.
+        tokio::task::spawn_blocking(move || store.gc_older_than(CHECKPOINT_GC_MAX_AGE));
+    }
+
+    let registry = Arc::new(PtyRegistry::with_checkpoints(checkpoints.clone()));
+    if checkpoints.is_some() {
+        spawn_checkpoint_tick(
+            Arc::clone(&registry),
+            cfg.checkpoint_tick_interval.unwrap_or(CHECKPOINT_TICK),
+        );
+    }
     let session_id = Uuid::new_v4().to_string();
     let shutdown = Arc::new(Notify::new());
     let active_sessions = Arc::new(AtomicUsize::new(0));
@@ -138,7 +173,28 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
         }
     }
 
+    // Final best-effort checkpoint pass on graceful shutdown (SIGTERM —
+    // typically host reboot/logout). The PTY children die with this
+    // process, so the freshest possible scrollback on disk is what the
+    // next launch cold-restores from.
+    if checkpoints.is_some() {
+        let registry = Arc::clone(&registry);
+        let _ = tokio::task::spawn_blocking(move || registry.checkpoint_all()).await;
+    }
+
     Ok(())
+}
+
+// Periodic disk-checkpoint driver. Runs for the daemon's lifetime —
+// process exit reaps it with the runtime.
+fn spawn_checkpoint_tick(registry: Arc<PtyRegistry>, tick: Duration) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tick).await;
+            let reg = Arc::clone(&registry);
+            let _ = tokio::task::spawn_blocking(move || reg.checkpoint_all()).await;
+        }
+    });
 }
 
 // Ref-counted "is anyone attached?" tracker for the idle GC. Increments

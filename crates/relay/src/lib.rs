@@ -2,6 +2,7 @@
 // drive the server in-process (spawning a binary per test would slow
 // the suite to a crawl). The actual binary entry point is `main.rs`.
 
+pub mod checkpoint;
 pub mod codec;
 pub mod registry;
 pub mod ring_buffer;

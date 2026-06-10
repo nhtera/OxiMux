@@ -939,8 +939,10 @@ pub(crate) fn spawn_attach_reconcile(
             &snap.live_external_ids,
             snap.session_id.as_deref(),
         );
+        let checkpoints_dir = crate::relay_cold_restore::default_checkpoints_dir();
         let mut attached = 0usize;
         let mut spawned = 0usize;
+        let mut cold_restored = 0usize;
         for entry in pending {
             let hint = match &entry.slot {
                 PendingSlot::SingleTab(ord) => attach_hints.get(ord).cloned(),
@@ -948,26 +950,57 @@ pub(crate) fn spawn_attach_reconcile(
                     leaf_attach_hints.get(&(*ord, *sub, *tab)).cloned()
                 }
             };
+            // The RAW persisted id (no liveness validation) keys the
+            // daemon's disk checkpoint for this slot — when the warm
+            // path fails, it's how the cold path finds the dead PTY's
+            // recovered scrollback.
+            let raw_hint = match &entry.slot {
+                PendingSlot::SingleTab(ord) => raw_relay_hint(&pane_relay_ids, *ord, 0, 0),
+                PendingSlot::LeafTab(ord, sub, tab) => {
+                    raw_relay_hint(&pane_relay_ids, *ord, *sub, *tab)
+                }
+            };
             let was_attach = hint.is_some();
             let cwd = entry.cwd;
             let env = entry.env;
+            let ckpt_dir = checkpoints_dir.clone();
             let result = executor
                 .spawn(async move {
                     // Warm re-attach first; a failed attach (PTY died between
                     // snapshot and now) falls back to a cold spawn, which
                     // itself falls back to an in-process PTY when the relay
                     // is unreachable.
-                    hint.as_deref()
-                        .and_then(attach_pty_existing)
-                        .or_else(|| spawn_local_pty(cwd, env))
+                    if let Some(live) = hint.as_deref().and_then(attach_pty_existing) {
+                        return Some((live, None));
+                    }
+                    // Cold spawn means the daemon lost this PTY. If it died
+                    // uncleanly it left a disk checkpoint — recover the
+                    // scrollback here (disk I/O stays off the main thread).
+                    let cold = match (&ckpt_dir, raw_hint.as_deref()) {
+                        (Some(dir), Some(id)) => {
+                            crate::relay_cold_restore::read_cold_restore_bytes(dir, id)
+                                .map(|bytes| (bytes, id.to_owned()))
+                        }
+                        _ => None,
+                    };
+                    spawn_local_pty(cwd, env).map(|session| (session, cold))
                 })
                 .await;
-            let Some((backend, session_id)) = result else {
+            let Some(((backend, session_id), cold)) = result else {
                 tracing::warn!("attach reconcile: spawn failed; pane stays empty");
                 continue;
             };
             let delivered = entry.view.update(cx, |view, cx| {
-                view.adopt_live_session(backend.clone(), session_id, cx)
+                let adopted = view.adopt_live_session(backend.clone(), session_id, cx);
+                if adopted {
+                    if let Some((bytes, _)) = &cold {
+                        // Prefill BEFORE the first poll tick drains the fresh
+                        // shell's prompt: recovered history paints first, the
+                        // live prompt then appends below the restored marker.
+                        view.prefill_grid(bytes);
+                    }
+                }
+                adopted
             });
             match delivered {
                 Ok(true) => {
@@ -975,6 +1008,21 @@ pub(crate) fn spawn_attach_reconcile(
                         attached += 1;
                     } else {
                         spawned += 1;
+                    }
+                    // The recovered scrollback is on screen — consume the
+                    // checkpoint so the same crash never restores twice.
+                    // Only on delivery: an undelivered slot's layout entry
+                    // survives (quit mid-reconcile) and may legitimately
+                    // cold-restore on the NEXT launch.
+                    if let (Some(dir), Some((_, pty_id))) = (&checkpoints_dir, &cold) {
+                        cold_restored += 1;
+                        let dir = dir.clone();
+                        let pty_id = pty_id.clone();
+                        executor
+                            .spawn(async move {
+                                crate::relay_cold_restore::consume_checkpoint(&dir, &pty_id);
+                            })
+                            .detach();
                     }
                 }
                 Ok(false) | Err(_) => {
@@ -1011,6 +1059,7 @@ pub(crate) fn spawn_attach_reconcile(
             total,
             attached,
             spawned,
+            cold_restored,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "post-paint pty attach reconcile done"
         );
