@@ -50,6 +50,14 @@ pub(crate) const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 /// 2 s keeps the `+A −B` chips feeling live without churning the disk.
 const DIFF_REFRESH_TICK: Duration = Duration::from_millis(2000);
 
+/// Cadence of the layout/relay-id autosave. Bounds what an app crash can
+/// lose of mid-session structural changes (new tabs, splits, closes) to
+/// one tick — quit/switch captures remain the authoritative full saves.
+/// Idle ticks cost nothing: the save sink dedupes byte-identical layout
+/// JSON, and the relay-id capture uses the cached handshake session id
+/// (no daemon round-trip).
+const LAYOUT_AUTOSAVE_TICK: Duration = Duration::from_secs(15);
+
 use crate::notifier::{AgentNotifySettings, Notifier, TabId};
 use crate::state::AppState;
 
@@ -309,6 +317,9 @@ pub struct WorkspaceRoot {
     /// Owns the periodic refresh loop. Dropping it cancels the loop when the
     /// window/root entity goes away.
     _diff_refresh_task: Task<()>,
+    /// Periodic layout + relay-id autosave — bounds mid-session crash
+    /// loss to one `LAYOUT_AUTOSAVE_TICK`. Held for its lifetime only.
+    _layout_autosave_task: Task<()>,
 }
 
 impl WorkspaceRoot {
@@ -628,6 +639,35 @@ impl WorkspaceRoot {
             }
         });
 
+        // Periodic layout + relay-id autosave. Quit/switch captures miss
+        // anything created mid-session — a tab or split made after the
+        // last capture is gone entirely if the app crashes. This bounds
+        // that loss to one `LAYOUT_AUTOSAVE_TICK`. Skipped during quit so
+        // it can't race the quit-save over a half-torn-down tree.
+        let layout_autosave_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(LAYOUT_AUTOSAVE_TICK).await;
+                if crate::shell::terminal_view::APP_QUITTING
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+                let still_alive = weak
+                    .update(cx, |this, cx| {
+                        this.capture_all_layouts(cx);
+                        if let Some(session_id) =
+                            crate::shell::terminal_view::relay_session_id_cached()
+                        {
+                            this.capture_all_pane_relay_ids_with_session(&session_id, cx);
+                        }
+                    })
+                    .is_ok();
+                if !still_alive {
+                    break;
+                }
+            }
+        });
+
         // Click router: drains tab-ids posted by the macOS click watcher.
         // For each id, raise the window and activate the matching tab.
         // Closure ends when the mpsc receiver returns None (all senders
@@ -735,6 +775,7 @@ impl WorkspaceRoot {
             diff_refresh_focused: true,
             diff_refresh_in_flight: false,
             _diff_refresh_task: diff_refresh_task,
+            _layout_autosave_task: layout_autosave_task,
         };
         this.rewire_scm_subscriptions(window, cx);
         // Load global custom commands on startup. No active project yet so
@@ -1398,12 +1439,20 @@ impl WorkspaceRoot {
         let Some(session_id) = snap.session_id else {
             return;
         };
+        self.capture_all_pane_relay_ids_with_session(&session_id, cx);
+    }
+
+    /// Same capture, but with the relay session id already in hand —
+    /// for callers that just took a relay snapshot (the post-paint
+    /// reconcile), so the capture adds no extra daemon round-trip on
+    /// the main thread.
+    pub fn capture_all_pane_relay_ids_with_session(&self, session_id: &str, cx: &gpui::App) {
         let repo = self.app_state.pane_relay_id_repo.clone();
         let window_id = &self.window_id;
         for (project_id, panes) in &self.project_panes_by_project {
             panes
                 .read(cx)
-                .capture_pane_relay_ids(&repo, project_id, window_id, &session_id, cx);
+                .capture_pane_relay_ids(&repo, project_id, window_id, session_id, cx);
         }
     }
 

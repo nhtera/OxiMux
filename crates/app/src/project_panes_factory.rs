@@ -33,8 +33,7 @@ use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{
-    TerminalView, attach_pty_existing, relay_state_snapshot, spawn_local_pty,
-    spawn_pending_placeholder_grid,
+    TerminalView, attach_pty_existing, relay_state_snapshot, spawn_pending_placeholder_grid,
 };
 use crate::workspace_root::WorkspaceRoot;
 
@@ -923,7 +922,7 @@ pub(crate) fn spawn_attach_reconcile(
     if pending.is_empty() {
         return;
     }
-    cx.spawn_in(window, async move |_root, cx| {
+    cx.spawn_in(window, async move |root, cx| {
         let started = std::time::Instant::now();
         let total = pending.len();
         let Ok(executor) = cx.update(|_, cx| cx.background_executor().clone()) else {
@@ -943,6 +942,7 @@ pub(crate) fn spawn_attach_reconcile(
         let mut attached = 0usize;
         let mut spawned = 0usize;
         let mut cold_restored = 0usize;
+        let mut cwd_only_restored = 0usize;
         for entry in pending {
             let hint = match &entry.slot {
                 PendingSlot::SingleTab(ord) => attach_hints.get(ord).cloned(),
@@ -986,12 +986,16 @@ pub(crate) fn spawn_attach_reconcile(
                     // The checkpoint's cwd is the dead shell's LIVE working
                     // directory (kernel-resolved by the daemon each tick) —
                     // fresher than the persisted layout cwd, so the revived
-                    // shell lands where the user actually was.
+                    // shell lands where the user actually was. Its (cols,
+                    // rows) seed the replacement's initial dims so the first
+                    // prompt wraps like the restored content above it.
                     let spawn_cwd = cold
                         .as_ref()
                         .and_then(|(restore, _)| restore.cwd.clone())
                         .unwrap_or(cwd);
-                    spawn_local_pty(spawn_cwd, env).map(|session| (session, cold))
+                    let spawn_dims = cold.as_ref().and_then(|(restore, _)| restore.dims);
+                    crate::shell::terminal_view::spawn_local_pty_sized(spawn_cwd, env, spawn_dims)
+                        .map(|session| (session, cold))
                 })
                 .await;
             let Some(((backend, session_id), cold)) = result else {
@@ -1001,10 +1005,14 @@ pub(crate) fn spawn_attach_reconcile(
             let delivered = entry.view.update(cx, |view, cx| {
                 let adopted = view.adopt_live_session(backend.clone(), session_id, cx);
                 if adopted {
-                    if let Some((restore, _)) = &cold {
+                    if let Some((restore, _)) = &cold
+                        && !restore.bytes.is_empty()
+                    {
                         // Prefill BEFORE the first poll tick drains the fresh
                         // shell's prompt: recovered history paints first, the
                         // live prompt then appends below the restored marker.
+                        // A cwd-only restore (no replayable scrollback) skips
+                        // this — blank grid, recovered spawn dir.
                         view.prefill_grid(&restore.bytes);
                     }
                 }
@@ -1021,9 +1029,20 @@ pub(crate) fn spawn_attach_reconcile(
                     // checkpoint so the same crash never restores twice.
                     // Only on delivery: an undelivered slot's layout entry
                     // survives (quit mid-reconcile) and may legitimately
-                    // cold-restore on the NEXT launch.
-                    if let (Some(dir), Some((_, pty_id))) = (&checkpoints_dir, &cold) {
-                        cold_restored += 1;
+                    // cold-restore on the NEXT launch. This consumes the
+                    // DEAD PTY's checkpoint (the raw persisted hint); the
+                    // cold-spawned replacement has a fresh daemon-minted
+                    // id, so the live pane's `os_pid()` checkpoint lookup
+                    // queries that new id — never this consumed one.
+                    if let (Some(dir), Some((restore, pty_id))) = (&checkpoints_dir, &cold) {
+                        // Count only content restores; a cwd-only restore
+                        // (empty bytes) replayed nothing into the grid and
+                        // would mislead crash triage if lumped in.
+                        if !restore.bytes.is_empty() {
+                            cold_restored += 1;
+                        } else {
+                            cwd_only_restored += 1;
+                        }
                         let dir = dir.clone();
                         let pty_id = pty_id.clone();
                         executor
@@ -1068,9 +1087,25 @@ pub(crate) fn spawn_attach_reconcile(
             attached,
             spawned,
             cold_restored,
+            cwd_only_restored,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "post-paint pty attach reconcile done"
         );
+        // Persist the post-reconcile reality right away: cold spawns
+        // minted NEW pty ids that exist only in memory until the next
+        // quit/switch capture — an app crash in that window would leave
+        // the table pointing at dead ids and strand this boot's live
+        // PTYs. Reuses the session id from the snapshot above (no extra
+        // main-thread daemon round-trip). Skipped during quit so it
+        // can't race the quit-save's own capture over a half-torn-down
+        // pane tree.
+        if let Some(session_id) = snap.session_id.as_deref()
+            && !crate::shell::terminal_view::APP_QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = root.update(cx, |root, cx| {
+                root.capture_all_pane_relay_ids_with_session(session_id, cx);
+            });
+        }
     })
     .detach();
 }
@@ -1165,15 +1200,53 @@ pub(crate) fn save_persisted_tabs(
             return;
         }
     };
-    if let Err(err) = repo.set(&key, &json) {
-        tracing::warn!(
-            ?err,
-            project_id,
-            window_id,
-            "save_persisted_tabs: settings.set failed"
-        );
+    // Skip byte-identical writes: the periodic layout autosave calls
+    // this every tick whether or not anything changed, and an idle
+    // session shouldn't churn SQLite. Keyed per settings key so multiple
+    // projects/windows dedupe independently. Quit/switch saves flow
+    // through the same gate — skipping an identical write is always
+    // correct.
+    let digest = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        json.hash(&mut hasher);
+        hasher.finish()
+    };
+    {
+        let last = LAST_SAVED_TABS_HASH
+            .lock()
+            .expect("saved-tabs hash map poisoned");
+        if last.get(&key) == Some(&digest) {
+            return;
+        }
+    }
+    match repo.set(&key, &json) {
+        // Record only AFTER the write lands — a failed write must stay
+        // "dirty" so the next identical save retries instead of being
+        // deduped into a permanent loss.
+        Ok(()) => {
+            LAST_SAVED_TABS_HASH
+                .lock()
+                .expect("saved-tabs hash map poisoned")
+                .insert(key, digest);
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                project_id,
+                window_id,
+                "save_persisted_tabs: settings.set failed"
+            );
+        }
     }
 }
+
+// Last-written layout JSON hash per settings key — the dedup gate for
+// `save_persisted_tabs`. Process-local: a fresh launch always writes
+// its first save, which is the conservative direction.
+static LAST_SAVED_TABS_HASH: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Read the open-windows manifest. Returns an empty manifest (→ legacy
 /// single-window boot) when the key is absent or fails to parse. `pub` so

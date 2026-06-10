@@ -194,17 +194,40 @@ pub fn external_id_for_session(id: TerminalSessionId) -> Option<String> {
     shared.lock().ok()?.external_id_of(id)
 }
 
+/// The relay daemon's session id from the cached handshake — a lock and
+/// a clone, NO daemon round-trip (unlike `relay_state_snapshot`, whose
+/// ListPtys is a wire RPC). For periodic callers (layout autosave) that
+/// need to scope `pane_relay_ids` rows without paying for a snapshot.
+pub fn relay_session_id_cached() -> Option<String> {
+    let shared = SHARED_BACKEND.get()?;
+    shared.lock().ok()?.external_session_id()
+}
+
 pub fn spawn_local_pty(
     cwd: PathBuf,
     env: Vec<(String, String)>,
 ) -> Option<(SharedBackend, TerminalSessionId)> {
+    spawn_local_pty_sized(cwd, env, None)
+}
+
+/// `spawn_local_pty` with explicit initial PTY dimensions. The cold
+/// restore path passes the dead PTY's checkpointed (cols, rows) so the
+/// replacement shell's first paint wraps for the size the restored
+/// content used — the pane's normal resize takes over right after
+/// adopt, so this only matters for that first prompt.
+pub fn spawn_local_pty_sized(
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    dims: Option<(u16, u16)>,
+) -> Option<(SharedBackend, TerminalSessionId)> {
+    let (cols, rows) = dims.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
     // Relay-backed path: one shared backend across the whole app.
     if let Some(shared) = SHARED_BACKEND.get() {
         let cfg = SpawnConfig {
             cwd: cwd.clone(),
             env: env.clone(),
-            cols: DEFAULT_COLS,
-            rows: DEFAULT_ROWS,
+            cols,
+            rows,
             scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
@@ -226,19 +249,20 @@ pub fn spawn_local_pty(
             }
         }
     }
-    spawn_fallback_portable(cwd, env)
+    spawn_fallback_portable(cwd, env, (cols, rows))
 }
 
 fn spawn_fallback_portable(
     cwd: PathBuf,
     env: Vec<(String, String)>,
+    (cols, rows): (u16, u16),
 ) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
         cwd,
         env,
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
+        cols,
+        rows,
         scrollback: spawn_scrollback(),
         ..SpawnConfig::default()
     };

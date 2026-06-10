@@ -46,21 +46,42 @@ const ALT_SCREEN_OFF: &[u8] = b"\x1b[?1049l";
 struct CheckpointMeta {
     #[serde(default)]
     cwd: String,
+    #[serde(default)]
+    cols: u16,
+    #[serde(default)]
+    rows: u16,
     ended_at_epoch_secs: Option<u64>,
     #[serde(default)]
     pid: Option<u32>,
 }
 
+/// When the ring's byte cap cuts mid-line, replay starts with a torn
+/// escape sequence or half a line. Advance the cut to the next line
+/// boundary — but only if one appears this close to the cut, so a
+/// pathological no-newline stream loses at most this much vs. losing
+/// the garbled-first-line trade.
+const LINE_BOUNDARY_SCAN_BYTES: usize = 4096;
+
 /// What a dead PTY left behind, ready to apply to its replacement.
 pub struct ColdRestore {
     /// Composed prefill payload: clear screen + recovered scrollback +
-    /// restored marker + mode reset.
+    /// restored marker + mode reset. Empty when the checkpoint had no
+    /// replayable scrollback (e.g. the session lived entirely in the
+    /// alternate screen) but still carried a usable cwd — the caller
+    /// then skips the grid prefill and only spawns at the recovered
+    /// directory.
     pub bytes: Vec<u8>,
     /// The shell child's last known working directory (live-resolved by
     /// the daemon at checkpoint time). `None` when the meta carried no
     /// cwd or the directory no longer exists — the caller then spawns
     /// at its own fallback cwd.
     pub cwd: Option<PathBuf>,
+    /// The dead PTY's (cols, rows) at its last checkpoint. The
+    /// replacement spawns at these dims so its first paint wraps for
+    /// the size the restored content used; the pane's normal resize
+    /// takes over right after adopt. `None` when the meta predates the
+    /// fields or carried degenerate values.
+    pub dims: Option<(u16, u16)>,
 }
 
 /// Where the daemon keeps its checkpoints: `<runtime dir>/checkpoints`,
@@ -82,17 +103,27 @@ pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRes
     if meta.ended_at_epoch_secs.is_some() {
         return None; // marked cleanly ended — not restorable
     }
-    let scrollback = std::fs::read(dir.join("scrollback.bin")).ok()?;
-    if scrollback.is_empty() {
-        return None;
-    }
-    // Tail first (bounds the parse work — mid-sequence cuts are the
-    // same trade the daemon's ring buffer already makes), then strip
-    // alternate-screen content (the part that scrambles on replay).
-    let start = scrollback.len().saturating_sub(COLD_RESTORE_MAX_BYTES);
-    let usable = truncate_alt_screen(&scrollback[start..]);
+    // The recovered cwd must still exist (the directory may have been a
+    // worktree or temp path deleted since the crash) — a fresh shell
+    // spawned into a missing dir fails outright on some shells.
+    let cwd = (!meta.cwd.is_empty())
+        .then(|| PathBuf::from(meta.cwd))
+        .filter(|p| p.is_absolute() && p.is_dir());
+    let dims = (meta.cols > 0 && meta.rows > 0).then_some((meta.cols, meta.rows));
+    // Tail first (bounds the parse work), aligned to a line boundary
+    // when the cap actually cut, then strip alternate-screen content
+    // (the part that scrambles on replay).
+    let scrollback = std::fs::read(dir.join("scrollback.bin")).unwrap_or_default();
+    let usable = truncate_alt_screen(tail_at_line_boundary(&scrollback));
     if usable.is_empty() {
-        return None;
+        // No replayable scrollback, but a live cwd is still worth the
+        // restore: the replacement shell lands where the user was, with
+        // a blank grid instead of a lone "restored" marker.
+        return cwd.map(|cwd| ColdRestore {
+            bytes: Vec::new(),
+            cwd: Some(cwd),
+            dims,
+        });
     }
     let mut out =
         Vec::with_capacity(CLEAR_SCREEN.len() + usable.len() + RESTORED_MARKER.len() + MODE_RESET.len());
@@ -100,13 +131,29 @@ pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRes
     out.extend_from_slice(usable);
     out.extend_from_slice(RESTORED_MARKER);
     out.extend_from_slice(MODE_RESET);
-    // The recovered cwd must still exist (the directory may have been a
-    // worktree or temp path deleted since the crash) — a fresh shell
-    // spawned into a missing dir fails outright on some shells.
-    let cwd = (!meta.cwd.is_empty())
-        .then(|| PathBuf::from(meta.cwd))
-        .filter(|p| p.is_absolute() && p.is_dir());
-    Some(ColdRestore { bytes: out, cwd })
+    Some(ColdRestore {
+        bytes: out,
+        cwd,
+        dims,
+    })
+}
+
+/// The byte-cap tail of the scrollback, advanced past the first `\n`
+/// when the cap cut into the stream — replay then starts on a whole
+/// line instead of a torn escape sequence. If no newline shows up
+/// within the scan window (one enormous line), keep the raw cut: a
+/// garbled first line beats dropping the window's worth of content.
+fn tail_at_line_boundary(scrollback: &[u8]) -> &[u8] {
+    let start = scrollback.len().saturating_sub(COLD_RESTORE_MAX_BYTES);
+    if start == 0 {
+        return scrollback;
+    }
+    let tail = &scrollback[start..];
+    let scan = &tail[..tail.len().min(LINE_BOUNDARY_SCAN_BYTES)];
+    match scan.iter().position(|&b| b == b'\n') {
+        Some(nl) => &tail[nl + 1..],
+        None => tail,
+    }
 }
 
 /// The shell child's OS pid for a LIVE daemon PTY, read from the same
@@ -268,6 +315,7 @@ mod tests {
         assert!(s.contains("--- session restored ---"));
         assert!(s.starts_with("\x1b[2J"), "clears before replaying");
         assert_eq!(restore.cwd.as_deref(), Some(Path::new("/")));
+        assert_eq!(restore.dims, Some((80, 24)));
 
         consume_checkpoint(&base, "pty-1");
         assert!(!dir.exists(), "consumed checkpoint removed");
@@ -330,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanly_ended_or_empty_not_restorable() {
+    fn cleanly_ended_not_restorable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let base = tmp.path().join("checkpoints");
         let ended = base.join("pty-ended");
@@ -342,15 +390,99 @@ mod tests {
         .unwrap();
         std::fs::write(ended.join("scrollback.bin"), b"bytes").unwrap();
         assert!(read_cold_restore(&base, "pty-ended").is_none());
+    }
 
-        let empty = base.join("pty-empty");
-        std::fs::create_dir_all(&empty).unwrap();
+    #[test]
+    fn empty_scrollback_still_recovers_cwd_without_marker() {
+        // An alt-screen-only or just-spawned session leaves no replayable
+        // scrollback, but its kernel-resolved cwd is still the best spawn
+        // dir — and a blank pane beats a lone "restored" marker.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("checkpoints");
+        for (id, scrollback) in [
+            ("pty-empty", Some(&b""[..])),
+            ("pty-alt-only", Some(&b"\x1b[?1049hTUI ONLY"[..])),
+            ("pty-meta-only", None), // crash before the first checkpoint tick
+        ] {
+            let dir = base.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                br#"{"cwd":"/","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#,
+            )
+            .unwrap();
+            if let Some(bytes) = scrollback {
+                std::fs::write(dir.join("scrollback.bin"), bytes).unwrap();
+            }
+            let restore = read_cold_restore(&base, id).expect("cwd-only restore");
+            assert!(restore.bytes.is_empty(), "{id}: no prefill bytes");
+            assert_eq!(restore.cwd.as_deref(), Some(Path::new("/")), "{id}");
+        }
+
+        // Nothing replayable AND no usable cwd → truly nothing to restore.
+        let bare = base.join("pty-bare");
+        std::fs::create_dir_all(&bare).unwrap();
         std::fs::write(
-            empty.join("meta.json"),
-            br#"{"cwd":"/","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#,
+            bare.join("meta.json"),
+            br#"{"cwd":"","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#,
         )
         .unwrap();
-        std::fs::write(empty.join("scrollback.bin"), b"").unwrap();
-        assert!(read_cold_restore(&base, "pty-empty").is_none());
+        std::fs::write(bare.join("scrollback.bin"), b"").unwrap();
+        assert!(read_cold_restore(&base, "pty-bare").is_none());
+    }
+
+    #[test]
+    fn degenerate_or_missing_dims_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("checkpoints");
+        // Meta written before the cols/rows fields existed (absent →
+        // serde default 0) and a zero-dim meta both yield dims = None.
+        for (id, meta) in [
+            (
+                "pty-no-dims",
+                &br#"{"cwd":"/","started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#[..],
+            ),
+            (
+                "pty-zero-dims",
+                &br#"{"cwd":"/","cols":0,"rows":0,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#[..],
+            ),
+        ] {
+            let dir = base.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("meta.json"), meta).unwrap();
+            std::fs::write(dir.join("scrollback.bin"), b"bytes").unwrap();
+            let restore = read_cold_restore(&base, id).expect("restorable");
+            assert_eq!(restore.dims, None, "{id}");
+        }
+    }
+
+    #[test]
+    fn capped_tail_starts_on_a_line_boundary() {
+        let mut sb = Vec::new();
+        sb.extend_from_slice(b"old\n");
+        sb.extend_from_slice(b"torn-line-part");
+        sb.extend_from_slice(b"\nkeep-me\r\n");
+        sb.resize(sb.len() + COLD_RESTORE_MAX_BYTES - 20, b'z');
+        // The cap cut lands inside "torn-line-part"; the trim must skip
+        // the rest of that torn line and start at "keep-me".
+        let tail = tail_at_line_boundary(&sb);
+        assert!(tail.starts_with(b"keep-me\r\n"));
+        assert!(!tail.windows(4).any(|w| w == b"torn"));
+    }
+
+    #[test]
+    fn capped_tail_without_nearby_newline_keeps_raw_cut() {
+        // One enormous line: dropping to the next newline would discard
+        // everything, so the raw (possibly torn) cut is kept.
+        let sb = vec![b'y'; COLD_RESTORE_MAX_BYTES + 100];
+        let tail = tail_at_line_boundary(&sb);
+        assert_eq!(tail.len(), COLD_RESTORE_MAX_BYTES);
+    }
+
+    #[test]
+    fn uncapped_scrollback_not_trimmed() {
+        // No cut happened — even a leading partial line is real content.
+        let sb = b"no-newline-here".to_vec();
+        assert_eq!(tail_at_line_boundary(&sb), sb.as_slice());
     }
 }

@@ -827,6 +827,23 @@ fn respawn_relay_after_death_boxed(
     ))
 }
 
+// Bounded respawn retry: 5 attempts, 500ms → 8s exponential backoff
+// (7.5s total sleep + supervisor-call latency). Enough to ride out a
+// socket race or a fork stalled under load, short enough that the user
+// isn't left wondering.
+const RESPAWN_MAX_ATTEMPTS: u32 = 5;
+// The retry loop's post-loop arm is unreachable only while at least one
+// attempt runs — keep that true at compile time.
+const _: () = assert!(RESPAWN_MAX_ATTEMPTS >= 1);
+const RESPAWN_BASE_DELAY: Duration = Duration::from_millis(500);
+const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(8);
+
+fn respawn_backoff_delay(attempt: u32) -> Duration {
+    RESPAWN_BASE_DELAY
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+        .min(RESPAWN_MAX_DELAY)
+}
+
 // Daemon-death recovery. Runs on the relay runtime. Ordering matters:
 // prune rows first (a quit during recovery must not persist hints that
 // point at the dead daemon's PTYs), then respawn + swap, then re-arm.
@@ -863,7 +880,38 @@ async fn respawn_relay_after_death(
         return;
     }
     let supervisor = RelaySupervisor::new(runtime_dir.clone(), log_dir.clone());
-    match supervisor.ensure_running().await {
+    // Bounded retry: a transient spawn failure (socket race, slow fork
+    // under load) must not permanently end daemon-backed terminals for
+    // the rest of the session. Version mismatch is NOT transient — a
+    // daemon from another build owns the socket and may serve other
+    // windows — so it exits immediately, same as the boot path.
+    let outcome = 'retry: {
+        for attempt in 1..=RESPAWN_MAX_ATTEMPTS {
+            if oximux_app::shell::terminal_view::APP_QUITTING.load(Ordering::SeqCst) {
+                tracing::info!("app quitting; abandoning relay respawn retries");
+                return;
+            }
+            match supervisor.ensure_running().await {
+                Ok(client) => break 'retry Ok(client),
+                Err(err @ SupervisorError::VersionMismatch) => {
+                    break 'retry Err(err);
+                }
+                Err(err) if attempt < RESPAWN_MAX_ATTEMPTS => {
+                    let delay = respawn_backoff_delay(attempt);
+                    tracing::warn!(
+                        ?err,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "relay respawn attempt failed; backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(err) => break 'retry Err(err),
+            }
+        }
+        unreachable!("loop breaks 'retry on the final attempt")
+    };
+    match outcome {
         Ok(client) => {
             let new_session_id = client.server_session_id().to_owned();
             let backend = RelayBackend::new(std::sync::Arc::new(client), handle.clone());
@@ -972,5 +1020,21 @@ mod tests {
     fn shutdown_grace_deadline_is_bounded() {
         assert!(SHUTDOWN_GRACE_DEADLINE >= Duration::from_secs(1));
         assert!(SHUTDOWN_GRACE_DEADLINE <= Duration::from_secs(5));
+    }
+
+    // The respawn backoff must grow geometrically from the base, cap at
+    // the max, and never overflow on absurd attempt numbers — a transient
+    // daemon-spawn failure rides this exact schedule before giving up.
+    #[test]
+    fn respawn_backoff_grows_and_caps() {
+        assert_eq!(respawn_backoff_delay(1), Duration::from_millis(500));
+        assert_eq!(respawn_backoff_delay(2), Duration::from_secs(1));
+        assert_eq!(respawn_backoff_delay(3), Duration::from_secs(2));
+        assert_eq!(respawn_backoff_delay(4), Duration::from_secs(4));
+        assert_eq!(respawn_backoff_delay(5), RESPAWN_MAX_DELAY);
+        assert_eq!(respawn_backoff_delay(64), RESPAWN_MAX_DELAY);
+        // Total worst-case wait stays well under a minute.
+        let total: Duration = (1..RESPAWN_MAX_ATTEMPTS).map(respawn_backoff_delay).sum();
+        assert!(total <= Duration::from_secs(30));
     }
 }
