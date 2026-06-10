@@ -111,7 +111,25 @@ pub enum Forge {
     Gitlab(GitlabForge),
 }
 
+/// Which forge backs the repo — the plain-data answer UI surfaces need
+/// (brand glyphs, host-specific labels) without holding the provider
+/// itself. Mirrors [`Forge`]'s variants 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeKind {
+    Github,
+    Gitlab,
+}
+
 impl Forge {
+    /// The provider's kind, for render-side branching (e.g. the Create-PR
+    /// button's brand glyph).
+    pub fn kind(&self) -> ForgeKind {
+        match self {
+            Forge::Github(_) => ForgeKind::Github,
+            Forge::Gitlab(_) => ForgeKind::Gitlab,
+        }
+    }
+
     /// Pick the provider for the repo at `cwd` from its `origin` URL, or
     /// `None` when `origin` is neither a GitHub nor a GitLab host (or absent).
     ///

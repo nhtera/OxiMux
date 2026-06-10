@@ -23,6 +23,12 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/git-branch.svg",
         include_bytes!("../assets/icons/git-branch.svg"),
     ),
+    // GitLab brand glyph for the Create-PR button — the upstream icon
+    // catalog ships only a GitHub mark.
+    (
+        "icons/gitlab.svg",
+        include_bytes!("../assets/icons/gitlab.svg"),
+    ),
     (
         "icons/list-collapse.svg",
         include_bytes!("../assets/icons/list-collapse.svg"),

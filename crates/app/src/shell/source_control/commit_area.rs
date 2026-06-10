@@ -177,6 +177,13 @@ pub struct CommitArea {
     /// (the row is disabled in that case, so the op never fires).
     pub(in crate::shell::source_control) rebase_base: Option<String>,
 
+    /// Which forge backs the repo, mirrored in by the panel's PR-status
+    /// refresh. Drives the Create-PR button's brand glyph (GitLab repos
+    /// get the GitLab mark instead of a GitHub one). `None` until the
+    /// first detection lands — Create-PR is gated on a detected forge,
+    /// so the default GitHub glyph can only flash on a GitHub repo.
+    pub(in crate::shell::source_control) forge_kind: Option<crate::shell::forge::ForgeKind>,
+
     /// AI generation lifecycle for the sparkles button. `Idle` until
     /// the user clicks; `Generating` while the spawned task is
     /// computing + applying. Cancellation is cooperative through the
@@ -260,6 +267,7 @@ impl CommitArea {
             _draft_subscription,
             staged_snapshot: Vec::new(),
             rebase_base: None,
+            forge_kind: None,
             ai_state: AiState::Idle,
         }
     }
@@ -528,7 +536,7 @@ impl CommitArea {
         let submit_label = action.label.clone();
         let submit_title = action.title.clone();
         let submit_disabled = action.disabled;
-        let primary_icon = primary_icon_for(action.kind);
+        let primary_icon = primary_icon_for(action.kind, self.forge_kind);
 
         // Relative wrapper anchors both the sparkles button (top-right)
         // and the AI overlay (full-area scrim during generation).
@@ -972,14 +980,25 @@ fn dispatch_dropdown(
     }
 }
 
-fn primary_icon_for(kind: PrimaryActionKind) -> Option<IconName> {
+fn primary_icon_for(
+    kind: PrimaryActionKind,
+    forge_kind: Option<crate::shell::forge::ForgeKind>,
+) -> Option<Icon> {
     match kind {
-        PrimaryActionKind::Commit => Some(IconName::Check),
-        PrimaryActionKind::Stage => Some(IconName::Plus),
-        PrimaryActionKind::Push | PrimaryActionKind::Publish => Some(IconName::ArrowUp),
-        PrimaryActionKind::Pull => Some(IconName::ArrowDown),
-        PrimaryActionKind::Sync => Some(IconName::ChevronsUpDown),
-        PrimaryActionKind::CreatePR => Some(IconName::Github),
+        PrimaryActionKind::Commit => Some(IconName::Check.into()),
+        PrimaryActionKind::Stage => Some(IconName::Plus.into()),
+        PrimaryActionKind::Push | PrimaryActionKind::Publish => Some(IconName::ArrowUp.into()),
+        PrimaryActionKind::Pull => Some(IconName::ArrowDown.into()),
+        PrimaryActionKind::Sync => Some(IconName::ChevronsUpDown.into()),
+        // Brand glyph matches the detected forge — a GitLab repo must not
+        // wear the GitHub mark. Unknown forge defaults to GitHub purely as
+        // a render fallback: Create-PR is disabled until detection lands.
+        PrimaryActionKind::CreatePR => Some(match forge_kind {
+            Some(crate::shell::forge::ForgeKind::Gitlab) => {
+                Icon::default().path("icons/gitlab.svg")
+            }
+            _ => IconName::Github.into(),
+        }),
     }
 }
 

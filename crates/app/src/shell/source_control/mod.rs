@@ -1478,6 +1478,12 @@ async fn refresh_pr_status(
     };
     let _ = this.update(cx, |panel, cx| {
         panel.pr_status_checked_at = Some(std::time::Instant::now());
+        // Mirror the detected forge kind into the commit area so the
+        // Create-PR button wears the right brand glyph (equality-guarded
+        // inside the setter, so the ~30s re-run costs nothing).
+        let forge_kind = forge.as_ref().map(|f| f.kind());
+        let commit_area = panel.commit_area.clone();
+        commit_area.update(cx, |area, cx| area.set_forge_kind(forge_kind, cx));
         let checks_changed = panel.ci_checks != checks;
         let changed = panel.forge_supports_pr != forge_supports
             || panel.has_open_pr != has_pr

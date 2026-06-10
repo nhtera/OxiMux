@@ -119,6 +119,22 @@ impl CommitArea {
         self.rebase_base = base;
     }
 
+    /// Mirror the detected forge kind in from the panel's PR-status
+    /// refresh. Equality-guarded notify: the Create-PR button's brand
+    /// glyph reads this at render time, so a kind change must repaint,
+    /// but the refresh re-runs every ~30s with an unchanged value.
+    pub fn set_forge_kind(
+        &mut self,
+        kind: Option<crate::shell::forge::ForgeKind>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.forge_kind == kind {
+            return;
+        }
+        self.forge_kind = kind;
+        cx.notify();
+    }
+
     /// True when the heuristic generator is currently running.
     pub fn is_generating_ai(&self) -> bool {
         self.ai_state.is_generating()
