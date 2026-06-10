@@ -246,6 +246,27 @@ fn pid_alive(pid: u32) -> bool {
         let Ok(pid_i32) = i32::try_from(pid) else {
             return false;
         };
+        // A daemon spawned by THIS app process is our never-reaped child
+        // (`spawn_detached` mem::forgets the Child). When it dies it
+        // lingers as a zombie — and kill(pid, 0) SUCCEEDS on zombies, so
+        // the signal-0 probe alone would report the corpse as alive and
+        // the crash heartbeat would never fire (found by live drill: a
+        // kill -9 of a same-instance daemon went undetected). Try a
+        // non-blocking reap first: it detects the death AND clears the
+        // zombie. ECHILD (a daemon inherited from a previous app run,
+        // reparented to PID 1 and reaped by it) falls through to the
+        // signal-0 probe, which is accurate for non-children.
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid with WNOHANG never blocks; it only touches
+        // the status out-param we own.
+        let reaped = unsafe { libc::waitpid(pid_i32, &mut status, libc::WNOHANG) };
+        if reaped == pid_i32 {
+            return false; // exited; zombie reaped just now
+        }
+        if reaped == 0 {
+            return true; // our child, still running
+        }
+        // ECHILD or other error: not our child — probe by signal 0.
         // SAFETY: kill(2) with sig=0 has no side effects; success
         // means the process exists, failure means errno tells us
         // why. We read errno through `std::io::Error::last_os_error`
@@ -469,5 +490,39 @@ mod tests {
         // probe must report dead (the alternative would silently make
         // the crash heartbeat into a no-op).
         assert!(!pid_alive(i32::MAX as u32));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_detects_own_unreaped_zombie_child() {
+        // Reproduces the live-drill failure: the supervisor mem::forgets
+        // the daemon Child, so a daemon killed while THIS process still
+        // runs becomes an un-reaped zombie — and kill(pid, 0) succeeds
+        // on zombies. The probe must reap-and-report-dead, or the crash
+        // heartbeat never fires for same-instance daemons.
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        std::mem::forget(child); // mirror spawn_detached: no Drop, no reap
+        assert!(pid_alive(pid), "freshly spawned child must read alive");
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        // Give the kernel a beat to turn the child into a zombie.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !pid_alive(pid) {
+                break; // detected (and reaped) — the fix works
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "zombie child still reads alive after 5s — heartbeat would never fire"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // After the reap the pid is gone entirely; stays dead.
+        assert!(!pid_alive(pid));
     }
 }
