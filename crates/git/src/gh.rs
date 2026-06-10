@@ -18,8 +18,6 @@ use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 /// `gh` can reach the network (auth, PR create), so allow more headroom than
 /// the local-git default.
@@ -64,56 +62,18 @@ impl GhCmd {
 
     /// Run to completion. Returns `(success, stdout, stderr)` regardless of
     /// exit code so callers can branch on `gh`'s exit status (e.g. `pr view`
-    /// exiting non-zero == no open PR, which is not an error).
+    /// exiting non-zero == no open PR, which is not an error). Transport
+    /// mechanics live in [`crate::forge_cli::run_raw`]; the env pins gh's
+    /// pager and prompts off so it can never block a poll thread.
     pub async fn run_raw(self) -> Result<(bool, String, String)> {
-        let secs = self.timeout.as_secs();
-        let mut cmd = Command::new("gh");
-        cmd.current_dir(&self.cwd)
-            .args(&self.args)
-            .env("LANG", "C")
-            .env("LC_ALL", "C")
-            // Never let gh open an interactive pager / prompt on a poll thread.
-            .env("GH_PAGER", "cat")
-            .env("GH_PROMPT_DISABLED", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(GitError::spawn)?;
-        let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
-        let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
-
-        let drain = async move {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            tokio::try_join!(
-                stdout_pipe.read_to_end(&mut out),
-                stderr_pipe.read_to_end(&mut err),
-            )?;
-            std::io::Result::Ok((out, err))
-        };
-        let sleep = tokio::time::sleep(self.timeout);
-        tokio::pin!(drain);
-        tokio::pin!(sleep);
-
-        tokio::select! {
-            biased;
-            _ = &mut sleep => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                Err(GitError::Timeout { secs })
-            }
-            drained = &mut drain => {
-                let (out, err) = drained.map_err(GitError::spawn)?;
-                let status = child.wait().await.map_err(GitError::spawn)?;
-                Ok((
-                    status.success(),
-                    String::from_utf8_lossy(&out).into_owned(),
-                    String::from_utf8_lossy(&err).into_owned(),
-                ))
-            }
-        }
+        crate::forge_cli::run_raw(
+            "gh",
+            &[("GH_PAGER", "cat"), ("GH_PROMPT_DISABLED", "1")],
+            &self.cwd,
+            &self.args,
+            self.timeout,
+        )
+        .await
     }
 }
 
@@ -136,17 +96,7 @@ pub async fn available(cwd: impl AsRef<Path>) -> bool {
 /// Create-PR affordance is hidden for other hosts. Uses `git` (not `gh`) so it
 /// works even when `gh` is absent. Any failure resolves to `false`.
 pub async fn is_github_remote(cwd: impl AsRef<Path>) -> bool {
-    let out = crate::process::GitCmd::new(cwd)
-        .args(["remote", "get-url", "origin"])
-        .run()
-        .await;
-    match out {
-        Ok(o) => {
-            let url = String::from_utf8_lossy(&o.stdout).to_lowercase();
-            url.contains("github.com")
-        }
-        Err(_) => false,
-    }
+    crate::forge_cli::origin_url_contains(cwd, "github.com").await
 }
 
 /// True when the current branch already has an **open** PR. `gh pr view` exits

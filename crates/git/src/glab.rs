@@ -21,8 +21,6 @@ use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 /// `glab` reaches the network (auth, MR create), so allow the same headroom as
 /// the `gh` default rather than the local-git timeout.
@@ -64,59 +62,24 @@ impl GlabCmd {
 
     /// Run to completion, returning `(success, stdout, stderr)` regardless of
     /// exit code so callers can branch on `glab`'s status (e.g. `mr view`
-    /// exiting non-zero == no MR, which is not an error).
+    /// exiting non-zero == no MR, which is not an error). Transport
+    /// mechanics live in [`crate::forge_cli::run_raw`]; the env pins glab's
+    /// pager, update check, and telemetry off so a poll thread never blocks
+    /// (every mutating call also passes an explicit `--yes`).
     pub async fn run_raw(self) -> Result<(bool, String, String)> {
-        let secs = self.timeout.as_secs();
-        let mut cmd = Command::new("glab");
-        cmd.current_dir(&self.cwd)
-            .args(&self.args)
-            .env("LANG", "C")
-            .env("LC_ALL", "C")
-            .env("NO_COLOR", "1")
-            // Keep glab from opening a pager / update check / prompt on a poll
-            // thread; every mutating call also passes an explicit `--yes`.
-            .env("PAGER", "cat")
-            .env("GLAB_CHECK_UPDATE", "0")
-            .env("GLAB_SEND_TELEMETRY", "0")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(GitError::spawn)?;
-        let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
-        let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
-
-        let drain = async move {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            tokio::try_join!(
-                stdout_pipe.read_to_end(&mut out),
-                stderr_pipe.read_to_end(&mut err),
-            )?;
-            std::io::Result::Ok((out, err))
-        };
-        let sleep = tokio::time::sleep(self.timeout);
-        tokio::pin!(drain);
-        tokio::pin!(sleep);
-
-        tokio::select! {
-            biased;
-            _ = &mut sleep => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                Err(GitError::Timeout { secs })
-            }
-            drained = &mut drain => {
-                let (out, err) = drained.map_err(GitError::spawn)?;
-                let status = child.wait().await.map_err(GitError::spawn)?;
-                Ok((
-                    status.success(),
-                    String::from_utf8_lossy(&out).into_owned(),
-                    String::from_utf8_lossy(&err).into_owned(),
-                ))
-            }
-        }
+        crate::forge_cli::run_raw(
+            "glab",
+            &[
+                ("NO_COLOR", "1"),
+                ("PAGER", "cat"),
+                ("GLAB_CHECK_UPDATE", "0"),
+                ("GLAB_SEND_TELEMETRY", "0"),
+            ],
+            &self.cwd,
+            &self.args,
+            self.timeout,
+        )
+        .await
     }
 }
 
@@ -127,16 +90,7 @@ impl GlabCmd {
 /// detected (documented limitation — such repos fall through to no forge). Any
 /// failure resolves to `false`.
 pub async fn is_gitlab_remote(cwd: impl AsRef<Path>) -> bool {
-    let out = crate::process::GitCmd::new(cwd)
-        .args(["remote", "get-url", "origin"])
-        .run()
-        .await;
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .to_lowercase()
-            .contains("gitlab"),
-        Err(_) => false,
-    }
+    crate::forge_cli::origin_url_contains(cwd, "gitlab").await
 }
 
 /// Full MR lifecycle state for the current branch. One `glab mr view -F json`

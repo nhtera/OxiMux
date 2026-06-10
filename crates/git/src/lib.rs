@@ -13,6 +13,7 @@ pub mod clone;
 pub mod commit;
 pub mod diff;
 pub mod error;
+pub(crate) mod forge_cli;
 pub mod gh;
 pub mod glab;
 pub mod log;
