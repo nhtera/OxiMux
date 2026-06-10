@@ -132,7 +132,7 @@ where
                 let title = action.title.clone();
                 let disabled = action.disabled;
                 let fg = if disabled { theme.fg_subtle } else { theme.fg_muted };
-                let hover_bg = theme.bg_panel_alt;
+                let hover_bg = theme.hover_overlay;
                 let btn = div()
                     .id("status-bar-git-primary")
                     .flex()

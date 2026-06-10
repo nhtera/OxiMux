@@ -119,7 +119,7 @@ pub fn paint_row(
     let click_path = path.clone();
     // Stable id per row — required for `.hover()` interactivity in GPUI.
     let row_id = gpui::ElementId::Name(format!("fe-row-{}", path.display()).into());
-    let hover_bg = ctx.theme.bg_panel_alt;
+    let hover_bg = ctx.theme.hover_overlay;
     let selection_bg = ctx.theme.selection;
 
     // Right-click dispatches the shared `FileTreeContextMenu` action.

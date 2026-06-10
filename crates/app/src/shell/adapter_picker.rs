@@ -550,7 +550,7 @@ pub(super) fn picker_row(
     match state {
         RowState::Active | RowState::Retry => row
             .cursor_pointer()
-            .hover(|s| s.bg(theme.bg_panel_alt))
+            .hover(|s| s.bg(theme.hover_overlay))
             .on_mouse_down(MouseButton::Left, on_click)
             .into_any_element(),
         RowState::Disabled => row.opacity(0.4).into_any_element(),

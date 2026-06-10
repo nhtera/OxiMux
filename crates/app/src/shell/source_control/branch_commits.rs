@@ -128,7 +128,7 @@ impl Render for BranchCommitsPanel {
                 .text_size(px(sc_style::GRAPH_META_TEXT))
                 .text_color(theme.fg_muted)
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+                .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
                 .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
                     cx.stop_propagation();
                     cx.emit(ShowBranchDiffAllRequested {
@@ -151,7 +151,7 @@ impl Render for BranchCommitsPanel {
             .font_weight(self.typography.w_semibold)
             .text_color(theme.fg_muted)
             .cursor_pointer()
-            .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+            .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle(cx)))
             .child(Icon::new(chevron).size_3().text_color(theme.fg_subtle))
             .child("COMMITTED ON BRANCH")
@@ -238,7 +238,7 @@ impl BranchCommitsPanel {
             .text_size(px(sc_style::BODY_TEXT))
             .text_color(theme.fg_base)
             .cursor_pointer()
-            .hover(|s| s.bg(theme.bg_panel_alt))
+            .hover(|s| s.bg(theme.hover_overlay))
             .on_click(cx.listener(move |_this, _: &ClickEvent, _window, cx| {
                 if let Some(r) = range.as_ref() {
                     cx.emit(ShowBranchFileRequested {

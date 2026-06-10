@@ -294,7 +294,7 @@ fn section(
         .font_weight(rctx.typography.w_semibold)
         .text_color(rctx.theme.fg_muted)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+        .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |panel, _: &MouseDownEvent, _window, cx| {

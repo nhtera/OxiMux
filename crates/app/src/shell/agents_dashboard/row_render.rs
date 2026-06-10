@@ -104,7 +104,7 @@ pub fn render_agent_row(
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .child(dot)
         .child(loc_label)
         .child(verb_chip)

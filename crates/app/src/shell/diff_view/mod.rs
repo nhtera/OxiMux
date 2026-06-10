@@ -1853,7 +1853,7 @@ impl Render for DiffView {
         let rail_open = self.rail_open;
         let toolbar = has_body.then(|| {
             let label = if split { "Inline" } else { "Side by side" };
-            let hover_bg = self.theme.bg_panel_alt;
+            let hover_bg = self.theme.hover_overlay;
             let all_folded = self.all_folded();
             let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
             // Review-notes cluster — a count label + Send / Copy / Clear,
@@ -1907,6 +1907,10 @@ impl Render for DiffView {
             // Leading rail toggle (multi-file only), pushed apart from the
             // view controls by a flex spacer so it sits at the left edge.
             let rail_toggle = multi_file.then(|| {
+                // Hover deliberately matches the persistent lit-state fill
+                // (NOT `hover_overlay`): while the rail is open the button
+                // must read "already pressed" under the pointer instead of
+                // flickering between two different fills on enter/leave.
                 let active_bg = self.theme.bg_panel_alt;
                 let mut btn = div()
                     .id("diff-rail-toggle")
@@ -2353,7 +2357,7 @@ fn failed_state(
                 .border_color(rctx.theme.border_inactive)
                 .rounded(px(4.0))
                 .cursor_pointer()
-                .hover(|s| s.bg(rctx.theme.bg_panel_alt))
+                .hover(|s| s.bg(rctx.theme.hover_overlay))
                 .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {
                     view.retry(cx);
                     cx.notify();

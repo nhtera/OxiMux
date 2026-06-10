@@ -180,7 +180,7 @@ fn render_header(
                 .px(px(6.0))
                 .rounded(px(density.r_chip))
                 .text_color(theme.status_error)
-                .hover(|s| s.bg(theme.bg_panel_alt))
+                .hover(|s| s.bg(theme.hover_overlay))
                 .cursor_pointer()
                 .child("Fix failing")
                 .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
@@ -197,7 +197,7 @@ fn render_header(
             .px(px(6.0))
             .rounded(px(density.r_chip))
             .text_color(theme.fg_muted)
-            .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+            .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
             .cursor_pointer()
             .child("Refresh")
             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {

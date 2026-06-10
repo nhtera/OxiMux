@@ -423,7 +423,7 @@ fn render_row(
 
     // Row chrome states (mirrors the convention used in source-control rows):
     //   - idle           → transparent (no bg)
-    //   - hover          → bg_panel_alt
+    //   - hover          → hover_overlay (alpha-white transient lift)
     //   - selected only  → bg_panel_alt + 1px border_active hairline so the
     //                      click feedback survives without overpainting hover
     //   - active editor  → theme.selection (the same blue used for text
@@ -449,7 +449,7 @@ fn render_row(
                 .border_color(theme.border_active)
         })
         .when(!is_sentinel && !is_active && !is_selected, |s| {
-            s.hover(|h| h.bg(theme.bg_panel_alt))
+            s.hover(|h| h.bg(theme.hover_overlay))
         })
         .child(chevron_el)
         .child(icon_el)

@@ -108,7 +108,7 @@ fn action_card(
         .rounded(px(density.r_card))
         .border_1()
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt).border_color(theme.border_active))
+        .hover(|s| s.bg(theme.hover_overlay).border_color(theme.border_active))
         .on_mouse_down(
             MouseButton::Left,
             move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {

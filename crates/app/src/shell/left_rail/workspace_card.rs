@@ -231,7 +231,7 @@ pub fn render_workspace_card(
             .border_color(theme.border_inactive)
             .bg(plan.row.bg)
     } else {
-        base.bg(plan.row.bg).hover(|s| s.bg(theme.bg_panel_alt))
+        base.bg(plan.row.bg).hover(|s| s.bg(theme.hover_overlay))
     };
 
     let card = shell

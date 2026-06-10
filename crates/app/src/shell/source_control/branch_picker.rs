@@ -574,7 +574,7 @@ fn rendered_row(
         .text_size(px(typography.t_body_md))
         .text_color(theme.fg_base)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {

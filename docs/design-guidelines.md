@@ -32,7 +32,7 @@ in the UI. This keeps the eye on the diff, terminal, and agent output — not ch
 |---|---|---|
 | `bg_base` | `#0E0F11` | Window background, dock empty area |
 | `bg_panel` | `#15171A` | Sidebar, status bar, panel backgrounds |
-| `bg_panel_alt` | `#1B1E22` | Hover, selected row, nested panel |
+| `bg_panel_alt` | `#1B1E22` | Selected row, nested panel (persistent fills — transient hover moved to `hover_overlay`) |
 | `bg_overlay` | `#22262B` | Tooltip, popover, command palette, context menu |
 | `fg_base` | `#E6E8EB` | Body text |
 | `fg_muted` | `#9AA0A6` | Labels, secondary text, inactive tabs |
@@ -40,6 +40,7 @@ in the UI. This keeps the eye on the diff, terminal, and agent output — not ch
 | `border_inactive` | white @ 8% alpha | Pane dividers, card edges — composites over any layer as a hairline catching light, not a flat grey line |
 | `border_active` | `#3A4047` | Focused pane border, popover outline (solid — focus must stay unambiguous against the faint dividers) |
 | `edge_highlight` | white @ 6% alpha | 1px top inner-highlight on floating surfaces — reads as elevation without a shadow |
+| `hover_overlay` | white @ 6% alpha | Transient hover fill on rows/cards/menu items — composites to a uniform brightness step over any surface tier (a flat hex hover read inverted on overlay cards). Hover ONLY; selected/persistent fills stay `bg_panel_alt` |
 | `selection` | `#2D3A4D` | Text selection background; also "currently-open" row tint |
 | `focus_ring` | `#4A6E9C` | Keyboard focus outline |
 | `match_bg_current` | `#D9A441` | Cycled "you-are-here" search match (Cmd+F) |
@@ -124,7 +125,8 @@ for a new hex value.
 |---|---|---|
 | Canvas | `bg_base` | Window background only |
 | Panel surface | `bg_panel` | Sidebar, file tree, SCM panel, status bar |
-| Raised / hover | `bg_panel_alt` | Row hover, alternating rows, selected row |
+| Raised (persistent) | `bg_panel_alt` | Alternating rows, selected row, nested panel fills |
+| Hover (transient) | `hover_overlay` | Row/card/menu-item hover on every surface tier |
 | Floating surface | `bg_overlay` | Pickers, context menus, dialogs |
 | Body text | `fg_base` | Primary text in any surface |
 | Secondary text | `fg_muted` | Labels, sub-rows, inactive tabs |
@@ -144,7 +146,7 @@ results, picker rows, left-rail workspace rows).
 | State | Background | Foreground | Extra |
 |---|---|---|---|
 | Idle | transparent | `fg_base` | — |
-| Hover | `bg_panel_alt` | `fg_base` | — |
+| Hover | `hover_overlay` | `fg_base` | alpha-white — same perceived step on panel, rail, and overlay surfaces |
 | Selected (click) | `bg_panel_alt` | `fg_base` | 1px `border_active` outline |
 | Active / current (persistent) | `selection` | `fg_base` | — |
 

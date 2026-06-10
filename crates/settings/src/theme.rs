@@ -26,6 +26,16 @@ pub struct Theme {
     pub selection: Hsla,
     pub focus_ring: Hsla,
 
+    /// Transient hover fill for interactive rows, cards, and menu items.
+    /// White at low alpha so the same token composites into a uniform
+    /// perceived brightness step over ANY surface tier (`bg_base`,
+    /// `bg_panel`, `bg_overlay`) — a flat hex swap reads correct on one
+    /// layer and inverted on a lighter one (it DARKENED rows on overlay
+    /// cards). Hover only; persistent fills (selected row, nested panel)
+    /// stay on `bg_panel_alt` so hover and selection remain two visibly
+    /// different states.
+    pub hover_overlay: Hsla,
+
     /// Non-interactive 1px top edge painted on floating surfaces (popovers,
     /// pickers, dialogs, menus, toasts). White at very low alpha so it reads
     /// as a physical edge catching light — conveying elevation without a
@@ -103,6 +113,11 @@ impl Theme {
             border_active: rgb(0x3A4047).into(),
             selection: rgb(0x2D3A4D).into(),
             focus_ring: rgb(0x4A6E9C).into(),
+
+            // Currently the same value as `edge_highlight` by coincidence,
+            // not by contract — hover strength and edge-elevation strength
+            // are independent knobs; tune them separately.
+            hover_overlay: Hsla { h: 0., s: 0., l: 1., a: 0.06 },
 
             edge_highlight: Hsla { h: 0., s: 0., l: 1., a: 0.06 },
 
@@ -201,6 +216,17 @@ mod tests {
     fn git_decorations_ignored_matches_fg_subtle() {
         let t = Theme::charcoal();
         assert_eq!(t.git.ignored, t.fg_subtle);
+    }
+
+    #[test]
+    fn hover_overlay_is_alpha_white() {
+        // Hover must composite over any surface tier — a flat (opaque)
+        // value regresses to the "darkens rows on overlay cards" bug the
+        // token exists to fix. Pin white hue + sub-10% alpha.
+        let t = Theme::charcoal();
+        assert_eq!(t.hover_overlay.l, 1.0);
+        assert_eq!(t.hover_overlay.s, 0.0);
+        assert!(t.hover_overlay.a > 0.0 && t.hover_overlay.a < 0.10);
     }
 
     #[test]

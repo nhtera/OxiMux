@@ -943,7 +943,7 @@ fn render_tab_chip(
         .cursor_pointer()
         .relative()
         .when(!is_active, |s| {
-            s.hover(|s| s.text_color(theme.fg_base).bg(theme.bg_panel_alt))
+            s.hover(|s| s.text_color(theme.fg_base).bg(theme.hover_overlay))
         })
         .when_some(color_bar, |s, bar| s.child(bar))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
@@ -1218,7 +1218,7 @@ fn pane_actions_button(entity_id_raw: u64, is_focused: bool, theme: Theme) -> im
         .overflow_hidden()
         .opacity(opacity)
         .cursor_pointer()
-        .when(is_focused, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
+        .when(is_focused, |s| s.hover(|s| s.bg(theme.hover_overlay)))
         .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
             let pos = ev.position;
             window.dispatch_action(
@@ -1258,7 +1258,7 @@ fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
         .justify_center()
         .flex_shrink_0()
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
             window.dispatch_action(
                 Box::new(RequestOpenAdapterPicker {
@@ -1424,7 +1424,7 @@ fn close_button(
         .cursor_pointer()
         .opacity(initial_opacity)
         .group_hover(group_name, |s| s.opacity(1.0))
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
             let entity = entity.clone();
             entity.update(cx, |this, cx| this.close_tab(ix, window, cx));

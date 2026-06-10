@@ -322,7 +322,7 @@ pub fn render_workspace_row(
             .border_color(theme.border_inactive)
             .bg(plan.bg)
     } else {
-        base.bg(plan.bg).hover(|s| s.bg(theme.bg_panel_alt))
+        base.bg(plan.bg).hover(|s| s.bg(theme.hover_overlay))
     };
     shell
         .child(

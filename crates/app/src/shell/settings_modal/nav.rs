@@ -143,7 +143,7 @@ fn nav_row(
         .when(selected, |s| {
             s.bg(theme.bg_panel_alt).font_weight(typography.w_medium)
         })
-        .when(!selected, |s| s.hover(|h| h.text_color(theme.fg_base).bg(theme.bg_panel_alt)))
+        .when(!selected, |s| s.hover(|h| h.text_color(theme.fg_base).bg(theme.hover_overlay)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _ev, _window, cx| this.select_pane(pane, cx)),

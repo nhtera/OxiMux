@@ -517,7 +517,7 @@ where
     if enabled {
         row = row
             .cursor_pointer()
-            .hover(|s| s.bg(theme.bg_panel_alt))
+            .hover(|s| s.bg(theme.hover_overlay))
             .on_mouse_down(MouseButton::Left, on_click);
     }
     row
@@ -547,7 +547,7 @@ where
         .text_size(px(typography.t_body_md))
         .text_color(theme.status_error)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label)
 }

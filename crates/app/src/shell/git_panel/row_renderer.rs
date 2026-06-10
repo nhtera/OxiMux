@@ -313,7 +313,7 @@ pub(super) fn row(
         .bg(bg)
         .text_size(px(sc_style::BODY_TEXT))
         .text_color(rctx.theme.fg_base)
-        .when(!is_selected, |s| s.hover(|s| s.bg(theme.bg_panel_alt)))
+        .when(!is_selected, |s| s.hover(|s| s.bg(theme.hover_overlay)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |panel, ev: &MouseDownEvent, window, cx| {

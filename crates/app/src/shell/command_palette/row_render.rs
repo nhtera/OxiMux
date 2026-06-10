@@ -119,7 +119,7 @@ fn row_shell(selected: bool, theme: Theme) -> gpui::Div {
         .px(px(10.))
         .rounded(px(ROW_RADIUS))
         .when(selected, |d| d.bg(theme.selection))
-        .when(!selected, |d| d.hover(|s| s.bg(theme.bg_panel_alt)))
+        .when(!selected, |d| d.hover(|s| s.bg(theme.hover_overlay)))
 }
 
 /// Keybinding rendered as a faint inset chip (one pill for the whole combo,

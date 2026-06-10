@@ -168,7 +168,7 @@ fn folder_row(
         .text_size(px(sc_style::BODY_TEXT))
         .text_color(theme.fg_base)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |panel, ev: &MouseDownEvent, _window, cx| {

@@ -149,7 +149,7 @@ impl Render for ProjectRowMenu {
                 .px(px(ROW_PADDING_X))
                 .rounded(px(density.r_xs))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.bg_panel_alt))
+                .hover(|s| s.bg(theme.hover_overlay))
                 .text_size(px(typography.t_body_md))
                 .text_color(fg)
                 .child(action.label())

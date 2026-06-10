@@ -71,7 +71,7 @@ pub(super) fn paint_file_row(
         .pr(px(8.0))
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_base)
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |me, _: &MouseDownEvent, _window, cx| {
@@ -163,7 +163,7 @@ pub(super) fn paint_match_row(
         .pl(px(ROW_INDENT + 14.0))
         .pr(px(8.0))
         .text_size(px(typography.t_body_sm))
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |me, _: &MouseDownEvent, _window, _cx| {

@@ -206,7 +206,7 @@ fn toggle_pill(
         .border_color(border)
         .bg(bg)
         .text_color(fg)
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
         .on_mouse_down(
             MouseButton::Left,
@@ -258,7 +258,7 @@ fn clear_slot(
         .h(px(TOGGLE_SIZE_PX))
         .rounded(px(density.r_chip))
         .text_color(theme.fg_muted)
-        .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+        .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
         .tooltip(move |window, cx| Tooltip::new("Clear").build(window, cx))
         .on_mouse_down(
             MouseButton::Left,

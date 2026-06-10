@@ -422,7 +422,7 @@ impl AddProjectDialog {
             .border_color(theme.border_inactive)
             .rounded(px(density.r_card))
             .cursor_pointer()
-            .hover(|s| s.bg(theme.bg_panel_alt))
+            .hover(|s| s.bg(theme.hover_overlay))
             .child(
                 div()
                     .text_size(px(typography.t_body_md))

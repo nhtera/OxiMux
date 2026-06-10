@@ -293,7 +293,7 @@ fn dir_row(
     } else {
         "icons/chevron-down.svg"
     };
-    let hover_bg = theme.bg_panel_alt;
+    let hover_bg = theme.hover_overlay;
     div()
         .id(id)
         .flex()
@@ -342,7 +342,7 @@ fn file_row(
     weak: WeakEntity<DiffView>,
 ) -> gpui::Stateful<gpui::Div> {
     let id = ElementId::Name(format!("diff-rail-row-{file_idx}").into());
-    let hover_bg = theme.bg_panel_alt;
+    let hover_bg = theme.hover_overlay;
     let mut row = div()
         .id(id)
         .flex()

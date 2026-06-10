@@ -357,7 +357,7 @@ fn build_header(
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
             // `update` + outer `window` — `update_in` does a with_window
             // lookup that returns Err from a mouse callback context.

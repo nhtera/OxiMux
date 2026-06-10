@@ -168,7 +168,7 @@ pub(super) fn render_commit_row(
         .w_full()
         .overflow_hidden()
         .cursor_pointer()
-        .hover(|s| s.bg(theme.bg_panel_alt))
+        .hover(|s| s.bg(theme.hover_overlay))
         .child(timeline.self_stretch())
         .child(subject)
         .when_some(chips, |row, chips| row.child(chips))

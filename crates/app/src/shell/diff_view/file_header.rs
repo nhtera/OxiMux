@@ -110,7 +110,7 @@ pub fn file_header_row(
     let id = gpui::ElementId::Name(format!("diff-header-{kind}-{file_idx}").into());
     let copy_id = gpui::ElementId::Name(format!("diff-header-copy-{kind}-{file_idx}").into());
     let copy_path = path.clone();
-    let hover_bg = theme.bg_panel_alt;
+    let hover_bg = theme.hover_overlay;
     let chevron = if folded {
         "icons/chevron-right.svg"
     } else {

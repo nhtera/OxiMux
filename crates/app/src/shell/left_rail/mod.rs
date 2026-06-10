@@ -584,7 +584,7 @@ fn sort_mode_chip(
         .cursor_pointer()
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_subtle)
-        .hover(|s| s.bg(theme.bg_panel_alt).text_color(theme.fg_base))
+        .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
         .tooltip(|window, cx| {
             gpui_component::tooltip::Tooltip::new("Sort: Smart → Recent → Manual")
                 .build(window, cx)
