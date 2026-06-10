@@ -61,16 +61,19 @@ impl Render for SidebarResizeGhost {
 /// Build the vertical drag handle for the left edge of the sidebar.
 /// The visible stripe is `HANDLE_STRIPE_PX` wide and centered inside
 /// a `HANDLE_STRIPE_PX + 2 * HANDLE_HIT_PAD_PX` hitbox; cursor
-/// `col_resize` engages on hover.
-pub fn build_handle(window_width: f32) -> AnyElement {
+/// `col_resize` engages on hover, and the stripe tints while the hit
+/// area is hovered so the grabbable edge announces itself.
+pub fn build_handle(window_width: f32, theme: oximux_settings::Theme) -> AnyElement {
     let stripe = div()
         .h_full()
         .w(px(HANDLE_STRIPE_PX))
-        .flex_shrink_0();
+        .flex_shrink_0()
+        .group_hover("right-sidebar-resize", move |s| s.bg(theme.border_active));
     div()
         .id(ElementId::Name(SharedString::from(
             "right-sidebar-resize-handle",
         )))
+        .group("right-sidebar-resize")
         .flex()
         .flex_row()
         .items_center()

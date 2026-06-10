@@ -42,7 +42,7 @@ const CARD_HEIGHT: f32 = 120.0;
 /// Fallback name when `path.file_name()` returns None.
 const FALLBACK_PROJECT_NAME: &str = "untitled";
 /// Branch stored at insert time; real HEAD detection lands later.
-const DEFAULT_BRANCH_PLACEHOLDER: &str = "main";
+pub(crate) const DEFAULT_BRANCH_PLACEHOLDER: &str = "main";
 
 /// Owner callback fired after a project is added (Browse or Clone).
 pub type OnPick = Box<dyn Fn(Project, &mut Window, &mut App) + Send + 'static>;
@@ -523,7 +523,7 @@ impl AddProjectDialog {
     }
 }
 
-fn name_from_path(path: &Path) -> String {
+pub(crate) fn name_from_path(path: &Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())

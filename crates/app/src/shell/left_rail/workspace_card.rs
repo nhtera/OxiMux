@@ -161,7 +161,13 @@ pub fn render_workspace_card(
     });
 
     // Diff chip: "+A −B" using status_added / status_removed colors.
-    let diff_elem = plan.diff.as_ref().map(|d| {
+    // Clean worktrees (0/0) suppress the chip — an all-zero stat row is
+    // noise on every resting workspace.
+    let diff_elem = plan
+        .diff
+        .as_ref()
+        .filter(|d| d.added > 0 || d.removed > 0)
+        .map(|d| {
         div()
             .flex()
             .flex_row()

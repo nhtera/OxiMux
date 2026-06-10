@@ -384,6 +384,33 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Register a folder dropped onto the left rail and make it the active
+    /// project. Same registration path as the add-project dialog —
+    /// `insert_or_touch` is idempotent, so dropping an already-known root
+    /// just re-activates it.
+    pub(crate) fn add_project_from_drop(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_str = path.to_string_lossy().to_string();
+        let name = crate::shell::add_project_dialog::name_from_path(&path);
+        match self.app_state.project_repo.insert_or_touch(
+            &name,
+            &path_str,
+            crate::shell::add_project_dialog::DEFAULT_BRANCH_PLACEHOLDER,
+        ) {
+            Ok(project) => {
+                self.refresh_recent_projects();
+                self.set_active_project(project, window, cx);
+            }
+            Err(err) => {
+                tracing::warn!(?err, path = %path_str, "dropped-folder registration failed");
+            }
+        }
+    }
+
     /// Push hidden-state to every project's terminals except `active_id`, so a
     /// background project's tabs throttle their PTY poll even though their
     /// `ProjectPanes` is no longer in the render tree (the per-render

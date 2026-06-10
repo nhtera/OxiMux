@@ -40,10 +40,18 @@ impl Render for LeftRailResizeGhost {
 }
 
 /// Build the vertical drag handle for the right edge of the rail.
-pub fn build_handle() -> AnyElement {
-    let stripe = div().h_full().w(px(HANDLE_STRIPE_PX)).flex_shrink_0();
+/// The stripe is invisible at rest and tints while the hit area is
+/// hovered, so the grabbable edge announces itself without adding a
+/// permanent line to the rail border.
+pub fn build_handle(theme: oximux_settings::Theme) -> AnyElement {
+    let stripe = div()
+        .h_full()
+        .w(px(HANDLE_STRIPE_PX))
+        .flex_shrink_0()
+        .group_hover("left-rail-resize", move |s| s.bg(theme.border_active));
     div()
         .id(ElementId::Name(SharedString::from("left-rail-resize-handle")))
+        .group("left-rail-resize")
         .flex()
         .flex_row()
         .items_center()

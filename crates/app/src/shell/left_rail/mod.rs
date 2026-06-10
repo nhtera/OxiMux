@@ -32,9 +32,9 @@ pub mod workspace_row;
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, UniformListScrollHandle,
-    WeakEntity, Window, div, px, svg,
+    AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, WeakEntity, Window, div, px, svg,
 };
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
@@ -394,15 +394,42 @@ impl Render for LeftRail {
             .child(div().flex_1().w_full().child(content_body))
             .child(render_toolbar(theme, density, &typography));
 
+        let weak_root_for_drop = self.weak_root.clone();
         div()
+            .id("left-rail-root")
             .flex()
             .flex_row()
             .h_full()
             .w(self.width)
             .border_r_1()
             .border_color(theme.border_inactive)
+            // OS-native folder drop target: tint while a directory drag
+            // hovers the rail, register + activate the folder(s) on drop.
+            // File (non-directory) drops are ignored.
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                style.bg(Hsla {
+                    a: 0.4,
+                    ..theme.selection
+                })
+            })
+            .on_drop::<gpui::ExternalPaths>(move |payload, window, cx| {
+                let dirs: Vec<std::path::PathBuf> = payload
+                    .paths()
+                    .iter()
+                    .filter(|p| p.is_dir())
+                    .cloned()
+                    .collect();
+                if dirs.is_empty() {
+                    return;
+                }
+                let _ = weak_root_for_drop.update(cx, |root, cx| {
+                    for dir in dirs {
+                        root.add_project_from_drop(dir, window, cx);
+                    }
+                });
+            })
             .child(body)
-            .child(resize::build_handle())
+            .child(resize::build_handle(theme))
     }
 }
 
