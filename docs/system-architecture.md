@@ -496,6 +496,14 @@ set_active_project (pre-paint, zero relay RPCs)
 
 Boot timing is logged on every launch: `boot: db open + state hydrate`, `boot: relay supervisor handshake`, `project panes built (pre-paint, no relay RPCs)`, `post-paint pty attach reconcile done`.
 
+### Disk scrollback checkpoints (cold restore after daemon death)
+
+The relay daemon checkpoints each PTY's replay ring to `<runtime dir>/checkpoints/<pty_id>/{meta.json,scrollback.bin}` every 5 s (atomic tmp+rename, skipped when `bytes_out` hasn't moved) and **removes** the checkpoint on every clean end — deliberate `Close` and natural child exit. Whatever remains on disk is therefore an unclean death (daemon crash, SIGKILL, host reboot).
+
+The wire protocol is untouched: the app reads checkpoints straight off disk. When the reconcile's warm attach fails and a slot cold-spawns, the background executor looks up the raw persisted hint's checkpoint and, after `adopt_live_session`, prefills the pane grid with: clear screen → alt-screen-truncated scrollback tail (≤ 512 KiB) → dim `--- session restored ---` marker → terminal mode reset (`relay_cold_restore.rs`). The checkpoint is deleted only after successful delivery, so a quit mid-reconcile can still restore on the next launch; orphans fall to the daemon's 7-day boot GC.
+
+This path is distinct from routine restore, which stays replay-free (the no-grid-replay invariant above is unchanged): cold restore trades reflow perfection for not losing the scrollback entirely, and the marker makes clear the content is history, not live state. `prefill_grid` ends with `clear_collected`, so query auto-replies recorded in the crashed session can't reach the new shell's stdin.
+
 ---
 
 ## Shell context env — SurfaceIds (mux-P4)
