@@ -6,7 +6,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ### 2026-06-12 — Notification system overhaul, agent-awake service, Notifications settings pane
 
-**Commits**: 00eea1f  
+**Commits**: `aeaaada`  
 **Touches**: `crates/app/src/notifier/` (mac.rs, mod.rs, null.rs), `crates/app/src/agent_awake.rs` (NEW), `crates/app/src/shell/settings_modal/` (Notifications pane NEW), `scripts/bundle-macos.sh`
 
 Replaces the deprecated `NSUserNotification` backend and wires a full notification dispatch stack:
