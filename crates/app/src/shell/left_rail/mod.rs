@@ -439,13 +439,15 @@ impl Render for LeftRail {
         };
 
         // Body fills the column minus the right-edge resize handle.
+        // The rail surface is painted by the ROOT row (not here) so the
+        // resize-handle column shares it — an unfilled handle column
+        // reads as a dark gutter against the lifted rail.
         let body = div()
             .flex()
             .flex_col()
             .h_full()
             .flex_1()
             .min_w_0()
-            .bg(theme.bg_rail)
             .child(render_nav_section(
                 self.active_nav,
                 self.agents_unread,
@@ -465,6 +467,7 @@ impl Render for LeftRail {
             .flex_row()
             .h_full()
             .w(self.width)
+            .bg(theme.bg_rail)
             .border_r_1()
             .border_color(theme.border_inactive)
             // OS-native folder drop target: tint while a directory drag
