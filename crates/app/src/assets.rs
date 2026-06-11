@@ -23,6 +23,11 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/git-branch.svg",
         include_bytes!("../assets/icons/git-branch.svg"),
     ),
+    // Locate glyph for the left rail's scroll-to-current-workspace button.
+    (
+        "icons/crosshair.svg",
+        include_bytes!("../assets/icons/crosshair.svg"),
+    ),
     // GitLab brand glyph for the Create-PR button — the upstream icon
     // catalog ships only a GitHub mark.
     (

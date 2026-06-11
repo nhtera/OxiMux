@@ -36,6 +36,21 @@ pub struct AgentRow {
     pub is_live: bool,
 }
 
+/// True for states a user should come look at: the session is blocked on
+/// them (approval / input) or has stopped (done / failed / interrupted) —
+/// the boolean companion of `attention_rank`'s tiers 0/3/4. Drives the
+/// unread badge on the Agents nav row.
+pub fn needs_attention(status: &AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::NeedsApproval(_)
+            | AgentStatus::WaitingForInput
+            | AgentStatus::Done { .. }
+            | AgentStatus::Failed(_)
+            | AgentStatus::Interrupted
+    )
+}
+
 /// Attention tier for sorting. Lower = higher priority (floats to top).
 ///
 /// Tiers:
@@ -150,6 +165,19 @@ mod tests {
 
     fn t() -> Theme {
         Theme::charcoal()
+    }
+
+    #[test]
+    fn needs_attention_matches_blocked_and_terminal_states() {
+        // Blocked-on-user and stopped states badge; in-flight states don't.
+        assert!(needs_attention(&AgentStatus::NeedsApproval("x".into())));
+        assert!(needs_attention(&AgentStatus::WaitingForInput));
+        assert!(needs_attention(&AgentStatus::Done { code: Some(0) }));
+        assert!(needs_attention(&AgentStatus::Done { code: None }));
+        assert!(needs_attention(&AgentStatus::Failed("boom".into())));
+        assert!(needs_attention(&AgentStatus::Interrupted));
+        assert!(!needs_attention(&AgentStatus::Running));
+        assert!(!needs_attention(&AgentStatus::Idle));
     }
 
     fn project(id: &str, name: &str) -> Project {

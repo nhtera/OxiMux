@@ -33,8 +33,8 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::{
     AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled,
-    UniformListScrollHandle, WeakEntity, Window, div, px, svg,
+    MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle, StatefulInteractiveElement,
+    Styled, UniformListScrollHandle, WeakEntity, Window, div, px, svg,
 };
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
@@ -45,7 +45,7 @@ use crate::shell::left_rail::workspace_row::DiffCounts;
 use crate::left_rail_layout;
 
 use crate::actions::OpenProjectPicker;
-use crate::shell::agents_dashboard::model::attention_rank;
+use crate::shell::agents_dashboard::model::{attention_rank, needs_attention};
 use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
@@ -103,6 +103,18 @@ pub struct LeftRail {
     /// Scroll position for the agents dashboard `uniform_list`. Stored on
     /// `LeftRail` so it survives re-renders while the Agents nav is active.
     agents_scroll: UniformListScrollHandle,
+    /// Scroll position for the home workspace list (children = project
+    /// groups). Drives the scroll-to-current-workspace affordance.
+    list_scroll: ScrollHandle,
+    /// Bumped by `scroll_to_active`; the active card keys its locate-glow
+    /// animation on this so each click replays the glow exactly once.
+    /// 0 = never triggered (no animation mounts).
+    locate_glow_seq: u64,
+    /// Agent sessions that entered an attention/terminal state while the
+    /// Agents page was NOT open. Shown as a badge on the Agents nav row;
+    /// zeroed when the page is opened. Lives here (not on the dashboard
+    /// view) because the rail entity survives project switches.
+    agents_unread: u32,
     /// Tasks page entity (GitHub issue/PR browser), mounted when the Tasks nav
     /// is active. Owns its own async fetch + filter state.
     tasks_view: Entity<TasksView>,
@@ -136,8 +148,28 @@ impl LeftRail {
             collapsed: HashSet::new(),
             sort_mode: WorkspaceSortMode::default(),
             agents_scroll: UniformListScrollHandle::new(),
+            list_scroll: ScrollHandle::new(),
+            locate_glow_seq: 0,
+            agents_unread: 0,
             tasks_view,
         }
+    }
+
+    /// Scroll the workspace list so the active project's group is in view
+    /// and replay the locate glow on the active card. Reduced motion skips
+    /// the glow — the scroll landing on the (already raised) active card
+    /// is sufficient locate feedback.
+    pub(crate) fn scroll_to_active(&mut self, cx: &mut Context<Self>) {
+        let Some(active_id) = self.active_project_id.as_deref() else {
+            return;
+        };
+        if let Some(ix) = self.projects.iter().position(|p| p.id == active_id) {
+            self.list_scroll.scroll_to_item(ix);
+        }
+        if !crate::motion_settings::active(cx).reduced {
+            self.locate_glow_seq += 1;
+        }
+        cx.notify();
     }
 
     /// Install the settings store + load persisted layout (width +
@@ -232,8 +264,29 @@ impl LeftRail {
         cx: &mut Context<Self>,
     ) {
         let project_changed = self.active_project_id != active_project_id;
+        // Unread accounting BEFORE the snapshot swap: any workspace whose
+        // status TRANSITIONED into an attention/terminal state while the
+        // Agents page is closed bumps the nav badge. Comparing against the
+        // previous snapshot (not absolute states) means a long-finished
+        // session doesn't re-count on every refresh.
+        if self.active_nav != Some(NavItem::Agents) {
+            for (ws_id, status) in &latest_status {
+                let was = self.latest_status.get(ws_id).cloned().flatten();
+                if status.as_ref() != was.as_ref()
+                    && status.as_ref().is_some_and(needs_attention)
+                {
+                    self.agents_unread = self.agents_unread.saturating_add(1);
+                }
+            }
+        }
         self.projects = projects;
         self.active_project_id = active_project_id;
+        // A locate glow is scoped to the workspace it was triggered on —
+        // reset on switch so the NEXT active card doesn't replay it
+        // uninvited (a fresh tree position would re-run the animation).
+        if self.active_workspace_id != active_workspace_id {
+            self.locate_glow_seq = 0;
+        }
         self.active_workspace_id = active_workspace_id;
         self.workspaces_by_project = workspaces_by_project;
         self.latest_status = latest_status;
@@ -300,6 +353,9 @@ impl LeftRail {
         } else {
             Some(item)
         };
+        if self.active_nav == Some(NavItem::Agents) {
+            self.agents_unread = 0;
+        }
         if self.active_nav == Some(NavItem::Tasks) {
             let active = self.active_project();
             self.tasks_view.update(cx, |tv, cx| {
@@ -355,6 +411,8 @@ impl Render for LeftRail {
                 self.live_worktrees.clone(),
                 self.diff_counts.clone(),
                 self.weak_root.clone(),
+                self.locate_glow_seq,
+                self.list_scroll.clone(),
                 theme,
                 density,
                 &typography,
@@ -371,7 +429,12 @@ impl Render for LeftRail {
                     density,
                     &typography,
                 ))
-                .child(div().flex_1().w_full().child(workspace_list))
+                // Scrollable list viewport. `min_h(0)` lets the flex child
+                // shrink below its content so overflow actually engages.
+                // The scroll handle itself is tracked on the list COLUMN
+                // (inside `render_workspace_list`, children = project
+                // groups) so `scroll_to_item` indexes project groups.
+                .child(div().flex_1().w_full().min_h(px(0.)).child(workspace_list))
                 .into_any_element()
         };
 
@@ -385,6 +448,7 @@ impl Render for LeftRail {
             .bg(theme.bg_rail)
             .child(render_nav_section(
                 self.active_nav,
+                self.agents_unread,
                 &entity,
                 theme,
                 density,
@@ -446,6 +510,8 @@ fn render_workspace_list(
     live_worktrees: HashSet<String>,
     diff_counts: HashMap<String, DiffCounts>,
     weak_root: WeakEntity<WorkspaceRoot>,
+    locate_glow_seq: u64,
+    list_scroll: ScrollHandle,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -454,7 +520,17 @@ fn render_workspace_list(
         return open_project_cta(theme, density, typography).into_any_element();
     }
 
-    let mut col = div().flex().flex_col().w_full();
+    // The column is the scroll container: its direct children are the
+    // project groups, so `ScrollHandle::scroll_to_item(project_index)`
+    // brings the active project's group into view.
+    let mut col = div()
+        .id("left-rail-workspace-list")
+        .flex()
+        .flex_col()
+        .w_full()
+        .h_full()
+        .overflow_y_scroll()
+        .track_scroll(&list_scroll);
     for project in projects {
         let workspaces = workspaces_by_project
             .get(&project.id)
@@ -507,6 +583,7 @@ fn render_workspace_list(
             weak_root.clone(),
             on_row_menu,
             on_project_menu,
+            locate_glow_seq,
             theme,
             density,
             typography,
@@ -563,8 +640,31 @@ fn workspace_header(
                 .text_color(theme.fg_muted)
                 .child("Projects"),
         )
+        .child(locate_active_icon(rail.clone(), theme))
         .child(sort_mode_chip(rail.clone(), sort_mode, theme, density, typography))
         .child(collapse_all_icon(rail.clone(), theme))
+}
+
+/// Scroll-to-current affordance: jumps the list to the active project's
+/// group and replays the locate glow on the active workspace card.
+fn locate_active_icon(rail: gpui::Entity<LeftRail>, theme: Theme) -> impl IntoElement {
+    div()
+        .id("workspaces-header-locate")
+        .cursor_pointer()
+        .text_color(theme.fg_muted)
+        .hover(|s| s.text_color(theme.fg_base))
+        .tooltip(|window, cx| {
+            gpui_component::tooltip::Tooltip::new("Scroll to current workspace").build(window, cx)
+        })
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
+            rail.update(cx, |r, cx| r.scroll_to_active(cx));
+        })
+        .child(
+            svg()
+                .path("icons/crosshair.svg")
+                .size(px(HEADER_ICON_SIZE))
+                .text_color(theme.fg_muted),
+        )
 }
 
 /// Sort-order toggle. A compact text chip showing the active mode; clicking

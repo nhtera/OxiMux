@@ -12,9 +12,11 @@
 //! (2 × `h_row` to fit two lines). Hover quick-actions (the "…" menu button)
 //! are preserved from the original row painter.
 
+use std::time::Duration;
+
 use gpui::{
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px, svg,
+    Animation, AnimationExt, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -28,6 +30,11 @@ use crate::shell::left_rail::workspace_row::{
 /// "Approved exceptions" table alongside `ROW_HEIGHT_MULT = 1.6`.
 const CARD_HEIGHT_MULT: f32 = 2.2;
 
+/// Locate-glow duration. Deliberately OUTSIDE the sub-200ms motion
+/// vocabulary: this is a one-shot "you are here" locator that must linger
+/// long enough to catch an eye that's still travelling from the button.
+const LOCATE_GLOW_MS: u64 = 1500;
+
 /// Render the rich two-line workspace card.
 ///
 /// `row_id` and `group_name` must be stable and unique per workspace — callers
@@ -39,6 +46,7 @@ pub fn render_workspace_card(
     row_id: SharedString,
     group_name: SharedString,
     show_menu: bool,
+    locate_glow_seq: u64,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -255,6 +263,30 @@ pub fn render_workspace_card(
         .children(trailing_btn)
         .on_mouse_down(MouseButton::Left, on_row_click);
 
+    // Locate glow: the scroll-to-current affordance replays a one-shot
+    // ring fade over the ACTIVE card, keyed on the bump sequence so it
+    // runs exactly once per trigger. Same recipe as the pane rim-flash:
+    // a dedicated absolute overlay animates its border alpha to zero and
+    // leaves no residue. seq == 0 means never triggered (and reduced
+    // motion never bumps the seq).
+    let glow_overlay = (plan.row.is_active && locate_glow_seq > 0).then(|| {
+        let ring = theme.focus_ring;
+        div()
+            .absolute()
+            .inset_0()
+            // Match the active card's inset + radius so the ring traces
+            // the card edge, not the full-width wrapper.
+            .mx(px(density.gap_inline))
+            .rounded(px(density.r_card))
+            .border_1()
+            .with_animation(
+                ElementId::NamedInteger("locate-glow".into(), locate_glow_seq),
+                Animation::new(Duration::from_millis(LOCATE_GLOW_MS))
+                    .with_easing(gpui::ease_out_quint()),
+                move |el, delta| el.border_color(Hsla { a: 1.0 - delta, ..ring }),
+            )
+    });
+
     // Outer wrapper carries the tint accent so it sits at a consistent
     // rail-left for every row (the active card's own margin doesn't shift it).
     div()
@@ -262,4 +294,5 @@ pub fn render_workspace_card(
         .w_full()
         .children(tint_bar)
         .child(card)
+        .children(glow_overlay)
 }

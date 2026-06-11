@@ -5,7 +5,7 @@
 
 use gpui::{
     App, Entity, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Styled, Window, div, px, svg,
+    Styled, Window, div, prelude::FluentBuilder as _, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -87,6 +87,7 @@ pub fn nav_row_icon_fg(item: NavItem, active: Option<NavItem>, theme: Theme) -> 
 
 pub fn render_nav_section(
     active: Option<NavItem>,
+    agents_unread: u32,
     rail: &Entity<LeftRail>,
     theme: Theme,
     density: Density,
@@ -94,9 +95,15 @@ pub fn render_nav_section(
 ) -> impl IntoElement {
     let mut col = div().flex().flex_col().w_full();
     for item in NavItem::ALL {
+        let badge = if item == NavItem::Agents {
+            agents_unread
+        } else {
+            0
+        };
         col = col.child(render_nav_row(
             item,
             active,
+            badge,
             rail.clone(),
             theme,
             density,
@@ -109,6 +116,7 @@ pub fn render_nav_section(
 fn render_nav_row(
     item: NavItem,
     active: Option<NavItem>,
+    badge: u32,
     rail: Entity<LeftRail>,
     theme: Theme,
     density: Density,
@@ -147,6 +155,23 @@ fn render_nav_row(
                 .text_color(fg)
                 .child(item.label()),
         )
+        .when(badge > 0, |row| {
+            // Unread chip — sessions that hit an attention/terminal state
+            // while this page was closed. Cleared when the page opens.
+            row.child(
+                div()
+                    .px(px(5.0))
+                    .rounded(px(density.r_chip))
+                    .bg(theme.bg_overlay)
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_muted)
+                    .child(if badge > 99 {
+                        "99+".to_string()
+                    } else {
+                        badge.to_string()
+                    }),
+            )
+        })
 }
 
 #[cfg(test)]
