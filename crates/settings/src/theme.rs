@@ -35,6 +35,12 @@ pub struct Theme {
     pub selection: Hsla,
     pub focus_ring: Hsla,
 
+    /// Resting border for text inputs — alpha-white like `border_inactive`
+    /// but strong enough to read as an affordance edge ("type here"), not
+    /// just a divider. The FOCUSED state keeps its existing solid
+    /// treatment so focus stays unambiguous.
+    pub border_input: Hsla,
+
     /// Transient hover fill for interactive rows, cards, and menu items.
     /// White at low alpha so the same token composites into a uniform
     /// perceived brightness step over ANY surface tier (`bg_base`,
@@ -132,6 +138,8 @@ impl Theme {
             // not by contract — hover strength and edge-elevation strength
             // are independent knobs; tune them separately.
             hover_overlay: Hsla { h: 0., s: 0., l: 1., a: 0.06 },
+
+            border_input: Hsla { h: 0., s: 0., l: 1., a: 0.15 },
 
             edge_highlight: Hsla { h: 0., s: 0., l: 1., a: 0.06 },
 
@@ -241,6 +249,17 @@ mod tests {
         assert_eq!(t.hover_overlay.l, 1.0);
         assert_eq!(t.hover_overlay.s, 0.0);
         assert!(t.hover_overlay.a > 0.0 && t.hover_overlay.a < 0.10);
+    }
+
+    #[test]
+    fn border_input_is_alpha_white() {
+        // Resting input borders must composite over any host surface and
+        // stay clearly stronger than the 8% hairline dividers.
+        let t = Theme::charcoal();
+        assert_eq!(t.border_input.l, 1.0);
+        assert_eq!(t.border_input.s, 0.0);
+        assert!(t.border_input.a > t.border_inactive.a);
+        assert!(t.border_input.a < 0.25);
     }
 
     #[test]

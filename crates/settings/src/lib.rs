@@ -17,7 +17,7 @@ pub mod typography;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
 pub use custom_commands::{CustomCommand, CustomCommandsFile, load_and_merge};
 pub use density::Density;
-pub use motion::Motion;
+pub use motion::{Motion, ease_out_spring};
 pub use project_scripts::{ProjectScripts, ScriptKind};
 pub use terminal::{BellStyle, TerminalSettings};
 pub use theme::{GitDecorations, Theme};

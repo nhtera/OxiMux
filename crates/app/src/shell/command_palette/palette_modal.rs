@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gpui::{
     Animation, AnimationExt, App, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, ease_out_quint, hsla, prelude::FluentBuilder,
+    StatefulInteractiveElement, Styled, Window, div, hsla, prelude::FluentBuilder,
     px,
 };
 use gpui_component::{Icon, IconName};
@@ -109,7 +109,7 @@ pub fn build_modal_layout(input: ModalRenderInput<'_>) -> gpui::Div {
         // motion collapses `m_overlay` to ~instant, so the card simply appears.
         .child(card.with_animation(
             "palette-enter",
-            Animation::new(motion.m_overlay).with_easing(ease_out_quint()),
+            Animation::new(motion.m_overlay).with_easing(oximux_settings::ease_out_spring()),
             |el, delta| el.opacity(delta).mt(px(6.0 * (1.0 - delta))),
         ))
 }

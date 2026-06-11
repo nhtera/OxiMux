@@ -168,9 +168,16 @@ impl ToastLayer {
         } else {
             (format!("toast-enter-{}", toast.id), motion.m_toast_in)
         };
+        // Enter rides the spring-tail open curve; exit keeps the plain
+        // quint fade so dismissal reads crisp, not springy.
+        let anim = if exiting {
+            Animation::new(dur).with_easing(ease_out_quint())
+        } else {
+            Animation::new(dur).with_easing(oximux_settings::ease_out_spring())
+        };
         card.with_animation(
             ElementId::Name(anim_id.into()),
-            Animation::new(dur).with_easing(ease_out_quint()),
+            anim,
             move |el, delta| {
                 if exiting {
                     el.opacity(1.0 - delta)

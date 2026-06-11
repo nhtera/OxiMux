@@ -63,13 +63,25 @@ pub fn nav_row_bg(item: NavItem, active: Option<NavItem>, theme: Theme) -> Hsla 
     }
 }
 
-/// Foreground (icon + label) color for a nav row. See [`nav_row_bg`] for the
+/// Foreground (label) color for a nav row. See [`nav_row_bg`] for the
 /// `active == None` (home) case.
 pub fn nav_row_fg(item: NavItem, active: Option<NavItem>, theme: Theme) -> Hsla {
     if active == Some(item) {
         theme.fg_base
     } else {
         theme.fg_muted
+    }
+}
+
+/// Icon color for a nav row — one step QUIETER than the label when
+/// inactive (`fg_subtle` vs the label's `fg_muted`), snapping to full
+/// strength with the label when active. The extra icon step is what
+/// telegraphs the active nav at a glance in a column of look-alike rows.
+pub fn nav_row_icon_fg(item: NavItem, active: Option<NavItem>, theme: Theme) -> Hsla {
+    if active == Some(item) {
+        theme.fg_base
+    } else {
+        theme.fg_subtle
     }
 }
 
@@ -103,6 +115,7 @@ fn render_nav_row(
     typography: &Typography,
 ) -> impl IntoElement {
     let fg = nav_row_fg(item, active, theme);
+    let icon_fg = nav_row_icon_fg(item, active, theme);
     let bg = nav_row_bg(item, active, theme);
 
     div()
@@ -125,7 +138,7 @@ fn render_nav_row(
             svg()
                 .path(item.icon_path())
                 .size(px(NAV_ICON_SIZE))
-                .text_color(fg),
+                .text_color(icon_fg),
         )
         .child(
             div()
@@ -217,6 +230,22 @@ mod tests {
         assert_eq!(
             nav_row_fg(NavItem::Tasks, Some(NavItem::Agents), t),
             t.fg_muted
+        );
+    }
+
+    #[test]
+    fn icon_sits_one_step_below_label_when_inactive() {
+        // Inactive icon must be QUIETER than the label (subtle < muted) so
+        // the active row's full-strength icon stands out in the column.
+        let t = Theme::charcoal();
+        assert_eq!(
+            nav_row_icon_fg(NavItem::Tasks, Some(NavItem::Agents), t),
+            t.fg_subtle
+        );
+        assert_eq!(nav_row_icon_fg(NavItem::Tasks, None, t), t.fg_subtle);
+        assert_eq!(
+            nav_row_icon_fg(NavItem::Tasks, Some(NavItem::Tasks), t),
+            t.fg_base
         );
     }
 

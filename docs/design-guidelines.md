@@ -42,6 +42,7 @@ in the UI. This keeps the eye on the diff, terminal, and agent output — not ch
 | `border_active` | `#3A4047` | Focused pane border, popover outline (solid — focus must stay unambiguous against the faint dividers) |
 | `edge_highlight` | white @ 6% alpha | 1px top inner-highlight on floating surfaces — reads as elevation without a shadow |
 | `hover_overlay` | white @ 6% alpha | Transient hover fill on rows/cards/menu items — composites to a uniform brightness step over any surface tier (a flat hex hover read inverted on overlay cards). Hover ONLY; selected/persistent fills stay `bg_panel_alt` |
+| `border_input` | white @ 15% alpha | Resting border on text inputs (routed through the gpui-component `colors.input` slot) — stronger than the hairline dividers so the type-here affordance reads; focused state keeps its existing solid treatment |
 | `selection` | `#2D3A4D` | Text selection background; also "currently-open" row tint |
 | `focus_ring` | `#4A6E9C` | Keyboard focus outline |
 | `match_bg_current` | `#D9A441` | Cycled "you-are-here" search match (Cmd+F) |
@@ -488,8 +489,15 @@ so reduced-motion is a single switch.
 | `m_toast_in` | 180ms | toast enter |
 | `m_toast_out` | 140ms | toast exit (crisper than enter) |
 
-Easing is `gpui::ease_out_quint()` at the call site — fast out of the gate, gentle
-settle (close to the reference `cubic-bezier(0.16, 1, 0.3, 1)`).
+**Easing vocabulary (two curves, split by direction):**
+
+- **OPENs** (overlay/palette/toast ENTER) use
+  `oximux_settings::ease_out_spring()` — exact `cubic-bezier(0.16, 1, 0.3, 1)`:
+  faster out of the gate than quint with a longer settle tail, so an opening
+  surface reads "snapped into place, then settled". Monotonic, never
+  overshoots (unit-test pinned).
+- **Everything else** (closes, exits, collapses, flashes) keeps
+  `gpui::ease_out_quint()` — dismissal and folding read crisp, not springy.
 
 **Rules**
 

@@ -159,9 +159,10 @@ fn main() {
         // Align the gpui-component Input border palette with OxiMux's
         // charcoal theme. Default `input`/`ring` are tuned for a light
         // shadcn-style page and read as "always focused" against our deep
-        // panel fill. `border_inactive` is the same color the rest of the
-        // shell uses for hairline edges, and `focus_ring` is the dedicated
-        // focus accent — same tokens, single source of truth.
+        // panel fill. Inputs rest on `border_input` (alpha-white, stronger
+        // than the hairline dividers so the type-here affordance reads),
+        // and `focus_ring` is the dedicated focus accent — same tokens,
+        // single source of truth.
         {
             let palette = oximux_settings::Theme::charcoal();
             // Read the OS auto-hide preference before taking the mutable global
@@ -171,7 +172,7 @@ fn main() {
             // `false` here.
             let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
             let component_theme = gpui_component::Theme::global_mut(cx);
-            component_theme.colors.input = palette.border_inactive;
+            component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
             // List scrollbars stay invisible until the pointer enters the
             // scroll region, then reveal thumb-only — quiet at rest, no
@@ -471,7 +472,7 @@ fn run_editor_spike() {
         {
             let palette = oximux_settings::Theme::charcoal();
             let component_theme = gpui_component::Theme::global_mut(cx);
-            component_theme.colors.input = palette.border_inactive;
+            component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
         }
         cx.activate(true);
@@ -537,6 +538,15 @@ fn run_file_tree_spike() {
     app.run(move |cx| {
         gpui_component::init(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        // Keep the spike's input chrome in step with the production init
+        // blocks above — debugging input styling in the spike must show
+        // the same borders the shipping window does.
+        {
+            let palette = oximux_settings::Theme::charcoal();
+            let component_theme = gpui_component::Theme::global_mut(cx);
+            component_theme.colors.input = palette.border_input;
+            component_theme.colors.ring = palette.focus_ring;
+        }
         cx.activate(true);
 
         let window_size = size(px(400.0), px(800.0));

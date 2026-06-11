@@ -89,3 +89,78 @@ impl Default for Motion {
 }
 
 impl Global for Motion {}
+
+/// Spring-tail easing for overlay/palette OPEN animations only —
+/// cubic-bezier(0.16, 1, 0.3, 1): faster out of the gate than
+/// `ease_out_quint` with a longer deceleration tail, so an opening
+/// surface reads "snapped into place, then settled". Closes and every
+/// other animation keep `gpui::ease_out_quint()` — the vocabulary split
+/// lives in `docs/design-guidelines.md` ("## Motion").
+pub fn ease_out_spring() -> impl Fn(f32) -> f32 {
+    |x| cubic_bezier_ease(0.16, 1.0, 0.3, 1.0, x)
+}
+
+/// Evaluate a CSS-style cubic-bezier timing curve at progress `x` (both
+/// axes 0..=1). Control x-coordinates within [0, 1] make x(t) monotonic,
+/// so a bisection solve for t is safe; ~20 iterations lands well under
+/// one output pixel of error for sub-200ms animations.
+fn cubic_bezier_ease(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let sample = |c1: f32, c2: f32, t: f32| {
+        let omt = 1.0 - t;
+        3.0 * omt * omt * t * c1 + 3.0 * omt * t * t * c2 + t * t * t
+    };
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let mut t = x;
+    for _ in 0..20 {
+        if sample(x1, x2, t) < x {
+            lo = t;
+        } else {
+            hi = t;
+        }
+        t = (lo + hi) * 0.5;
+    }
+    sample(y1, y2, t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spring_ease_endpoints_pin_exactly() {
+        let f = ease_out_spring();
+        assert_eq!(f(0.0), 0.0);
+        assert_eq!(f(1.0), 1.0);
+    }
+
+    #[test]
+    fn spring_ease_is_monotonic_and_never_overshoots() {
+        // Position-critical layouts ride this curve — it must never go
+        // above 1.0 (no bounce) and never move backwards.
+        let f = ease_out_spring();
+        let mut prev = 0.0f32;
+        for i in 0..=100 {
+            let y = f(i as f32 / 100.0);
+            assert!(y >= prev - 1e-4, "regressed at step {i}: {y} < {prev}");
+            assert!((0.0..=1.0 + 1e-4).contains(&y), "out of range at {i}: {y}");
+            prev = y;
+        }
+    }
+
+    #[test]
+    fn spring_ease_front_loads_motion() {
+        // The whole point of the curve: most of the travel happens early
+        // (fast start), the tail settles. At 20% time it must be well past
+        // half the distance, and it must sit above ease-out-quint's value
+        // early on.
+        let f = ease_out_spring();
+        assert!(f(0.2) > 0.55, "not front-loaded: f(0.2) = {}", f(0.2));
+        assert!(f(0.5) > 0.85, "tail not settling: f(0.5) = {}", f(0.5));
+    }
+}
