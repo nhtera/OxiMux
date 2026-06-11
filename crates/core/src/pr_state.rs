@@ -7,6 +7,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which forge object a pasted reference points at. Issues and PRs/MRs
+/// resolve through different CLI subcommands (`issue view` vs `pr`/`mr
+/// view`), so the parsed reference must carry the distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForgeRefKind {
+    Issue,
+    /// A GitHub pull request or GitLab merge request.
+    Pull,
+}
+
 /// The current branch's PR state. `None` covers both "no PR exists" and
 /// "can't tell" (forge CLI absent, parse failure) — callers treat the
 /// absence of a known state as "no PR", keeping PR controls usable.

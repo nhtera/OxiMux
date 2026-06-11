@@ -12,6 +12,7 @@
 
 pub mod github_gh;
 pub mod gitlab_glab;
+pub mod ref_parse;
 
 use std::path::Path;
 
@@ -148,6 +149,23 @@ impl Forge {
         } else {
             None
         }
+    }
+}
+
+/// Title of one issue / PR / MR through whichever forge backs the repo.
+/// `repo` overrides the target repository when the pasted URL names one.
+/// A free function (not a `ForgeProvider` method) — only the workspace
+/// prefill needs it, and the trait stays minimal.
+pub async fn fetch_ref_title(
+    forge: Forge,
+    cwd: &Path,
+    kind: oximux_core::ForgeRefKind,
+    number: u32,
+    repo: Option<&str>,
+) -> Option<String> {
+    match forge {
+        Forge::Github(_) => oximux_git::gh::item_title(cwd, kind, number, repo).await,
+        Forge::Gitlab(_) => oximux_git::glab::item_title(cwd, kind, number, repo).await,
     }
 }
 

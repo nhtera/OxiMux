@@ -246,3 +246,29 @@ fn display_row_separator_is_not_selectable() {
     );
     assert!(DisplayRow::CreateFromHead("x".into()).is_selectable());
 }
+
+#[test]
+fn build_rows_caps_branches_with_more_hint() {
+    use oximux_app::shell::source_control::branch_picker::MAX_BRANCH_ROWS;
+    let cands: Vec<String> = (0..20).map(|i| format!("feature-{i:02}")).collect();
+    let rows = build_rows(PickerMode::Switch, &cands, None, "");
+    let branch_rows = rows
+        .iter()
+        .filter(|r| matches!(r, DisplayRow::Branch { .. }))
+        .count();
+    assert_eq!(branch_rows, MAX_BRANCH_ROWS);
+    assert!(rows.contains(&DisplayRow::MoreHint(20 - MAX_BRANCH_ROWS)));
+    // The hint never participates in keyboard navigation.
+    assert!(!DisplayRow::MoreHint(3).is_selectable());
+    assert_eq!(DisplayRow::MoreHint(3).outcome(), None);
+}
+
+#[test]
+fn build_rows_no_hint_at_or_under_cap() {
+    use oximux_app::shell::source_control::branch_picker::MAX_BRANCH_ROWS;
+    let cands: Vec<String> = (0..MAX_BRANCH_ROWS)
+        .map(|i| format!("b-{i:02}"))
+        .collect();
+    let rows = build_rows(PickerMode::Switch, &cands, None, "");
+    assert!(!rows.iter().any(|r| matches!(r, DisplayRow::MoreHint(_))));
+}

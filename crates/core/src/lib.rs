@@ -33,7 +33,7 @@ pub use git_state::{
     RenameInfo, RenameKind, WorktreeStatus,
 };
 pub use pane_session::PaneSession;
-pub use pr_state::PrState;
+pub use pr_state::{ForgeRefKind, PrState};
 pub use project::Project;
 pub use workspace::{ViewMode, Workspace, WorktreeSettings};
 

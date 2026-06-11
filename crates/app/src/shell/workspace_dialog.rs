@@ -10,21 +10,30 @@
 //! Pattern: full-window overlay (absolute inset-0) for click-outside
 //! dismiss; centered modal card. Mirrors the step 5 project picker shape.
 
+use std::time::Duration;
+
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled, Window,
-    div, px,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled,
+    Subscription, Task, Window, div, px,
 };
 use gpui_component::{
     Disableable,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    input::{Enter as InputEnter, Escape as InputEscape, Input, InputEvent, InputState},
 };
 use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::derive_slug;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::shell::forge::ref_parse::parse_forge_ref;
+use crate::shell::forge::{Forge, fetch_ref_title};
 use crate::ui::FloatingSurface;
+
+/// Debounce between the last keystroke that looks like a forge reference
+/// and the title fetch — a paste settles in one event, typed digits get a
+/// beat to finish.
+const TITLE_FETCH_DEBOUNCE_MS: u64 = 350;
 
 const MODAL_WIDTH: f32 = 480.0;
 const MODAL_TOP_OFFSET: f32 = 96.0;
@@ -58,6 +67,10 @@ pub struct WorkspaceDialogSubmit {
     pub name: String,
     /// Selected project for Create mode; `None` for Rename mode.
     pub project: Option<Project>,
+    /// Forge reference (e.g. `"#42"`) the name was prefilled from, when the
+    /// user pasted an issue/PR URL or number. Persisted on the workspace as
+    /// its linked issue.
+    pub linked_issue: Option<String>,
     /// Optional agent to auto-spawn after Created. `None` = Skip.
     pub agent: Option<AgentAdapter>,
 }
@@ -77,6 +90,24 @@ pub struct WorkspaceDialog {
     /// `None` = "Skip (no agent)".
     selected_agent: Option<AgentAdapter>,
     agent_dropdown_open: bool,
+    /// Forge reference the current name was prefilled from (`"#42"`).
+    /// Cleared the moment the user edits the name again — their text wins.
+    linked_issue: Option<String>,
+    /// Monotonic cancellation token for the title fetch: every name change
+    /// bumps it, and a completed fetch only applies if its epoch is still
+    /// current. Cheap cancel-on-edit without aborting the task.
+    fetch_epoch: u64,
+    /// True while a title fetch is pending/in flight — drives the inline
+    /// "fetching title…" hint.
+    fetching_title: bool,
+    /// Suppresses the input-change handler while the fetch APPLIES the
+    /// fetched title (set_value fires the same Change event a keystroke
+    /// does, which would immediately wipe `linked_issue`).
+    applying_title: bool,
+    /// Holds the in-flight debounce + fetch task.
+    _title_fetch: Option<Task<()>>,
+    /// Wires `name_input` changes into the forge-reference detection.
+    _name_sub: Subscription,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -91,7 +122,18 @@ impl WorkspaceDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. fix-login"));
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("e.g. fix-login, #42, or an issue URL")
+        });
+        let name_sub = cx.subscribe_in(
+            &name_input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.on_name_changed(window, cx);
+                }
+            },
+        );
         Self {
             mode: None,
             name_input,
@@ -102,10 +144,88 @@ impl WorkspaceDialog {
             project_dropdown_open: false,
             selected_agent: None,
             agent_dropdown_open: false,
+            linked_issue: None,
+            fetch_epoch: 0,
+            fetching_title: false,
+            applying_title: false,
+            _title_fetch: None,
+            _name_sub: name_sub,
             theme,
             density,
             typography,
         }
+    }
+
+    /// React to a name edit: a recognizable forge reference kicks off a
+    /// debounced title fetch; anything else cancels whatever was pending
+    /// and clears the prefill state — the user's text always wins.
+    fn on_name_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.applying_title {
+            return;
+        }
+        self.fetch_epoch += 1;
+        self.linked_issue = None;
+        self.fetching_title = false;
+        self._title_fetch = None;
+        if !matches!(self.mode, Some(WorkspaceDialogMode::Create)) {
+            return;
+        }
+        let Some(parsed) = parse_forge_ref(&self.current_name(cx)) else {
+            cx.notify();
+            return;
+        };
+        let Some(project) = self.selected_project.clone() else {
+            return;
+        };
+        let epoch = self.fetch_epoch;
+        let root = std::path::PathBuf::from(&project.root_path);
+        self.fetching_title = true;
+        self._title_fetch = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(TITLE_FETCH_DEBOUNCE_MS))
+                .await;
+            // Bail before any network if another edit superseded us.
+            let still_current = this
+                .read_with(cx, |d, _| d.fetch_epoch == epoch)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+            let title = match Forge::detect(&root).await {
+                Some(forge) => {
+                    fetch_ref_title(
+                        forge,
+                        &root,
+                        parsed.kind,
+                        parsed.number,
+                        parsed.repo.as_deref(),
+                    )
+                    .await
+                }
+                None => None,
+            };
+            let _ = this.update_in(cx, |d, window, cx| {
+                if d.fetch_epoch != epoch
+                    || !matches!(d.mode, Some(WorkspaceDialogMode::Create))
+                {
+                    return;
+                }
+                d.fetching_title = false;
+                if let Some(title) = title {
+                    // Belt-and-suspenders: set_value currently suppresses
+                    // Change events, but if that ever changes a re-fired
+                    // Change would instantly cancel the prefill it came
+                    // from — the guard keeps this path self-contained.
+                    d.applying_title = true;
+                    d.name_input
+                        .update(cx, |s, cx| s.set_value(&title, window, cx));
+                    d.applying_title = false;
+                    d.linked_issue = Some(format!("#{}", parsed.number));
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     pub fn is_open(&self) -> bool {
@@ -129,7 +249,16 @@ impl WorkspaceDialog {
         self.project_dropdown_open = false;
         self.selected_agent = None;
         self.agent_dropdown_open = false;
-        window.focus(&self.focus_handle, cx);
+        self.linked_issue = None;
+        self.fetch_epoch += 1;
+        self.fetching_title = false;
+        self._title_fetch = None;
+        // Focus the NAME INPUT, not the card: typing must land immediately
+        // (the card's `on_key_down` still sees Enter/Escape via the
+        // capture-phase action handlers — same contract as the branch
+        // picker).
+        let input_focus = self.name_input.read(cx).focus_handle(cx);
+        window.focus(&input_focus, cx);
         cx.notify();
     }
 
@@ -145,12 +274,20 @@ impl WorkspaceDialog {
             .update(cx, |s, cx| s.set_value(&existing_name, window, cx));
         self.project_dropdown_open = false;
         self.agent_dropdown_open = false;
-        window.focus(&self.focus_handle, cx);
+        let input_focus = self.name_input.read(cx).focus_handle(cx);
+        window.focus(&input_focus, cx);
         cx.notify();
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.mode = None;
+        // Invalidate any in-flight title fetch — without this a fetch
+        // completing after close (or into a later Rename open) would
+        // overwrite whatever the input holds by then.
+        self.fetch_epoch += 1;
+        self.fetching_title = false;
+        self._title_fetch = None;
+        self.linked_issue = None;
         self.project_dropdown_open = false;
         self.agent_dropdown_open = false;
         cx.notify();
@@ -190,6 +327,7 @@ impl WorkspaceDialog {
             WorkspaceDialogMode::Rename(_) => None,
         };
         let agent = self.selected_agent;
+        let linked_issue = self.linked_issue.clone();
         self.close(cx);
         (self.on_submit)(
             WorkspaceDialogSubmit {
@@ -197,6 +335,7 @@ impl WorkspaceDialog {
                 name,
                 project,
                 agent,
+                linked_issue,
             },
             window,
             cx,
@@ -236,10 +375,39 @@ impl Render for WorkspaceDialog {
             WorkspaceDialogMode::Rename(_) => ("Rename Workspace", "Rename"),
         };
         let is_create = matches!(self.mode, Some(WorkspaceDialogMode::Create));
-        let slug_line = format!("Branch: oximux/{}", slug);
+        // Inline prefill state rides the slug line: pending fetch shows a
+        // quiet hint, a successful prefill shows the linked reference.
+        let slug_line = if self.fetching_title {
+            format!("Branch: oximux/{slug} · fetching title…")
+        } else if let Some(issue) = &self.linked_issue {
+            format!("Branch: oximux/{slug} · linked {issue}")
+        } else {
+            format!("Branch: oximux/{slug}")
+        };
 
         let mut card = div()
             .track_focus(&self.focus_handle)
+            // The focused name input converts Enter/Escape into its own
+            // ACTIONS before raw key listeners on ancestors run — intercept
+            // them at the capture phase (same contract as the branch
+            // picker). The raw `on_key_down` stays for the no-input focus
+            // path (e.g. after clicking a dropdown).
+            .capture_action(cx.listener(|this, _: &InputEscape, _window, cx| {
+                cx.stop_propagation();
+                // First Escape collapses an open dropdown; only a bare
+                // Escape dismisses the whole dialog.
+                if this.project_dropdown_open || this.agent_dropdown_open {
+                    this.project_dropdown_open = false;
+                    this.agent_dropdown_open = false;
+                    cx.notify();
+                } else {
+                    this.close(cx);
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &InputEnter, window, cx| {
+                cx.stop_propagation();
+                this.try_submit(window, cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "enter" => this.try_submit(window, cx),
@@ -563,6 +731,7 @@ mod tests {
             name: "fix-login".to_string(),
             project: Some(project("p1", "Acme")),
             agent: Some(AgentAdapter::ClaudeCode),
+            linked_issue: None,
         };
         assert_eq!(payload.mode, WorkspaceDialogMode::Create);
         assert!(payload.project.is_some());
@@ -576,6 +745,7 @@ mod tests {
             name: "new".to_string(),
             project: None,
             agent: None,
+            linked_issue: None,
         };
         assert!(payload.project.is_none());
         assert!(payload.agent.is_none());

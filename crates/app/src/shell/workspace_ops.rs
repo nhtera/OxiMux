@@ -1140,7 +1140,7 @@ impl WorkspaceRoot {
                     project,
                     submit.name,
                     submit.agent,
-                    None,
+                    submit.linked_issue,
                     false,
                     window,
                     cx,

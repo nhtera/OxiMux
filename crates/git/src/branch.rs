@@ -16,7 +16,9 @@ use oximux_core::BranchInfo;
 const SEP: &str = "\t";
 
 impl Repository {
-    /// List local branches. Order matches git's natural ordering (alphabetical).
+    /// List local branches, most-recently-committed first — the branch the
+    /// user just worked on surfaces at the top of the switch picker instead
+    /// of wherever the alphabet put it.
     pub async fn list_branches(&self) -> Result<Vec<BranchInfo>> {
         // %(HEAD) is "*" on the current branch, " " on others. We emit the
         // current flag as a non-ambiguous "1" / "0" instead.
@@ -24,7 +26,7 @@ impl Repository {
             "%(refname:short){SEP}%(if)%(HEAD)%(then)1%(else)0%(end){SEP}%(upstream:short)"
         );
         let out = GitCmd::new(self.workdir())
-            .args(["branch", "--list", "--format"])
+            .args(["branch", "--list", "--sort=-committerdate", "--format"])
             .arg(format)
             .run()
             .await?;

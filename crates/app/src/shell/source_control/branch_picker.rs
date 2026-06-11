@@ -90,32 +90,43 @@ pub enum PickerOutcome {
 pub type OnPick =
     Box<dyn Fn(PickerOutcome, PickerMode, &mut Window, &mut App) + Send + 'static>;
 
-/// One row in the rendered display. Separators are non-selectable; arrow
-/// nav skips them. `Branch.is_current` drives a check-mark indicator.
+/// Most branch rows shown at once. The card has a fixed max height with no
+/// scroll — rows past the cap were silently CLIPPED before; the cap plus an
+/// explicit overflow hint keeps every visible row reachable and tells the
+/// user to narrow the filter instead of pretending the list ends.
+pub const MAX_BRANCH_ROWS: usize = 12;
+
+/// One row in the rendered display. Separators and the overflow hint are
+/// non-selectable; arrow nav skips them. `Branch.is_current` drives a
+/// check-mark indicator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisplayRow {
     Branch { name: String, is_current: bool },
     Separator,
     CreateFromHead(String),
     RepoDefault,
+    /// "+N more — keep typing" hint when the filter still matches more
+    /// branches than the cap shows.
+    MoreHint(usize),
 }
 
 impl DisplayRow {
     /// True when the row participates in keyboard navigation and accepts
-    /// Enter/click. Separators are never selectable; everything else is.
+    /// Enter/click. Separators and the overflow hint are never selectable;
+    /// everything else is.
     pub fn is_selectable(&self) -> bool {
-        !matches!(self, DisplayRow::Separator)
+        !matches!(self, DisplayRow::Separator | DisplayRow::MoreHint(_))
     }
 
     /// Translate a selectable row into the outcome that fires when the
-    /// user commits it. Returns `None` for `Separator` (which should never
-    /// be selectable anyway — defensive guard).
+    /// user commits it. Returns `None` for the non-selectable rows (which
+    /// should never reach here anyway — defensive guard).
     pub fn outcome(&self) -> Option<PickerOutcome> {
         match self {
             DisplayRow::Branch { name, .. } => Some(PickerOutcome::Branch(name.clone())),
             DisplayRow::CreateFromHead(name) => Some(PickerOutcome::CreateFromHead(name.clone())),
             DisplayRow::RepoDefault => Some(PickerOutcome::UseRepoDefault),
-            DisplayRow::Separator => None,
+            DisplayRow::Separator | DisplayRow::MoreHint(_) => None,
         }
     }
 }
@@ -165,10 +176,13 @@ pub fn build_rows(
         }
     }
 
-    for idx in &filtered {
+    for idx in filtered.iter().take(MAX_BRANCH_ROWS) {
         let name = candidates[*idx].clone();
         let is_current = current_branch.is_some_and(|c| c == name);
         rows.push(DisplayRow::Branch { name, is_current });
+    }
+    if filtered.len() > MAX_BRANCH_ROWS {
+        rows.push(DisplayRow::MoreHint(filtered.len() - MAX_BRANCH_ROWS));
     }
 
     if matches!(mode, PickerMode::Switch) {
@@ -182,7 +196,9 @@ pub fn build_rows(
         let exact_match =
             !trimmed.is_empty() && candidates.iter().any(|c| c.to_lowercase() == folded);
         if !trimmed.is_empty() && !exact_match {
-            if !filtered.is_empty() {
+            // The overflow hint already separates the branch list from
+            // what follows — a second hairline would orphan it.
+            if !filtered.is_empty() && filtered.len() <= MAX_BRANCH_ROWS {
                 rows.push(DisplayRow::Separator);
             }
             rows.push(DisplayRow::CreateFromHead(trimmed.to_string()));
@@ -468,6 +484,7 @@ impl Render for BranchPicker {
             for row in &rows {
                 let elem = match row {
                     DisplayRow::Separator => separator_row(theme),
+                    DisplayRow::MoreHint(n) => more_hint_row(*n, theme, &typography),
                     other => {
                         let selected = selectable_cursor == selected_idx;
                         let idx = selectable_cursor;
@@ -513,6 +530,20 @@ fn separator_row(theme: Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// Non-selectable overflow hint under the capped branch list.
+fn more_hint_row(more: usize, theme: Theme, typography: &Typography) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .h(px(ROW_HEIGHT))
+        .px(px(ROW_PADDING_X))
+        .text_size(px(typography.t_body_sm))
+        .text_color(theme.fg_subtle)
+        .italic()
+        .child(SharedString::from(format!("+{more} more — keep typing")))
+        .into_any_element()
+}
+
 fn empty_row(theme: Theme, typography: &Typography) -> AnyElement {
     div()
         .flex()
@@ -555,7 +586,9 @@ fn rendered_row(
             None,
             true,
         ),
-        DisplayRow::Separator => unreachable!("separator filtered before rendered_row"),
+        DisplayRow::Separator | DisplayRow::MoreHint(_) => {
+            unreachable!("non-selectable rows filtered before rendered_row")
+        }
     };
     let bg = if selected {
         theme.bg_panel_alt

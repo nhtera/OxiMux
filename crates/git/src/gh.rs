@@ -139,6 +139,51 @@ fn parse_pr_state(stdout: &str) -> PrState {
     PrState::None
 }
 
+/// Title of one issue / PR by number — `gh issue|pr view N --json title`.
+/// `repo` (an `owner/repo` slug from a pasted URL) targets a repository
+/// other than `cwd`'s origin via `-R`. Any failure (gh absent, bad number,
+/// no network) resolves to `None` — callers prefill nothing and the user's
+/// typed text stands.
+pub async fn item_title(
+    cwd: impl AsRef<Path>,
+    kind: oximux_core::ForgeRefKind,
+    number: u32,
+    repo: Option<&str>,
+) -> Option<String> {
+    let subcommand = match kind {
+        oximux_core::ForgeRefKind::Issue => "issue",
+        oximux_core::ForgeRefKind::Pull => "pr",
+    };
+    let mut cmd = GhCmd::new(cwd).args([
+        subcommand,
+        "view",
+        &number.to_string(),
+        "--json",
+        "title",
+    ]);
+    if let Some(slug) = repo {
+        cmd = cmd.args(["-R", slug]);
+    }
+    match cmd.run_raw().await {
+        Ok((true, stdout, _)) => parse_title_json(&stdout),
+        _ => None,
+    }
+}
+
+/// Pull the `title` field out of a `--json title` / `-F json` response.
+/// Serde (not substring-scanning) so a title that happens to contain
+/// `"title"` can't confuse the parse. Shared by the gh and glab fetchers.
+pub(crate) fn parse_title_json(stdout: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct TitleView {
+        #[serde(default)]
+        title: String,
+    }
+    let v: TitleView = serde_json::from_str(stdout.trim()).ok()?;
+    let title = v.title.trim().to_string();
+    (!title.is_empty()).then_some(title)
+}
+
 /// Options for [`pr_create`]. An empty `title` falls back to `gh pr create
 /// --fill` (title + body from the branch's commits); a non-empty `title` is
 /// passed explicitly along with `body`. `base` selects the target branch when
@@ -437,6 +482,24 @@ async fn forge_list(cwd: impl AsRef<Path>, kind: &str, filter: ForgeListFilter) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_title_json_reads_gh_shape() {
+        assert_eq!(
+            parse_title_json(r#"{"title":"Fix crash"}"#),
+            Some("Fix crash".to_string())
+        );
+        assert_eq!(parse_title_json(r#"{"title":"  "}"#), None);
+        assert_eq!(parse_title_json("not json"), None);
+    }
+
+    #[test]
+    fn parse_title_json_tolerates_glab_full_object() {
+        // glab's `-F json` returns the whole object, not just the
+        // requested field — serde must ignore the rest.
+        let json = r#"{"id":1,"iid":42,"title":"Fix crash","description":"x","state":"opened"}"#;
+        assert_eq!(parse_title_json(json), Some("Fix crash".to_string()));
+    }
 
     #[test]
     fn parses_checks_json() {

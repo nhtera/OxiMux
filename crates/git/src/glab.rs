@@ -123,6 +123,37 @@ pub async fn has_open_mr(cwd: impl AsRef<Path>) -> bool {
     mr_state(cwd).await.is_open()
 }
 
+/// Title of one issue / MR by number — `glab issue|mr view N -F json`.
+/// `repo` (a `group/project` path from a pasted URL) targets a repository
+/// other than `cwd`'s origin via `--repo`. Any failure (glab absent, bad
+/// number, no network) resolves to `None` — callers prefill nothing and
+/// the user's typed text stands.
+pub async fn item_title(
+    cwd: impl AsRef<Path>,
+    kind: oximux_core::ForgeRefKind,
+    number: u32,
+    repo: Option<&str>,
+) -> Option<String> {
+    let subcommand = match kind {
+        oximux_core::ForgeRefKind::Issue => "issue",
+        oximux_core::ForgeRefKind::Pull => "mr",
+    };
+    let mut cmd = GlabCmd::new(cwd).args([
+        subcommand,
+        "view",
+        &number.to_string(),
+        "-F",
+        "json",
+    ]);
+    if let Some(path) = repo {
+        cmd = cmd.args(["--repo", path]);
+    }
+    match cmd.run_raw().await {
+        Ok((true, stdout, _)) => crate::gh::parse_title_json(&stdout),
+        _ => None,
+    }
+}
+
 /// Extract the MR state from `glab mr view -F json` (`{"state":"opened",...}`).
 /// Parses the `state` field with serde so only the actual state value is read
 /// — a lowercase GitLab state word (`opened`/`merged`/`closed`/`locked`) is
