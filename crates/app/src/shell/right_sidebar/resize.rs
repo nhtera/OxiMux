@@ -31,6 +31,10 @@ const HANDLE_STRIPE_PX: f32 = 1.0;
 /// clickable width = `HANDLE_STRIPE_PX + 2 * HANDLE_HIT_PAD_PX` ≈ 7px.
 const HANDLE_HIT_PAD_PX: f32 = 3.0;
 
+/// Width of the hover/drag highlight bar, flush with the sidebar edge.
+/// Wider than the resting hairline so the grabbable edge is obvious.
+const HANDLE_HOVER_BAR_PX: f32 = 3.0;
+
 /// Drag payload for a sidebar resize. Carries a fallback window
 /// width captured at drag-start; the move handler prefers the live
 /// `DragMoveEvent::bounds.size.width` and only reads this when the
@@ -59,15 +63,24 @@ impl Render for SidebarResizeGhost {
 }
 
 /// Build the vertical drag handle for the left edge of the sidebar.
-/// The visible stripe is `HANDLE_STRIPE_PX` wide and centered inside
-/// a `HANDLE_STRIPE_PX + 2 * HANDLE_HIT_PAD_PX` hitbox; cursor
-/// `col_resize` engages on hover, and the stripe tints while the hit
-/// area is hovered so the grabbable edge announces itself.
+/// The hairline stripe IS the sidebar's left border (flush against the
+/// edge, `border_inactive`, the sidebar root draws no border of its
+/// own). Hovering the `HANDLE_STRIPE_PX + 2 * HANDLE_HIT_PAD_PX`
+/// hitbox paints a wider `border_active` bar over it — an absolute
+/// overlay so the highlight widens without any layout shift, and the
+/// edge never reads as two offset lines.
 pub fn build_handle(window_width: f32, theme: oximux_settings::Theme) -> AnyElement {
     let stripe = div()
         .h_full()
         .w(px(HANDLE_STRIPE_PX))
         .flex_shrink_0()
+        .bg(theme.border_inactive);
+    let hover_bar = div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .w(px(HANDLE_HOVER_BAR_PX))
         .group_hover("right-sidebar-resize", move |s| s.bg(theme.border_active));
     div()
         .id(ElementId::Name(SharedString::from(
@@ -77,13 +90,14 @@ pub fn build_handle(window_width: f32, theme: oximux_settings::Theme) -> AnyElem
         .flex()
         .flex_row()
         .items_center()
-        .justify_center()
+        .justify_start()
         .h_full()
         .w(px(HANDLE_STRIPE_PX + 2.0 * HANDLE_HIT_PAD_PX))
         .flex_shrink_0()
         .cursor_col_resize()
         .occlude()
         .child(stripe)
+        .child(hover_bar)
         .on_drag(
             SidebarResizePayload { window_width },
             |_payload, _offset, _window, cx| cx.new(|_| SidebarResizeGhost),

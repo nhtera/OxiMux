@@ -653,8 +653,6 @@ impl Render for RightSidebar {
             .h_full()
             .w(self.panel_width)
             .bg(theme.bg_panel)
-            .border_l_1()
-            .border_color(theme.border_inactive)
             .child(resize::build_handle(window_width, theme))
             .child(
                 div()

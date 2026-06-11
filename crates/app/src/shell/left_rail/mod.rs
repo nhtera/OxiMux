@@ -468,8 +468,6 @@ impl Render for LeftRail {
             .h_full()
             .w(self.width)
             .bg(theme.bg_rail)
-            .border_r_1()
-            .border_color(theme.border_inactive)
             // OS-native folder drop target: tint while a directory drag
             // hovers the rail, register + activate the folder(s) on drop.
             // File (non-directory) drops are ignored.

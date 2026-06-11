@@ -23,6 +23,9 @@ use crate::shell::left_rail::LeftRail;
 const HANDLE_STRIPE_PX: f32 = 1.0;
 /// Hit-area padding on each side of the visible stripe (~7px total).
 const HANDLE_HIT_PAD_PX: f32 = 3.0;
+/// Width of the hover/drag highlight bar, flush with the rail edge.
+/// Wider than the resting hairline so the grabbable edge is obvious.
+const HANDLE_HOVER_BAR_PX: f32 = 3.0;
 
 /// Drag payload for a left-rail resize. The new width derives from the
 /// cursor's window x each tick, so no snapshot data is needed.
@@ -40,14 +43,23 @@ impl Render for LeftRailResizeGhost {
 }
 
 /// Build the vertical drag handle for the right edge of the rail.
-/// The stripe is invisible at rest and tints while the hit area is
-/// hovered, so the grabbable edge announces itself without adding a
-/// permanent line to the rail border.
+/// The hairline stripe IS the rail's right border (flush against the
+/// edge, `border_inactive`, the rail root draws no border of its own).
+/// Hovering the hit area paints a wider `border_active` bar over it —
+/// an absolute overlay so the highlight widens without any layout
+/// shift, and the edge never reads as two offset lines.
 pub fn build_handle(theme: oximux_settings::Theme) -> AnyElement {
     let stripe = div()
         .h_full()
         .w(px(HANDLE_STRIPE_PX))
         .flex_shrink_0()
+        .bg(theme.border_inactive);
+    let hover_bar = div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(HANDLE_HOVER_BAR_PX))
         .group_hover("left-rail-resize", move |s| s.bg(theme.border_active));
     div()
         .id(ElementId::Name(SharedString::from("left-rail-resize-handle")))
@@ -55,13 +67,14 @@ pub fn build_handle(theme: oximux_settings::Theme) -> AnyElement {
         .flex()
         .flex_row()
         .items_center()
-        .justify_center()
+        .justify_end()
         .h_full()
         .w(px(HANDLE_STRIPE_PX + 2.0 * HANDLE_HIT_PAD_PX))
         .flex_shrink_0()
         .cursor_col_resize()
         .occlude()
         .child(stripe)
+        .child(hover_bar)
         .on_drag(LeftRailResizePayload, |_payload, _offset, _window, cx| {
             cx.new(|_| LeftRailResizeGhost)
         })
