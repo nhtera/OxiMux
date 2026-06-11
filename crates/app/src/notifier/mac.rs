@@ -1,112 +1,342 @@
-//! macOS desktop-notification dispatch via `mac-notification-sys`.
+//! macOS desktop-notification dispatch via `UNUserNotificationCenter`.
 //!
-//! `notify_needs_approval` schedules one `tokio::task::spawn_blocking` per
-//! dispatch. The blocking task posts a banner with `wait_for_click: true`
-//! so the upstream call blocks the worker thread until the user clicks or
-//! the banner is dismissed. On `NotificationResponse::Click` the agent's
-//! session id is pushed through an mpsc sender; a GPUI-side receiver
-//! activates the originating workspace tab. Other response variants do
-//! nothing (the badge stays amber until the agent itself transitions out
-//! of `NeedsApproval`).
+//! One process-global delegate handles click routing and foreground
+//! presentation; per-window `MacNotifier` instances share it through a
+//! registered-sender list. Each banner gets a namespaced identifier
+//! (`agent:{tab}:{seq}` / `test:{seq}`); posting a new banner for a tab
+//! removes that tab's previous delivered banner first, so a pane never
+//! stacks stale state in Notification Center.
 //!
-//! macOS does not expose a synchronous "is authorized?" query through this
-//! crate. The first dispatch returning `Err` is treated as permission
-//! denial: we set an `AtomicBool`, log once at WARN, and short-circuit
-//! every subsequent call for the process lifetime.
+//! `UNUserNotificationCenter` only exists for bundled apps — touching it
+//! from a bare `cargo run` binary raises an Objective-C exception. The
+//! constructor probes `NSBundle` first and downgrades to a no-op (with a
+//! one-time WARN) when unbundled, so the non-notification dev loop keeps
+//! working. Authorization denial likewise flips a process-wide flag and
+//! short-circuits every later dispatch.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
+use std::time::Instant;
 
-use mac_notification_sys::{Notification, NotificationResponse};
+use block2::Block;
+use objc2::rc::Retained;
+use objc2::runtime::{Bool, ProtocolObject};
+use objc2::{AllocAnyThread, define_class, msg_send};
+use objc2_foundation::{
+    NSArray, NSBundle, NSError, NSObject, NSObjectProtocol, NSString,
+};
+use objc2_user_notifications::{
+    UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
+    UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
+    UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{AgentNotifySettings, NotificationKind, Notifier, TabId};
+use super::{
+    AgentNotifySettings, BurstGate, NotificationRequest, NotificationSource,
+    Notifier, NotifierAvailability,
+};
+use std::sync::Arc;
 
-/// macOS-backed implementation. The mpsc sender bridges from the blocking
-/// worker thread back into the GPUI runtime; an `AsyncApp` handle cannot
-/// cross that boundary because it holds an `Rc`-based weak reference and
-/// is therefore `!Send`.
+/// Process-wide "notifications cannot work" latch: unbundled binary or
+/// authorization denied. Checked before every dispatch.
+static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+/// Why dispatch is unavailable — drives the settings-pane hint copy.
+static UNBUNDLED: AtomicBool = AtomicBool::new(false);
+/// Identifier sequence shared by every notifier instance, so two windows
+/// can never mint the same banner id.
+static ID_SEQ: AtomicU64 = AtomicU64::new(1);
+/// One-time center setup (delegate + authorization request).
+static CENTER_SETUP: Once = Once::new();
+
+/// Click sinks, one per live window. The delegate broadcasts a clicked
+/// tab id to all of them; each window's router ignores tabs it does not
+/// own. Closed-window senders fail to send and are pruned in place.
+static CLICK_SENDERS: Mutex<Vec<UnboundedSender<u64>>> = Mutex::new(Vec::new());
+
+/// Process-wide 5s per-workspace burst collapse. Static (not per
+/// notifier instance) so the same worktree open in two windows still
+/// produces one banner for a same-instant burst.
+static BURST: Mutex<Option<BurstGate>> = Mutex::new(None);
+
+/// True when a banner for `workspace_key` may fire now.
+fn burst_allows(workspace_key: &str) -> bool {
+    let mut slot = match BURST.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.get_or_insert_with(BurstGate::new)
+        .should_fire(workspace_key, Instant::now())
+}
+
+/// The delegate must outlive the process (`UNUserNotificationCenter`
+/// holds it weakly). Stateless: callbacks only touch the statics above,
+/// which is what makes the `Send + Sync` assertion below sound.
+struct DelegateHolder(#[allow(dead_code)] Retained<NotificationDelegate>);
+unsafe impl Send for DelegateHolder {}
+unsafe impl Sync for DelegateHolder {}
+static DELEGATE: OnceLock<DelegateHolder> = OnceLock::new();
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "OxiMuxNotificationDelegate"]
+    struct NotificationDelegate;
+
+    unsafe impl NSObjectProtocol for NotificationDelegate {}
+
+    unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        fn did_receive_response(
+            &self,
+            _center: &UNUserNotificationCenter,
+            response: &UNNotificationResponse,
+            completion_handler: &Block<dyn Fn()>,
+        ) {
+            let identifier = response.notification().request().identifier().to_string();
+            if let Some(tab_id) = parse_agent_identifier(&identifier) {
+                broadcast_click(tab_id);
+            }
+            completion_handler.call(());
+        }
+
+        #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+        fn will_present(
+            &self,
+            _center: &UNUserNotificationCenter,
+            _notification: &UNNotification,
+            completion_handler: &Block<dyn Fn(UNNotificationPresentationOptions)>,
+        ) {
+            // Foreground delivery: the dispatcher already gated on focus /
+            // pane visibility, so anything that reaches the OS while the
+            // app is frontmost was deliberately allowed — show it.
+            completion_handler.call((UNNotificationPresentationOptions::Banner
+                | UNNotificationPresentationOptions::Sound
+                | UNNotificationPresentationOptions::List,));
+        }
+    }
+);
+
+impl NotificationDelegate {
+    fn new() -> Retained<Self> {
+        let this = Self::alloc().set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// `agent:{tab}:{seq}` → tab id. Test banners (`test:{seq}`) and foreign
+/// identifiers yield `None` (click just dismisses).
+fn parse_agent_identifier(identifier: &str) -> Option<u64> {
+    let rest = identifier.strip_prefix("agent:")?;
+    let (tab, _seq) = rest.split_once(':')?;
+    tab.parse().ok()
+}
+
+/// Send a clicked tab id to every registered window router, pruning
+/// senders whose receiver is gone (window closed).
+fn broadcast_click(tab_id: u64) {
+    let mut senders = match CLICK_SENDERS.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    senders.retain(|tx| tx.send(tab_id).is_ok());
+}
+
+/// True when the process runs from a real `.app` bundle. A bare binary
+/// has no bundle identifier, and `UNUserNotificationCenter` raises an
+/// Objective-C exception when touched from one.
+fn running_in_bundle() -> bool {
+    NSBundle::mainBundle().bundleIdentifier().is_some()
+}
+
+/// One-time center wiring: install the click/foreground delegate and ask
+/// for banner + sound authorization. Denial latches [`UNAVAILABLE`].
+fn setup_center_once() {
+    CENTER_SETUP.call_once(|| {
+        let delegate = NotificationDelegate::new();
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        let _ = DELEGATE.set(DelegateHolder(delegate));
+
+        let handler = block2::StackBlock::new(|granted: Bool, _err: *mut NSError| {
+            if !granted.as_bool() {
+                UNAVAILABLE.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "notification authorization denied; suppressing dispatch \
+                     (System Settings → Notifications → OxiMux)"
+                );
+            }
+        })
+        .copy();
+        center.requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+            &handler,
+        );
+    });
+}
+
+/// Post a system-infrastructure banner (relay restart, daemon version
+/// mismatch). Bypasses the agent settings gates — these are rare,
+/// load-bearing messages about the app itself — but still honors the
+/// process availability latch. No click routing; non-blocking.
+///
+/// Callable from any thread: the notification center is documented
+/// thread-safe, and the bindings encode that (no main-thread marker is
+/// required to obtain or use it) — the relay-respawn path calls this
+/// from an async runtime worker.
+pub fn post_system_banner(title: &str, body: &str) {
+    if !running_in_bundle() {
+        tracing::warn!(title, body, "system banner skipped (unbundled dev binary)");
+        return;
+    }
+    setup_center_once();
+    if UNAVAILABLE.load(Ordering::Relaxed) {
+        return;
+    }
+    let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let content = UNMutableNotificationContent::new();
+    content.setTitle(&NSString::from_str(title));
+    content.setBody(&NSString::from_str(body));
+    let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+        &NSString::from_str(&format!("system:{seq}")),
+        &content,
+        None,
+    );
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    center.addNotificationRequest_withCompletionHandler(&request, None);
+}
+
+/// macOS-backed implementation. Gating order per dispatch: process
+/// availability → settings (master / source / focus / kind) → per-
+/// workspace burst gate → post (replacing the tab's previous banner).
 pub struct MacNotifier {
-    click_tx: UnboundedSender<u64>,
-    permission_denied: Arc<AtomicBool>,
     /// Live per-kind enable + sound + focus-gate prefs, shared with the
     /// settings pane (which flips the atomics at runtime).
     settings: Arc<AgentNotifySettings>,
+    /// Last posted banner id per tab, so a fresh edge replaces the stale
+    /// banner instead of stacking under it in Notification Center.
+    last_posted: Mutex<HashMap<u64, String>>,
 }
 
 impl MacNotifier {
     /// `click_tx` is the producer half of an unbounded channel whose
-    /// consumer activates the matching workspace tab when a notification
-    /// is clicked. Unbounded keeps the OS callback path lock-free; the
-    /// receiver is a single GPUI-side task that drains promptly. `settings`
-    /// is the shared preference cell read on every dispatch.
+    /// consumer (this window's router) activates the matching workspace
+    /// tab when a banner is clicked. `settings` is the shared preference
+    /// cell read on every dispatch.
     pub fn new(click_tx: UnboundedSender<u64>, settings: Arc<AgentNotifySettings>) -> Self {
+        if !running_in_bundle() {
+            // Set the "why" flag before the availability latch so a
+            // concurrent `availability()` read never sees unavailable-
+            // without-reason (which would render the wrong hint copy).
+            UNBUNDLED.store(true, Ordering::Relaxed);
+            if !UNAVAILABLE.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "not running from an .app bundle; desktop notifications disabled \
+                     (use scripts/bundle-macos.sh for the notification dev loop)"
+                );
+            }
+        } else {
+            setup_center_once();
+            match CLICK_SENDERS.lock() {
+                Ok(mut senders) => senders.push(click_tx),
+                Err(poisoned) => poisoned.into_inner().push(click_tx),
+            }
+        }
         Self {
-            click_tx,
-            permission_denied: Arc::new(AtomicBool::new(false)),
             settings,
+            last_posted: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Namespaced banner identifier for a request.
+    fn mint_identifier(req: &NotificationRequest) -> String {
+        let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        match req.source {
+            NotificationSource::Test => format!("test:{seq}"),
+            _ => format!("agent:{}:{seq}", req.tab_id.0),
         }
     }
 }
 
 impl Notifier for MacNotifier {
-    fn notify(
-        &self,
-        tab_id: TabId,
-        kind: NotificationKind,
-        agent_label: &str,
-        body: &str,
-        window_active: bool,
-    ) {
-        if self.permission_denied.load(Ordering::Relaxed) {
+    fn notify(&self, req: NotificationRequest) {
+        if UNAVAILABLE.load(Ordering::Relaxed) {
             return;
         }
-        // Per-kind enable + focus gate live in the shared settings cell.
-        if !self.settings.should_fire(kind, window_active) {
+        if !self.settings.should_fire(&req) {
             return;
         }
-        let title = kind.title(agent_label);
-        let message = if body.is_empty() {
-            "Click to switch to the tab.".to_string()
-        } else {
-            body.to_string()
-        };
-        let sound = self.settings.sound_enabled().then(|| kind.sound_name());
-        let click_tx = self.click_tx.clone();
-        let permission_denied = Arc::clone(&self.permission_denied);
-        let tab_id_raw = tab_id.0;
+        if req.source != NotificationSource::Test && !burst_allows(&req.workspace_key) {
+            return;
+        }
 
-        // JoinHandle dropped intentionally: the closure body is the single
-        // FFI call plus a non-blocking mpsc send, so a panic here cannot
-        // leave the calling task in a corrupted state. spawn_blocking
-        // honors its own panic policy (logged + thread retired).
-        tokio::task::spawn_blocking(move || {
-            let mut builder = Notification::new();
-            builder.title(&title).message(&message).wait_for_click(true);
-            if let Some(name) = sound {
-                builder.sound(name);
+        let title = req.kind.title(&req.label);
+        let message = if req.body.is_empty() {
+            "Click to jump to the workspace.".to_string()
+        } else {
+            req.body.clone()
+        };
+        let identifier = Self::mint_identifier(&req);
+        let stale = {
+            let mut last = match self.last_posted.lock() {
+                Ok(l) => l,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if req.source == NotificationSource::Test {
+                None
+            } else {
+                last.insert(req.tab_id.0, identifier.clone())
             }
-            let result = builder.send();
-            match result {
-                Ok(NotificationResponse::Click) => {
-                    // Receiver may be dropped at app shutdown; ignore.
-                    let _ = click_tx.send(tab_id_raw);
-                }
-                Ok(_) => {
-                    // None / CloseButton / ActionButton / Reply — user
-                    // dismissed without engaging. Badge stays amber until
-                    // the agent transitions out of NeedsApproval.
-                }
-                Err(err) => {
-                    if !permission_denied.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            ?err,
-                            "macOS notification dispatch failed; suppressing further attempts \
-                             this session (check System Settings → Notifications)"
-                        );
-                    }
-                }
+        };
+
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        if let Some(stale_id) = stale {
+            let ids = NSArray::from_retained_slice(&[NSString::from_str(&stale_id)]);
+            center.removeDeliveredNotificationsWithIdentifiers(&ids);
+        }
+
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(&title));
+        content.setBody(&NSString::from_str(&message));
+        if self.settings.sound_enabled() {
+            content.setSound(Some(&UNNotificationSound::defaultSound()));
+        }
+        let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+            &NSString::from_str(&identifier),
+            &content,
+            None,
+        );
+        let completion = block2::StackBlock::new(|err: *mut NSError| {
+            if !err.is_null() {
+                let desc = unsafe { (*err).localizedDescription().to_string() };
+                tracing::warn!(error = %desc, "notification dispatch failed");
             }
-        });
+        })
+        .copy();
+        center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+    }
+
+    fn availability(&self) -> NotifierAvailability {
+        if !UNAVAILABLE.load(Ordering::Relaxed) {
+            NotifierAvailability::Available
+        } else if UNBUNDLED.load(Ordering::Relaxed) {
+            NotifierAvailability::Unbundled
+        } else {
+            NotifierAvailability::PermissionDenied
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_identifier_roundtrip() {
+        assert_eq!(parse_agent_identifier("agent:42:7"), Some(42));
+        assert_eq!(parse_agent_identifier("test:7"), None);
+        assert_eq!(parse_agent_identifier("agent:notanum:7"), None);
+        assert_eq!(parse_agent_identifier("agent:42"), None);
+        assert_eq!(parse_agent_identifier(""), None);
     }
 }

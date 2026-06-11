@@ -14,7 +14,8 @@ use oximux_agents::AgentStatusStream;
 use oximux_core::AgentStatus;
 
 use crate::notifier::{
-    NotificationKind, Notifier, SuppressMap, TabId, notification_kind_for_transition,
+    NotificationKind, NotificationRequest, NotificationSource, Notifier, SuppressMap, TabId,
+    notification_kind_for_transition,
 };
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
@@ -25,11 +26,16 @@ use crate::shell::terminal_view::TerminalView;
 ///     (`NeedsApproval` / `WaitingForInput` / `Done` / `Failed`) that pass the
 ///     per-(tab, kind) `SuppressMap` rate limit. The per-kind enable + focus
 ///     gate live inside the notifier's shared settings, so the task always
-///     passes the current focus state and lets the notifier decide.
+///     passes the current focus + visibility state and lets the notifier
+///     decide,
+///  3. Holds the agent-awake sleep assertion while the agent is `Running`
+///     (RAII — a tab closed mid-run releases via task drop).
 ///
 /// `window_active` is a shared `Arc<AtomicBool>` updated by the owning
 /// `ProjectPanes` window-activation observer, so every group watcher
 /// reads the same flag without holding a back-reference up the tree.
+/// `workspace_key` is the agent's worktree path — the notifier's burst
+/// gate collapses same-workspace banners across tabs with it.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_status_task(
     status_rx: AgentStatusStream,
@@ -37,6 +43,7 @@ pub fn spawn_status_task(
     window_active: Arc<AtomicBool>,
     tab_id: TabId,
     label: SharedString,
+    workspace_key: String,
     view: WeakEntity<TerminalView>,
     cx: &mut Context<PaneGroup>,
 ) -> Task<()> {
@@ -44,6 +51,11 @@ pub fn spawn_status_task(
     cx.spawn(async move |weak, cx| {
         let mut prev_status: AgentStatus = status_rx.borrow_and_update().clone();
         let mut suppress = SuppressMap::new();
+        // Sleep-assertion stake for this agent; held exactly while Running.
+        // The agent may already be Running at subscribe time (e.g. a watcher
+        // re-spawned for a respawned tab).
+        let mut awake_hold = matches!(prev_status, AgentStatus::Running)
+            .then(|| crate::agent_awake::global().acquire());
         loop {
             if status_rx.changed().await.is_err() {
                 return;
@@ -59,6 +71,14 @@ pub fn spawn_status_task(
                 .is_err()
             {
                 return;
+            }
+            // Track the Running stake on every transition, not just
+            // notify-worthy edges (Running itself is a transient state the
+            // edge detector ignores).
+            match (&awake_hold, matches!(new_status, AgentStatus::Running)) {
+                (None, true) => awake_hold = Some(crate::agent_awake::global().acquire()),
+                (Some(_), false) => awake_hold = None,
+                _ => {}
             }
             // Fire on a genuine lifecycle edge; the notifier itself applies
             // the per-kind enable + focus gate from shared settings, so we
@@ -82,7 +102,22 @@ pub fn spawn_status_task(
                         AgentStatus::Failed(msg) => msg.clone(),
                         _ => String::new(),
                     };
-                    notifier.notify(tab_id, kind, &label, &body, window_active_now);
+                    // A pane the user can currently see never banners; the
+                    // visibility sweep keeps this flag current for hidden
+                    // tabs and inactive projects alike.
+                    let pane_visible = view
+                        .read_with(cx, |v, _| v.is_visible())
+                        .unwrap_or(false);
+                    notifier.notify(NotificationRequest {
+                        source: NotificationSource::AgentState,
+                        kind,
+                        tab_id,
+                        workspace_key: workspace_key.clone(),
+                        label: label.to_string(),
+                        body,
+                        window_active: window_active_now,
+                        pane_visible,
+                    });
                 }
                 // In-app toast for terminal lifecycle edges (finished /
                 // failed), independent of the OS banner's focus gate so the

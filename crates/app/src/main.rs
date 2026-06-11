@@ -747,17 +747,10 @@ fn boot_relay_supervisor(
         Err(SupervisorError::VersionMismatch) => {
             tracing::warn!("relay version mismatch; falling back to in-process PTYs");
             #[cfg(target_os = "macos")]
-            {
-                // Plain thread (not spawn_blocking) — we are NOT inside
-                // a tokio runtime context here; this branch is sync boot
-                // code reached via `block_on(ensure_running())`.
-                std::thread::spawn(|| {
-                    let _ = mac_notification_sys::Notification::new()
-                        .title("OxiMux relay version mismatch")
-                        .message("Restart OxiMux to pick up the new daemon.")
-                        .send();
-                });
-            }
+            oximux_app::notifier::mac::post_system_banner(
+                "OxiMux relay version mismatch",
+                "Restart OxiMux to pick up the new daemon.",
+            );
             return None;
         }
         Err(SupervisorError::Other(err)) => {
@@ -982,21 +975,11 @@ async fn respawn_relay_after_death(
     }
 }
 
-// AppKit notification call is blocking — keep it off the runtime worker.
 fn notify_user(title: &'static str, message: &'static str) {
-    tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = mac_notification_sys::Notification::new()
-                .title(title)
-                .message(message)
-                .send();
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (title, message);
-        }
-    });
+    #[cfg(target_os = "macos")]
+    oximux_app::notifier::mac::post_system_banner(title, message);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (title, message);
 }
 
 fn init_tracing() {

@@ -52,7 +52,6 @@ uuid = { workspace = true }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mac-notification-sys = "0.6"
 # Objective-C bridge for the NSProcessInfo `beginActivityWithOptions`
 # App Nap opt-out (`app_nap`) and the AppKit menu-item responder selectors
 # (`menu::platform`). objc2 is the maintained successor and is already in the
@@ -60,6 +59,12 @@ mac-notification-sys = "0.6"
 # directly adds no new compilation — and its macros emit clean cfgs, unlike
 # objc 0.2's `cfg(feature = "cargo-clippy")` expansions.
 objc2 = "0.6"
+# Desktop notifications (`notifier::mac`) ride UNUserNotificationCenter;
+# foundation + block2 supply NSString/NSBundle and the completion-handler
+# blocks. All three are already in the transitive graph via gpui-component.
+objc2-foundation = "0.3"
+objc2-user-notifications = "0.3"
+block2 = "0.6"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

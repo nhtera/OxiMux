@@ -853,6 +853,63 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
+    /// Land a notification click on its agent tab: activate the owning
+    /// project (cross-project included), select + locate the owning
+    /// workspace in the rail, focus the exact tab, and raise the window.
+    /// A stale click (tab closed since) does nothing.
+    pub(crate) fn navigate_to_agent_tab(
+        &mut self,
+        tab_id: crate::notifier::TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolve the owning project by searching every cached panes
+        // entity — agent tabs survive project switches inside them, and a
+        // project that was never activated cannot own a live agent.
+        let owner = self.project_panes_by_project.iter().find_map(|(id, panes)| {
+            panes
+                .read(cx)
+                .agent_worktree_for_tab_id(tab_id, cx)
+                .map(|wt| (id.clone(), panes.clone(), wt))
+        });
+        let Some((project_id, panes, worktree_path)) = owner else {
+            tracing::info!(tab_id = tab_id.0, "notification click for a closed agent tab; ignoring");
+            return;
+        };
+        if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
+            let Some(project) = self
+                .app_state
+                .recent_projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            else {
+                tracing::warn!(%project_id, "notification click: owning project not in recent_projects");
+                return;
+            };
+            self.set_active_project(project, window, cx);
+        }
+        // Rail selection + locate affordance for the owning workspace
+        // (match by worktree path; the synthesized primary row covers
+        // agents running at the project root).
+        let worktree_str = worktree_path.to_string_lossy().into_owned();
+        let workspace = self
+            .rail_workspaces_by_project
+            .get(&project_id)
+            .and_then(|rows| rows.iter().find(|w| w.worktree_path == worktree_str))
+            .cloned();
+        if let Some(w) = workspace {
+            self.active_workspace_id = Some(w.id.clone());
+            self.record_nav(&w.project_id, &w.id);
+        }
+        self.left_rail.update(cx, |rail, cx| rail.scroll_to_active(cx));
+        panes.update(cx, |p, cx| {
+            p.set_active_by_tab_id(tab_id, window, cx);
+        });
+        window.activate_window();
+        cx.notify();
+    }
+
     /// A project's workspace rows, always including the synthesized "primary"
     /// (repo-root) row as the first entry when no real workspace occupies the
     /// root. Single source of the "a project is never an empty group"

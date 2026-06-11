@@ -392,6 +392,10 @@ impl WorkspaceRoot {
         let agent_notify_settings = Arc::new(AgentNotifySettings::from_getter(|k| {
             app_state.settings_repo.get(k).ok().flatten()
         }));
+        // Seed the process-global sleep-assertion holder from the persisted
+        // pref so a disabled toggle survives a relaunch (the settings pane
+        // keeps it in sync afterwards).
+        crate::agent_awake::global().set_enabled(agent_notify_settings.agent_awake_enabled());
         #[cfg(target_os = "macos")]
         let notifier: Arc<dyn Notifier> = Arc::new(crate::notifier::mac::MacNotifier::new(
             click_tx,
@@ -550,6 +554,7 @@ impl WorkspaceRoot {
                 typography.clone(),
                 agent_notify_settings.clone(),
                 app_state.settings_repo.clone(),
+                notifier.clone(),
                 cx,
             )
         });
@@ -689,26 +694,19 @@ impl WorkspaceRoot {
         });
 
         // Click router: drains tab-ids posted by the macOS click watcher.
-        // For each id, raise the window and activate the matching tab.
-        // Closure ends when the mpsc receiver returns None (all senders
-        // dropped, e.g. at app shutdown) or when the entity is gone.
+        // For each id, navigate to the owning project + workspace + tab
+        // (cross-project included). Raises the window only when the tab
+        // still exists — popping the window with no destination on a
+        // stale click (agent closed since the banner fired) would be
+        // disruptive UX. Closure ends when the mpsc receiver returns None
+        // (all senders dropped, e.g. at app shutdown) or when the entity
+        // is gone.
         let click_router = cx.spawn_in(window, async move |weak, cx| {
             while let Some(tab_id_raw) = click_rx.recv().await {
                 let tab_id = TabId(tab_id_raw);
-                // Raise the window only when the tab still exists. A
-                // notification for a since-closed agent (M1 review-260521):
-                // popping the window with no destination would be a
-                // disruptive UX on a stale click.
                 if weak
                     .update_in(cx, |root, window, cx| {
-                        let activated = root.active_project_panes().is_some_and(|panes_entity| {
-                            panes_entity.update(cx, |panes, cx| {
-                                panes.set_active_by_tab_id(tab_id, window, cx)
-                            })
-                        });
-                        if activated {
-                            window.activate_window();
-                        }
+                        root.navigate_to_agent_tab(tab_id, window, cx);
                     })
                     .is_err()
                 {

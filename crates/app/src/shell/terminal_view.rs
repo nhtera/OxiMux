@@ -950,6 +950,13 @@ impl TerminalView {
     /// visible repaints immediately so the just-shown tab reflects any output
     /// that landed while it was throttled; the poll loop picks up the faster
     /// cadence on its next iteration.
+    /// Whether this pane is currently the on-screen tab of a rendered
+    /// group. Hidden tabs and inactive projects' panes report false; the
+    /// notification dispatcher uses it for visible-pane suppression.
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible == visible {
             return;

@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 #
-# Build OxiMux.app for local use. No signing, no notarization in Phase 0.
+# Build OxiMux.app for local use. Signs the bundle ad-hoc by default so
+# UNUserNotificationCenter (desktop notifications) has a sealed identity;
+# set OXIMUX_SIGN_ID to a real "Developer ID Application: …" identity for
+# a stable TCC identity across rebuilds. No notarization.
 # Output: dist/OxiMux.app
 #
 # Usage:
 #   ./scripts/bundle-macos.sh                 # release bundle (default)
 #   ./scripts/bundle-macos.sh debug           # debug bundle (faster build)
 #   ./scripts/bundle-macos.sh --debug-fast    # refresh binary only (~200 ms)
+#   OXIMUX_SIGN_ID="Developer ID Application: …" ./scripts/bundle-macos.sh
 #
 # --debug-fast: assumes an existing dist/OxiMux.app and a fresh
 # `cargo build -p oximux-app`. Copies target/debug/oximux into the
@@ -25,6 +29,20 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 APP_DIR="dist/OxiMux.app"
+
+# Seal the bundle so notification delivery has a code identity. Ad-hoc
+# ("-") works for the local dev loop; macOS keys notification permission
+# to the bundle id, so the grant survives ad-hoc rebuilds. A real
+# identity via OXIMUX_SIGN_ID gives a stable cdhash too (useful when ad-
+# hoc behaves inconsistently across TCC resets). Nested binaries first,
+# then the bundle seal.
+sign_bundle() {
+    local sign_id="${OXIMUX_SIGN_ID:--}"
+    codesign --force -s "$sign_id" "$APP_DIR/Contents/MacOS/oximux-relay"
+    codesign --force -s "$sign_id" "$APP_DIR/Contents/MacOS/oximux"
+    codesign --force -s "$sign_id" "$APP_DIR"
+    echo "==> Signed $APP_DIR (identity: $sign_id)"
+}
 
 # Fast path: refresh the bundled binary in place. Fail loudly if there
 # is no existing bundle to refresh — implicit `mkdir` would mask a
@@ -54,6 +72,7 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
         mkdir -p "$APP_DIR/Contents/Resources"
         cp -f "assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
     fi
+    sign_bundle
     echo "==> Refreshed $APP_DIR/Contents/{MacOS,Info.plist,Resources} from target/debug"
     exit 0
 fi
@@ -91,6 +110,8 @@ cp "assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 if [[ -f "assets/AppIcon.icns" ]]; then
     cp "assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
+
+sign_bundle
 
 echo "==> $APP_DIR ready ($(du -sh "$APP_DIR" | cut -f1))"
 echo "    open $APP_DIR    # to launch"

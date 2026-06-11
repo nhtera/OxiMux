@@ -322,6 +322,19 @@ impl ProjectPanes {
         }
     }
 
+    /// Worktree path of the agent tab matching `tab_id` anywhere in this
+    /// project's groups. `Some` doubles as the ownership answer for the
+    /// notification click router's cross-project search.
+    pub fn agent_worktree_for_tab_id(
+        &self,
+        tab_id: TabId,
+        cx: &gpui::App,
+    ) -> Option<std::path::PathBuf> {
+        self.groups
+            .values()
+            .find_map(|g| g.read(cx).agent_worktree_for_tab_id(tab_id))
+    }
+
     /// Spawn the first Terminal tab in the only (initial) pane group.
     pub fn seed_default_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(group) = self.active_group() {

@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-12 — Notification system overhaul, agent-awake service, Notifications settings pane
+
+**Commits**: 00eea1f  
+**Touches**: `crates/app/src/notifier/` (mac.rs, mod.rs, null.rs), `crates/app/src/agent_awake.rs` (NEW), `crates/app/src/shell/settings_modal/` (Notifications pane NEW), `scripts/bundle-macos.sh`
+
+Replaces the deprecated `NSUserNotification` backend and wires a full notification dispatch stack:
+
+- **UNUserNotificationCenter backend** (`notifier/mac.rs`). Per-tab banner identifiers with replacement semantics; click round-trip through a process-global delegate; authorization request with denial latch; graceful no-op for unbundled `cargo run` binaries.
+- **Dispatch gating**. Master enable + per-source enables (agent-state now; terminal-bell reserved). Hard visible-pane suppression: a pane on screen in the frontmost window never banners. 5 s per-workspace burst collapse (process-wide). Existing per-kind toggles + focus gate preserved. Persisted settings keys are back-compatible.
+- **Notification click navigation**. Cross-project: switches to the owning project, selects and scroll-locates the workspace in the left rail, focuses the exact agent tab, raises the window. Stale clicks are ignored.
+- **Agent-awake service** (`agent_awake.rs`). Ref-counted `IOPMAssertion` (`PreventUserIdleSystemSleep`) held while any agent session is Running. Settings toggle (default on). Unit-tested via a backend seam.
+- **Notifications settings pane**. Master / source / kind / sound / focus / agent-awake toggles plus a "Send test notification" button with availability hints. Notification rows moved out of the Agents pane.
+- **Bundle codesigning** (`scripts/bundle-macos.sh`). Ad-hoc by default; `OXIMUX_SIGN_ID` env override. Sealed code identity required for UNUserNotification delivery.
+- Boot-infrastructure banners (relay version mismatch / respawn) routed through the same backend.
+
+Tests: 1 898 workspace tests green; new unit coverage for gating matrix, burst gate, identifier parsing, and awake refcount.
+
+---
+
 ### 2026-06-06 — Settings modal, Quick Open index, lifecycle scripts, Create PR + CI, floating PiP terminal
 
 **Commits**: `cdcbe65`, `0817caa`, `778160a`, `e5dc89f`, `d0c7ba1`, `a2a6c95`, `326464a`  

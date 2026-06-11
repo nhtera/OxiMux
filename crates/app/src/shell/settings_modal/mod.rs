@@ -16,6 +16,7 @@ mod segmented;
 mod pane_about;
 mod pane_agents;
 mod pane_keybindings;
+mod pane_notifications;
 mod pane_terminal;
 mod view;
 
@@ -31,7 +32,7 @@ use gpui_component::input::{InputEvent, InputState};
 use oximux_settings::{CommitMessageAiSettings, Density, TerminalSettings, Theme, Typography};
 use oximux_storage::SettingsRepo;
 
-use crate::notifier::AgentNotifySettings;
+use crate::notifier::{AgentNotifySettings, Notifier};
 
 /// Emitted when the modal closes (any path: ×, Esc, click-outside, toggle).
 /// `WorkspaceRoot` listens and returns keyboard focus to itself so global
@@ -65,6 +66,9 @@ pub struct SettingsModal {
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
     pub(crate) notify_repo: SettingsRepo,
+    /// Live dispatch sink for the test-notification button (and the
+    /// availability hint next to it).
+    pub(crate) notifier: Arc<dyn Notifier>,
     /// Top-left of the card. `None` until the user drags (or the first frame
     /// resolves it), at which point it holds the live, viewport-clamped
     /// position. Reset to `None` on each `open()` so the modal re-centers.
@@ -87,6 +91,7 @@ impl SettingsModal {
         typography: Typography,
         notify: Arc<AgentNotifySettings>,
         notify_repo: SettingsRepo,
+        notifier: Arc<dyn Notifier>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -100,6 +105,7 @@ impl SettingsModal {
             ai: CommitMessageAiSettings::default(),
             notify,
             notify_repo,
+            notifier,
             pos: None,
             drag_grab: None,
             search_input: None,

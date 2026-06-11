@@ -1,6 +1,6 @@
 //! No-op `Notifier` — non-mac builds and as a permission-denied fallback.
 
-use super::{NotificationKind, Notifier, TabId};
+use super::{NotificationRequest, Notifier};
 
 /// Discards every dispatch. Used on non-macOS targets (where no OS
 /// notification path is wired) and as the universal mock for tests that
@@ -9,13 +9,5 @@ use super::{NotificationKind, Notifier, TabId};
 pub struct NullNotifier;
 
 impl Notifier for NullNotifier {
-    fn notify(
-        &self,
-        _tab_id: TabId,
-        _kind: NotificationKind,
-        _agent_label: &str,
-        _body: &str,
-        _window_active: bool,
-    ) {
-    }
+    fn notify(&self, _req: NotificationRequest) {}
 }

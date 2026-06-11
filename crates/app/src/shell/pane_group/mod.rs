@@ -560,6 +560,21 @@ impl PaneGroup {
         paths
     }
 
+    /// Worktree path of the agent tab matching `tab_id`, if this group
+    /// owns it. Read-only counterpart of `set_active_by_tab_id` — the
+    /// notification click router uses it to resolve which project (and
+    /// rail workspace) a clicked banner belongs to.
+    pub fn agent_worktree_for_tab_id(&self, tab_id: TabId) -> Option<PathBuf> {
+        self.tabs.iter().find_map(|t| match &t.kind {
+            PaneGroupTabKind::Agent {
+                session_id,
+                worktree_path,
+                ..
+            } if TabId::from(*session_id) == tab_id => Some(worktree_path.clone()),
+            _ => None,
+        })
+    }
+
     /// Index of an existing agent tab whose worktree matches `path`, if
     /// any. Lets the sidebar focus the tab already running in a clicked
     /// workspace's worktree instead of spawning a duplicate.
@@ -1238,6 +1253,7 @@ impl PaneGroup {
             self.window_active.clone(),
             TabId::from(session_id),
             label.clone(),
+            worktree_path.to_string_lossy().into_owned(),
             view.downgrade(),
             cx,
         );

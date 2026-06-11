@@ -16,21 +16,23 @@ use super::SettingsModal;
 const NAV_WIDTH: f32 = 184.0;
 
 /// Which settings pane is shown in the body. `Appearance` + `About` are
-/// read-only; `Terminal` + `Agents` round-trip to disk; `Keybindings`
-/// is a read-only reference list.
+/// read-only; `Terminal` + `Agents` + `Notifications` round-trip to disk;
+/// `Keybindings` is a read-only reference list.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPane {
     Terminal,
     Agents,
+    Notifications,
     Keybindings,
     Appearance,
     About,
 }
 
 impl SettingsPane {
-    pub(super) const ALL: [SettingsPane; 5] = [
+    pub(super) const ALL: [SettingsPane; 6] = [
         SettingsPane::Terminal,
         SettingsPane::Agents,
+        SettingsPane::Notifications,
         SettingsPane::Keybindings,
         SettingsPane::Appearance,
         SettingsPane::About,
@@ -40,18 +42,21 @@ impl SettingsPane {
         match self {
             SettingsPane::Terminal => "Terminal",
             SettingsPane::Agents => "Agents / AI",
+            SettingsPane::Notifications => "Notifications",
             SettingsPane::Keybindings => "Keybindings",
             SettingsPane::Appearance => "Appearance",
             SettingsPane::About => "About",
         }
     }
 
-    /// Leading nav glyph. Terminal/Appearance/About resolve from the bundled
-    /// component catalog; Keybindings ships a local `keyboard.svg`.
+    /// Leading nav glyph. Terminal/Notifications/Appearance/About resolve
+    /// from the bundled component catalog; Keybindings ships a local
+    /// `keyboard.svg`.
     fn icon_path(self) -> &'static str {
         match self {
             SettingsPane::Terminal => "icons/square-terminal.svg",
             SettingsPane::Agents => "icons/sparkles.svg",
+            SettingsPane::Notifications => "icons/bell.svg",
             SettingsPane::Keybindings => "icons/keyboard.svg",
             SettingsPane::Appearance => "icons/palette.svg",
             SettingsPane::About => "icons/info.svg",
