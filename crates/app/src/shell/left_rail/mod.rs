@@ -91,6 +91,12 @@ pub struct LeftRail {
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
+    /// True while a resize drag is in flight. Set on every drag tick
+    /// (`resize::apply_drag_move`), cleared on the first render after
+    /// the drag ends. Drives the handle's highlight bar — hover styles
+    /// are suppressed during drags, so the lit state must come from
+    /// rail state instead.
+    resizing: bool,
     /// Settings store for persisting `width` on each drag tick. `None`
     /// in unit tests that build the rail without a DB.
     settings_repo: Option<SettingsRepo>,
@@ -144,6 +150,7 @@ impl LeftRail {
             live_worktrees: HashSet::new(),
             diff_counts: HashMap::new(),
             width: px(density.w_left_rail),
+            resizing: false,
             settings_repo: None,
             collapsed: HashSet::new(),
             sort_mode: WorkspaceSortMode::default(),
@@ -369,6 +376,12 @@ impl LeftRail {
 
 impl Render for LeftRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A resize drag is over once no drag is active — releasing the
+        // button produces no further drag-move ticks, so the flag is
+        // cleared here on the next render instead.
+        if self.resizing && !cx.has_active_drag() {
+            self.resizing = false;
+        }
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
@@ -494,7 +507,7 @@ impl Render for LeftRail {
                 });
             })
             .child(body)
-            .child(resize::build_handle(theme))
+            .child(resize::build_handle(self.resizing, theme))
     }
 }
 

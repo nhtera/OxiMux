@@ -14,7 +14,8 @@
 
 use gpui::{
     AnyElement, AppContext, Context, ElementId, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::shell::left_rail::LeftRail;
@@ -48,19 +49,24 @@ impl Render for LeftRailResizeGhost {
 /// Hovering the hit area paints a wider `border_active` bar over it —
 /// an absolute overlay so the highlight widens without any layout
 /// shift, and the edge never reads as two offset lines.
-pub fn build_handle(theme: oximux_settings::Theme) -> AnyElement {
+pub fn build_handle(resizing: bool, theme: oximux_settings::Theme) -> AnyElement {
     let stripe = div()
         .h_full()
         .w(px(HANDLE_STRIPE_PX))
         .flex_shrink_0()
         .bg(theme.border_inactive);
+    // Hover styles are suppressed while a drag is active, so the bar
+    // would vanish on the first drag tick if it relied on hover alone.
+    // `resizing` (rail state, set per drag-move tick) keeps it lit for
+    // the whole drag.
     let hover_bar = div()
         .absolute()
         .top_0()
         .bottom_0()
         .right_0()
         .w(px(HANDLE_HOVER_BAR_PX))
-        .group_hover("left-rail-resize", move |s| s.bg(theme.border_active));
+        .group_hover("left-rail-resize", move |s| s.bg(theme.border_active))
+        .when(resizing, |bar| bar.bg(theme.border_active));
     div()
         .id(ElementId::Name(SharedString::from("left-rail-resize-handle")))
         .group("left-rail-resize")
@@ -89,5 +95,6 @@ pub fn build_handle(theme: oximux_settings::Theme) -> AnyElement {
 /// width equals the cursor's x. Clamp + persist live inside
 /// `LeftRail::set_width`.
 pub fn apply_drag_move(rail: &mut LeftRail, cursor_x: f32, cx: &mut Context<LeftRail>) {
+    rail.resizing = true;
     rail.set_width(px(cursor_x), cx);
 }

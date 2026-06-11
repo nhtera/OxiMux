@@ -17,7 +17,8 @@
 
 use gpui::{
     AnyElement, AppContext, Context, ElementId, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::scm_layout_settings;
@@ -69,19 +70,24 @@ impl Render for SidebarResizeGhost {
 /// hitbox paints a wider `border_active` bar over it — an absolute
 /// overlay so the highlight widens without any layout shift, and the
 /// edge never reads as two offset lines.
-pub fn build_handle(window_width: f32, theme: oximux_settings::Theme) -> AnyElement {
+pub fn build_handle(window_width: f32, resizing: bool, theme: oximux_settings::Theme) -> AnyElement {
     let stripe = div()
         .h_full()
         .w(px(HANDLE_STRIPE_PX))
         .flex_shrink_0()
         .bg(theme.border_inactive);
+    // Hover styles are suppressed while a drag is active, so the bar
+    // would vanish on the first drag tick if it relied on hover alone.
+    // `resizing` (sidebar state, set per drag-move tick) keeps it lit
+    // for the whole drag.
     let hover_bar = div()
         .absolute()
         .top_0()
         .bottom_0()
         .left_0()
         .w(px(HANDLE_HOVER_BAR_PX))
-        .group_hover("right-sidebar-resize", move |s| s.bg(theme.border_active));
+        .group_hover("right-sidebar-resize", move |s| s.bg(theme.border_active))
+        .when(resizing, |bar| bar.bg(theme.border_active));
     div()
         .id(ElementId::Name(SharedString::from(
             "right-sidebar-resize-handle",
@@ -120,6 +126,7 @@ pub fn apply_drag_move(
 ) {
     let candidate = window_width - cursor_x;
     let clamped = scm_layout_settings::clamp_panel_width(candidate, window_width);
+    sidebar.resizing = true;
     sidebar.set_panel_width(px(clamped), cx);
 }
 

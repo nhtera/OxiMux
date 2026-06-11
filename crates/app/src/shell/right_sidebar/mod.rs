@@ -106,6 +106,12 @@ pub struct RightSidebar {
     /// `WorkspaceRoot` for the chrome-width forwarding into
     /// ProjectPanes, and by `render()` for the column's `w(...)` style.
     panel_width: Pixels,
+    /// True while a resize drag is in flight. Set on every drag tick
+    /// (`resize::apply_drag_move`), cleared on the first render after
+    /// the drag ends. Drives the handle's highlight bar — hover styles
+    /// are suppressed during drags, so the lit state must come from
+    /// sidebar state instead.
+    resizing: bool,
     /// Global settings store for persistence on resize. `None` =
     /// test/non-persistent mount; setter just updates state.
     settings_repo: Option<SettingsRepo>,
@@ -284,6 +290,7 @@ impl RightSidebar {
             _poller: poller,
             _poll_observer: poll_observer,
             panel_width,
+            resizing: false,
             settings_repo,
             theme,
         }
@@ -422,6 +429,7 @@ impl RightSidebar {
             _poller: poller,
             _poll_observer: poll_observer,
             panel_width: DEFAULT_PANEL_WIDTH,
+            resizing: false,
             settings_repo: None,
             theme,
         }
@@ -521,7 +529,13 @@ impl RightSidebar {
 }
 
 impl Render for RightSidebar {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A resize drag is over once no drag is active — releasing the
+        // button produces no further drag-move ticks, so the flag is
+        // cleared here on the next render instead.
+        if self.resizing && !cx.has_active_drag() {
+            self.resizing = false;
+        }
         let theme = self.theme;
 
         // NOTE: on_action handlers for sidebar keybindings are registered on
@@ -653,7 +667,7 @@ impl Render for RightSidebar {
             .h_full()
             .w(self.panel_width)
             .bg(theme.bg_panel)
-            .child(resize::build_handle(window_width, theme))
+            .child(resize::build_handle(window_width, self.resizing, theme))
             .child(
                 div()
                     .flex()
