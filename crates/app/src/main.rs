@@ -153,6 +153,13 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // Warm the syntect grammar + theme sets (~30 ms) during idle boot
+        // so the first diff paint never pays the lazy-init cost.
+        cx.background_executor()
+            .spawn(async {
+                oximux_app::shell::diff_view::syntax::prewarm();
+            })
+            .detach();
         // gpui-component defaults to ThemeMode::Light; flip to Dark so the
         // TabBar + future component chrome match OxiMux's dark terminal panes.
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);

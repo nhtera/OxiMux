@@ -267,6 +267,11 @@ impl GitPanel {
                         error = %err,
                         "single-path discard failed"
                     );
+                    crate::shell::toast::toast_op_error(
+                        cx,
+                        &format!("Discard {}", path.display()),
+                        &err,
+                    );
                 }
                 cx.notify();
             });
@@ -346,6 +351,7 @@ impl GitPanel {
                         error = %err,
                         "confirmed_discard_area failed"
                     );
+                    crate::shell::toast::toast_op_error(cx, "Discard changes", &err);
                 }
                 cx.notify();
             });

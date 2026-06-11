@@ -1118,6 +1118,7 @@ impl DiffView {
             status: orig.status.clone(),
             hunks: regions.into_iter().map(|r| r.stage_hunk).collect(),
             large: false,
+            mode: None,
         };
         Some(HunkTarget {
             staged,

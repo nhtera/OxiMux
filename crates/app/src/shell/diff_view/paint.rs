@@ -323,7 +323,10 @@ pub fn overview_ruler(
         let weak = weak.clone();
         ruler = ruler.child(
             div()
-                .id(gpui::ElementId::Name(format!("diff-ruler-run-{i}").into()))
+                .id(gpui::ElementId::NamedInteger(
+                    "diff-ruler-run".into(),
+                    i as u64,
+                ))
                 .absolute()
                 .right(px(0.0))
                 .w_full()
@@ -1410,14 +1413,12 @@ fn line_row_el(
         .text_color(line.fg)
         .child(StyledText::new(line.content.clone()).with_highlights(line.highlights.iter().cloned()));
 
-    let row_id = gpui::ElementId::Name(
-        format!(
-            "diff-line-{}-{}-{}",
-            line.file_idx,
-            line.old_cell.trim(),
-            line.new_cell.trim()
-        )
-        .into(),
+    // Packed (file, plan-row) id — same treatment as the split row: as
+    // stable as the old gutter-text pair (both only change when the diff
+    // changes) without a format! per visible row per frame.
+    let row_id = gpui::ElementId::NamedInteger(
+        "diff-line".into(),
+        ((line.file_idx as u64) << 32) | (row_index as u64 & 0xffff_ffff),
     );
     // Hover wash: on a tinted row, deepen the same hue a touch so the cue
     // survives (the add/remove color "wins" under the pointer); on context,
@@ -1596,8 +1597,10 @@ pub fn staging_card_overlay(
     let hover_weak = weak.clone();
     Some(
         div()
-            .id(gpui::ElementId::Name(
-                format!("diff-staging-card-{file_idx}-{region_idx}").into(),
+            // Packed (file, region) id — no per-frame string allocation.
+            .id(gpui::ElementId::NamedInteger(
+                "diff-staging-card".into(),
+                ((file_idx as u64) << 32) | (region_idx as u64 & 0xffff_ffff),
             ))
             .absolute()
             .top(px(top))
@@ -1635,9 +1638,13 @@ fn split_line_el(
     typography: &Typography,
     weak: WeakEntity<DiffView>,
 ) -> impl IntoElement {
-    let lid = left.map(|c| c.gutter.trim().to_string()).unwrap_or_default();
-    let rid = right.map(|c| c.gutter.trim().to_string()).unwrap_or_default();
-    let row_id = gpui::ElementId::Name(format!("diff-split-{file_idx}-{lid}-{rid}").into());
+    // Packed (file, plan-row) id — identifies the row as stably as the old
+    // gutter-text pair (both change only when the diff itself changes) but
+    // without two String builds + a format! per visible row per frame.
+    let row_id = gpui::ElementId::NamedInteger(
+        "diff-split".into(),
+        ((file_idx as u64) << 32) | (row_index as u64 & 0xffff_ffff),
+    );
     let target_region = region;
     let target_row = region.map(|_| row_index);
     div()
@@ -1754,7 +1761,10 @@ fn context_fold_row(
     typography: &Typography,
     weak: WeakEntity<DiffView>,
 ) -> impl IntoElement {
-    let id = gpui::ElementId::Name(format!("diff-fold-{file_idx}-{}", fold_id.1).into());
+    let id = gpui::ElementId::NamedInteger(
+        "diff-fold".into(),
+        ((file_idx as u64) << 32) | (fold_id.1 as u64 & 0xffff_ffff),
+    );
     let hover_bg = theme.bg_panel;
     div()
         .id(id)

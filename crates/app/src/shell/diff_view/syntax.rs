@@ -175,11 +175,10 @@ fn syntax_for(lang: Language) -> Option<&'static SyntaxReference> {
         .or_else(|| Some(SYNTAX_SET.find_syntax_plain_text()))
 }
 
-/// Pre-warm the static sets. Optional — first call to `highlight_line`
-/// would warm them anyway. Call this from a background task at workspace
-/// open if the ~30 ms cold-start latency on the first diff render shows
-/// up in profiling. Default policy: don't pre-warm; let lazy init absorb
-/// the cost.
+/// Pre-warm the static sets. Called from a background task at app boot
+/// (`main.rs`) so the ~30 ms cold-start never lands on the first diff
+/// paint. Safe to call any number of times; first call to
+/// `highlight_line` would warm them anyway.
 pub fn prewarm() {
     let _ = (&*SYNTAX_SET, &*SYNTAX_DARK);
 }

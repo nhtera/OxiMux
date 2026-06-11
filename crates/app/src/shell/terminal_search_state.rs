@@ -14,7 +14,10 @@
 use gpui::KeyDownEvent;
 use oximux_pty::Cell;
 
-use crate::shell::terminal_search::{MatchRange, SearchOptions, find_matches_with_options};
+use crate::shell::terminal_search::{
+    MatchRange, SearchOptions, compile_search_regex, find_matches_precompiled,
+    find_matches_with_options,
+};
 
 /// Outcome of a keystroke routed to the search overlay. The host matches
 /// on this to decide whether to notify, fetch a fresh grid, or fall through
@@ -71,6 +74,11 @@ pub struct SearchState {
     /// off, which preserves the original "case-insensitive plain substring"
     /// scan behavior.
     pub options: SearchOptions,
+    /// Compiled regex cached across reruns, keyed by the (query,
+    /// case-sensitive) pair it was built from — typing reruns of the same
+    /// needle (scroll-driven refreshes, toggles that don't affect the
+    /// pattern) skip recompilation. `None` also covers invalid patterns.
+    compiled: Option<(String, bool, regex::Regex)>,
 }
 
 impl Default for SearchState {
@@ -88,6 +96,7 @@ impl SearchState {
             history_len: 0,
             current_index: None,
             options: SearchOptions::default(),
+            compiled: None,
         }
     }
 
@@ -122,7 +131,27 @@ impl SearchState {
             return;
         }
         self.history_len = grid.len().saturating_sub(visible_rows);
-        self.matches = find_matches_with_options(grid, &self.query, self.options);
+        self.matches = if self.options.regex {
+            // Compile at most once per (needle, case) pair. Invalid
+            // patterns don't cache — they're cheap to re-reject and yield
+            // zero matches either way.
+            let stale = !matches!(
+                &self.compiled,
+                Some((q, cs, _)) if *q == self.query && *cs == self.options.case_sensitive
+            );
+            if stale {
+                self.compiled = compile_search_regex(&self.query, self.options.case_sensitive)
+                    .map(|re| (self.query.clone(), self.options.case_sensitive, re));
+            }
+            match &self.compiled {
+                Some((q, cs, re)) if *q == self.query && *cs == self.options.case_sensitive => {
+                    find_matches_precompiled(grid, re, self.options)
+                }
+                _ => Vec::new(), // invalid pattern → zero matches (unchanged)
+            }
+        } else {
+            find_matches_with_options(grid, &self.query, self.options)
+        };
         self.current_index = if self.matches.is_empty() {
             None
         } else {

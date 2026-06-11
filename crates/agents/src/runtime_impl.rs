@@ -128,7 +128,7 @@ impl CliRuntime {
         term_id: TerminalSessionId,
     ) -> Result<AgentSessionId> {
         let adapter = {
-            let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+            let inner = lock_recover(&self.inner, "CliRuntime sessions");
             inner
                 .adapters
                 .get(&adapter_key)
@@ -151,7 +151,7 @@ impl CliRuntime {
         let machine = StatusMachine::new(patterns);
         let (status_tx, status_rx) = watch::channel(AgentStatus::Idle);
         let poll_handle = tokio::spawn(poll_loop(backend.clone(), term_id, machine, status_tx));
-        let mut inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        let mut inner = lock_recover(&self.inner, "CliRuntime sessions");
         let id = AgentSessionId::new(inner.next_id);
         inner.next_id = inner.next_id.saturating_add(1);
         inner.sessions.insert(
@@ -170,7 +170,7 @@ impl CliRuntime {
     /// if called twice for the same enum (only relevant for tests that
     /// swap in a mock).
     pub fn register_adapter(&self, key: AgentAdapter, adapter: Arc<dyn CliAgentAdapter>) {
-        let mut inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        let mut inner = lock_recover(&self.inner, "CliRuntime sessions");
         inner.adapters.insert(key, adapter);
     }
 
@@ -182,7 +182,7 @@ impl CliRuntime {
     /// non-blocking. Errors when the session is unknown (already cancelled
     /// or never started).
     pub fn backend_for(&self, id: AgentSessionId) -> Result<SharedBackend> {
-        let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        let inner = lock_recover(&self.inner, "CliRuntime sessions");
         inner
             .sessions
             .get(&id)
@@ -195,7 +195,7 @@ impl CliRuntime {
     /// of the shared backend (each backend can serve multiple sessions in
     /// principle — `oximux-pty` does not enforce one-id-per-backend).
     pub fn terminal_session_id(&self, id: AgentSessionId) -> Result<TerminalSessionId> {
-        let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        let inner = lock_recover(&self.inner, "CliRuntime sessions");
         inner
             .sessions
             .get(&id)
@@ -214,7 +214,7 @@ impl Default for CliRuntime {
 impl AgentRuntime for CliRuntime {
     async fn start_session(&self, cfg: AgentSessionConfig) -> Result<AgentSessionId> {
         let adapter = {
-            let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+            let inner = lock_recover(&self.inner, "CliRuntime sessions");
             inner
                 .adapters
                 .get(&cfg.adapter)
@@ -261,9 +261,7 @@ impl AgentRuntime for CliRuntime {
             );
         }
         let shared = {
-            self.inner
-                .lock()
-                .expect("CliRuntime mutex poisoned")
+            lock_recover(&self.inner, "CliRuntime sessions")
                 .shared_backend
                 .clone()
         };
@@ -284,7 +282,7 @@ impl AgentRuntime for CliRuntime {
             let launch = build_launch_line(&spec.program, &spec.args);
             let shared_for_spawn = shared.clone();
             let term_id = tokio::task::spawn_blocking(move || -> Result<TerminalSessionId> {
-                let mut be = shared_for_spawn.lock().expect("backend mutex poisoned");
+                let mut be = lock_recover(&shared_for_spawn, "terminal backend");
                 let id = be.spawn(relay_cfg)?;
                 be.write(id, launch.as_bytes())?;
                 if let Some(seed) = stdin_seed {
@@ -315,7 +313,7 @@ impl AgentRuntime for CliRuntime {
 
     async fn send_message(&self, id: AgentSessionId, msg: &str) -> Result<()> {
         let (backend, term_id) = {
-            let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+            let inner = lock_recover(&self.inner, "CliRuntime sessions");
             let entry = inner
                 .sessions
                 .get(&id)
@@ -324,7 +322,7 @@ impl AgentRuntime for CliRuntime {
         };
         let bytes = msg.as_bytes().to_vec();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut be = backend.lock().expect("backend mutex poisoned");
+            let mut be = lock_recover(&backend, "terminal backend");
             be.write(term_id, &bytes)
         })
         .await??;
@@ -333,7 +331,7 @@ impl AgentRuntime for CliRuntime {
 
     async fn cancel(&self, id: AgentSessionId) -> Result<()> {
         let entry = {
-            let mut inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+            let mut inner = lock_recover(&self.inner, "CliRuntime sessions");
             inner
                 .sessions
                 .remove(&id)
@@ -352,7 +350,7 @@ impl AgentRuntime for CliRuntime {
         // and join() deadlocks waiting for a watcher that's blocked on
         // tx.send(). Draining unblocks the sender path before join.
         tokio::task::spawn_blocking(move || {
-            let mut be = backend.lock().expect("backend mutex poisoned");
+            let mut be = lock_recover(&backend, "terminal backend");
             let _ = be.drain_events();
             let _ = be.close(term_id);
         })
@@ -374,7 +372,7 @@ impl AgentRuntime for CliRuntime {
     }
 
     fn subscribe_status(&self, id: AgentSessionId) -> Result<AgentStatusStream> {
-        let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        let inner = lock_recover(&self.inner, "CliRuntime sessions");
         let entry = inner
             .sessions
             .get(&id)
@@ -383,7 +381,7 @@ impl AgentRuntime for CliRuntime {
     }
 
     fn current_status(&self, id: AgentSessionId) -> Result<AgentStatus> {
-        let inner = self.inner.lock().expect("CliRuntime mutex poisoned");
+        let inner = lock_recover(&self.inner, "CliRuntime sessions");
         let entry = inner
             .sessions
             .get(&id)
@@ -446,7 +444,7 @@ async fn poll_loop(
     loop {
         interval.tick().await;
         let events = {
-            let mut be = backend.lock().expect("backend mutex poisoned");
+            let mut be = lock_recover(&backend, "terminal backend");
             // Per-session drain: on the shared relay backend a plain
             // `drain_events()` would steal every other pane's events. The
             // default impl filters by id, so this is also correct for the
@@ -489,11 +487,46 @@ async fn poll_loop(
     }
 }
 
+/// Lock a mutex, recovering from poison instead of propagating the
+/// panic. The guarded values (session table, adapter registry, terminal
+/// backend) are per-session islands that stay usable after another
+/// thread panicked mid-access — recovering keeps every other agent
+/// operation working, whereas propagating would cascade one failed
+/// agent future into whole-runtime death.
+fn lock_recover<'a, T: ?Sized>(
+    m: &'a Mutex<T>,
+    what: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(what, "mutex poisoned; recovering");
+        poisoned.into_inner()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::CustomCommandAdapter;
     use std::path::PathBuf;
+
+    // A panic while some thread held the runtime lock must not take every
+    // later agent operation down with it: lock_recover hands back the
+    // still-consistent value instead of propagating the poison.
+    #[test]
+    fn lock_recover_survives_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(5i32));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = m2.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(m.lock().is_err(), "mutex must be poisoned by the panic");
+        assert_eq!(*lock_recover(&m, "test"), 5, "value recovered intact");
+        // And a recovered lock keeps working for writes afterwards.
+        *lock_recover(&m, "test") = 6;
+        assert_eq!(*lock_recover(&m, "test"), 6);
+    }
 
     fn echo_cfg(program: &str, args: Vec<String>) -> AgentSessionConfig {
         AgentSessionConfig {

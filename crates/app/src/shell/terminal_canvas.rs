@@ -67,7 +67,9 @@ impl Default for Alphas {
 /// builds one of these per frame and moves it into the closure so the
 /// canvas API's `FnOnce + 'static` requirement is satisfied.
 pub struct PaintParams {
-    pub snapshot: TerminalSnapshot,
+    /// Shared grid snapshot — an `Arc` handle so building params per
+    /// frame never deep-clones the cell grid.
+    pub snapshot: std::sync::Arc<TerminalSnapshot>,
     pub theme: Theme,
     pub typography: Typography,
     /// `(row, col)` of the cursor. Set to `(usize::MAX, usize::MAX)` to

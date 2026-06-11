@@ -365,7 +365,10 @@ pub struct TerminalView {
     /// the duration of a single non-blocking trait call.
     backend: SharedBackend,
     session_id: TerminalSessionId,
-    snapshot: TerminalSnapshot,
+    /// Latest grid snapshot, refreshed at tick time only when output /
+    /// resize events arrived. `Arc` so the per-frame `PaintParams` build
+    /// is a pointer bump — never a full-grid deep clone.
+    snapshot: Arc<TerminalSnapshot>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -400,6 +403,11 @@ pub struct TerminalView {
     /// the state machine + key dispatch. The view owns I/O (grid fetch +
     /// `cx.notify`) and delegates everything else.
     search: SearchState,
+    /// Monotonic generation for keystroke-debounced search reruns: each
+    /// query edit bumps it and arms a short timer; only the timer whose
+    /// generation is still current rescans, so fast typing never clones
+    /// the full scrollback grid per keystroke.
+    search_debounce_gen: u64,
     /// Latest OSC 2 title from the PTY (`TerminalEvent::TitleChange`). `None`
     /// until the shell emits one. Reserved for future use by the workspace
     /// tab strip — current labels are static `"Terminal N"` slugs.
@@ -548,11 +556,13 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let snapshot = backend
-            .lock()
-            .expect("pty backend mutex poisoned")
-            .snapshot(session_id)
-            .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS));
+        let snapshot = Arc::new(
+            backend
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot(session_id)
+                .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS)),
+        );
 
         let focus_handle = cx.focus_handle();
         // Register on_focus / on_blur BEFORE calling focus() so the initial
@@ -609,6 +619,7 @@ impl TerminalView {
             visible: true,
             attention: false,
             search: SearchState::new(),
+            search_debounce_gen: 0,
             title: None,
             dormant_cwd: None,
             _poll_task: Some(poll_task),
@@ -693,12 +704,13 @@ impl TerminalView {
                 let _ = be.close(old_id);
             }
         });
-        self.snapshot = self
-            .backend
-            .lock()
-            .expect("pty backend mutex poisoned")
-            .snapshot(session_id)
-            .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS));
+        self.snapshot = Arc::new(
+            self.backend
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot(session_id)
+                .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS)),
+        );
         // The session was attached/spawned at its own size; (0,0) can never
         // equal a real canvas grid, so the next render always resizes it to
         // the painted bounds.
@@ -734,16 +746,18 @@ impl TerminalView {
     ) -> Self {
         // Apply the saved scrollback to the dormant grid emulator.
         if !prefill_bytes.is_empty() {
-            let mut guard = backend.lock().expect("pty backend mutex poisoned");
+            let mut guard = backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Err(err) = guard.prefill_grid(session_id, prefill_bytes) {
                 tracing::warn!(?err, "dormant prefill_grid failed");
             }
         }
-        let snapshot = backend
-            .lock()
-            .expect("pty backend mutex poisoned")
-            .snapshot(session_id)
-            .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS));
+        let snapshot = Arc::new(
+            backend
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot(session_id)
+                .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS)),
+        );
 
         let focus_handle = cx.focus_handle();
         // On focus-in: flip the live-cursor state, then wake the PTY.
@@ -786,6 +800,7 @@ impl TerminalView {
             visible: true,
             attention: false,
             search: SearchState::new(),
+            search_debounce_gen: 0,
             title: None,
             dormant_cwd: Some(cwd),
             _poll_task: None,
@@ -832,7 +847,7 @@ impl TerminalView {
         let promote_result = self
             .backend
             .lock()
-            .expect("pty backend mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .promote_to_live(session_id, cfg);
         if let Err(err) = promote_result {
             tracing::warn!(?err, "respawn promote_to_live failed; staying dormant");
@@ -910,7 +925,7 @@ impl TerminalView {
     /// lock is held for one non-blocking call only — never await across,
     /// never sleep within. Returns whatever `f` returns.
     fn with_backend<R>(&self, f: impl FnOnce(&mut dyn TerminalBackend) -> R) -> R {
-        let mut be = self.backend.lock().expect("pty backend mutex poisoned");
+        let mut be = self.backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&mut **be)
     }
 
@@ -1125,6 +1140,28 @@ impl TerminalView {
         let grid = self.with_backend(|be| be.search_grid(session_id));
         let visible = self.snapshot.cells.len();
         self.search.rerun(&grid, visible);
+    }
+
+    /// Debounce keystroke-driven reruns: fetching the search grid clones
+    /// the entire scrollback out of the emulator under its lock, so doing
+    /// it per keystroke makes fast typing churn. Each edit bumps the
+    /// generation and arms one short timer; only the newest generation's
+    /// timer actually rescans. Open/toggle/next-match paths stay
+    /// immediate (single events, no churn).
+    fn schedule_debounced_search(&mut self, cx: &mut Context<Self>) {
+        const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
+        self.search_debounce_gen = self.search_debounce_gen.wrapping_add(1);
+        let my_gen = self.search_debounce_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.search_debounce_gen == my_gen && view.search.active {
+                    view.rerun_search();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Map a window-space pointer position to a `(row, col)` cell, clamped to
@@ -1417,7 +1454,7 @@ impl TerminalView {
                 return;
             }
             SearchKeyOutcome::QueryChanged => {
-                self.rerun_search();
+                self.schedule_debounced_search(cx);
                 cx.notify();
                 return;
             }
@@ -1578,7 +1615,7 @@ impl TerminalView {
         let promote_result = self
             .backend
             .lock()
-            .expect("pty backend mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .promote_to_live(session_id, cfg);
         if let Err(err) = promote_result {
             tracing::warn!(?err, "wake_dormant promote_to_live failed");
@@ -1706,7 +1743,7 @@ impl TerminalView {
         }
         let session_id = self.session_id;
         if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
-            self.snapshot = snapshot;
+            self.snapshot = Arc::new(snapshot);
             self.revalidate_hover();
         }
         if had_output {
@@ -1837,7 +1874,7 @@ impl TerminalView {
         // next emits output. The render that triggered `maybe_resize`
         // proceeds with up-to-date cell data this same frame.
         if let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
-            self.snapshot = snapshot;
+            self.snapshot = Arc::new(snapshot);
             self.revalidate_hover();
         }
     }

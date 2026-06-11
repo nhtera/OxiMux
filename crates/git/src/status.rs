@@ -263,13 +263,17 @@ fn split_n_fields_then_path(rec: &[u8], n: usize) -> Result<Split<'_>> {
     let s =
         std::str::from_utf8(rec).map_err(|e| GitError::parse(format!("record not utf-8: {e}")))?;
     let mut parts: Vec<&str> = s.splitn(n + 1, ' ').collect();
-    if parts.len() < n + 1 {
-        return Err(GitError::parse(format!(
-            "expected {n} fields + path, got {} parts",
-            parts.len()
-        )));
-    }
-    let path = parts.pop().expect("checked len above");
+    // Pop-then-check keeps the length guarantee and the extraction in one
+    // motion — no separate pre-check a refactor could orphan from the pop.
+    let path = match parts.pop() {
+        Some(path) if parts.len() == n => path,
+        popped => {
+            return Err(GitError::parse(format!(
+                "expected {n} fields + path, got {} parts",
+                parts.len() + usize::from(popped.is_some())
+            )));
+        }
+    };
     // splitn surfaces adjacent separators as empty fields — reject so we never
     // index past the intended field slot.
     if parts.iter().any(|p| p.is_empty()) {

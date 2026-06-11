@@ -210,8 +210,13 @@ impl WorktreePanel {
             Err(_) => return,
         }
         let task = cx.spawn(async move |this, cx| {
-            let _ = rx.await;
-            let _ = this.update(cx, |panel, cx| panel.refresh(cx));
+            let result = rx.await;
+            let _ = this.update(cx, |panel, cx| {
+                if let Ok(Err(err)) = &result {
+                    crate::shell::toast::toast_op_error(cx, "Remove worktree", err);
+                }
+                panel.refresh(cx);
+            });
         });
         self._remove_task = Some(task);
     }

@@ -155,11 +155,21 @@ impl Pending {
     fn finalize(self) -> Option<FileDiff> {
         let (path, status) = self.resolve_path_and_status()?;
         let total_lines: usize = self.hunks.iter().map(|h| h.lines.len()).sum();
+        // Mode is only meaningful for Added/Deleted (ModeChanged carries
+        // its own pair in the status); whichever extended header was
+        // present is the right one — they're mutually exclusive in git
+        // output.
+        let mode = match status {
+            DiffStatus::Added => self.new_file_mode,
+            DiffStatus::Deleted => self.deleted_file_mode,
+            _ => None,
+        };
         Some(FileDiff {
             path,
             status,
             hunks: self.hunks,
             large: total_lines > LARGE_DIFF_LINE_THRESHOLD,
+            mode,
         })
     }
 

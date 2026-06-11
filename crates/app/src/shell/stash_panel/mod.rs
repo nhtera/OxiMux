@@ -163,7 +163,7 @@ impl StashPanel {
     pub fn apply(&mut self, stash_ref: StashRef, cx: &mut Context<Self>) {
         self.spawn_op(
             move |repo| async move { repo.stash_apply(&stash_ref).await },
-            "stash_apply",
+            "Stash apply",
             cx,
         );
     }
@@ -171,7 +171,7 @@ impl StashPanel {
     pub fn pop(&mut self, stash_ref: StashRef, cx: &mut Context<Self>) {
         self.spawn_op(
             move |repo| async move { repo.stash_pop(&stash_ref).await },
-            "stash_pop",
+            "Stash pop",
             cx,
         );
     }
@@ -186,7 +186,7 @@ impl StashPanel {
         };
         self.spawn_op(
             move |repo| async move { repo.stash_drop(&stash_ref).await },
-            "stash_drop",
+            "Stash drop",
             cx,
         );
     }
@@ -221,8 +221,11 @@ impl StashPanel {
             }
         }
         let task = cx.spawn(async move |this, cx| {
-            let _result = rx.await;
+            let result = rx.await;
             let _ = this.update(cx, |panel, cx| {
+                if let Ok(Err(err)) = &result {
+                    crate::shell::toast::toast_op_error(cx, "Stash push", err);
+                }
                 panel.refresh(cx);
             });
         });
@@ -249,8 +252,11 @@ impl StashPanel {
             }
         }
         let task = cx.spawn(async move |this, cx| {
-            let _result = rx.await;
+            let result = rx.await;
             let _ = this.update(cx, |panel, cx| {
+                if let Ok(Err(err)) = &result {
+                    crate::shell::toast::toast_op_error(cx, label, err);
+                }
                 // Always refresh after an op — even on failure the user
                 // wants to see the current state.
                 panel.refresh(cx);

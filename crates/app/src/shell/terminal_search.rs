@@ -91,9 +91,22 @@ fn scan_substring(grid: &[Vec<Cell>], needle: &str, options: SearchOptions) -> V
             let match_byte_start = search_start + found_byte;
             let char_start = row_buf[..match_byte_start].chars().count();
             let needle_char_len = needle_norm.chars().count();
+            if needle_char_len == 0 {
+                // Mirrors the regex path's zero-width guard: nothing
+                // highlightable, and `char_end_exclusive - 1` would
+                // underflow below.
+                break;
+            }
             let char_end_exclusive = char_start + needle_char_len;
-            let col_start = col_index[char_start];
-            let col_end_inclusive = col_index[char_end_exclusive - 1];
+            // In-bounds by construction (col_index has one entry per
+            // row_buf char), but a `get` keeps a future drift in the
+            // buf/index pairing a missed match instead of a panic.
+            let (Some(&col_start), Some(&col_end_inclusive)) = (
+                col_index.get(char_start),
+                col_index.get(char_end_exclusive - 1),
+            ) else {
+                break;
+            };
             let col_end = col_end_inclusive + 1;
             if !options.whole_word || is_word_boundary(row, col_start, col_end) {
                 out.push(MatchRange {
@@ -111,18 +124,38 @@ fn scan_substring(grid: &[Vec<Cell>], needle: &str, options: SearchOptions) -> V
     out
 }
 
-/// Regex scan. Invalid patterns yield zero matches (silent — overlay should
-/// surface the error visually rather than panic mid-typing). Uses
-/// `RegexBuilder` so we can flip `case_insensitive` rather than splicing
-/// `(?i)` into the pattern (cleaner, and works with anchors).
-fn scan_regex(grid: &[Vec<Cell>], needle: &str, options: SearchOptions) -> Vec<MatchRange> {
-    let re = match RegexBuilder::new(needle)
-        .case_insensitive(!options.case_sensitive)
+/// Compile a search regex with the overlay's case toggle applied. `None`
+/// for invalid patterns (silent — the overlay surfaces errors visually
+/// rather than panicking mid-typing). Exposed so the stateful search can
+/// cache the compiled regex across reruns of the same needle.
+pub fn compile_search_regex(needle: &str, case_sensitive: bool) -> Option<regex::Regex> {
+    RegexBuilder::new(needle)
+        .case_insensitive(!case_sensitive)
         .build()
-    {
-        Ok(re) => re,
-        Err(_) => return Vec::new(),
+        .ok()
+}
+
+/// Regex scan against a caller-supplied precompiled regex. Split from
+/// [`scan_regex`] so a cached regex skips recompilation per rerun.
+pub fn find_matches_precompiled(
+    grid: &[Vec<Cell>],
+    re: &regex::Regex,
+    options: SearchOptions,
+) -> Vec<MatchRange> {
+    scan_regex_with(grid, re, options)
+}
+
+/// Regex scan. Uses `RegexBuilder` so we can flip `case_insensitive`
+/// rather than splicing `(?i)` into the pattern (cleaner, and works with
+/// anchors).
+fn scan_regex(grid: &[Vec<Cell>], needle: &str, options: SearchOptions) -> Vec<MatchRange> {
+    let Some(re) = compile_search_regex(needle, options.case_sensitive) else {
+        return Vec::new();
     };
+    scan_regex_with(grid, &re, options)
+}
+
+fn scan_regex_with(grid: &[Vec<Cell>], re: &regex::Regex, options: SearchOptions) -> Vec<MatchRange> {
     let mut out = Vec::new();
     let mut row_buf = String::with_capacity(256);
     let mut col_index = Vec::with_capacity(256);
@@ -143,8 +176,13 @@ fn scan_regex(grid: &[Vec<Cell>], needle: &str, options: SearchOptions) -> Vec<M
                 continue;
             }
             let char_end_exclusive = char_start + match_chars;
-            let col_start = col_index[char_start];
-            let col_end_inclusive = col_index[char_end_exclusive - 1];
+            // Same defensive `get` as the substring path — see comment there.
+            let (Some(&col_start), Some(&col_end_inclusive)) = (
+                col_index.get(char_start),
+                col_index.get(char_end_exclusive - 1),
+            ) else {
+                continue;
+            };
             let col_end = col_end_inclusive + 1;
             if !options.whole_word || is_word_boundary(row, col_start, col_end) {
                 out.push(MatchRange {
@@ -303,6 +341,42 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].col_start, 0);
         assert_eq!(matches[0].col_end, 6);
+    }
+
+    /// Unicode fixture: 'İ' lowercases to TWO chars (i + combining dot),
+    /// so the case-insensitive scratch buffer has more chars than the row
+    /// has columns — exercising the char→column index where one source
+    /// column owns several scratch chars. The wide glyph + '\0' trail
+    /// cell exercises the trail-cell mapping, and the row-final match
+    /// exercises the `col_end_inclusive + 1` edge. Locks in: in-bounds,
+    /// no panic, column-space spans.
+    #[test]
+    fn unicode_expanding_lowercase_and_wide_glyphs_stay_in_bounds() {
+        // Columns: İ(0) s(1) t(2) 漢(3) trail(4) a(5) b(6) c(7)
+        let mut row = row_from_str("İst漢 abc");
+        row[4].ch = '\0';
+        let grid = vec![row];
+        // Case-insensitive: needle and row go through the same expansion.
+        let matches = find(&grid, "İst");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].col_start, 0);
+        assert_eq!(matches[0].col_end, 3);
+        // Match ending at the very last column.
+        let matches = find(&grid, "abc");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].col_start, 5);
+        assert_eq!(matches[0].col_end, 8);
+        // Regex path over the same row must stay in bounds too.
+        let matches = find_opts(
+            &grid,
+            "a.c",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].col_end, 8);
     }
 
     // --- QA-added edge cases ---

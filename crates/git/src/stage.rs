@@ -222,18 +222,17 @@ pub(crate) fn build_patch(file: &FileDiff, indices: &[usize]) -> Result<Vec<u8>>
     );
     // Extended headers — REQUIRED by `git apply` for delete / add to be
     // interpreted as file-mode-change-to-absent rather than a literal
-    // `dev/null` path being created. Mode defaults to 100644 because
-    // `FileDiff` doesn't (yet) carry the actual file mode; if the source was
-    // 100755 the worst case is the staged deletion has a slightly wrong mode
-    // recorded in the patch — git's deletion logic doesn't actually use it.
-    // FIXME(v1.1): plumb actual file mode through `DiffStatus::Added` /
-    // `DiffStatus::Deleted` so executables round-trip correctly.
+    // `dev/null` path being created. The mode comes from the parsed
+    // diff's own extended header (`FileDiff::mode`) so an added
+    // executable stages as 100755; 100644 is only the fallback for
+    // diffs that never carried the header.
+    let mode = file.mode.unwrap_or(0o100644);
     match &file.status {
         DiffStatus::Added => {
-            writeln_to_vec(&mut out, format_args!("new file mode 100644"));
+            writeln_to_vec(&mut out, format_args!("new file mode {mode:06o}"));
         }
         DiffStatus::Deleted => {
-            writeln_to_vec(&mut out, format_args!("deleted file mode 100644"));
+            writeln_to_vec(&mut out, format_args!("deleted file mode {mode:06o}"));
         }
         DiffStatus::Renamed { from, similarity } | DiffStatus::Copied { from, similarity } => {
             // Without these, `git apply` treats the patch as a plain modify
@@ -319,6 +318,7 @@ mod tests {
             status: DiffStatus::Modified,
             hunks,
             large: false,
+            mode: None,
         }
     }
 
@@ -369,6 +369,7 @@ mod tests {
             status: DiffStatus::Binary,
             hunks: vec![],
             large: false,
+            mode: None,
         };
         let err = build_patch(&f, &[0]).unwrap_err();
         assert!(matches!(err, GitError::InvalidInput { .. }));
@@ -384,6 +385,7 @@ mod tests {
             },
             hunks: vec![],
             large: false,
+            mode: None,
         };
         let err = build_patch(&f, &[0]).unwrap_err();
         assert!(matches!(err, GitError::InvalidInput { .. }));
@@ -430,6 +432,7 @@ diff --git a/src/a.rs b/src/a.rs
                 vec![line(DiffLineKind::Removed, "fn dead() {}")],
             )],
             large: false,
+            mode: None,
         };
         let bytes = build_patch(&f, &[0]).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
@@ -443,6 +446,7 @@ diff --git a/src/a.rs b/src/a.rs
             status: DiffStatus::Added,
             hunks: vec![hunk(0, 1, vec![line(DiffLineKind::Added, "fn new() {}")])],
             large: false,
+            mode: None,
         };
         let bytes = build_patch(&f, &[0]).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
@@ -466,6 +470,7 @@ diff --git a/src/a.rs b/src/a.rs
                 ],
             )],
             large: false,
+            mode: None,
         };
         let bytes = build_patch(&f, &[0]).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();

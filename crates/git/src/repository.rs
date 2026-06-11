@@ -319,6 +319,7 @@ impl Repository {
                 status: DiffStatus::Binary,
                 hunks: Vec::new(),
                 large: false,
+                mode: None,
             }]);
         }
         let text = std::str::from_utf8(&bytes)
@@ -372,6 +373,7 @@ impl Repository {
             status: DiffStatus::Added,
             hunks,
             large,
+            mode: None,
         }])
     }
 

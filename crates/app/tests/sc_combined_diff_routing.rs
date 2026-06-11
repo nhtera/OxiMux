@@ -67,6 +67,7 @@ fn file(name: &str) -> FileDiff {
             }],
         }],
         large: false,
+        mode: None,
     }
 }
 

@@ -441,3 +441,55 @@ async fn build_patch_roundtrips_through_real_git() {
     assert!(!lines.contains(&"ONE"));
     assert!(!lines.contains(&"TWENTY"));
 }
+
+/// An added EXECUTABLE must keep its 100755 mode through the
+/// parse → build_patch → `git apply --cached` round-trip. The synth
+/// used to hardcode `new file mode 100644`; the mode now rides along
+/// from the parsed diff's own extended header.
+#[tokio::test]
+#[cfg(unix)]
+async fn stage_added_executable_preserves_100755() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("seed.txt"), "seed\n");
+    run_git(p, &["add", "seed.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    // New executable script, registered intent-to-add so it shows up in
+    // diff_unstaged as Added (with hunks) rather than untracked.
+    let script = p.join("tool.sh");
+    write(&script, "#!/bin/sh\necho hi\n");
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    run_git(p, &["add", "-N", "tool.sh"]);
+
+    let repo = Repository::open(p).await.unwrap();
+    let diffs = repo.diff_unstaged().await.unwrap();
+    let file = diffs
+        .iter()
+        .find(|f| f.path.ends_with("tool.sh"))
+        .expect("intent-to-add script appears in unstaged diff");
+    assert_eq!(file.status, DiffStatus::Added);
+    assert_eq!(
+        file.mode,
+        Some(0o100755),
+        "parser must surface the executable new-file mode"
+    );
+
+    repo.stage_hunks(file, &[0]).await.unwrap();
+
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "--stage", "tool.sh"])
+        .current_dir(p)
+        .output()
+        .expect("git on PATH");
+    let stage_line = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stage_line.starts_with("100755"),
+        "staged executable must keep 100755, got: {stage_line:?}"
+    );
+}

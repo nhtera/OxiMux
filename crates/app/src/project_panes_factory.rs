@@ -190,8 +190,7 @@ pub(crate) fn build_project_panes(
     // present. Falls through to the legacy single-group path otherwise.
     // Clone the tree out so we can hand it (by reference) into the
     // helper while still moving `snap` for the per-group iteration.
-    if snap.group_tree.is_some() && !snap.groups.is_empty() {
-        let tree = snap.group_tree.clone().expect("group_tree just checked");
+    if let (Some(tree), false) = (snap.group_tree.clone(), snap.groups.is_empty()) {
         let entity = restore_multi_group(
             panes_entity,
             snap,
@@ -1110,11 +1109,38 @@ pub(crate) fn spawn_attach_reconcile(
     .detach();
 }
 
+/// Outcome of reading a persisted layout blob.
+pub(crate) enum LoadedTabs {
+    /// Nothing persisted for this key — first open of the project.
+    Absent,
+    /// A healthy, shape-validated snapshot.
+    Snapshot(PersistedTabs),
+    /// A payload was present but unusable — parse failure (truncated
+    /// autosave) or a shape-invariant violation that would crash or
+    /// scramble the live tree. The raw bytes are preserved aside as a
+    /// `*.corrupt.json`; the caller falls back to the default layout
+    /// and surfaces a toast.
+    Corrupt,
+}
+
+/// Preserve an unusable payload + log, returning [`LoadedTabs::Corrupt`].
+fn reject_corrupt_payload(key: &str, raw: &str, reason: &str) -> LoadedTabs {
+    let preserved = crate::restore_fallback::corrupt_layouts_dir()
+        .and_then(|dir| crate::restore_fallback::preserve_corrupt_payload(&dir, key, raw));
+    tracing::error!(
+        key,
+        reason,
+        ?preserved,
+        "persisted layout rejected; falling back to default layout"
+    );
+    LoadedTabs::Corrupt
+}
+
 pub(crate) fn load_persisted_tabs(
     repo: &SettingsRepo,
     project_id: &str,
     window_id: &str,
-) -> Option<PersistedTabs> {
+) -> LoadedTabs {
     // Try the per-window key first.
     let key = settings_key(project_id, window_id);
     let raw_opt = match repo.get(&key) {
@@ -1126,41 +1152,42 @@ pub(crate) fn load_persisted_tabs(
                 window_id,
                 "load_persisted_tabs: settings.get failed"
             );
-            return None;
+            return LoadedTabs::Absent;
         }
     };
     // For the first window, fall back to the legacy (pre-V005) key so
     // existing single-window users' tab layouts survive the upgrade.
-    let raw = match raw_opt {
-        Some(r) => r,
+    let (used_key, raw) = match raw_opt {
+        Some(r) => (key, r),
         None if window_id == "main" => {
             let legacy_key = legacy_settings_key(project_id);
             match repo.get(&legacy_key) {
-                Ok(Some(r)) => r,
-                Ok(None) => return None,
+                Ok(Some(r)) => (legacy_key, r),
+                Ok(None) => return LoadedTabs::Absent,
                 Err(err) => {
                     tracing::warn!(
                         ?err,
                         project_id,
                         "load_persisted_tabs: legacy settings.get failed"
                     );
-                    return None;
+                    return LoadedTabs::Absent;
                 }
             }
         }
-        None => return None,
+        None => return LoadedTabs::Absent,
     };
-    match serde_json::from_str::<PersistedTabs>(&raw) {
-        Ok(snap) => Some(snap),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                project_id,
-                window_id,
-                "load_persisted_tabs: parse failed; ignoring"
-            );
-            None
-        }
+    let snap = match serde_json::from_str::<PersistedTabs>(&raw) {
+        Ok(snap) => snap,
+        Err(err) => return reject_corrupt_payload(&used_key, &raw, &format!("parse: {err}")),
+    };
+    // Shape gate: a parseable blob can still violate tree invariants the
+    // live `PaneTree` relies on (weights/children desync, empty splits,
+    // NaN weights, group/tab counts out of sync) — those panic or drop
+    // panes much later, so they're rejected here, before any live entity
+    // is built.
+    match crate::restore_fallback::validate_persisted_tabs(&snap) {
+        Ok(()) => LoadedTabs::Snapshot(snap),
+        Err(err) => reject_corrupt_payload(&used_key, &raw, &format!("shape: {err}")),
     }
 }
 
@@ -1212,10 +1239,13 @@ pub(crate) fn save_persisted_tabs(
         json.hash(&mut hasher);
         hasher.finish()
     };
+    // A poisoned lock only means some thread panicked mid-access; the
+    // map is plain data and stays usable — recover rather than abort a
+    // layout save (worst case: one redundant write).
     {
         let last = LAST_SAVED_TABS_HASH
             .lock()
-            .expect("saved-tabs hash map poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if last.get(&key) == Some(&digest) {
             return;
         }
@@ -1227,7 +1257,7 @@ pub(crate) fn save_persisted_tabs(
         Ok(()) => {
             LAST_SAVED_TABS_HASH
                 .lock()
-                .expect("saved-tabs hash map poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(key, digest);
         }
         Err(err) => {
@@ -1571,5 +1601,111 @@ mod tests {
         let hints = compute_leaf_attach_hints(&persisted, &live_set(&["pty-live"]), Some("sess-1"));
         assert_eq!(hints.len(), 1);
         assert_eq!(hints.get(&(0, 0, 0)).map(String::as_str), Some("pty-live"));
+    }
+
+    // ── load_persisted_tabs: corrupt-payload gate ───────────────────────────
+    //
+    // A damaged blob (truncated autosave, weights/children desync) must
+    // never reach the live-tree build: the loader rejects it, preserves
+    // the raw payload aside, and reports `Corrupt` so the caller falls
+    // back to the default layout with a toast. The preserve dir is
+    // redirected via OXIMUX_CORRUPT_LAYOUTS_DIR so test artifacts never
+    // land in the real data dir.
+
+    /// Serializes loader tests: they share the process-global preserve-dir
+    /// env var, so parallel runs would cross-pollinate preserve dirs.
+    static LOADER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn loader_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        LOADER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn loader_fixture(raw: &str) -> (LoadedTabs, std::path::PathBuf) {
+        let preserve_dir = std::env::temp_dir().join(format!(
+            "oximux-loader-test-{}-{}",
+            std::process::id(),
+            raw.len()
+        ));
+        let _ = std::fs::remove_dir_all(&preserve_dir);
+        // SAFETY: test-only; LOADER_ENV_LOCK (held by every caller for
+        // the full test body) serializes all access to this variable.
+        unsafe { std::env::set_var("OXIMUX_CORRUPT_LAYOUTS_DIR", &preserve_dir) };
+        let db = oximux_storage::open_memory().expect("memory db");
+        let repo = SettingsRepo::new(db);
+        repo.set(&settings_key("proj", "main"), raw).expect("seed");
+        let out = load_persisted_tabs(&repo, "proj", "main");
+        // Clear immediately — the preserve happened (or didn't) inside the
+        // load above, and a stale var must not leak into any later test
+        // that doesn't hold the lock.
+        unsafe { std::env::remove_var("OXIMUX_CORRUPT_LAYOUTS_DIR") };
+        (out, preserve_dir)
+    }
+
+    #[test]
+    fn loader_rejects_truncated_json_and_preserves_payload() {
+        let _env = loader_env_guard();
+        let truncated = r#"{"tabs":[{"label":"Terminal 1","tree":"Leaf"#;
+        let (out, dir) = loader_fixture(truncated);
+        assert!(matches!(out, LoadedTabs::Corrupt));
+        let preserved: Vec<_> = std::fs::read_dir(&dir)
+            .expect("preserve dir created")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".corrupt.json"))
+            .collect();
+        assert_eq!(preserved.len(), 1, "raw payload preserved exactly once");
+        let body = std::fs::read_to_string(preserved[0].path()).unwrap();
+        assert_eq!(body, truncated, "payload preserved byte-identical");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_rejects_shape_violation_and_preserves_payload() {
+        let _env = loader_env_guard();
+        // Parses fine, but the split's weights/children desync would
+        // panic later in live-tree mutation — must be caught at load.
+        let bad_shape = r#"{
+            "tabs":[{"label":"T1","tree":{"Split":{"axis":"Horizontal",
+                "children":["Leaf","Leaf"],"weights":[1.0]}}}],
+            "active":0,"next_label_n":2}"#;
+        let (out, dir) = loader_fixture(bad_shape);
+        assert!(matches!(out, LoadedTabs::Corrupt));
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) >= 1,
+            "shape-rejected payload preserved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_passes_healthy_snapshot() {
+        let _env = loader_env_guard();
+        let healthy = serde_json::to_string(&PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "Terminal 1".into(),
+                ..PersistedTab::default()
+            }],
+            active: 0,
+            next_label_n: 2,
+            ..PersistedTabs::default()
+        })
+        .unwrap();
+        let (out, dir) = loader_fixture(&healthy);
+        match out {
+            LoadedTabs::Snapshot(snap) => assert_eq!(snap.tabs.len(), 1),
+            _ => panic!("healthy snapshot must load"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_reports_absent_when_nothing_persisted() {
+        let db = oximux_storage::open_memory().expect("memory db");
+        let repo = SettingsRepo::new(db);
+        assert!(matches!(
+            load_persisted_tabs(&repo, "proj", "main"),
+            LoadedTabs::Absent
+        ));
     }
 }

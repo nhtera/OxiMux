@@ -44,6 +44,7 @@ fn file(path: &str, status: DiffStatus, hunks: Vec<DiffHunk>, large: bool) -> Fi
         status,
         hunks,
         large,
+        mode: None,
     }
 }
 

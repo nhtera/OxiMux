@@ -367,16 +367,30 @@ async fn collect_commit_stats(
     // rather than awaiting each in turn: a page is 20 commits, and at
     // ~50 ms per shellout a serial loop costs ~1 s of wall-clock — long
     // enough to be the visible delay before the commit list's hover
-    // tooltips populate. `join_all` drives every shellout on the same
-    // task simultaneously, collapsing the wall-clock to roughly the
-    // slowest single diff. Order is irrelevant: results land in a map
-    // keyed by OID.
-    let results = futures::future::join_all(
-        commits
-            .iter()
-            .map(|c| async move { (c.oid.clone(), oximux_git::diff_numstat_commit(workdir, &c.oid).await) }),
-    )
-    .await;
+    // tooltips populate. Concurrency is CAPPED so a page arrival never
+    // forks 20 git processes at once (process churn + repo lock
+    // contention); 4 in flight keeps the wall-clock near the uncapped
+    // case while bounding the spike. Order is irrelevant: results land
+    // in a map keyed by OID.
+    const MAX_CONCURRENT_NUMSTAT: usize = 4;
+    use futures::StreamExt;
+    // Materialize the future list first (owned oids) — mapping lazily
+    // inside `stream::iter` trips a higher-ranked lifetime check under
+    // `tokio::spawn`'s Send bound.
+    let futs: Vec<_> = commits
+        .iter()
+        .map(|c| {
+            let oid = c.oid.clone();
+            async move {
+                let res = oximux_git::diff_numstat_commit(workdir, &oid).await;
+                (oid, res)
+            }
+        })
+        .collect();
+    let results: Vec<_> = futures::stream::iter(futs)
+        .buffer_unordered(MAX_CONCURRENT_NUMSTAT)
+        .collect()
+        .await;
     let mut out = HashMap::with_capacity(results.len());
     for (oid, res) in results {
         match res {

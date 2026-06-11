@@ -94,9 +94,7 @@ impl RelayBackend {
         // before the swap publishes the backend).
         self.next_session_id
             .fetch_max(max_inherited + 1, Ordering::Relaxed);
-        self.inherited_dead_sessions
-            .lock()
-            .expect("inherited sessions poisoned")
+        lock_recover(&self.inherited_dead_sessions, "inherited sessions")
             .extend(ids);
     }
 
@@ -111,9 +109,7 @@ impl RelayBackend {
     // Phase 06 calls this at capture time (on app quit / project
     // switch) to persist `(project, ordinal) → relay_pty_id`.
     pub fn relay_pty_id_of_session(&self, id: TerminalSessionId) -> Option<String> {
-        self.sessions
-            .lock()
-            .expect("sessions poisoned")
+        lock_recover(&self.sessions, "sessions")
             .get(&id)
             .map(|s| s.relay_pty_id.clone())
     }
@@ -132,7 +128,7 @@ impl RelayBackend {
     }
 
     fn relay_pty_id_of(&self, id: TerminalSessionId) -> Result<String> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         sessions
             .get(&id)
             .map(|s| s.relay_pty_id.clone())
@@ -175,7 +171,7 @@ impl RelayBackend {
         // sized to fit it, regardless of what the user picked for fresh spawns.
         let state = Arc::new(Mutex::new(TerminalState::new(cols, rows, SCROLLBACK_ROWS)));
         {
-            let mut s = state.lock().expect("state poisoned");
+            let mut s = lock_recover(&state, "terminal state");
             s.advance(&replay);
             // Replay is historical: drop title/clipboard/bell/color events it
             // fired so they don't leak into the first live frame.
@@ -186,7 +182,7 @@ impl RelayBackend {
         let generation = Arc::new(AtomicU64::new(1));
         let notif_rx = self.client.subscribe_pty(relay_pty_id);
         let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
-        self.sessions.lock().expect("sessions poisoned").insert(
+        lock_recover(&self.sessions, "sessions").insert(
             id,
             Session {
                 relay_pty_id: relay_pty_id.to_owned(),
@@ -248,9 +244,39 @@ fn apply_relay_notification(
             // clipboard, device/color replies) in the same locked pass that
             // advances the grid, then queue them AHEAD of this chunk's Output
             // so attention (bell) lands before the bytes that raised it.
-            let derived = match state.lock() {
-                Ok(mut s) => s.advance_collecting(id, &bytes),
-                Err(_) => Vec::new(),
+            //
+            // Containment boundary: a panic inside the emulator advance
+            // (one bad byte stream) must kill only THIS session — surfaced
+            // as a synthetic exit — never the whole backend. The poisoned
+            // state mutex left behind is fine: every other accessor treats
+            // a failed state lock as "skip", and the session is dead from
+            // here on (same lifecycle as a real process exit; the view's
+            // normal exit handling performs the close/cleanup). The event
+            // `queues` mutex is a separate lock the panic never holds, so
+            // the synthetic Exit below always delivers.
+            let advanced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                PANIC_ON_ADVANCE.with(|f| {
+                    if f.get() {
+                        panic!("injected pump panic");
+                    }
+                });
+                match state.lock() {
+                    Ok(mut s) => s.advance_collecting(id, &bytes),
+                    Err(_) => Vec::new(),
+                }
+            }));
+            let derived = match advanced {
+                Ok(d) => d,
+                Err(payload) => {
+                    tracing::error!(
+                        ?id,
+                        panic = panic_msg(payload.as_ref()),
+                        "terminal emulator panicked; retiring session with synthetic exit"
+                    );
+                    push_event(queues, id, TerminalEvent::Exit { id, code: None });
+                    return ControlFlow::Break(());
+                }
             };
             for ev in derived {
                 // The daemon owns cwd over the relay; drop OSC 7 here rather
@@ -330,7 +356,7 @@ impl TerminalBackend for RelayBackend {
         let generation = Arc::new(AtomicU64::new(1));
         let notif_rx = self.client.subscribe_pty(&relay_pty_id);
         let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
-        self.sessions.lock().expect("sessions poisoned").insert(
+        lock_recover(&self.sessions, "sessions").insert(
             id,
             Session {
                 relay_pty_id,
@@ -375,7 +401,7 @@ impl TerminalBackend for RelayBackend {
         // through a per-call ack. This mirrors how a terminal forwards a
         // resize to its PTY (a one-way ioctl) without waiting.
         let (pty_id, attachment_id) = {
-            let mut sessions = self.sessions.lock().expect("sessions poisoned");
+            let mut sessions = lock_recover(&self.sessions, "sessions");
             let s = sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
@@ -409,7 +435,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn snapshot(&self, id: TerminalSessionId) -> Result<TerminalSnapshot> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         let session = sessions
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
@@ -421,7 +447,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn input_mode(&self, id: TerminalSessionId) -> oximux_pty::InputMode {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         sessions
             .get(&id)
             .and_then(|s| s.state.lock().ok().map(|st| st.input_mode()))
@@ -429,7 +455,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn mouse_mode(&self, id: TerminalSessionId) -> oximux_pty::MouseMode {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         sessions
             .get(&id)
             .and_then(|s| s.state.lock().ok().map(|st| st.mouse_mode()))
@@ -437,7 +463,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn scroll(&mut self, id: TerminalSessionId, delta: i32) -> Result<()> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         let session = sessions
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
@@ -448,7 +474,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn scroll_to_bottom(&mut self, id: TerminalSessionId) -> Result<()> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         let session = sessions
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
@@ -459,7 +485,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn bracketed_paste(&self, id: TerminalSessionId) -> Result<bool> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         let session = sessions
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
@@ -471,7 +497,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn search_grid(&self, id: TerminalSessionId) -> Vec<Vec<Cell>> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         let Some(session) = sessions.get(&id) else {
             return Vec::new();
         };
@@ -483,7 +509,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn serialize_buffer(&self, id: TerminalSessionId, max_bytes: usize) -> Vec<u8> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         let Some(session) = sessions.get(&id) else {
             return Vec::new();
         };
@@ -501,7 +527,7 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn prefill_grid(&mut self, id: TerminalSessionId, bytes: &[u8]) -> Result<()> {
-        let sessions = self.sessions.lock().expect("sessions poisoned");
+        let sessions = lock_recover(&self.sessions, "sessions");
         let session = sessions
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
@@ -526,17 +552,14 @@ impl TerminalBackend for RelayBackend {
         // Drains every session's queue. Used by tests + cleanup paths;
         // the per-frame render path uses `drain_events_for` instead so
         // each pane only sees its own events.
-        let mut map = self.event_queues.lock().expect("event queues poisoned");
+        let mut map = lock_recover(&self.event_queues, "event queues");
         let mut out = Vec::new();
         for q in map.values_mut() {
             out.extend(q.drain(..));
         }
         // Crash-recovery: flush every inherited dead session as one
         // synthetic Exit each (see `seed_synthetic_exits`).
-        let mut inherited = self
-            .inherited_dead_sessions
-            .lock()
-            .expect("inherited sessions poisoned");
+        let mut inherited = lock_recover(&self.inherited_dead_sessions, "inherited sessions");
         out.extend(
             inherited
                 .drain()
@@ -549,15 +572,10 @@ impl TerminalBackend for RelayBackend {
         // Crash-recovery: an inherited dead session yields exactly one
         // synthetic Exit so its poller (agent status machine, pane tick)
         // learns the process died with the old daemon.
-        if self
-            .inherited_dead_sessions
-            .lock()
-            .expect("inherited sessions poisoned")
-            .remove(&id)
-        {
+        if lock_recover(&self.inherited_dead_sessions, "inherited sessions").remove(&id) {
             return vec![TerminalEvent::Exit { id, code: None }];
         }
-        let mut map = self.event_queues.lock().expect("event queues poisoned");
+        let mut map = lock_recover(&self.event_queues, "event queues");
         match map.get_mut(&id) {
             Some(q) => q.drain(..).collect(),
             None => Vec::new(),
@@ -565,16 +583,14 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn live_session_ids(&self) -> Vec<TerminalSessionId> {
-        self.sessions
-            .lock()
-            .expect("sessions poisoned")
+        lock_recover(&self.sessions, "sessions")
             .keys()
             .copied()
             .collect()
     }
 
     fn close(&mut self, id: TerminalSessionId) -> Result<()> {
-        let session = match self.sessions.lock().expect("sessions poisoned").remove(&id) {
+        let session = match lock_recover(&self.sessions, "sessions").remove(&id) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -582,9 +598,7 @@ impl TerminalBackend for RelayBackend {
         // stops advancing the now-orphaned `TerminalState` instead of
         // draining any still-buffered Output during teardown.
         session.generation.fetch_add(1, Ordering::Release);
-        self.event_queues
-            .lock()
-            .expect("event queues poisoned")
+        lock_recover(&self.event_queues, "event queues")
             .remove(&id);
         self.client.unsubscribe_pty(&session.relay_pty_id);
         // Defer the synchronous relay Close round-trip to a detached
@@ -634,7 +648,7 @@ impl TerminalBackend for RelayBackend {
         // session is removed here, the source `TerminalView`'s eventual
         // `Drop` → `close(id)` finds nothing and is a no-op, so the daemon PTY
         // survives the move.
-        let session = match self.sessions.lock().expect("sessions poisoned").remove(&id) {
+        let session = match lock_recover(&self.sessions, "sessions").remove(&id) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -642,9 +656,7 @@ impl TerminalBackend for RelayBackend {
         // now-detached `TerminalState` — the destination window mounts a fresh
         // session + pump against the same PTY.
         session.generation.fetch_add(1, Ordering::Release);
-        self.event_queues
-            .lock()
-            .expect("event queues poisoned")
+        lock_recover(&self.event_queues, "event queues")
             .remove(&id);
         self.client.unsubscribe_pty(&session.relay_pty_id);
         // Release this attachment in the daemon. Detach (not Close) keeps the
@@ -682,14 +694,65 @@ impl TerminalBackend for RelayBackend {
 }
 
 fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {
-    if let Ok(mut map) = queues.lock() {
-        map.entry(id).or_default().push_back(event);
-    }
+    lock_recover(queues, "event queues")
+        .entry(id)
+        .or_default()
+        .push_back(event);
+}
+
+/// Lock a mutex, recovering from poison instead of propagating the
+/// panic. Every guarded value in this backend is a plain-data map or
+/// per-session terminal grid that stays usable after another thread
+/// panicked mid-access (the pump's panic boundary retires the affected
+/// session with a synthetic exit), so recovery can never hand out state
+/// a caller can't safely drop — whereas propagating would cascade one
+/// bad session into whole-backend death.
+fn lock_recover<'a, T: ?Sized>(
+    m: &'a Mutex<T>,
+    what: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(what, "mutex poisoned; recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Best-effort text of a caught panic payload for the containment log.
+fn panic_msg(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+// Test-only injection: makes the next emulator advance inside
+// `apply_relay_notification` panic, exercising the pump's containment
+// boundary without needing a byte sequence that crashes the real parser.
+#[cfg(test)]
+thread_local! {
+    static PANIC_ON_ADVANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A panic while some thread held a backend lock must not take every
+    // later backend call down with it: lock_recover hands back the
+    // still-consistent map instead of propagating the poison.
+    #[test]
+    fn lock_recover_survives_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(vec![1u8]));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = m2.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(m.lock().is_err(), "mutex must be poisoned by the panic");
+        assert_eq!(*lock_recover(&m, "test"), vec![1u8]);
+    }
 
     fn queue_len(queues: &SessionEventQueues, id: TerminalSessionId) -> usize {
         queues
@@ -698,6 +761,59 @@ mod tests {
             .get(&id)
             .map(|q| q.len())
             .unwrap_or(0)
+    }
+
+    // Containment boundary: a panic inside the emulator advance must
+    // retire ONLY that session — one synthetic Exit event, pump stops —
+    // and must not unwind into the caller (which would kill the backend).
+    #[test]
+    fn pump_panic_is_contained_as_synthetic_exit() {
+        let id = TerminalSessionId(42);
+        let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let generation = AtomicU64::new(1);
+
+        PANIC_ON_ADVANCE.with(|f| f.set(true));
+        let flow = apply_relay_notification(
+            &state,
+            &queues,
+            id,
+            &generation,
+            1,
+            Notification::Output {
+                pty_id: "p".into(),
+                bytes: b"boom".to_vec(),
+            },
+        );
+        PANIC_ON_ADVANCE.with(|f| f.set(false));
+
+        assert!(flow.is_break(), "panicked session's pump must stop");
+        let guard = queues.lock().unwrap();
+        let q = guard.get(&id).expect("synthetic exit queued");
+        assert_eq!(q.len(), 1, "exactly one synthetic event");
+        assert!(
+            matches!(q[0], TerminalEvent::Exit { code: None, .. }),
+            "the synthetic event is Exit {{ code: None }}"
+        );
+        drop(guard);
+
+        // The backend itself survives: another session keeps pumping
+        // normally after the contained panic.
+        let other = TerminalSessionId(43);
+        let other_state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
+        let flow = apply_relay_notification(
+            &other_state,
+            &queues,
+            other,
+            &generation,
+            1,
+            Notification::Output {
+                pty_id: "q".into(),
+                bytes: b"hi".to_vec(),
+            },
+        );
+        assert!(flow.is_continue(), "other sessions are unaffected");
+        assert_eq!(queue_len(&queues, other), 1);
     }
 
     // The reconnect generation guard: once a pump is superseded (the

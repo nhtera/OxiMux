@@ -260,6 +260,20 @@ pub fn toast(cx: &mut App, kind: ToastKind, text: impl Into<String>) {
     let _ = layer.update(cx, |layer, cx| layer.push(kind, text, cx));
 }
 
+/// Standard error toast for a failed user-initiated operation:
+/// "«op» failed: «first line of err»". Only the first line shows — git
+/// and storage errors are often multi-line; full detail belongs in the
+/// call site's tracing event, not the card.
+pub fn toast_op_error(cx: &mut App, op: &str, err: &str) {
+    toast(cx, ToastKind::Error, op_error_text(op, err));
+}
+
+/// Pure formatting half of [`toast_op_error`] — split for testability.
+fn op_error_text(op: &str, err: &str) -> String {
+    let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("unknown error").trim();
+    format!("{op} failed: {first}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +284,22 @@ mod tests {
         assert_eq!(ToastKind::Info.accent(&t), t.status_info);
         assert_eq!(ToastKind::Success.accent(&t), t.status_ok);
         assert_eq!(ToastKind::Error.accent(&t), t.status_error);
+    }
+
+    #[test]
+    fn op_error_text_takes_first_nonempty_line() {
+        assert_eq!(
+            op_error_text("Delete workspace", "fatal: 'x' is dirty\nhint: use --force"),
+            "Delete workspace failed: fatal: 'x' is dirty"
+        );
+        // Leading blank lines are skipped, not shown as an empty reason.
+        assert_eq!(
+            op_error_text("Stash apply", "\n  conflict in a.rs  \nmore"),
+            "Stash apply failed: conflict in a.rs"
+        );
+        assert_eq!(
+            op_error_text("Rename", ""),
+            "Rename failed: unknown error"
+        );
     }
 }

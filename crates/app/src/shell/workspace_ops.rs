@@ -17,7 +17,7 @@ use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Wind
 use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, ScriptKind, Theme, Typography};
-use oximux_storage::{ProjectRepo, StorageError, WorkspaceRepo};
+use oximux_storage::{AgentSessionRepo, ProjectRepo, StorageError, WorkspaceRepo};
 
 use crate::shell::left_rail::row_menu::ScriptAvail;
 
@@ -147,6 +147,81 @@ pub enum CreateOutcome {
         insert_error: StorageError,
         rollback_error: String,
     },
+}
+
+/// Body of [`WorkspaceRoot::workspaces_with_primary`] as a free function so
+/// the rail gather can run it on the background executor (SQLite + a
+/// `.git` stat — never call from a render path).
+fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<Workspace> {
+    let mut list = match repo.list_for_project(&project.id) {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
+            Vec::new()
+        }
+    };
+    let has_root_row = list.iter().any(|w| w.worktree_path == project.root_path);
+    if !has_root_row {
+        // Git repo → branch-based primary ("main"); plain folder → a single
+        // "Folder" row with empty branch. Synthesized for display only;
+        // identified later by `worktree_path == project.root_path`.
+        let is_git = Path::new(&project.root_path).join(".git").exists();
+        let (name, slug, branch) = if is_git {
+            (
+                project.default_branch.clone(),
+                project.default_branch.clone(),
+                project.default_branch.clone(),
+            )
+        } else {
+            (project.name.clone(), String::new(), String::new())
+        };
+        list.insert(
+            0,
+            Workspace {
+                id: format!("primary:{}", project.id),
+                project_id: project.id.clone(),
+                name,
+                slug,
+                branch,
+                worktree_path: project.root_path.clone(),
+                status: "active".to_string(),
+                created_at: String::new(),
+                archived_at: None,
+                linked_issue: None,
+                tint: None,
+            },
+        );
+    }
+    list
+}
+
+/// One full pass of the sidebar's DB-backed data across every recent
+/// project: workspace rows (incl. synthesized primaries) + the latest
+/// agent-session status per workspace. Runs on the background executor —
+/// this is the ONLY place the rail touches SQLite.
+fn gather_rail_db_data(
+    workspace_repo: &WorkspaceRepo,
+    agent_repo: &AgentSessionRepo,
+    projects: &[Project],
+) -> (HashMap<String, Vec<Workspace>>, LatestStatusMap) {
+    let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
+        HashMap::with_capacity(projects.len());
+    let mut latest_status: LatestStatusMap = HashMap::new();
+    for project in projects {
+        let list = workspaces_with_primary_for(workspace_repo, project);
+        for workspace in &list {
+            let latest = match agent_repo.list_for_workspace(&workspace.id) {
+                Ok(mut sessions) => sessions.drain(..).next().map(|s| s.status),
+                Err(err) => {
+                    tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
+                    None
+                }
+            };
+            latest_status.insert(workspace.id.clone(), latest);
+        }
+        workspaces_by_project.insert(project.id.clone(), list);
+    }
+    (workspaces_by_project, latest_status)
 }
 
 /// Open the project repo, create a new worktree on branch `oximux/<slug>`,
@@ -446,6 +521,10 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         tracing::info!(project_id = %project.id, name = %project.name, "active project set");
+        // The incoming project may be brand new (add-project flows route
+        // here after refresh_recent_projects) — pull its workspace rows
+        // into the rail cache.
+        self.mark_rail_dirty(cx);
         // Capture the outgoing project's pane scrollback before swapping so
         // a project-switch-then-quit-other-window flow doesn't lose data.
         // No-op when no project was previously active.
@@ -513,8 +592,25 @@ impl WorkspaceRoot {
             let typography = self.typography.clone();
             let cli_runtime = self.cli_runtime.clone();
             let notifier = self.notifier.clone();
-            let snapshot =
-                load_persisted_tabs(&self.app_state.settings_repo, &project.id, &window_id);
+            let snapshot = match load_persisted_tabs(
+                &self.app_state.settings_repo,
+                &project.id,
+                &window_id,
+            ) {
+                crate::project_panes_factory::LoadedTabs::Snapshot(s) => Some(s),
+                crate::project_panes_factory::LoadedTabs::Absent => None,
+                crate::project_panes_factory::LoadedTabs::Corrupt => {
+                    // Payload preserved aside by the loader; boot continues
+                    // on the default layout so a damaged blob can never
+                    // keep the app from reaching a usable window.
+                    self.push_toast(
+                        crate::shell::toast::ToastKind::Error,
+                        "Layout could not be restored — reset to default",
+                        cx,
+                    );
+                    None
+                }
+            };
             let pane_buffers = crate::project_panes_factory::load_pane_buffers(
                 &self.app_state.pane_buffer_repo,
                 &project.id,
@@ -762,47 +858,12 @@ impl WorkspaceRoot {
     /// root. Single source of the "a project is never an empty group"
     /// invariant — shared by the left-rail snapshot and the Cmd+J jump list so
     /// both surface the same rows (incl. the primary that is not a DB row).
+    ///
+    /// Does SQLite + a filesystem stat — event-driven callers only. The
+    /// render path reads the cache the rail gather builds with the free
+    /// function below instead.
     pub(crate) fn workspaces_with_primary(&self, project: &Project) -> Vec<Workspace> {
-        let mut list = match self.app_state.workspace_repo.list_for_project(&project.id) {
-            Ok(list) => list,
-            Err(err) => {
-                tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
-                Vec::new()
-            }
-        };
-        let has_root_row = list.iter().any(|w| w.worktree_path == project.root_path);
-        if !has_root_row {
-            // Git repo → branch-based primary ("main"); plain folder → a single
-            // "Folder" row with empty branch. Synthesized for display only;
-            // identified later by `worktree_path == project.root_path`.
-            let is_git = Path::new(&project.root_path).join(".git").exists();
-            let (name, slug, branch) = if is_git {
-                (
-                    project.default_branch.clone(),
-                    project.default_branch.clone(),
-                    project.default_branch.clone(),
-                )
-            } else {
-                (project.name.clone(), String::new(), String::new())
-            };
-            list.insert(
-                0,
-                Workspace {
-                    id: format!("primary:{}", project.id),
-                    project_id: project.id.clone(),
-                    name,
-                    slug,
-                    branch,
-                    worktree_path: project.root_path.clone(),
-                    status: "active".to_string(),
-                    created_at: String::new(),
-                    archived_at: None,
-                    linked_issue: None,
-                    tint: None,
-                },
-            );
-        }
-        list
+        workspaces_with_primary_for(&self.app_state.workspace_repo, project)
     }
 
     /// Build the Cmd+J jump candidates: every workspace across all projects
@@ -1062,35 +1123,27 @@ impl WorkspaceRoot {
         // Worktree paths with an open PTY tab (terminal or agent) — drives
         // the live (green) status dot. Aggregated across every project whose
         // panes have been built, so a worktree stays green while its session
-        // lives even after switching to another project.
+        // lives even after switching to another project. Pure entity reads.
         let mut live_worktrees: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for panes in self.project_panes_by_project.values() {
             live_worktrees.extend(panes.read(cx).live_worktree_paths(cx));
         }
+        // Workspace rows + latest agent statuses come from the rail caches
+        // (gathered on the background executor by `mark_rail_dirty`) —
+        // render never touches SQLite or stats the filesystem.
         let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
             HashMap::with_capacity(projects.len());
-        let mut latest_status: LatestStatusMap = HashMap::new();
         for project in &projects {
-            // Single source of the "project always shows its primary row"
-            // invariant (shared with the Cmd+J jump list).
-            let list = self.workspaces_with_primary(project);
-            for workspace in &list {
-                let latest = match self
-                    .app_state
-                    .agent_session_repo
-                    .list_for_workspace(&workspace.id)
-                {
-                    Ok(mut sessions) => sessions.drain(..).next().map(|s| s.status),
-                    Err(err) => {
-                        tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
-                        None
-                    }
-                };
-                latest_status.insert(workspace.id.clone(), latest);
-            }
-            workspaces_by_project.insert(project.id.clone(), list);
+            workspaces_by_project.insert(
+                project.id.clone(),
+                self.rail_workspaces_by_project
+                    .get(&project.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
+        let latest_status = self.rail_latest_status.clone();
         // Diff counts are refreshed out-of-band by the periodic, focus-gated
         // refresh loop (see `WorkspaceRoot::run_diff_refresh_round`); here we
         // only read the latest cached snapshot. Render never shells out to git.
@@ -1107,6 +1160,58 @@ impl WorkspaceRoot {
                 cx,
             );
         });
+    }
+
+    /// Note that the sidebar's DB-backed data (workspace rows, latest
+    /// agent-session statuses) may be stale and schedule ONE background
+    /// gather. Bursts coalesce: while a gather is in flight, further calls
+    /// only re-set the dirty flag and the running task loops once more.
+    /// Call after every workspace/agent-session write, on project switch,
+    /// and from the periodic diff tick (reconciliation net).
+    pub(crate) fn mark_rail_dirty(&mut self, cx: &mut Context<Self>) {
+        self.rail_dirty = true;
+        if self.rail_refresh_inflight {
+            return;
+        }
+        self.rail_refresh_inflight = true;
+        cx.spawn(async move |weak, cx| {
+            loop {
+                let Ok((workspace_repo, agent_repo, projects)) = weak.update(cx, |this, _| {
+                    this.rail_dirty = false;
+                    (
+                        this.app_state.workspace_repo.clone(),
+                        this.app_state.agent_session_repo.clone(),
+                        this.app_state.recent_projects.clone(),
+                    )
+                }) else {
+                    return;
+                };
+                // All SQLite + the per-project `.git` stat run off the main
+                // thread (cx.spawn itself stays on the main thread — known
+                // footgun).
+                let (workspaces, statuses) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        gather_rail_db_data(&workspace_repo, &agent_repo, &projects)
+                    })
+                    .await;
+                let run_again = weak.update(cx, |this, cx| {
+                    this.rail_workspaces_by_project = workspaces;
+                    this.rail_latest_status = statuses;
+                    cx.notify();
+                    if this.rail_dirty {
+                        true
+                    } else {
+                        this.rail_refresh_inflight = false;
+                        false
+                    }
+                });
+                if !matches!(run_again, Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Route a workspace-dialog submission to the right backend flow.
@@ -1219,6 +1324,7 @@ impl WorkspaceRoot {
                     );
                     let cwd = PathBuf::from(&workspace.worktree_path);
                     let _ = weak.update_in(cx, |this, window, cx| {
+                        this.mark_rail_dirty(cx);
                         cx.notify();
                         // Land on the new workspace (e.g. created from a task):
                         // select it and return the rail to the home list so it's
@@ -1267,6 +1373,13 @@ impl WorkspaceRoot {
                 }
                 CreateOutcome::GitFailed(msg) => {
                     tracing::warn!(slug = %slug, error = %msg, "workspace create: git step failed");
+                    let _ = weak.update(cx, |_, cx| {
+                        crate::shell::toast::toast_op_error(
+                            cx,
+                            &format!("Create workspace \u{201c}{slug}\u{201d}"),
+                            &msg,
+                        );
+                    });
                 }
                 CreateOutcome::StorageFailedRollbackClean(err) => {
                     tracing::warn!(
@@ -1274,6 +1387,13 @@ impl WorkspaceRoot {
                         slug = %slug,
                         "workspace create: insert failed, rollback clean"
                     );
+                    let _ = weak.update(cx, |_, cx| {
+                        crate::shell::toast::toast_op_error(
+                            cx,
+                            &format!("Create workspace \u{201c}{slug}\u{201d}"),
+                            &err.to_string(),
+                        );
+                    });
                 }
                 CreateOutcome::StorageFailedRollbackDirty {
                     insert_error,
@@ -1285,6 +1405,15 @@ impl WorkspaceRoot {
                         slug = %slug,
                         "workspace create: insert failed AND rollback failed; manual cleanup required"
                     );
+                    let _ = weak.update(cx, |_, cx| {
+                        crate::shell::toast::toast(
+                            cx,
+                            crate::shell::toast::ToastKind::Error,
+                            format!(
+                                "Create workspace \u{201c}{slug}\u{201d} failed and rollback left a partial worktree — clean up manually"
+                            ),
+                        );
+                    });
                 }
             }
         })
@@ -1308,7 +1437,13 @@ impl WorkspaceRoot {
             .rename(&workspace.id, new_name)
         {
             tracing::warn!(?err, workspace_id = %workspace.id, "rename failed");
+            crate::shell::toast::toast_op_error(
+                cx,
+                &format!("Rename workspace \u{201c}{}\u{201d}", workspace.name),
+                &err.to_string(),
+            );
         }
+        self.mark_rail_dirty(cx);
         cx.notify();
     }
 
@@ -1332,6 +1467,7 @@ impl WorkspaceRoot {
         if let Err(err) = self.app_state.workspace_repo.mark_archived(&workspace.id) {
             tracing::warn!(?err, workspace_id = %workspace.id, "mark_archived failed");
         }
+        self.mark_rail_dirty(cx);
         cx.notify();
     }
 
@@ -1348,6 +1484,7 @@ impl WorkspaceRoot {
             tracing::warn!(?err, workspace_id, "set_workspace_tint failed");
             return;
         }
+        self.mark_rail_dirty(cx);
         cx.notify();
     }
 
@@ -1355,6 +1492,13 @@ impl WorkspaceRoot {
     /// `ConfirmDialog`; expected string is the slug. On confirm: removes
     /// worktree + branch + DB row (FK cascade clears pane/agent
     /// sessions).
+    ///
+    /// When the previous delete of THIS workspace failed at worktree
+    /// removal, the dialog becomes the Force Delete variant. The armed
+    /// offer is consumed at request time — cancelling the force dialog
+    /// therefore returns the NEXT attempt to a normal delete, which is
+    /// intentional: the row still exists, so normal-first stays the
+    /// default and force remains a deliberate two-step escalation.
     #[allow(dead_code)]
     pub(crate) fn request_delete_workspace(
         &mut self,
@@ -1366,6 +1510,12 @@ impl WorkspaceRoot {
             tracing::info!("request_delete_workspace: no active project, ignoring");
             return;
         };
+        // Second attempt after a failed worktree removal → the dialog
+        // becomes the Force Delete variant: force-remove the worktree and
+        // branch, ALWAYS drop the DB row, and report anything left behind.
+        // Requesting delete on a different workspace drops the offer.
+        let force = self.force_delete_offer.as_deref() == Some(workspace.id.as_str());
+        self.force_delete_offer = None;
         let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let slug = workspace.slug.clone();
         let workspace_for_cb = workspace.clone();
@@ -1381,9 +1531,7 @@ impl WorkspaceRoot {
             // Clear the confirm dialog up-front so the user can never get
             // stuck behind it on an early-return failure path (C1 — code-
             // review 260521-1306). The destructive intent has already
-            // fired; subsequent errors surface via tracing for now (a
-            // future status-bar surface is the right home for user-visible
-            // failure reporting).
+            // fired; subsequent errors surface as toasts below.
             let _ = weak.update(cx, |this, cx| {
                 this.confirm_dialog = None;
                 cx.notify();
@@ -1398,36 +1546,108 @@ impl WorkspaceRoot {
                     Ok(r) => r,
                     Err(err) => {
                         tracing::warn!(?err, "delete_workspace: open repo failed");
+                        let _ = weak.update(cx, |_, cx| {
+                            crate::shell::toast::toast_op_error(
+                                cx,
+                                &format!("Delete workspace \u{201c}{}\u{201d}", workspace.slug),
+                                &err.to_string(),
+                            );
+                        });
                         return;
                     }
                 };
-                if let Err(err) = repo.remove_worktree(&worktree_path, false).await {
-                    tracing::warn!(?err, slug = %workspace.slug, "remove_worktree failed; workspace row + branch preserved for retry");
-                    return;
+                let mut leftovers: Vec<String> = Vec::new();
+                if let Err(err) = repo.remove_worktree(&worktree_path, force).await {
+                    if !force {
+                        // Preserve the row + branch for retry, surface the
+                        // reason, and arm the Force Delete variant for the
+                        // next attempt on this workspace.
+                        tracing::warn!(?err, slug = %workspace.slug, "remove_worktree failed; workspace row + branch preserved for retry");
+                        let _ = weak.update(cx, |this, cx| {
+                            this.force_delete_offer = Some(workspace.id.clone());
+                            crate::shell::toast::toast(
+                                cx,
+                                crate::shell::toast::ToastKind::Error,
+                                format!(
+                                    "Couldn't delete workspace \u{201c}{}\u{201d}: {} — choose Delete again to force-remove",
+                                    workspace.slug,
+                                    err.to_string().lines().next().unwrap_or("unknown error").trim(),
+                                ),
+                            );
+                        });
+                        return;
+                    }
+                    // Force path: keep going; report what stayed behind.
+                    tracing::warn!(?err, slug = %workspace.slug, "force delete: remove_worktree still failed");
+                    leftovers.push(format!("worktree at {}", workspace.worktree_path));
                 }
-                if let Err(err) = repo.delete_branch(&branch, false).await {
+                if let Err(err) = repo.delete_branch(&branch, force).await {
                     tracing::warn!(?err, branch = %branch, "delete_branch failed");
                     // Don't bail — DB cleanup still wanted to keep
                     // state in sync.
+                    leftovers.push(format!("branch {branch}"));
                 }
-                if let Err(err) = workspace_repo.delete(&workspace.id) {
-                    tracing::warn!(?err, workspace_id = %workspace.id, "delete row failed");
-                }
-                let _ = weak.update(cx, |_this, cx| cx.notify());
+                let row_deleted = match workspace_repo.delete(&workspace.id) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!(?err, workspace_id = %workspace.id, "delete row failed");
+                        let _ = weak.update(cx, |_, cx| {
+                            crate::shell::toast::toast_op_error(
+                                cx,
+                                &format!("Delete workspace \u{201c}{}\u{201d}", workspace.slug),
+                                &err.to_string(),
+                            );
+                        });
+                        false
+                    }
+                };
+                let _ = weak.update(cx, |this, cx| {
+                    this.force_delete_offer = None;
+                    // Leftover report only when the workspace entry itself
+                    // is gone — a failed row delete already toasted above,
+                    // and "removed; not deleted: …" would contradict it.
+                    if row_deleted && !leftovers.is_empty() {
+                        crate::shell::toast::toast(
+                            cx,
+                            crate::shell::toast::ToastKind::Error,
+                            format!(
+                                "Workspace \u{201c}{}\u{201d} removed; not deleted: {} — clean up manually",
+                                workspace.slug,
+                                leftovers.join(", "),
+                            ),
+                        );
+                    }
+                    this.mark_rail_dirty(cx);
+                });
             })
             .detach();
         });
-        let prompt = ConfirmPrompt {
-            title: "Delete workspace".into(),
-            body: format!(
-                "Removes the worktree at {} and deletes branch {}. This cannot be undone.",
-                workspace.worktree_path, workspace.branch
-            )
-            .into(),
-            expected: slug.into(),
-            on_confirm,
-            confirm_label: None,
-            on_cancel: None,
+        let prompt = if force {
+            ConfirmPrompt {
+                title: "Force delete workspace".into(),
+                body: format!(
+                    "The worktree at {} could not be removed normally. Force delete removes the workspace entry anyway and force-removes the worktree and branch {}; anything that still fails is reported and left on disk.",
+                    workspace.worktree_path, workspace.branch
+                )
+                .into(),
+                expected: slug.into(),
+                on_confirm,
+                confirm_label: Some("Force Delete".into()),
+                on_cancel: None,
+            }
+        } else {
+            ConfirmPrompt {
+                title: "Delete workspace".into(),
+                body: format!(
+                    "Removes the worktree at {} and deletes branch {}. This cannot be undone.",
+                    workspace.worktree_path, workspace.branch
+                )
+                .into(),
+                expected: slug.into(),
+                on_confirm,
+                confirm_label: None,
+                on_cancel: None,
+            }
         };
         let theme = self.theme;
         let density = self.density;

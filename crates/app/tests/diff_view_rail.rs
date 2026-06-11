@@ -33,6 +33,7 @@ fn one_change_file(path: &str) -> FileDiff {
             lines: vec![line(DiffLineKind::Added, "x")],
         }],
         large: false,
+        mode: None,
     }
 }
 

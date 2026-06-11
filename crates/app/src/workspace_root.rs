@@ -307,6 +307,26 @@ pub struct WorkspaceRoot {
     /// written inside `Render` — results flow in from background completions
     /// via weak-entity update + cx.notify().
     pub(crate) diff_counts: HashMap<String, DiffCounts>,
+    /// Cached sidebar DB data: each project's workspace rows (incl. the
+    /// synthesized primary). Refreshed event-driven via `mark_rail_dirty`
+    /// (workspace CRUD, project switch, the periodic diff tick as a
+    /// reconciliation net) — `refresh_left_rail` only READS this, so
+    /// render never touches SQLite.
+    pub(crate) rail_workspaces_by_project: HashMap<String, Vec<oximux_core::Workspace>>,
+    /// Cached latest agent-session status per workspace id — same
+    /// lifecycle as [`Self::rail_workspaces_by_project`].
+    pub(crate) rail_latest_status: crate::shell::left_rail::LatestStatusMap,
+    /// Workspace id whose normal delete failed at the worktree-removal
+    /// step. The next delete request for the SAME workspace offers the
+    /// Force Delete variant (force-remove + always drop the DB row,
+    /// reporting leftovers). Cleared on success or when a different
+    /// workspace's delete is requested.
+    pub(crate) force_delete_offer: Option<String>,
+    /// Set when rail DB data may be stale; consumed by the gather task.
+    pub(crate) rail_dirty: bool,
+    /// Guards against overlapping rail gathers (the gather re-runs itself
+    /// while `rail_dirty` keeps getting re-set).
+    pub(crate) rail_refresh_inflight: bool,
     /// `true` while the window is active. The periodic diff refresh only runs
     /// when focused so an inactive window does not churn `git` in the
     /// background (mirrors the SCM status poller's pause-on-blur behavior).
@@ -772,11 +792,20 @@ impl WorkspaceRoot {
             focus_handle,
             window_id,
             diff_counts: HashMap::new(),
+            force_delete_offer: None,
+            rail_workspaces_by_project: HashMap::new(),
+            rail_latest_status: HashMap::new(),
+            rail_dirty: false,
+            rail_refresh_inflight: false,
             diff_refresh_focused: true,
             diff_refresh_in_flight: false,
             _diff_refresh_task: diff_refresh_task,
             _layout_autosave_task: layout_autosave_task,
         };
+        // Seed the sidebar's DB-backed caches (workspace rows + agent
+        // statuses) — the first gather lands async, typically before the
+        // first meaningful paint.
+        this.mark_rail_dirty(cx);
         this.rewire_scm_subscriptions(window, cx);
         // Load global custom commands on startup. No active project yet so
         // only the global `commands.toml` is checked; project commands are
@@ -820,6 +849,10 @@ impl WorkspaceRoot {
     /// Called only from main-thread GPUI callbacks, where `Handle::try_current`
     /// resolves to that runtime.
     pub(crate) fn run_diff_refresh_round(&mut self, cx: &mut Context<Self>) {
+        // Reconciliation net for the sidebar's DB caches: any workspace /
+        // agent-session write that missed an explicit `mark_rail_dirty`
+        // call is picked up within one focus-gated tick.
+        self.mark_rail_dirty(cx);
         if self.diff_refresh_in_flight {
             return;
         }
@@ -936,6 +969,11 @@ impl WorkspaceRoot {
             crate::shell::terminal_view::spawn_local_pty(cwd, ids.env())
         else {
             tracing::warn!("floating terminal: PTY spawn failed; not showing");
+            self.push_toast(
+                ToastKind::Error,
+                "Floating terminal failed to start — no PTY available",
+                cx,
+            );
             return;
         };
         let entity = cx.new(|cx| {
@@ -1515,6 +1553,13 @@ impl WorkspaceRoot {
                 Ok(id) => id,
                 Err(err) => {
                     tracing::warn!(?err, adapter = adapter_id, "start_session failed");
+                    let _ = cx.update(|_, cx| {
+                        crate::shell::toast::toast_op_error(
+                            cx,
+                            &format!("Start {adapter_id} agent"),
+                            &err.to_string(),
+                        );
+                    });
                     return;
                 }
             };
@@ -1523,6 +1568,13 @@ impl WorkspaceRoot {
                 Err(err) => {
                     tracing::warn!(?err, "backend_for after start_session");
                     let _ = runtime.cancel(session_id).await;
+                    let _ = cx.update(|_, cx| {
+                        crate::shell::toast::toast_op_error(
+                            cx,
+                            &format!("Start {adapter_id} agent"),
+                            &err.to_string(),
+                        );
+                    });
                     return;
                 }
             };
@@ -1531,6 +1583,13 @@ impl WorkspaceRoot {
                 Err(err) => {
                     tracing::warn!(?err, "terminal_session_id after start_session");
                     let _ = runtime.cancel(session_id).await;
+                    let _ = cx.update(|_, cx| {
+                        crate::shell::toast::toast_op_error(
+                            cx,
+                            &format!("Start {adapter_id} agent"),
+                            &err.to_string(),
+                        );
+                    });
                     return;
                 }
             };
@@ -1539,6 +1598,13 @@ impl WorkspaceRoot {
                 Err(err) => {
                     tracing::warn!(?err, "subscribe_status after start_session");
                     let _ = runtime.cancel(session_id).await;
+                    let _ = cx.update(|_, cx| {
+                        crate::shell::toast::toast_op_error(
+                            cx,
+                            &format!("Start {adapter_id} agent"),
+                            &err.to_string(),
+                        );
+                    });
                     return;
                 }
             };

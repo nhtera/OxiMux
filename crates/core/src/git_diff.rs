@@ -79,6 +79,13 @@ pub struct FileDiff {
     /// reports this so the UI can collapse oversized diffs; it never
     /// truncates `hunks` itself.
     pub large: bool,
+    /// POSIX file mode from the `new file mode` / `deleted file mode`
+    /// extended header (e.g. `0o100755`). Only populated for `Added` /
+    /// `Deleted`; `None` for other statuses or when the header was
+    /// absent. Lets patch synthesis round-trip executables instead of
+    /// hardcoding 100644.
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 /// 1000 visible lines → renderer should collapse by default.
@@ -370,6 +377,7 @@ mod region_tests {
             status: DiffStatus::Modified,
             hunks,
             large: false,
+            mode: None,
         }
     }
 

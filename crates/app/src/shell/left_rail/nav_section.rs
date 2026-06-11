@@ -22,6 +22,10 @@ pub enum NavItem {
 
 const NAV_ICON_SIZE: f32 = 16.0;
 
+/// Feature gate for the Automations nav row. The page behind it is not
+/// built yet; flip to `true` when the build-out lands.
+const SHOW_AUTOMATIONS: bool = false;
+
 impl NavItem {
     pub const ALL: [NavItem; 4] = [
         NavItem::Tasks,
@@ -95,6 +99,11 @@ pub fn render_nav_section(
 ) -> impl IntoElement {
     let mut col = div().flex().flex_col().w_full();
     for item in NavItem::ALL {
+        // Hidden until the feature ships — a nav row that opens an empty
+        // stub is a dead click target, worse than no row.
+        if item == NavItem::Automations && !SHOW_AUTOMATIONS {
+            continue;
+        }
         let badge = if item == NavItem::Agents {
             agents_unread
         } else {

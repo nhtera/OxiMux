@@ -20,6 +20,7 @@ pub mod project_panes_factory;
 pub mod project_scripts_loader;
 pub mod relay_cold_restore;
 pub mod relay_supervisor;
+pub(crate) mod restore_fallback;
 pub mod scm_layout_settings;
 pub mod shell;
 pub mod state;
