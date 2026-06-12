@@ -67,8 +67,15 @@ pub const WEEK_MS: i64 = 7 * 24 * HOUR_MS;
 /// tiers (the meter hides rather than guessing a denominator).
 ///
 /// Calibration constants: block budgets follow the commonly-cited
-/// community estimates for input+output tokens per 5-hour block; the
-/// weekly budget is modeled as 10 blocks' worth. Tune at the live drill.
+/// community estimates for input+output tokens per 5-hour block. The
+/// weekly multiplier was recalibrated at the 2026-06-12 live drill: a
+/// sustained-heavy week on a max_5x account (multiple agents, near-daily
+/// all-day use, account NOT weekly-limited) tallied ~23.6M deduplicated
+/// weighted tokens — the original 10-block model (2.2M) pinned the meter
+/// at ~100% for a week the vendor still considered in-budget. 150 blocks
+/// puts that observed week at ~70%, leaving headroom the account
+/// demonstrably had. Tune again whenever the CLI's own usage panel can be
+/// compared side by side.
 pub fn budget_for_tier(tier: &str) -> Option<TierBudget> {
     let block_tokens: f64 = if tier.contains("max_20x") {
         880_000.0
@@ -81,7 +88,7 @@ pub fn budget_for_tier(tier: &str) -> Option<TierBudget> {
     };
     Some(TierBudget {
         block_tokens,
-        weekly_tokens: block_tokens * 10.0,
+        weekly_tokens: block_tokens * 150.0,
     })
 }
 
@@ -182,14 +189,21 @@ mod tests {
     #[test]
     fn budget_for_tier_known_tiers() {
         assert_eq!(
-            budget_for_tier("default_claude_max_5x").unwrap().block_tokens,
+            budget_for_tier("default_claude_max_5x")
+                .unwrap()
+                .block_tokens,
             220_000.0
         );
         assert_eq!(
-            budget_for_tier("default_claude_max_20x").unwrap().block_tokens,
+            budget_for_tier("default_claude_max_20x")
+                .unwrap()
+                .block_tokens,
             880_000.0
         );
-        assert_eq!(budget_for_tier("claude_pro").unwrap().block_tokens, 44_000.0);
+        assert_eq!(
+            budget_for_tier("claude_pro").unwrap().block_tokens,
+            44_000.0
+        );
     }
 
     #[test]

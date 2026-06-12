@@ -100,7 +100,7 @@ fn agent_session_update_ended_at() {
 }
 
 #[test]
-fn agent_session_list_running_at_shutdown_filters_correctly() {
+fn agent_session_list_unfinished_at_shutdown_filters_correctly() {
     let (workspace_id, _, agents) = fixture();
 
     let running = agents
@@ -109,6 +109,13 @@ fn agent_session_list_running_at_shutdown_filters_correctly() {
     agents
         .update_status(&running.id, &AgentStatus::Running)
         .expect("set running");
+
+    // An agent parked at its prompt decays Running → Idle before a
+    // crash/teardown; the sweep must rescue it too (insert leaves the row
+    // at the default `idle` slug with no ended_at).
+    let decayed_idle = agents
+        .insert(&workspace_id, "claude_code", None, None)
+        .unwrap();
 
     let done = agents.insert(&workspace_id, "codex", None, None).unwrap();
     agents
@@ -121,9 +128,11 @@ fn agent_session_list_running_at_shutdown_filters_correctly() {
         .update_status(&interrupted.id, &AgentStatus::Interrupted)
         .expect("set interrupted");
 
-    let shutdown = agents.list_running_at_shutdown().expect("list");
-    assert_eq!(shutdown.len(), 1);
-    assert_eq!(shutdown[0].id, running.id);
+    let shutdown = agents.list_unfinished_at_shutdown().expect("list");
+    let ids: Vec<&str> = shutdown.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(shutdown.len(), 2);
+    assert!(ids.contains(&running.id.as_str()));
+    assert!(ids.contains(&decayed_idle.id.as_str()));
 }
 
 // V013 dropped the workspaces FK (synthesized 'primary:<project_id>' ids

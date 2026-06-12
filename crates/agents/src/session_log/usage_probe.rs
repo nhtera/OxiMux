@@ -163,7 +163,9 @@ fn session_logs_within(projects_dir: &Path, now_ms: i64) -> Vec<(PathBuf, i64, u
                 continue;
             }
             let Ok(meta) = file.metadata() else { continue };
-            let Ok(modified) = meta.modified() else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
             let mtime_ms = modified
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -177,25 +179,51 @@ fn session_logs_within(projects_dir: &Path, now_ms: i64) -> Vec<(PathBuf, i64, u
     out
 }
 
-/// Tally one log file into hour buckets, line by line. Unparseable lines
-/// (drifted format, truncation) are skipped — never an error.
+/// Tally one log file into hour buckets, line by line, deduplicated by
+/// message id. Unparseable lines (drifted format, truncation) are skipped
+/// — never an error.
+///
+/// Dedup matters: streaming re-emits the SAME assistant message (same
+/// `message.id`, same API call) on multiple consecutive lines as content
+/// blocks arrive — up to ~8 repeats per message in real logs, inflating a
+/// naive line-sum ~5×. Last occurrence wins (it carries the final
+/// `output_tokens`). Lines without an id (format drift) are counted
+/// directly rather than dropped.
 fn tally_file(path: &Path) -> HourBuckets {
     let mut buckets = HourBuckets::new();
     let Ok(f) = fs::File::open(path) else {
         return buckets;
     };
+    let mut by_id: HashMap<String, (i64, f64)> = HashMap::new();
     for line in BufReader::new(f).lines() {
         let Ok(line) = line else { break };
-        if let Some((ts_ms, tokens)) = usage_event_from_line(&line) {
-            *buckets.entry(bucket_key(ts_ms)).or_insert(0.0) += tokens;
+        if let Some(event) = usage_event_from_line(&line) {
+            match event.message_id {
+                Some(id) => {
+                    by_id.insert(id, (event.ts_ms, event.tokens));
+                }
+                None => {
+                    *buckets.entry(bucket_key(event.ts_ms)).or_insert(0.0) += event.tokens;
+                }
+            }
         }
+    }
+    for (ts_ms, tokens) in by_id.into_values() {
+        *buckets.entry(bucket_key(ts_ms)).or_insert(0.0) += tokens;
     }
     buckets
 }
 
-/// Extract `(timestamp_ms, weighted_tokens)` from one log line: assistant
-/// entries with a `message.usage` object. Everything else → `None`.
-fn usage_event_from_line(line: &str) -> Option<(i64, f64)> {
+/// One counted usage event from a log line.
+struct UsageEvent {
+    message_id: Option<String>,
+    ts_ms: i64,
+    tokens: f64,
+}
+
+/// Extract a [`UsageEvent`] from one log line: assistant entries with a
+/// `message.usage` object. Everything else → `None`.
+fn usage_event_from_line(line: &str) -> Option<UsageEvent> {
     // Cheap pre-filter: every counted line mentions both markers.
     if !line.contains("\"assistant\"") || !line.contains("\"usage\"") {
         return None;
@@ -218,7 +246,15 @@ fn usage_event_from_line(line: &str) -> Option<(i64, f64)> {
         .pointer("/message/model")
         .and_then(Value::as_str)
         .unwrap_or("");
-    Some((ts_ms, weighted_tokens(input, output, model)))
+    let message_id = v
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(UsageEvent {
+        message_id,
+        ts_ms,
+        tokens: weighted_tokens(input, output, model),
+    })
 }
 
 #[cfg(test)]
@@ -229,6 +265,18 @@ mod tests {
     fn assistant_usage_line(ts: &str, model: &str, input: u64, output: u64) -> String {
         format!(
             r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
+        )
+    }
+
+    fn assistant_usage_line_with_id(
+        id: &str,
+        ts: &str,
+        model: &str,
+        input: u64,
+        output: u64,
+    ) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
         )
     }
 
@@ -261,9 +309,9 @@ mod tests {
     #[test]
     fn usage_event_parses_assistant_usage() {
         let line = assistant_usage_line("2026-06-12T00:30:00Z", "claude-sonnet-4-6", 100, 20);
-        let (ts, tokens) = usage_event_from_line(&line).unwrap();
-        assert_eq!(ts, 1781222400000 + 30 * 60_000);
-        assert_eq!(tokens, 120.0);
+        let event = usage_event_from_line(&line).unwrap();
+        assert_eq!(event.ts_ms, 1781222400000 + 30 * 60_000);
+        assert_eq!(event.tokens, 120.0);
     }
 
     #[test]
@@ -274,10 +322,52 @@ mod tests {
     }
 
     #[test]
+    fn tally_dedupes_streamed_repeats_by_message_id() {
+        // Streaming re-emits the same message id with growing
+        // output_tokens; only the LAST occurrence may count.
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("s.jsonl");
+        let ts = "2026-06-12T00:30:00Z";
+        let lines = [
+            assistant_usage_line_with_id("msg_a", ts, "claude-sonnet-4-6", 100, 5),
+            assistant_usage_line_with_id("msg_a", ts, "claude-sonnet-4-6", 100, 15),
+            assistant_usage_line_with_id("msg_a", ts, "claude-sonnet-4-6", 100, 40),
+            assistant_usage_line_with_id("msg_b", ts, "claude-sonnet-4-6", 50, 10),
+        ];
+        let mut f = std::fs::File::create(&p).unwrap();
+        for l in &lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        let buckets = tally_file(&p);
+        let total: f64 = buckets.values().sum();
+        // msg_a counts once at its final shape (100+40), msg_b once (50+10).
+        assert_eq!(total, 200.0);
+    }
+
+    #[test]
+    fn tally_counts_idless_lines_directly() {
+        // Format drift without `message.id` must still count (once per
+        // line) rather than vanish.
+        let home = tempfile::tempdir().unwrap();
+        let p = home.path().join("s.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant_usage_line("2026-06-12T00:30:00Z", "claude-sonnet-4-6", 10, 5)
+        )
+        .unwrap();
+        let buckets = tally_file(&p);
+        assert_eq!(buckets.values().sum::<f64>(), 15.0);
+    }
+
+    #[test]
     fn usage_event_applies_opus_multiplier() {
         let line = assistant_usage_line("2026-06-12T00:30:00Z", "claude-opus-4-8", 100, 0);
-        let (_, tokens) = usage_event_from_line(&line).unwrap();
-        assert_eq!(tokens, 500.0);
+        let event = usage_event_from_line(&line).unwrap();
+        assert_eq!(event.tokens, 500.0);
     }
 
     #[test]
@@ -313,7 +403,7 @@ mod tests {
         assert_eq!(snap.five_hour.budget_tokens, 220_000.0);
         assert!(snap.five_hour.resets_at_ms.is_some());
         assert_eq!(snap.weekly.used_tokens, 1800.0);
-        assert_eq!(snap.weekly.budget_tokens, 2_200_000.0);
+        assert_eq!(snap.weekly.budget_tokens, 33_000_000.0);
     }
 
     #[test]
@@ -322,7 +412,12 @@ mod tests {
         write_log(
             home.path(),
             "s1.jsonl",
-            &[assistant_usage_line(&recent_ts(5), "claude-sonnet-4-6", 100, 0)],
+            &[assistant_usage_line(
+                &recent_ts(5),
+                "claude-sonnet-4-6",
+                100,
+                0,
+            )],
         );
         let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
         let first = probe.sample().expect("first");
@@ -337,12 +432,22 @@ mod tests {
         write_log(
             home.path(),
             "fresh.jsonl",
-            &[assistant_usage_line(&recent_ts(5), "claude-sonnet-4-6", 100, 0)],
+            &[assistant_usage_line(
+                &recent_ts(5),
+                "claude-sonnet-4-6",
+                100,
+                0,
+            )],
         );
         write_log(
             home.path(),
             "ancient.jsonl",
-            &[assistant_usage_line(&recent_ts(5), "claude-sonnet-4-6", 999, 0)],
+            &[assistant_usage_line(
+                &recent_ts(5),
+                "claude-sonnet-4-6",
+                999,
+                0,
+            )],
         );
         let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
         assert!(probe.sample().is_some());

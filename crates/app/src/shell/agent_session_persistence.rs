@@ -82,7 +82,9 @@ pub(crate) fn spawn_for_session(
         let (m, e) = (model.clone(), effort.clone());
         let inserted = cx
             .background_executor()
-            .spawn(async move { repo.insert(&workspace_key, adapter_id, m.as_deref(), e.as_deref()) })
+            .spawn(
+                async move { repo.insert(&workspace_key, adapter_id, m.as_deref(), e.as_deref()) },
+            )
             .await;
         let row_id = match inserted {
             Ok(session) => session.id,
@@ -104,9 +106,16 @@ pub(crate) fn spawn_for_session(
         }
         while !last.is_terminal() {
             if status_rx.changed().await.is_err() {
-                // Sender dropped without a terminal transition (runtime
-                // torn down mid-flight). The boot-time sweep will mark a
-                // dangling `running` row Interrupted on next launch.
+                // Sender dropped without a terminal transition — the
+                // runtime tore the session down mid-flight (e.g. tab close
+                // aborting the poll task before its Exit event drains). By
+                // definition the agent stopped without finishing, so write
+                // the terminal truth here instead of leaving the row at
+                // whatever non-terminal status it last had (`Running`
+                // decays to `Idle` at the prompt, which the boot sweep
+                // used to miss entirely).
+                write_status(&agent_repo, &row_id, &AgentStatus::Interrupted, cx).await;
+                let _ = weak.update(cx, |this, cx| this.mark_rail_dirty(cx));
                 return;
             }
             let status = status_rx.borrow_and_update().clone();

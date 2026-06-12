@@ -59,10 +59,34 @@ fn agent_status_unknown_slug_returns_none() {
 }
 
 #[test]
-fn agent_status_running_slug_matches_query_literal() {
-    // `AgentSessionRepo::list_running_at_shutdown` hardcodes
-    // `WHERE status = 'running'`. This test machine-checks the slug
-    // matches — if `Running.as_str()` ever returns anything other than
-    // "running", the query goes silent and this test fails.
-    assert_eq!(AgentStatus::Running.as_str(), "running");
+fn agent_status_non_terminal_slugs_match_query() {
+    // `AgentSessionRepo::list_unfinished_at_shutdown` hardcodes
+    // `WHERE status IN ('idle', 'running', 'waiting_input',
+    // 'needs_approval')`. This test machine-checks every non-terminal
+    // slug against that literal set — if a slug drifts or a new
+    // non-terminal variant appears without updating the query, the sweep
+    // goes silently blind and this test fails.
+    let query_literals = ["idle", "running", "waiting_input", "needs_approval"];
+    let non_terminal = [
+        AgentStatus::Idle,
+        AgentStatus::Running,
+        AgentStatus::WaitingForInput,
+        AgentStatus::NeedsApproval(String::new()),
+    ];
+    for status in &non_terminal {
+        assert!(!status.is_terminal());
+        assert!(
+            query_literals.contains(&status.as_str()),
+            "non-terminal slug {:?} missing from the sweep query",
+            status.as_str()
+        );
+    }
+    // And the terminal set must stay OUT of the sweep.
+    for status in [
+        AgentStatus::Done { code: Some(0) },
+        AgentStatus::Failed(String::new()),
+        AgentStatus::Interrupted,
+    ] {
+        assert!(!query_literals.contains(&status.as_str()));
+    }
 }

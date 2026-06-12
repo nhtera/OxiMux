@@ -58,8 +58,8 @@ pub enum AgentStatus {
     /// Process exited non-zero or runtime failed to spawn.
     Failed(String),
     /// Session was alive at shutdown and could not be resumed on restart.
-    /// Set by Phase 4 step 9 on every row returned from
-    /// `AgentSessionRepo::list_running_at_shutdown`.
+    /// Set by the boot sweep on every row returned from
+    /// `AgentSessionRepo::list_unfinished_at_shutdown`.
     Interrupted,
 }
 

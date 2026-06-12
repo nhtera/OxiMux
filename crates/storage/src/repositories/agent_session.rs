@@ -115,21 +115,27 @@ impl AgentSessionRepo {
         Ok(())
     }
 
-    /// Sessions whose `status = 'running'` AND have no `ended_at` — i.e.
-    /// they were alive when the app went down. The Phase 4 step 9 startup
-    /// path calls `update_status(id, AgentStatus::Interrupted)` on each.
+    /// Sessions in any NON-TERMINAL status with no `ended_at` — i.e. they
+    /// were alive when the app went down. The startup path calls
+    /// `update_status(id, AgentStatus::Interrupted)` on each.
     ///
-    /// The literal `'running'` MUST stay in lockstep with
-    /// `AgentStatus::Running.as_str()`; the codec test
-    /// `agent_status_running_slug_matches_query` (in
+    /// Matching every non-terminal slug (not just `'running'`) matters
+    /// because the status machine decays `Running` → `Idle` after output
+    /// silence: an agent sitting at its prompt when the app dies leaves an
+    /// `idle` row, which a running-only sweep would orphan forever.
+    ///
+    /// The literals MUST stay in lockstep with `AgentStatus::as_str` and
+    /// `AgentStatus::is_terminal`; the codec test
+    /// `agent_status_non_terminal_slugs_match_query` (in
     /// `crates/storage/tests/agent_status_codec.rs`) machine-checks the
     /// link.
-    pub fn list_running_at_shutdown(&self) -> Result<Vec<AgentSession>, StorageError> {
+    pub fn list_unfinished_at_shutdown(&self) -> Result<Vec<AgentSession>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at \
                  FROM agent_sessions \
-                 WHERE status = 'running' AND ended_at IS NULL \
+                 WHERE status IN ('idle', 'running', 'waiting_input', 'needs_approval') \
+                   AND ended_at IS NULL \
                  ORDER BY started_at ASC",
             )?;
             let iter = stmt.query_map([], AgentSessionRow::from_row)?;

@@ -136,9 +136,9 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
     // serial `with_conn` lock acquisitions — fine for v1 dogfood scale
     // (O(10) sessions); step 9 should batch via a transactional repo
     // method when realistic loads grow. Idempotent if interrupted by a
-    // crash mid-iteration: next boot's `list_running_at_shutdown` returns
-    // only the still-`Running` rows.
-    let running = agent_session_repo.list_running_at_shutdown()?;
+    // crash mid-iteration: next boot's `list_unfinished_at_shutdown`
+    // returns only the still-non-terminal rows.
+    let running = agent_session_repo.list_unfinished_at_shutdown()?;
     for session in &running {
         agent_session_repo.update_status(&session.id, &AgentStatus::Interrupted)?;
     }
@@ -240,11 +240,11 @@ mod tests {
                 .all(|s| s.status == AgentStatus::Interrupted)
         );
         // The DB rows must actually be `interrupted` now — second
-        // `list_running_at_shutdown` returns empty.
+        // `list_unfinished_at_shutdown` returns empty.
         assert!(
             state
                 .agent_session_repo
-                .list_running_at_shutdown()
+                .list_unfinished_at_shutdown()
                 .expect("list")
                 .is_empty()
         );

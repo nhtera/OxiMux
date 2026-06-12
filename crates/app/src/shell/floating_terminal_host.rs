@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use gpui::{AppContext, Context, Window};
 
 use crate::shell::context_env::SurfaceIds;
-use crate::shell::floating_terminal::{
-    FloatingTabSpec, FloatingTerminal, FloatingTerminalEvent,
-};
+use crate::shell::floating_terminal::{FloatingTabSpec, FloatingTerminal, FloatingTerminalEvent};
 use crate::shell::floating_terminal_persistence::{FloatingTabsBlob, tabs_key};
 use crate::shell::toast::ToastKind;
 use crate::workspace_root::WorkspaceRoot;
@@ -27,6 +25,14 @@ impl WorkspaceRoot {
     pub(crate) fn toggle_floating_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.floating_terminal.is_some() {
             self.floating_terminal_visible = !self.floating_terminal_visible;
+            // Hiding while keyboard focus sits inside the card leaves
+            // focus on an element that is no longer rendered — action
+            // dispatch then has no focus path, so every chord (including
+            // the one that re-shows this card) silently no-ops until the
+            // user clicks somewhere. Hand focus back to the active pane.
+            if !self.floating_terminal_visible {
+                crate::shell::workspace_ops::refocus_active_pane(self, window, cx);
+            }
             cx.notify();
             return;
         }
@@ -109,8 +115,7 @@ impl WorkspaceRoot {
             .unwrap_or_else(|| PathBuf::from("/"));
         let cwd_str = cwd.to_string_lossy().into_owned();
         let ids = SurfaceIds::fresh(cwd_str.clone());
-        let (backend, session_id) =
-            crate::shell::terminal_view::spawn_local_pty(cwd, ids.env())?;
+        let (backend, session_id) = crate::shell::terminal_view::spawn_local_pty(cwd, ids.env())?;
         Some(FloatingTabSpec {
             backend,
             session_id,
