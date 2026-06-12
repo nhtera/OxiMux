@@ -6,7 +6,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ### 2026-06-12 — Keyboard shortcut registry: editable keybindings, TOML overrides, live rebind
 
-**Commits**: `_pending_`  
+**Commits**: `e492b29`  
 **Touches**: `crates/app/src/keymap_registry/` (NEW), `crates/app/src/keybindings_settings.rs` (NEW), `crates/settings/src/keybindings.rs` (NEW), `crates/app/src/shell/settings_modal/` (Keybindings pane rewritten), `crates/app/src/keymap.rs` (DELETED), 9 chord-display call sites
 
 Named-action shortcut registry becomes the single source of truth for every keybinding:
