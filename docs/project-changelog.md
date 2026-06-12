@@ -4,6 +4,20 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-12 — Tabbed floating terminal: tab set, persistence, expand-to-pane
+
+**Commits**: `cf81d6d`  
+**Touches**: `crates/app/src/shell/` (floating_terminal.rs rewritten, floating_terminal_host.rs NEW, floating_terminal_persistence.rs NEW, mod.rs), `crates/app/src/workspace_root.rs`
+
+The floating ("PiP") terminal grows from one session into a small tabbed surface:
+
+- **Tabs.** Compact strip appears at two-plus tabs (single tab keeps the original strip-less look); click to switch, `Cmd+{`/`Cmd+}` cycle, per-tab `×`, `+` button or `Cmd+T` spawns at the active workspace cwd, double-click a chip to rename (reuses the pane rename dialog). The pane chords keep their pane meaning — the card scopes the existing actions via focus-path handlers, no new bindings.
+- **Sessions survive relaunch.** The tab set persists per window (`floating_terminal.tabs.<window_id>`); on the first toggle after launch, tabs whose relay PTY still lives in the daemon reattach with scrollback intact, the rest respawn fresh at their saved cwd. This also closes a silent leak: floating PTYs already survived quit in the daemon but nothing ever reclaimed them. Entity-drop paths (last tab closed/expanded, title-bar close) write the blob immediately so a deliberately-closed set can never resurrect.
+- **Expand-to-pane.** The `⤢` button moves the active tab's terminal view into the active pane group as a regular tab — same entity, the PTY keeps streaming mid-command, no respawn — then focuses it there.
+- Host logic (spawn, restore round-trips, expand, rename dialog) split into `floating_terminal_host.rs`; the card itself stays PTY-free and event-driven.
+
+---
+
 ### 2026-06-12 — Agent session persistence, Stopped status, live activity, usage meter
 
 **Commits**: `4635afe`  
