@@ -3,17 +3,25 @@
 //! OS-level tear-off (a second window) — this is one overlay inside the main
 //! window, toggled with `Cmd+Shift+T`.
 //!
-//! The entity is held by `WorkspaceRoot` and kept alive across hides (only
-//! `visible` flips) so the PTY survives toggling; the close button drops the
-//! entity, which tears the PTY down via `TerminalView`'s drop. Geometry is
-//! persisted (debounced) to the settings repo and restored on next launch.
+//! The card hosts a small TAB SET: multiple PTY sessions with a compact
+//! strip that appears at two-plus tabs (a single tab renders strip-less —
+//! the original look). The entity is held by `WorkspaceRoot` and kept alive
+//! across hides (only `visible` flips) so the PTYs survive toggling; the
+//! title-bar close button drops the entity, which tears every PTY down via
+//! `TerminalView` drop. Geometry AND the tab set persist to the settings
+//! repo (debounced); relay-backed tabs reattach across relaunch on the
+//! first toggle (see `floating_terminal_persistence`).
+//!
+//! Spawning stays with `WorkspaceRoot` (it owns cwd resolution + the
+//! no-backend bail): the card emits `NewTabRequested` / `ExpandActive…` /
+//! `RenameRequested` events instead of touching PTYs itself.
 
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Context, DragMoveEvent, Entity, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Point, Render, StatefulInteractiveElement, Styled, Task, Window, div,
-    point, px,
+    AppContext, ClickEvent, Context, DragMoveEvent, Entity, Focusable, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, Render,
+    StatefulInteractiveElement, Styled, Task, Window, div, point, prelude::FluentBuilder, px,
 };
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
@@ -23,6 +31,7 @@ use oximux_agents::SharedBackend;
 use oximux_pty::TerminalSessionId;
 
 use crate::shell::context_env::SurfaceIds;
+use crate::shell::floating_terminal_persistence::{FloatingTabsBlob, PersistedFloatingTab};
 use crate::shell::terminal_view::TerminalView;
 
 /// Settings-repo key for the persisted geometry blob.
@@ -32,10 +41,12 @@ const MIN_W: f32 = 320.0;
 const MIN_H: f32 = 200.0;
 /// Title-bar height (the drag handle).
 const TITLE_H: f32 = 28.0;
+/// Tab-strip height (shown only at 2+ tabs).
+const STRIP_H: f32 = 24.0;
 /// Bottom-right resize handle hit area.
 const RESIZE_HANDLE: f32 = 14.0;
-/// Debounce before writing geometry to SQLite, so a drag/resize gesture writes
-/// once on settle rather than on every move tick.
+/// Debounce before writing geometry/tabs to SQLite, so a gesture or a tab
+/// burst writes once on settle rather than per tick.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Position + size of the floating card, persisted as JSON.
@@ -62,6 +73,37 @@ impl FloatingGeom {
     }
 }
 
+/// Everything `WorkspaceRoot` resolves before a tab can mount: a spawned
+/// (or reattached) PTY plus its identity. The card never spawns PTYs.
+pub struct FloatingTabSpec {
+    pub backend: SharedBackend,
+    pub session_id: TerminalSessionId,
+    pub ids: SurfaceIds,
+    pub cwd: String,
+    pub custom_title: Option<String>,
+}
+
+/// One mounted floating tab.
+struct FloatingTab {
+    view: Entity<TerminalView>,
+    session_id: TerminalSessionId,
+    cwd: String,
+    custom_title: Option<String>,
+    /// Relay-side PTY id captured at mount — `None` on the in-process
+    /// fallback backend (then the tab respawns by cwd on restore).
+    external_id: Option<String>,
+}
+
+/// Positional default title: first tab keeps the original single-session
+/// label, later ones number up. Pure for tests.
+pub fn default_tab_title(ordinal: usize) -> String {
+    if ordinal == 0 {
+        "Terminal".to_string()
+    } else {
+        format!("Terminal {}", ordinal + 1)
+    }
+}
+
 /// Drag payloads — markers distinguishing a title-bar move from a corner
 /// resize so the two `on_drag_move` handlers don't cross-fire.
 struct TitleDrag;
@@ -77,27 +119,31 @@ impl Render for DragGhost {
 }
 
 pub struct FloatingTerminal {
-    view: Entity<TerminalView>,
+    tabs: Vec<FloatingTab>,
+    active: usize,
     geom: FloatingGeom,
     /// Cursor offset within the title bar captured on mouse-down so dragging
     /// keeps the grab point under the cursor instead of snapping to a corner.
     drag_grab: Option<Point<Pixels>>,
     settings_repo: Option<SettingsRepo>,
-    _persist_task: Option<Task<()>>,
+    /// Per-window settings key for the persisted tab set.
+    tabs_key: String,
+    _geom_persist_task: Option<Task<()>>,
+    _tabs_persist_task: Option<Task<()>>,
     theme: Theme,
     density: Density,
     typography: Typography,
 }
 
 impl FloatingTerminal {
-    /// Construct a floating terminal from an already-spawned PTY. The caller
-    /// (`WorkspaceRoot`) spawns the PTY first so it can bail before creating
-    /// the entity when no backend is available; this fn just mounts the view.
+    /// Mount a card from already-resolved tab specs (one fresh spawn, or a
+    /// restored set). `specs` MUST be non-empty — the caller bails before
+    /// constructing the entity when no PTY is available.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend: SharedBackend,
-        session_id: TerminalSessionId,
-        ids: SurfaceIds,
+        specs: Vec<FloatingTabSpec>,
+        active: usize,
+        tabs_key: String,
         settings_repo: Option<SettingsRepo>,
         theme: Theme,
         density: Density,
@@ -105,27 +151,172 @@ impl FloatingTerminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut this = Self {
+            tabs: Vec::new(),
+            active: 0,
+            geom: FloatingGeom::load(&settings_repo),
+            drag_grab: None,
+            settings_repo,
+            tabs_key,
+            _geom_persist_task: None,
+            _tabs_persist_task: None,
+            theme,
+            density,
+            typography,
+        };
+        for spec in specs {
+            let tab = this.mount_tab(spec, window, cx);
+            this.tabs.push(tab);
+        }
+        this.active = active.min(this.tabs.len().saturating_sub(1));
+        this.schedule_persist_tabs(cx);
+        this
+    }
+
+    fn mount_tab(
+        &self,
+        spec: FloatingTabSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> FloatingTab {
         let view = cx.new(|cx| {
             TerminalView::mount(
-                backend,
-                session_id,
-                ids,
-                theme,
-                density,
-                typography.clone(),
+                spec.backend,
+                spec.session_id,
+                spec.ids,
+                self.theme,
+                self.density,
+                self.typography.clone(),
                 window,
                 cx,
             )
         });
-        Self {
+        FloatingTab {
             view,
-            geom: FloatingGeom::load(&settings_repo),
-            drag_grab: None,
-            settings_repo,
-            _persist_task: None,
-            theme,
-            density,
-            typography,
+            session_id: spec.session_id,
+            cwd: spec.cwd,
+            custom_title: spec.custom_title,
+            external_id: crate::shell::terminal_view::external_id_for_session(spec.session_id),
+        }
+    }
+
+    /// Append a new tab (the `+` button / Cmd+T path — the root spawned the
+    /// PTY) and make it active.
+    pub fn push_tab(&mut self, spec: FloatingTabSpec, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.mount_tab(spec, window, cx);
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.focus_active(window, cx);
+        self.schedule_persist_tabs(cx);
+        cx.notify();
+    }
+
+    /// Close one tab (chip `×` / Cmd+W). Dropping the view tears its PTY
+    /// down. Closing the last tab emits `Close` so the root drops the card
+    /// — same end state as the title-bar close.
+    pub fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            // The entity drops right after `Close`, which would cancel a
+            // debounced write — persist the (now empty) set immediately so
+            // the next toggle doesn't resurrect a deliberately-closed tab.
+            self.persist_tabs_now();
+            cx.emit(FloatingTerminalEvent::Close);
+            return;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if idx < self.active {
+            self.active -= 1;
+        }
+        self.focus_active(window, cx);
+        self.schedule_persist_tabs(cx);
+        cx.notify();
+    }
+
+    /// Activate a tab and focus its terminal.
+    pub fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() || idx == self.active {
+            return;
+        }
+        self.active = idx;
+        self.focus_active(window, cx);
+        self.schedule_persist_tabs(cx);
+        cx.notify();
+    }
+
+    /// Cycle the active tab (NextTab / PrevTab within the card).
+    fn cycle_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.tabs.len() as isize;
+        if n < 2 {
+            return;
+        }
+        let next = (self.active as isize + delta).rem_euclid(n) as usize;
+        self.activate_tab(next, window, cx);
+    }
+
+    /// Set (or reset, with `None`) a tab's custom title.
+    pub fn set_tab_title(&mut self, idx: usize, title: Option<String>, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.custom_title = title.filter(|t| !t.trim().is_empty());
+            self.schedule_persist_tabs(cx);
+            cx.notify();
+        }
+    }
+
+    /// Display title for a tab — custom when set, positional default else.
+    pub fn tab_title(&self, idx: usize) -> String {
+        self.tabs
+            .get(idx)
+            .map(|t| {
+                t.custom_title
+                    .clone()
+                    .unwrap_or_else(|| default_tab_title(idx))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Detach the active tab for expand-to-pane: the view entity (PTY
+    /// intact) plus its display title + session id. Emits `Close` when the
+    /// card empties — the root drops it after re-homing the view.
+    pub fn take_active_tab(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, Entity<TerminalView>, TerminalSessionId)> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let title = self.tab_title(self.active);
+        let tab = self.tabs.remove(self.active);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
+        if self.tabs.is_empty() {
+            // Immediate write — `Close` drops the entity and would cancel
+            // a debounced one. A stale blob here is worse than elsewhere:
+            // the expanded tab's PTY now lives in a pane, and a later
+            // restore attempt against its external id would fight the
+            // pane's single-subscriber attach.
+            self.persist_tabs_now();
+            cx.emit(FloatingTerminalEvent::Close);
+        } else {
+            self.schedule_persist_tabs(cx);
+            cx.notify();
+        }
+        Some((title, tab.view, tab.session_id))
+    }
+
+    /// Number of open tabs (root-side guards + tests).
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.view.read(cx).focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -135,7 +326,7 @@ impl FloatingTerminal {
         let max_y = (f32::from(vp.height) - self.geom.h).max(0.0);
         self.geom.x = x.clamp(0.0, max_x);
         self.geom.y = y.clamp(0.0, max_y);
-        self.schedule_persist(cx);
+        self.schedule_persist_geom(cx);
         cx.notify();
     }
 
@@ -145,19 +336,19 @@ impl FloatingTerminal {
         let max_h = (f32::from(vp.height) - self.geom.y).max(MIN_H);
         self.geom.w = w.clamp(MIN_W, max_w);
         self.geom.h = h.clamp(MIN_H, max_h);
-        self.schedule_persist(cx);
+        self.schedule_persist_geom(cx);
         cx.notify();
     }
 
     /// Debounced geometry write — coalesces a gesture's move ticks into one
     /// SQLite write on settle. The previous task is dropped (cancelled) each
     /// time, so only the last tick's write survives.
-    fn schedule_persist(&mut self, cx: &mut Context<Self>) {
+    fn schedule_persist_geom(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.settings_repo.clone() else {
             return;
         };
         let geom = self.geom;
-        self._persist_task = Some(cx.spawn(async move |_this, cx| {
+        self._geom_persist_task = Some(cx.spawn(async move |_this, cx| {
             cx.background_executor().timer(PERSIST_DEBOUNCE).await;
             if let Ok(json) = serde_json::to_string(&geom)
                 && let Err(err) = repo.set(GEOMETRY_KEY, &json)
@@ -165,6 +356,151 @@ impl FloatingTerminal {
                 tracing::warn!(?err, "failed to persist floating terminal geometry");
             }
         }));
+    }
+
+    /// Synchronous tab-set write for paths where the entity is about to
+    /// drop (last tab closed / expanded out, title-bar close) — a debounced
+    /// task would be cancelled by the drop and leave a stale blob.
+    fn persist_tabs_now(&self) {
+        if let Some(repo) = &self.settings_repo {
+            self.persisted_blob().save(repo, &self.tabs_key);
+        }
+    }
+
+    /// Debounced tab-set write — same coalescing contract as geometry.
+    fn schedule_persist_tabs(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.settings_repo.clone() else {
+            return;
+        };
+        let key = self.tabs_key.clone();
+        let blob = self.persisted_blob();
+        self._tabs_persist_task = Some(cx.spawn(async move |_this, cx| {
+            cx.background_executor().timer(PERSIST_DEBOUNCE).await;
+            blob.save(&repo, &key);
+        }));
+    }
+
+    /// Snapshot the live tab set into its persisted form.
+    fn persisted_blob(&self) -> FloatingTabsBlob {
+        FloatingTabsBlob {
+            relay_session: crate::shell::terminal_view::relay_session_id_cached(),
+            active: self.active,
+            tabs: self
+                .tabs
+                .iter()
+                .map(|t| PersistedFloatingTab {
+                    custom_title: t.custom_title.clone(),
+                    cwd: t.cwd.clone(),
+                    external_id: t.external_id.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Compact tab strip — rendered only at 2+ tabs so the single-tab card
+    /// keeps the original strip-less look.
+    fn render_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let active = self.active;
+        let chips = (0..self.tabs.len())
+            .map(|i| {
+                let is_active = i == active;
+                let title = self.tab_title(i);
+                div()
+                    .id(("floating-tab", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(density.gap_inline))
+                    .h(px(STRIP_H - 4.0))
+                    .px(px(density.gap_inline * 2.0))
+                    .rounded(px(density.r_xs))
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(if is_active { theme.fg_base } else { theme.fg_subtle })
+                    .when(is_active, |s| s.bg(theme.bg_panel))
+                    .when(!is_active, |s| s.hover(|s| s.bg(theme.hover_overlay)))
+                    .cursor_pointer()
+                    // Single click activates; double click renames (the
+                    // root hosts the dialog).
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if ev.click_count() >= 2 {
+                            cx.emit(FloatingTerminalEvent::RenameRequested { idx: i });
+                        } else {
+                            this.activate_tab(i, window, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .max_w(px(140.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id(("floating-tab-close", i))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(14.0))
+                            .rounded(px(density.r_xs))
+                            .text_color(theme.fg_subtle)
+                            .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_tab(i, window, cx);
+                                }),
+                            ),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .h(px(STRIP_H))
+            .px(px(density.gap_inline))
+            .bg(self.theme.bg_panel_alt)
+            .border_b_1()
+            .border_color(theme.border_inactive)
+            .children(chips)
+    }
+
+    /// Small square title-bar button (`+` / `⤢` / `×`).
+    fn title_button(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        on_down: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(TITLE_H - 8.0))
+            .rounded(px(density.r_xs))
+            .text_color(theme.fg_muted)
+            .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
+            .child(glyph)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, window, cx| {
+                    cx.stop_propagation();
+                    on_down(this, window, cx);
+                }),
+            )
     }
 }
 
@@ -174,6 +510,9 @@ impl Render for FloatingTerminal {
         let density = self.density;
         let typography = self.typography.clone();
         let geom = self.geom;
+        let show_strip = self.tabs.len() >= 2;
+        let active_view = self.tabs.get(self.active).map(|t| t.view.clone());
+        let title = self.tab_title(self.active);
 
         let title_bar = div()
             .id("floating-term-title")
@@ -187,25 +526,41 @@ impl Render for FloatingTerminal {
             .text_size(px(typography.t_sub_label))
             .text_color(theme.fg_subtle)
             .cursor_grab()
-            .child("Terminal")
+            .child(title)
             .child(
                 div()
-                    .id("floating-term-close")
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_center()
-                    .size(px(TITLE_H - 8.0))
-                    .rounded(px(density.r_xs))
-                    .text_color(theme.fg_muted)
-                    .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
-                    .child("×")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_this, _ev, _window, cx| {
-                            cx.stop_propagation();
+                    .gap(px(2.0))
+                    .child(self.title_button(
+                        "floating-term-new-tab",
+                        "+",
+                        |_this, _window, cx| cx.emit(FloatingTerminalEvent::NewTabRequested),
+                        cx,
+                    ))
+                    .child(self.title_button(
+                        "floating-term-expand",
+                        "⤢",
+                        |_this, _window, cx| {
+                            cx.emit(FloatingTerminalEvent::ExpandActiveRequested)
+                        },
+                        cx,
+                    ))
+                    .child(self.title_button(
+                        "floating-term-close",
+                        "×",
+                        |this, _window, cx| {
+                            // Closing the whole card is a deliberate
+                            // teardown: clear the persisted set NOW (not
+                            // debounced — the entity is about to drop) so
+                            // the next toggle starts fresh.
+                            this.tabs.clear();
+                            this.persist_tabs_now();
                             cx.emit(FloatingTerminalEvent::Close);
-                        }),
-                    ),
+                        },
+                        cx,
+                    )),
             )
             // Capture the grab offset, then begin the drag.
             .on_mouse_down(
@@ -248,6 +603,21 @@ impl Render for FloatingTerminal {
             .rounded(px(density.r_card))
             .overflow_hidden()
             .shadow_lg()
+            // Tab actions scoped to the card: these fire only while focus is
+            // inside the floating terminal (action dispatch walks the focus
+            // path), so the same chords keep their pane meaning elsewhere.
+            .on_action(cx.listener(|_this, _: &crate::actions::NewTab, _window, cx| {
+                cx.emit(FloatingTerminalEvent::NewTabRequested);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::CloseTab, window, cx| {
+                this.close_tab(this.active, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::NextTab, window, cx| {
+                this.cycle_tab(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::PrevTab, window, cx| {
+                this.cycle_tab(-1, window, cx);
+            }))
             // Move: fired while the title-bar drag is active.
             .on_drag_move::<TitleDrag>(cx.listener(
                 |this, ev: &DragMoveEvent<TitleDrag>, window, cx| {
@@ -278,20 +648,30 @@ impl Render for FloatingTerminal {
                 }),
             )
             .child(title_bar)
+            .when(show_strip, |card| card.child(self.render_strip(cx)))
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
-                    .child(self.view.clone()),
+                    .children(active_view),
             )
             .child(resize_handle)
     }
 }
 
-/// Emitted to `WorkspaceRoot` when the user clicks the close button.
+/// Emitted to `WorkspaceRoot`. The card stays PTY-free: anything that needs
+/// a spawn, a pane group, or a dialog goes up as an event.
 pub enum FloatingTerminalEvent {
+    /// Title-bar close, or the last tab closed — drop the entity.
     Close,
+    /// `+` button / Cmd+T while floating-focused: spawn a PTY at the active
+    /// workspace cwd and `push_tab` it.
+    NewTabRequested,
+    /// `⤢` button: move the active tab's view into the active pane group.
+    ExpandActiveRequested,
+    /// Double-click on a tab chip: open the rename dialog for `idx`.
+    RenameRequested { idx: usize },
 }
 
 impl gpui::EventEmitter<FloatingTerminalEvent> for FloatingTerminal {}
@@ -336,5 +716,12 @@ mod tests {
         let repo = SettingsRepo::new(oximux_storage::open_memory().unwrap());
         repo.set(GEOMETRY_KEY, "not valid json").unwrap();
         assert_eq!(FloatingGeom::load(&Some(repo)), FloatingGeom::default());
+    }
+
+    #[test]
+    fn default_tab_titles_are_positional() {
+        assert_eq!(default_tab_title(0), "Terminal");
+        assert_eq!(default_tab_title(1), "Terminal 2");
+        assert_eq!(default_tab_title(4), "Terminal 5");
     }
 }

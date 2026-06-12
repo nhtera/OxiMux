@@ -1078,68 +1078,11 @@ impl WorkspaceRoot {
         panes.update(cx, |p, cx| p.open_terminal_tab_in_active_group(window, cx));
     }
 
-    /// Toggle the in-window floating terminal. First dispatch lazily spawns it
-    /// at the active worktree cwd (the PTY then persists across hides); later
-    /// dispatches just flip its visibility. The card's close button drops the
-    /// entity (tearing the PTY down), so a later toggle spawns a fresh one.
-    fn toggle_floating_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.floating_terminal.is_some() {
-            self.floating_terminal_visible = !self.floating_terminal_visible;
-            cx.notify();
-            return;
-        }
-        // Spawn at the active pane group's cwd (the current worktree), falling
-        // back to the home dir when there's no active project.
-        let cwd = self
-            .active_project_panes()
-            .map(|p| p.read(cx).cwd().clone())
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        let settings_repo = Some(self.app_state.settings_repo.clone());
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        // Spawn the PTY up front so we can bail before creating the entity when
-        // no backend is available (otherwise `cx.new` would build a card around
-        // a dead terminal).
-        let ids = crate::shell::context_env::SurfaceIds::fresh(cwd.to_string_lossy().into_owned());
-        let Some((backend, session_id)) =
-            crate::shell::terminal_view::spawn_local_pty(cwd, ids.env())
-        else {
-            tracing::warn!("floating terminal: PTY spawn failed; not showing");
-            self.push_toast(
-                ToastKind::Error,
-                "Floating terminal failed to start — no PTY available",
-                cx,
-            );
-            return;
-        };
-        let entity = cx.new(|cx| {
-            crate::shell::floating_terminal::FloatingTerminal::new(
-                backend,
-                session_id,
-                ids,
-                settings_repo,
-                theme,
-                density,
-                typography,
-                window,
-                cx,
-            )
-        });
-        self._floating_terminal_sub = Some(cx.subscribe(
-            &entity,
-            |this, _entity, _event: &crate::shell::floating_terminal::FloatingTerminalEvent, cx| {
-                this.floating_terminal = None;
-                this.floating_terminal_visible = false;
-                this._floating_terminal_sub = None;
-                cx.notify();
-            },
-        ));
-        self.floating_terminal = Some(entity);
-        self.floating_terminal_visible = true;
-        cx.notify();
-    }
+    // `toggle_floating_terminal` and the rest of the floating-terminal host
+    // logic (restore, new-tab spawn, expand-to-pane, rename) live in
+    // `crate::shell::floating_terminal_host` — same split-impl pattern as
+    // `workspace_ops`.
+
 
     /// Resolves the currently-visible `ProjectPanes` entity by reading
     /// `active_project.id` against the per-project map. `None` when no

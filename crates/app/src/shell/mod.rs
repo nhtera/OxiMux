@@ -49,6 +49,8 @@ pub mod split_direction;
 pub mod stash_panel;
 pub mod status_bar;
 pub mod tab_context_menu;
+pub mod floating_terminal_host;
+pub mod floating_terminal_persistence;
 pub mod usage_meter;
 pub mod tasks_view;
 pub mod terminal_canvas;
