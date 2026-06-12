@@ -3119,12 +3119,33 @@ impl Render for WorkspaceRoot {
                 // whichever popover is currently visible. Modal dialogs
                 // (project picker / workspace create / palette) own their
                 // own focus and currently ignore this.
+                //
+                // When NOTHING is open, propagate instead of consuming: a
+                // matched key binding swallows the keystroke before key
+                // listeners ever run, so a no-op here would eat every
+                // Escape a focused terminal needs — for its PTY (TUIs, the
+                // agent CLI's panels, vim) and for the search overlay.
+                let any_open = this.pane_actions.read(cx).is_open()
+                    || this.tab_context_menu.read(cx).is_open()
+                    || this.file_tree_context_menu.read(cx).is_open()
+                    || this.git_row_context_menu.read(cx).is_open()
+                    || this.commit_context_menu.read(cx).is_open()
+                    || this.adapter_picker.read(cx).is_open()
+                    || this.usage_popover_open;
+                if !any_open {
+                    cx.propagate();
+                    return;
+                }
                 this.pane_actions.update(cx, |p, cx| p.close(cx));
                 this.tab_context_menu.update(cx, |m, cx| m.close(cx));
                 this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                 this.commit_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                if this.usage_popover_open {
+                    this.usage_popover_open = false;
+                    cx.notify();
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _window, cx| {
                 if let Some(rs) = &this.right_sidebar {
