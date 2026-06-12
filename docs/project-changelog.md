@@ -4,6 +4,18 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Exact usage meter via the account usage API
+
+**Commits**: `e0bdac5`  
+**Touches**: `crates/agents/src/session_log/` (usage_oauth.rs NEW, usage.rs, usage_probe.rs, mod.rs), `crates/app/src/shell/usage_meter.rs`
+
+The status-bar meter now shows the account's REAL rate-limit numbers instead of a local estimate. The OAuth deployment behind the primary CLI exposes `GET /api/oauth/usage` — the same window utilization its own usage panel renders, exact percentages and reset timestamps, account-wide across devices. Verified side by side: chip `16% 5h · 5% wk` and popover reset countdowns match the CLI's panel and the account settings page exactly.
+
+- **Auth + transport**: bearer token from the CLI's Keychain credentials item (on-disk file fallback); `curl` with its config fed via stdin so the token never appears in process arguments. Ad-hoc dev bundles may re-prompt Keychain access per reseal (stable `OXIMUX_SIGN_ID` makes "Always Allow" stick); a decline backs off for 15 minutes and falls to the estimate.
+- **Strategy order**: account API first, deduplicated JSONL tally as the offline/unauthenticated fallback. `UsageSnapshot` carries its source: exact numbers render without the `~` prefix, the popover drops token counts for plain percentages, the weekly line gains the real reset countdown, and reset formatting learns day spans ("6d 21h").
+
+---
+
 ### 2026-06-12 — Live-drill fixes: usage overcount, stuck agent rows, floating-toggle focus
 
 **Commits**: `1b50a09`  
