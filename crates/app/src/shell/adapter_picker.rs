@@ -1,15 +1,16 @@
 //! Inline adapter-picker popover — anchored to the `+` button.
 //!
 //! Click `+` → list "+ New terminal" + every detected adapter. Click a row
-//! to spawn it. Detection (`AdapterRegistry::detect_available`) is async
-//! with a 500 ms timeout; results cache for the app lifetime. Subsequent
-//! opens render the cache instantly + fire a background refresh.
+//! to spawn it immediately with the agent's default settings — no model or
+//! effort sub-step (mirrors the one-click launch of the reference cockpit).
+//! Detection (`AdapterRegistry::detect_available`) is async with a 500 ms
+//! timeout; results cache for the app lifetime. Subsequent opens render the
+//! cache instantly + fire a background refresh.
 //!
 //! Pattern mirrors [`super::pane_actions::PaneActionsMenu`] — hand-rolled
 //! `Entity<Self>` with full-window overlay for click-outside dismiss; no
 //! `FocusHandle`, no Escape key (parity with the existing popover).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,13 +23,6 @@ use oximux_core::AgentAdapter;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::ui::FloatingSurface;
-
-use crate::shell::adapter_picker_params::{self, ParamsStage};
-
-/// Last-used `(model, effort)` for one adapter slug. `None` == "Default"
-/// (no flag passed). Loaded from SQLite at construction; updated
-/// optimistically after each spawn so the next open preselects instantly.
-pub type SavedParams = (Option<String>, Option<String>);
 
 /// Width of the popover card. Slightly wider than `PaneActionsMenu` to fit
 /// adapter labels ("Claude Code", "Codex CLI") + the disabled hint.
@@ -48,20 +42,16 @@ const SEP_HEIGHT: f32 = 1.0;
 /// `Adapter` carries both the `AgentAdapter` discriminant (for runtime
 /// dispatch) and the `&'static str` slug (for tab labelling) so the
 /// caller doesn't have to re-walk `detect_available` to recover the id —
-/// the row already held both.
+/// the row already held both. The agent always launches with its default
+/// settings (no model/effort flags); that is the entire launch decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterSelection {
     /// First row — spawns a plain shell tab.
     NewTerminal,
-    /// One of the registry's available agent adapters, with the model /
-    /// reasoning-effort the user chose in the params sub-step. Both are
-    /// `None` when the adapter declares no options (the sub-step is skipped)
-    /// or the user kept the "Default" option.
+    /// One of the registry's available agent adapters.
     Adapter {
         kind: AgentAdapter,
         id: &'static str,
-        model: Option<String>,
-        effort: Option<String>,
     },
 }
 
@@ -72,19 +62,8 @@ pub type OnSelect = Box<dyn Fn(AdapterSelection, &mut Window, &mut App) + Send +
 
 /// Hand-rolled popover entity. Mounted as a sibling of `PaneActionsMenu`
 /// inside `WorkspaceRoot`; renders `div().into_any_element()` when closed.
-/// Which surface the open picker is showing: the adapter list, or the
-/// model/effort params sub-step for a chosen adapter.
-enum Stage {
-    List,
-    Params(ParamsStage),
-}
-
 pub struct AdapterPicker {
     open: bool,
-    /// List vs params sub-step. Reset to `List` on close.
-    stage: Stage,
-    /// Last-used params per adapter slug, for preselecting the sub-step.
-    last_params: HashMap<String, SavedParams>,
     /// Left-edge offset in CSS pixels — set by the action handler at open
     /// time so the popover tracks the `+` button across left-rail toggles.
     left_anchor_px: f32,
@@ -109,13 +88,10 @@ impl AdapterPicker {
         density: Density,
         typography: Typography,
         registry: Arc<AdapterRegistry>,
-        last_params: HashMap<String, SavedParams>,
         on_select: OnSelect,
     ) -> Self {
         Self {
             open: false,
-            stage: Stage::List,
-            last_params,
             left_anchor_px: 0.0,
             entries: None,
             is_refreshing: false,
@@ -129,23 +105,6 @@ impl AdapterPicker {
 
     pub fn is_open(&self) -> bool {
         self.open
-    }
-
-    // Accessors for the params sub-step module (sibling file).
-    pub(super) fn theme(&self) -> Theme {
-        self.theme
-    }
-    pub(super) fn density(&self) -> Density {
-        self.density
-    }
-    pub(super) fn typography(&self) -> Typography {
-        self.typography.clone()
-    }
-    pub(super) fn params_stage(&self) -> Option<&ParamsStage> {
-        match &self.stage {
-            Stage::Params(p) => Some(p),
-            Stage::List => None,
-        }
     }
 
     /// Toggle-aware open: a second click on the `+` button closes the
@@ -171,101 +130,20 @@ impl AdapterPicker {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.open = false;
-        self.stage = Stage::List;
         cx.notify();
     }
 
-    /// Click on an adapter row. Spawn immediately when the adapter declares
-    /// no model/effort options; otherwise enter the params sub-step with the
-    /// last-used choice (or "Default") preselected.
-    #[allow(clippy::too_many_arguments)]
-    fn choose_adapter(
+    /// Click on an adapter row: launch it immediately with the agent's
+    /// default settings, then close. No model/effort sub-step — picking the
+    /// adapter is the whole decision.
+    fn select_adapter(
         &mut self,
         kind: AgentAdapter,
         id: &'static str,
-        display_name: &'static str,
-        models: &'static [&'static str],
-        efforts: &'static [&'static str],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if models.is_empty() && efforts.is_empty() {
-            (self.on_select)(
-                AdapterSelection::Adapter {
-                    kind,
-                    id,
-                    model: None,
-                    effort: None,
-                },
-                window,
-                cx,
-            );
-            self.close(cx);
-            return;
-        }
-        // Preselect the saved choice; index 0 is the "Default" (None) option,
-        // so a concrete saved value maps to its position + 1.
-        let saved = self.last_params.get(id);
-        let model_sel = saved
-            .and_then(|(m, _)| m.as_deref())
-            .and_then(|m| models.iter().position(|x| *x == m))
-            .map_or(0, |i| i + 1);
-        let effort_sel = saved
-            .and_then(|(_, e)| e.as_deref())
-            .and_then(|e| efforts.iter().position(|x| *x == e))
-            .map_or(0, |i| i + 1);
-        self.stage = Stage::Params(ParamsStage {
-            kind,
-            id,
-            display_name,
-            models,
-            efforts,
-            model_sel,
-            effort_sel,
-        });
-        cx.notify();
-    }
-
-    /// Set the highlighted model option (index 0 = "Default"). No-op when not
-    /// in the params stage.
-    pub(super) fn set_model_sel(&mut self, sel: usize, cx: &mut Context<Self>) {
-        if let Stage::Params(p) = &mut self.stage {
-            p.model_sel = sel;
-            cx.notify();
-        }
-    }
-
-    /// Set the highlighted effort option (index 0 = "Default").
-    pub(super) fn set_effort_sel(&mut self, sel: usize, cx: &mut Context<Self>) {
-        if let Stage::Params(p) = &mut self.stage {
-            p.effort_sel = sel;
-            cx.notify();
-        }
-    }
-
-    /// Return to the adapter list from the params sub-step.
-    pub(super) fn back_to_list(&mut self, cx: &mut Context<Self>) {
-        self.stage = Stage::List;
-        cx.notify();
-    }
-
-    /// Confirm the params sub-step: fire the selection, optimistically cache
-    /// the choice so the next open preselects it, and close.
-    pub(super) fn confirm_params(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Stage::Params(p) = &self.stage else {
-            return;
-        };
-        let model = p.selected_model();
-        let effort = p.selected_effort();
-        let selection = AdapterSelection::Adapter {
-            kind: p.kind,
-            id: p.id,
-            model: model.clone(),
-            effort: effort.clone(),
-        };
-        self.last_params
-            .insert(p.id.to_string(), (model, effort));
-        (self.on_select)(selection, window, cx);
+        (self.on_select)(AdapterSelection::Adapter { kind, id }, window, cx);
         self.close(cx);
     }
 
@@ -347,10 +225,7 @@ impl Render for AdapterPicker {
             return div().into_any_element();
         }
         let left_px = self.left_anchor_px;
-        let card = match &self.stage {
-            Stage::List => self.render_list_card(cx),
-            Stage::Params(_) => adapter_picker_params::render_card(self, cx),
-        };
+        let card = self.render_list_card(cx);
 
         // Full-window invisible overlay for click-outside dismiss. Same
         // shape as `PaneActionsMenu`.
@@ -484,9 +359,6 @@ fn append_adapter_rows(
     for (ix, entry) in render_rows(entries).into_iter().enumerate() {
         let kind = entry.adapter_enum;
         let id = entry.adapter_id;
-        let display_name = entry.display_name;
-        let models = entry.models;
-        let efforts = entry.efforts;
         let label = SharedString::from(entry.display_name);
         let (state, hint) = if entry.available {
             (RowState::Active, None)
@@ -498,9 +370,7 @@ fn append_adapter_rows(
         };
         let handler = cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             if matches!(state, RowState::Active) {
-                // Spawn directly, or open the model/effort sub-step when the
-                // adapter declares options.
-                this.choose_adapter(kind, id, display_name, models, efforts, window, cx);
+                this.select_adapter(kind, id, window, cx);
             }
         });
         card = card.child(picker_row(
@@ -571,7 +441,6 @@ mod tests {
             Density::cockpit(),
             Typography::cockpit(),
             Arc::new(AdapterRegistry::empty()),
-            HashMap::new(),
             noop_on_select(),
         )
     }

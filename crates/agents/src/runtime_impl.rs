@@ -280,24 +280,46 @@ impl AgentRuntime for CliRuntime {
         };
 
         let (backend, term_id): (SharedBackend, TerminalSessionId) = if let Some(shared) = shared {
-            // Relay path: the daemon can only spawn a shell (its Spawn RPC
-            // carries no argv), so launch the agent the way a user would —
-            // spawn the login shell, then `exec` the agent command into it.
-            // `exec` replaces the shell so the PTY's foreground process IS
-            // the agent (process-group SIGTERM on cancel still reaches it),
-            // and the daemon owns the PTY so it survives an app restart and
-            // the tab can re-attach to the live CLI on next launch.
+            // Relay path. The daemon's Spawn RPC names a single program with
+            // no argv, so a *plain* launch (no flags, no stdin prompt — the
+            // common one-click default) spawns the agent binary directly as
+            // the PTY's foreground process: nothing wraps it, so nothing
+            // echoes a command line — the terminal shows only the agent's own
+            // banner. An absolute path is required because the detached
+            // daemon's PATH may not include the agent (resolved here via the
+            // app's PATH, which already located it at detection time).
+            //
+            // When the launch carries argv (a restored session's model/effort)
+            // or a stdin prompt seed, fall back to spawning the login shell
+            // and `exec`-ing the full command into it — the shell both carries
+            // the argv and resolves PATH from the user's profile. Either way
+            // the agent ends up as the PTY leaf (so cancel's process-group
+            // SIGTERM and exit→EOF status both reach it), and the daemon owns
+            // the PTY so it survives an app restart and re-attaches on launch.
+            let direct_program = if spec.args.is_empty() && stdin_seed.is_none() {
+                resolve_program_abs(&spec.program).await
+            } else {
+                None
+            };
             let relay_cfg = SpawnConfig {
-                shell: wrapper_shell(),
+                shell: direct_program
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(wrapper_shell),
                 args: Vec::new(),
                 ..spawn_cfg.clone()
             };
-            let launch = build_launch_line(&spec.program, &spec.args);
+            // No wrapper → no launch line to write (the binary is the process
+            // itself). Otherwise build the `exec <program> <args…>` line.
+            let launch =
+                direct_program.is_none().then(|| build_launch_line(&spec.program, &spec.args));
             let shared_for_spawn = shared.clone();
             let term_id = tokio::task::spawn_blocking(move || -> Result<TerminalSessionId> {
                 let mut be = lock_recover(&shared_for_spawn, "terminal backend");
                 let id = be.spawn(relay_cfg)?;
-                be.write(id, launch.as_bytes())?;
+                if let Some(launch) = launch {
+                    be.write(id, launch.as_bytes())?;
+                }
                 if let Some(seed) = stdin_seed {
                     be.write(id, &seed)?;
                 }
@@ -412,6 +434,28 @@ impl AgentRuntime for CliRuntime {
 /// `exec` the agent into it. Falls back to zsh when `$SHELL` is unset.
 fn wrapper_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+}
+
+/// Resolve a program (possibly a bare name like `claude`) to an absolute
+/// path using the *app* process's PATH — the same PATH that located the
+/// binary at detection time. Returns `None` when the program isn't a clean
+/// absolute path we can hand to the detached daemon to `exec` directly; the
+/// caller then falls back to the login-shell wrapper, which resolves PATH
+/// from the user's profile.
+async fn resolve_program_abs(program: &std::path::Path) -> Option<std::path::PathBuf> {
+    if program.is_absolute() {
+        return Some(program.to_path_buf());
+    }
+    let output = tokio::process::Command::new("which")
+        .arg(program.as_os_str())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let resolved = std::path::PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    resolved.is_absolute().then_some(resolved)
 }
 
 /// Build the one-line `exec <program> <args…>` command written into the

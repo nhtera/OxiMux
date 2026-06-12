@@ -1490,22 +1490,16 @@ impl WorkspaceRoot {
                             this.left_rail.update(cx, |rail, cx| rail.go_home(cx));
                         }
                         if let Some(kind) = agent {
-                            // Auto-spawn from the create dialog uses the
-                            // adapter's last-used params (or defaults when
-                            // none saved) — no picker step here.
+                            // Auto-spawn from the create dialog launches the
+                            // agent with its default settings — same one-click
+                            // behavior as the `+` adapter picker.
                             let id = agent_adapter_id(kind);
-                            let (model, effort) = this
-                                .app_state
-                                .agent_last_params
-                                .get(id)
-                                .cloned()
-                                .unwrap_or((None, None));
                             this.spawn_agent_tab(
                                 kind,
                                 id,
                                 cwd.clone(),
-                                model,
-                                effort,
+                                None,
+                                None,
                                 window,
                                 cx,
                             );

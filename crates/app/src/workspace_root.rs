@@ -504,25 +504,7 @@ impl WorkspaceRoot {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
                 AdapterSelection::NewTerminal => this.spawn_local_terminal_tab(window, cx),
-                AdapterSelection::Adapter {
-                    kind,
-                    id,
-                    model,
-                    effort,
-                } => {
-                    // Remember the choice so the next launch preselects it.
-                    if let Err(err) = this.app_state.agent_last_params_repo.upsert(
-                        id,
-                        model.as_deref(),
-                        effort.as_deref(),
-                    ) {
-                        tracing::warn!(?err, adapter = id, "persist last agent params failed");
-                    }
-                    // Keep the in-memory snapshot live so the create-dialog
-                    // auto-spawn path reflects this choice without a restart.
-                    this.app_state
-                        .agent_last_params
-                        .insert(id.to_string(), (model.clone(), effort.clone()));
+                AdapterSelection::Adapter { kind, id } => {
                     // Root the agent at the active project (its panes' cwd),
                     // so the worktree the agent runs in matches a sidebar
                     // workspace row — that drives the live (green) status
@@ -540,7 +522,8 @@ impl WorkspaceRoot {
                             std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
-                    this.spawn_agent_tab(kind, id, cwd, model, effort, window, cx)
+                    // One-click launch: always the agent's default settings.
+                    this.spawn_agent_tab(kind, id, cwd, None, None, window, cx)
                 }
             });
         });
@@ -550,7 +533,6 @@ impl WorkspaceRoot {
                 density,
                 typography.clone(),
                 adapter_registry.clone(),
-                app_state.agent_last_params.clone(),
                 on_select,
             )
         });

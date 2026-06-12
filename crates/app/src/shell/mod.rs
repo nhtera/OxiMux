@@ -4,7 +4,6 @@
 //! + Typography` and return an `impl IntoElement` (RenderOnce). No state.
 
 pub mod adapter_picker;
-pub mod adapter_picker_params;
 pub mod agent_presentation;
 pub mod agent_session_persistence;
 pub mod agents_dashboard;

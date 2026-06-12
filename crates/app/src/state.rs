@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use oximux_core::{AgentSession, AgentStatus, Project, Workspace};
 use oximux_storage::{
-    AgentLastParamsRepo, AgentSessionRepo, Db, DiffReviewNoteRepo, PaneBufferRepo, PaneRelayIdRepo,
-    PaneSessionRepo, ProjectRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
+    AgentSessionRepo, Db, DiffReviewNoteRepo, PaneBufferRepo, PaneRelayIdRepo, PaneSessionRepo,
+    ProjectRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
 };
 
 /// Recent-projects fetch limit. The project picker (step 5) paginates if a
@@ -47,12 +47,6 @@ pub struct AppState {
     pub(crate) pane_buffer_repo: PaneBufferRepo,
     pub(crate) pane_relay_id_repo: PaneRelayIdRepo,
     pub(crate) settings_repo: SettingsRepo,
-    /// Last-used model/effort per agent adapter (V009 `agent_last_params`).
-    /// The launch picker preselects from these; spawning upserts here.
-    pub(crate) agent_last_params_repo: AgentLastParamsRepo,
-    /// Boot snapshot of [`Self::agent_last_params_repo`] as a slug → (model,
-    /// effort) map, handed to the adapter picker for preselection.
-    pub(crate) agent_last_params: HashMap<String, (Option<String>, Option<String>)>,
     /// Per-worktree SCM scratch state (V006 `worktree_settings` table).
     /// GitPanel reads/writes `view_mode_override` keyed by the worktree's
     /// absolute path so the chosen view mode survives an app restart;
@@ -108,20 +102,12 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
     let pane_buffer_repo = PaneBufferRepo::new(db.clone());
     let pane_relay_id_repo = PaneRelayIdRepo::new(db.clone());
     let settings_repo = SettingsRepo::new(db.clone());
-    let agent_last_params_repo = AgentLastParamsRepo::new(db.clone());
     let worktree_settings_repo = WorktreeSettingsRepo::new(db.clone());
 
     // Install the process-wide review-note repo handle so diff views (built
     // deep in the pane/sidebar tree) can persist + rehydrate notes without
     // threading a Db through every intermediate constructor.
     crate::shell::diff_view::note_repo_handle::init_note_repo(DiffReviewNoteRepo::new(db.clone()));
-
-    let agent_last_params: HashMap<String, (Option<String>, Option<String>)> =
-        agent_last_params_repo
-            .list_all()?
-            .into_iter()
-            .map(|(id, model, effort)| (id, (model, effort)))
-            .collect();
 
     let recent_projects = project_repo.list_recent(RECENT_PROJECTS_LIMIT)?;
 
@@ -170,8 +156,6 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
         pane_buffer_repo,
         pane_relay_id_repo,
         settings_repo,
-        agent_last_params_repo,
-        agent_last_params,
         worktree_settings_repo,
         recent_projects,
         workspaces,
