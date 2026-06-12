@@ -6,7 +6,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ### 2026-06-12 — Terminal search follow, link existence gating, bell notifications
 
-**Commits**: `_pending_`  
+**Commits**: `d21fadb`  
 **Touches**: `crates/app/src/shell/` (terminal_view.rs, terminal_links.rs, terminal_search_state.rs, pane_group/mod.rs, project_panes/mod.rs, workspace_ops.rs, settings_modal pane_terminal + pane_notifications), `crates/app/src/notifier/` (mod.rs, mac.rs), `crates/app/src/actions.rs`, `crates/app/src/keymap_registry/inventory.rs`, `crates/app/src/workspace_root.rs`, `crates/settings/src/terminal.rs`
 
 Terminal interaction polish — search, file links, and the bell:
@@ -19,7 +19,7 @@ Terminal interaction polish — search, file links, and the bell:
 
 ### 2026-06-12 — SCM section caps, split staged/unstaged counts, untracked counts, token batch
 
-**Commits**: `_pending_`  
+**Commits**: `2e93015`  
 **Touches**: `crates/git/src/` (numstat.rs, repository.rs), `crates/core/src/git_state.rs`, `crates/app/src/shell/git_panel/` (changed_files, row_renderer, selection, mod), `crates/settings/src/` (theme.rs, motion.rs), `docs/design-guidelines.md`
 
 Source-control panel scannability + the design-token batch:
