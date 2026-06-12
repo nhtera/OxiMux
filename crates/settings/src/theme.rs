@@ -85,6 +85,12 @@ pub struct Theme {
     pub status_removed: Hsla,
     pub status_warning: Hsla,
 
+    /// Commit-graph lane palette — a colour-blind-safe 5-hue cycle for
+    /// multi-lane DAG rendering (lane index % 5). The commit timeline is a
+    /// single flat lane today (dot = `focus_ring`); these tokens exist so
+    /// lane work lands on a stable palette instead of inventing hues.
+    pub graph_lane_colors: [Hsla; 5],
+
     /// Git status decoration palette — used by the workspace card status
     /// dot in the left rail and (later) the file explorer status badges.
     pub git: GitDecorations,
@@ -156,6 +162,14 @@ impl Theme {
             // `status_removed` aliases `status_error` deliberately — one
             // canonical red prevents palette sprawl when "deletion" and
             // "destructive op" need to look identical.
+            graph_lane_colors: [
+                rgb(0xFFB000).into(),
+                rgb(0xDC267F).into(),
+                rgb(0x994F00).into(),
+                rgb(0x40B0A6).into(),
+                rgb(0xB66DFF).into(),
+            ],
+
             status_added: rgb(0x64D26B).into(),
             status_removed: rgb(0xD26464).into(),
             status_warning: rgb(0xD2A864).into(),
@@ -232,6 +246,16 @@ mod tests {
         assert_eq!(t.git.added, rgb(0x81B88B).into());
         assert_eq!(t.git.deleted, rgb(0xC74E39).into());
         assert_ne!(t.git.added, t.status_ok);
+    }
+
+    #[test]
+    fn graph_lane_colors_are_five_distinct_hues() {
+        let t = Theme::charcoal();
+        for (i, a) in t.graph_lane_colors.iter().enumerate() {
+            for b in t.graph_lane_colors.iter().skip(i + 1) {
+                assert_ne!(a, b, "lane palette has duplicate hues");
+            }
+        }
     }
 
     #[test]

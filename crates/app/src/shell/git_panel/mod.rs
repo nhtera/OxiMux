@@ -103,6 +103,11 @@ pub struct GitPanel {
     /// otherwise a range spanning a collapsed section silently selects
     /// invisible rows.
     pub(super) collapsed_sections: HashSet<&'static str>,
+    /// Sections whose row CAP has been lifted via the "View all" footer
+    /// row. Long sections render only the first `SECTION_ROW_CAP` rows
+    /// until their title lands here. Same `pub(super)` rationale as
+    /// `collapsed_sections`: range selection must skip capped-away rows.
+    pub(super) expanded_row_sections: HashSet<&'static str>,
     /// Scroll position for the static sections list. Wired through `track_scroll`
     /// on the inner overflow region and consumed by `vertical_scrollbar` so the
     /// thumb actually moves as the user scrolls.
@@ -230,6 +235,7 @@ impl GitPanel {
             typography,
             filter_query: String::new(),
             collapsed_sections: HashSet::new(),
+            expanded_row_sections: HashSet::new(),
             scroll_handle: ScrollHandle::new(),
             _watch_task: watch_task,
             on_open,
@@ -311,6 +317,14 @@ impl GitPanel {
         if !self.collapsed_sections.remove(name) {
             self.collapsed_sections.insert(name);
         }
+        cx.notify();
+    }
+
+    /// Lift the row cap for one section ("View all" footer row click).
+    /// One-way per panel instance — the cap exists to keep a huge dirty
+    /// tree scannable on first open, not to fight the user afterwards.
+    pub(crate) fn expand_section_rows(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        self.expanded_row_sections.insert(name);
         cx.notify();
     }
 
@@ -496,6 +510,7 @@ impl Render for GitPanel {
                     typography: &self.typography,
                     selected: &self.selected,
                     collapsed: &self.collapsed_sections,
+                    expanded_rows: &self.expanded_row_sections,
                     branch: state.branch.as_deref(),
                     in_flight_discards: &self.in_flight_discards,
                     filter_active: !self.filter_query.trim().is_empty(),

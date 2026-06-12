@@ -170,6 +170,7 @@ fn parse_ordinary(rec: &[u8], state: &mut GitState) -> Result<()> {
         worktree,
         rename: None,
         line_counts: None,
+        staged_line_counts: None,
         conflict_kind: None,
     });
     Ok(())
@@ -197,6 +198,7 @@ fn parse_renamed(rec: &[u8], orig: &[u8], state: &mut GitState) -> Result<()> {
             score,
         }),
         line_counts: None,
+        staged_line_counts: None,
         conflict_kind: None,
     });
     Ok(())
@@ -221,6 +223,7 @@ fn parse_unmerged(rec: &[u8], state: &mut GitState) -> Result<()> {
         worktree: WorktreeStatus::Unmerged,
         rename: None,
         line_counts: None,
+        staged_line_counts: None,
         conflict_kind,
     });
     Ok(())
@@ -244,6 +247,7 @@ fn parse_path_only(
         worktree,
         rename: None,
         line_counts: None,
+        staged_line_counts: None,
         conflict_kind: None,
     });
     Ok(())

@@ -66,6 +66,7 @@ in the UI. This keeps the eye on the diff, terminal, and agent output — not ch
 | `status_added` | `#64D26B` | SCM diff +N count, "added" line tint |
 | `status_removed` | `#D26464` | SCM diff −N count (aliases `status_error`) |
 | `status_warning` | `#D2A864` | Conflict / in-progress operation banner |
+| `graph_lane_colors[0..5]` | `#FFB000` `#DC267F` `#994F00` `#40B0A6` `#B66DFF` | Commit-graph lane cycle (lane % 5) — colour-blind-safe. The timeline is a single flat lane today (dot = `focus_ring`); reserved for multi-lane DAG rendering |
 
 ### Theme helpers (alpha-composited backgrounds)
 
@@ -99,6 +100,18 @@ editor by design.
 | `pad_overlay` | 6 | Inner padding for floating cards |
 | `pad_row` | 6 | Row left/right padding |
 | `gap_inline` | 6 | Spacing between inline siblings |
+
+**Radius scale (reference ratios).** Shipped radii predate this note; new
+surfaces that need a radius outside the table should derive it from a 10px
+base with the ratio steps sm `0.6×` (6) / md `0.8×` (8) / lg `1×` (10) /
+xl `1.4×` (14), then promote the value to a `Density` token once a second
+site appears — never inline a one-off number twice.
+
+**Hover-only scrollbar (reference spec).** Scroll surfaces that grow custom
+scrollbars use: thumb at 28% white-alpha resting, 48% on hover, 36% while
+dragging; the gutter keeps a stable width (no layout shift on hover);
+thumb appears only while the surface is hovered or actively scrolling.
+Applied opportunistically as scroll surfaces get touched.
 
 ## Typography
 
@@ -488,6 +501,7 @@ so reduced-motion is a single switch.
 | `m_collapse` | 190ms | collapsible section expand |
 | `m_toast_in` | 180ms | toast enter |
 | `m_toast_out` | 140ms | toast exit (crisper than enter) |
+| `m_exit` | 200ms | exit/dismiss for surfaces adopting `ease_in_exit` |
 
 **Easing vocabulary (two curves, split by direction):**
 
@@ -496,6 +510,11 @@ so reduced-motion is a single switch.
   faster out of the gate than quint with a longer settle tail, so an opening
   surface reads "snapped into place, then settled". Monotonic, never
   overshoots (unit-test pinned).
+- **EXITs adopting the accelerate-out read** use
+  `oximux_settings::ease_in_exit()` — exact `cubic-bezier(0.7, 0, 0.84, 0)`
+  @ `m_exit` (200ms): the surface lingers a beat then accelerates away, the
+  mirror image of the spring open. Adopted opportunistically as exit
+  animations get touched; monotonic, unit-test pinned.
 - **Everything else** (closes, exits, collapses, flashes) keeps
   `gpui::ease_out_quint()` — dismissal and folding read crisp, not springy.
 

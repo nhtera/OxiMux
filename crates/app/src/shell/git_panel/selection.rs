@@ -150,7 +150,23 @@ impl GitPanel {
             .cloned()
             .collect();
         let sections = partition_files(&filtered);
-        flatten_visible_sections(&sections, &self.collapsed_sections)
+        match self.view_mode {
+            oximux_core::ViewMode::Flat => flatten_visible_sections(
+                &sections,
+                &self.collapsed_sections,
+                &self.expanded_row_sections,
+            ),
+            // Tree mode renders folder rows that consume cap slots, so the
+            // visible-leaf set must run the SAME tree → flatten → truncate
+            // pipeline as the renderer — the flat approximation would let a
+            // range select leaves the cap pushed off screen.
+            oximux_core::ViewMode::Tree => flatten_visible_tree_sections(
+                &sections,
+                &self.collapsed_sections,
+                &self.expanded_row_sections,
+                &self.collapsed_dirs,
+            ),
+        }
     }
 
     /// Vectorised stage for every path in `selected`. No-op when the
@@ -274,31 +290,71 @@ impl GitPanel {
 /// testing the collapsed-section filter. Section title strings match
 /// the `&'static str` keys passed to `changed_files::section()` in
 /// `render_sections` and stored in `GitPanel::collapsed_sections`.
+/// Tree-mode counterpart of [`flatten_visible_sections`]: replays the
+/// renderer's exact pipeline (build tree → flatten with collapsed dirs →
+/// truncate rendered rows to the cap) and keeps only the leaf paths, so
+/// range selection matches what is actually on screen row-for-row.
+pub(super) fn flatten_visible_tree_sections(
+    sections: &FileSections<'_>,
+    collapsed: &HashSet<&'static str>,
+    expanded_rows: &HashSet<&'static str>,
+    collapsed_dirs: &HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    use super::changed_files::SECTION_ROW_CAP;
+    use crate::shell::source_control::tree::{NodeKind, TreeSection, build_tree, flatten};
+
+    let mut out = Vec::new();
+    let mut push_section =
+        |title: &'static str, files: &[&FileStatus], section: TreeSection| {
+            if collapsed.contains(title) {
+                return;
+            }
+            let tree = build_tree(files.iter().copied(), section);
+            let mut rows = flatten(&tree, collapsed_dirs);
+            if !expanded_rows.contains(title) && rows.len() > SECTION_ROW_CAP {
+                rows.truncate(SECTION_ROW_CAP);
+            }
+            out.extend(
+                rows.into_iter()
+                    .filter(|r| matches!(r.kind, NodeKind::File))
+                    .map(|r| r.path),
+            );
+        };
+    push_section("CHANGES", &sections.unstaged, TreeSection::Unstaged);
+    push_section("STAGED CHANGES", &sections.staged, TreeSection::Staged);
+    push_section("UNTRACKED FILES", &sections.untracked, TreeSection::Untracked);
+    out
+}
+
 pub(super) fn flatten_visible_sections(
     sections: &FileSections<'_>,
     collapsed: &HashSet<&'static str>,
+    expanded_rows: &HashSet<&'static str>,
 ) -> Vec<PathBuf> {
-    let unstaged_visible = !collapsed.contains("CHANGES");
-    let staged_visible = !collapsed.contains("STAGED CHANGES");
-    let untracked_visible = !collapsed.contains("UNTRACKED FILES");
+    use super::changed_files::SECTION_ROW_CAP;
     let mut out = Vec::with_capacity(
         sections.unstaged.len() + sections.staged.len() + sections.untracked.len(),
     );
-    if unstaged_visible {
-        for f in sections.unstaged.iter() {
+    // Mirror of the FLAT renderer's visibility rules: collapsed sections
+    // hide everything, capped sections hide rows past `SECTION_ROW_CAP` —
+    // a Shift+Click range must never grab a row the user can't see. Tree
+    // mode goes through `flatten_visible_tree_sections` instead.
+    let mut push_section = |title: &'static str, files: &[&FileStatus]| {
+        if collapsed.contains(title) {
+            return;
+        }
+        let cap = if expanded_rows.contains(title) {
+            files.len()
+        } else {
+            SECTION_ROW_CAP
+        };
+        for f in files.iter().take(cap) {
             out.push(f.path.clone());
         }
-    }
-    if staged_visible {
-        for f in sections.staged.iter() {
-            out.push(f.path.clone());
-        }
-    }
-    if untracked_visible {
-        for f in sections.untracked.iter() {
-            out.push(f.path.clone());
-        }
-    }
+    };
+    push_section("CHANGES", &sections.unstaged);
+    push_section("STAGED CHANGES", &sections.staged);
+    push_section("UNTRACKED FILES", &sections.untracked);
     out
 }
 
@@ -328,13 +384,64 @@ mod tests {
     }
 
     #[test]
+    fn flatten_respects_section_row_cap_until_expanded() {
+        use super::super::changed_files::SECTION_ROW_CAP;
+        let u: Vec<FileStatus> = (0..SECTION_ROW_CAP + 3)
+            .map(|i| fs(&format!("f{i:02}.rs")))
+            .collect();
+        let sections = sections_from(&u, &[], &[]);
+        let collapsed = HashSet::new();
+
+        let capped = flatten_visible_sections(&sections, &collapsed, &HashSet::new());
+        assert_eq!(capped.len(), SECTION_ROW_CAP, "capped section hides the tail");
+        assert!(!capped.contains(&PathBuf::from(format!("f{:02}.rs", SECTION_ROW_CAP))));
+
+        let mut expanded = HashSet::new();
+        expanded.insert("CHANGES");
+        let full = flatten_visible_sections(&sections, &collapsed, &expanded);
+        assert_eq!(full.len(), SECTION_ROW_CAP + 3, "expanded section shows all");
+    }
+
+    #[test]
+    fn tree_flatten_counts_folder_rows_against_the_cap() {
+        use super::super::changed_files::SECTION_ROW_CAP;
+        // One folder + (CAP + 2) leaves inside it: the renderer shows the
+        // folder row plus the first CAP-1 leaves, so selection must too.
+        let u: Vec<FileStatus> = (0..SECTION_ROW_CAP + 2)
+            .map(|i| fs(&format!("dir/f{i:02}.rs")))
+            .collect();
+        let sections = sections_from(&u, &[], &[]);
+        let got = flatten_visible_tree_sections(
+            &sections,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            got.len(),
+            SECTION_ROW_CAP - 1,
+            "folder row consumes one cap slot"
+        );
+
+        let mut expanded = HashSet::new();
+        expanded.insert("CHANGES");
+        let full = flatten_visible_tree_sections(
+            &sections,
+            &HashSet::new(),
+            &expanded,
+            &HashSet::new(),
+        );
+        assert_eq!(full.len(), SECTION_ROW_CAP + 2, "expanded shows every leaf");
+    }
+
+    #[test]
     fn flatten_includes_all_sections_when_none_collapsed() {
         let u = [fs("a.rs"), fs("b.rs")];
         let s = [fs("c.rs")];
         let t = [fs("d.rs")];
         let sections = sections_from(&u, &s, &t);
         let collapsed: HashSet<&'static str> = HashSet::new();
-        let got = flatten_visible_sections(&sections, &collapsed);
+        let got = flatten_visible_sections(&sections, &collapsed, &HashSet::new());
         assert_eq!(
             got,
             vec![
@@ -357,7 +464,7 @@ mod tests {
         let sections = sections_from(&u, &s, &t);
         let mut collapsed: HashSet<&'static str> = HashSet::new();
         collapsed.insert("STAGED CHANGES");
-        let got = flatten_visible_sections(&sections, &collapsed);
+        let got = flatten_visible_sections(&sections, &collapsed, &HashSet::new());
         assert_eq!(got, vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
     }
 
@@ -369,7 +476,7 @@ mod tests {
         let sections = sections_from(&u, &s, &t);
         let mut collapsed: HashSet<&'static str> = HashSet::new();
         collapsed.insert("CHANGES");
-        let got = flatten_visible_sections(&sections, &collapsed);
+        let got = flatten_visible_sections(&sections, &collapsed, &HashSet::new());
         assert_eq!(got, vec![PathBuf::from("c.rs"), PathBuf::from("d.rs")]);
     }
 
@@ -383,7 +490,7 @@ mod tests {
         collapsed.insert("CHANGES");
         collapsed.insert("STAGED CHANGES");
         collapsed.insert("UNTRACKED FILES");
-        let got = flatten_visible_sections(&sections, &collapsed);
+        let got = flatten_visible_sections(&sections, &collapsed, &HashSet::new());
         assert!(got.is_empty());
     }
 
@@ -398,7 +505,7 @@ mod tests {
         let sections = sections_from(&u, &s, &t);
         let mut collapsed: HashSet<&'static str> = HashSet::new();
         collapsed.insert("STAGED CHANGES");
-        let got = flatten_visible_sections(&sections, &collapsed);
+        let got = flatten_visible_sections(&sections, &collapsed, &HashSet::new());
         assert_eq!(
             got,
             vec![

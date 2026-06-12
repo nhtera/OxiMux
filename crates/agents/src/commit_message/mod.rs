@@ -168,6 +168,7 @@ mod tests {
             worktree: WorktreeStatus::Unmodified,
             rename: None,
             line_counts: None,
+            staged_line_counts: None,
             conflict_kind: None,
         }
     }

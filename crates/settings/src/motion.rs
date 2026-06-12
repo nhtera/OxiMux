@@ -35,6 +35,10 @@ pub struct Motion {
     pub m_toast_in: Duration,
     /// Toast exit (fade out) — quicker than enter so dismissal feels crisp.
     pub m_toast_out: Duration,
+    /// Exit/dismiss duration for surfaces adopting the accelerate-out
+    /// [`ease_in_exit`] curve (the exit counterpart of `ease_out_spring`).
+    /// Surfaces not yet converted keep their existing close timings.
+    pub m_exit: Duration,
     /// True when this is the reduced-motion variant (durations collapsed to an
     /// instant floor). Lets a call site branch cheaply if it wants to skip the
     /// animation wrapper entirely rather than play a 1ms no-op.
@@ -50,6 +54,7 @@ impl Motion {
             m_collapse: Duration::from_millis(190),
             m_toast_in: Duration::from_millis(180),
             m_toast_out: Duration::from_millis(140),
+            m_exit: Duration::from_millis(200),
             reduced: false,
         }
     }
@@ -68,6 +73,7 @@ impl Motion {
             m_collapse: floor,
             m_toast_in: floor,
             m_toast_out: floor,
+            m_exit: floor,
             reduced: true,
         }
     }
@@ -98,6 +104,14 @@ impl Global for Motion {}
 /// lives in `docs/design-guidelines.md` ("## Motion").
 pub fn ease_out_spring() -> impl Fn(f32) -> f32 {
     |x| cubic_bezier_ease(0.16, 1.0, 0.3, 1.0, x)
+}
+
+/// Accelerate-out easing for EXIT animations — cubic-bezier(0.7, 0, 0.84, 0):
+/// a closing surface lingers for a beat then accelerates away, the mirror
+/// image of `ease_out_spring`'s fast-start settle. Paired with `m_exit`.
+/// Surfaces not yet converted keep `gpui::ease_out_quint()` on close.
+pub fn ease_in_exit() -> impl Fn(f32) -> f32 {
+    |x| cubic_bezier_ease(0.7, 0.0, 0.84, 0.0, x)
 }
 
 /// Evaluate a CSS-style cubic-bezier timing curve at progress `x` (both
@@ -151,6 +165,28 @@ mod tests {
             assert!((0.0..=1.0 + 1e-4).contains(&y), "out of range at {i}: {y}");
             prev = y;
         }
+    }
+
+    #[test]
+    fn exit_ease_endpoints_pin_exactly() {
+        let f = ease_in_exit();
+        assert_eq!(f(0.0), 0.0);
+        assert_eq!(f(1.0), 1.0);
+    }
+
+    #[test]
+    fn exit_ease_is_monotonic_and_back_loads_motion() {
+        // Exit reads "linger, then accelerate away": well under half the
+        // distance at 50% time, monotonic, never out of range.
+        let f = ease_in_exit();
+        let mut prev = 0.0f32;
+        for i in 0..=100 {
+            let y = f(i as f32 / 100.0);
+            assert!(y >= prev - 1e-4, "regressed at step {i}: {y} < {prev}");
+            assert!((0.0..=1.0 + 1e-4).contains(&y), "out of range at {i}: {y}");
+            prev = y;
+        }
+        assert!(f(0.5) < 0.30, "not back-loaded: f(0.5) = {}", f(0.5));
     }
 
     #[test]

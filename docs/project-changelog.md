@@ -4,6 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-12 — SCM section caps, split staged/unstaged counts, untracked counts, token batch
+
+**Commits**: `_pending_`  
+**Touches**: `crates/git/src/` (numstat.rs, repository.rs), `crates/core/src/git_state.rs`, `crates/app/src/shell/git_panel/` (changed_files, row_renderer, selection, mod), `crates/settings/src/` (theme.rs, motion.rs), `docs/design-guidelines.md`
+
+Source-control panel scannability + the design-token batch:
+
+- **Per-section line counts.** `FileStatus` now carries both unstaged (worktree-vs-index) and staged (index-vs-HEAD) counts from two batched numstat calls per poll; a partially staged file shows each section's own `+N −N` instead of one combined vs-HEAD figure on both rows.
+- **Untracked file counts.** Whole-file `+N` via a bounded `git diff --no-index` pass: first 20 untracked rows, files over 1 MB skipped, (path, mtime) cache → zero git spawns at steady state, concurrency capped at 4.
+- **Section row cap.** Changed/staged/untracked sections render 12 rows plus a "View all (N more)" footer that expands in place; tree mode counts folder rows against the cap. Shift+Click range selection mirrors the rendered set exactly in both view modes — it can never select an off-screen row.
+- **Design tokens.** `graph_lane_colors` (5-hue colour-blind-safe palette, reserved for future commit-graph lanes), `Motion::m_exit` (200 ms) + `ease_in_exit()` cubic-bezier(0.7, 0, 0.84, 0); radius-scale ratios and the hover-only scrollbar spec documented in design-guidelines.
+- Commit-message heuristic updated for the count split (staged counts drive the per-file `(+A -B)` notes).
+
+---
+
 ### 2026-06-12 — Keyboard shortcut registry: editable keybindings, TOML overrides, live rebind
 
 **Commits**: `e492b29`  

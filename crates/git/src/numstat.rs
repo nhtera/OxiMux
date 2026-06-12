@@ -52,6 +52,64 @@ pub async fn diff_numstat_head(workdir: &Path) -> Result<HashMap<PathBuf, (u32, 
     parse_numstat_z(&raw.stdout)
 }
 
+/// Run `git diff --numstat -z` (worktree vs index) — UNSTAGED per-file
+/// counts. Pairs with [`diff_numstat_staged`] so the Changes and Staged
+/// sections can each show the counts that section would actually commit /
+/// discard, instead of one combined vs-HEAD figure on both rows of a
+/// partially staged file.
+pub async fn diff_numstat_unstaged(workdir: &Path) -> Result<HashMap<PathBuf, (u32, u32)>> {
+    let raw = GitCmd::new(workdir)
+        .timeout(NUMSTAT_TIMEOUT)
+        .args(["diff", "--numstat", "-z"])
+        .run_raw()
+        .await?;
+    if !raw.status.success() {
+        return Ok(HashMap::new());
+    }
+    parse_numstat_z(&raw.stdout)
+}
+
+/// Run `git diff --cached --numstat -z` (index vs HEAD) — STAGED per-file
+/// counts. Empty map on failure (no HEAD yet), same best-effort contract
+/// as every other numstat helper.
+pub async fn diff_numstat_staged(workdir: &Path) -> Result<HashMap<PathBuf, (u32, u32)>> {
+    let raw = GitCmd::new(workdir)
+        .timeout(NUMSTAT_TIMEOUT)
+        .args(["diff", "--cached", "--numstat", "-z"])
+        .run_raw()
+        .await?;
+    if !raw.status.success() {
+        return Ok(HashMap::new());
+    }
+    parse_numstat_z(&raw.stdout)
+}
+
+/// Line count for one UNTRACKED file via `git diff --no-index --numstat`
+/// against `/dev/null`. `--no-index` exits 1 when the files differ (which
+/// is the expected case), so only exit codes above 1 are treated as
+/// failure. Returns `None` for binaries (numstat emits `-`) and failures.
+pub async fn diff_numstat_untracked_file(workdir: &Path, path: &Path) -> Option<(u32, u32)> {
+    let raw = GitCmd::new(workdir)
+        .timeout(NUMSTAT_TIMEOUT)
+        .args([
+            "diff",
+            "--no-index",
+            "--numstat",
+            "-z",
+            "--",
+            "/dev/null",
+        ])
+        .arg(path)
+        .run_raw()
+        .await
+        .ok()?;
+    if raw.status.code().is_none_or(|c| c > 1) {
+        return None;
+    }
+    let map = parse_numstat_z(&raw.stdout).ok()?;
+    map.into_values().next()
+}
+
 /// Run `git diff --numstat -z -M <base> <head>` and parse into a
 /// `path → (added, removed)` map. Used by the "Committed on Branch"
 /// section to decorate each branch-committed file with its net line

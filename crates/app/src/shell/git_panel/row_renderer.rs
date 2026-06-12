@@ -255,7 +255,14 @@ pub(super) fn row(
 
     let name_el = render_name_with_rename(&file_name, f.rename.as_ref(), &theme, rctx.typography);
     let sub_label = render_conflict_sub_label(f.conflict_kind, &theme);
-    let diff_counts = render_diff_counts(f.line_counts, &theme, rctx.typography);
+    // Each section shows its own side of a partial stage: the Staged row
+    // the index-vs-HEAD counts, the Changes/Untracked rows the
+    // worktree-vs-index (or whole-file) counts.
+    let section_counts = match kind {
+        RowKind::Staged => f.staged_line_counts,
+        RowKind::Unstaged | RowKind::Untracked => f.line_counts,
+    };
+    let diff_counts = render_diff_counts(section_counts, &theme, rctx.typography);
 
     // Name-and-meta cluster: file name (+ rename arrow) and the parent
     // directory share one baseline row; the conflict sub-label, when

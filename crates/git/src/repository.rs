@@ -10,6 +10,7 @@ use crate::numstat;
 use crate::process::GitCmd;
 use crate::status;
 use oximux_core::{BranchInfo, CombinedDiff, CombinedDiffScope, FileDiff, FileGroup, GitState};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -45,10 +46,28 @@ const FULL_FILE_CONTEXT: &str = "--unified=1000000";
 /// a no-op, so we drop the noise.
 const DIFF_BASE_ARGS: &[&str] = &["diff", "-p", "--no-color", "--no-ext-diff"];
 
+/// Only the first N untracked rows (status order = render order) get line
+/// counts — the panel caps collapsed sections well below this anyway.
+const UNTRACKED_COUNT_CAP: usize = 20;
+/// Untracked files above this size are not counted (cached negative).
+const UNTRACKED_SIZE_CAP: u64 = 1_000_000;
+/// Ceiling on concurrent `--no-index` numstat processes per poll.
+const UNTRACKED_CONCURRENCY: usize = 4;
+
 /// Cache slot for `list_remote_branches`. `Arc<RwLock<_>>` so cloned
 /// `Repository` handles share the same cache rather than each
 /// re-running `git for-each-ref` independently.
 pub(crate) type RemoteBranchCache = Arc<RwLock<Option<(Instant, Vec<BranchInfo>)>>>;
+
+/// Cache for untracked-file line counts keyed by path → (mtime, counts).
+/// `counts = None` is a cached negative (binary or oversized file) so the
+/// poll doesn't re-stat-and-count it every tick. Shared across cloned
+/// `Repository` handles like the other caches.
+pub(crate) type UntrackedCountCache =
+    Arc<RwLock<HashMap<PathBuf, (std::time::SystemTime, Option<(u32, u32)>)>>>;
+
+/// One freshly counted untracked file: (path, mtime at count time, counts).
+type CountedUntracked = (PathBuf, std::time::SystemTime, Option<(u32, u32)>);
 
 #[derive(Debug, Clone)]
 pub struct Repository {
@@ -67,6 +86,8 @@ pub struct Repository {
     /// Cache slot for `lease_status`. Shared across cloned handles for
     /// the same reason as `remote_branch_cache`.
     pub(crate) lease_status_cache: crate::remote::LeaseStatusCache,
+    /// Per-path line counts for untracked files (see [`UntrackedCountCache`]).
+    pub(crate) untracked_count_cache: UntrackedCountCache,
 }
 
 impl Repository {
@@ -141,6 +162,7 @@ impl Repository {
             git_dir,
             remote_branch_cache: Arc::new(RwLock::new(None)),
             lease_status_cache: Arc::new(RwLock::new(None)),
+            untracked_count_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -186,23 +208,27 @@ impl Repository {
                 "-z",
             ])
             .run();
-        let (status_out, numstat_res, branch_res) = tokio::join!(
+        let (status_out, unstaged_res, staged_res, branch_res) = tokio::join!(
             status_fut,
-            numstat::diff_numstat_head(&self.workdir),
+            numstat::diff_numstat_unstaged(&self.workdir),
+            numstat::diff_numstat_staged(&self.workdir),
             self.branch_committed(),
         );
 
         let out = status_out?;
         let mut state = status::parse_porcelain_v2(&out.stdout)?;
 
-        // Enrich with `+N -N` counts from `git diff --numstat HEAD`. Best
-        // effort: a numstat failure (no HEAD, transient git error) leaves
-        // every `line_counts` at `None`, the UI keeps rendering, and the
-        // panel still gives users every other piece of information. The
-        // `warn!` on the failure path is the only signal a malformed
-        // numstat parse leaves — without it, the symptom "no counts ever
-        // show" is undiagnosable.
-        match numstat_res {
+        // Enrich with per-side `+N -N` counts: `line_counts` carries the
+        // UNSTAGED diff (worktree vs index) and `staged_line_counts` the
+        // STAGED diff (index vs HEAD), so a partially staged file shows
+        // each section's own figure instead of one combined vs-HEAD count
+        // on both rows. Best effort: a numstat failure leaves the counts
+        // at `None`, the UI keeps rendering, and the panel still gives
+        // users every other piece of information. The `warn!` on the
+        // failure path is the only signal a malformed numstat parse
+        // leaves — without it, the symptom "no counts ever show" is
+        // undiagnosable.
+        match unstaged_res {
             Ok(counts) => {
                 for f in state.files.iter_mut() {
                     if let Some(&(added, removed)) = counts.get(f.path.as_path()) {
@@ -214,10 +240,27 @@ impl Repository {
                 tracing::warn!(
                     error = %e,
                     workdir = %self.workdir.display(),
-                    "diff --numstat HEAD failed; status returned without line counts"
+                    "diff --numstat failed; status returned without unstaged line counts"
                 );
             }
         }
+        match staged_res {
+            Ok(counts) => {
+                for f in state.files.iter_mut() {
+                    if let Some(&(added, removed)) = counts.get(f.path.as_path()) {
+                        f.staged_line_counts = Some((added, removed));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workdir = %self.workdir.display(),
+                    "diff --cached --numstat failed; status returned without staged line counts"
+                );
+            }
+        }
+        self.fill_untracked_counts(&mut state).await;
         // Enrich with the "Committed on Branch" file list (commits this
         // branch carries vs its base). Best-effort, same contract as
         // numstat: a failure leaves the section empty and never fails the
@@ -236,6 +279,95 @@ impl Repository {
             }
         }
         Ok(state)
+    }
+
+    /// Fill `line_counts` for untracked files via `git diff --no-index`
+    /// against `/dev/null` — bounded so a freshly-cloned dependency dump
+    /// can't turn the status poll into a process storm:
+    /// - only the first [`UNTRACKED_COUNT_CAP`] untracked rows (status
+    ///   order = render order) are counted;
+    /// - files over [`UNTRACKED_SIZE_CAP`] are skipped (cached negative);
+    /// - results are cached by (path, mtime), so steady-state polls cost
+    ///   one `fs::metadata` per row and zero git spawns;
+    /// - fresh counts run at most [`UNTRACKED_CONCURRENCY`] at a time.
+    ///
+    /// Best-effort throughout: any failure simply leaves that row's count
+    /// at `None` (no badge), never fails the poll.
+    async fn fill_untracked_counts(&self, state: &mut GitState) {
+        use futures::StreamExt;
+        use oximux_core::WorktreeStatus;
+
+        let candidates: Vec<PathBuf> = state
+            .files
+            .iter()
+            .filter(|f| matches!(f.worktree, WorktreeStatus::Untracked))
+            .map(|f| f.path.clone())
+            .take(UNTRACKED_COUNT_CAP)
+            .collect();
+        if candidates.is_empty() {
+            // Drop stale entries so a cleaned-up tree releases the memory.
+            if let Ok(mut cache) = self.untracked_count_cache.write()
+                && !cache.is_empty()
+            {
+                cache.clear();
+            }
+            return;
+        }
+
+        let mut resolved: HashMap<PathBuf, Option<(u32, u32)>> = HashMap::new();
+        let mut to_count: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        for rel in &candidates {
+            let abs = self.workdir.join(rel);
+            let Ok(meta) = tokio::fs::metadata(&abs).await else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else { continue };
+            let cached = self
+                .untracked_count_cache
+                .read()
+                .ok()
+                .and_then(|c| c.get(rel).copied());
+            match cached {
+                Some((cached_mtime, counts)) if cached_mtime == mtime => {
+                    resolved.insert(rel.clone(), counts);
+                }
+                _ if meta.len() > UNTRACKED_SIZE_CAP => {
+                    // Cached negative: don't re-stat the decision next poll.
+                    if let Ok(mut cache) = self.untracked_count_cache.write() {
+                        cache.insert(rel.clone(), (mtime, None));
+                    }
+                }
+                _ => to_count.push((rel.clone(), mtime)),
+            }
+        }
+
+        let fresh: Vec<CountedUntracked> =
+            futures::stream::iter(to_count.into_iter().map(|(rel, mtime)| async move {
+                let counts = numstat::diff_numstat_untracked_file(&self.workdir, &rel).await;
+                (rel, mtime, counts)
+            }))
+            .buffer_unordered(UNTRACKED_CONCURRENCY)
+            .collect()
+            .await;
+
+        if let Ok(mut cache) = self.untracked_count_cache.write() {
+            for (rel, mtime, counts) in &fresh {
+                cache.insert(rel.clone(), (*mtime, *counts));
+            }
+            // Evict paths that are no longer untracked (committed, deleted,
+            // or beyond the cap) so the cache tracks the live set.
+            let live: std::collections::HashSet<&PathBuf> = candidates.iter().collect();
+            cache.retain(|k, _| live.contains(k));
+        }
+        for (rel, _, counts) in fresh {
+            resolved.insert(rel, counts);
+        }
+
+        for f in state.files.iter_mut() {
+            if let Some(counts) = resolved.get(&f.path) {
+                f.line_counts = *counts;
+            }
+        }
     }
 
     /// Patch-format diff of the working tree against the index (changes not

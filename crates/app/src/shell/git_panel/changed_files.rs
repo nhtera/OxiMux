@@ -123,6 +123,12 @@ pub enum RowKindForActions {
 
 /// Bundle of styling + selection state threaded through the render helpers.
 /// Cuts down on clippy `too_many_arguments` noise once `cx` is also in scope.
+/// Collapsed row cap per section: long sections render this many rows
+/// plus a "View all (N)" footer until expanded, so a 500-file dirty tree
+/// stays scannable on first open. Shared with the selection module so
+/// Shift+Click ranges can't grab capped-away (invisible) rows.
+pub(super) const SECTION_ROW_CAP: usize = 12;
+
 pub struct RenderCtx<'a> {
     pub theme: Theme,
     pub density: Density,
@@ -141,6 +147,10 @@ pub struct RenderCtx<'a> {
     /// duration of a single render pass — re-reading the entity from `cx`
     /// during render panics because GPUI already holds a mut borrow.
     pub collapsed: &'a HashSet<&'static str>,
+    /// Section titles whose row cap is lifted (the "View all" footer was
+    /// clicked). Sections outside this set render at most
+    /// [`SECTION_ROW_CAP`] rows.
+    pub expanded_rows: &'a HashSet<&'static str>,
     /// Current branch name from `GitState::branch`. Used by the empty
     /// state to emit "no changes ahead of {branch}" rather than the bare
     /// "No changes". `None` covers detached HEAD or pre-status states.
@@ -240,6 +250,35 @@ pub fn render_sections(
             cx,
         ))
         .into_any_element()
+}
+
+/// "View all (N more)" footer row for a capped section. Clicking lifts
+/// the cap in place — no scroll jump, no modal.
+fn view_all_row(
+    title: &'static str,
+    hidden: usize,
+    rctx: &RenderCtx<'_>,
+    cx: &mut Context<GitPanel>,
+) -> impl IntoElement {
+    let theme = rctx.theme;
+    div()
+        .id(gpui::SharedString::from(format!("git-view-all-{title}")))
+        .flex()
+        .items_center()
+        .h(px(rctx.density.h_row))
+        .px(px(sc_style::PAD_H))
+        .rounded(px(rctx.density.r_xs))
+        .text_size(px(sc_style::CAPS_TEXT))
+        .text_color(theme.fg_muted)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |panel, _: &MouseDownEvent, _window, cx| {
+                panel.expand_section_rows(title, cx);
+            }),
+        )
+        .child(format!("View all ({hidden} more)"))
 }
 
 fn section(
@@ -349,9 +388,19 @@ fn section(
         // settle across the panel's frequent status re-renders instead of
         // restarting every frame.
         let mut body = div().flex().flex_col().w_full();
+        let cap_lifted = rctx.expanded_rows.contains(&title);
+        // Number of body rows hidden by the cap (Flat counts files; Tree
+        // counts rendered rows incl. folders — the unit the user scrolls).
+        let mut capped_away = 0usize;
         match rctx.view_mode {
             ViewMode::Flat => {
-                for f in rows {
+                let visible: &[&FileStatus] = if !cap_lifted && rows.len() > SECTION_ROW_CAP {
+                    capped_away = rows.len() - SECTION_ROW_CAP;
+                    &rows[..SECTION_ROW_CAP]
+                } else {
+                    rows
+                };
+                for f in visible {
                     body = body.child(row(f, kind, rctx, cx));
                 }
             }
@@ -377,10 +426,14 @@ fn section(
                     rows.iter().copied(),
                     crate::shell::git_panel::tree_render::section_for(kind),
                 );
-                let flat_rows = crate::shell::source_control::tree::flatten(
+                let mut flat_rows = crate::shell::source_control::tree::flatten(
                     &tree,
                     rctx.collapsed_dirs,
                 );
+                if !cap_lifted && flat_rows.len() > SECTION_ROW_CAP {
+                    capped_away = flat_rows.len() - SECTION_ROW_CAP;
+                    flat_rows.truncate(SECTION_ROW_CAP);
+                }
                 for flat_row in flat_rows {
                     body = body.child(
                         crate::shell::git_panel::tree_render::render_tree_row(
@@ -389,6 +442,9 @@ fn section(
                     );
                 }
             }
+        }
+        if capped_away > 0 {
+            body = body.child(view_all_row(title, capped_away, rctx, cx));
         }
         col = col.child(body.with_animation(
             ElementId::Name(format!("git-section-body-{title}").into()),

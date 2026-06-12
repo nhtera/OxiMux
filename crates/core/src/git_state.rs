@@ -71,11 +71,18 @@ pub struct FileStatus {
     pub worktree: WorktreeStatus,
     /// Populated for record type 2 (rename/copy).
     pub rename: Option<RenameInfo>,
-    /// `(added, removed)` line counts vs `HEAD`. Populated by merging
-    /// `git diff --numstat HEAD` into the porcelain v2 file list. `None`
-    /// when the path has no countable diff (binary, mode-only, untracked,
-    /// fresh repo without HEAD).
+    /// UNSTAGED `(added, removed)` line counts (worktree vs index), from
+    /// `git diff --numstat`. For untracked files this is the whole-file
+    /// line count when the lazy untracked pass has produced one. `None`
+    /// when the path has no countable unstaged diff (binary, mode-only,
+    /// fully staged, fresh repo without HEAD).
     pub line_counts: Option<(u32, u32)>,
+    /// STAGED `(added, removed)` line counts (index vs HEAD), from
+    /// `git diff --cached --numstat`. Drives the Staged-section row badge
+    /// so a partially staged file shows what would actually be committed.
+    /// `serde(default)` keeps previously persisted snapshots loadable.
+    #[serde(default)]
+    pub staged_line_counts: Option<(u32, u32)>,
     /// Three-way-merge conflict classification — `Some` only for `u`
     /// records whose XY pair maps to one of the seven legal conflict
     /// codes (`DD`, `AU`, `UD`, `UA`, `DU`, `AA`, `UU`).
@@ -94,6 +101,7 @@ impl FileStatus {
             worktree,
             rename: None,
             line_counts: None,
+            staged_line_counts: None,
             conflict_kind: None,
         }
     }

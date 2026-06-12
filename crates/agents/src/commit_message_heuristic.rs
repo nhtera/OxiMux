@@ -337,7 +337,10 @@ fn file_bullet(file: &FileStatus) -> String {
         }
         _ => String::new(),
     };
-    let counts_note = match file.line_counts {
+    // The heuristic describes STAGED files, so the index-vs-HEAD counts
+    // are the right figure; fall back to the unstaged counts for callers
+    // feeding worktree snapshots (e.g. nothing staged yet).
+    let counts_note = match file.staged_line_counts.or(file.line_counts) {
         Some((added, removed)) if added + removed > 0 => format!(" (+{added} -{removed})"),
         _ => String::new(),
     };
@@ -389,6 +392,7 @@ mod tests {
             worktree: WorktreeStatus::Unmodified,
             rename: None,
             line_counts: None,
+            staged_line_counts: None,
             conflict_kind: None,
         }
     }
@@ -404,6 +408,7 @@ mod tests {
                 score: 100,
             }),
             line_counts: None,
+            staged_line_counts: None,
             conflict_kind: None,
         }
     }
@@ -414,7 +419,10 @@ mod tests {
             index,
             worktree: WorktreeStatus::Unmodified,
             rename: None,
-            line_counts: Some((added, removed)),
+            // Mirror the production shape for a fully staged file: the
+            // unstaged diff is empty, the staged side carries the counts.
+            line_counts: None,
+            staged_line_counts: Some((added, removed)),
             conflict_kind: None,
         }
     }
