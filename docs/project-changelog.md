@@ -4,6 +4,19 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-12 — Live-drill fixes: usage overcount, stuck agent rows, floating-toggle focus
+
+**Commits**: `1b50a09`  
+**Touches**: `crates/agents/src/session_log/` (usage.rs, usage_probe.rs), `crates/app/src/shell/` (agent_session_persistence.rs, floating_terminal_host.rs), `crates/app/src/state.rs`, `crates/core/src/agent_session.rs`, `crates/storage/` (agent_session repo + tests)
+
+Three defects surfaced by the round's live GUI drills, all verified fixed in a follow-up drill:
+
+- **Usage meter counted streamed repeats.** Session logs re-emit the same assistant message (same API call, same `message.id`) on multiple lines as content blocks stream — up to ~8 repeats — inflating the token tally ~5× and pinning the weekly meter at 100%. The tally now dedupes by message id (last occurrence wins, carrying final `output_tokens`). The weekly budget multiplier was recalibrated 10 → 150 blocks against an observed in-budget heavy week (deduped ~23.6M weighted tokens reading ~70%).
+- **Cancelled agents left `idle` rows forever.** `Running` decays to `Idle` at the prompt, so a tab closed (or app crashed) while an agent sat idle left a non-terminal row the running-only boot sweep never rescued — the dashboard showed "Idle" where "Stopped" belonged. The sweep now matches every non-terminal status with no `ended_at`, and the persistence watcher writes `Interrupted` itself when the status sender drops without a terminal transition (tab-close teardown can abort the poll task before its Exit event drains).
+- **Floating-terminal toggle went dead after hide.** Hiding the card while keyboard focus sat inside it left focus on an unrendered element — action dispatch had no focus path, so every chord (including the re-show toggle) silently no-opped until a click. Hiding now hands focus back to the active pane.
+
+---
+
 ### 2026-06-12 — Tabbed floating terminal: tab set, persistence, expand-to-pane
 
 **Commits**: `cf81d6d`  
