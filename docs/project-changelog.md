@@ -4,6 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Surface PTY exit; auto-close cleanly exited terminals
+
+**Commits**: `3dffc99`  
+**Touches**: `crates/app/src/shell/terminal_view.rs`, `crates/app/src/shell/pane_group/` (mod.rs, render.rs, sub_pane.rs, e2e_tests.rs), `crates/relay/src/registry.rs`, `crates/relay/tests/checkpoint_lifecycle.rs`
+
+A terminal whose child process exited used to freeze on its final frame — indistinguishable from a hang (e.g. a program started with `exec`, leaving no shell to fall back to, after the user quit it). The daemon already emitted `Exit` on child death but the view dropped it. Now the exit is handled, with a hybrid close policy:
+
+- **Clean exit (status 0) → auto-close the pane.** A lone-view tab closes the whole tab; a split leaf or a stacked leaf-tab closes just that pane and keeps the tab (cascade mirrors Cmd+W). The window-less PTY poll task emits a `CleanExit` event; the pane group queues it and closes in `render`, the one place with a window.
+- **Non-zero / signalled exit → keep the pane open with a centered `⏻ process exited (code N) · ⌘W to close` banner**, so a failure stays readable (status code retained, unlike a code-blind auto-close).
+- **Dead sessions never cold-restore as corpses.** An exited view is no longer persisted as a reattach target, and the daemon now replays `Exit` to a client that reconnects *after* the child already died (the daemon outlives the app) — so a re-launched app drops or respawns the slot instead of adopting a frozen, input-less pane.
+
+Verified live (auto-close, crash banner, split-leaf close, dead-corpse drop on relaunch) and with unit tests on each rung of the close cascade plus the attach-after-exit replay.
+
+---
+
 ### 2026-06-13 — Exact usage meter via the account usage API
 
 **Commits**: `e0bdac5`  
