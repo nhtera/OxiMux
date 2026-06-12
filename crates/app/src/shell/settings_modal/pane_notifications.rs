@@ -21,7 +21,7 @@ use crate::notifier::{
 /// the matching atomic in [`AgentNotifySettings`]. Driven as data so the
 /// rows stay in sync with the struct without near-identical blocks.
 type NotifySelect = fn(&AgentNotifySettings) -> &AtomicBool;
-const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 9] = [
+const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 10] = [
     (
         "Enable notifications",
         "Master switch for every desktop banner OxiMux posts.",
@@ -33,6 +33,12 @@ const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 9] = [
         "Banner when an agent needs attention or finishes.",
         keys::SOURCE_AGENT_STATE,
         |s| &s.source_agent_state,
+    ),
+    (
+        "Terminal bell banners",
+        "Banner when a hidden terminal rings the bell (Terminal → Bell set to Notify).",
+        keys::SOURCE_TERMINAL_BELL,
+        |s| &s.source_terminal_bell,
     ),
     (
         "Approval needed",

@@ -8,7 +8,9 @@
 //! parsed from `path:line:col` are kept 1-based (as the text shows them); the
 //! open path converts to the editor's 0-based `Position`.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Where a detected link points.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +134,64 @@ fn classify_path(token: &str) -> Option<LinkTarget> {
     })
 }
 
+/// Cached answer for "does this resolved path exist on disk?". `Pending`
+/// while the background stat is in flight — no underline yet, so hover and
+/// paint stay free of filesystem IO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existence {
+    Pending,
+    Exists,
+    Missing,
+}
+
+/// Entries expire after this long. For resolved answers that means a file
+/// created (or deleted) after the first hover is re-checked instead of
+/// pinned to a stale answer; for `Pending` it means a check whose task was
+/// torn down before landing (entity drop races, shutdown) self-heals on
+/// the next hover instead of suppressing the underline forever. A stat
+/// slower than the TTL can double-spawn; the results are idempotent.
+pub const EXISTENCE_TTL: Duration = Duration::from_secs(5);
+
+/// Wholesale-clear threshold. Entries are one cheap stat away from being
+/// rebuilt, so a dumb clear beats LRU bookkeeping at this size.
+const EXISTENCE_CAP: usize = 512;
+
+/// Existence cache keyed by RESOLVED absolute path — the session cwd is
+/// baked in at resolution time, so one key covers the (cwd, relative-path)
+/// pair the spec calls for.
+pub struct ExistenceCache {
+    entries: HashMap<PathBuf, (Existence, Instant)>,
+}
+
+impl ExistenceCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Current answer, or `None` when the path is unknown or its entry
+    /// expired — the caller should record `Pending` and start a check.
+    pub fn lookup(&self, path: &Path, now: Instant) -> Option<Existence> {
+        self.entries.get(path).and_then(|(state, at)| {
+            (now.saturating_duration_since(*at) < EXISTENCE_TTL).then_some(*state)
+        })
+    }
+
+    pub fn record(&mut self, path: PathBuf, state: Existence, now: Instant) {
+        if self.entries.len() >= EXISTENCE_CAP && !self.entries.contains_key(&path) {
+            self.entries.clear();
+        }
+        self.entries.insert(path, (state, now));
+    }
+}
+
+impl Default for ExistenceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Heuristic: a path either contains a `/` or has a `name.ext` dot (a `.`
 /// followed by a letter), which excludes numeric tokens like `3.14`.
 fn looks_like_path(s: &str) -> bool {
@@ -226,5 +286,25 @@ mod tests {
     fn boundary_and_out_of_range_yield_none() {
         assert_eq!(target_at("a b", 1), None); // the space
         assert_eq!(target_at("abc", 9), None); // past end
+    }
+
+    #[test]
+    fn existence_cache_expires_every_entry_kind() {
+        let t0 = Instant::now();
+        let mut cache = ExistenceCache::new();
+        let p = PathBuf::from("/tmp/x.rs");
+
+        assert_eq!(cache.lookup(&p, t0), None, "unknown path");
+
+        cache.record(p.clone(), Existence::Pending, t0);
+        assert_eq!(cache.lookup(&p, t0), Some(Existence::Pending));
+        // An abandoned Pending (check task torn down) self-heals: the
+        // entry expires and the next hover re-arms a fresh check.
+        assert_eq!(cache.lookup(&p, t0 + EXISTENCE_TTL), None);
+
+        cache.record(p.clone(), Existence::Missing, t0);
+        assert_eq!(cache.lookup(&p, t0), Some(Existence::Missing));
+        // A resolved answer expires after the TTL → caller re-checks.
+        assert_eq!(cache.lookup(&p, t0 + EXISTENCE_TTL), None);
     }
 }

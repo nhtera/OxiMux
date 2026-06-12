@@ -199,14 +199,14 @@ mod rebind_plan {
     #[test]
     fn conflict_then_resolve_rebinds_the_surviving_owner() {
         // Step 1 gave new_tab search's chord (conflict); step 2 moves
-        // search away. The surviving owner (new_tab @ cmd-f) must be
-        // re-bound AFTER the cmd-f shadow, or the shadow — appended after
-        // new_tab's step-1 binding — would leave cmd-f dead.
+        // search away to a free chord. The surviving owner (new_tab @
+        // cmd-f) must be re-bound AFTER the cmd-f shadow, or the shadow —
+        // appended after new_tab's step-1 binding — would leave cmd-f dead.
         let prev = effective(&[("new_tab", "cmd-f")]);
-        let next = effective(&[("new_tab", "cmd-f"), ("search_scrollback", "cmd-g")]);
+        let next = effective(&[("new_tab", "cmd-f"), ("search_scrollback", "cmd-9")]);
         let steps = plan_rebind(&prev, &next);
         assert!(shadow_index(&steps, "cmd-f") < bind_index(&steps, "new_tab", "cmd-f"));
-        assert!(shadow_index(&steps, "cmd-g") < bind_index(&steps, "search_scrollback", "cmd-g"));
+        assert!(shadow_index(&steps, "cmd-9") < bind_index(&steps, "search_scrollback", "cmd-9"));
     }
 
     #[test]

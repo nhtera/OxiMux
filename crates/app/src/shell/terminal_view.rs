@@ -35,14 +35,15 @@ use oximux_pty::{
 use oximux_settings::{BellStyle, Density, TerminalSettings, Theme, Typography};
 
 use crate::actions::{
-    Search, SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SendTextToActiveAgent,
+    FindNextMatch, FindPrevMatch, Search, SendLastCommandOutputToAgent,
+    SendTerminalSelectionToAgent, SendTextToActiveAgent,
 };
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::key_input::keystroke_to_bytes;
 use crate::shell::mouse_report::{MouseAction, MouseBtn, encode_button, encode_scroll, mod_bits};
 use crate::shell::pane_group::PaneGroup;
-use crate::shell::terminal_links::{LinkMatch, LinkTarget, detect_at};
+use crate::shell::terminal_links::{Existence, ExistenceCache, LinkMatch, LinkTarget, detect_at};
 use crate::shell::terminal_canvas::{
     Alphas, PaintParams, grid_dims_for, paint_grid, point_to_cell,
 };
@@ -454,6 +455,19 @@ pub struct TerminalView {
     /// held, so the canvas can underline it. Cleared when the pointer leaves a
     /// link or Cmd is released.
     hovered_link: Option<(usize, usize, usize)>,
+    /// Last bell-banner dispatch instant, rate-limiting BEL storms (a
+    /// misbehaving child can emit thousands per second) to one banner
+    /// request per window. The dispatcher's per-workspace burst gate
+    /// collapses further, but that one is shared across panes -- this
+    /// keeps a single pane from monopolizing it.
+    last_bell_banner: Option<std::time::Instant>,
+    /// Async path-existence answers for detected `path:line` links, keyed by
+    /// resolved absolute path. Hover/paint/click consult it without touching
+    /// the filesystem; misses spawn a background stat (see
+    /// [`Self::path_link_ready`]). Underline and open both require a
+    /// confirmed `Exists`, which is what keeps version-string-shaped false
+    /// positives from ever lighting up.
+    link_exists: ExistenceCache,
     /// Shell-integration command marks (OSC 133/633), newest last. Each holds
     /// the absolute history line of its prompt and the exit code once the
     /// command finishes — the canvas paints a gutter badge (red on non-zero).
@@ -630,6 +644,8 @@ impl TerminalView {
             selecting: None,
             opener: None,
             hovered_link: None,
+            last_bell_banner: None,
+            link_exists: ExistenceCache::new(),
             command_marks: Vec::new(),
             progress: None,
             pending_attach: false,
@@ -811,6 +827,8 @@ impl TerminalView {
             selecting: None,
             opener: None,
             hovered_link: None,
+            last_bell_banner: None,
+            link_exists: ExistenceCache::new(),
             command_marks: Vec::new(),
             progress: None,
             pending_attach: false,
@@ -1147,6 +1165,64 @@ impl TerminalView {
         let grid = self.with_backend(|be| be.search_grid(session_id));
         let visible = self.snapshot.cells.len();
         self.search.rerun(&grid, visible);
+        // Find-as-you-type lands on the first hit; jump the viewport to it
+        // the same way cycling does.
+        self.follow_current_match();
+    }
+
+    /// Scroll the viewport so the cycled match is visible, then refresh the
+    /// snapshot so the very next paint shows the new window (the regular
+    /// poll-driven resnapshot would otherwise lag a frame behind the
+    /// highlight). No-op when the match is already on screen.
+    fn follow_current_match(&mut self) {
+        let visible = self.snapshot.cells.len();
+        let Some(delta) = self
+            .search
+            .follow_delta(visible, self.snapshot.display_offset)
+        else {
+            return;
+        };
+        let id = self.session_id;
+        if let Err(err) = self.with_backend(|be| be.scroll(id, delta)) {
+            tracing::warn!(?err, "match-follow scroll failed");
+            return;
+        }
+        if let Ok(snapshot) = self.with_backend(|be| be.snapshot(id)) {
+            self.snapshot = Arc::new(snapshot);
+            self.revalidate_hover();
+        }
+    }
+
+    /// Cycle to the next search match (wrapping) and follow it. Bound to a
+    /// registry chord; a closed overlay makes it a silent no-op so the
+    /// chord never surprises outside search mode.
+    pub(crate) fn on_find_next(
+        &mut self,
+        _: &FindNextMatch,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.search.active {
+            return;
+        }
+        self.search.next_match();
+        self.follow_current_match();
+        cx.notify();
+    }
+
+    /// Cycle to the previous search match. See [`Self::on_find_next`].
+    pub(crate) fn on_find_prev(
+        &mut self,
+        _: &FindPrevMatch,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.search.active {
+            return;
+        }
+        self.search.prev_match();
+        self.follow_current_match();
+        cx.notify();
     }
 
     /// Debounce keystroke-driven reruns: fetching the search grid clones
@@ -1330,8 +1406,14 @@ impl TerminalView {
     }
 
     /// Resolve a possibly-relative link path against the session's OSC 7 cwd,
-    /// falling back to the path as-is when no cwd is known.
+    /// falling back to the path as-is when no cwd is known. A leading `~`
+    /// component expands to the home directory (common in `ls`/`fd` output).
     fn resolve_path(&mut self, path: &std::path::Path) -> PathBuf {
+        if let Ok(rest) = path.strip_prefix("~")
+            && let Some(home) = dirs::home_dir()
+        {
+            return home.join(rest);
+        }
         if path.is_absolute() {
             return path.to_path_buf();
         }
@@ -1339,6 +1421,57 @@ impl TerminalView {
         match self.with_backend(|be| be.cwd_hint(id)) {
             Some(cwd) => cwd.join(path),
             None => path.to_path_buf(),
+        }
+    }
+
+    /// True once the async existence check has confirmed `path` on disk.
+    /// A cache miss records `Pending` and spawns the stat on the background
+    /// executor (never the foreground -- hover/paint must stay IO-free),
+    /// then notifies, so the underline lights up without a mouse move once
+    /// the answer lands.
+    fn path_link_ready(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        let resolved = self.resolve_path(path);
+        let now = std::time::Instant::now();
+        match self.link_exists.lookup(&resolved, now) {
+            Some(Existence::Exists) => true,
+            Some(Existence::Pending | Existence::Missing) => false,
+            None => {
+                self.link_exists
+                    .record(resolved.clone(), Existence::Pending, now);
+                cx.spawn(async move |this, cx| {
+                    let stat_path = resolved.clone();
+                    let exists = cx
+                        .background_executor()
+                        .spawn(async move { stat_path.exists() })
+                        .await;
+                    let state = if exists {
+                        Existence::Exists
+                    } else {
+                        Existence::Missing
+                    };
+                    let _ = this.update(cx, |view, cx| {
+                        view.link_exists
+                            .record(resolved, state, std::time::Instant::now());
+                        if exists {
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+                false
+            }
+        }
+    }
+
+    /// The hovered span filtered to links we will actually act on: URLs
+    /// always; paths only once existence is confirmed. Re-derives the
+    /// target from the live snapshot (a single-row token scan, no IO), so
+    /// the paint path picks up a confirmation that arrived via notify.
+    fn underlinable_hover(&mut self, cx: &mut Context<Self>) -> Option<(usize, usize, usize)> {
+        let span = self.hovered_link?;
+        match self.link_at(span.0, span.1)?.target {
+            LinkTarget::Url(_) => Some(span),
+            LinkTarget::Path { path, .. } => self.path_link_ready(&path, cx).then_some(span),
         }
     }
 
@@ -1377,6 +1510,15 @@ impl TerminalView {
         let Some(hit) = self.link_at(row, col) else {
             return false;
         };
+        // Path links open only once existence is confirmed -- mirrors the
+        // underline gate, so a click can never act on a span that was not
+        // showing as clickable. The ready check also kicks the async stat,
+        // so an eager click on an unconfirmed path "arms" it for the next.
+        if let LinkTarget::Path { path, .. } = &hit.target
+            && !self.path_link_ready(&path.clone(), cx)
+        {
+            return false;
+        }
         self.open_link(hit.target, window, cx);
         true
     }
@@ -1398,8 +1540,17 @@ impl TerminalView {
     fn update_hover(&mut self, ev: &MouseMoveEvent, window: &Window, cx: &mut Context<Self>) {
         let next = if ev.modifiers.platform {
             let (row, col) = self.cell_at(ev.position, window);
-            self.link_at(row, col)
-                .map(|hit| (row, hit.col_start, hit.col_end))
+            match self.link_at(row, col) {
+                Some(hit) => {
+                    // Kick (or refresh) the async existence check for path
+                    // targets; the paint-side gate owns the underline call.
+                    if let LinkTarget::Path { path, .. } = &hit.target {
+                        let _ = self.path_link_ready(&path.clone(), cx);
+                    }
+                    Some((row, hit.col_start, hit.col_end))
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -1456,7 +1607,12 @@ impl TerminalView {
         match self.search.handle_key(event) {
             SearchKeyOutcome::Pass => {}
             SearchKeyOutcome::Consumed => return,
-            SearchKeyOutcome::Dismissed | SearchKeyOutcome::CurrentChanged => {
+            SearchKeyOutcome::Dismissed => {
+                cx.notify();
+                return;
+            }
+            SearchKeyOutcome::CurrentChanged => {
+                self.follow_current_match();
                 cx.notify();
                 return;
             }
@@ -1699,6 +1855,7 @@ impl TerminalView {
         let mut needs_snapshot = false;
         let mut had_output = false;
         let mut got_bell = false;
+        let mut bell_rang = false;
         let mut latest_title: Option<String> = None;
         let mut clipboard_text: Option<String> = None;
         let mut pty_replies: Vec<Vec<u8>> = Vec::new();
@@ -1712,13 +1869,14 @@ impl TerminalView {
                 TerminalEvent::TitleChange { title, .. } => {
                     latest_title = Some(title.clone());
                 }
-                // A BEL while this pane is NOT focused raises attention (unless
-                // the bell is disabled). A bell in the pane you're already
-                // looking at is just noise.
-                TerminalEvent::Bell { .. }
-                    if !self.focused && settings.bell != BellStyle::Off =>
-                {
-                    got_bell = true
+                TerminalEvent::Bell { .. } => {
+                    bell_rang = true;
+                    // A BEL while this pane is NOT focused raises attention
+                    // (unless the bell is disabled). A bell in the pane
+                    // you're already looking at is just noise.
+                    if !self.focused && settings.bell != BellStyle::Off {
+                        got_bell = true;
+                    }
                 }
                 // OSC 52: the child asked to set the system clipboard. Keep the
                 // last in the batch; written once below.
@@ -1747,6 +1905,17 @@ impl TerminalView {
         }
         if got_bell {
             self.attention = true;
+        }
+        // Notify routes the bell to the OS pipeline on top of the visual
+        // attention. The dispatcher owns the policy gates (master/source
+        // enables, visible-pane suppression, focus gate, burst collapse);
+        // this end only rate-limits BEL storms per pane. Deliberately NOT
+        // gated on `self.focused`: a focused pane in a backgrounded window
+        // is the "ran a command, switched apps, BEL on completion" case the
+        // Notify setting exists for, and a frontmost window is already
+        // silenced by the dispatcher's visible-pane rule.
+        if bell_rang && settings.bell == BellStyle::Notify {
+            self.maybe_notify_bell(cx);
         }
         let session_id = self.session_id;
         if needs_snapshot && let Ok(snapshot) = self.with_backend(|be| be.snapshot(session_id)) {
@@ -1780,6 +1949,28 @@ impl TerminalView {
         // progress) so a background tab's chip can light up.
         if self.visible || got_bell {
             cx.notify();
+        }
+    }
+
+    /// Forward a bell to the pane group's notification dispatch, at most
+    /// once per debounce window. The group contributes the context this
+    /// view can't see (tab label, workspace key, window-active flag).
+    fn maybe_notify_bell(&mut self, cx: &mut Context<Self>) {
+        const BELL_BANNER_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+        let now = std::time::Instant::now();
+        if self
+            .last_bell_banner
+            .is_some_and(|t| now.duration_since(t) < BELL_BANNER_DEBOUNCE)
+        {
+            return;
+        }
+        self.last_bell_banner = Some(now);
+        let session = self.session_id;
+        let pane_visible = self.is_visible();
+        if let Some(opener) = self.opener.clone() {
+            let _ = opener.update(cx, |pg, cx| {
+                pg.notify_terminal_bell(session, pane_visible, cx);
+            });
         }
     }
 
@@ -1828,6 +2019,12 @@ impl TerminalView {
 
     /// Latest OSC 2 title the shell emitted, if any. Exposed for future use
     /// by the workspace tab strip.
+    /// The PTY session this view renders. Bell-banner routing matches on
+    /// it to find the owning tab.
+    pub fn session_id(&self) -> TerminalSessionId {
+        self.session_id
+    }
+
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
@@ -2032,7 +2229,7 @@ impl Render for TerminalView {
             buckets,
             pane_focused,
             pad,
-            hovered_link: self.hovered_link,
+            hovered_link: self.underlinable_hover(cx),
             selection: self.selection,
             command_badges: self.visible_command_badges(),
             alphas,
@@ -2067,10 +2264,12 @@ impl Render for TerminalView {
             })) as terminal_search_overlay::ToggleHandler;
             let on_prev = Box::new(cx.listener(|this, _, _, cx| {
                 this.search.prev_match();
+                this.follow_current_match();
                 cx.notify();
             })) as terminal_search_overlay::ClickHandler;
             let on_next = Box::new(cx.listener(|this, _, _, cx| {
                 this.search.next_match();
+                this.follow_current_match();
                 cx.notify();
             })) as terminal_search_overlay::ClickHandler;
             let on_close = Box::new(cx.listener(|this, _, _, cx| {
@@ -2169,6 +2368,8 @@ impl Render for TerminalView {
             .font(self.typography.mono_font())
             .text_size(px(self.typography.t_body_lg))
             .on_action(cx.listener(Self::on_search))
+            .on_action(cx.listener(Self::on_find_next))
+            .on_action(cx.listener(Self::on_find_prev))
             .on_action(cx.listener(Self::on_send_selection_to_agent))
             .on_action(cx.listener(Self::on_send_last_command_output_to_agent))
             .on_mouse_down(

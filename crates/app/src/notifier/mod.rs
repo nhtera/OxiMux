@@ -130,6 +130,18 @@ impl From<AgentSessionId> for TabId {
     }
 }
 
+/// What a clicked banner points at, decoded from the banner identifier's
+/// namespace by the OS click delegate and routed to the window's
+/// navigation handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickTarget {
+    /// `agent:{tab}:{seq}` — an agent tab, in [`TabId`] space.
+    AgentTab(TabId),
+    /// `bell:{session}:{seq}` — the raw terminal session id whose pane
+    /// rang the bell.
+    TerminalSession(u64),
+}
+
 /// Which agent lifecycle edge a notification represents. Drives the banner
 /// title, the chosen system sound, and the per-kind enable check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,6 +154,10 @@ pub enum NotificationKind {
     Done,
     /// Agent exited with an error.
     Failed,
+    /// Terminal bell (BEL) from a pane the user can't see. Only dispatched
+    /// when the bell setting is `Notify`, so it has no per-kind toggle of
+    /// its own — the source gate + that setting are the opt-ins.
+    Bell,
 }
 
 impl NotificationKind {
@@ -164,6 +180,7 @@ impl NotificationKind {
             Self::WaitingForInput => format!("Agent waiting for input — {agent_label}"),
             Self::Done => format!("Agent finished — {agent_label}"),
             Self::Failed => format!("Agent failed — {agent_label}"),
+            Self::Bell => format!("Terminal bell — {agent_label}"),
         }
     }
 }
@@ -305,6 +322,9 @@ impl AgentNotifySettings {
             NotificationKind::WaitingForInput => &self.waiting_input,
             NotificationKind::Done => &self.done,
             NotificationKind::Failed => &self.failed,
+            // Bell carries no per-kind toggle: the per-pane `Notify` bell
+            // setting and the source gate above are the opt-ins.
+            NotificationKind::Bell => return true,
         };
         flag.load(Ordering::Relaxed)
     }
@@ -552,6 +572,36 @@ mod tests {
         // Visible pane in a *backgrounded* window still fires — the user
         // is not looking at the app.
         assert!(s.should_fire(&req(NotificationKind::Done, false, true)));
+    }
+
+    /// Bell request fixture: terminal-bell source, Bell kind.
+    fn bell_req(window_active: bool, pane_visible: bool) -> NotificationRequest {
+        let mut r = req(NotificationKind::Bell, window_active, pane_visible);
+        r.source = NotificationSource::TerminalBell;
+        r
+    }
+
+    #[test]
+    fn bell_fires_without_a_per_kind_toggle() {
+        // Defaults: master + bell source on, focus gate on. A bell from a
+        // backgrounded window fires even though Bell has no kind toggle.
+        let s = AgentNotifySettings::defaults();
+        assert!(s.should_fire(&bell_req(false, false)));
+        // Focus gate still applies — active window stays quiet.
+        assert!(!s.should_fire(&bell_req(true, false)));
+        // Visible pane in an active window is always silent.
+        assert!(!s.should_fire(&bell_req(true, true)));
+    }
+
+    #[test]
+    fn bell_source_gate_blocks_bell_only() {
+        let s = AgentNotifySettings::from_values(NotifyPrefValues {
+            source_terminal_bell: false,
+            ..NotifyPrefValues::default()
+        });
+        assert!(!s.should_fire(&bell_req(false, false)));
+        // Agent banners are unaffected by the bell source gate.
+        assert!(s.should_fire(&req(NotificationKind::Done, false, false)));
     }
 
     #[test]

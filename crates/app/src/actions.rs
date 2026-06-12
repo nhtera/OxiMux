@@ -353,6 +353,12 @@ actions!(
         MruPrev,
         /// Open the scrollback search overlay on the focused terminal pane.
         Search,
+        /// Cycle the search overlay to the next match (wrapping), scrolling
+        /// the viewport to keep the current match visible. No-op when the
+        /// overlay is closed.
+        FindNextMatch,
+        /// Cycle the search overlay to the previous match. See FindNextMatch.
+        FindPrevMatch,
         /// Toggle the git changed-files panel (binding moved to SelectSourceControlTab).
         OpenGitPanel,
         /// Refresh the source-control panel — re-runs the status poll

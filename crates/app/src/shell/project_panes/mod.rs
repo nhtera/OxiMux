@@ -335,6 +335,55 @@ impl ProjectPanes {
             .find_map(|g| g.read(cx).agent_worktree_for_tab_id(tab_id))
     }
 
+    /// The cwd of the pane group owning `session`, if any group in this
+    /// project does. Read-only counterpart of `activate_terminal_session`;
+    /// the bell-banner click router uses it to resolve which project (and
+    /// rail workspace) a clicked banner belongs to.
+    pub fn group_cwd_for_terminal_session(
+        &self,
+        session: oximux_pty::TerminalSessionId,
+        cx: &gpui::App,
+    ) -> Option<std::path::PathBuf> {
+        self.groups.values().find_map(|g| {
+            let group = g.read(cx);
+            group
+                .tab_index_for_terminal_session(session, cx)
+                .map(|_| group.cwd().clone())
+        })
+    }
+
+    /// Activate the tab hosting `session` in whichever group owns it and
+    /// focus that group. Returns false when no group does (tab closed).
+    pub fn activate_terminal_session(
+        &mut self,
+        session: oximux_pty::TerminalSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut found_group: Option<PaneGroupId> = None;
+        for (id, group) in &self.groups {
+            let hit = group.update(cx, |g, cx| {
+                match g.tab_index_for_terminal_session(session, cx) {
+                    Some(idx) => {
+                        g.set_active(idx, window, cx);
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if hit {
+                found_group = Some(*id);
+                break;
+            }
+        }
+        if let Some(id) = found_group {
+            self.set_active_group(id, window, cx);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Spawn the first Terminal tab in the only (initial) pane group.
     pub fn seed_default_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(group) = self.active_group() {

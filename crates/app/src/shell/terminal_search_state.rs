@@ -64,7 +64,7 @@ pub struct SearchState {
     /// History row count at scan time. The render path subtracts this from
     /// `MatchRange::row` to get a visible-row index. Deriving it at render
     /// time from `max(MatchRange::row)` fails on partial-history scrollback
-    /// and on history-only match sets — see code-review 260516-0807 H1.
+    /// and on history-only match sets, so it must be captured here.
     pub history_len: usize,
     /// Index into `matches` for the cycled "you are here" match. Set to
     /// `Some(0)` after each `rerun` when matches exist, advanced by
@@ -286,6 +286,27 @@ impl SearchState {
         SearchKeyOutcome::Consumed
     }
 
+    /// Lines to scroll (positive = back into history, matching the
+    /// backend's `scroll` convention) so the cycled match is on screen,
+    /// or `None` when no scroll is needed — match already visible, or no
+    /// current match. Off-screen matches land mid-viewport so the user
+    /// gets context above and below; the emulator clamps over-scroll, so
+    /// a tail-area match simply snaps back to offset 0.
+    pub fn follow_delta(&self, visible_rows: usize, display_offset: usize) -> Option<i32> {
+        if visible_rows == 0 {
+            return None;
+        }
+        let row = self.matches.get(self.current_index?)?.row;
+        let window_top = self.history_len.saturating_sub(display_offset);
+        if row >= window_top && row < window_top + visible_rows {
+            return None;
+        }
+        let desired_top = row.saturating_sub(visible_rows / 2);
+        let desired_offset = self.history_len.saturating_sub(desired_top);
+        let delta = desired_offset as i64 - display_offset as i64;
+        (delta != 0).then(|| delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+    }
+
     /// Bucket match ranges by visible row, tagging each with its highlight
     /// kind (`Current` for the cycled match, `Other` for the rest).
     /// Returns an empty Vec when inactive or no matches — callers can pass
@@ -337,6 +358,37 @@ mod tests {
             col_start: 0,
             col_end: 1,
         }
+    }
+
+    #[test]
+    fn follow_delta_scrolls_to_offscreen_matches_only() {
+        // 100 history rows above a 10-row viewport pinned to the tail.
+        let mut s = SearchState::new();
+        s.active = true;
+        s.history_len = 100;
+        s.current_index = Some(0);
+
+        // Match on the live tail (row 105) is already visible → no scroll.
+        s.matches = vec![hit(105)];
+        assert_eq!(s.follow_delta(10, 0), None);
+
+        // Match up in history (row 20): center it → window top 15 →
+        // offset 85, so scroll back 85 lines.
+        s.matches = vec![hit(20)];
+        assert_eq!(s.follow_delta(10, 0), Some(85));
+
+        // Already scrolled to offset 85: same match needs no further scroll.
+        assert_eq!(s.follow_delta(10, 85), None);
+
+        // From offset 85, a tail match (row 105) is below the window;
+        // desired top (100) caps the offset at 0 → scroll forward 85.
+        s.matches = vec![hit(105)];
+        assert_eq!(s.follow_delta(10, 85), Some(-85));
+
+        // No matches → never scrolls.
+        s.matches.clear();
+        s.current_index = None;
+        assert_eq!(s.follow_delta(10, 50), None);
     }
 
     #[test]

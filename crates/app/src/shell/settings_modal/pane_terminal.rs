@@ -112,6 +112,10 @@ pub(super) fn entries(
                 this.terminal.bell = BellStyle::Visual;
                 this.persist_terminal(cx);
             }),
+            Segment::new("Notify", t.bell == BellStyle::Notify, |this, _w, cx| {
+                this.terminal.bell = BellStyle::Notify;
+                this.persist_terminal(cx);
+            }),
         ],
         theme,
         density,

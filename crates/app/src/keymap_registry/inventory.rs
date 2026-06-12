@@ -12,11 +12,11 @@ use gpui::KeyBinding;
 use super::{ActionSpec, Category};
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
-    DismissOverlay, FocusNextPane, FocusNextSubPane, FocusPrevPane, FocusPrevSubPane, MruNext,
-    MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent, NewTab, NewWindow, NextTab,
-    OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen, OpenSettings,
-    OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl, ReloadCustomCommands,
-    Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
+    DismissOverlay, FindNextMatch, FindPrevMatch, FocusNextPane, FocusNextSubPane, FocusPrevPane,
+    FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent, NewTab,
+    NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen,
+    OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
+    ReloadCustomCommands, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
     SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleFloatingTerminal, ToggleLeftSidebar,
     ToggleRightSidebar, ToggleZoomSubPane,
@@ -130,6 +130,11 @@ pub const ACTIONS: &[ActionSpec] = &[
     ),
     // ---- Terminal & Agents -------------------------------------------
     entry!("search_scrollback", "Search scrollback", Terminal, "cmd-f", Search),
+    entry!("find_next_match", "Find next match", Terminal, "cmd-g", FindNextMatch),
+    // cmd-shift-g (the platform "find previous" convention) is owned by
+    // select_source_control_tab, a shipped default; prev gets the alt
+    // variant instead. Both are user-rebindable.
+    entry!("find_prev_match", "Find previous match", Terminal, "alt-cmd-g", FindPrevMatch),
     // Sends the focused terminal's selection to the active agent's input
     // buffer (no trailing newline — the user reviews + hits Enter).
     entry!(

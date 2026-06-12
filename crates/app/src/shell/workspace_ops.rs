@@ -910,6 +910,63 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
+    /// Notification-click navigation for a terminal-bell banner: find the
+    /// pane group owning the ringing session (cross-project included),
+    /// select + locate the owning workspace in the rail by the group's
+    /// cwd, activate the exact tab, and raise the window. A stale click
+    /// (tab closed since) does nothing.
+    pub(crate) fn navigate_to_terminal_session(
+        &mut self,
+        session: oximux_pty::TerminalSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = self.project_panes_by_project.iter().find_map(|(id, panes)| {
+            panes
+                .read(cx)
+                .group_cwd_for_terminal_session(session, cx)
+                .map(|cwd| (id.clone(), panes.clone(), cwd))
+        });
+        let Some((project_id, panes, group_cwd)) = owner else {
+            tracing::info!(
+                session = session.0,
+                "bell notification click for a closed terminal; ignoring"
+            );
+            return;
+        };
+        if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
+            let Some(project) = self
+                .app_state
+                .recent_projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            else {
+                tracing::warn!(%project_id, "bell click: owning project not in recent_projects");
+                return;
+            };
+            self.set_active_project(project, window, cx);
+        }
+        // Rail selection by the owning group's cwd (best-effort -- a
+        // terminal can cd anywhere, but the group cwd is its workspace).
+        let cwd_str = group_cwd.to_string_lossy().into_owned();
+        let workspace = self
+            .rail_workspaces_by_project
+            .get(&project_id)
+            .and_then(|rows| rows.iter().find(|w| w.worktree_path == cwd_str))
+            .cloned();
+        if let Some(w) = workspace {
+            self.active_workspace_id = Some(w.id.clone());
+            self.record_nav(&w.project_id, &w.id);
+        }
+        self.left_rail.update(cx, |rail, cx| rail.scroll_to_active(cx));
+        panes.update(cx, |p, cx| {
+            p.activate_terminal_session(session, window, cx);
+        });
+        window.activate_window();
+        cx.notify();
+    }
+
     /// A project's workspace rows, always including the synthesized "primary"
     /// (repo-root) row as the first entry when no real workspace occupies the
     /// root. Single source of the "a project is never an empty group"

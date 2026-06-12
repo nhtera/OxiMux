@@ -18,7 +18,7 @@ mod e2e_tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
     AppContext, Context, FocusHandle, Focusable, Point, ScrollHandle, SharedString, Subscription,
@@ -573,6 +573,64 @@ impl PaneGroup {
             } if TabId::from(*session_id) == tab_id => Some(worktree_path.clone()),
             _ => None,
         })
+    }
+
+    /// The workspace cwd this group spawns terminals into. The bell-banner
+    /// click router uses it to resolve the owning rail workspace.
+    pub fn cwd(&self) -> &PathBuf {
+        &self.cwd
+    }
+
+    /// Index of the tab whose terminal split tree hosts `session`, if this
+    /// group owns it. Walks every leaf and tab in each tree (not just live
+    /// views) so a bell from a background sub-pane tab still resolves.
+    pub fn tab_index_for_terminal_session(
+        &self,
+        session: TerminalSessionId,
+        cx: &gpui::App,
+    ) -> Option<usize> {
+        self.tabs.iter().position(|t| match &t.content {
+            PaneContent::Terminal(tree) => tree
+                .iter_all_views()
+                .any(|(_, _, v)| v.read(cx).session_id() == session),
+            PaneContent::Editor(_) | PaneContent::Diff(_) => false,
+        })
+    }
+
+    /// Dispatch a terminal-bell banner for `session` through the
+    /// notification pipeline. Called by the ringing `TerminalView` (which
+    /// owns the per-pane debounce); this end contributes the request
+    /// context the view can't see: the tab label, the workspace key for
+    /// burst collapse, and the live window-active flag. The dispatcher
+    /// applies the master/source gates, visible-pane suppression, and the
+    /// focus gate.
+    pub fn notify_terminal_bell(
+        &self,
+        session: TerminalSessionId,
+        pane_visible: bool,
+        cx: &gpui::App,
+    ) {
+        let Some(idx) = self.tab_index_for_terminal_session(session, cx) else {
+            return;
+        };
+        let tab = &self.tabs[idx];
+        let label = tab
+            .custom_title
+            .clone()
+            .unwrap_or_else(|| tab.label.clone());
+        self.notifier.notify(crate::notifier::NotificationRequest {
+            source: crate::notifier::NotificationSource::TerminalBell,
+            kind: crate::notifier::NotificationKind::Bell,
+            // Bell banners carry the raw terminal session id in the tab_id
+            // slot; the `bell:` identifier namespace keeps it from ever
+            // being read as an agent tab id.
+            tab_id: TabId(session.0),
+            workspace_key: self.cwd.to_string_lossy().into_owned(),
+            label: label.to_string(),
+            body: String::new(),
+            window_active: self.window_active.load(Ordering::Relaxed),
+            pane_visible,
+        });
     }
 
     /// Index of an existing agent tab whose worktree matches `path`, if

@@ -58,7 +58,7 @@ const DIFF_REFRESH_TICK: Duration = Duration::from_millis(2000);
 /// (no daemon round-trip).
 const LAYOUT_AUTOSAVE_TICK: Duration = Duration::from_secs(15);
 
-use crate::notifier::{AgentNotifySettings, Notifier, TabId};
+use crate::notifier::{AgentNotifySettings, Notifier};
 use crate::state::AppState;
 
 use crate::actions::{
@@ -385,7 +385,8 @@ impl WorkspaceRoot {
         // `Notifier` impl) gets the sender; the router task below drains
         // the receiver on the GPUI side. Non-mac builds plug in a no-op
         // notifier and the channel pair is unused.
-        let (click_tx, mut click_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let (click_tx, mut click_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::notifier::ClickTarget>();
         // Live notification prefs (per-kind enable, sound, focus gate),
         // hydrated from the flat settings store. Shared with the notifier;
         // the settings pane flips the atomics at runtime.
@@ -709,11 +710,19 @@ impl WorkspaceRoot {
         // (all senders dropped, e.g. at app shutdown) or when the entity
         // is gone.
         let click_router = cx.spawn_in(window, async move |weak, cx| {
-            while let Some(tab_id_raw) = click_rx.recv().await {
-                let tab_id = TabId(tab_id_raw);
+            while let Some(target) = click_rx.recv().await {
                 if weak
-                    .update_in(cx, |root, window, cx| {
-                        root.navigate_to_agent_tab(tab_id, window, cx);
+                    .update_in(cx, |root, window, cx| match target {
+                        crate::notifier::ClickTarget::AgentTab(tab_id) => {
+                            root.navigate_to_agent_tab(tab_id, window, cx);
+                        }
+                        crate::notifier::ClickTarget::TerminalSession(raw) => {
+                            root.navigate_to_terminal_session(
+                                oximux_pty::TerminalSessionId(raw),
+                                window,
+                                cx,
+                            );
+                        }
                     })
                     .is_err()
                 {

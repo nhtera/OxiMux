@@ -22,6 +22,10 @@ pub enum BellStyle {
     /// Raise the pane/tab attention signal (the current behavior).
     #[default]
     Visual,
+    /// Visual attention PLUS an OS notification when the ringing pane is
+    /// not visible (routed through the notification dispatcher, so master/
+    /// source gates and burst collapse all apply).
+    Notify,
 }
 
 /// All user-tunable terminal knobs. `#[serde(default)]` lets a partial TOML
@@ -130,6 +134,12 @@ mod tests {
         assert_eq!(s.blink_interval_ms, 530);
         assert!(s.osc52_clipboard);
         assert_eq!(s.scroll_multiplier, 1.0);
+    }
+
+    #[test]
+    fn bell_notify_round_trips() {
+        let s = TerminalSettings::from_toml_str("bell = \"notify\"\n").expect("parse");
+        assert_eq!(s.bell, BellStyle::Notify);
     }
 
     #[test]

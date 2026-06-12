@@ -4,6 +4,19 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-12 — Terminal search follow, link existence gating, bell notifications
+
+**Commits**: `_pending_`  
+**Touches**: `crates/app/src/shell/` (terminal_view.rs, terminal_links.rs, terminal_search_state.rs, pane_group/mod.rs, project_panes/mod.rs, workspace_ops.rs, settings_modal pane_terminal + pane_notifications), `crates/app/src/notifier/` (mod.rs, mac.rs), `crates/app/src/actions.rs`, `crates/app/src/keymap_registry/inventory.rs`, `crates/app/src/workspace_root.rs`, `crates/settings/src/terminal.rs`
+
+Terminal interaction polish — search, file links, and the bell:
+
+- **Search match cycling follows the viewport.** Cycling (overlay Enter/⇧Enter/arrows/buttons and the new `find_next_match` ⌘G / `find_prev_match` ⌥⌘G actions) scrolls an off-screen match to mid-viewport; find-as-you-type jumps to the first hit. Works in plain and regex modes. (⌘⇧G stays with the source-control tab; both chords are rebindable.)
+- **Path links underline only when real.** `path:line:col` spans confirm existence on a background task (TTL'd cache keyed by resolved path, zero filesystem IO in hover/paint); unconfirmed or missing paths never underline and never open, so version-string look-alikes can't bait a click. `~/...` paths now resolve to the home directory.
+- **Bell → Notify.** Third bell mode routes BEL from a pane you can't see through the notification pipeline (master/source gates, visible-pane suppression, focus gate, per-workspace burst collapse all apply; per-pane 2 s rate limit). Banner click jumps to the ringing tab — cross-project included — via a new `bell:` banner namespace alongside the agent one. "Terminal bell banners" source toggle added to Notifications settings.
+
+---
+
 ### 2026-06-12 — SCM section caps, split staged/unstaged counts, untracked counts, token batch
 
 **Commits**: `_pending_`  

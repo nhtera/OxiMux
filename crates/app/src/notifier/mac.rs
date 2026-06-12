@@ -34,8 +34,8 @@ use objc2_user_notifications::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
-    AgentNotifySettings, BurstGate, NotificationRequest, NotificationSource,
-    Notifier, NotifierAvailability,
+    AgentNotifySettings, BurstGate, ClickTarget, NotificationRequest, NotificationSource,
+    Notifier, NotifierAvailability, TabId,
 };
 use std::sync::Arc;
 
@@ -50,10 +50,10 @@ static ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// One-time center setup (delegate + authorization request).
 static CENTER_SETUP: Once = Once::new();
 
-/// Click sinks, one per live window. The delegate broadcasts a clicked
-/// tab id to all of them; each window's router ignores tabs it does not
-/// own. Closed-window senders fail to send and are pruned in place.
-static CLICK_SENDERS: Mutex<Vec<UnboundedSender<u64>>> = Mutex::new(Vec::new());
+/// Click sinks, one per live window. The delegate broadcasts the decoded
+/// click target to all of them; each window's router ignores targets it
+/// does not own. Closed-window senders fail to send and are pruned in place.
+static CLICK_SENDERS: Mutex<Vec<UnboundedSender<ClickTarget>>> = Mutex::new(Vec::new());
 
 /// Process-wide 5s per-workspace burst collapse. Static (not per
 /// notifier instance) so the same worktree open in two windows still
@@ -94,8 +94,8 @@ define_class!(
             completion_handler: &Block<dyn Fn()>,
         ) {
             let identifier = response.notification().request().identifier().to_string();
-            if let Some(tab_id) = parse_agent_identifier(&identifier) {
-                broadcast_click(tab_id);
+            if let Some(target) = parse_click_identifier(&identifier) {
+                broadcast_click(target);
             }
             completion_handler.call(());
         }
@@ -124,22 +124,32 @@ impl NotificationDelegate {
     }
 }
 
-/// `agent:{tab}:{seq}` → tab id. Test banners (`test:{seq}`) and foreign
-/// identifiers yield `None` (click just dismisses).
-fn parse_agent_identifier(identifier: &str) -> Option<u64> {
-    let rest = identifier.strip_prefix("agent:")?;
-    let (tab, _seq) = rest.split_once(':')?;
-    tab.parse().ok()
+/// Decode a banner identifier into its click target: `agent:{tab}:{seq}`
+/// → agent tab, `bell:{session}:{seq}` → terminal session. Test banners
+/// (`test:{seq}`) and foreign identifiers yield `None` (click just
+/// dismisses).
+fn parse_click_identifier(identifier: &str) -> Option<ClickTarget> {
+    let parse_id = |rest: &str| -> Option<u64> {
+        let (id, _seq) = rest.split_once(':')?;
+        id.parse().ok()
+    };
+    if let Some(rest) = identifier.strip_prefix("agent:") {
+        return parse_id(rest).map(|id| ClickTarget::AgentTab(TabId(id)));
+    }
+    if let Some(rest) = identifier.strip_prefix("bell:") {
+        return parse_id(rest).map(ClickTarget::TerminalSession);
+    }
+    None
 }
 
-/// Send a clicked tab id to every registered window router, pruning
-/// senders whose receiver is gone (window closed).
-fn broadcast_click(tab_id: u64) {
+/// Send a decoded click target to every registered window router,
+/// pruning senders whose receiver is gone (window closed).
+fn broadcast_click(target: ClickTarget) {
     let mut senders = match CLICK_SENDERS.lock() {
         Ok(s) => s,
         Err(poisoned) => poisoned.into_inner(),
     };
-    senders.retain(|tx| tx.send(tab_id).is_ok());
+    senders.retain(|tx| tx.send(target).is_ok());
 }
 
 /// True when the process runs from a real `.app` bundle. A bare binary
@@ -213,9 +223,10 @@ pub struct MacNotifier {
     /// Live per-kind enable + sound + focus-gate prefs, shared with the
     /// settings pane (which flips the atomics at runtime).
     settings: Arc<AgentNotifySettings>,
-    /// Last posted banner id per tab, so a fresh edge replaces the stale
-    /// banner instead of stacking under it in Notification Center.
-    last_posted: Mutex<HashMap<u64, String>>,
+    /// Last posted banner id per namespaced source key (`agent:{tab}` /
+    /// `bell:{session}`), so a fresh edge replaces the stale banner
+    /// instead of stacking under it in Notification Center.
+    last_posted: Mutex<HashMap<String, String>>,
 }
 
 impl MacNotifier {
@@ -223,7 +234,7 @@ impl MacNotifier {
     /// consumer (this window's router) activates the matching workspace
     /// tab when a banner is clicked. `settings` is the shared preference
     /// cell read on every dispatch.
-    pub fn new(click_tx: UnboundedSender<u64>, settings: Arc<AgentNotifySettings>) -> Self {
+    pub fn new(click_tx: UnboundedSender<ClickTarget>, settings: Arc<AgentNotifySettings>) -> Self {
         if !running_in_bundle() {
             // Set the "why" flag before the availability latch so a
             // concurrent `availability()` read never sees unavailable-
@@ -248,12 +259,27 @@ impl MacNotifier {
         }
     }
 
-    /// Namespaced banner identifier for a request.
+    /// Namespaced banner identifier for a request. The namespace doubles
+    /// as the click-routing discriminator (see `parse_click_identifier`),
+    /// so bell banners — whose `tab_id` carries a raw terminal session id —
+    /// never collide with agent tab ids.
     fn mint_identifier(req: &NotificationRequest) -> String {
         let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
         match req.source {
             NotificationSource::Test => format!("test:{seq}"),
-            _ => format!("agent:{}:{seq}", req.tab_id.0),
+            NotificationSource::TerminalBell => format!("bell:{}:{seq}", req.tab_id.0),
+            NotificationSource::AgentState => format!("agent:{}:{seq}", req.tab_id.0),
+        }
+    }
+
+    /// Replacement key for `last_posted`: namespace + id, so an agent tab
+    /// and a terminal session that happen to share a numeric id never
+    /// evict each other's banner.
+    fn replace_key(req: &NotificationRequest) -> String {
+        match req.source {
+            NotificationSource::Test => "test".to_string(),
+            NotificationSource::TerminalBell => format!("bell:{}", req.tab_id.0),
+            NotificationSource::AgentState => format!("agent:{}", req.tab_id.0),
         }
     }
 }
@@ -285,7 +311,7 @@ impl Notifier for MacNotifier {
             if req.source == NotificationSource::Test {
                 None
             } else {
-                last.insert(req.tab_id.0, identifier.clone())
+                last.insert(Self::replace_key(&req), identifier.clone())
             }
         };
 
@@ -332,11 +358,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_identifier_roundtrip() {
-        assert_eq!(parse_agent_identifier("agent:42:7"), Some(42));
-        assert_eq!(parse_agent_identifier("test:7"), None);
-        assert_eq!(parse_agent_identifier("agent:notanum:7"), None);
-        assert_eq!(parse_agent_identifier("agent:42"), None);
-        assert_eq!(parse_agent_identifier(""), None);
+    fn click_identifier_roundtrip() {
+        assert_eq!(
+            parse_click_identifier("agent:42:7"),
+            Some(ClickTarget::AgentTab(TabId(42)))
+        );
+        assert_eq!(
+            parse_click_identifier("bell:9:3"),
+            Some(ClickTarget::TerminalSession(9))
+        );
+        assert_eq!(parse_click_identifier("test:7"), None);
+        assert_eq!(parse_click_identifier("agent:notanum:7"), None);
+        assert_eq!(parse_click_identifier("agent:42"), None);
+        assert_eq!(parse_click_identifier("bell:42"), None);
+        assert_eq!(parse_click_identifier(""), None);
     }
 }
