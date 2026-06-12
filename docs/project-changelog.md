@@ -4,6 +4,20 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-12 — Agent session persistence, Stopped status, live activity, usage meter
+
+**Commits**: `4635afe`  
+**Touches**: `crates/agents/src/session_log/` (NEW: mod, activity, usage, usage_probe), `crates/agents/src/` (runtime_impl.rs, status_machine.rs), `crates/app/src/shell/` (agent_session_persistence.rs NEW, usage_meter.rs NEW, agent_presentation.rs, agent_status_badge.rs, agents_dashboard/, left_rail/mod.rs, status_bar.rs, workspace_ops.rs), `crates/app/src/` (workspace_root.rs, project_panes_factory.rs), `crates/storage/` (V013 migration, workspace repo)
+
+Agent observability round — the rail finally tells the truth about agents:
+
+- **Session persistence wired end-to-end.** The `agent_sessions` table had no writer (the V001 workspace FK rejected repo-root `primary:<project_id>` launches, so the pipeline was stillborn). V013 drops the FK; a per-launch watcher now inserts the row and mirrors every status transition (+ `ended_at`) for fresh spawns AND relay re-adopts. Dashboard/rail rows show real Running / Done / Failed / Stopped, and survive restarts (boot sweep marks dangling `running` rows Interrupted — code that finally has rows to act on).
+- **Cancel reads as "Stopped", not "Failed".** `cancel()` flags the session before closing the PTY; the poll loop publishes `Interrupted` instead of misreading the kill signal as `Done`/`Failed`. Presented as "Stopped" with a muted dot + "Stopped before finishing" tooltip everywhere (verb chip, rail dot, tab badge — badge was red before).
+- **Live activity line.** Running primary-CLI rows show the current tool call ("Bash: cargo test…") from a bounded 64 KiB session-log tail — 2 s focus-gated background tick, 5-minute freshness gate, cleared the moment the session stops. No hooks or user setup required.
+- **Status-bar usage meter.** `~NN% 5h · ~NN% wk` chip estimated from local session-log token tallies scaled by the account tier; click opens a popover with reset countdown, raw token counts, and the estimate disclosure. Hidden entirely when no data exists; budgets live in one tunable table pending live calibration. 60 s background tick with per-file parse caching.
+
+---
+
 ### 2026-06-12 — Terminal search follow, link existence gating, bell notifications
 
 **Commits**: `d21fadb`  
