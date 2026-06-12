@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — One-click agent launch (default settings)
+
+**Commits**: _(local, pending)_  
+**Touches**: `crates/app/src/shell/adapter_picker.rs`, `crates/app/src/shell/adapter_picker_params.rs` (deleted), `crates/app/src/shell/mod.rs`, `crates/app/src/workspace_root.rs`, `crates/app/src/shell/workspace_ops.rs`, `crates/app/src/state.rs`, `crates/agents/src/runtime_impl.rs`
+
+The `+` adapter picker used to open a model → effort → "Start agent" sub-step after you clicked an agent. Simplified to a single click: clicking an agent row launches it immediately with the agent's own default settings, matching the one-click launch of the reference cockpit.
+
+- **Picker** (`adapter_picker.rs`): clicking an adapter row fires `select_adapter` → spawn + close. Removed the model/effort `Stage::Params` machinery, the per-adapter last-used preselection, and the whole params sub-step file (`adapter_picker_params.rs`). `AdapterSelection::Adapter` now carries just `{ kind, id }`.
+- **Both launch entry points pass defaults**: the picker `on_select` and the create-dialog auto-spawn both call `spawn_agent_tab(.., None, None, ..)` — no model/effort flags. The session-restore path keeps its stored model/effort (`spawn_agent_tab` still accepts them), so a previously-configured restored agent is unaffected.
+- **Dropped the now-unused `agent_last_params` boot snapshot + repo handle** from `AppState`. The storage repo + V009 table stay in place (dormant lib API) rather than ripping a shipped migration.
+- **Clean launch display** (`runtime_impl.rs`): the relay spawn path used to run the login shell and write `exec <agent>` into it, so the terminal showed a `% exec claude` line. Now a plain launch (no argv, no stdin prompt — the one-click default) spawns the agent binary **directly** as the PTY's foreground process, so nothing echoes a command line — the terminal shows only the agent's own banner. The binary is resolved to an absolute path (via the app's PATH, which already located it at detection) so the detached daemon can `exec` it. A launch that carries argv (a restored session's model/effort) or a stdin seed still falls back to the login-shell + `exec` wrapper, which both carries the argv and resolves PATH from the user's profile. Process tree is identical either way (the agent is the PTY leaf), so cancel, exit→status, the exit banner, and auto-close are unchanged.
+
+Verified: clicking "Claude Code" in the `+` menu spawns `claude` straight into a new tab — no intermediate picker, no `exec` line, just Claude's banner (Claude Max session live, MCP detected). 831 app-lib + 224 agents tests green (12 adapter-picker).
+
+---
+
 ### 2026-06-13 — Agent name + count for hand-launched agents
 
 **Commits**: _(local, pending)_  
