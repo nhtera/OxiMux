@@ -151,8 +151,11 @@ fn workspace_unique_project_slug_conflict() {
     }
 }
 
+// V013 dropped the agent_sessions → workspaces FK (synthesized
+// 'primary:<project_id>' ids broke it), so deleting a workspace cascades
+// to panes only; agent-session history rows survive as accepted orphans.
 #[test]
-fn workspace_delete_cascades_to_panes_and_agents() {
+fn workspace_delete_cascades_to_panes_but_keeps_agent_history() {
     let (project_id, workspaces, panes, agents) = project_and_repos();
     let w = workspaces
         .insert(&project_id, "A", "a", "oximux/a", "/wt/a")
@@ -164,5 +167,5 @@ fn workspace_delete_cascades_to_panes_and_agents() {
 
     workspaces.delete(&w.id).expect("delete workspace");
     assert!(panes.list_for_workspace(&w.id).expect("list").is_empty());
-    assert!(agents.list_for_workspace(&w.id).expect("list").is_empty());
+    assert_eq!(agents.list_for_workspace(&w.id).expect("list").len(), 1);
 }

@@ -109,6 +109,25 @@ impl WorkspaceRepo {
         Ok(row.map(Into::into))
     }
 
+    /// Resolve the active (non-archived) workspace owning a worktree path.
+    /// Used by the agent-session persistence path to key session rows by
+    /// workspace id given only the launch cwd. Newest first when a path
+    /// somehow has two rows (should not happen; defensive).
+    pub fn get_by_worktree_path(&self, path: &str) -> Result<Option<Workspace>, StorageError> {
+        let row = self.db.with_conn(|c| {
+            c.query_row(
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint \
+                 FROM workspaces \
+                 WHERE worktree_path = ?1 AND archived_at IS NULL \
+                 ORDER BY created_at DESC LIMIT 1",
+                [path],
+                WorkspaceRow::from_row,
+            )
+            .optional()
+        })?;
+        Ok(row.map(Into::into))
+    }
+
     /// List active (non-archived) workspaces for a project, newest first.
     pub fn list_for_project(&self, project_id: &str) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {

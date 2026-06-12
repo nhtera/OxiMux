@@ -22,6 +22,7 @@ use oximux_pty::{
     PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -69,6 +70,10 @@ struct SessionEntry {
     /// lives inside the poll task and survives until terminal-state exit.
     status_rx: watch::Receiver<AgentStatus>,
     poll_handle: JoinHandle<()>,
+    /// Set by `cancel()` before the PTY is closed so the poll task can
+    /// classify the resulting Exit event as user-initiated (`Interrupted`)
+    /// rather than a process failure (`Done { code: None }` / `Failed`).
+    cancel_requested: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -150,7 +155,14 @@ impl CliRuntime {
         let patterns: Arc<[_]> = adapter.status_patterns().to_vec().into();
         let machine = StatusMachine::new(patterns);
         let (status_tx, status_rx) = watch::channel(AgentStatus::Idle);
-        let poll_handle = tokio::spawn(poll_loop(backend.clone(), term_id, machine, status_tx));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let poll_handle = tokio::spawn(poll_loop(
+            backend.clone(),
+            term_id,
+            machine,
+            status_tx,
+            cancel_requested.clone(),
+        ));
         let mut inner = lock_recover(&self.inner, "CliRuntime sessions");
         let id = AgentSessionId::new(inner.next_id);
         inner.next_id = inner.next_id.saturating_add(1);
@@ -161,6 +173,7 @@ impl CliRuntime {
                 term_id,
                 status_rx,
                 poll_handle,
+                cancel_requested,
             },
         );
         id
@@ -339,6 +352,10 @@ impl AgentRuntime for CliRuntime {
         };
         let backend = entry.backend.clone();
         let term_id = entry.term_id;
+        // Flag BEFORE close() so the poll task is guaranteed to see the
+        // cancel when the Exit event arrives — the exit cannot precede the
+        // close that causes it.
+        entry.cancel_requested.store(true, Ordering::SeqCst);
         // close() joins the watcher thread → fully reaps the child; do it
         // off the async runtime.
         //
@@ -438,6 +455,7 @@ async fn poll_loop(
     term_id: TerminalSessionId,
     mut machine: StatusMachine,
     status_tx: watch::Sender<AgentStatus>,
+    cancel_requested: Arc<AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -465,7 +483,15 @@ async fn poll_loop(
                     }
                 }
                 TerminalEvent::Exit { id, code } if id == term_id => {
-                    if let Some(t) = machine.note_exit(code) {
+                    // A cancel-triggered exit is a user decision, not a
+                    // process outcome — publish Interrupted ("Stopped" in
+                    // the UI) instead of the Done/Failed exit-code mapping.
+                    let transition = if cancel_requested.load(Ordering::SeqCst) {
+                        machine.note_interrupted()
+                    } else {
+                        machine.note_exit(code)
+                    };
+                    if let Some(t) = transition {
                         let _ = status_tx.send(t.to);
                     }
                     saw_exit = true;
@@ -690,6 +716,13 @@ mod tests {
         assert!(
             final_status.is_terminal(),
             "expected terminal, got {final_status:?}"
+        );
+        // A user cancel must read as Interrupted ("Stopped"), never as the
+        // Done/Failed exit-code mapping the kill signal would produce.
+        assert_eq!(
+            final_status,
+            AgentStatus::Interrupted,
+            "cancel must publish Interrupted, got {final_status:?}"
         );
     }
 

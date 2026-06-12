@@ -19,7 +19,7 @@ use oximux_settings::Theme;
 pub struct AgentVerb {
     /// Short human-readable verb for the current state ("Running",
     /// "Waiting for input", "Needs approval", "Done", "Failed",
-    /// "Interrupted", "Idle", "Ready").
+    /// "Stopped", "Idle", "Ready").
     pub label: &'static str,
     /// Status-token color matching the verb — same mapping as the rail dot.
     pub color: Hsla,
@@ -39,7 +39,9 @@ pub struct AgentVerb {
 /// - `NeedsApproval`       → "Needs approval" / `status_warn`
 /// - `Done { code: 0 }`    → "Done" / `status_ok`
 /// - `Done { code != 0 }` or `Failed` → "Failed" / `status_error`
-/// - `Interrupted`         → "Interrupted" / `status_muted`
+/// - `Interrupted`         → "Stopped" / `status_muted` (covers both a
+///   user cancel and a session that was alive at shutdown — in either case
+///   the agent stopped without finishing, through no fault of its own)
 pub fn agent_verb(status: Option<&AgentStatus>, is_live: bool, theme: Theme) -> AgentVerb {
     match status {
         None | Some(AgentStatus::Idle) => {
@@ -80,7 +82,7 @@ pub fn agent_verb(status: Option<&AgentStatus>, is_live: bool, theme: Theme) -> 
             color: theme.status_error,
         },
         Some(AgentStatus::Interrupted) => AgentVerb {
-            label: "Interrupted",
+            label: "Stopped",
             color: theme.status_muted,
         },
     }
@@ -186,9 +188,9 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_is_status_muted() {
+    fn interrupted_is_stopped_status_muted() {
         let v = agent_verb(Some(&AgentStatus::Interrupted), false, t());
-        assert_eq!(v.label, "Interrupted");
+        assert_eq!(v.label, "Stopped");
         assert_eq!(v.color, t().status_muted);
     }
 }

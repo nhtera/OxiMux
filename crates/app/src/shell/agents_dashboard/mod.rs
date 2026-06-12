@@ -38,6 +38,7 @@ pub fn render_agents_dashboard(
     latest_status: &LatestStatusMap,
     live_worktrees: &HashSet<String>,
     diff_counts: &HashMap<String, DiffCounts>,
+    agent_activity: &HashMap<String, String>,
     weak_root: WeakEntity<WorkspaceRoot>,
     scroll: &UniformListScrollHandle,
     theme: Theme,
@@ -51,6 +52,7 @@ pub fn render_agents_dashboard(
         latest_status,
         live_worktrees,
         diff_counts,
+        agent_activity,
         theme,
     );
 

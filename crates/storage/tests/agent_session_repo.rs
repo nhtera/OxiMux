@@ -126,10 +126,25 @@ fn agent_session_list_running_at_shutdown_filters_correctly() {
     assert_eq!(shutdown[0].id, running.id);
 }
 
+// V013 dropped the workspaces FK (synthesized 'primary:<project_id>' ids
+// have no workspaces row, so the FK kept the persistence path dead).
+// Session rows now survive workspace deletion as accepted orphans.
 #[test]
-fn agent_session_cascade_delete_on_workspace() {
+fn agent_session_survives_workspace_delete() {
     let (workspace_id, workspaces, agents) = fixture();
     let a = agents.insert(&workspace_id, "codex", None, None).unwrap();
     workspaces.delete(&workspace_id).expect("delete workspace");
-    assert!(agents.get_by_id(&a.id).expect("get").is_none());
+    assert!(agents.get_by_id(&a.id).expect("get").is_some());
+}
+
+// The reason V013 exists: a synthesized primary-workspace id (no
+// workspaces row backing it) must be insertable.
+#[test]
+fn agent_session_insert_accepts_synthesized_primary_id() {
+    let (_workspace_id, _workspaces, agents) = fixture();
+    let a = agents
+        .insert("primary:some-project-uuid", "claude-code", None, None)
+        .expect("insert with synthesized workspace id");
+    let got = agents.get_by_id(&a.id).expect("get").expect("row");
+    assert_eq!(got.workspace_id, "primary:some-project-uuid");
 }

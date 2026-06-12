@@ -197,31 +197,43 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
 
 /// One full pass of the sidebar's DB-backed data across every recent
 /// project: workspace rows (incl. synthesized primaries) + the latest
-/// agent-session status per workspace. Runs on the background executor —
-/// this is the ONLY place the rail touches SQLite.
+/// agent-session status and adapter per workspace. Runs on the background
+/// executor — this is the ONLY place the rail touches SQLite.
+///
+/// The adapter map (workspace id → adapter slug of the latest session)
+/// gates the activity tail: only the primary CLI journals session logs,
+/// so other adapters never get a tail attempt.
 fn gather_rail_db_data(
     workspace_repo: &WorkspaceRepo,
     agent_repo: &AgentSessionRepo,
     projects: &[Project],
-) -> (HashMap<String, Vec<Workspace>>, LatestStatusMap) {
+) -> (
+    HashMap<String, Vec<Workspace>>,
+    LatestStatusMap,
+    HashMap<String, String>,
+) {
     let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
         HashMap::with_capacity(projects.len());
     let mut latest_status: LatestStatusMap = HashMap::new();
+    let mut latest_adapter: HashMap<String, String> = HashMap::new();
     for project in projects {
         let list = workspaces_with_primary_for(workspace_repo, project);
         for workspace in &list {
             let latest = match agent_repo.list_for_workspace(&workspace.id) {
-                Ok(mut sessions) => sessions.drain(..).next().map(|s| s.status),
+                Ok(mut sessions) => sessions.drain(..).next(),
                 Err(err) => {
                     tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
                     None
                 }
             };
-            latest_status.insert(workspace.id.clone(), latest);
+            if let Some(session) = &latest {
+                latest_adapter.insert(workspace.id.clone(), session.adapter_id.clone());
+            }
+            latest_status.insert(workspace.id.clone(), latest.map(|s| s.status));
         }
         workspaces_by_project.insert(project.id.clone(), list);
     }
-    (workspaces_by_project, latest_status)
+    (workspaces_by_project, latest_status, latest_adapter)
 }
 
 /// Open the project repo, create a new worktree on branch `oximux/<slug>`,
@@ -1262,6 +1274,7 @@ impl WorkspaceRoot {
         // refresh loop (see `WorkspaceRoot::run_diff_refresh_round`); here we
         // only read the latest cached snapshot. Render never shells out to git.
         let diff_counts_snapshot = self.diff_counts.clone();
+        let agent_activity_snapshot = self.agent_activity.clone();
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
                 projects,
@@ -1271,6 +1284,7 @@ impl WorkspaceRoot {
                 latest_status,
                 live_worktrees,
                 diff_counts_snapshot,
+                agent_activity_snapshot,
                 cx,
             );
         });
@@ -1303,7 +1317,7 @@ impl WorkspaceRoot {
                 // All SQLite + the per-project `.git` stat run off the main
                 // thread (cx.spawn itself stays on the main thread — known
                 // footgun).
-                let (workspaces, statuses) = cx
+                let (workspaces, statuses, adapters) = cx
                     .background_executor()
                     .spawn(async move {
                         gather_rail_db_data(&workspace_repo, &agent_repo, &projects)
@@ -1312,6 +1326,7 @@ impl WorkspaceRoot {
                 let run_again = weak.update(cx, |this, cx| {
                     this.rail_workspaces_by_project = workspaces;
                     this.rail_latest_status = statuses;
+                    this.rail_latest_adapter = adapters;
                     cx.notify();
                     if this.rail_dirty {
                         true

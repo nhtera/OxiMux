@@ -58,6 +58,17 @@ const DIFF_REFRESH_TICK: Duration = Duration::from_millis(2000);
 /// (no daemon round-trip).
 const LAYOUT_AUTOSAVE_TICK: Duration = Duration::from_secs(15);
 
+/// Cadence of the agent-activity tail. Each tick does one bounded (64 KiB)
+/// tail read per Running primary-CLI session on the background executor;
+/// 2 s matches the phase target of "activity tracks tool changes within
+/// ~2 s" without measurable IO churn.
+const AGENT_ACTIVITY_TICK: Duration = Duration::from_secs(2);
+
+/// Cadence of the usage-meter sample. The probe re-parses only logs whose
+/// (mtime, len) changed since the previous sample, so a steady-state tick
+/// costs one directory scan + at most one active-log re-parse.
+const USAGE_METER_TICK: Duration = Duration::from_secs(60);
+
 use crate::notifier::{AgentNotifySettings, Notifier};
 use crate::state::AppState;
 
@@ -316,6 +327,19 @@ pub struct WorkspaceRoot {
     /// Cached latest agent-session status per workspace id — same
     /// lifecycle as [`Self::rail_workspaces_by_project`].
     pub(crate) rail_latest_status: crate::shell::left_rail::LatestStatusMap,
+    /// Adapter slug of the latest agent session per workspace id — same
+    /// lifecycle as `rail_latest_status`. Gates the activity tail (only
+    /// the primary CLI journals session logs).
+    pub(crate) rail_latest_adapter: HashMap<String, String>,
+    /// Live tool-activity line per workspace id ("Bash: cargo test…"),
+    /// refreshed by `_agent_activity_task` for Running primary-CLI
+    /// sessions and pushed to the rail via `refresh_left_rail`.
+    pub(crate) agent_activity: HashMap<String, String>,
+    /// Latest usage-meter sample. `None` hides the status-bar meter
+    /// entirely (no account config / unknown tier).
+    pub(crate) usage_snapshot: Option<oximux_agents::session_log::usage::UsageSnapshot>,
+    /// Whether the usage popover (click on the meter) is open.
+    pub(crate) usage_popover_open: bool,
     /// Workspace id whose normal delete failed at the worktree-removal
     /// step. The next delete request for the SAME workspace offers the
     /// Force Delete variant (force-remove + always drop the DB row,
@@ -340,6 +364,11 @@ pub struct WorkspaceRoot {
     /// Periodic layout + relay-id autosave — bounds mid-session crash
     /// loss to one `LAYOUT_AUTOSAVE_TICK`. Held for its lifetime only.
     _layout_autosave_task: Task<()>,
+    /// Periodic agent-activity tail (Running sessions only, focus-gated,
+    /// background IO). Dropping cancels the loop.
+    _agent_activity_task: Task<()>,
+    /// Periodic usage-meter sample (60 s, background IO). Dropping cancels.
+    _usage_meter_task: Task<()>,
 }
 
 impl WorkspaceRoot {
@@ -672,6 +701,95 @@ impl WorkspaceRoot {
             }
         });
 
+        // Periodic agent-activity tail: for Running primary-CLI sessions,
+        // tail the newest session log for the current tool call and push
+        // the label map to the dashboard rows. Focus-gated like the diff
+        // refresh; all file IO on the background executor.
+        let agent_activity_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(AGENT_ACTIVITY_TICK).await;
+                // Snapshot targets on the main thread: Running workspaces
+                // whose latest session belongs to the primary CLI.
+                let Ok(targets) = weak.update(cx, |this, _| {
+                    if !this.diff_refresh_focused {
+                        return Vec::new();
+                    }
+                    let mut targets: Vec<(String, String)> = Vec::new();
+                    for (ws_id, status) in &this.rail_latest_status {
+                        if !matches!(status, Some(oximux_core::AgentStatus::Running)) {
+                            continue;
+                        }
+                        if this.rail_latest_adapter.get(ws_id).map(String::as_str)
+                            != Some("claude-code")
+                        {
+                            continue;
+                        }
+                        let path = this
+                            .rail_workspaces_by_project
+                            .values()
+                            .flatten()
+                            .find(|w| &w.id == ws_id)
+                            .map(|w| w.worktree_path.clone());
+                        if let Some(path) = path {
+                            targets.push((ws_id.clone(), path));
+                        }
+                    }
+                    targets
+                }) else {
+                    break;
+                };
+                let new_map = cx
+                    .background_executor()
+                    .spawn(async move { gather_agent_activity(targets) })
+                    .await;
+                let alive = weak
+                    .update(cx, |this, cx| {
+                        if this.agent_activity != new_map {
+                            this.agent_activity = new_map;
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
+
+        // Periodic usage-meter sample. Sample immediately (so the meter is
+        // present right after boot), then every `USAGE_METER_TICK`. The
+        // probe caches per-file tallies, so steady-state ticks only
+        // re-parse logs that changed.
+        use oximux_agents::session_log::usage_probe::UsageProbe as _;
+        let usage_probe: std::sync::Arc<
+            oximux_agents::session_log::usage_probe::SessionLogUsageProbe,
+        > = std::sync::Arc::new(
+            oximux_agents::session_log::usage_probe::SessionLogUsageProbe::new(
+                dirs::home_dir().unwrap_or_default(),
+            ),
+        );
+        let usage_meter_task = cx.spawn(async move |weak, cx| {
+            loop {
+                let probe = usage_probe.clone();
+                let snapshot = cx
+                    .background_executor()
+                    .spawn(async move { probe.sample() })
+                    .await;
+                let alive = weak
+                    .update(cx, |this, cx| {
+                        if this.usage_snapshot != snapshot {
+                            this.usage_snapshot = snapshot;
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+                cx.background_executor().timer(USAGE_METER_TICK).await;
+            }
+        });
+
         // Periodic layout + relay-id autosave. Quit/switch captures miss
         // anything created mid-session — a tab or split made after the
         // last capture is gone entirely if the app crashes. This bounds
@@ -809,12 +927,18 @@ impl WorkspaceRoot {
             force_delete_offer: None,
             rail_workspaces_by_project: HashMap::new(),
             rail_latest_status: HashMap::new(),
+            rail_latest_adapter: HashMap::new(),
+            agent_activity: HashMap::new(),
+            usage_snapshot: None,
+            usage_popover_open: false,
             rail_dirty: false,
             rail_refresh_inflight: false,
             diff_refresh_focused: true,
             diff_refresh_in_flight: false,
             _diff_refresh_task: diff_refresh_task,
             _layout_autosave_task: layout_autosave_task,
+            _agent_activity_task: agent_activity_task,
+            _usage_meter_task: usage_meter_task,
         };
         // Seed the sidebar's DB-backed caches (workspace rows + agent
         // statuses) — the first gather lands async, typically before the
@@ -1547,7 +1671,7 @@ impl WorkspaceRoot {
         let runtime = self.cli_runtime.clone();
         let cwd_for_tab = cwd.clone();
 
-        cx.spawn_in(window, async move |_root, cx| {
+        cx.spawn_in(window, async move |root, cx| {
             // `adapter_id` arrives from the row the user clicked — the
             // picker holds the `RegistryEntry` slug at click time, so we
             // skip a redundant `detect_available` walk here (M1 fix from
@@ -1622,6 +1746,22 @@ impl WorkspaceRoot {
                     return;
                 }
             };
+
+            // Mirror this session's status history into the agent_sessions
+            // row so the rail/dashboard rows show Running / Done / Stopped.
+            // Watch receivers are cheap clones; the watcher self-terminates
+            // on the terminal status.
+            let _ = root.update(cx, |this, cx| {
+                crate::shell::agent_session_persistence::spawn_for_session(
+                    this,
+                    cwd_for_tab.to_string_lossy().into_owned(),
+                    adapter_id,
+                    model.clone(),
+                    effort.clone(),
+                    status_rx.clone(),
+                    cx,
+                );
+            });
 
             let mount_result = panes.update_in(cx, |p, window, cx| {
                 p.push_agent_tab(
@@ -3114,6 +3254,7 @@ impl Render for WorkspaceRoot {
                 // Clone for the closure; the outer `window` is plumbed via
                 // `update` (not `update_in`) per the GPUI memory note.
                 let scm_for_click = scm_panel.clone();
+                let weak_for_usage = cx.entity().downgrade();
                 status_bar::view(
                     theme,
                     density,
@@ -3123,6 +3264,7 @@ impl Render for WorkspaceRoot {
                     agent_count,
                     git_state.as_ref(),
                     primary,
+                    self.usage_snapshot.as_ref(),
                     move |window, cx| {
                         if let Some(sc) = scm_for_click.clone() {
                             sc.update(cx, |panel, cx| {
@@ -3130,6 +3272,58 @@ impl Render for WorkspaceRoot {
                             });
                         }
                     },
+                    move |_window, cx| {
+                        let _ = weak_for_usage.update(cx, |this, cx| {
+                            this.usage_popover_open = !this.usage_popover_open;
+                            cx.notify();
+                        });
+                    },
+                )
+            })
+            // Usage-meter popover — anchored above the status bar's right
+            // corner. The transparent full-window backdrop closes it on any
+            // outside click; z-band above the floating terminal, below the
+            // palette overlays that follow.
+            .when(self.usage_popover_open, |parent| {
+                let Some(snapshot) = self.usage_snapshot.as_ref() else {
+                    return parent;
+                };
+                let weak_close = cx.entity().downgrade();
+                let card = crate::shell::usage_meter::render_usage_popover(
+                    snapshot,
+                    oximux_agents::session_log::now_unix_ms(),
+                    theme,
+                    density,
+                    typography,
+                );
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            move |_ev, _window, cx| {
+                                let _ = weak_close.update(cx, |this, cx| {
+                                    this.usage_popover_open = false;
+                                    cx.notify();
+                                });
+                            },
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(8.0))
+                                .bottom(px(density.h_status_bar + 6.0))
+                                // Clicks on the card must not bubble to the
+                                // backdrop's dismiss handler — the user may
+                                // click while reading the numbers.
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    |_ev, _window, cx| cx.stop_propagation(),
+                                )
+                                .child(card),
+                        ),
                 )
             })
             // Floating ("PiP") terminal — sits above the workspace panels but
@@ -3250,4 +3444,35 @@ pub(crate) fn tab_can_tear_off(
     tree.live_count() == 1
         && tree.active_leaf().map(|l| l.len()).unwrap_or(0) == 1
         && active_has_external_id
+}
+
+/// One activity-tail round: for each `(workspace_id, worktree_path)`
+/// target, find the newest primary-CLI session log for that cwd and pull
+/// the current tool call out of its tail. Blocking file IO — background
+/// executor only. A target without a fresh log simply contributes no
+/// entry, so finished/stale rows clear naturally.
+fn gather_agent_activity(targets: Vec<(String, String)>) -> HashMap<String, String> {
+    use oximux_agents::session_log::{self, activity};
+
+    let mut out = HashMap::new();
+    let Some(home) = dirs::home_dir() else {
+        return out;
+    };
+    let claude_dir = home.join(".claude");
+    let now_ms = session_log::now_unix_ms();
+    for (workspace_id, worktree_path) in targets {
+        let dir = session_log::project_log_dir(&claude_dir, std::path::Path::new(&worktree_path));
+        let Some((log, mtime_ms)) = session_log::newest_session_log(&dir) else {
+            continue;
+        };
+        // A log idle past the freshness window can't hold current activity;
+        // skip the read entirely.
+        if now_ms.saturating_sub(mtime_ms) > activity::FRESH_WITHIN_MS {
+            continue;
+        }
+        if let Some(act) = activity::read_current_activity(&log, now_ms) {
+            out.insert(workspace_id, act.label());
+        }
+    }
+    out
 }

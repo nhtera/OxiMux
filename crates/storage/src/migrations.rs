@@ -121,6 +121,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "workspace_tint",
         sql: include_str!("../migrations/V012__workspace_tint.sql"),
     },
+    Migration {
+        version: 13,
+        name: "agent_sessions_drop_workspace_fk",
+        sql: include_str!("../migrations/V013__agent_sessions_drop_workspace_fk.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

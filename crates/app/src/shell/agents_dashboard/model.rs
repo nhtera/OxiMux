@@ -34,6 +34,10 @@ pub struct AgentRow {
     pub status: Option<AgentStatus>,
     /// Whether the workspace currently has an open agent tab (green idle dot).
     pub is_live: bool,
+    /// Live tool-activity line for Running sessions ("Bash: cargo test…"),
+    /// tailed from the agent CLI's session log on a background tick. `None`
+    /// when idle, non-Running, or the log has no fresh tool call.
+    pub activity: Option<String>,
 }
 
 /// True for states a user should come look at: the session is blocked on
@@ -94,6 +98,7 @@ pub fn build_agent_rows(
     latest_status: &LatestStatusMap,
     live_worktrees: &HashSet<String>,
     diff_counts: &HashMap<String, DiffCounts>,
+    agent_activity: &HashMap<String, String>,
     theme: Theme,
 ) -> Vec<AgentRow> {
     let mut rows: Vec<AgentRow> = Vec::new();
@@ -118,6 +123,11 @@ pub fn build_agent_rows(
 
             let verb = agent_verb(status.as_ref(), is_live, theme);
             let diff = diff_counts.get(&workspace.worktree_path).cloned();
+            // Activity is only meaningful while Running — a stale "Bash: …"
+            // on a Done row would read as still-working.
+            let activity = matches!(status, Some(AgentStatus::Running))
+                .then(|| agent_activity.get(&workspace.id).cloned())
+                .flatten();
 
             rows.push(AgentRow {
                 project_name: project.name.clone(),
@@ -126,6 +136,7 @@ pub fn build_agent_rows(
                 diff,
                 status,
                 is_live,
+                activity,
             });
         }
     }
@@ -154,7 +165,13 @@ fn estimated_row_width(r: &AgentRow) -> usize {
     };
     // Fixed budget for the diff chip when present (`+NN −NN`).
     let diff_len = if r.diff.is_some() { 8 } else { 0 };
-    r.project_name.len() + r.workspace.name.len() + branch_len + r.verb.label.len() + diff_len
+    let activity_len = r.activity.as_ref().map_or(0, |a| a.len() + 3);
+    r.project_name.len()
+        + r.workspace.name.len()
+        + branch_len
+        + r.verb.label.len()
+        + diff_len
+        + activity_len
 }
 
 // ─── unit tests ──────────────────────────────────────────────────────────────
@@ -294,6 +311,7 @@ mod tests {
             diff: None,
             status,
             is_live,
+            activity: None,
         }
     }
 
@@ -389,6 +407,7 @@ mod tests {
             &HashMap::new(),   // no status
             &HashSet::new(),   // not live
             &HashMap::new(),
+            &HashMap::new(),
             t(),
         );
         assert!(rows.is_empty(), "dormant workspace must be skipped");
@@ -403,7 +422,7 @@ mod tests {
         wbp.insert("p1".to_string(), vec![ws]);
         let mut live = HashSet::new();
         live.insert(worktree_path);
-        let rows = build_agent_rows(&[p], &wbp, &HashMap::new(), &live, &HashMap::new(), t());
+        let rows = build_agent_rows(&[p], &wbp, &HashMap::new(), &live, &HashMap::new(), &HashMap::new(), t());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].workspace.id, "a");
     }
@@ -422,6 +441,7 @@ mod tests {
             &status_map,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             t(),
         );
         assert_eq!(rows.len(), 1);
@@ -439,7 +459,7 @@ mod tests {
         live.insert(worktree_path.clone());
         let mut diff_map = HashMap::new();
         diff_map.insert(worktree_path, DiffCounts { added: 5, removed: 3 });
-        let rows = build_agent_rows(&[p], &wbp, &HashMap::new(), &live, &diff_map, t());
+        let rows = build_agent_rows(&[p], &wbp, &HashMap::new(), &live, &diff_map, &HashMap::new(), t());
         let diff = rows[0].diff.as_ref().expect("diff must be carried");
         assert_eq!(diff.added, 5);
         assert_eq!(diff.removed, 3);
@@ -458,6 +478,7 @@ mod tests {
             &wbp,
             &status_map,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             t(),
         );
@@ -482,10 +503,40 @@ mod tests {
             &status_map,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             t(),
         );
         assert_eq!(rows[0].workspace.id, "b");
         assert_eq!(rows[1].workspace.id, "a");
+    }
+
+    #[test]
+    fn activity_attached_to_running_rows_only() {
+        let p = project("p1", "Proj");
+        let run = workspace("run", "p1");
+        let done = workspace("done", "p1");
+        let mut status_map: LatestStatusMap = HashMap::new();
+        status_map.insert("run".to_string(), Some(AgentStatus::Running));
+        status_map.insert("done".to_string(), Some(AgentStatus::Done { code: Some(0) }));
+        let mut activity = HashMap::new();
+        activity.insert("run".to_string(), "Bash: cargo test".to_string());
+        // Stale entry for a finished session must NOT surface.
+        activity.insert("done".to_string(), "Bash: old".to_string());
+        let mut wbp = HashMap::new();
+        wbp.insert("p1".to_string(), vec![run, done]);
+        let rows = build_agent_rows(
+            &[p],
+            &wbp,
+            &status_map,
+            &HashSet::new(),
+            &HashMap::new(),
+            &activity,
+            t(),
+        );
+        let running = rows.iter().find(|r| r.workspace.id == "run").unwrap();
+        let finished = rows.iter().find(|r| r.workspace.id == "done").unwrap();
+        assert_eq!(running.activity.as_deref(), Some("Bash: cargo test"));
+        assert!(finished.activity.is_none());
     }
 
     // ── widest_row_index ──────────────────────────────────────────────────────
@@ -521,6 +572,7 @@ mod tests {
             &wbp,
             &status_map,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             t(),
         );

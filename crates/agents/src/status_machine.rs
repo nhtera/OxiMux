@@ -119,6 +119,18 @@ impl StatusMachine {
         self.transition_to(to)
     }
 
+    /// Record a user-initiated cancel. The PTY exit that follows a cancel
+    /// is a kill signal, which `note_exit` would misreport as `Done` /
+    /// `Failed` — this maps it to `Interrupted` instead so the UI can show
+    /// "Stopped" rather than a false failure. Idempotent like `note_exit`:
+    /// returns `None` if already terminal.
+    pub fn note_interrupted(&mut self) -> Option<StatusTransition> {
+        if self.current.is_terminal() {
+            return None;
+        }
+        self.transition_to(AgentStatus::Interrupted)
+    }
+
     /// Force a status — used by the manual badge-click override when the
     /// regex table misclassifies. Refuses to leave a terminal state (a
     /// `Done`/`Failed` session cannot be resurrected by clicking; cancel
@@ -323,6 +335,23 @@ mod tests {
         // miss (ring was cleared) and fallback must transition to Running.
         let t = sm.feed(b"running step 2...", t0()).unwrap();
         assert_eq!(t.to, AgentStatus::Running);
+    }
+
+    #[test]
+    fn note_interrupted_maps_to_interrupted() {
+        let mut sm = StatusMachine::new(patterns(&[]));
+        sm.feed(b"working...", t0());
+        let t = sm.note_interrupted().unwrap();
+        assert_eq!(t.to, AgentStatus::Interrupted);
+        assert!(sm.current().is_terminal());
+    }
+
+    #[test]
+    fn note_interrupted_idempotent_after_terminal() {
+        let mut sm = StatusMachine::new(patterns(&[]));
+        sm.note_exit(Some(0));
+        assert!(sm.note_interrupted().is_none());
+        assert!(matches!(sm.current(), AgentStatus::Done { code: Some(0) }));
     }
 
     #[test]

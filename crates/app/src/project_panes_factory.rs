@@ -491,7 +491,7 @@ fn restore_agent_tab(
     };
     let adapter_id: &'static str = static_adapter_id(persisted.adapter);
     let persisted_clone = persisted.clone();
-    cx.spawn_in(window, async move |_root, cx| {
+    cx.spawn_in(window, async move |root, cx| {
         // Warm re-attach: if the agent's PTY is still alive in the relay
         // daemon (same session id), adopt the running CLI instead of
         // respawning — the conversation + scrollback resume exactly where
@@ -583,6 +583,20 @@ fn restore_agent_tab(
                 (session_id, backend, term_id, status_rx)
             }
         };
+        // Restored sessions get a fresh agent_sessions row too (the boot
+        // sweep already marked the pre-restart row Interrupted); without
+        // this, a live re-adopted agent would read "Stopped" on the rail.
+        let _ = root.update(cx, |this, cx| {
+            crate::shell::agent_session_persistence::spawn_for_session(
+                this,
+                persisted_clone.worktree_path.clone(),
+                adapter_id,
+                persisted_clone.model.clone(),
+                persisted_clone.effort.clone(),
+                status_rx.clone(),
+                cx,
+            );
+        });
         let mount = panes.update_in(cx, |p, window, cx| match target_group {
             Some(group_id) => p.push_restored_agent_tab_in(
                 group_id,

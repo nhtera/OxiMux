@@ -88,6 +88,11 @@ pub struct LeftRail {
     /// down here via `set_sidebar_data`. `None` for a worktree means the
     /// count is not yet available; the card omits the chip rather than blocking.
     diff_counts: HashMap<String, DiffCounts>,
+    /// Live tool-activity lines per workspace id ("Bash: cargo test…"),
+    /// tailed from agent session logs by `WorkspaceRoot`'s background tick
+    /// and pushed down with the rest of the snapshot. Rendered on Running
+    /// dashboard rows only.
+    agent_activity: HashMap<String, String>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -149,6 +154,7 @@ impl LeftRail {
             latest_status: HashMap::new(),
             live_worktrees: HashSet::new(),
             diff_counts: HashMap::new(),
+            agent_activity: HashMap::new(),
             width: px(density.w_left_rail),
             resizing: false,
             settings_repo: None,
@@ -268,6 +274,7 @@ impl LeftRail {
         latest_status: LatestStatusMap,
         live_worktrees: HashSet<String>,
         diff_counts: HashMap<String, DiffCounts>,
+        agent_activity: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) {
         let project_changed = self.active_project_id != active_project_id;
@@ -299,6 +306,7 @@ impl LeftRail {
         self.latest_status = latest_status;
         self.live_worktrees = live_worktrees;
         self.diff_counts = diff_counts;
+        self.agent_activity = agent_activity;
 
         // Keep the Tasks page's project in sync; re-fetch only when the active
         // project actually changes while the page is open.
@@ -397,6 +405,7 @@ impl Render for LeftRail {
                 &self.latest_status,
                 &self.live_worktrees,
                 &self.diff_counts,
+                &self.agent_activity,
                 self.weak_root.clone(),
                 &self.agents_scroll,
                 theme,

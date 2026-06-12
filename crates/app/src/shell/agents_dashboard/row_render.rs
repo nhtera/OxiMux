@@ -2,7 +2,7 @@
 //!
 //! Each row is laid out as a single nowrap horizontal strip:
 //!
-//!   [status dot] [project · slug/branch] [flex spacer] [verb chip] [+A −B chip?]
+//!   [status dot] [project · slug/branch] [activity?] [verb chip] [+A −B chip?]
 //!
 //! Nowrap keeps the row from reflowing inside `uniform_list` so horizontal
 //! scroll works correctly when the rail is narrow.
@@ -50,6 +50,19 @@ pub fn render_agent_row(
         .overflow_hidden()
         .whitespace_nowrap()
         .child(loc_text);
+
+    // Live activity line for Running rows ("Bash: cargo test…") — dim,
+    // truncating before the verb chip so the status stays visible.
+    let activity_label = row.activity.as_ref().map(|a| {
+        div()
+            .min_w_0()
+            .max_w(px(260.))
+            .text_size(px(typography.t_sub_label))
+            .text_color(theme.fg_subtle)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(a.clone())
+    });
 
     // Verb chip (colored label e.g. "Running", "Waiting for input").
     let verb_chip = div()
@@ -107,6 +120,7 @@ pub fn render_agent_row(
         .hover(|s| s.bg(theme.hover_overlay))
         .child(dot)
         .child(loc_label)
+        .children(activity_label)
         .child(verb_chip)
         .children(review_chip)
         .children(diff_chip)

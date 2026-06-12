@@ -12,11 +12,13 @@ use gpui::{
     App, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
+use oximux_agents::session_log::usage::UsageSnapshot;
 use oximux_core::GitState;
 use oximux_git::PollState;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::source_control::primary_action::PrimaryAction;
+use crate::shell::usage_meter;
 
 /// Pure helper for the git zone text. Returns:
 ///   - `"<branch>  •  N changed"` (or `0 changed`) when Ready
@@ -97,7 +99,8 @@ pub fn primary_button_visible(
     git_state.is_some() && primary.is_some()
 }
 
-pub fn view<F>(
+#[allow(clippy::too_many_arguments)]
+pub fn view<F, G>(
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -106,10 +109,13 @@ pub fn view<F>(
     agent_count: usize,
     git_state: Option<&PollState>,
     primary: Option<PrimaryAction>,
+    usage: Option<&UsageSnapshot>,
     on_primary_click: F,
+    on_usage_click: G,
 ) -> impl IntoElement
 where
     F: Fn(&mut Window, &mut App) + 'static,
+    G: Fn(&mut Window, &mut App) + 'static,
 {
     let git_label = git_zone_label(git_state);
     let show_primary = primary_button_visible(git_state, primary.as_ref());
@@ -174,6 +180,34 @@ where
         zone
     };
 
+    // Usage meter — present only when the probe produced a snapshot
+    // (account config + known tier). "~" marks the numbers as estimates;
+    // the click popover carries the full disclosure.
+    let usage_chip = usage.map(|snapshot| {
+        let label = usage_meter::meter_label(snapshot);
+        let color = usage_meter::meter_color(snapshot, theme);
+        let hover_bg = theme.hover_overlay;
+        div()
+            .id("status-bar-usage-meter")
+            .flex()
+            .items_center()
+            .h(px(16.))
+            .px(px(4.))
+            .rounded(px(density.r_chip))
+            .text_size(px(typography.t_body_sm))
+            .text_color(color)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .tooltip(|window, cx| {
+                gpui_component::tooltip::Tooltip::new("Estimated agent usage — click for details")
+                    .build(window, cx)
+            })
+            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                on_usage_click(window, cx);
+            })
+            .child(label)
+    });
+
     div()
         .flex()
         .flex_row()
@@ -201,6 +235,13 @@ where
                 .justify_end()
                 .items_center()
                 .gap(px(2.))
+                .children(usage_chip.map(|chip| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(chip)
+                        .child(separator(theme, typography))
+                }))
                 .child(
                     div()
                         .text_size(px(typography.t_body_sm))

@@ -6,6 +6,7 @@
 pub mod adapter_picker;
 pub mod adapter_picker_params;
 pub mod agent_presentation;
+pub mod agent_session_persistence;
 pub mod agents_dashboard;
 pub mod add_project_dialog;
 pub mod agent_status_badge;
@@ -48,6 +49,7 @@ pub mod split_direction;
 pub mod stash_panel;
 pub mod status_bar;
 pub mod tab_context_menu;
+pub mod usage_meter;
 pub mod tasks_view;
 pub mod terminal_canvas;
 pub mod terminal_links;

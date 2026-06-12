@@ -46,9 +46,10 @@ pub fn status_color(status: &AgentStatus, theme: Theme) -> Hsla {
         AgentStatus::Done { code: Some(_) } => theme.status_error,
         AgentStatus::Done { code: None } => theme.status_muted,
         AgentStatus::Failed(_) => theme.status_error,
-        // Session was running at shutdown and could not be resumed; treat
-        // visually like a non-zero exit so the user notices on relaunch.
-        AgentStatus::Interrupted => theme.status_error,
+        // Stopped without finishing — user cancel, or alive at shutdown and
+        // not resumed. Deliberate or environmental, not a failure: muted,
+        // matching the "Stopped" verb on the rail/dashboard rows.
+        AgentStatus::Interrupted => theme.status_muted,
     }
 }
 
@@ -74,6 +75,7 @@ pub fn tooltip_for(status: &AgentStatus) -> Option<String> {
         }
         AgentStatus::Failed(msg) => Some(format!("Failed: {}", truncate_for_tooltip(msg))),
         AgentStatus::Done { code: Some(c) } if *c != 0 => Some(format!("Exited with code {c}")),
+        AgentStatus::Interrupted => Some("Stopped before finishing".to_string()),
         _ => None,
     }
 }
@@ -160,6 +162,20 @@ mod tests {
     fn failed_uses_status_error() {
         let s = AgentStatus::Failed("spawn refused".into());
         assert_eq!(status_color(&s, t()), t().status_error);
+    }
+
+    #[test]
+    fn interrupted_uses_status_muted() {
+        assert_eq!(
+            status_color(&AgentStatus::Interrupted, t()),
+            t().status_muted
+        );
+    }
+
+    #[test]
+    fn tooltip_for_interrupted_says_stopped() {
+        let tip = tooltip_for(&AgentStatus::Interrupted).expect("tooltip");
+        assert!(tip.contains("Stopped"));
     }
 
     #[test]

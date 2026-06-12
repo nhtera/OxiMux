@@ -11,6 +11,7 @@ pub mod commit_message_heuristic;
 pub mod registry;
 pub mod runtime;
 pub mod runtime_impl;
+pub mod session_log;
 pub mod status_machine;
 
 pub use cli::{
