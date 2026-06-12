@@ -217,17 +217,17 @@ fn main() {
         cx.set_global(oximux_app::git_state_cache::GitStateCache::load_from(
             app_state.settings_repo(),
         ));
-        cx.bind_keys(oximux_app::keymap::default_key_bindings());
+        // Install the full keymap (registry defaults ⊕ keybindings.toml
+        // overrides) — this covers the menu-action chords too, and MUST run
+        // before `set_menus`: GPUI reads the keymap when it builds the menu
+        // to render each item's ⌘ glyph, and never re-reads it for a static
+        // menu. Bind first, then build.
+        oximux_app::keybindings_settings::install(cx);
         // Install the application menu so the macOS menu bar reads "OxiMux"
         // (not the launching process's name) and carries the standard
-        // About / Hide / Quit / Window items. Menu-item shortcuts are read
-        // back from the keymap, so the menu key bindings must be installed
-        // too. `Quit` routes through `cx.quit()` so it shares the graceful-
-        // shutdown path; the native items defer to AppKit selectors.
-        // Menu key bindings MUST be installed before `set_menus`: GPUI reads
-        // the keymap when it builds the menu to render each item's ⌘ glyph,
-        // and never re-reads it for a static menu. Bind first, then build.
-        cx.bind_keys(oximux_app::menu::key_bindings());
+        // About / Hide / Quit / Window items. `Quit` routes through
+        // `cx.quit()` so it shares the graceful-shutdown path; the native
+        // items defer to AppKit selectors.
         cx.set_menus(oximux_app::menu::app_menus());
         cx.on_action::<oximux_app::menu::Quit>(|_, cx| cx.quit());
         cx.on_action::<oximux_app::menu::About>(|_, _cx| oximux_app::menu::platform::about());

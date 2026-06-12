@@ -54,7 +54,7 @@ impl SettingsModal {
                 ),
                 (
                     SettingsPane::Keybindings.label(),
-                    pane_keybindings::entries(theme, typography),
+                    pane_keybindings::entries(self, theme, density, typography, cx),
                 ),
                 (
                     SettingsPane::Appearance.label(),
@@ -75,7 +75,7 @@ impl SettingsModal {
                 pane_notifications::render(self, theme, density, typography, cx)
             }
             SettingsPane::Keybindings => {
-                pane_keybindings::render(&query, theme, density, typography)
+                pane_keybindings::render(self, theme, density, typography, cx)
             }
             SettingsPane::Appearance => pane_about::render_appearance(&query, theme, typography),
             SettingsPane::About => pane_about::render_about(&query, theme, typography),

@@ -620,10 +620,19 @@ fn open_project_cta(theme: Theme, density: Density, typography: &Typography) -> 
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_subtle)
         .hover(|s| s.text_color(theme.fg_base))
-        .child("Open a project (⌘O)")
+        .child(open_project_hint())
         .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
             window.dispatch_action(Box::new(OpenProjectPicker), cx);
         })
+}
+
+/// "Open a project (⌘O)" with the chord resolved from the keymap registry
+/// (drops the parens when the action is unbound).
+fn open_project_hint() -> String {
+    match crate::keymap_registry::display_chord_for("open_project_picker") {
+        Some(chord) => format!("Open a project ({chord})"),
+        None => "Open a project".to_string(),
+    }
 }
 
 fn divider(theme: Theme) -> impl IntoElement {

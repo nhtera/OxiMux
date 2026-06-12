@@ -289,7 +289,10 @@ pub fn command_center(
             div()
                 .text_size(px(typography.t_label_xs))
                 .text_color(theme.fg_subtle)
-                .child("⌘P"),
+                .child(
+                    crate::keymap_registry::display_chord_for("open_quick_open")
+                        .unwrap_or_default(),
+                ),
         );
 
     // `flex_1` + `justify_center` centers the field and leaves the flanks as

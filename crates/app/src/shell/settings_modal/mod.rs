@@ -22,6 +22,7 @@ mod view;
 
 pub use nav::SettingsPane;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui::{
@@ -82,6 +83,16 @@ pub struct SettingsModal {
     pub(super) search_input: Option<Entity<InputState>>,
     /// Keeps the `InputEvent::Change` → repaint subscription alive.
     _search_sub: Option<Subscription>,
+    /// Working copy of the `keybindings.toml` override map; reseeded from
+    /// disk at each `open()`. Edits persist + apply to the live keymap
+    /// immediately (see `pane_keybindings`).
+    pub(crate) keybind_overrides: BTreeMap<String, String>,
+    /// Action id currently capturing a new chord, if any. While set, a
+    /// keystroke interceptor swallows every key press app-wide so a bound
+    /// chord can be recorded without dispatching its action.
+    pub(crate) recording_action: Option<&'static str>,
+    /// The interceptor subscription — alive exactly while recording.
+    pub(super) recording_sub: Option<Subscription>,
 }
 
 impl SettingsModal {
@@ -110,6 +121,9 @@ impl SettingsModal {
             drag_grab: None,
             search_input: None,
             _search_sub: None,
+            keybind_overrides: BTreeMap::new(),
+            recording_action: None,
+            recording_sub: None,
         }
     }
 
@@ -136,6 +150,11 @@ impl SettingsModal {
             .try_global::<CommitMessageAiSettings>()
             .cloned()
             .unwrap_or_default();
+        // Reseed the keybinding overrides from disk (hand edits since boot
+        // show up here; load problems were already toasted at boot).
+        self.keybind_overrides = crate::keybindings_settings::load_overrides().0;
+        self.recording_action = None;
+        self.recording_sub = None;
         // Build a fresh (empty) search input each open, and repaint the panes
         // whenever its text changes so the filter is live.
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings"));
@@ -186,6 +205,10 @@ impl SettingsModal {
         // orphaned after the modal is hidden.
         self.search_input = None;
         self._search_sub = None;
+        // A close mid-recording must release the keystroke interceptor or
+        // every subsequent key press in the app would be swallowed.
+        self.recording_action = None;
+        self.recording_sub = None;
         if was_open {
             cx.emit(SettingsModalEvent::Closed);
         }

@@ -83,9 +83,8 @@ fn render_tab_button(
         .bg(indicator_color);
     let indicator_row = div().w_full().pb(px(3.0)).child(indicator);
 
-    // Hover tooltip: tab name + keyboard shortcut. Shortcut strings here
-    // mirror the bindings registered in main.rs sidebar keybinds —
-    // keep both sides in sync if those bindings move.
+    // Hover tooltip: tab name + keyboard shortcut, resolved live from the
+    // keymap registry so user overrides show up without a restart.
     let tooltip_text: gpui::SharedString = tooltip_label(tab).into();
 
     div()
@@ -108,24 +107,18 @@ fn render_tab_button(
         .child(indicator_row)
 }
 
-/// Keyboard shortcut hint string for a tab, or empty when no binding is
-/// registered. Pure function so it can be unit-tested without a GPUI
-/// runtime; kept here (not in `tab.rs`) so the `tab` module remains free
-/// of binding-string knowledge — that's a `main.rs` concern that the
-/// activity bar mirrors for tooltip purposes.
-///
-/// `Files` is currently unbound at the keymap level (see `main.rs`
-/// `cmd-shift-t` comment): the tab is hidden from `visible_tabs`, so
-/// `render_tab_button` is never called with `Files` and this arm is
-/// unreachable at runtime. The empty string is the correct value when
-/// `Files` is reintroduced without a new keybinding.
-fn shortcut_hint(tab: RightTab) -> &'static str {
-    match tab {
-        RightTab::Files => "",
-        RightTab::Explorer => "⌘⇧E",
-        RightTab::Search => "⌘⇧F",
-        RightTab::SourceControl => "⌘⇧G",
-    }
+/// Keyboard shortcut hint for a tab, resolved live from the keymap
+/// registry so a user override shows up in the tooltip. Empty when the
+/// action is unbound (`Files` has no select action and is hidden from
+/// `visible_tabs`, so its arm is unreachable at runtime).
+fn shortcut_hint(tab: RightTab) -> String {
+    let id = match tab {
+        RightTab::Files => return String::new(),
+        RightTab::Explorer => "select_explorer_tab",
+        RightTab::Search => "select_search_tab",
+        RightTab::SourceControl => "select_source_control_tab",
+    };
+    crate::keymap_registry::display_chord_for(id).unwrap_or_default()
 }
 
 /// Format the tooltip label. Drops the parenthesized shortcut when the
@@ -144,9 +137,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shortcut_hint_matches_main_bindings() {
-        // Mirror of crates/app/src/main.rs sidebar keybinds. Update both
-        // at once. `Files` is intentionally empty — currently unbound.
+    fn shortcut_hint_reads_registry_defaults() {
+        // Resolved from the keymap registry — no hand-mirrored strings.
         assert_eq!(shortcut_hint(RightTab::Files), "");
         assert_eq!(shortcut_hint(RightTab::Explorer), "⌘⇧E");
         assert_eq!(shortcut_hint(RightTab::Search), "⌘⇧F");

@@ -53,7 +53,7 @@ pub fn palette_row(
             .child(highlighted_label(&item.name, query, theme, typography)),
     );
 
-    if let Some(kb) = item.keybinding {
+    if let Some(kb) = item.keybinding.as_deref() {
         row = row.child(keybinding_chip(kb, theme, typography));
     }
     row

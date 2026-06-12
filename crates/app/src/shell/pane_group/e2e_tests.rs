@@ -26,7 +26,7 @@ use oximux_agents::CliRuntime;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{CloseTab, SplitSubPaneRight};
-use crate::keymap::default_key_bindings;
+use crate::keymap_registry::default_bindings as default_key_bindings;
 use crate::notifier::null::NullNotifier;
 use crate::persisted_terminals::{PersistedAxis, PersistedTree};
 use crate::shell::context_env::SurfaceIds;
@@ -450,5 +450,74 @@ async fn keymap_cmd_w_closes_per_pane_tab_first(cx: &mut TestAppContext) {
             1,
             "cmd-w must close a per-pane tab first via the keymap"
         );
+    });
+}
+
+/// Live rebind through the production path: `apply_live` must make the new
+/// chord dispatch AND dead-stop the old one via its NoAction shadow — the
+/// boot keymap is never cleared, so shadow precedence is what guarantees a
+/// moved chord stops firing.
+#[gpui::test]
+async fn keymap_apply_live_moves_a_binding_and_kills_the_old_chord(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    cx.update(|cx| cx.bind_keys(default_key_bindings()));
+
+    // Two per-pane tabs so each close has an observable effect.
+    window
+        .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+    window
+        .update(cx, |group, win, cx| group.add_tab_to_leaf(0, win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    // Move close_tab cmd-w → cmd-e (sync the registry's effective map to
+    // defaults first so the diff is exactly this one change regardless of
+    // other tests sharing the process-global state).
+    cx.update(|cx| {
+        crate::keymap_registry::apply_live(cx, &std::collections::BTreeMap::new());
+        let overrides = std::collections::BTreeMap::from([(
+            "close_tab".to_string(),
+            "cmd-e".to_string(),
+        )]);
+        let warnings = crate::keymap_registry::apply_live(cx, &overrides);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    });
+
+    // Old chord must be dead (shadowed), leaving both per-pane tabs alive.
+    cx.simulate_keystrokes(window.into(), "cmd-w");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        let tab = group.active_tab().expect("active tab");
+        let PaneContent::Terminal(tree) = &tab.content else {
+            panic!("expected Terminal");
+        };
+        assert_eq!(
+            tree.active_leaf().expect("leaf").len(),
+            2,
+            "cmd-w must stop dispatching after the rebind"
+        );
+    });
+
+    // New chord drives the same close cascade.
+    cx.simulate_keystrokes(window.into(), "cmd-e");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        let tab = group.active_tab().expect("active tab");
+        let PaneContent::Terminal(tree) = &tab.content else {
+            panic!("expected Terminal");
+        };
+        assert_eq!(
+            tree.active_leaf().expect("leaf").len(),
+            1,
+            "cmd-e must close a per-pane tab after the rebind"
+        );
+    });
+
+    // Restore defaults so the shared effective map can't surprise another
+    // test in this binary.
+    cx.update(|cx| {
+        crate::keymap_registry::apply_live(cx, &std::collections::BTreeMap::new());
     });
 }

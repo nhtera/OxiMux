@@ -29,7 +29,9 @@ struct LaunchActionSpec {
     icon: &'static str,
     title: &'static str,
     subtitle: &'static str,
-    shortcut: &'static str,
+    /// Keymap-registry action id whose live chord renders as the shortcut
+    /// hint (empty = no hint).
+    shortcut_action: &'static str,
     primary: bool,
 }
 
@@ -39,7 +41,7 @@ const LAUNCH_ACTIONS: &[LaunchActionSpec] = &[
         icon: "icons/folder-open.svg",
         title: "Open project",
         subtitle: "Resume a repo or pick a folder",
-        shortcut: "\u{2318}O",
+        shortcut_action: "open_project_picker",
         primary: true,
     },
     LaunchActionSpec {
@@ -47,7 +49,7 @@ const LAUNCH_ACTIONS: &[LaunchActionSpec] = &[
         icon: "icons/git-branch.svg",
         title: "New workspace",
         subtitle: "Create an isolated worktree",
-        shortcut: "\u{2318}\u{21E7}N",
+        shortcut_action: "open_workspace_create",
         primary: false,
     },
     LaunchActionSpec {
@@ -55,7 +57,7 @@ const LAUNCH_ACTIONS: &[LaunchActionSpec] = &[
         icon: "icons/plus.svg",
         title: "Add project",
         subtitle: "Browse, clone, or attach remote",
-        shortcut: "\u{2318}O",
+        shortcut_action: "open_project_picker",
         primary: false,
     },
     LaunchActionSpec {
@@ -63,7 +65,7 @@ const LAUNCH_ACTIONS: &[LaunchActionSpec] = &[
         icon: "icons/keyboard.svg",
         title: "Command palette",
         subtitle: "Find actions and custom prompts",
-        shortcut: "\u{2318}\u{21E7}P",
+        shortcut_action: "open_command_palette",
         primary: false,
     },
 ];
@@ -163,11 +165,16 @@ fn action_card(
                         .child(spec.subtitle),
                 ),
         )
-        .child(shortcut_chip(spec.shortcut, theme, density, typography))
+        .child(shortcut_chip(
+            crate::keymap_registry::display_chord_for(spec.shortcut_action).unwrap_or_default(),
+            theme,
+            density,
+            typography,
+        ))
 }
 
 fn shortcut_chip(
-    label: &'static str,
+    label: String,
     theme: Theme,
     density: Density,
     typography: &Typography,

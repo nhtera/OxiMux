@@ -247,7 +247,12 @@ impl SourceControlPanel {
                             .path("icons/refresh-cw.svg")
                             .size(px(sc_style::ICON)),
                     )
-                    .tooltip("Refresh (⌘R)")
+                    .tooltip(
+                        match crate::keymap_registry::display_chord_for("refresh_source_control") {
+                            Some(chord) => format!("Refresh ({chord})"),
+                            None => "Refresh".to_string(),
+                        },
+                    )
                     .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
                         panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
                     })),

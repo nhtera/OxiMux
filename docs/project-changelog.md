@@ -4,6 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-12 — Keyboard shortcut registry: editable keybindings, TOML overrides, live rebind
+
+**Commits**: `_pending_`  
+**Touches**: `crates/app/src/keymap_registry/` (NEW), `crates/app/src/keybindings_settings.rs` (NEW), `crates/settings/src/keybindings.rs` (NEW), `crates/app/src/shell/settings_modal/` (Keybindings pane rewritten), `crates/app/src/keymap.rs` (DELETED), 9 chord-display call sites
+
+Named-action shortcut registry becomes the single source of truth for every keybinding:
+
+- **Registry inventory** (`keymap_registry/inventory.rs`). 47 actions with stable ids, labels, six categories, and default chords — replaces the hand-maintained `keymap.rs` + read-only settings table pair and absorbs the menu chords (⌘Q/⌘H/⌥⌘H/⌘M). Group-split and reload-commands actions ship unbound but bindable.
+- **User overrides** (`keybindings.toml` in the app data dir). Flat `action_id = "chord"` table; empty string unbinds. Unknown ids and invalid chords keep the default and surface as an error toast at first window; a syntactically broken file falls back to defaults — never a crash. Chord validation rejects unknown key names (gpui's parser accepts any token).
+- **Live rebind without restart**. Settings edits append `NoAction` shadows for vacated chords then re-bind every owner of an affected chord — correct through chord swaps and conflict-then-resolve sequences (covered by unit tests + a keystroke-simulation e2e). The boot keymap is never cleared, preserving the component library's text-input bindings.
+- **Editable Keybindings pane**. Record-a-chord (keystroke interceptor runs before action dispatch, so bound chords are recordable; Esc cancels, ⌫ unbinds), conflict badges on every owner of a duplicated chord, per-row Reset for overrides, Reset-all, searchable via the global settings finder.
+- **Registry-driven chord display**. Command palette, activity-bar tooltips, top-bar hint, welcome screen, left rail, workspace dialog, and SCM refresh tooltip all resolve glyphs live from the registry — user overrides show up everywhere; the palette's incorrect ⌘D/⌘⇧D chips on the group-split rows are gone.
+
+---
+
 ### 2026-06-12 — Notification system overhaul, agent-awake service, Notifications settings pane
 
 **Commits**: `aeaaada`  

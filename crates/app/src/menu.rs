@@ -12,7 +12,7 @@
 //! dispatched as GPUI actions and handled in `main.rs`, which calls into the
 //! [`platform`] helpers below to invoke the AppKit responder selectors.
 
-use gpui::{KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, actions};
+use gpui::{Menu, MenuItem, OsAction, SystemMenuType, actions};
 
 // Menu actions. `Quit` and the native window/app items carry handlers wired
 // in `main.rs`; the Edit entries are driven by the OS via their `OsAction`
@@ -81,18 +81,9 @@ pub fn app_menus() -> Vec<Menu> {
     ]
 }
 
-/// Keyboard shortcuts for the menu actions. Installed via `cx.bind_keys` in
-/// `main.rs`; GPUI reads these back to render the ⌘Q / ⌘H / ⌥⌘H / ⌘M glyphs
-/// next to the menu items. Clipboard shortcuts are intentionally NOT bound
-/// here — the terminal owns ⌘C/⌘V/⌘X, and a global binding would shadow it.
-pub fn key_bindings() -> Vec<KeyBinding> {
-    vec![
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", HideApp, None),
-        KeyBinding::new("cmd-alt-h", HideOthers, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-    ]
-}
+// The ⌘Q / ⌘H / ⌥⌘H / ⌘M chords live in the keymap registry inventory
+// (Global category) with every other binding; GPUI reads them back from the
+// keymap to render the menu-item glyphs.
 
 /// AppKit responder selectors for the standard app/window menu items. GPUI's
 /// menu API only natively wires the clipboard `OsAction`s, so the rest are

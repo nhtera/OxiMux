@@ -506,7 +506,12 @@ impl WorkspaceDialog {
             .selected_project
             .as_ref()
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| "No projects — open one first (⌘O)".to_string());
+            .unwrap_or_else(|| {
+                match crate::keymap_registry::display_chord_for("open_project_picker") {
+                    Some(chord) => format!("No projects — open one first ({chord})"),
+                    None => "No projects — open one first".to_string(),
+                }
+            });
 
         let mut col = div()
             .flex()

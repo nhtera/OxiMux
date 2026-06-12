@@ -16,16 +16,16 @@ const CONTENT_MAX_W: f32 = 560.0;
 const SECTION_GAP: f32 = 16.0;
 const TAGLINE_GAP: f32 = 8.0;
 
-/// Static list of shortcut hint rows shown in the welcome screen. Each
-/// shortcut is an ordered slice of key glyphs — rendered as one chip per
-/// token with a small gap between, instead of a single "cmd-shift-p"
-/// pill. The welcome state keeps only project-entry shortcuts because
-/// terminal and split-pane commands need an active workspace.
-pub const SHORTCUT_HINTS: &[(&[&str], &str)] = &[
-    (&["\u{2318}", "O"], "Open a project"),
-    (&["\u{2318}", "\u{21E7}", "N"], "New workspace"),
-    (&["\u{2318}", "P"], "Quick Open"),
-    (&["\u{2318}", "\u{21E7}", "P"], "Command Palette"),
+/// Shortcut hint rows shown in the welcome screen, as (registry action id,
+/// description). Glyphs resolve live from the keymap registry — one chip
+/// per key token — so user overrides show up here too. The welcome state
+/// keeps only project-entry shortcuts because terminal and split-pane
+/// commands need an active workspace.
+pub const SHORTCUT_HINTS: &[(&str, &str)] = &[
+    ("open_project_picker", "Open a project"),
+    ("open_workspace_create", "New workspace"),
+    ("open_quick_open", "Quick Open"),
+    ("open_command_palette", "Command Palette"),
 ];
 
 /// Pure predicate — show welcome only when there are no live project panes.
@@ -100,14 +100,18 @@ fn tagline(theme: Theme, typography: &Typography) -> impl IntoElement {
 
 fn hints(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
     let mut col = div().flex().flex_col().gap(px(TAGLINE_GAP));
-    for (keys, desc) in SHORTCUT_HINTS {
+    for (action_id, desc) in SHORTCUT_HINTS {
+        // An unbound action (user cleared the chord) drops its hint row.
+        let Some(keys) = crate::keymap_registry::display_tokens_for(action_id) else {
+            continue;
+        };
         col = col.child(hint_row(keys, desc, theme, density, typography));
     }
     col
 }
 
 fn hint_row(
-    keys: &'static [&'static str],
+    keys: Vec<String>,
     desc: &'static str,
     theme: Theme,
     density: Density,
@@ -117,7 +121,7 @@ fn hint_row(
     // justify_between so the description hugs the left and the chip
     // cluster hugs the right within a fixed 320px frame.
     let mut chips = div().flex().flex_row().items_center().gap(px(4.));
-    for key in keys.iter() {
+    for key in keys {
         chips = chips.child(key_chip(key, theme, density, typography));
     }
     div()
@@ -139,7 +143,7 @@ fn hint_row(
 
 /// One key chip — small square with the glyph centered.
 fn key_chip(
-    glyph: &'static str,
+    glyph: String,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -176,8 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_hints_count_is_four() {
+    fn shortcut_hints_resolve_from_registry() {
         assert_eq!(SHORTCUT_HINTS.len(), 4);
+        for (id, _) in SHORTCUT_HINTS {
+            assert!(
+                crate::keymap_registry::display_tokens_for(id).is_some(),
+                "welcome hint `{id}` should resolve a default chord"
+            );
+        }
+        assert_eq!(
+            crate::keymap_registry::display_tokens_for("open_project_picker").unwrap(),
+            vec!["\u{2318}".to_string(), "O".to_string()]
+        );
     }
 
     #[test]

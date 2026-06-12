@@ -562,6 +562,13 @@ impl WorkspaceRoot {
         // Register this window's layer as the active toast surface up front so
         // toasts work before the first window-activation event arrives.
         crate::shell::toast::set_active_toast_layer(cx, toast_layer.downgrade());
+        // Keybinding-override problems found at boot predate any window;
+        // surface them now that a toast layer exists (first window drains).
+        for warning in crate::keybindings_settings::take_boot_warnings() {
+            toast_layer.update(cx, |layer, cx| {
+                layer.push(crate::shell::toast::ToastKind::Error, warning, cx);
+            });
+        }
         // When the settings modal closes (×, Esc, click-outside, or toggle),
         // return keyboard focus to the workspace root. The modal grabs focus
         // for its search field on open; without this the handle stays focused
