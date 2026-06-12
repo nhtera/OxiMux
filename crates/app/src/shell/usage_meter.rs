@@ -1,24 +1,34 @@
-//! Status-bar usage meter — compact `~NN% 5h · ~NN% wk` chip + click
+//! Status-bar usage meter — compact `NN% 5h · NN% wk` chip + click
 //! popover with window details.
 //!
 //! Data comes from `oximux_agents::session_log::usage_probe` on a 60 s
 //! background tick owned by `WorkspaceRoot`. Everything here is rendering
 //! plus pure formatting; the meter renders nothing at all when no snapshot
 //! is available (no account config, unknown tier) — absent beats "N/A"
-//! noise. All numbers are estimates from local session logs; every surface
-//! carries the "~" prefix and the popover spells the caveat out.
+//! noise. Presentation follows the snapshot source: account-API numbers
+//! are exact and render plainly; local-tally numbers are estimates and
+//! every surface carries the "~" prefix plus a popover caveat.
 
 use gpui::{Div, Hsla, ParentElement, Styled, div, px};
-use oximux_agents::session_log::usage::{UsageSnapshot, UsageWindow};
+use oximux_agents::session_log::usage::{UsageSnapshot, UsageSource, UsageWindow};
 use oximux_settings::{Density, Theme, Typography};
 
-/// Compact status-bar label: `~63% 5h · ~41% wk`.
+/// Compact status-bar label: `12% 5h · 4% wk` (exact) or
+/// `~63% 5h · ~41% wk` (estimate).
 pub fn meter_label(snapshot: &UsageSnapshot) -> String {
+    let approx = approx_prefix(snapshot);
     format!(
-        "~{}% 5h · ~{}% wk",
+        "{approx}{}% 5h · {approx}{}% wk",
         pct(snapshot.five_hour.ratio()),
         pct(snapshot.weekly.ratio())
     )
+}
+
+fn approx_prefix(snapshot: &UsageSnapshot) -> &'static str {
+    match snapshot.source {
+        UsageSource::AccountApi => "",
+        UsageSource::LocalEstimate => "~",
+    }
 }
 
 /// Meter color keyed to the hotter window: error ≥ 90 %, warn ≥ 70 %,
@@ -38,7 +48,8 @@ fn pct(ratio: f32) -> u8 {
     (ratio * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
-/// `"2h 05m"` / `"45m"` until a reset timestamp; `None` when already past.
+/// `"6d 21h"` / `"2h 05m"` / `"45m"` until a reset timestamp; `None` when
+/// already past. Days appear once the span exceeds 48 h (weekly resets).
 pub fn format_reset_in(resets_at_ms: i64, now_ms: i64) -> Option<String> {
     let remaining = resets_at_ms - now_ms;
     if remaining <= 0 {
@@ -46,7 +57,9 @@ pub fn format_reset_in(resets_at_ms: i64, now_ms: i64) -> Option<String> {
     }
     let mins = remaining / 60_000;
     let (h, m) = (mins / 60, mins % 60);
-    Some(if h > 0 {
+    Some(if h >= 48 {
+        format!("{}d {}h", h / 24, h % 24)
+    } else if h > 0 {
         format!("{h}h {m:02}m")
     } else {
         format!("{m}m")
@@ -64,13 +77,20 @@ pub fn format_tokens(tokens: f64) -> String {
     }
 }
 
-fn window_line(window: &UsageWindow, name: &str, reset: String) -> String {
-    format!(
-        "{name}: ~{}%  ({} / {} tokens) · {reset}",
-        pct(window.ratio()),
-        format_tokens(window.used_tokens),
-        format_tokens(window.budget_tokens),
-    )
+/// One popover line. Exact windows show the percentage plainly; estimate
+/// windows keep the "~" and disclose the token math behind the guess.
+fn window_line(window: &UsageWindow, name: &str, reset: String, source: UsageSource) -> String {
+    match source {
+        UsageSource::AccountApi => {
+            format!("{name}: {}% used · {reset}", pct(window.ratio()))
+        }
+        UsageSource::LocalEstimate => format!(
+            "{name}: ~{}%  ({} / {} tokens) · {reset}",
+            pct(window.ratio()),
+            format_tokens(window.used_tokens),
+            format_tokens(window.budget_tokens),
+        ),
+    }
 }
 
 /// The popover card body: one line per window + the estimate disclosure.
@@ -88,8 +108,35 @@ pub fn render_usage_popover(
         .and_then(|t| format_reset_in(t, now_ms))
         .map(|in_| format!("resets in {in_}"))
         .unwrap_or_else(|| "no active block".to_string());
-    let five_line = window_line(&snapshot.five_hour, "5-hour block", five_reset);
-    let weekly_line = window_line(&snapshot.weekly, "Weekly", "rolling 7 days".to_string());
+    let five_line = window_line(
+        &snapshot.five_hour,
+        "5-hour block",
+        five_reset,
+        snapshot.source,
+    );
+    // The account API knows the real weekly reset; the local estimate can
+    // only describe its rolling window.
+    let weekly_reset = snapshot
+        .weekly
+        .resets_at_ms
+        .and_then(|t| format_reset_in(t, now_ms))
+        .map(|in_| format!("resets in {in_}"))
+        .unwrap_or_else(|| "rolling 7 days".to_string());
+    let weekly_line = window_line(&snapshot.weekly, "Weekly", weekly_reset, snapshot.source);
+    let (title, footer) = match snapshot.source {
+        UsageSource::AccountApi => (
+            "Agent usage",
+            if snapshot.tier.is_empty() {
+                "From the account usage API".to_string()
+            } else {
+                format!("From the account usage API · tier {}", snapshot.tier)
+            },
+        ),
+        UsageSource::LocalEstimate => (
+            "Agent usage (estimated)",
+            format!("Estimated from local session logs · tier {}", snapshot.tier),
+        ),
+    };
 
     div()
         .flex()
@@ -104,7 +151,7 @@ pub fn render_usage_popover(
             div()
                 .text_size(px(typography.t_body_sm))
                 .text_color(theme.fg_base)
-                .child("Agent usage (estimated)"),
+                .child(title),
         )
         .child(
             div()
@@ -122,10 +169,7 @@ pub fn render_usage_popover(
             div()
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
-                .child(format!(
-                    "Estimated from local session logs · tier {}",
-                    snapshot.tier
-                )),
+                .child(footer),
         )
 }
 
@@ -146,7 +190,50 @@ mod tests {
                 resets_at_ms: None,
             },
             tier: "default_claude_max_5x".to_string(),
+            source: UsageSource::LocalEstimate,
         }
+    }
+
+    fn exact_snapshot(five_pct: f64, weekly_pct: f64) -> UsageSnapshot {
+        UsageSnapshot {
+            five_hour: UsageWindow {
+                used_tokens: five_pct,
+                budget_tokens: 100.0,
+                resets_at_ms: Some(10_000_000),
+            },
+            weekly: UsageWindow {
+                used_tokens: weekly_pct,
+                budget_tokens: 100.0,
+                resets_at_ms: Some(600_000_000),
+            },
+            tier: "default_claude_max_5x".to_string(),
+            source: UsageSource::AccountApi,
+        }
+    }
+
+    #[test]
+    fn meter_label_exact_source_drops_tilde() {
+        assert_eq!(meter_label(&exact_snapshot(12.0, 4.0)), "12% 5h · 4% wk");
+    }
+
+    #[test]
+    fn window_line_exact_source_skips_token_counts() {
+        let snap = exact_snapshot(12.0, 4.0);
+        let line = window_line(
+            &snap.five_hour,
+            "5-hour block",
+            "resets in 4h 33m".to_string(),
+            snap.source,
+        );
+        assert_eq!(line, "5-hour block: 12% used · resets in 4h 33m");
+    }
+
+    #[test]
+    fn format_reset_in_shows_days_for_long_spans() {
+        // 6 days 21 hours out.
+        let span_ms = (6 * 24 + 21) * 3_600_000_i64 + 5 * 60_000;
+        assert_eq!(format_reset_in(span_ms, 0).as_deref(), Some("6d 21h"));
+        assert_eq!(format_reset_in(3_900_000, 0).as_deref(), Some("1h 05m"));
     }
 
     #[test]

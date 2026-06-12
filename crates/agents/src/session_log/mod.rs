@@ -16,6 +16,7 @@
 
 pub mod activity;
 pub mod usage;
+pub mod usage_oauth;
 pub mod usage_probe;
 
 use std::fs;

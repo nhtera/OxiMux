@@ -37,13 +37,28 @@ impl UsageWindow {
     }
 }
 
+/// Where a snapshot's numbers came from — decides whether the UI presents
+/// them as exact or estimate-grade ("~" prefix, token-count caveats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    /// The vendor's account usage API: exact window utilization
+    /// percentages and reset times for the whole account (all devices).
+    AccountApi,
+    /// Local session-log token tally: estimate-grade, this machine only,
+    /// scaled by the guessed per-tier budgets below.
+    LocalEstimate,
+}
+
 /// Full probe output: both windows + the account tier they were scaled by.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSnapshot {
     pub five_hour: UsageWindow,
     pub weekly: UsageWindow,
-    /// Raw tier slug from the account config (e.g. `default_claude_max_5x`).
+    /// Raw tier slug from the account config (e.g. `default_claude_max_5x`);
+    /// empty when unknown (possible on the `AccountApi` path, which does
+    /// not need budgets).
     pub tier: String,
+    pub source: UsageSource,
 }
 
 /// Estimated weighted-token budgets for one account tier.

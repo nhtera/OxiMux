@@ -1,9 +1,10 @@
-//! `UsageProbe` — blocking sampler that turns on-disk session logs into a
-//! [`UsageSnapshot`]. Strategy investigation outcome (plan step 4): the
-//! CLI ships no usage query command, and the account config caches no
-//! window percentages — the per-message `usage` objects in the session
-//! logs are the only local source, so the JSONL tally IS the probe
-//! (estimate-grade, sanctioned).
+//! `UsageProbe` — blocking sampler producing a [`UsageSnapshot`].
+//!
+//! Strategy order: the account usage API first (`usage_oauth` — exact
+//! account-wide percentages, the same numbers the CLI's own usage panel
+//! shows), then the local session-log token tally as the estimate-grade
+//! fallback when the API is unreachable (no credentials, offline,
+//! Keychain declined).
 //!
 //! Blocking file IO throughout — callers MUST run `sample()` on a
 //! background executor. A per-file `(mtime, len)` cache keeps steady-state
@@ -18,8 +19,8 @@ use std::sync::Mutex;
 use serde_json::Value;
 
 use super::usage::{
-    HourBuckets, UsageSnapshot, WEEK_MS, bucket_key, budget_for_tier, five_hour_window,
-    weekly_window, weighted_tokens,
+    HourBuckets, UsageSnapshot, UsageSource, UsageWindow, WEEK_MS, bucket_key, budget_for_tier,
+    five_hour_window, weekly_window, weighted_tokens,
 };
 use super::{now_unix_ms, parse_timestamp_ms};
 
@@ -42,6 +43,12 @@ pub trait UsageProbe: Send + Sync {
 pub struct SessionLogUsageProbe {
     home: PathBuf,
     cache: Mutex<HashMap<PathBuf, FileTally>>,
+    /// The account usage API is tried before the tally (exact numbers).
+    /// Off in tests — the fetch shells out to the Keychain and network.
+    oauth_enabled: bool,
+    /// Don't re-attempt the API before this instant after a failure: a
+    /// Keychain decline would otherwise re-prompt on every 60 s tick.
+    oauth_backoff_until_ms: Mutex<i64>,
 }
 
 struct FileTally {
@@ -50,11 +57,67 @@ struct FileTally {
     buckets: HourBuckets,
 }
 
+/// After a failed API attempt, stay on the estimate path this long.
+const OAUTH_BACKOFF_MS: i64 = 15 * 60_000;
+
 impl SessionLogUsageProbe {
     pub fn new(home: PathBuf) -> Self {
         Self {
             home,
             cache: Mutex::new(HashMap::new()),
+            oauth_enabled: true,
+            oauth_backoff_until_ms: Mutex::new(0),
+        }
+    }
+
+    /// Estimate-only probe: skips the account usage API entirely.
+    pub fn new_estimate_only(home: PathBuf) -> Self {
+        Self {
+            oauth_enabled: false,
+            ..Self::new(home)
+        }
+    }
+
+    /// Try the account usage API, honoring the failure backoff.
+    fn sample_oauth(&self, now_ms: i64) -> Option<UsageSnapshot> {
+        if !self.oauth_enabled {
+            return None;
+        }
+        {
+            let until = self
+                .oauth_backoff_until_ms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if now_ms < *until {
+                return None;
+            }
+        }
+        match super::usage_oauth::fetch(&self.home) {
+            Some(usage) => {
+                let tier = read_account_tier(&self.home.join(".claude.json")).unwrap_or_default();
+                Some(UsageSnapshot {
+                    five_hour: UsageWindow {
+                        used_tokens: usage.five_hour.utilization,
+                        budget_tokens: 100.0,
+                        resets_at_ms: usage.five_hour.resets_at_ms,
+                    },
+                    weekly: UsageWindow {
+                        used_tokens: usage.seven_day.utilization,
+                        budget_tokens: 100.0,
+                        resets_at_ms: usage.seven_day.resets_at_ms,
+                    },
+                    tier,
+                    source: UsageSource::AccountApi,
+                })
+            }
+            None => {
+                let mut until = self
+                    .oauth_backoff_until_ms
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *until = now_ms + OAUTH_BACKOFF_MS;
+                None
+            }
         }
     }
 
@@ -70,9 +133,12 @@ impl SessionLogUsageProbe {
 
 impl UsageProbe for SessionLogUsageProbe {
     fn sample(&self) -> Option<UsageSnapshot> {
+        let now = now_unix_ms();
+        if let Some(snapshot) = self.sample_oauth(now) {
+            return Some(snapshot);
+        }
         let tier = read_account_tier(&self.home.join(".claude.json"))?;
         let budget = budget_for_tier(&tier)?;
-        let now = now_unix_ms();
 
         let projects_dir = self.home.join(".claude").join("projects");
         let logs = session_logs_within(&projects_dir, now);
@@ -133,6 +199,7 @@ impl UsageProbe for SessionLogUsageProbe {
             five_hour: five_hour_window(&merged, now, budget.block_tokens),
             weekly: weekly_window(&merged, now, budget.weekly_tokens),
             tier,
+            source: UsageSource::LocalEstimate,
         })
     }
 }
@@ -373,14 +440,14 @@ mod tests {
     #[test]
     fn sample_none_without_account_config() {
         let home = tempfile::tempdir().unwrap();
-        let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
         assert!(probe.sample().is_none());
     }
 
     #[test]
     fn sample_none_for_unknown_tier() {
         let home = fixture_home("enterprise_unbounded");
-        let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
         assert!(probe.sample().is_none());
     }
 
@@ -396,7 +463,7 @@ mod tests {
                 r#"{"type":"user","message":{"content":"hi"}}"#.to_string(),
             ],
         );
-        let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
         let snap = probe.sample().expect("snapshot");
         assert_eq!(snap.tier, "default_claude_max_5x");
         assert_eq!(snap.five_hour.used_tokens, 1800.0);
@@ -419,7 +486,7 @@ mod tests {
                 0,
             )],
         );
-        let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
         let first = probe.sample().expect("first");
         let second = probe.sample().expect("second");
         assert_eq!(first.five_hour.used_tokens, second.five_hour.used_tokens);
@@ -449,7 +516,7 @@ mod tests {
                 0,
             )],
         );
-        let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
         assert!(probe.sample().is_some());
         assert_eq!(probe.cached_file_count(), 2);
         // Age `ancient.jsonl` past the horizon; the next sample must both
@@ -469,7 +536,7 @@ mod tests {
     #[test]
     fn sample_with_no_logs_reads_zero() {
         let home = fixture_home("claude_pro");
-        let probe = SessionLogUsageProbe::new(home.path().to_path_buf());
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
         let snap = probe.sample().expect("snapshot");
         assert_eq!(snap.five_hour.used_tokens, 0.0);
         assert_eq!(snap.five_hour.resets_at_ms, None);
