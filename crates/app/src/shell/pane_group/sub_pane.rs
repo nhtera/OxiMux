@@ -121,6 +121,23 @@ impl LeafTabs {
         }
         true
     }
+
+    /// Close the tab at `idx` (not necessarily the active one). Returns
+    /// `false` when it was the LAST tab (caller removes the whole leaf) or
+    /// `idx` is out of range. Keeps `active` pointing at the same logical
+    /// tab when one before it is removed.
+    fn close_tab_at(&mut self, idx: usize) -> bool {
+        if idx >= self.tabs.len() || self.tabs.len() <= 1 {
+            return false;
+        }
+        self.tabs.remove(idx);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+        true
+    }
 }
 
 /// One terminal tab's sub-pane state. Always non-empty in a well-formed
@@ -361,6 +378,48 @@ impl TerminalSplitTree {
         self.tree.remove_leaf(closed);
         // Pick a new active: first surviving leaf in in-order traversal.
         if let Some(next) = self.tree.in_order_leaves().first().copied() {
+            self.active = next;
+        }
+        true
+    }
+
+    /// Close a SPECIFIC tab inside a SPECIFIC leaf (by slot + tab index),
+    /// regardless of which leaf/tab is active. Returns `true` when the tab
+    /// was removed and the leaf survives (it had >1 tab); `false` when that
+    /// was the leaf's last tab — caller falls back to [`close_leaf`].
+    /// Used by the auto-close-on-exit path, which targets the pane that
+    /// exited rather than the active one.
+    pub fn close_tab_in_leaf(&mut self, leaf: usize, tab_idx: usize) -> bool {
+        match self.panes.get_mut(leaf) {
+            Some(Some(l)) => l.close_tab_at(tab_idx),
+            _ => false,
+        }
+    }
+
+    /// Close a SPECIFIC leaf (the whole sub-pane, all its tabs) by slot,
+    /// regardless of which leaf is active. No-op + `false` when it's the
+    /// LAST live leaf (caller closes the owning group tab) or the slot is
+    /// already empty. Mirrors [`close_active`] but targets `leaf`.
+    pub fn close_leaf(&mut self, leaf: usize) -> bool {
+        if self.live_count() <= 1 {
+            return false;
+        }
+        if self.panes.get(leaf).and_then(|s| s.as_ref()).is_none() {
+            return false;
+        }
+        if self.zoomed == Some(leaf) {
+            self.zoomed = None;
+        }
+        if let Some(slot) = self.panes.get_mut(leaf) {
+            *slot = None;
+        }
+        self.tree.remove_leaf(leaf);
+        // Re-point `active` only if the closed leaf was the active one; a
+        // background pane's exit must not steal focus from the leaf the user
+        // is in.
+        if !self.tree.in_order_leaves().contains(&self.active)
+            && let Some(next) = self.tree.in_order_leaves().first().copied()
+        {
             self.active = next;
         }
         true

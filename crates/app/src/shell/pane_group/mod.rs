@@ -40,7 +40,7 @@ use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::{Axis, SplitInsert};
-use crate::shell::terminal_view::{TerminalView, spawn_local_pty};
+use crate::shell::terminal_view::{TerminalView, TerminalViewEvent, spawn_local_pty};
 
 /// Discriminator for `PaneGroupTab` carrying any per-kind metadata.
 pub enum PaneGroupTabKind {
@@ -220,6 +220,13 @@ pub struct PaneGroup {
     /// drag leaves the strip.
     drag_hover: Option<TabDragHover>,
     active: usize,
+    /// Session ids of terminal views that reported a clean exit (status 0) and
+    /// want their hosting tab auto-closed. Pushed by the `CleanExit`
+    /// subscription (no `&mut Window` there) and drained at the top of
+    /// `render` (which has one) — see [`close_lone_exited_tabs`]. Only
+    /// lone-view terminal tabs are closed; split / stacked panes keep the exit
+    /// banner instead.
+    pending_clean_exit_closes: Vec<TerminalSessionId>,
     /// Last set of on-screen terminal view ids pushed to `set_visible(true)`.
     /// Render diffs against this so the per-view visibility sweep only runs
     /// when the shown set actually changes (tab/leaf-tab switch, split, zoom),
@@ -296,6 +303,7 @@ impl PaneGroup {
             tab_order: Vec::new(),
             drag_hover: None,
             active: 0,
+            pending_clean_exit_closes: Vec::new(),
             last_visible_ids: std::collections::HashSet::new(),
             focus_handle: cx.focus_handle(),
             next_terminal_n: 1,
@@ -896,6 +904,70 @@ impl PaneGroup {
     fn wire_opener(view: &gpui::Entity<TerminalView>, cx: &mut Context<Self>) {
         let opener = cx.weak_entity();
         view.update(cx, |v, _| v.set_opener(opener));
+        // Auto-close: a clean child exit (status 0) asks the group to close the
+        // hosting tab. Window-free here (subscribe has no `&mut Window`), so we
+        // queue the session id and let `render` (which has a window) do the
+        // actual `close_tab`.
+        cx.subscribe(view, |this, _view, event, cx| match event {
+            TerminalViewEvent::CleanExit { session_id } => {
+                this.pending_clean_exit_closes.push(*session_id);
+                cx.notify();
+            }
+        })
+        .detach();
+    }
+
+    /// Drain `pending_clean_exit_closes`: for each session that reported a
+    /// clean exit, close the pane it lived in. Cascades like Cmd+W —
+    /// stacked leaf-tab → drop that tab; split leaf (its last tab) → drop the
+    /// leaf; the tab's last remaining view → close the whole group tab.
+    /// Called from `render`, the one place with a `&mut Window`.
+    pub fn close_lone_exited_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_clean_exit_closes.is_empty() {
+            return;
+        }
+        let sessions = std::mem::take(&mut self.pending_clean_exit_closes);
+        for session in sessions {
+            // Locate the exited view: (tab, leaf slot, leaf-tab idx) plus the
+            // tab's total view count and that leaf's tab count, so we know
+            // which rung of the cascade to take. Done first (immutable +
+            // `view.read`) so the close mutation below holds no live borrow.
+            let mut hit = None;
+            for (tab_idx, tab) in self.tabs.iter().enumerate() {
+                let PaneContent::Terminal(tree) = &tab.content else {
+                    continue;
+                };
+                let mut total = 0usize;
+                let mut found: Option<(usize, usize)> = None;
+                for (slot, leaf_tab_idx, view) in tree.iter_all_views() {
+                    total += 1;
+                    if view.read(cx).session_id() == session {
+                        found = Some((slot, leaf_tab_idx));
+                    }
+                }
+                if let Some((slot, leaf_tab_idx)) = found {
+                    let leaf_tab_count = tree.leaf(slot).map(|l| l.len()).unwrap_or(1);
+                    hit = Some((tab_idx, slot, leaf_tab_idx, total, leaf_tab_count));
+                    break;
+                }
+            }
+            let Some((tab_idx, slot, leaf_tab_idx, total, leaf_tab_count)) = hit else {
+                continue;
+            };
+            if total == 1 {
+                // Lone view → close the whole group tab.
+                self.close_tab(tab_idx, window, cx);
+            } else if let PaneContent::Terminal(tree) = &mut self.tabs[tab_idx].content {
+                if leaf_tab_count > 1 {
+                    // Stacked leaf-tab → drop just that tab.
+                    tree.close_tab_in_leaf(slot, leaf_tab_idx);
+                } else {
+                    // Split leaf holding only this view → drop the leaf.
+                    tree.close_leaf(slot);
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Open `path` and move the editor cursor to the 1-based `line`/`col` as

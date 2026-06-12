@@ -167,3 +167,45 @@ async fn natural_shell_exit_removes_checkpoint() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn attach_after_exit_replays_exit_to_new_subscriber() {
+    // The daemon outlives the app; a re-launched app attaching to a session
+    // whose child already died must be told it is dead (replayed `Exit`),
+    // not left adopting the frozen ring as a live, input-less pane.
+    let registry = PtyRegistry::with_checkpoints(None);
+    let pty_id = registry.spawn(spawn_args()).expect("spawn");
+
+    // Subscriber A drives the shell to a clean exit and observes it.
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<Notification>(64);
+    registry.attach(&pty_id, tx_a).expect("attach A");
+    registry.write(&pty_id, b"exit\n").expect("write exit");
+    let code_a = timeout(Duration::from_secs(5), async {
+        loop {
+            match rx_a.recv().await {
+                Some(Notification::Exit { code, .. }) => break code,
+                Some(_) => continue,
+                None => panic!("channel closed before Exit"),
+            }
+        }
+    })
+    .await
+    .expect("first subscriber sees Exit");
+    assert_eq!(code_a, Some(0), "a clean `exit` carries status 0");
+
+    // Subscriber B reconnects AFTER the child is gone — it must still get Exit.
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<Notification>(64);
+    registry.attach(&pty_id, tx_b).expect("attach B");
+    let code_b = timeout(Duration::from_secs(2), async {
+        loop {
+            match rx_b.recv().await {
+                Some(Notification::Exit { code, .. }) => break code,
+                Some(_) => continue,
+                None => panic!("channel closed before replayed Exit"),
+            }
+        }
+    })
+    .await
+    .expect("reconnecting subscriber is replayed Exit");
+    assert_eq!(code_b, Some(0), "replayed Exit carries the real status");
+}

@@ -33,7 +33,7 @@ use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
-use crate::shell::terminal_view::{TerminalView, spawn_local_pty_dormant};
+use crate::shell::terminal_view::{TerminalView, TerminalViewEvent, spawn_local_pty_dormant};
 
 /// Convenience: boot a `PaneGroup` entity inside a GPUI test window.
 /// Returns `(window, temp_dir)`. `temp_dir` must stay alive for the
@@ -192,6 +192,149 @@ async fn close_tab_cascade_closes_per_pane_tab_before_group_tab(cx: &mut TestApp
             tree.active_leaf().expect("leaf").len(),
             1,
             "leaf should have exactly 1 per-pane tab after cascade close"
+        );
+    });
+}
+
+// ── auto-close: a clean exit closes a lone-view terminal tab ───────────────
+
+/// Read the active tab's sole terminal view + its session id.
+fn active_lone_view(
+    window: &gpui::WindowHandle<PaneGroup>,
+    cx: &mut TestAppContext,
+) -> (Entity<TerminalView>, oximux_pty::TerminalSessionId) {
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        let tab = group.active_tab().expect("active tab");
+        let PaneContent::Terminal(tree) = &tab.content else {
+            panic!("expected Terminal content");
+        };
+        let view = tree.active_view().expect("active view").clone();
+        let session = view.read(app).session_id();
+        (view, session)
+    })
+}
+
+#[gpui::test]
+async fn clean_exit_auto_closes_lone_terminal_tab(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    window
+        .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    let (view, session) = active_lone_view(&window, cx);
+    assert_eq!(
+        cx.read(|app| window.read(app).expect("alive").tab_count()),
+        1,
+        "pre-condition: exactly one terminal tab"
+    );
+
+    // Emit the clean-exit signal the way `tick` does on status 0, then drain.
+    cx.update(|cx| {
+        view.update(cx, |_v, cx| {
+            cx.emit(TerminalViewEvent::CleanExit {
+                session_id: session,
+            })
+        })
+    });
+    cx.run_until_parked();
+    window
+        .update(cx, |group, win, cx| group.close_lone_exited_tabs(win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.read(|app| window.read(app).expect("alive").tab_count()),
+        0,
+        "lone-view terminal tab must auto-close on a clean exit"
+    );
+}
+
+#[gpui::test]
+async fn clean_exit_closes_split_leaf_keeps_tab(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    window
+        .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+    // Split → the tab now hosts two live sub-panes (leaves).
+    window
+        .update(cx, |group, win, cx| {
+            group.on_split_sub_pane_right(&SplitSubPaneRight, win, cx);
+        })
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    // The exited view's leaf must drop, but the group tab survives.
+    let (view, session) = active_lone_view(&window, cx);
+    cx.update(|cx| {
+        view.update(cx, |_v, cx| {
+            cx.emit(TerminalViewEvent::CleanExit {
+                session_id: session,
+            })
+        })
+    });
+    cx.run_until_parked();
+    window
+        .update(cx, |group, win, cx| group.close_lone_exited_tabs(win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(group.tab_count(), 1, "split tab itself must survive");
+        let tab = group.active_tab().expect("active tab");
+        let PaneContent::Terminal(tree) = &tab.content else {
+            panic!("expected Terminal content");
+        };
+        assert_eq!(
+            tree.live_count(),
+            1,
+            "the exited sub-pane leaf must be closed, leaving one"
+        );
+    });
+}
+
+#[gpui::test]
+async fn clean_exit_closes_stacked_leaf_tab_keeps_tab(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    window
+        .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+    // Add a second per-pane tab stacked in the same leaf (no split).
+    window
+        .update(cx, |group, win, cx| group.add_tab_to_leaf(0, win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    // The newly added tab is active; exit it → just that leaf-tab drops.
+    let (view, session) = active_lone_view(&window, cx);
+    cx.update(|cx| {
+        view.update(cx, |_v, cx| {
+            cx.emit(TerminalViewEvent::CleanExit {
+                session_id: session,
+            })
+        })
+    });
+    cx.run_until_parked();
+    window
+        .update(cx, |group, win, cx| group.close_lone_exited_tabs(win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(group.tab_count(), 1, "group tab must survive");
+        let tab = group.active_tab().expect("active tab");
+        let PaneContent::Terminal(tree) = &tab.content else {
+            panic!("expected Terminal content");
+        };
+        assert_eq!(
+            tree.active_leaf().expect("leaf").len(),
+            1,
+            "the exited leaf-tab must be closed, leaving one"
         );
     });
 }

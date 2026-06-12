@@ -23,9 +23,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ScrollWheelEvent, Styled, Task, WeakEntity, Window, canvas, div, px,
+    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task, WeakEntity, Window,
+    canvas, div, px,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -358,6 +359,18 @@ struct CommandMark {
     exit: Option<i32>,
 }
 
+/// Events a `TerminalView` raises to its host pane group. Today the only one
+/// is a clean child exit (status 0): the group decides whether to auto-close
+/// the hosting tab (a lone-view terminal tab) or leave the exit banner in
+/// place (split / stacked panes). A non-zero or signalled exit is NOT emitted
+/// — it always keeps the banner so the failure stays on screen.
+#[derive(Clone, Copy)]
+pub enum TerminalViewEvent {
+    CleanExit { session_id: TerminalSessionId },
+}
+
+impl EventEmitter<TerminalViewEvent> for TerminalView {}
+
 pub struct TerminalView {
     /// `Arc<Mutex<Box<dyn TerminalBackend>>>` — shared with whoever spawned
     /// the session. For local terminals the renderer is the only holder;
@@ -493,6 +506,14 @@ pub struct TerminalView {
     /// dropping the row (which would orphan the daemon PTY on next boot).
     /// Read only by [`relay_id_for_capture`](Self::relay_id_for_capture).
     pending_relay_hint: Option<String>,
+    /// `Some(code)` once the PTY's child process exits (`TerminalEvent::Exit`);
+    /// `None` while it runs. Drives the "process exited" banner so a pane whose
+    /// leader has died — e.g. a program run with `exec`, leaving no shell to
+    /// fall back to — reads as finished rather than hung instead of freezing on
+    /// its final frame. Cleared whenever the view is made live again
+    /// ([`adopt_live_session`](Self::adopt_live_session) /
+    /// [`respawn_if_dormant`](Self::respawn_if_dormant)).
+    exited: Option<i32>,
 }
 
 impl TerminalView {
@@ -650,6 +671,7 @@ impl TerminalView {
             progress: None,
             pending_attach: false,
             pending_relay_hint: None,
+            exited: None,
         }
     }
 
@@ -710,6 +732,10 @@ impl TerminalView {
         }
         self.pending_attach = false;
         self.pending_relay_hint = None;
+        // A fresh live session is replacing the placeholder — drop any stale
+        // exit banner so a swap (e.g. post-attach reconcile) never leaves the
+        // "process exited" marker over a now-running shell.
+        self.exited = None;
         let old_backend = std::mem::replace(&mut self.backend, backend);
         let old_id = std::mem::replace(&mut self.session_id, session_id);
         // The placeholder owns no child process, but close it anyway so the
@@ -833,6 +859,7 @@ impl TerminalView {
             progress: None,
             pending_attach: false,
             pending_relay_hint: None,
+            exited: None,
         }
     }
 
@@ -873,6 +900,8 @@ impl TerminalView {
             // can still scroll through the prefilled grid.
             return;
         }
+        // The shell is alive again at the dormant cwd — clear any exit marker.
+        self.exited = None;
         self._poll_task = Some(Self::start_poll_task(cx));
         cx.notify();
     }
@@ -1003,6 +1032,14 @@ impl TerminalView {
     /// dropping it (which would orphan the daemon PTY: alive, but no
     /// row points at it on the next boot).
     pub fn relay_id_for_capture(&self) -> Option<String> {
+        // An exited session is dead in the daemon — persisting its relay id
+        // would cold-restore a frozen, input-less pane on the next launch. Drop
+        // the reattach hint so a dead session is never revived as a corpse;
+        // lone clean-exit tabs are already auto-closed before capture, and any
+        // other exited leaf respawns fresh instead of restoring dead.
+        if self.exited.is_some() {
+            return None;
+        }
         if self.pending_attach {
             return self.pending_relay_hint.clone();
         }
@@ -1854,6 +1891,7 @@ impl TerminalView {
         // and avoids pinning the cursor visible on a dead session.
         let mut needs_snapshot = false;
         let mut had_output = false;
+        let mut exit_changed = false;
         let mut got_bell = false;
         let mut bell_rang = false;
         let mut latest_title: Option<String> = None;
@@ -1864,6 +1902,25 @@ impl TerminalView {
                 TerminalEvent::Output { .. } => {
                     needs_snapshot = true;
                     had_output = true;
+                }
+                // The child process died. Record the code so render shows a
+                // "process exited" banner; without it a dead leader (e.g. a
+                // program run with `exec`, with no shell to fall back to) just
+                // freezes the final frame and is indistinguishable from a hang.
+                // A clean exit (status 0) ALSO emits `CleanExit` so a lone-view
+                // tab auto-closes (the group decides); a non-zero/signalled exit
+                // keeps the banner. `None` (signal/detach) maps to the `-1`
+                // sentinel — a real Unix status is 0..=255, so it can't collide
+                // and never reads as clean.
+                TerminalEvent::Exit { code, .. } => {
+                    let code = code.unwrap_or(-1);
+                    self.exited = Some(code);
+                    exit_changed = true;
+                    if code == 0 {
+                        cx.emit(TerminalViewEvent::CleanExit {
+                            session_id: self.session_id,
+                        });
+                    }
                 }
                 TerminalEvent::Resize { .. } => needs_snapshot = true,
                 TerminalEvent::TitleChange { title, .. } => {
@@ -1947,7 +2004,7 @@ impl TerminalView {
         // (its snapshot is already updated above, so it's current the instant
         // it's shown) but still repaints on an attention edge (bell / error
         // progress) so a background tab's chip can light up.
-        if self.visible || got_bell {
+        if self.visible || got_bell || exit_changed {
             cx.notify();
         }
     }
@@ -2511,6 +2568,14 @@ impl Render for TerminalView {
         if let Some(badge) = dormant_badge {
             root = root.child(badge);
         }
+        // A pane whose PTY child has exited gets a centered "process exited"
+        // strip so a dead leader reads as finished, not hung — otherwise the
+        // frozen final frame is indistinguishable from a stuck terminal.
+        // Mutually exclusive with the dormant badge (dormant = never spawned;
+        // exited = spawned and died).
+        if let Some(code) = self.exited {
+            root = root.child(build_exit_banner(&theme, code));
+        }
         // Scrolled-up indicator: a faint chip while the viewport is off the
         // live tail, so the user knows new output is landing below the fold
         // and that any keystroke will snap back down.
@@ -2665,6 +2730,40 @@ fn build_dormant_badge(theme: &Theme) -> gpui::Div {
         // the dormancy contract: the shell isn't running yet; first
         // focus or keystroke wakes it at the saved cwd.
         .child("↻ restored — click to wake")
+}
+
+/// Centered top strip shown once a pane's PTY child has exited. Marks the
+/// pane as finished (not hung) and points the user at the close shortcut —
+/// this is a terminating affordance, so there is no inline restart. Exit code
+/// `0` reads as a clean end; any non-zero code is shown so a crash is visible.
+fn build_exit_banner(theme: &Theme, code: i32) -> gpui::Div {
+    // `0` = clean, `>0` = real status, `<0` = signal/unknown (the `-1`
+    // sentinel from a `None` exit code) where no number is meaningful.
+    let label = if code > 0 {
+        format!("process exited (code {code})")
+    } else {
+        "process exited".to_string()
+    };
+    div()
+        .absolute()
+        .top(px(6.0))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .px(px(10.0))
+                .py(px(3.0))
+                .rounded(px(4.0))
+                .bg(theme.bg_overlay)
+                .text_color(theme.fg_muted)
+                .text_size(px(11.0))
+                .border_1()
+                .border_color(theme.border_inactive)
+                // `⏻` = U+23FB Power Symbol.
+                .child(format!("⏻ {label} · ⌘W to close")),
+        )
 }
 
 /// Faint top-right chip shown while the viewport is scrolled up off the live

@@ -51,6 +51,13 @@ impl Render for PaneGroup {
             self.set_drag_hover(None, cx);
         }
 
+        // Auto-close the pane of any terminal whose shell cleanly exited
+        // (queued by the `CleanExit` subscription, which has no window):
+        // stacked tab / split leaf / whole tab as the cascade dictates. Done
+        // before the element tree is built so this frame paints the post-close
+        // state directly.
+        self.close_lone_exited_tabs(window, cx);
+
         // Lazy install — first render is the first paint where we have
         // window + cx + focus_handle in the same scope. Subsequent calls
         // are idempotent.

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,13 @@ struct Entry {
     // The `close` grace poll watches this to skip the full SIGKILL
     // wait when the child has already reaped naturally.
     child_exited: Arc<AtomicBool>,
+    // The child's exit status, stored by `reader_loop` just before it sets
+    // `child_exited`. `EXIT_CODE_NONE` (a signal/detach, no status) or a real
+    // 0..=255. Read only when `child_exited` is set, so its pre-exit value is
+    // never observed. Lets `attach` replay an `Exit` to a client that
+    // reconnects AFTER the child already died (the daemon outlives the app, so
+    // a re-launched app would otherwise adopt a dead session as a frozen pane).
+    exit_code: Arc<AtomicI32>,
     // Best-effort PID of the spawned child for the SIGTERM step. None
     // on non-Unix or when portable-pty returns None.
     pid: Option<u32>,
@@ -191,6 +198,7 @@ impl PtyRegistry {
         let ring = Arc::new(Mutex::new(RingBuffer::new(REPLAY_BUFFER_BYTES)));
         let subscribers: Arc<Mutex<Vec<Sender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
         let child_exited = Arc::new(AtomicBool::new(false));
+        let exit_code = Arc::new(AtomicI32::new(EXIT_CODE_NONE));
 
         // The reader thread owns the cloned read fd and the Child
         // handle (so it can wait for the exit code). It pushes bytes
@@ -200,6 +208,7 @@ impl PtyRegistry {
         let ring_for_reader = Arc::clone(&ring);
         let subs_for_reader = Arc::clone(&subscribers);
         let exited_for_reader = Arc::clone(&child_exited);
+        let exit_code_for_reader = Arc::clone(&exit_code);
         let bytes_out_for_reader = Arc::clone(&bytes_out);
         let checkpoints_for_reader = self.checkpoints.clone();
         std::thread::Builder::new()
@@ -212,6 +221,7 @@ impl PtyRegistry {
                     ring_for_reader,
                     subs_for_reader,
                     exited_for_reader,
+                    exit_code_for_reader,
                     bytes_out_for_reader,
                     checkpoints_for_reader,
                 )
@@ -245,6 +255,7 @@ impl PtyRegistry {
             ring,
             subscribers,
             child_exited,
+            exit_code,
             pid,
             bytes_in: AtomicU64::new(0),
             bytes_out,
@@ -285,6 +296,23 @@ impl PtyRegistry {
         let ring = entry.ring.lock().expect("ring poisoned");
         let mut subs = entry.subscribers.lock().expect("subs poisoned");
         let replay = ring.snapshot();
+        // If the child already died (the daemon outlives the app, so a
+        // re-launched app can attach to a dead session), replay the terminal
+        // `Exit` to THIS new subscriber after its scrollback — otherwise it
+        // adopts the frozen ring as a live, input-less pane. Sent before the
+        // push so `reader_loop`'s own one-shot fan-out (if it is still in
+        // flight) can't also reach this sender; a benign duplicate is harmless
+        // (the client treats Exit idempotently).
+        if entry.child_exited.load(Ordering::Acquire) {
+            let raw = entry.exit_code.load(Ordering::Acquire);
+            let code = (raw != EXIT_CODE_NONE).then_some(raw);
+            // `try_send` (not async `send`) to match `fan_out`; the channel was
+            // just created by the attaching client so it is empty.
+            let _ = sub.try_send(Notification::Exit {
+                pty_id: pty_id.to_owned(),
+                code,
+            });
+        }
         subs.push(sub);
         drop(subs);
         drop(ring);
@@ -581,6 +609,12 @@ fn send_sigterm(pid: Option<u32>) {
     }
 }
 
+/// Sentinel `exit_code` for "the child carried no status" — a signal or
+/// detach where `Child::wait` returned `None`. Distinguishes a real `0`
+/// (clean exit) from "unknown" so `attach` can replay the correct
+/// `Notification::Exit { code }` (`None` here) to a late-reconnecting client.
+const EXIT_CODE_NONE: i32 = i32::MIN;
+
 fn reader_loop(
     pty_id: String,
     mut reader: Box<dyn Read + Send>,
@@ -588,6 +622,7 @@ fn reader_loop(
     ring: Arc<Mutex<RingBuffer>>,
     subscribers: Arc<Mutex<Vec<Sender<Notification>>>>,
     child_exited: Arc<AtomicBool>,
+    exit_code: Arc<AtomicI32>,
     bytes_out: Arc<AtomicU64>,
     checkpoints: Option<Arc<CheckpointStore>>,
 ) {
@@ -618,6 +653,9 @@ fn reader_loop(
         }
     }
     let code = child.wait().ok().map(|s| s.exit_code() as i32);
+    // Stash the status BEFORE flipping `child_exited`, so any reader that
+    // observes the flag (here or in `attach`) also sees the final code.
+    exit_code.store(code.unwrap_or(EXIT_CODE_NONE), Ordering::Release);
     // Release-ordered so the corresponding Acquire load in `close`
     // observes the flag flip without sequencing the fan_out below.
     child_exited.store(true, Ordering::Release);
