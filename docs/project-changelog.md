@@ -4,6 +4,44 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Agent name + count for hand-launched agents
+
+**Commits**: _(local, pending)_  
+**Touches**: `crates/agents/src/agent_title.rs`, `crates/agents/src/lib.rs`, `crates/app/src/shell/agent_presentation.rs`, `crates/app/src/shell/pane_group/` (mod.rs, render.rs), `crates/app/src/shell/project_panes/mod.rs`, `crates/app/src/shell/workspace_ops.rs`, `crates/app/src/shell/left_rail/` (mod.rs, project_group.rs, workspace_row.rs, workspace_card.rs), `crates/app/src/workspace_root.rs`
+
+Building on the ambient-status work below: the worktree card and the tab chip now show the detected agent's NAME, and a hand-launched agent counts in the status-bar total — closer to the reference app's per-worktree agent listing, kept compact to fit OxiMux.
+
+- **`agent_label_from_title`** resolves a display name from the OSC title (Claude Code / Codex / Gemini CLI / Aider / OpenCode / Cursor / …), whole-token matched with a `[\w./\\-]` boundary so `opencode-helper` doesn't match.
+- **Card status line** renders `"Claude Code · Running"` — the name comes from a hand-launched agent's title (`AmbientAgent.label`) or, for a spawned session, the tracked adapter id mapped via `adapter_display_name`. No name resolved → the line shows the verb alone as before.
+- **Tab chip** (`detect_tab_agent`) unifies a hand-launched agent terminal with a spawned one: while a recognized agent runs, the plain terminal tab adopts the agent's name, brand icon, and status dot (a user-set custom title still wins for the label). Updates live via the group's existing per-view observer.
+- **Status-bar "N agents"** now adds plain terminals running a recognized agent (`ambient_agent_count`) to the spawned-tab count, so a hand-typed `claude` registers there too.
+
+Verified live: real `cc` typed into a plain terminal flips the graphify-rs card from a stale "Claude Code · Stopped" to "Claude Code · Ready", renames the tab "Terminal 1" → "Claude Code", and bumps the status bar `0 agents → 1 agent`. Unit-tested the label heuristic (named-agent precedence, bare-glyph fallback, boundary rejection), the adapter-name map, and card-plan name carry-through.
+
+Note: OSC title state isn't replayed when the daemon re-attaches a restored terminal (only scrollback is) — a cold-restored agent tab reads its stale tracked status and "Terminal N" until the program re-emits a title.
+
+Scope (v1): a single name + verb per card (not the reference UX's expandable multi-row list); the dashboard/nav badge unchanged.
+
+---
+
+### 2026-06-13 — Ambient agent status from plain-terminal titles
+
+**Commits**: _(local, pending)_  
+**Touches**: `crates/agents/src/agent_title.rs` (NEW), `crates/agents/src/lib.rs`, `crates/app/src/shell/agent_presentation.rs`, `crates/app/src/shell/pane_group/mod.rs`, `crates/app/src/shell/project_panes/mod.rs`, `crates/app/src/shell/workspace_ops.rs`, `crates/app/src/shell/left_rail/` (mod.rs, project_group.rs)
+
+Status tracking used to be opt-in at spawn time: only a tab minted through the adapter picker got a `StatusMachine`, so a plain terminal — or a coding agent the user launched by hand (`claude`/`codex`/…) — never moved the sidebar dot. The card kept showing the last tracked session's stale state ("Stopped") while real work was happening in a terminal.
+
+Now an agent is detected ambiently from the terminal's OSC window title, which agent CLIs rewrite as they run (already piped into `TerminalView.title`):
+
+- **`classify_agent_title`** maps a title to a live status — a Braille spinner glyph → `Running`, an idle/awaiting marker (U+2733) → `Idle`, a stop-hand glyph (U+270B) or permission phrasing → `NeedsApproval`. Keyword fallbacks fire only when a known agent token is present (whole-token matched), so plain-shell titles (cwd, `user@host`) never register a concrete state.
+- **Plain-terminal tabs are scanned** each render; the reading is keyed by worktree path. `resolve_effective_status` combines it with the tracked DB status: an *active* tracked session (working/blocking) stays authoritative, otherwise the live ambient reading overrides an absent/idle/finished one — so a hand-typed agent surfaces over a stale "Stopped"/"Done".
+
+Verified live in a plain terminal: a working-spinner title flips a stale "Stopped" worktree to "Running" (blue); an idle marker shows "Ready" (green). Unit-tested classifier (glyph + keyword + boundary cases) and resolution precedence.
+
+Scope (v1): left-rail cards only; the Agents dashboard and the nav unread badge still read the DB. No stale-decay timer yet — a sticky working title persists until the shell overwrites it (a follow-up could time it out). Hook-server / inline-status-protocol layers intentionally deferred.
+
+---
+
 ### 2026-06-13 — Surface PTY exit; auto-close cleanly exited terminals
 
 **Commits**: `3dffc99`  
