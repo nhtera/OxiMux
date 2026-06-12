@@ -2053,12 +2053,16 @@ impl Render for WorkspaceRoot {
             .map(|p| p.read(cx).manager().in_order_groups().len())
             .unwrap_or(0);
 
-        // Aggregate open-agent-tab count across every group in the active
-        // project. Same semantics as before — users care about total
+        // Aggregate agent count across every group in the active project:
+        // spawned `Agent` tabs PLUS plain terminals running a hand-launched
+        // agent (detected from the terminal title). Users care about total
         // agents in flight, not just the foreground group's.
         let agent_count = active_panes
             .as_ref()
-            .map(|p| p.read(cx).agent_count(cx))
+            .map(|p| {
+                let panes = p.read(cx);
+                panes.agent_count(cx) + panes.ambient_agent_count(cx)
+            })
             .unwrap_or(0);
 
         // True TTY count = terminal + agent tabs across every group.

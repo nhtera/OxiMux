@@ -159,8 +159,32 @@ pub fn render_workspace_card(
         .children(issue_chip)
         .children(folder_pill);
 
-    // Line 2 — agent verb + diff chip. Both are optional; when absent the
-    // line collapses to empty (card stays two-row tall for consistency).
+    // Line 2 — [agent name ·] agent verb + diff chip. All optional; when
+    // absent the line collapses to empty (card stays two-row tall).
+    // The agent name (a tracked session's adapter, or a hand-launched agent
+    // detected from its terminal title) precedes the verb: "Claude Code · Running".
+    let name_elem = plan.agent_name.as_ref().map(|name| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .min_w_0()
+            .child(
+                div()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_muted)
+                    .truncate()
+                    .child(name.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_subtle)
+                    .child("·"),
+            )
+    });
+
     let verb_elem = plan.agent_verb.as_ref().map(|v| {
         div()
             .text_size(px(typography.t_sub_label))
@@ -200,6 +224,7 @@ pub fn render_workspace_card(
         .flex_row()
         .items_center()
         .gap(px(density.gap_inline))
+        .children(name_elem)
         .children(verb_elem)
         .children(diff_elem);
 

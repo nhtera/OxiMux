@@ -205,15 +205,32 @@ pub fn build_tab_strip_for(
     // context-menu handlers) is preserved.
     let tabs: Vec<PaneGroupTabHeader> = group
         .visible_tabs()
-        .map(|(idx, t)| PaneGroupTabHeader {
-            tab_idx: idx,
-            // Custom title overrides the default label when set.
-            label: t.custom_title.clone().unwrap_or_else(|| t.label.clone()),
-            kind_marker: kind_marker(&t.kind),
-            agent_status: agent_status_for(&t.kind),
-            attention: attention_for(&t.content, cx),
-            color: t.color,
-            pinned: t.pinned,
+        .map(|(idx, t)| {
+            // A plain terminal running a recognized agent adopts the agent
+            // chip wholesale — icon, status dot, and name — so a hand-launched
+            // agent is visually identical to a spawned one (a user-set custom
+            // title still wins for the label).
+            let ambient = detect_tab_agent(t, cx);
+            PaneGroupTabHeader {
+                tab_idx: idx,
+                label: t.custom_title.clone().unwrap_or_else(|| {
+                    ambient
+                        .as_ref()
+                        .map(|a| a.label.into())
+                        .unwrap_or_else(|| t.label.clone())
+                }),
+                kind_marker: ambient
+                    .as_ref()
+                    .map(|a| PaneTabKindMarker::Agent(a.adapter_id))
+                    .unwrap_or_else(|| kind_marker(&t.kind)),
+                agent_status: ambient
+                    .as_ref()
+                    .map(|a| a.status.clone())
+                    .or_else(|| agent_status_for(&t.kind)),
+                attention: attention_for(&t.content, cx),
+                color: t.color,
+                pinned: t.pinned,
+            }
         })
         .collect();
     let active = group.active();
@@ -268,6 +285,50 @@ enum PaneTabKindMarker {
     /// status badge) but keep their own marker so future visual
     /// differentiation (e.g. a `±` adornment) is a single-line change.
     Diff,
+}
+
+/// A recognized agent running inside a plain terminal tab, detected live from
+/// its OSC title. Drives the tab chip's name, brand icon, and status dot so a
+/// hand-launched agent presents identically to a spawned one.
+struct TabAgent {
+    label: &'static str,
+    /// Registry adapter slug for the brand glyph (`agent_icon`), or `""` when
+    /// the agent isn't one with a dedicated icon (falls back to terminal).
+    adapter_id: &'static str,
+    status: oximux_core::AgentStatus,
+}
+
+/// Detect an agent in a *plain* terminal tab from the active view's OSC title.
+/// `None` for non-terminal tabs, terminals with no title, or titles that don't
+/// classify as agent activity. Spawned `Agent` tabs are left to their own
+/// `status_rx`-driven chip.
+fn detect_tab_agent(tab: &PaneGroupTab, cx: &App) -> Option<TabAgent> {
+    if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
+        return None;
+    }
+    let PaneContent::Terminal(tree) = &tab.content else {
+        return None;
+    };
+    let title = tree.active_view()?.read(cx).title()?;
+    let status = oximux_agents::classify_agent_title(title)?;
+    let label = oximux_agents::agent_label_from_title(title)?;
+    Some(TabAgent {
+        label,
+        adapter_id: adapter_slug_for_label(label),
+        status,
+    })
+}
+
+/// Map an agent display name to its registry adapter slug so the tab chip
+/// renders the right brand glyph. Names without a dedicated icon map to `""`
+/// (terminal-glyph fallback in `agent_icon`).
+fn adapter_slug_for_label(label: &str) -> &'static str {
+    match label {
+        "Claude Code" => "claude-code",
+        "Codex" => "codex",
+        "Aider" => "aider",
+        _ => "",
+    }
 }
 
 fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {

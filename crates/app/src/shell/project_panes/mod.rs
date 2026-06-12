@@ -220,6 +220,16 @@ impl ProjectPanes {
         self.groups.values().map(|g| g.read(cx).agent_count()).sum()
     }
 
+    /// Count of plain-terminal tabs running a hand-launched agent across all
+    /// groups. Added to `agent_count` for the status-bar total so a manually
+    /// started `claude`/`codex`/… shows up in "N agents".
+    pub fn ambient_agent_count(&self, cx: &App) -> usize {
+        self.groups
+            .values()
+            .map(|g| g.read(cx).ambient_agent_count(cx))
+            .sum()
+    }
+
     /// Pick a target agent session for "send to active agent" actions.
     /// Preference order: (1) the active group's active tab when it's an
     /// agent (most-direct routing for the common "terminal + agent side
@@ -745,6 +755,32 @@ impl ProjectPanes {
             }
         }
         set
+    }
+
+    /// Ambient agent statuses inferred from plain-terminal titles across all
+    /// groups, keyed by worktree path string (matching
+    /// `Workspace.worktree_path`). When several groups/terminals key the same
+    /// path, the strongest (most attention-worthy) reading wins. Surfaces a
+    /// hand-launched agent on the sidebar without a tracked session.
+    pub fn ambient_agent_statuses(
+        &self,
+        cx: &gpui::App,
+    ) -> std::collections::HashMap<String, crate::shell::agent_presentation::AmbientAgent> {
+        use crate::shell::agent_presentation::{AmbientAgent, ambient_status_rank};
+        let mut map: std::collections::HashMap<String, AmbientAgent> =
+            std::collections::HashMap::new();
+        for group in self.groups.values() {
+            for (path, agent) in group.read(cx).ambient_agent_statuses(cx) {
+                let key = path.display().to_string();
+                let replace = map.get(&key).is_none_or(|cur| {
+                    ambient_status_rank(&agent.status) > ambient_status_rank(&cur.status)
+                });
+                if replace {
+                    map.insert(key, agent);
+                }
+            }
+        }
+        map
     }
 
     /// Open or activate a diff tab in the active group for `(path, staged)`.

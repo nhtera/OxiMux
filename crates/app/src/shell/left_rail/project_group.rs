@@ -13,6 +13,7 @@ use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::OpenWorkspaceCreate;
+use crate::shell::agent_presentation::AmbientAgent;
 use crate::shell::left_rail::LeftRail;
 use crate::shell::left_rail::workspace_card::render_workspace_card;
 use crate::shell::left_rail::workspace_row::{DiffCounts, build_workspace_card_plan};
@@ -70,8 +71,10 @@ pub fn render_project_group(
     project: Project,
     workspaces: Vec<Workspace>,
     latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
+    latest_adapter_for: impl Fn(&str) -> Option<&'static str>,
     active_workspace_id: Option<&str>,
     live_worktrees: &std::collections::HashSet<String>,
+    ambient_by_path: &std::collections::HashMap<String, AmbientAgent>,
     diff_counts: &std::collections::HashMap<String, DiffCounts>,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
@@ -113,7 +116,28 @@ pub fn render_project_group(
         let is_primary = workspace.worktree_path == project.root_path;
         let is_folder = is_primary && workspace.branch.is_empty();
         let is_live = live_worktrees.contains(&workspace.worktree_path);
-        let latest = latest_status_for(&workspace.id);
+        // Combine the tracked session status with any live ambient reading
+        // from a hand-launched agent in this worktree's terminal: an active
+        // tracked session stays authoritative, otherwise the ambient reading
+        // overrides a stale/absent one (see `resolve_effective_status`).
+        let tracked = latest_status_for(&workspace.id);
+        let tracked_present = tracked.is_some();
+        let ambient = ambient_by_path.get(&workspace.worktree_path);
+        let latest = crate::shell::agent_presentation::resolve_effective_status(
+            tracked,
+            ambient.map(|a| a.status.clone()),
+        );
+        // Agent display name: a hand-launched agent's name (from its title)
+        // wins; otherwise a tracked session contributes its adapter name.
+        // `None` leaves the card showing only the status verb.
+        let agent_name: Option<SharedString> = ambient
+            .and_then(|a| a.label)
+            .or_else(|| {
+                tracked_present
+                    .then(|| latest_adapter_for(&workspace.id))
+                    .flatten()
+            })
+            .map(SharedString::new_static);
         // Diff counts are looked up from the pushed-down cache; `None` means
         // not yet available — the card renders without the chip.
         let diff = diff_counts.get(&workspace.worktree_path).cloned();
@@ -124,6 +148,7 @@ pub fn render_project_group(
             is_folder,
             is_live,
             latest.as_ref(),
+            agent_name,
             diff,
             theme,
         );

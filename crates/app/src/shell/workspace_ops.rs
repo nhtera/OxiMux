@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
 use oximux_core::{AgentAdapter, Project, Workspace};
+
+use crate::shell::agent_presentation::AmbientAgent;
 use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, ScriptKind, Theme, Typography};
 use oximux_storage::{AgentSessionRepo, ProjectRepo, StorageError, WorkspaceRepo};
@@ -1255,6 +1257,23 @@ impl WorkspaceRoot {
         for panes in self.project_panes_by_project.values() {
             live_worktrees.extend(panes.read(cx).live_worktree_paths(cx));
         }
+        // Ambient agent statuses inferred live from plain-terminal OSC titles
+        // (a hand-launched `claude`/`codex`/… with no tracked session). Keyed
+        // by worktree path; the card resolves these against the DB-backed
+        // status so a live hand-typed agent surfaces over a stale one. Strong-
+        // est reading per path wins when projects overlap on a worktree.
+        let mut ambient_status: HashMap<String, AmbientAgent> = HashMap::new();
+        for panes in self.project_panes_by_project.values() {
+            for (path, agent) in panes.read(cx).ambient_agent_statuses(cx) {
+                let replace = ambient_status.get(&path).is_none_or(|cur| {
+                    crate::shell::agent_presentation::ambient_status_rank(&agent.status)
+                        > crate::shell::agent_presentation::ambient_status_rank(&cur.status)
+                });
+                if replace {
+                    ambient_status.insert(path, agent);
+                }
+            }
+        }
         // Workspace rows + latest agent statuses come from the rail caches
         // (gathered on the background executor by `mark_rail_dirty`) —
         // render never touches SQLite or stats the filesystem.
@@ -1270,6 +1289,7 @@ impl WorkspaceRoot {
             );
         }
         let latest_status = self.rail_latest_status.clone();
+        let latest_adapter = self.rail_latest_adapter.clone();
         // Diff counts are refreshed out-of-band by the periodic, focus-gated
         // refresh loop (see `WorkspaceRoot::run_diff_refresh_round`); here we
         // only read the latest cached snapshot. Render never shells out to git.
@@ -1283,6 +1303,8 @@ impl WorkspaceRoot {
                 workspaces_by_project,
                 latest_status,
                 live_worktrees,
+                ambient_status,
+                latest_adapter,
                 diff_counts_snapshot,
                 agent_activity_snapshot,
                 cx,

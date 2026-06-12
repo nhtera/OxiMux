@@ -88,12 +88,131 @@ pub fn agent_verb(status: Option<&AgentStatus>, is_live: bool, theme: Theme) -> 
     }
 }
 
+/// A live agent detected from a plain terminal's OSC title: its status plus,
+/// when recognizable, the agent's display name. Carried through the rail so a
+/// hand-launched agent shows up by name on the card, not just by status.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AmbientAgent {
+    pub status: AgentStatus,
+    /// Display name (e.g. "Claude Code"), or `None` when the title classifies
+    /// as agent activity but the specific CLI couldn't be named.
+    pub label: Option<&'static str>,
+}
+
+/// Map a tracked-session adapter id (as stored in the agent-session row) to a
+/// display name for the card. Unknown ids fall back to a generic label.
+pub fn adapter_display_name(adapter_id: &str) -> &'static str {
+    match adapter_id {
+        "claude-code" => "Claude Code",
+        "codex" => "Codex",
+        "aider" => "Aider",
+        "gemini" => "Gemini CLI",
+        _ => "Agent",
+    }
+}
+
+/// Attention rank for an ambient (title-derived) status, used to pick the
+/// strongest reading when several terminals/views in one worktree each
+/// classify. Higher wins: a blocking prompt beats active work beats idle.
+pub fn ambient_status_rank(status: &AgentStatus) -> u8 {
+    match status {
+        AgentStatus::NeedsApproval(_) | AgentStatus::WaitingForInput => 3,
+        AgentStatus::Running => 2,
+        AgentStatus::Idle => 1,
+        _ => 0,
+    }
+}
+
+/// Resolve the status a workspace card should show by combining its tracked
+/// agent-session status (from the session store, possibly stale) with an
+/// ambient status detected live from a plain terminal's title.
+///
+/// A tracked session that is currently *active* (working or blocking) stays
+/// authoritative — its `StatusMachine` is the ground truth and must not be
+/// shadowed by a hand-launched terminal in the same worktree. Otherwise the
+/// live ambient reading (if any) replaces an absent, idle, or finished
+/// tracked status, so a hand-typed agent surfaces instead of the last
+/// session's stale "Done"/"Stopped".
+pub fn resolve_effective_status(
+    tracked: Option<AgentStatus>,
+    ambient: Option<AgentStatus>,
+) -> Option<AgentStatus> {
+    let tracked_is_active = matches!(
+        tracked,
+        Some(AgentStatus::Running)
+            | Some(AgentStatus::WaitingForInput)
+            | Some(AgentStatus::NeedsApproval(_))
+    );
+    if tracked_is_active {
+        tracked
+    } else {
+        ambient.or(tracked)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn t() -> Theme {
         Theme::charcoal()
+    }
+
+    // ── effective-status resolution (tracked × ambient) ──────────────────────
+
+    #[test]
+    fn ambient_fills_when_no_tracked_session() {
+        let eff = resolve_effective_status(None, Some(AgentStatus::Running));
+        assert_eq!(eff, Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn ambient_overrides_stale_terminal_tracked_status() {
+        // The reported bug: a finished/cancelled session pins "Stopped" while
+        // a hand-launched agent is live. Ambient must win.
+        let eff =
+            resolve_effective_status(Some(AgentStatus::Interrupted), Some(AgentStatus::Running));
+        assert_eq!(eff, Some(AgentStatus::Running));
+        let eff = resolve_effective_status(
+            Some(AgentStatus::Done { code: Some(0) }),
+            Some(AgentStatus::Idle),
+        );
+        assert_eq!(eff, Some(AgentStatus::Idle));
+    }
+
+    #[test]
+    fn active_tracked_session_is_not_shadowed_by_ambient() {
+        // A real spawned agent that is working stays authoritative.
+        let eff = resolve_effective_status(Some(AgentStatus::Running), Some(AgentStatus::Idle));
+        assert_eq!(eff, Some(AgentStatus::Running));
+        let eff = resolve_effective_status(
+            Some(AgentStatus::NeedsApproval("tool".into())),
+            Some(AgentStatus::Running),
+        );
+        assert_eq!(eff, Some(AgentStatus::NeedsApproval("tool".into())));
+    }
+
+    #[test]
+    fn no_ambient_keeps_tracked_status() {
+        let eff = resolve_effective_status(Some(AgentStatus::Interrupted), None);
+        assert_eq!(eff, Some(AgentStatus::Interrupted));
+        assert_eq!(resolve_effective_status(None, None), None);
+    }
+
+    #[test]
+    fn adapter_display_name_maps_known_ids() {
+        assert_eq!(adapter_display_name("claude-code"), "Claude Code");
+        assert_eq!(adapter_display_name("codex"), "Codex");
+        assert_eq!(adapter_display_name("something-else"), "Agent");
+    }
+
+    #[test]
+    fn ambient_rank_orders_by_attention() {
+        assert!(
+            ambient_status_rank(&AgentStatus::NeedsApproval("x".into()))
+                > ambient_status_rank(&AgentStatus::Running)
+        );
+        assert!(ambient_status_rank(&AgentStatus::Running) > ambient_status_rank(&AgentStatus::Idle));
     }
 
     // ── dot-color parity: each case must match status_dot_color exactly ──────

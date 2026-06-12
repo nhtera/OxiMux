@@ -24,8 +24,13 @@ use gpui::{
     AppContext, Context, FocusHandle, Focusable, Point, ScrollHandle, SharedString, Subscription,
     Task, Window, px,
 };
-use oximux_agents::{AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend};
+use oximux_agents::{
+    AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend, agent_label_from_title,
+    classify_agent_title,
+};
 use oximux_core::{AgentAdapter, AgentSessionId};
+
+use crate::shell::agent_presentation::AmbientAgent;
 use oximux_pty::TerminalSessionId;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -566,6 +571,67 @@ impl PaneGroup {
             paths.push(self.cwd.clone());
         }
         paths
+    }
+
+    /// Agent statuses inferred live from the OSC titles of *plain* terminal
+    /// tabs — a hand-launched agent CLI (typed `claude`/`codex`/… into a
+    /// terminal) the spawn machinery never minted a tracked session for.
+    /// Keyed by the group's `cwd` (the path plain terminals run at, matching
+    /// [`live_worktree_paths`]). `Agent`-kind tabs are excluded: their
+    /// `StatusMachine` is authoritative and already feeds the sidebar.
+    ///
+    /// Multiple views in one tab can each classify; the strongest reading
+    /// (most attention-worthy) wins so a working sub-pane is not masked by an
+    /// idle sibling. The winning view's title also resolves the agent's
+    /// display name when recognizable.
+    pub fn ambient_agent_statuses(&self, cx: &gpui::App) -> Vec<(PathBuf, AmbientAgent)> {
+        use crate::shell::agent_presentation::ambient_status_rank;
+        let mut best: Option<AmbientAgent> = None;
+        for tab in &self.tabs {
+            if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
+                continue;
+            }
+            let PaneContent::Terminal(tree) = &tab.content else {
+                continue;
+            };
+            for (_, _, view) in tree.iter_all_views() {
+                let view = view.read(cx);
+                let Some(title) = view.title() else { continue };
+                let Some(status) = classify_agent_title(title) else {
+                    continue;
+                };
+                let label = agent_label_from_title(title);
+                if best
+                    .as_ref()
+                    .is_none_or(|cur| ambient_status_rank(&status) > ambient_status_rank(&cur.status))
+                {
+                    best = Some(AmbientAgent { status, label });
+                }
+            }
+        }
+        best.map(|agent| vec![(self.cwd.clone(), agent)])
+            .unwrap_or_default()
+    }
+
+    /// Count of plain-terminal tabs running a recognizable agent (any view's
+    /// title classifies). Feeds the status-bar "N agents" total alongside
+    /// spawned `Agent` tabs, so a hand-launched agent registers there too.
+    pub fn ambient_agent_count(&self, cx: &gpui::App) -> usize {
+        self.tabs
+            .iter()
+            .filter(|tab| matches!(tab.kind, PaneGroupTabKind::Terminal))
+            .filter(|tab| {
+                let PaneContent::Terminal(tree) = &tab.content else {
+                    return false;
+                };
+                tree.iter_all_views().any(|(_, _, view)| {
+                    view.read(cx)
+                        .title()
+                        .and_then(classify_agent_title)
+                        .is_some()
+                })
+            })
+            .count()
     }
 
     /// Worktree path of the agent tab matching `tab_id`, if this group

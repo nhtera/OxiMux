@@ -45,6 +45,7 @@ use crate::shell::left_rail::workspace_row::DiffCounts;
 use crate::left_rail_layout;
 
 use crate::actions::OpenProjectPicker;
+use crate::shell::agent_presentation::AmbientAgent;
 use crate::shell::agents_dashboard::model::{attention_rank, needs_attention};
 use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
@@ -79,6 +80,15 @@ pub struct LeftRail {
     active_workspace_id: Option<String>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
+    /// Agents inferred live from plain-terminal OSC titles, keyed by worktree
+    /// path (status + display name). A hand-launched agent (typed
+    /// `claude`/`codex`/…) with no tracked session shows up here; the card
+    /// resolves the status against `latest_status` and shows the name.
+    ambient_status: HashMap<String, AmbientAgent>,
+    /// Latest tracked-session adapter id per workspace id (e.g. "claude-code").
+    /// Resolves the agent display name on the card for a SPAWNED agent, the
+    /// same way `ambient_status.label` does for a hand-launched one.
+    latest_adapter: HashMap<String, String>,
     /// Worktree paths that currently have an open agent tab. A workspace
     /// in this set reads as "live" (green idle dot) even before its
     /// session reports a concrete status.
@@ -152,6 +162,8 @@ impl LeftRail {
             active_workspace_id: None,
             workspaces_by_project: HashMap::new(),
             latest_status: HashMap::new(),
+            ambient_status: HashMap::new(),
+            latest_adapter: HashMap::new(),
             live_worktrees: HashSet::new(),
             diff_counts: HashMap::new(),
             agent_activity: HashMap::new(),
@@ -273,6 +285,8 @@ impl LeftRail {
         workspaces_by_project: HashMap<String, Vec<Workspace>>,
         latest_status: LatestStatusMap,
         live_worktrees: HashSet<String>,
+        ambient_status: HashMap<String, AmbientAgent>,
+        latest_adapter: HashMap<String, String>,
         diff_counts: HashMap<String, DiffCounts>,
         agent_activity: HashMap<String, String>,
         cx: &mut Context<Self>,
@@ -304,6 +318,8 @@ impl LeftRail {
         self.active_workspace_id = active_workspace_id;
         self.workspaces_by_project = workspaces_by_project;
         self.latest_status = latest_status;
+        self.ambient_status = ambient_status;
+        self.latest_adapter = latest_adapter;
         self.live_worktrees = live_worktrees;
         self.diff_counts = diff_counts;
         self.agent_activity = agent_activity;
@@ -431,6 +447,8 @@ impl Render for LeftRail {
                 self.workspaces_by_project.clone(),
                 self.latest_status.clone(),
                 self.live_worktrees.clone(),
+                self.ambient_status.clone(),
+                self.latest_adapter.clone(),
                 self.diff_counts.clone(),
                 self.weak_root.clone(),
                 self.locate_glow_seq,
@@ -531,6 +549,8 @@ fn render_workspace_list(
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
     live_worktrees: HashSet<String>,
+    ambient_status: HashMap<String, AmbientAgent>,
+    latest_adapter: HashMap<String, String>,
     diff_counts: HashMap<String, DiffCounts>,
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
@@ -574,6 +594,16 @@ fn render_workspace_list(
         let latest_status_for =
             move |workspace_id: &str| status_for_group.get(workspace_id).cloned().flatten();
 
+        // Resolve the tracked-session adapter display name for a workspace,
+        // so a spawned agent shows its name on the card the same way a
+        // hand-launched (ambient) one does.
+        let adapter_for_group = latest_adapter.clone();
+        let latest_adapter_for = move |workspace_id: &str| -> Option<&'static str> {
+            adapter_for_group
+                .get(workspace_id)
+                .map(|id| crate::shell::agent_presentation::adapter_display_name(id))
+        };
+
         let weak_root_for_menu = weak_root.clone();
         let on_row_menu = move |workspace: Workspace,
                                 x: f32,
@@ -599,8 +629,10 @@ fn render_workspace_list(
             project,
             workspaces,
             latest_status_for,
+            latest_adapter_for,
             active_workspace_id.as_deref(),
             &live_worktrees,
+            &ambient_status,
             &diff_counts,
             rail.clone(),
             weak_root.clone(),
