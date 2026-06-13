@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-14 — New-tab picker: "New Browser Tab" entry + command-palette polish
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/adapter_picker.rs` (new browser-tab row, leading icons, shortcut chips, section layout), `workspace_root.rs` (route the new selection through the ⌘⇧B handler), `assets.rs` + `assets/icons/square-terminal.svg` (new terminal glyph)
+
+The `+` new-tab popover listed only "+ New terminal" and the agent adapters. It now opens an embedded browser tab too, and the whole menu picked up a command-palette finish.
+
+- **New Browser Tab quick action** sits beside New Terminal at the top; selecting it reuses the same root handler the ⌘⇧B keybinding fires, so menu and shortcut open the tab through one path.
+- **Leading glyphs** on every row — a terminal mark, a globe, and each agent's brand icon (reusing the card icon map) — in a fixed box so labels align.
+- **Shortcut chips** show each quick action's *live* chord (⌘T / ⌘⇧B) pulled from the keymap registry, so a rebind stays accurate; the "default" / "not installed" agent hints keep their muted right-aligned text.
+- A separator splits the quick actions from the agent list; the card widened a touch to fit glyph + label + chip.
+
+Verified: clean build, 13 picker unit tests green, live-verified — menu renders with icons/chips and New Browser Tab opens a tab.
+
+---
+
 ### 2026-06-14 — Browser toolbar menus: native `NSMenu` dropdowns replacing injected in-page panels
 
 **Commits**: _(local, pending)_
