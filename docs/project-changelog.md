@@ -4,6 +4,24 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Agent launch settings + relay argv (protocol v5)
+
+**Commits**: _(local, pending)_  
+**Touches**: `crates/settings/src/agent_launch.rs` (new), `crates/settings/src/lib.rs`, `crates/app/src/agent_launch_settings.rs` (new), `crates/app/src/lib.rs`, `crates/app/src/main.rs`, `crates/app/src/shell/settings_modal/` (mod.rs, pane_agents.rs, pane_agents_launch.rs [new]), `crates/app/src/shell/adapter_picker.rs`, `crates/app/src/workspace_root.rs`, `crates/app/src/project_panes_factory.rs`, `crates/agents/src/runtime.rs`, `crates/agents/src/runtime_impl.rs`, `crates/agents/src/cli/` (claude_code.rs, codex.rs, aider.rs), `crates/relay-proto/src/messages.rs`, `crates/relay/src/registry.rs`, `crates/relay/src/server.rs`, `crates/relay-client/src/backend.rs`, `crates/app/src/relay_supervisor.rs`
+
+A Settings → Agents "Launch defaults" section, so the one-click launcher can apply per-agent defaults — matching the reference cockpit's agent-settings screen. Configurable per agent: extra CLI flags (a one-tap skip-permissions toggle), a default model, and enable/disable; plus a default agent surfaced first in the picker.
+
+- **Settings model** (`agent_launch.rs`): `AgentLaunchSettings { default_agent, yolo_defaults_migrated, agents: { <id>: { args, model, disabled } } }`, persisted to `agent_launch.toml` (TOML + GPUI global + debounced file-watcher, same pattern as the other settings files). A `split_args` helper shell-splits the free-text args (quote-aware) at launch.
+- **Skip-permissions ON by default** (matching the reference cockpit): on a fresh profile, a one-shot migration (`seed_yolo_defaults`, mirroring the reference UX's `migrateAgentYoloDefaults`) back-fills each built-in's skip-permissions flag (`--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox` / `--yes-always`) and persists the file, so the first one-click launch starts the agent in full-autonomy mode. The `yolo_defaults_migrated` guard means a user who later clears a flag is never re-seeded; an agent already configured is left untouched.
+- **Settings UI** (`pane_agents_launch.rs`): default-agent segmented picker + a row per built-in agent with three live chips — Enabled/Disabled, Skip-perms On/Off (toggles the agent-correct flag: `--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox` / `--yes-always` in/out of the args string, preserving any other hand-edited flags), and a Model cycle. Edits write the TOML immediately; the watcher reloads + swaps the global. Both sections are searchable.
+- **Launch threading**: `AgentSessionConfig` gained `extra_args`; each built-in adapter appends them after its model/effort flags and before the positional prompt. The picker `on_select` fills the model when unset and the extra args from the global; the restore path re-applies args on respawn.
+- **Picker** (`adapter_picker.rs`): hides disabled agents and floats the default agent to the top with a "default" badge (stable order otherwise).
+- **Relay protocol v5** (`messages.rs`, `registry.rs`, `server.rs`, `backend.rs`): `Request::Spawn` now carries `args` (the program's argv). The daemon runs `program args…` directly as the PTY leaf, so a launch WITH flags still shows only the agent's banner — no `exec` wrapper, no echoed command line. Socket bumps to `relay-v5.sock`; a fresh client spawns a fresh daemon and any stale v4 daemon idles out (the established per-version-socket drain). The runtime relay branch now always direct-spawns the resolved absolute binary with its argv, falling back to the login-shell `exec` wrapper only when abs-path resolution fails; a stdin prompt seed (aider) is written after spawn in both cases.
+
+Verified: relay v5 daemon spawns live on launch (`relay-v5.sock`); a new end-to-end integration test spawns `/bin/echo MARKER` through the real daemon and confirms the arg reaches the child (`spawn_args_reach_child_process`); `build_command` arg ordering, settings TOML round-trip + `split_args`, the skip-perms/model toggle helpers, and picker filter/order are unit-tested. Full workspace suite green; clippy clean. GUI screenshot verification was blocked this session by a ScreenCaptureKit/Screen-Recording failure in the environment (not app code) — the visual settings-pane + live launch smoke is the one outstanding check.
+
+---
+
 ### 2026-06-13 — One-click agent launch (default settings)
 
 **Commits**: _(local, pending)_  
