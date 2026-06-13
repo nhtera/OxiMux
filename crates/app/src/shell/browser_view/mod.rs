@@ -11,16 +11,19 @@
 
 mod agent_context;
 mod native;
+#[cfg(target_os = "macos")]
+mod native_menu;
 mod render;
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{
-    App, AppContext, BorrowAppContext, ClipboardItem, Context, FocusHandle, Focusable, Image,
-    ImageFormat, SharedString, Task, Window,
+    App, AppContext, BorrowAppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable,
+    Image, ImageFormat, Pixels, SharedString, Task, Window,
 };
 use gpui_component::input::InputState;
 use oximux_settings::{Density, Theme, Typography};
@@ -116,11 +119,22 @@ pub enum PageAppearance {
 
 impl PageAppearance {
     /// Lowercase slug shared with the in-page theme menu (marks the active row).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn slug(self) -> &'static str {
         match self {
             PageAppearance::System => "system",
             PageAppearance::Light => "light",
             PageAppearance::Dark => "dark",
+        }
+    }
+
+    /// Display label for the native page-theme menu rows.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn menu_label(self) -> &'static str {
+        match self {
+            PageAppearance::System => "System",
+            PageAppearance::Light => "Light",
+            PageAppearance::Dark => "Dark",
         }
     }
 }
@@ -192,6 +206,12 @@ pub struct BrowserView {
     /// A profiles-menu choice awaiting the next render (where a `Window` exists
     /// to rebuild the webview).
     pending_profile: Option<ProfileRequest>,
+    /// Window-relative bounds of the appearance + profile toolbar buttons,
+    /// recorded each paint by a measuring canvas (see `render`). The native
+    /// dropdowns anchor under these so they drop straight from the button (a
+    /// `Cell` so the paint closure can write without borrowing the entity).
+    appearance_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    profile_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl BrowserView {
@@ -251,6 +271,8 @@ impl BrowserView {
             pending_agent_text: None,
             profile_id,
             pending_profile: None,
+            appearance_anchor: Rc::new(Cell::new(None)),
+            profile_anchor: Rc::new(Cell::new(None)),
         }
     }
 
@@ -502,10 +524,42 @@ impl BrowserView {
         self.appearance
     }
 
-    /// Open the in-page page-theme menu (System / Light / Dark, active ✓). It
-    /// renders in the page rather than the toolbar — a GPUI menu would draw
-    /// under the native webview — and routes the choice back via `set_appearance`.
-    pub fn open_appearance_menu(&self) {
+    /// Open the page-theme menu (System / Light / Dark, active ✓) and apply the
+    /// chosen scheme.
+    ///
+    /// macOS pops a native `NSMenu` over the webview (it composites above the
+    /// native view; a GPUI menu would draw under it). The pop-up runs modally —
+    /// a nested run loop that pumps the app's main-thread tasks — so it must
+    /// open *outside* the current `App` borrow this click handler holds, or a
+    /// pumped task re-entering `App::update` double-borrows and aborts. Deferring
+    /// onto a foreground task lets the handler return (releasing the borrow)
+    /// first; the choice is applied once the menu closes.
+    #[cfg(target_os = "macos")]
+    pub fn open_appearance_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(native) = self.native.clone() else {
+            return;
+        };
+        let anchor = self.appearance_anchor.get();
+        const ORDER: [PageAppearance; 3] =
+            [PageAppearance::System, PageAppearance::Light, PageAppearance::Dark];
+        let items: Vec<native_menu::MenuItem> = ORDER
+            .iter()
+            .map(|a| native_menu::MenuItem::new(a.menu_label(), *a == self.appearance))
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let Some(idx) = native.popup_menu(anchor, Some("Page theme"), &items) else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| view.set_appearance(ORDER[idx], cx));
+        })
+        .detach();
+    }
+
+    /// Off macOS the native view has no AppKit menu to pop over it, so the
+    /// theme picker is injected into the page (its own shadow root) and routes
+    /// the choice back via `set_appearance`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn open_appearance_menu(&mut self, _cx: &mut Context<Self>) {
         if let Some(n) = &self.native {
             n.eval_script(&agent_context::appearance_menu_js(self.appearance.slug()));
         }
@@ -527,11 +581,53 @@ impl BrowserView {
             .unwrap_or_else(|| "Default".to_string())
     }
 
-    /// Open the in-page profiles menu: every cookie-isolated profile with a ✓
-    /// on the active one, then a "New Profile…" action. Renders in the page
-    /// (a GPUI menu would draw under the native webview); selections route back
-    /// over IPC and apply on the next render (they rebuild the webview).
-    pub fn open_profile_menu(&self, cx: &App) {
+    /// Open the profiles menu: every cookie-isolated profile with a ✓ on the
+    /// active one, then a "New Profile…" action below a divider.
+    ///
+    /// macOS pops a native `NSMenu` over the webview, deferred onto a foreground
+    /// task so its modal run loop opens outside this handler's `App` borrow (see
+    /// [`Self::open_appearance_menu`]). The pick is routed through
+    /// `pending_profile` and applied on the next render — switching/creating a
+    /// profile rebuilds the webview, which needs a `Window` the async task lacks.
+    #[cfg(target_os = "macos")]
+    pub fn open_profile_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(native) = self.native.clone() else {
+            return;
+        };
+        let anchor = self.profile_anchor.get();
+        // Parallel lists: `targets[i]` is the action for menu row `i`. Row 0 is
+        // the shared default store; then one row per profile; last is "New".
+        let active = self.profile_id;
+        let mut items = vec![native_menu::MenuItem::new("Default", active.is_none())];
+        let mut targets: Vec<ProfileRequest> = vec![ProfileRequest::Switch(None)];
+        if let Some(g) = cx.try_global::<BrowserProfiles>() {
+            for p in &g.profiles {
+                items.push(native_menu::MenuItem::new(p.name.clone(), Some(p.id) == active));
+                targets.push(ProfileRequest::Switch(Some(p.id)));
+            }
+        }
+        items.push(native_menu::MenuItem::new("New Profile…", false).with_separator());
+        targets.push(ProfileRequest::New);
+
+        cx.spawn(async move |this, cx| {
+            let Some(idx) = native.popup_menu(anchor, Some("Profiles"), &items) else {
+                return;
+            };
+            let mut targets = targets;
+            let req = targets.swap_remove(idx);
+            let _ = this.update(cx, |view, cx| {
+                view.pending_profile = Some(req);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Off macOS the profiles menu is injected into the page (a GPUI menu would
+    /// draw under the native webview); selections route back over IPC and apply
+    /// on the next render (where a `Window` exists to rebuild the webview).
+    #[cfg(not(target_os = "macos"))]
+    pub fn open_profile_menu(&mut self, cx: &mut Context<Self>) {
         let Some(n) = &self.native else { return };
         let active = self.profile_id;
         let mut items: Vec<serde_json::Value> = vec![serde_json::json!({

@@ -167,12 +167,13 @@ pub fn confirm_toast_js(label: &str) -> String {
 }
 
 /// Page-theme dropdown menu, injected in-page (its own shadow root) when the
-/// toolbar's appearance button is clicked. A GPUI menu would render *under* the
-/// native webview, so — like the picker popover — it lives in the page: a dark
-/// translucent panel at the top-right listing System / Light / Dark with a ✓ on
-/// the active one. Selecting a row posts `set_appearance` back to the host; a
-/// full-page backdrop (and `Esc`, when the page holds focus) dismisses it.
-/// `__OX_CURRENT__` is substituted with the active slug by [`appearance_menu_js`].
+/// toolbar's appearance button is clicked — the off-macOS fallback, where the
+/// native view has no AppKit `NSMenu` to pop over it. A dark translucent panel
+/// at the top-right listing System / Light / Dark with a ✓ on the active one.
+/// Selecting a row posts `set_appearance` back to the host; a full-page backdrop
+/// (and `Esc`, when the page holds focus) dismisses it. `__OX_CURRENT__` is
+/// substituted with the active slug by [`appearance_menu_js`].
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const APPEARANCE_MENU_JS: &str = r#"
 (function () {
   if (window.__oxThemeMenu) { window.__oxThemeMenu.remove(); window.__oxThemeMenu = null; }
@@ -224,19 +225,21 @@ const APPEARANCE_MENU_JS: &str = r#"
 "#;
 
 /// Build the page-theme menu JS with the active slug (`system`/`light`/`dark`)
-/// marked. See [`APPEARANCE_MENU_JS`].
+/// marked. See [`APPEARANCE_MENU_JS`]. Off-macOS fallback (macOS uses `NSMenu`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn appearance_menu_js(current: &str) -> String {
     let cur = serde_json::to_string(current).unwrap_or_else(|_| "\"system\"".to_string());
     APPEARANCE_MENU_JS.replace("__OX_CURRENT__", &cur)
 }
 
 /// Profiles dropdown, injected in-page when the toolbar's profile button is
-/// clicked (same in-page rationale as the theme menu). Lists every cookie-
-/// isolated profile with a ✓ + a highlighted row on the active one, then a
-/// "New Profile…" action below a divider. Selecting a profile posts
+/// clicked — the off-macOS fallback (same rationale as the theme menu). Lists
+/// every cookie-isolated profile with a ✓ + a highlighted row on the active
+/// one, then a "New Profile…" action below a divider. Selecting a profile posts
 /// `switch_profile`; the action posts `new_profile`. `__OX_PROFILES__` is
 /// substituted by [`profile_menu_js`] with a JSON array of `{id, name, active}`
 /// (the host owns the list, so the page can't fabricate a profile).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const PROFILE_MENU_JS: &str = r#"
 (function () {
   if (window.__oxProfileMenu) { window.__oxProfileMenu.remove(); window.__oxProfileMenu = null; }
@@ -292,7 +295,8 @@ const PROFILE_MENU_JS: &str = r#"
 "#;
 
 /// Build the profiles menu JS from a JSON array of `{id, name, active}` rows.
-/// See [`PROFILE_MENU_JS`].
+/// See [`PROFILE_MENU_JS`]. Off-macOS fallback (macOS uses `NSMenu`).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn profile_menu_js(items_json: &str) -> String {
     PROFILE_MENU_JS.replace("__OX_PROFILES__", items_json)
 }

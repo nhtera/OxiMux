@@ -225,6 +225,52 @@ impl NativeWebview {
         let _ = self.webview.focus_parent();
     }
 
+    /// Pop a native toolbar dropdown, anchored under `anchor_bounds` (a button's
+    /// window-relative bounds) when given, else at the mouse. Returns the chosen
+    /// row index. Blocks on the menu's modal loop — call it off the GPUI `App`
+    /// borrow (a pumped task would otherwise re-enter and double-borrow).
+    ///
+    /// The window root the webview was parented into is the same view `wry`
+    /// positions the child webview against, so we reuse its top-left→AppKit
+    /// Y-flip to map the button's bounds into that view's space for the anchor.
+    #[cfg(target_os = "macos")]
+    pub fn popup_menu(
+        &self,
+        anchor_bounds: Option<Bounds<Pixels>>,
+        header: Option<&str>,
+        items: &[super::native_menu::MenuItem],
+    ) -> Option<usize> {
+        use objc2_app_kit::NSView;
+        use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+        use objc2::rc::Retained;
+        use wry::WebViewExtMacOS;
+
+        let host: Option<Retained<NSView>> = self
+            .inspector_dock
+            .as_ref()
+            .map(|d| d.host.clone())
+            .or_else(|| unsafe { self.webview.webview().superview() });
+
+        let anchor = anchor_bounds.zip(host).map(|(b, host)| {
+            let bx = f32::from(b.origin.x) as f64;
+            let by = f32::from(b.origin.y) as f64;
+            let bw = f32::from(b.size.width) as f64;
+            let bh = f32::from(b.size.height) as f64;
+            let flipped = host.isFlipped();
+            let view_y = if flipped {
+                by
+            } else {
+                host.frame().size.height - by - bh
+            };
+            super::native_menu::Anchor {
+                view: host,
+                rect: CGRect::new(CGPoint::new(bx, view_y), CGSize::new(bw, bh)),
+                flipped,
+            }
+        });
+        super::native_menu::popup(anchor, header, items)
+    }
+
     /// Open the WebKit inspector docked *inside the browser pane* (page on top,
     /// inspector below) — the layout a normal browser shows.
     ///

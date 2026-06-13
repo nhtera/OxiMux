@@ -87,6 +87,11 @@ objc2-app-kit = { version = "0.3", features = [
   "NSAppearance",
   "NSResponder",
   "NSView",
+  # Native toolbar dropdowns (`native_menu`): profile + page-theme pickers pop
+  # as real NSMenus above the webview rather than HTML injected into the page.
+  "NSMenu",
+  "NSMenuItem",
+  "NSEvent",
 ] }
 objc2-web-kit = { version = "0.3", features = [
   "WKWebView",

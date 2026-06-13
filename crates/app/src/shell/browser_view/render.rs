@@ -3,6 +3,9 @@
 //! webview's frame to the laid-out body bounds each frame — the webview
 //! draws there natively, above the GPU canvas.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
     Bounds, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement, Pixels,
     Render, SharedString, Styled, Window, canvas, div, px,
@@ -83,6 +86,21 @@ impl Render for BrowserView {
             }
             Button::new(id).icon(icon_el).ghost().small()
         };
+
+        // A zero-cost overlay that records its bounds (== the wrapped button's,
+        // window-relative) each paint, so the native dropdown can anchor under
+        // the button. Painted before the button so it sits behind it and never
+        // intercepts the click.
+        let anchor_canvas = |slot: Rc<Cell<Option<Bounds<Pixels>>>>| {
+            canvas(
+                |_, _, _| (),
+                move |bounds: Bounds<Pixels>, _: (), _window, _cx| slot.set(Some(bounds)),
+            )
+            .absolute()
+            .size_full()
+        };
+        let appearance_anchor = self.appearance_anchor.clone();
+        let profile_anchor = self.profile_anchor.clone();
 
         let toolbar = div()
             .flex()
@@ -186,37 +204,41 @@ impl Render for BrowserView {
                     .tooltip("Toggle DevTools")
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_devtools(cx)))
             })
-            .child({
-                let mut icon = Icon::default().path("icons/contrast.svg");
-                if self.appearance != PageAppearance::System {
-                    icon = icon.text_color(theme.status_ok);
-                }
-                Button::new("browser-appearance")
-                    .icon(icon)
-                    .ghost()
-                    .small()
-                    .tooltip(SharedString::from(format!(
-                        "Page theme: {appearance_label} (click to choose)"
-                    )))
-                    .on_click(cx.listener(|this, _, _window, _cx| this.open_appearance_menu()))
-            })
-            // Profile button → in-page menu (every profile + "New Profile…").
+            .child(
+                div().relative().child(anchor_canvas(appearance_anchor)).child({
+                    let mut icon = Icon::default().path("icons/contrast.svg");
+                    if self.appearance != PageAppearance::System {
+                        icon = icon.text_color(theme.status_ok);
+                    }
+                    Button::new("browser-appearance")
+                        .icon(icon)
+                        .ghost()
+                        .small()
+                        .tooltip(SharedString::from(format!(
+                            "Page theme: {appearance_label} (click to choose)"
+                        )))
+                        .on_click(cx.listener(|this, _, _window, cx| this.open_appearance_menu(cx)))
+                }),
+            )
+            // Profile button → native dropdown (every profile + "New Profile…").
             // The active profile tints the icon so a non-default store shows at
             // a glance; the standalone "+" button folded into the menu.
-            .child({
-                let mut icon = Icon::default().path("icons/user.svg");
-                if self.profile_id.is_some() {
-                    icon = icon.text_color(theme.status_ok);
-                }
-                Button::new("browser-profile")
-                    .icon(icon)
-                    .ghost()
-                    .small()
-                    .tooltip(SharedString::from(format!(
-                        "Profile: {profile_name} (click to manage)"
-                    )))
-                    .on_click(cx.listener(|this, _, _window, cx| this.open_profile_menu(cx)))
-            });
+            .child(
+                div().relative().child(anchor_canvas(profile_anchor)).child({
+                    let mut icon = Icon::default().path("icons/user.svg");
+                    if self.profile_id.is_some() {
+                        icon = icon.text_color(theme.status_ok);
+                    }
+                    Button::new("browser-profile")
+                        .icon(icon)
+                        .ghost()
+                        .small()
+                        .tooltip(SharedString::from(format!(
+                            "Profile: {profile_name} (click to manage)"
+                        )))
+                        .on_click(cx.listener(|this, _, _window, cx| this.open_profile_menu(cx)))
+                }),
+            );
         // A copied result lights the firing button (see `probe_btn`) and floats
         // a "✓ copied" toast over the page (in-page, so it can't shift the
         // toolbar's icons). No trailing pill in the flex row.
