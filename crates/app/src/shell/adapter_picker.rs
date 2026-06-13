@@ -18,15 +18,20 @@ use gpui::{
     AnyElement, App, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Render, SharedString, Styled, Window, div, px,
 };
+use gpui_component::{Icon, Sizable};
 use oximux_agents::{AdapterRegistry, RegistryEntry};
 use oximux_core::AgentAdapter;
 use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
+use super::agent_presentation::adapter_icon_path;
+use crate::keymap_registry::display_chord_for;
 use crate::ui::FloatingSurface;
 
-/// Width of the popover card. Slightly wider than `PaneActionsMenu` to fit
-/// adapter labels ("Claude Code", "Codex CLI") + the disabled hint.
-const MENU_WIDTH: f32 = 240.0;
+/// Width of the popover card. Wide enough for a leading glyph, the adapter
+/// label ("Claude Code", "Codex CLI"), and a trailing shortcut chip or hint.
+const MENU_WIDTH: f32 = 264.0;
+/// Leading-glyph box size; matches the toolbar's small icon footprint.
+const ROW_ICON_PX: f32 = 15.0;
 /// Vertical gap below the chrome row before the popover starts. Matches the
 /// pane-actions menu so the two visually align if both happen to be open.
 const ANCHOR_TOP_PX: f32 = 42.0;
@@ -46,8 +51,10 @@ const SEP_HEIGHT: f32 = 1.0;
 /// settings (no model/effort flags); that is the entire launch decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterSelection {
-    /// First row — spawns a plain shell tab.
+    /// Quick action — spawns a plain shell tab.
     NewTerminal,
+    /// Quick action — opens an embedded browser tab at the default URL.
+    NewBrowserTab,
     /// One of the registry's available agent adapters.
     Adapter {
         kind: AgentAdapter,
@@ -274,11 +281,13 @@ impl AdapterPicker {
 
         let mut card = card_container(theme, density);
 
-        // "+ New terminal" row — always first, always clickable.
+        // Quick actions — a plain shell, then an embedded browser tab. Each
+        // carries its live global shortcut so the picker doubles as a reminder.
         card = card.child(picker_row(
             "new-terminal",
-            SharedString::from("+ New terminal"),
-            None,
+            Some("icons/square-terminal.svg"),
+            SharedString::from("New Terminal"),
+            display_chord_for("new_tab").map(|c| RowTrailing::Shortcut(c.into())),
             RowState::Active,
             theme,
             density,
@@ -288,9 +297,22 @@ impl AdapterPicker {
                 this.close(cx);
             }),
         ));
+        card = card.child(picker_row(
+            "new-browser-tab",
+            Some("icons/globe.svg"),
+            SharedString::from("New Browser Tab"),
+            display_chord_for("new_browser_tab").map(|c| RowTrailing::Shortcut(c.into())),
+            RowState::Active,
+            theme,
+            density,
+            typography.clone(),
+            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                (this.on_select)(AdapterSelection::NewBrowserTab, window, cx);
+                this.close(cx);
+            }),
+        ));
 
-        // Separator between the new-terminal escape hatch and the adapter
-        // list.
+        // Separator between the quick actions and the adapter list.
         card = card.child(
             div()
                 .h(px(SEP_HEIGHT))
@@ -310,6 +332,7 @@ impl AdapterPicker {
             // First open — no cache, detection running. Show Loading.
             (None, _) => card.child(picker_row(
                 "loading",
+                None,
                 SharedString::from("Loading…"),
                 None,
                 RowState::Disabled,
@@ -327,6 +350,7 @@ impl AdapterPicker {
             // or empty registry). Offer retry.
             (Some(entries), false) if entries.is_empty() => card.child(picker_row(
                 "retry",
+                None,
                 SharedString::from("Detection failed — retry"),
                 None,
                 RowState::Retry,
@@ -382,10 +406,16 @@ fn append_adapter_rows(
         let id = entry.adapter_id;
         let label = SharedString::from(entry.display_name);
         let is_default = !default_agent.is_empty() && id == default_agent;
-        let (state, hint) = if !entry.available {
-            (RowState::Disabled, Some(SharedString::from("not installed")))
+        let (state, trailing) = if !entry.available {
+            (
+                RowState::Disabled,
+                Some(RowTrailing::Hint(SharedString::from("not installed"))),
+            )
         } else if is_default {
-            (RowState::Active, Some(SharedString::from("default")))
+            (
+                RowState::Active,
+                Some(RowTrailing::Hint(SharedString::from("default"))),
+            )
         } else {
             (RowState::Active, None)
         };
@@ -396,8 +426,9 @@ fn append_adapter_rows(
         });
         card = card.child(picker_row(
             ("adapter-row", ix),
+            Some(adapter_icon_path(id)),
             label,
-            hint,
+            trailing,
             state,
             theme,
             density,
@@ -408,11 +439,21 @@ fn append_adapter_rows(
     card
 }
 
+/// Right-aligned row adornment. A `Hint` is muted plain text ("not installed",
+/// "default"); a `Shortcut` is a bordered key-chord chip ("⌘T") so the quick
+/// actions double as a keybinding reminder.
+#[derive(Clone)]
+pub(super) enum RowTrailing {
+    Hint(SharedString),
+    Shortcut(SharedString),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn picker_row(
     id: impl Into<gpui::ElementId>,
+    icon: Option<&'static str>,
     label: SharedString,
-    hint: Option<SharedString>,
+    trailing: Option<RowTrailing>,
     state: RowState,
     theme: Theme,
     density: Density,
@@ -424,19 +465,51 @@ pub(super) fn picker_row(
         .flex()
         .flex_row()
         .items_center()
+        .gap(px(8.0))
         .h(px(density.h_overlay_item))
         .px(px(ROW_PADDING_X))
         .rounded(px(density.r_xs))
         .text_size(px(typography.t_body_md))
-        .text_color(theme.fg_base)
-        .child(div().flex_1().child(label));
-    if let Some(h) = hint {
+        .text_color(theme.fg_base);
+    // Leading glyph in a fixed box so labels align across rows.
+    if let Some(path) = icon {
         row = row.child(
             div()
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_subtle)
-                .child(h),
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(ROW_ICON_PX))
+                .h(px(ROW_ICON_PX))
+                .child(Icon::default().path(path).xsmall().text_color(theme.fg_muted)),
         );
+    }
+    row = row.child(div().flex_1().min_w(px(0.0)).child(label));
+    match trailing {
+        Some(RowTrailing::Hint(h)) => {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child(h),
+            );
+        }
+        Some(RowTrailing::Shortcut(chord)) => {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded(px(density.r_xs))
+                    .border_1()
+                    .border_color(theme.border_inactive)
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child(chord),
+            );
+        }
+        None => {}
     }
     match state {
         RowState::Active | RowState::Retry => row

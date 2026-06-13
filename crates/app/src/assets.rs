@@ -23,6 +23,11 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/git-branch.svg",
         include_bytes!("../assets/icons/git-branch.svg"),
     ),
+    // Terminal glyph for the new-tab picker's "New Terminal" quick action.
+    (
+        "icons/square-terminal.svg",
+        include_bytes!("../assets/icons/square-terminal.svg"),
+    ),
     // Locate glyph for the left rail's scroll-to-current-workspace button.
     (
         "icons/crosshair.svg",

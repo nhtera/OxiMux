@@ -504,6 +504,11 @@ impl WorkspaceRoot {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
                 AdapterSelection::NewTerminal => this.spawn_local_terminal_tab(window, cx),
+                // Reuse the ⌘⇧B root handler so the menu entry and the
+                // keybinding open the browser tab through one path.
+                AdapterSelection::NewBrowserTab => {
+                    window.dispatch_action(Box::new(NewBrowserTab), cx);
+                }
                 AdapterSelection::Adapter { kind, id } => {
                     // Root the agent at the active project (its panes' cwd),
                     // so the worktree the agent runs in matches a sidebar
