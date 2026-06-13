@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Browser P2 polish + P3 rich (copy-confirmation · DevTools · page theme · profiles · pick→agent)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/` (mod.rs, native.rs, render.rs, agent_context.rs), `crates/app/src/browser_profiles.rs` (new), `crates/app/src/{persisted_terminals.rs, project_panes_factory.rs, main.rs, lib.rs, assets.rs}`, `crates/app/src/shell/{project_panes/mod.rs, pane_group/mod.rs}`, `crates/app/Cargo.toml` (+`objc2-app-kit` NSAppearance/NSResponder/NSView), root `Cargo.toml` (uuid `serde`), `crates/app/assets/icons/{check,wrench,contrast,user}.svg` (new)
+
+Closes the "did anything happen?" gap on the agent-context probes and adds the optional rich layer. Built on the same in-process `wry` webview — still no CDP.
+
+- **Copy confirmation** (was silent): the firing probe button swaps to a green check + a "copied" pill (`Screenshot copied` / `DOM copied` / `Console copied` / `Element copied`) for ~1.4s via a per-result timer; a screenshot also flashes the page white once the capture lands (so the flash is never in the shot); the element picker shows an in-page `✓ Copied` bubble at the picked element. Tooltips reworded to disambiguate **Screenshot (image)** from **Copy DOM (text)** — the two used to read as one generic "snapshot".
+- **DevTools** (wrench): `with_devtools(true)` at build; the button toggles the inspector (`open/close/is_devtools_open`) and tints green while open.
+- **Page appearance** (contrast, cycle System→Light→Dark): macOS `NSAppearanceCustomization::setAppearance` on the webview's view (`.aqua` / `.darkAqua` / cleared) drives the embedded page's `prefers-color-scheme`; independent of the app chrome.
+- **Profiles** (user + ＋): named, cookie/cache-isolated webview stores via `wry`'s macOS `with_data_store_identifier([u8;16])` (the profile UUID's bytes → a distinct `WKWebsiteDataStore`). The button cycles Default → each profile (switching rebuilds the webview against the new store, keeping the URL); ＋ creates one. The list persists as JSON in the app data dir (a `BrowserProfiles` global); the active profile persists per tab (`PersistedTabKind::Browser` gained `profile_id`, `#[serde(default)]` so pre-existing tabs restore into the default store).
+- **Pick → agent** (the deferred direct-pipe): the picker's `A` key routes the formatted element into the active agent terminal via the existing `SendTextToActiveAgent` action (`C` still copies to the clipboard). The IPC callback has no `Window`, so the text is stashed and dispatched on the next render (the same path the terminal/diff views use).
+
+UX note: appearance + profile are **cycle-on-click** rather than dropdown popovers — an inline menu would render *under* the native webview (the same reason modals set `WebviewSuppressed`), so cycling keeps the controls self-contained; a richer popover picker is a possible follow-up.
+
+Verified: full lib suite green (857 tests, 0 fail) incl. new unit tests (pick→agent IPC parse, copy-kind button-sharing + pill labels, profile name/JSON round-trip); clippy clean on new code; full workspace build links the objc2 FFI. Code-reviewed **SHIP** — applied both flagged fixes (clear stale title/loading on a profile rebuild; mint the new-profile name inside the mutation to avoid duplicate "Profile N"). Live-GUI verification of the toolbar controls (devtools open, appearance switch, profile cookie-isolation, copy-confirmation) is **pending**.
+
+---
+
 ### 2026-06-13 — Browser agent-context (v1 — DOM / console / screenshot / element-pick → clipboard)
 
 **Commits**: _(local, pending)_
