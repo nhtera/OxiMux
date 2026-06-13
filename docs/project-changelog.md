@@ -4,6 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Settings pane visual polish (carded sections + rich agent rows)
+
+**Commits**: _(local, pending)_  
+**Touches**: `crates/app/src/shell/agent_presentation.rs`, `crates/app/src/shell/settings_modal/` (layout.rs, controls.rs, pane_agents.rs, pane_agents_launch.rs)
+
+A visual pass over the Agents settings pane to bring it in line with the reference cockpit's polished, carded look — replacing the flat, monochrome row list with grouped panels, agent icons, and colour-coded controls. View-layer only; no behaviour or persistence changes.
+
+- **Carded sections** (`layout.rs`): a reusable `card_surface` (recessed fill, hairline border, rounded corners, top edge-highlight) wraps each settings group as its own panel, and `section_title` gives each card a bold heading + muted description. The Agents pane now reads as two titled cards ("Commit messages", "Agent launch") instead of one undifferentiated divider list.
+- **Rich agent rows** (`pane_agents_launch.rs`): each built-in agent renders with its CLI glyph in a rounded icon tile, the name (+ an accent "Default" badge when it's the default agent), the current flags/model summary, and the live controls pinned right. The identity dims when an agent is disabled.
+- **Icon chips + real toggles**: the default-agent picker is now a row of icon chips (glyph + name, accent-ringed when selected) instead of a plain segmented track; the enabled control is a real pill toggle; and skip-permissions is an accent `toggle_chip` (`controls.rs`) that reads with colour when on rather than an "On/Off" word swap. Agent-icon resolution lives in a shared `adapter_icon_path` helper.
+
+GUI-verified live: the carded pane renders, default-agent chips select with the accent ring + glyph recolour, the "Default" badge appears on the chosen agent's row, skip-perms toggles between accent/muted with the flags summary updating, and edits persist through the file-watcher. Full workspace suite green (839 lib tests); clippy clean on the touched files. This also closes the outstanding visual-smoke check from the agent-launch-settings entry below (screen capture worked this session).
+
+---
+
 ### 2026-06-13 — Agent launch settings + relay argv (protocol v5)
 
 **Commits**: _(local, pending)_  
