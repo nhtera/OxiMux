@@ -72,6 +72,26 @@ block2 = "0.6"
 # Chosen for future cross-platform (WebView2 / WebKitGTK) over a macOS-only
 # objc2-web-kit binding.
 wry = "0.55"
+# Browser agent-context screenshot: `WKWebView.takeSnapshot` returns an
+# `NSImage`; app-kit's `NSBitmapImageRep` re-encodes it to PNG bytes for the
+# clipboard. web-kit's snapshot method is feature-gated on the snapshot
+# config + block2 + app-kit interop, none of which wry turns on by default,
+# so they're declared here. All three crates are already in the graph (via
+# wry / gpui-component) — this only flips extra feature flags, no new builds.
+objc2-app-kit = { version = "0.3", features = [
+  "NSImage",
+  "NSImageRep",
+  "NSBitmapImageRep",
+] }
+objc2-web-kit = { version = "0.3", features = [
+  "WKWebView",
+  "WKSnapshotConfiguration",
+  "block2",
+  "objc2-app-kit",
+  "objc2-core-foundation",
+] }
+# `CGRect` for the element-rect snapshot region (already in the graph).
+objc2-core-foundation = "0.3"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

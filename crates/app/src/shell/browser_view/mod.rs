@@ -9,6 +9,7 @@
 //! Only the URL is persistent state — restore re-navigates. No relay, no
 //! PTY: a pure in-process leaf like the editor / diff views.
 
+mod agent_context;
 mod native;
 mod render;
 
@@ -16,16 +17,16 @@ use std::rc::Rc;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gpui::{App, AppContext, Context, FocusHandle, Focusable, SharedString, Task, Window};
+use gpui::{
+    App, AppContext, ClipboardItem, Context, FocusHandle, Focusable, Image, ImageFormat,
+    SharedString, Task, Window,
+};
 use gpui_component::input::InputState;
 use oximux_settings::{Density, Theme, Typography};
 use wry::PageLoadEvent;
 
+use agent_context::{IpcMessage, PickRect};
 use native::{NativeWebview, WebviewCallbacks};
-
-/// Document-start script — installed on every navigation. Kept minimal for
-/// P1 (a marker only); P2 layers the console/error ring buffers here.
-const INIT_SCRIPT: &str = "/* oximux browser */";
 
 /// Privacy-preserving default search endpoint used when the address bar
 /// content is not a URL. A query string, not a product reference.
@@ -55,6 +56,10 @@ enum ChromeEvent {
     Navigated(String),
     LoadStarted,
     LoadFinished(String),
+    /// Raw `window.ipc.postMessage` body from an agent-context probe.
+    Ipc(String),
+    /// PNG bytes from an async screenshot, bound for the clipboard.
+    Screenshot(Vec<u8>),
 }
 
 pub struct BrowserView {
@@ -69,10 +74,17 @@ pub struct BrowserView {
     /// visibility. Set by the host each render (`set_active`).
     active: bool,
     address: gpui::Entity<InputState>,
+    /// Tracks the address bar's focus state across renders so we only reclaim
+    /// keyboard first-responder from the webview on the rising edge (the click
+    /// into the field), not every frame.
+    address_focused: bool,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
     typography: Typography,
+    /// Sender into the entity event loop — agent-context probes route async
+    /// results (screenshots) back through here onto the main thread.
+    events_tx: UnboundedSender<ChromeEvent>,
     _events: Task<()>,
 }
 
@@ -93,6 +105,7 @@ impl BrowserView {
 
         // Channel: webview callbacks (main run loop) → entity event loop.
         let (tx, mut rx) = unbounded::<ChromeEvent>();
+        let events_tx = tx.clone();
         let native = build_native(window, &url, tx).map(Rc::new);
         if native.is_none() {
             tracing::warn!("BrowserView: native webview build failed; tab will show an error state");
@@ -117,10 +130,12 @@ impl BrowserView {
             // so the initial `false` must match the webview's built state.
             active: false,
             address,
+            address_focused: false,
             focus_handle: cx.focus_handle(),
             theme,
             density,
             typography,
+            events_tx,
             _events: events,
         }
     }
@@ -136,8 +151,94 @@ impl BrowserView {
                     self.url = u;
                 }
             }
+            ChromeEvent::Ipc(body) => {
+                self.on_ipc(&body, cx);
+                return;
+            }
+            ChromeEvent::Screenshot(png) => {
+                let image = Image::from_bytes(ImageFormat::Png, png);
+                cx.write_to_clipboard(ClipboardItem::new_image(&image));
+                return;
+            }
         }
         cx.notify();
+    }
+
+    /// Dispatch a probe payload posted from the page: format it to the
+    /// clipboard, or (for a picked rect) kick off the element screenshot.
+    /// Foreign IPC bodies are ignored.
+    fn on_ipc(&mut self, body: &str, cx: &mut Context<Self>) {
+        let Some(msg) = IpcMessage::parse(body) else {
+            return;
+        };
+        match msg {
+            IpcMessage::Console { items, errors } => {
+                self.to_clipboard(agent_context::format_console(&items, &errors), cx);
+            }
+            IpcMessage::Dom(snap) => {
+                self.to_clipboard(agent_context::format_dom_snapshot(&snap), cx);
+            }
+            // The picker focuses the webview to read its keys; once it ends
+            // (copy / shot / cancel) hand the keyboard back so the next address
+            // bar or pane keystroke doesn't leak into the page.
+            IpcMessage::Pick(payload) => {
+                self.to_clipboard(agent_context::format_pick(&payload), cx);
+                self.release_webview_focus();
+            }
+            IpcMessage::PickShot { rect } => {
+                self.capture_screenshot(Some(rect));
+                self.release_webview_focus();
+            }
+            IpcMessage::PickCancel => self.release_webview_focus(),
+        }
+    }
+
+    /// Hand keyboard first-responder from the webview back to the GPUI surface.
+    fn release_webview_focus(&self) {
+        if let Some(native) = &self.native {
+            native.focus_parent();
+        }
+    }
+
+    fn to_clipboard(&self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Copy the captured console + error buffers to the clipboard.
+    pub fn copy_console(&self) {
+        if let Some(n) = &self.native {
+            n.eval_script(agent_context::READ_CONSOLE_JS);
+        }
+    }
+
+    /// Copy a compact DOM snapshot (interactive + landmark elements) to the
+    /// clipboard.
+    pub fn copy_dom_snapshot(&self) {
+        if let Some(n) = &self.native {
+            n.eval_script(agent_context::SNAPSHOT_JS);
+        }
+    }
+
+    /// Start the in-page element picker. Focus the webview first so it reads
+    /// the picker's `C` / `S` / `Esc` keys (the crosshair button that invoked
+    /// this is a GPUI element, which otherwise keeps first responder).
+    pub fn start_element_picker(&self) {
+        if let Some(n) = &self.native {
+            n.focus();
+            n.eval_script(agent_context::PICKER_JS);
+        }
+    }
+
+    /// Capture the webview (or a sub-`rect`) to a PNG on the clipboard. The
+    /// snapshot is async; the result returns over the event channel.
+    pub fn capture_screenshot(&self, rect: Option<PickRect>) {
+        let Some(native) = &self.native else {
+            return;
+        };
+        let tx = self.events_tx.clone();
+        native.screenshot(rect, move |png| {
+            let _ = tx.unbounded_send(ChromeEvent::Screenshot(png));
+        });
     }
 
     /// Show/hide the webview. The host computes `active && !covered` each
@@ -150,6 +251,12 @@ impl BrowserView {
         self.active = active;
         if let Some(native) = &self.native {
             native.set_visible(active);
+            // A hidden webview must not keep keyboard first-responder, or it
+            // swallows input for whatever the user switches to (another tab, a
+            // terminal). Hand the keyboard back to the GPUI surface on hide.
+            if !active {
+                native.focus_parent();
+            }
         }
     }
 
@@ -214,6 +321,7 @@ fn build_native(
 ) -> Option<NativeWebview> {
     let nav_tx = tx.clone();
     let title_tx = tx.clone();
+    let ipc_tx = tx.clone();
     let load_tx = tx;
     let callbacks = WebviewCallbacks {
         on_navigation: move |u: String| {
@@ -231,8 +339,11 @@ fn build_native(
                 let _ = load_tx.unbounded_send(ChromeEvent::LoadFinished(u));
             }
         },
+        on_ipc: move |body: String| {
+            let _ = ipc_tx.unbounded_send(ChromeEvent::Ipc(body));
+        },
     };
-    NativeWebview::build(window, url, INIT_SCRIPT, callbacks).ok()
+    NativeWebview::build(window, url, agent_context::INIT_SCRIPT, callbacks).ok()
 }
 
 /// Normalize address-bar text into a navigable URL.

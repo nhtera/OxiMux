@@ -30,6 +30,14 @@ impl Render for BrowserView {
             self.address
                 .update(cx, |s, cx| s.set_value(SharedString::from(url), window, cx));
         }
+        // On the click that focuses the address bar, hand keyboard
+        // first-responder back from the webview to the GPUI surface — GPUI's
+        // focus state and the native first-responder diverge once the page is
+        // clicked, so without this the user's typing leaks into the page.
+        if editing && !self.address_focused && let Some(native) = &self.native {
+            native.focus_parent();
+        }
+        self.address_focused = editing;
 
         let nav_btn = |id: &'static str, icon: &'static str| {
             Button::new(id)
@@ -71,6 +79,29 @@ impl Render for BrowserView {
                         this.submit_address(cx);
                     }))
                     .child(Input::new(&self.address).small()),
+            )
+            // Agent-context probes — each copies pasteable page context to the
+            // clipboard for an AI agent. Picker reads keys in the page, so it
+            // focuses the webview; the others read on demand.
+            .child(
+                nav_btn("browser-pick", "icons/crosshair.svg")
+                    .tooltip("Pick element → clipboard")
+                    .on_click(cx.listener(|this, _, _window, _cx| this.start_element_picker())),
+            )
+            .child(
+                nav_btn("browser-shot", "icons/camera.svg")
+                    .tooltip("Screenshot → clipboard")
+                    .on_click(cx.listener(|this, _, _window, _cx| this.capture_screenshot(None))),
+            )
+            .child(
+                nav_btn("browser-dom", "icons/file-code.svg")
+                    .tooltip("Copy DOM snapshot")
+                    .on_click(cx.listener(|this, _, _window, _cx| this.copy_dom_snapshot())),
+            )
+            .child(
+                nav_btn("browser-console", "icons/list-tree.svg")
+                    .tooltip("Copy console log")
+                    .on_click(cx.listener(|this, _, _window, _cx| this.copy_console())),
             );
 
         let body: gpui::AnyElement = match &self.native {

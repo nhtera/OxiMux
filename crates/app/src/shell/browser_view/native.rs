@@ -17,6 +17,8 @@ use wry::{
     dpi::{LogicalPosition, LogicalSize},
 };
 
+use super::agent_context::PickRect;
+
 /// Owns the live `wry::WebView`. `!Send` — only ever touched on the GPUI
 /// main thread (construction, frame updates, navigation, teardown-on-drop).
 pub struct NativeWebview {
@@ -26,11 +28,12 @@ pub struct NativeWebview {
 /// Page-chrome callbacks wired into the webview at build time. Each fires
 /// on the main run loop; implementations forward into the owning entity
 /// (typically over a channel) — keep them cheap and non-reentrant.
-pub struct WebviewCallbacks<N, T, L>
+pub struct WebviewCallbacks<N, T, L, I>
 where
     N: Fn(String) -> bool + 'static,
     T: Fn(String) + 'static,
     L: Fn(PageLoadEvent, String) + 'static,
+    I: Fn(String) + 'static,
 {
     /// Top-level navigation starting (the new URL). Return `true` to allow.
     pub on_navigation: N,
@@ -38,22 +41,27 @@ where
     pub on_title: T,
     /// Page load started / finished (event + URL).
     pub on_load: L,
+    /// Raw message body posted from the page via `window.ipc.postMessage`
+    /// (the agent-context probes). Parsed by the owning entity.
+    pub on_ipc: I,
 }
 
 impl NativeWebview {
     /// Build a webview as a child of `window`'s native surface, loading
     /// `url`. `init_script` runs at document-start on every navigation.
-    pub fn build<N, T, L>(
+    pub fn build<N, T, L, I>(
         window: &Window,
         url: &str,
         init_script: &str,
-        callbacks: WebviewCallbacks<N, T, L>,
+        callbacks: WebviewCallbacks<N, T, L, I>,
     ) -> wry::Result<Self>
     where
         N: Fn(String) -> bool + 'static,
         T: Fn(String) + 'static,
         L: Fn(PageLoadEvent, String) + 'static,
+        I: Fn(String) + 'static,
     {
+        let on_ipc = callbacks.on_ipc;
         let webview = WebViewBuilder::new()
             .with_url(url)
             .with_initialization_script(init_script)
@@ -68,6 +76,9 @@ impl NativeWebview {
             .with_navigation_handler(callbacks.on_navigation)
             .with_document_title_changed_handler(callbacks.on_title)
             .with_on_page_load_handler(callbacks.on_load)
+            .with_ipc_handler(move |req: wry::http::Request<String>| {
+                on_ipc(req.into_body());
+            })
             .build_as_child(window)?;
         Ok(Self { webview })
     }
@@ -113,4 +124,100 @@ impl NativeWebview {
     pub fn reload(&self) {
         self.eval("location.reload()");
     }
+
+    /// Run an arbitrary script (agent-context probes: snapshot / console /
+    /// picker injection). Results come back over the IPC handler, not here.
+    pub fn eval_script(&self, js: &str) {
+        self.eval(js);
+    }
+
+    /// Give the webview keyboard focus — the element picker reads keystrokes
+    /// (`C` / `S` / `Esc`) in the page, so it needs first responder after the
+    /// crosshair button (a GPUI element) was clicked.
+    pub fn focus(&self) {
+        let _ = self.webview.focus();
+    }
+
+    /// Hand keyboard first-responder back to the GPUI render surface (the
+    /// webview's parent view). The webview is a native sibling NSView: once it
+    /// takes first-responder (a click into the page, or our own `focus()` for
+    /// the picker) it KEEPS it even when hidden — `isHidden` doesn't resign
+    /// first-responder — which silently swallows every keystroke app-wide.
+    /// Call this whenever the webview should stop owning the keyboard: when its
+    /// tab is hidden, when the picker ends, and when the address bar is focused.
+    pub fn focus_parent(&self) {
+        let _ = self.webview.focus_parent();
+    }
+
+    /// Capture the webview to PNG bytes and deliver them to `on_png` (fired on
+    /// the main thread once the async snapshot completes). `rect` snapshots a
+    /// sub-region in view coordinates; `None` captures the visible viewport.
+    #[cfg(target_os = "macos")]
+    pub fn screenshot(&self, rect: Option<PickRect>, on_png: impl Fn(Vec<u8>) + 'static) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use block2::RcBlock;
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
+        use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+        use objc2_foundation::{NSDictionary, NSError};
+        use objc2_web_kit::WKSnapshotConfiguration;
+        use wry::WebViewExtMacOS;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let webview = self.webview.webview();
+
+        let config = rect.map(|r| {
+            let c = unsafe { WKSnapshotConfiguration::new(mtm) };
+            unsafe {
+                c.setRect(CGRect::new(
+                    CGPoint::new(r.x, r.y),
+                    CGSize::new(r.w, r.h),
+                ));
+            }
+            c
+        });
+
+        // The block bound is `Fn` (ObjC blocks may be retained); a once-guard
+        // keeps a stray double-invocation from writing the clipboard twice.
+        let fired = Arc::new(AtomicBool::new(false));
+        let handler = RcBlock::new(move |image: *mut NSImage, _err: *mut NSError| {
+            if fired.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            if image.is_null() {
+                return;
+            }
+            let image: &NSImage = unsafe { &*image };
+            let Some(png) = png_bytes(image) else {
+                return;
+            };
+            on_png(png);
+        });
+
+        unsafe {
+            webview
+                .takeSnapshotWithConfiguration_completionHandler(config.as_deref(), &handler);
+        }
+
+        /// NSImage → PNG via a bitmap re-encode (TIFF is NSImage's lossless
+        /// interchange rep; `NSBitmapImageRep` re-encodes it to PNG).
+        fn png_bytes(image: &NSImage) -> Option<Vec<u8>> {
+            let tiff = image.TIFFRepresentation()?;
+            let rep = NSBitmapImageRep::imageRepWithData(&tiff)?;
+            let props = NSDictionary::new();
+            let png = unsafe {
+                rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &props)
+            }?;
+            Some(png.to_vec())
+        }
+    }
+
+    /// No native snapshot off macOS — agent-context screenshot is the one
+    /// platform-specific probe; the rest ride the cross-platform JS bridge.
+    #[cfg(not(target_os = "macos"))]
+    pub fn screenshot(&self, _rect: Option<PickRect>, _on_png: impl Fn(Vec<u8>) + 'static) {}
 }
