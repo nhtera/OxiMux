@@ -29,6 +29,67 @@ pub(super) fn section_card(
     group.into_any_element()
 }
 
+/// Wrap a section's content in a raised "card": a slightly recessed fill, a
+/// hairline border, rounded corners, and a 1px top edge-highlight that catches
+/// light to suggest elevation. This is the grouped-card look of a polished
+/// preferences window — each cluster of rows reads as its own panel instead of
+/// floating on the flat body. The horizontal padding insets the rows (and their
+/// dividers) off the rounded corners.
+pub(super) fn card_surface(theme: Theme, density: Density, content: AnyElement) -> AnyElement {
+    div()
+        .relative()
+        .w_full()
+        .bg(theme.bg_panel)
+        .border_1()
+        .border_color(theme.border_inactive)
+        .rounded(px(density.r_card))
+        .px(px(14.0))
+        .py(px(2.0))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(density.r_card))
+                .right(px(density.r_card))
+                .h(px(1.0))
+                .bg(theme.edge_highlight),
+        )
+        .child(content)
+        .into_any_element()
+}
+
+/// A section heading above a [`card_surface`]: a bold title with a muted
+/// one-line description beneath. Gives each card a labelled, scannable header
+/// the way a native preferences pane groups its settings.
+pub(super) fn section_title(
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    let subtitle = subtitle.into();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_size(px(typography.t_body_md))
+                .font_weight(typography.w_semibold)
+                .text_color(theme.fg_base)
+                .child(title.into()),
+        )
+        .when(!subtitle.is_empty(), |c| {
+            c.child(
+                div()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child(subtitle),
+            )
+        })
+        .into_any_element()
+}
+
 /// A searchable setting: its label + description (matched against the filter
 /// query) and the already-built control element.
 pub(super) struct SettingEntry {

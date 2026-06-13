@@ -111,6 +111,18 @@ pub fn adapter_display_name(adapter_id: &str) -> &'static str {
     }
 }
 
+/// Bundled SVG glyph path for an agent's launcher icon, so a row or chip can
+/// show the CLI's mark instead of a generic dot. Unknown ids fall back to the
+/// generic sparkles glyph shared with the Agents nav entry.
+pub fn adapter_icon_path(adapter_id: &str) -> &'static str {
+    match adapter_id {
+        "claude-code" => "icons/claude-code.svg",
+        "codex" => "icons/codex.svg",
+        "aider" => "icons/aider.svg",
+        _ => "icons/sparkles.svg",
+    }
+}
+
 /// Attention rank for an ambient (title-derived) status, used to pick the
 /// strongest reading when several terminals/views in one worktree each
 /// classify. Higher wins: a blocking prompt beats active work beats idle.
@@ -204,6 +216,14 @@ mod tests {
         assert_eq!(adapter_display_name("claude-code"), "Claude Code");
         assert_eq!(adapter_display_name("codex"), "Codex");
         assert_eq!(adapter_display_name("something-else"), "Agent");
+    }
+
+    #[test]
+    fn adapter_icon_path_maps_known_ids_and_falls_back() {
+        assert_eq!(adapter_icon_path("claude-code"), "icons/claude-code.svg");
+        assert_eq!(adapter_icon_path("codex"), "icons/codex.svg");
+        assert_eq!(adapter_icon_path("aider"), "icons/aider.svg");
+        assert_eq!(adapter_icon_path("something-else"), "icons/sparkles.svg");
     }
 
     #[test]

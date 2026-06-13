@@ -4,13 +4,17 @@
 //! reloads + swaps the global. These are the defaults the one-click launcher
 //! applies when the user picks an agent.
 
-use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::{
+    AnyElement, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    Styled, Window, div, prelude::FluentBuilder, px, svg,
+};
 use oximux_settings::{Density, Theme, Typography, split_args};
 
 use super::SettingsModal;
-use super::controls::value_chip;
-use super::layout::{SettingEntry, entry};
+use super::controls::{toggle_chip, toggle_switch, value_chip};
+use super::layout::{SettingEntry, card_surface, entry, section_card, setting_row_desc};
 use super::segmented::{Segment, segmented};
+use crate::shell::agent_presentation::adapter_icon_path;
 
 /// Built-in agents exposed in the launch settings, in picker order. The
 /// custom adapter is excluded — its command is fully user-supplied, so a
@@ -103,6 +107,298 @@ pub(super) fn entries(
         ));
     }
     out
+}
+
+/// The full launch-defaults card: a "Default agent" row with one icon chip per
+/// option, then a rich row per built-in agent (icon tile, name, current flags,
+/// and live enabled / skip-permissions / model controls). Wrapped in a card so
+/// the cluster reads as its own panel — the carded, icon-led look of a polished
+/// preferences pane rather than a flat row list.
+pub(super) fn render_launch_card(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(LAUNCH_AGENTS.len() + 1);
+    rows.push(setting_row_desc(
+        "Default agent",
+        "Surfaced first in the launcher.",
+        default_agent_chips(modal, theme, density, typography, cx),
+        theme,
+        typography,
+    ));
+    for (adapter_id, display) in LAUNCH_AGENTS {
+        rows.push(agent_row(
+            modal, adapter_id, display, theme, density, typography, cx,
+        ));
+    }
+    card_surface(theme, density, section_card(theme, density, rows))
+}
+
+/// The default-agent picker as a row of icon chips: "None" plus one chip per
+/// built-in agent (glyph + name). The selected chip is accent-ringed.
+fn default_agent_chips(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let current = modal.agent_launch.default_agent.clone();
+    let mut row = div().flex().flex_row().items_center().gap(px(6.0));
+    row = row.child(choice_chip(
+        "launch-default-none",
+        "None",
+        None,
+        current.is_empty(),
+        theme,
+        density,
+        typography,
+        |this, _w, cx| {
+            this.agent_launch.default_agent = String::new();
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    ));
+    for (adapter_id, display) in LAUNCH_AGENTS {
+        let selected = current == adapter_id;
+        row = row.child(choice_chip(
+            SharedString::from(format!("launch-default-{adapter_id}")),
+            display,
+            Some(adapter_icon_path(adapter_id)),
+            selected,
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                this.agent_launch.default_agent = adapter_id.to_string();
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        ));
+    }
+    row.into_any_element()
+}
+
+/// One selectable icon chip used by the default-agent picker. Accent-ringed
+/// (info-blue fill + border) when `selected`, muted otherwise.
+#[allow(clippy::too_many_arguments)]
+fn choice_chip(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    icon: Option<&'static str>,
+    selected: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    on_click: impl Fn(&mut SettingsModal, &mut Window, &mut gpui::Context<SettingsModal>) + 'static,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let icon_color = if selected {
+        theme.status_info
+    } else {
+        theme.fg_muted
+    };
+    div()
+        .id(id.into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .h(px(density.h_overlay_item))
+        .px(px(9.0))
+        .rounded(px(density.r_chip))
+        .border_1()
+        .text_size(px(typography.t_body_sm))
+        .cursor_pointer()
+        .when(selected, |s| {
+            s.bg(Hsla { a: 0.14, ..theme.status_info })
+                .border_color(theme.status_info)
+                .text_color(theme.fg_base)
+        })
+        .when(!selected, |s| {
+            s.bg(theme.bg_panel_alt)
+                .border_color(theme.border_inactive)
+                .text_color(theme.fg_muted)
+                .hover(|h| h.border_color(theme.border_active).text_color(theme.fg_base))
+        })
+        .when_some(icon, |c, path| {
+            c.child(
+                svg()
+                    .path(path)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(icon_color),
+            )
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
+        )
+        .child(label.into())
+        .into_any_element()
+}
+
+/// A rich per-agent row: an icon tile + name (+ a "Default" badge when this is
+/// the default agent) + the current flags/model summary on the left, and the
+/// live skip-permissions / model / enabled controls pinned right. The identity
+/// (tile + text) dims when the agent is disabled; the controls stay lit so the
+/// row can be re-enabled and pre-configured.
+#[allow(clippy::too_many_arguments)]
+fn agent_row(
+    modal: &SettingsModal,
+    adapter_id: &'static str,
+    display: &'static str,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let launch = modal.agent_launch.for_agent(adapter_id);
+    let disabled = launch.map(|l| l.disabled).unwrap_or(false);
+    let args = launch.map(|l| l.args.as_str()).unwrap_or("");
+    let model = launch.map(|l| l.model.as_str()).unwrap_or("");
+    let yolo_on = has_flag(args, yolo_flag(adapter_id));
+    let is_default =
+        !modal.agent_launch.default_agent.is_empty() && modal.agent_launch.default_agent == adapter_id;
+
+    let tile = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(30.0))
+        .flex_none()
+        .rounded(px(density.r_xs))
+        .bg(theme.bg_panel_alt)
+        .border_1()
+        .border_color(theme.border_inactive)
+        .child(
+            svg()
+                .path(adapter_icon_path(adapter_id))
+                .size(px(17.0))
+                .text_color(theme.fg_base),
+        );
+
+    let mut name_line = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(typography.t_body_md))
+                .text_color(theme.fg_base)
+                .child(display),
+        );
+    if is_default {
+        name_line = name_line.child(default_badge(theme, typography));
+    }
+
+    let info = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .flex_1()
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .child(name_line)
+        .child(
+            div()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child(agent_summary(modal, adapter_id)),
+        );
+
+    let identity = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .flex_1()
+        .min_w(px(0.0))
+        .when(disabled, |s| s.opacity(0.5))
+        .child(tile)
+        .child(info);
+
+    let yolo_chip = toggle_chip(
+        SharedString::from(format!("launch-yolo-{adapter_id}")),
+        "Skip perms",
+        yolo_on,
+        theme,
+        density,
+        typography,
+        move |this, _w, cx| {
+            let flag = yolo_flag(adapter_id);
+            let e = this.agent_launch.entry_mut(adapter_id);
+            e.args = toggle_flag(&e.args, flag);
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    );
+    let model_chip = value_chip(
+        SharedString::from(format!("launch-model-{adapter_id}")),
+        model_label(model),
+        theme,
+        density,
+        typography,
+        move |this, _w, cx| {
+            let presets = model_presets(adapter_id);
+            let e = this.agent_launch.entry_mut(adapter_id);
+            e.model = cycle_model(presets, &e.model);
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    );
+    let enabled_toggle = toggle_switch(
+        SharedString::from(format!("launch-enabled-{adapter_id}")),
+        !disabled,
+        theme,
+        move |this, _w, cx| {
+            let e = this.agent_launch.entry_mut(adapter_id);
+            e.disabled = !e.disabled;
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    );
+
+    let controls = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .flex_none()
+        .child(yolo_chip)
+        .child(model_chip)
+        .child(enabled_toggle);
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .w_full()
+        .py(px(10.0))
+        .child(identity)
+        .child(controls)
+        .into_any_element()
+}
+
+/// A small accent pill marking the configured default agent.
+fn default_badge(theme: Theme, typography: &Typography) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .flex_none()
+        .px(px(6.0))
+        .py(px(1.0))
+        .rounded(px(3.0))
+        .bg(Hsla { a: 0.16, ..theme.status_info })
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.status_info)
+        .child("Default")
+        .into_any_element()
 }
 
 /// Segmented picker: None + one segment per built-in agent.

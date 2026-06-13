@@ -10,8 +10,8 @@
 //! without tripping Rust 2024's RPIT lifetime-capture rules.
 
 use gpui::{
-    AnyElement, Context, ElementId, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, Styled, Window, div, px,
+    AnyElement, Context, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -44,6 +44,52 @@ pub(super) fn value_chip(
         .text_color(theme.fg_base)
         .cursor_pointer()
         .hover(|s| s.border_color(theme.border_active))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
+        )
+        .child(text.into())
+        .into_any_element()
+}
+
+/// A two-state value chip that tints to the accent when `active`. Reads with
+/// colour (info-blue fill + text + border) when on and as a muted resting chip
+/// when off, so an enabled flag is legible at a glance instead of relying on an
+/// "On"/"Off" word swap alone. Clicking fires `on_click` with a live modal.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn toggle_chip(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    active: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    on_click: impl Fn(&mut SettingsModal, &mut Window, &mut Context<SettingsModal>) + 'static,
+    cx: &mut Context<SettingsModal>,
+) -> AnyElement {
+    let accent_fill = Hsla { a: 0.14, ..theme.status_info };
+    div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(density.h_overlay_item))
+        .px(px(10.0))
+        .rounded(px(density.r_chip))
+        .border_1()
+        .text_size(px(typography.t_body_sm))
+        .cursor_pointer()
+        .when(active, |s| {
+            s.bg(accent_fill)
+                .border_color(theme.status_info)
+                .text_color(theme.status_info)
+        })
+        .when(!active, |s| {
+            s.bg(theme.bg_panel_alt)
+                .border_color(theme.border_inactive)
+                .text_color(theme.fg_muted)
+                .hover(|h| h.border_color(theme.border_active).text_color(theme.fg_base))
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),

@@ -8,7 +8,7 @@ use oximux_settings::{CommitMessageAiMode, Density, Theme, Typography};
 
 use super::SettingsModal;
 use super::controls::value_chip;
-use super::layout::{SettingEntry, entries_card, entry};
+use super::layout::{SettingEntry, card_surface, entries_card, entry, section_title};
 use super::segmented::{Segment, segmented};
 
 /// Agent CLIs the segmented picker exposes.
@@ -26,55 +26,71 @@ pub(super) fn render(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
-    let ai_card = entries_card(
+    let ai_card = card_surface(
         theme,
         density,
-        typography,
-        ai_entries(modal, theme, density, typography, cx),
+        entries_card(
+            theme,
+            density,
+            typography,
+            ai_entries(modal, theme, density, typography, cx),
+        ),
     );
-    let launch_card = entries_card(
-        theme,
-        density,
-        typography,
-        super::pane_agents_launch::entries(modal, theme, density, typography, cx),
-    );
+    let launch_card =
+        super::pane_agents_launch::render_launch_card(modal, theme, density, typography, cx);
+
+    // Each section = a labelled title + its card + a muted footnote, grouped
+    // tightly (8px) and separated from the next section by a wider gap.
+    let ai_section = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(section_title(
+            "Commit messages",
+            "How commit messages are generated from the staged diff.",
+            theme,
+            typography,
+        ))
+        .child(ai_card)
+        .child(footnote(hint(modal.ai.mode), theme, typography));
+
+    let launch_section = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(section_title(
+            "Agent launch",
+            "Defaults the one-click launcher applies when you pick an agent.",
+            theme,
+            typography,
+        ))
+        .child(launch_card)
+        .child(footnote(
+            "One-click launch applies these. Hand-edit agent_launch.toml for arbitrary flags.",
+            theme,
+            typography,
+        ));
+
     div()
         .flex()
         .flex_col()
-        .gap(px(16.0))
-        .child(ai_card)
-        .child(
-            div()
-                .pt(px(4.0))
-                .text_size(px(typography.t_sub_label))
-                .text_color(theme.fg_subtle)
-                .child(hint(modal.ai.mode)),
-        )
-        .child(section_header("Launch defaults", theme, typography))
-        .child(launch_card)
-        .child(
-            div()
-                .pt(px(4.0))
-                .text_size(px(typography.t_sub_label))
-                .text_color(theme.fg_subtle)
-                .child(
-                    "One-click launch applies these. Hand-edit agent_launch.toml for arbitrary flags.",
-                ),
-        )
+        .gap(px(20.0))
+        .child(ai_section)
+        .child(launch_section)
         .into_any_element()
 }
 
-/// A small muted section header dividing the two cards.
-fn section_header(
-    label: &'static str,
+/// A muted explanatory line beneath a card.
+fn footnote(
+    text: impl Into<gpui::SharedString>,
     theme: Theme,
     typography: &Typography,
 ) -> AnyElement {
     div()
-        .pt(px(4.0))
+        .px(px(2.0))
         .text_size(px(typography.t_sub_label))
-        .text_color(theme.fg_muted)
-        .child(label)
+        .text_color(theme.fg_subtle)
+        .child(text.into())
         .into_any_element()
 }
 
