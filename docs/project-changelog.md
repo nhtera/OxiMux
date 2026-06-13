@@ -4,6 +4,100 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-14 — Browser DevTools: docked inside the pane (page over inspector) replacing a standalone window
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/native.rs` (webview re-parent into a pane-sized container + attached-inspector dock)
+
+DevTools opened in a separate floating `Web Inspector` window. WebKit's *attached* inspector docks into the inspected webview's superview and splits it; our webview was parented straight into the GPUI window root, so an attached inspector overran the whole app — which is why the code forced it detached into its own window (and that window sometimes re-docked and broke the app layout). Now it docks **inside the browser pane**, page-on-top / inspector-below, like a normal browser.
+
+- **At build, the webview is re-parented into a pane-sized container view** (`wrap_for_docked_inspector`). The container is pinned to the pane's body bounds each paint (replicating wry's top-left→AppKit Y-flip against the window root); the webview fills it via autoresizing until the inspector claims its share. So WebKit's split is **confined to the pane** — it never touches the toolbar, sidebar, or other tabs.
+- **`open_devtools` steers the inspector to attached** (`StartsAttached = true`) and force-attaches, the inverse of the old standalone-window steering. Visibility now gates the **container** (not the webview) so a docked inspector hides with its tab.
+- **Graceful fallback:** if the container wrap can't be set up (`inspector_dock == None`), DevTools reverts to the old standalone-window path rather than spilling.
+
+Verified: clean build, 22 browser_view tests green. Live-verify pending on your click.
+
+---
+
+### 2026-06-14 — Browser profiles: dropdown menu (list + New Profile…) replacing cycle + standalone "+"
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/agent_context.rs` (`profile_menu_js` + `switch_profile`/`new_profile` IPC), `crates/app/src/shell/browser_view/mod.rs` (`open_profile_menu` + deferred `ProfileRequest`), `crates/app/src/shell/browser_view/render.rs`
+
+The profile control was a cycle-on-click button (rotate to the next store, current name only in a tooltip) plus a separate "+" button to mint a new profile — two buttons, neither showing the full list. Consolidated into one menu.
+
+- **Profile button → opens a Profiles menu** listing every cookie-isolated profile with a green **✓** + a highlighted row on the active one, a divider, then **New Profile…**. Switching is one click to a *named* target (no blind cycling); the standalone "+" button is folded in and removed.
+- The button **tints green** when a non-default profile is active, so an isolated store shows at a glance.
+- Same in-page-menu technique as the theme menu (a GPUI menu would render under the native webview); dark glass panel, blue hover, pop animation, backdrop dismiss.
+- Host owns the list: `open_profile_menu` injects it as a JSON array of `{id, name, active}` (the page can't fabricate a profile). Selecting posts `switch_profile {id}` (`"default"` or a UUID) or `new_profile`; because both rebuild the webview (which needs a `Window`, absent in the IPC callback), the choice is stashed as a `ProfileRequest` and applied on the next render — the same deferral the pick-to-agent path uses.
+
+Verified: 22 browser_view tests green (1 new: item splice + action parse); clean build. Live-verify pending on your click.
+
+---
+
+### 2026-06-14 — Browser page-theme: dropdown menu (System/Light/Dark) replacing cycle-on-click
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/agent_context.rs` (`appearance_menu_js` + `AppearanceValue` + `set_appearance` IPC), `crates/app/src/shell/browser_view/mod.rs` (`open_appearance_menu`/`set_appearance`), `crates/app/src/shell/browser_view/render.rs`
+
+The page color-scheme control was a cycle-on-click button (System → Light → Dark, the current state visible only in a tooltip) — undiscoverable and slow to reach a known state. It's now a proper dropdown menu, matching the reference browsers' disclosure pattern.
+
+- **Click → opens a menu** listing **System / Light / Dark** with a green **✓** on the active option, so the current state is visible and any option is one click away (no more 3× cycling).
+- The menu is **injected in-page** (its own shadow root), not drawn in the toolbar — a GPUI menu would render *under* the native webview (same constraint that puts the picker popover + copy toast in-page). Dark translucent panel with a "Page theme" header, blue row hover, pop animation; a full-page backdrop dismisses it (plus `Esc` when the page holds focus). Anchored top-right under the toolbar control cluster.
+- The contrast button **tints green** while an override is active (System = no tint), so a non-default page theme is visible at a glance.
+- Host side: `AppearanceValue` (`system`/`light`/`dark`) deserializes the menu's `set_appearance` IPC and maps onto `PageAppearance`; `open_appearance_menu` injects the menu seeded with the active slug, `set_appearance` applies the choice.
+
+Verified: 21 browser_view tests green (2 new: active-slug marking + `set_appearance` parse); clean build. Live-verify pending on your click.
+
+---
+
+### 2026-06-14 — Browser copy-confirmation: in-page toast (no more toolbar icon shift)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/agent_context.rs` (`confirm_toast_js`), `crates/app/src/shell/browser_view/mod.rs` (`flash_confirm`), `crates/app/src/shell/browser_view/render.rs` (drop trailing pill)
+
+The "✓ Copied" confirmation used to render as a pill appended to the end of the toolbar's flex row. Because the address bar is `flex_1`, the pill's arrival shrank it and shoved every icon between them to the left — a visible blink on each copy.
+
+- **Confirmation now floats in the page**, not the toolbar: a glassy white "✓ <label>" toast pinned to the page's top-right, slides down + fades in, auto-dismisses (~1.5s). It lives in its own shadow root (a toolbar pill shifts icons; a host-drawn GPUI overlay would render *under* the native webview — same constraint that puts the picker chip in-page). Result: **zero toolbar layout shift**, and the confirmation sits where the eye already is.
+- The firing toolbar button still flashes a green check (which control was pressed) — unchanged, and shift-free since it's a same-size icon swap.
+- Picker results keep their own near-element chip and skip the page toast (no double confirmation); screenshot / DOM / console copies get the toast. The label is JSON-encoded into the injected JS so page-safe text can't escape the literal.
+
+Verified: 19 browser_view tests green (1 new: toast label encoding); clean build. Live-verified on duckduckgo.com.
+
+---
+
+### 2026-06-14 — Browser element-picker: click-copies-image default + "⋯ More" facets
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/agent_context.rs` (picker JS + `PickPart` + `format_pick_part`), `crates/app/src/shell/browser_view/mod.rs`, `crates/app/src/shell/browser_view/render.rs` (tooltip)
+
+The element picker used to act on keyboard keys only (`C`/`A`/`S`) — **clicking a grabbed element did nothing**, so there was no copied feedback and no choice of what to copy. Now a click performs the default copy instantly and surfaces the rest behind a "more" affordance (the disclosure pattern those reference browsers use).
+
+- **Click → copies a screenshot of the element** (the most generally useful grab) and drops a white **"✓ Copied"** chip (green check badge) anchored above it.
+- **"⋯ More" button on the chip** opens a small popover with the other facets: **Copy element** (full agent markdown), **Copy HTML** (raw `outerHTML`), **Copy styles** (CSS declaration block), **Copy text**, **Copy image again**, **Send to agent**. Native-style panel (rounded, translucent, monospace identity header, blue hover highlight, keyboard hints); a backdrop dismisses it. The chip + popover live in their own shadow root so they survive the picking overlay's teardown.
+- **Keyboard accelerators preserved**: while hovering, bare `C` (copy element) · `A` (→ agent) · `S` (screenshot) · `Esc` (cancel) still copy directly — each then shows the same chip so `⋯` is reachable afterward.
+- Host side: `PickPayload` gained a `part` facet (`all`/`html`/`styles`/`text`, `#[serde(default)] = all` for the `C` accelerator + older IPC); `format_pick_part` copies the bare value for the narrow facets and the full markdown for `all`.
+
+Verified: 18 browser_view tests green (2 new: facet formatting + `part` default/parse); clippy clean on new code. **Live-verified:** popover + identity header render over duckduckgo.com.
+
+---
+
+### 2026-06-13 — Browser toolbar UI/UX polish (detached DevTools · stop button · https lock · group divider)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/{native,render,mod}.rs`, `crates/app/src/assets.rs`, `crates/app/Cargo.toml` (+`objc2-foundation` `NSUserDefaults`), `crates/app/assets/icons/lock.svg` (new)
+
+Follow-up polish on the browser toolbar.
+
+- **DevTools no longer breaks the app layout.** wry's `open_devtools` docks the inspector *attached*, which (because our webview is a window-level child of GPUI's surface) laid the inspector out across the whole window and overlapped the SCM panel / left rail. Now `open_devtools` sets the WebKit default `__WebInspectorPageGroupLevel1__.WebKit2InspectorStartsAttached = false` before `[_inspector show]`, so the inspector opens in its own standalone window that never touches the app layout. (In-pane docking the way a normal browser does it would mean re-parenting WebKit's private inspector view into a clipped container and hand-managing the page/inspector frame split — far more machinery than a local cockpit needs.) **Live-verified:** opens as a separate "Web Inspector" window, the app chrome stays intact behind it, and it closes cleanly.
+- **Stop button:** the reload button swaps to a stop button while a page is loading (`window.stop()`); the loading flag is cleared on stop since `window.stop()` fires no load-finished callback.
+- **https lock glyph** left of the address text for secure origins.
+- **Group divider** separating the nav/address group from the agent-context + page-tools cluster.
+
+Verified: 857 lib tests green; clippy clean on new code. Code-reviewed **SHIP** after one fix (the stop button clearing `loading` so it can't stick).
+
+---
+
 ### 2026-06-13 — Browser P2 polish + P3 rich (copy-confirmation · DevTools · page theme · profiles · pick→agent)
 
 **Commits**: _(local, pending)_
