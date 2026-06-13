@@ -66,8 +66,8 @@ enum ChromeEvent {
 }
 
 /// Which agent-context probe most recently produced a result — drives the
-/// toolbar's transient confirmation (a green check on the firing button plus
-/// a short "copied" pill), so a copy is no longer silent.
+/// transient confirmation (a green check on the firing toolbar button plus a
+/// short "copied" toast floated over the page), so a copy is no longer silent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CopyKind {
     Screenshot,
@@ -80,7 +80,7 @@ enum CopyKind {
 }
 
 impl CopyKind {
-    /// Text for the confirmation pill.
+    /// Text for the confirmation toast.
     fn pill_label(self) -> &'static str {
         match self {
             CopyKind::Screenshot => "Screenshot copied",
@@ -114,6 +114,38 @@ pub enum PageAppearance {
     Dark,
 }
 
+impl PageAppearance {
+    /// Lowercase slug shared with the in-page theme menu (marks the active row).
+    fn slug(self) -> &'static str {
+        match self {
+            PageAppearance::System => "system",
+            PageAppearance::Light => "light",
+            PageAppearance::Dark => "dark",
+        }
+    }
+}
+
+impl From<agent_context::AppearanceValue> for PageAppearance {
+    fn from(v: agent_context::AppearanceValue) -> Self {
+        match v {
+            agent_context::AppearanceValue::System => PageAppearance::System,
+            agent_context::AppearanceValue::Light => PageAppearance::Light,
+            agent_context::AppearanceValue::Dark => PageAppearance::Dark,
+        }
+    }
+}
+
+/// A profiles-menu choice deferred to the next render. Switching or creating a
+/// profile rebuilds the webview, which needs a `&Window`; the IPC callback has
+/// none, so the choice is stashed and applied in `render` (mirrors
+/// `pending_agent_text`).
+enum ProfileRequest {
+    /// Switch to this store (`None` = the shared default).
+    Switch(Option<uuid::Uuid>),
+    /// Create a fresh isolated profile and switch to it.
+    New,
+}
+
 pub struct BrowserView {
     /// `None` if the native webview failed to build — render shows an error.
     native: Option<Rc<NativeWebview>>,
@@ -138,8 +170,9 @@ pub struct BrowserView {
     /// results (screenshots) back through here onto the main thread.
     events_tx: UnboundedSender<ChromeEvent>,
     _events: Task<()>,
-    /// The most recent probe result, shown as a transient toolbar
-    /// confirmation; cleared by `_confirm` after a short delay.
+    /// The most recent probe result; lights the firing toolbar button for a
+    /// short window (the textual confirmation floats in-page). Cleared by
+    /// `_confirm` after a short delay.
     confirmed: Option<CopyKind>,
     /// Holds the timer that clears `confirmed`; a fresh result replaces it so
     /// rapid clicks restart the window instead of stacking.
@@ -156,6 +189,9 @@ pub struct BrowserView {
     /// Active browser profile (cookie/cache store). `None` = the shared default
     /// store. Persisted per tab; switching rebuilds the webview.
     profile_id: Option<uuid::Uuid>,
+    /// A profiles-menu choice awaiting the next render (where a `Window` exists
+    /// to rebuild the webview).
+    pending_profile: Option<ProfileRequest>,
 }
 
 impl BrowserView {
@@ -214,14 +250,25 @@ impl BrowserView {
             devtools_open: false,
             pending_agent_text: None,
             profile_id,
+            pending_profile: None,
         }
     }
 
     /// Flash a transient confirmation for a probe result: light the firing
-    /// toolbar button and show a "copied" pill for a short window. A new
-    /// result restarts the window.
+    /// toolbar button and float a "copied" toast over the page for a short
+    /// window. A new result restarts the window.
     fn flash_confirm(&mut self, kind: CopyKind, cx: &mut Context<Self>) {
         self.confirmed = Some(kind);
+        // The textual confirmation floats in the page (top-right), not the
+        // toolbar — an inline pill in the toolbar's flex row shoved every icon
+        // left as it appeared. Picker results already draw their own
+        // near-element chip, so they skip the page toast and only light the
+        // toolbar button.
+        if let Some(native) = &self.native
+            && !matches!(kind, CopyKind::Pick | CopyKind::PickToAgent)
+        {
+            native.eval_script(&agent_context::confirm_toast_js(kind.pill_label()));
+        }
         cx.notify();
         self._confirm = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -284,7 +331,7 @@ impl BrowserView {
             // (copy / shot / agent / cancel) hand the keyboard back so the next
             // address bar or pane keystroke doesn't leak into the page.
             IpcMessage::Pick(payload) => {
-                self.to_clipboard(agent_context::format_pick(&payload), cx);
+                self.to_clipboard(agent_context::format_pick_part(&payload), cx);
                 self.flash_confirm(CopyKind::Pick, cx);
                 self.release_webview_focus();
             }
@@ -298,6 +345,24 @@ impl BrowserView {
                 self.release_webview_focus();
             }
             IpcMessage::PickCancel => self.release_webview_focus(),
+            IpcMessage::SetAppearance { value } => self.set_appearance(value.into(), cx),
+            // Profile changes rebuild the webview (needs a `Window`); defer to
+            // the next render. `"default"` = the shared store; otherwise a UUID.
+            IpcMessage::SwitchProfile { id } => {
+                let target = if id == "default" {
+                    Some(None)
+                } else {
+                    uuid::Uuid::parse_str(&id).ok().map(Some)
+                };
+                if let Some(target) = target {
+                    self.pending_profile = Some(ProfileRequest::Switch(target));
+                    cx.notify();
+                }
+            }
+            IpcMessage::NewProfile => {
+                self.pending_profile = Some(ProfileRequest::New);
+                cx.notify();
+            }
         }
     }
 
@@ -398,6 +463,17 @@ impl BrowserView {
         }
     }
 
+    fn stop_loading(&mut self, cx: &mut Context<Self>) {
+        if let Some(n) = &self.native {
+            n.stop();
+        }
+        // `window.stop()` doesn't fire a page-load-finished callback on
+        // WKWebView, so clear the loading flag here or the toolbar would stay
+        // stuck on the stop icon.
+        self.loading = false;
+        cx.notify();
+    }
+
     /// Live URL — persistence reads this so a restored tab reopens where the
     /// user left off (including link-click navigations).
     pub fn current_url(&self) -> String {
@@ -426,13 +502,17 @@ impl BrowserView {
         self.appearance
     }
 
-    /// Cycle the page color-scheme override System → Light → Dark → System.
-    pub fn cycle_appearance(&mut self, cx: &mut Context<Self>) {
-        let next = match self.appearance {
-            PageAppearance::System => PageAppearance::Light,
-            PageAppearance::Light => PageAppearance::Dark,
-            PageAppearance::Dark => PageAppearance::System,
-        };
+    /// Open the in-page page-theme menu (System / Light / Dark, active ✓). It
+    /// renders in the page rather than the toolbar — a GPUI menu would draw
+    /// under the native webview — and routes the choice back via `set_appearance`.
+    pub fn open_appearance_menu(&self) {
+        if let Some(n) = &self.native {
+            n.eval_script(&agent_context::appearance_menu_js(self.appearance.slug()));
+        }
+    }
+
+    /// Apply a page color-scheme override (from the in-page theme menu).
+    fn set_appearance(&mut self, next: PageAppearance, cx: &mut Context<Self>) {
         self.appearance = next;
         if let Some(n) = &self.native {
             n.set_appearance(next);
@@ -447,16 +527,43 @@ impl BrowserView {
             .unwrap_or_else(|| "Default".to_string())
     }
 
-    /// Switch to the next profile in the ring (Default, then each saved
-    /// profile). Rebuilds the webview against the new isolated store.
-    pub fn cycle_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut ring: Vec<Option<uuid::Uuid>> = vec![None];
+    /// Open the in-page profiles menu: every cookie-isolated profile with a ✓
+    /// on the active one, then a "New Profile…" action. Renders in the page
+    /// (a GPUI menu would draw under the native webview); selections route back
+    /// over IPC and apply on the next render (they rebuild the webview).
+    pub fn open_profile_menu(&self, cx: &App) {
+        let Some(n) = &self.native else { return };
+        let active = self.profile_id;
+        let mut items: Vec<serde_json::Value> = vec![serde_json::json!({
+            "id": "default",
+            "name": "Default",
+            "active": active.is_none(),
+        })];
         if let Some(g) = cx.try_global::<BrowserProfiles>() {
-            ring.extend(g.profiles.iter().map(|p| Some(p.id)));
+            for p in &g.profiles {
+                items.push(serde_json::json!({
+                    "id": p.id.to_string(),
+                    "name": p.name,
+                    "active": Some(p.id) == active,
+                }));
+            }
         }
-        let idx = ring.iter().position(|x| *x == self.profile_id).unwrap_or(0);
-        let next = ring[(idx + 1) % ring.len()];
-        self.switch_profile(next, window, cx);
+        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+        n.eval_script(&agent_context::profile_menu_js(&json));
+    }
+
+    /// Apply a deferred profiles-menu choice (called from `render`, where a
+    /// `Window` exists to rebuild the webview).
+    fn apply_profile_request(
+        &mut self,
+        req: ProfileRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match req {
+            ProfileRequest::Switch(id) => self.switch_profile(id, window, cx),
+            ProfileRequest::New => self.new_profile(window, cx),
+        }
     }
 
     /// Create a new isolated profile and switch this tab to it.

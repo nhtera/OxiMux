@@ -20,7 +20,9 @@ impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let density = self.density;
-        let typography = &self.typography;
+        // Cloned (not borrowed) so the deferred profile-apply below can take a
+        // mutable borrow of `self` without conflicting with a live `&self`.
+        let typography = self.typography.clone();
 
         // Keep the address bar in step with the live URL while the user is
         // NOT editing it (so link-click navigations are reflected). When the
@@ -45,6 +47,12 @@ impl Render for BrowserView {
         // exists, via the same action the terminal/diff views use.
         if let Some(text) = self.pending_agent_text.take() {
             window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+        }
+
+        // Apply a deferred profiles-menu choice now that a `Window` exists to
+        // rebuild the webview (the IPC callback had none).
+        if let Some(req) = self.pending_profile.take() {
+            self.apply_profile_request(req, window, cx);
         }
 
         // Tooltip labels for the cycle-on-click profile + appearance controls.
@@ -95,20 +103,50 @@ impl Render for BrowserView {
                 nav_btn("browser-forward", "icons/arrow-right.svg")
                     .on_click(cx.listener(|this, _, _window, _cx| this.go_forward())),
             )
-            .child(
+            // Reload, or stop while a page is loading (swap).
+            .child(if self.loading {
+                nav_btn("browser-stop", "icons/x.svg")
+                    .tooltip("Stop")
+                    .on_click(cx.listener(|this, _, _window, cx| this.stop_loading(cx)))
+            } else {
                 nav_btn("browser-reload", "icons/refresh-cw.svg")
-                    .on_click(cx.listener(|this, _, _window, _cx| this.reload())),
-            )
+                    .tooltip("Reload")
+                    .on_click(cx.listener(|this, _, _window, _cx| this.reload()))
+            })
             // Address bar — submit on Enter via `capture_action` (an ancestor
-            // `on_key_down` never fires while the Input owns focus).
+            // `on_key_down` never fires while the Input owns focus). A lock
+            // glyph marks an https origin.
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(density.gap_inline * 0.5))
                     .capture_action(cx.listener(|this, _: &InputEnter, _window, cx| {
                         this.submit_address(cx);
                     }))
-                    .child(Input::new(&self.address).small()),
+                    .children(self.url.starts_with("https://").then(|| {
+                        Icon::default()
+                            .path("icons/lock.svg")
+                            .xsmall()
+                            .text_color(theme.fg_subtle)
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(Input::new(&self.address).small()),
+                    ),
+            )
+            // Divider: separates navigation from the agent-context + page tools.
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(16.0))
+                    .mx(px(density.gap_inline * 0.5))
+                    .bg(theme.border_inactive),
             )
             // Agent-context probes — each hands pasteable page context to an AI
             // agent. The firing button briefly turns into a green check (see
@@ -116,7 +154,7 @@ impl Render for BrowserView {
             // silent. Picker reads keys in the page, so it focuses the webview.
             .child(
                 probe_btn("browser-pick", "icons/crosshair.svg", CopyKind::Pick)
-                    .tooltip("Pick element (C copy · A → agent)")
+                    .tooltip("Pick element — click copies an image, then ⋯ for more (C · A → agent)")
                     .on_click(cx.listener(|this, _, _window, _cx| this.start_element_picker())),
             )
             .child(
@@ -148,45 +186,40 @@ impl Render for BrowserView {
                     .tooltip("Toggle DevTools")
                     .on_click(cx.listener(|this, _, _window, cx| this.toggle_devtools(cx)))
             })
-            .child(
-                nav_btn("browser-appearance", "icons/contrast.svg")
+            .child({
+                let mut icon = Icon::default().path("icons/contrast.svg");
+                if self.appearance != PageAppearance::System {
+                    icon = icon.text_color(theme.status_ok);
+                }
+                Button::new("browser-appearance")
+                    .icon(icon)
+                    .ghost()
+                    .small()
                     .tooltip(SharedString::from(format!(
-                        "Page theme: {appearance_label} (click to cycle)"
+                        "Page theme: {appearance_label} (click to choose)"
                     )))
-                    .on_click(cx.listener(|this, _, _window, cx| this.cycle_appearance(cx))),
-            )
-            .child(
-                nav_btn("browser-profile", "icons/user.svg")
+                    .on_click(cx.listener(|this, _, _window, _cx| this.open_appearance_menu()))
+            })
+            // Profile button → in-page menu (every profile + "New Profile…").
+            // The active profile tints the icon so a non-default store shows at
+            // a glance; the standalone "+" button folded into the menu.
+            .child({
+                let mut icon = Icon::default().path("icons/user.svg");
+                if self.profile_id.is_some() {
+                    icon = icon.text_color(theme.status_ok);
+                }
+                Button::new("browser-profile")
+                    .icon(icon)
+                    .ghost()
+                    .small()
                     .tooltip(SharedString::from(format!(
-                        "Profile: {profile_name} (click to switch)"
+                        "Profile: {profile_name} (click to manage)"
                     )))
-                    .on_click(cx.listener(|this, _, window, cx| this.cycle_profile(window, cx))),
-            )
-            .child(
-                nav_btn("browser-profile-new", "icons/plus.svg")
-                    .tooltip("New isolated profile")
-                    .on_click(cx.listener(|this, _, window, cx| this.new_profile(window, cx))),
-            )
-            .children(self.confirmed.map(|kind| {
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(density.gap_inline * 0.5))
-                    .px(px(density.pad_panel * 0.6))
-                    .py(px(density.pad_panel * 0.25))
-                    .rounded_full()
-                    .bg(theme.bg_panel_alt)
-                    .text_color(theme.fg_muted)
-                    .text_size(px(typography.t_body_sm))
-                    .child(
-                        Icon::default()
-                            .path("icons/check.svg")
-                            .small()
-                            .text_color(theme.status_ok),
-                    )
-                    .child(SharedString::from(kind.pill_label()))
-            }));
+                    .on_click(cx.listener(|this, _, _window, cx| this.open_profile_menu(cx)))
+            });
+        // A copied result lights the firing button (see `probe_btn`) and floats
+        // a "✓ copied" toast over the page (in-page, so it can't shift the
+        // toolbar's icons). No trailing pill in the flex row.
 
         let body: gpui::AnyElement = match &self.native {
             Some(native) => {

@@ -62,7 +62,7 @@ objc2 = "0.6"
 # Desktop notifications (`notifier::mac`) ride UNUserNotificationCenter;
 # foundation + block2 supply NSString/NSBundle and the completion-handler
 # blocks. All three are already in the transitive graph via gpui-component.
-objc2-foundation = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSUserDefaults"] }
 objc2-user-notifications = "0.3"
 block2 = "0.6"
 # Embedded browser-tab engine: one Rust API over the platform webview

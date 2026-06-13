@@ -23,6 +23,25 @@ use super::agent_context::PickRect;
 /// main thread (construction, frame updates, navigation, teardown-on-drop).
 pub struct NativeWebview {
     webview: WebView,
+    /// macOS: a pane-sized container the webview is re-parented into so the
+    /// WebKit inspector can dock *inside the pane* (split page/inspector) rather
+    /// than spilling over the whole app. `None` if the wrap could not be set up
+    /// (then DevTools falls back to a standalone inspector window).
+    #[cfg(target_os = "macos")]
+    inspector_dock: Option<InspectorDock>,
+}
+
+/// The two retained AppKit views backing an in-pane docked inspector.
+///
+/// `container` is pinned to the pane's body bounds each paint and holds the
+/// webview as its sole child; when the inspector attaches, WebKit splits this
+/// container between page and inspector. `host` is the container's superview
+/// (GPUI's window root) — kept for the bounds Y-flip, matching how `wry`
+/// positions a child webview against its parent's height.
+#[cfg(target_os = "macos")]
+struct InspectorDock {
+    host: objc2::rc::Retained<objc2_app_kit::NSView>,
+    container: objc2::rc::Retained<objc2_app_kit::NSView>,
 }
 
 /// Page-chrome callbacks wired into the webview at build time. Each fires
@@ -96,11 +115,38 @@ impl NativeWebview {
         #[cfg(not(target_os = "macos"))]
         let _ = data_store_id;
         let webview = builder.build_as_child(window)?;
-        Ok(Self { webview })
+        #[cfg(target_os = "macos")]
+        let inspector_dock = wrap_for_docked_inspector(&webview);
+        Ok(Self {
+            webview,
+            #[cfg(target_os = "macos")]
+            inspector_dock,
+        })
     }
 
     /// Pin the webview frame to a GPUI element's window-relative bounds.
+    ///
+    /// When a docked-inspector container exists we size *that* (the webview
+    /// fills it via autoresizing, or WebKit splits it with the inspector); the
+    /// container's superview is the GPUI window root, so we replicate `wry`'s
+    /// own top-left→AppKit Y-flip against it. Otherwise we defer to `wry`.
     pub fn set_bounds_px(&self, bounds: Bounds<Pixels>) {
+        #[cfg(target_os = "macos")]
+        if let Some(dock) = &self.inspector_dock {
+            use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+            let x = f32::from(bounds.origin.x) as f64;
+            let y = f32::from(bounds.origin.y) as f64;
+            let w = f32::from(bounds.size.width) as f64;
+            let h = f32::from(bounds.size.height) as f64;
+            let origin_y = if dock.host.isFlipped() {
+                y
+            } else {
+                dock.host.frame().size.height - y - h
+            };
+            dock.container
+                .setFrame(CGRect::new(CGPoint::new(x, origin_y), CGSize::new(w, h)));
+            return;
+        }
         let _ = self.webview.set_bounds(Rect {
             position: LogicalPosition::new(
                 f32::from(bounds.origin.x) as f64,
@@ -116,6 +162,14 @@ impl NativeWebview {
     }
 
     pub fn set_visible(&self, visible: bool) {
+        // Toggle the container (not the webview) so a docked inspector — a
+        // sibling of the webview inside the container — hides with the page
+        // when the tab is inactive or covered.
+        #[cfg(target_os = "macos")]
+        if let Some(dock) = &self.inspector_dock {
+            dock.container.setHidden(!visible);
+            return;
+        }
         let _ = self.webview.set_visible(visible);
     }
 
@@ -139,6 +193,12 @@ impl NativeWebview {
 
     pub fn reload(&self) {
         self.eval("location.reload()");
+    }
+
+    /// Halt the in-flight navigation/resource loads (the toolbar's stop button,
+    /// shown in place of reload while a page is loading).
+    pub fn stop(&self) {
+        self.eval("window.stop()");
     }
 
     /// Run an arbitrary script (agent-context probes: snapshot / console /
@@ -165,7 +225,49 @@ impl NativeWebview {
         let _ = self.webview.focus_parent();
     }
 
-    /// Open / close / query the WebKit inspector for this page.
+    /// Open the WebKit inspector docked *inside the browser pane* (page on top,
+    /// inspector below) — the layout a normal browser shows.
+    ///
+    /// WebKit's attached inspector docks into the inspected webview's superview
+    /// and splits it. We re-parented the webview into a pane-sized container at
+    /// build time (`wrap_for_docked_inspector`), so the split stays within the
+    /// pane. We steer the initial presentation to *attached* (the opposite of a
+    /// standalone window) and force-attach in case the page's inspector was
+    /// previously materialized detached.
+    ///
+    /// If the wrap could not be set up (`inspector_dock == None`), an attached
+    /// inspector would spill over the whole app, so we keep the old behavior:
+    /// open it as a standalone floating window instead.
+    #[cfg(target_os = "macos")]
+    pub fn open_devtools(&self) {
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2_foundation::{NSUserDefaults, ns_string};
+        use wry::WebViewExtMacOS;
+
+        let docked = self.inspector_dock.is_some();
+        // WebKit reads this default when it first materializes an inspector for
+        // a page group: `true` docks it attached to the page (inside our
+        // container), `false` opens a standalone window. Steer it per `docked`.
+        let defaults = NSUserDefaults::standardUserDefaults();
+        defaults.setBool_forKey(
+            docked,
+            ns_string!("__WebInspectorPageGroupLevel1__.WebKit2InspectorStartsAttached"),
+        );
+        let webview = self.webview.webview();
+        unsafe {
+            let inspector: Retained<AnyObject> = objc2::msg_send![&*webview, _inspector];
+            let _: () = objc2::msg_send![&inspector, show];
+            // Re-attach if a prior `show` had materialized it detached. WebKit's
+            // bias toward re-docking (the reason detaching is unreliable) works
+            // in our favor here.
+            if docked {
+                let _: () = objc2::msg_send![&inspector, attach];
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn open_devtools(&self) {
         self.webview.open_devtools();
     }
@@ -273,4 +375,46 @@ impl NativeWebview {
     /// platform-specific probe; the rest ride the cross-platform JS bridge.
     #[cfg(not(target_os = "macos"))]
     pub fn screenshot(&self, _rect: Option<PickRect>, _on_png: impl Fn(Vec<u8>) + 'static) {}
+}
+
+/// Re-parent the freshly built child webview into a pane-sized container so the
+/// WebKit inspector can dock inside the pane (see [`NativeWebview::open_devtools`]).
+///
+/// `wry` parents a child webview directly into the GPUI window root. WebKit's
+/// attached inspector splits the inspected view's *superview*, so left as-is it
+/// would overrun the whole app. Inserting an intermediate container — sized to
+/// the pane each paint — confines that split. The webview fills the container
+/// via autoresizing until the inspector claims its share. Returns `None` if any
+/// AppKit handle is unavailable, leaving DevTools to fall back to a window.
+#[cfg(target_os = "macos")]
+fn wrap_for_docked_inspector(webview: &WebView) -> Option<InspectorDock> {
+    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
+    use wry::WebViewExtMacOS;
+
+    let mtm = MainThreadMarker::new()?;
+    let wk = webview.webview(); // Retained<WKWebView> — an NSView subclass
+    // SAFETY: all on the GPUI main thread; the webview is a live child view.
+    unsafe {
+        let host = wk.superview()?; // GPUI window root the webview was parented into
+        let frame = wk.frame();
+
+        let container = NSView::initWithFrame(NSView::alloc(mtm), frame);
+        // Slot the container in where the webview sat, then move the webview in.
+        host.addSubview(&container);
+        container.addSubview(&wk);
+        wk.setFrame(container.bounds());
+        wk.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        // Build starts the page hidden via `with_visible(false)` (the webview's
+        // own `setHidden`). Move that gate to the container so the page + a
+        // docked inspector hide together; the first render sweep reveals the
+        // active tab.
+        wk.setHidden(false);
+        container.setHidden(true);
+
+        Some(InspectorDock { host, container })
+    }
 }

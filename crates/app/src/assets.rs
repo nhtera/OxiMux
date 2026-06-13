@@ -137,6 +137,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/contrast.svg"),
     ),
     ("icons/user.svg", include_bytes!("../assets/icons/user.svg")),
+    // Address-bar security indicator for https pages.
+    ("icons/lock.svg", include_bytes!("../assets/icons/lock.svg")),
 ];
 
 impl AssetSource for AppAssets {

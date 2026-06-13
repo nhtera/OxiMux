@@ -123,11 +123,191 @@ pub const SCREENSHOT_FLASH_JS: &str = r#"
 })();
 "#;
 
+/// A floating "✓ <label>" toast pinned to the page's top-right, used to confirm
+/// toolbar-button copies. It lives in the page (its own shadow root) rather
+/// than the toolbar: a host-drawn pill in the toolbar's flex row shoved every
+/// icon left as it appeared, and a GPUI overlay would render *under* the native
+/// webview. Slides down + fades in, then auto-dismisses; a fresh toast replaces
+/// any in-flight one. `__OX_LABEL__` is substituted with a JSON-encoded string
+/// by [`confirm_toast_js`], so the label can never break out of the literal.
+const CONFIRM_TOAST_JS: &str = r#"
+(function () {
+  var id = '__oxToast';
+  var prev = document.getElementById(id); if (prev) prev.remove();
+  var host = document.createElement('div'); host.id = id;
+  host.style.cssText = 'position:fixed;top:10px;right:12px;z-index:2147483647;pointer-events:none;';
+  var sh = host.attachShadow({ mode: 'open' });
+  var s = document.createElement('style');
+  s.textContent =
+    '.t{display:inline-flex;align-items:center;gap:7px;font:12px -apple-system,system-ui,sans-serif;'
+    + 'font-weight:600;color:#1d1d1f;background:rgba(255,255,255,0.97);padding:7px 13px 7px 9px;'
+    + 'border-radius:999px;box-shadow:0 8px 26px rgba(0,0,0,0.28);'
+    + '-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);'
+    + 'opacity:0;transform:translateY(-10px);transition:opacity .2s ease,transform .2s ease;}'
+    + '.t.in{opacity:1;transform:translateY(0);}'
+    + '.b{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;'
+    + 'border-radius:50%;background:#34c759;color:#fff;font-size:11px;line-height:1;flex:0 0 auto;}';
+  sh.appendChild(s);
+  var t = document.createElement('div'); t.className = 't';
+  var b = document.createElement('span'); b.className = 'b'; b.textContent = '✓'; t.appendChild(b);
+  var x = document.createElement('span'); x.textContent = __OX_LABEL__; t.appendChild(x);
+  sh.appendChild(t);
+  document.documentElement.appendChild(host);
+  requestAnimationFrame(function () { t.classList.add('in'); });
+  setTimeout(function () { if (t) t.classList.remove('in'); }, 1500);
+  setTimeout(function () { host.remove(); }, 1740);
+})();
+"#;
+
+/// Build the in-page confirmation toast for `label`, JSON-encoding the label so
+/// page-safe text can't escape the JS string literal. See [`CONFIRM_TOAST_JS`].
+pub fn confirm_toast_js(label: &str) -> String {
+    let json = serde_json::to_string(label).unwrap_or_else(|_| "\"Copied\"".to_string());
+    CONFIRM_TOAST_JS.replace("__OX_LABEL__", &json)
+}
+
+/// Page-theme dropdown menu, injected in-page (its own shadow root) when the
+/// toolbar's appearance button is clicked. A GPUI menu would render *under* the
+/// native webview, so — like the picker popover — it lives in the page: a dark
+/// translucent panel at the top-right listing System / Light / Dark with a ✓ on
+/// the active one. Selecting a row posts `set_appearance` back to the host; a
+/// full-page backdrop (and `Esc`, when the page holds focus) dismisses it.
+/// `__OX_CURRENT__` is substituted with the active slug by [`appearance_menu_js`].
+const APPEARANCE_MENU_JS: &str = r#"
+(function () {
+  if (window.__oxThemeMenu) { window.__oxThemeMenu.remove(); window.__oxThemeMenu = null; }
+  var host = document.createElement('div');
+  host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;';
+  var rs = host.attachShadow({ mode: 'open' });
+  var st = document.createElement('style');
+  st.textContent =
+    '.backdrop{position:fixed;inset:0;pointer-events:auto;}'
+    + '.menu{position:fixed;top:8px;right:10px;min-width:172px;pointer-events:auto;'
+    + 'background:rgba(38,38,42,0.98);color:#fff;border:0.5px solid rgba(255,255,255,0.16);'
+    + 'border-radius:10px;padding:5px;font:13px -apple-system,system-ui,sans-serif;'
+    + 'box-shadow:0 14px 38px rgba(0,0,0,0.5);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);'
+    + 'transform-origin:top right;animation:oxpop .13s cubic-bezier(.2,.8,.2,1);}'
+    + '@keyframes oxpop{from{opacity:0;transform:scale(.95) translateY(-6px);}to{opacity:1;transform:none;}}'
+    + '.head{padding:4px 9px 7px;font:11px ui-monospace,monospace;color:rgba(255,255,255,0.5);'
+    + 'border-bottom:0.5px solid rgba(255,255,255,0.1);margin-bottom:4px;}'
+    + '.item{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:6px;cursor:pointer;'
+    + 'white-space:nowrap;}'
+    + '.item:hover{background:#3478f6;color:#fff;}'
+    + '.tick{width:13px;text-align:center;color:#34c759;font-size:12px;flex:0 0 auto;}'
+    + '.item:hover .tick{color:#fff;}'
+    + '.lbl{flex:1;}';
+  rs.appendChild(st);
+  var bd = document.createElement('div'); bd.className = 'backdrop';
+  bd.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); cleanup(); }, true);
+  rs.appendChild(bd);
+  var menu = document.createElement('div'); menu.className = 'menu';
+  var head = document.createElement('div'); head.className = 'head'; head.textContent = 'Page theme'; menu.appendChild(head);
+  var CUR = __OX_CURRENT__;
+  [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']].forEach(function (it) {
+    var row = document.createElement('div'); row.className = 'item';
+    var tk = document.createElement('span'); tk.className = 'tick'; tk.textContent = (it[0] === CUR ? '✓' : ''); row.appendChild(tk);
+    var lb = document.createElement('span'); lb.className = 'lbl'; lb.textContent = it[1]; row.appendChild(lb);
+    row.addEventListener('click', function (e) {
+      e.preventDefault(); e.stopPropagation();
+      window.ipc.postMessage(JSON.stringify({ kind: 'set_appearance', value: it[0] }));
+      cleanup();
+    }, true);
+    menu.appendChild(row);
+  });
+  rs.appendChild(menu);
+  document.documentElement.appendChild(host);
+  function cleanup() { window.removeEventListener('keydown', esc, true); host.remove(); window.__oxThemeMenu = null; }
+  function esc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cleanup(); } }
+  window.addEventListener('keydown', esc, true);
+  window.__oxThemeMenu = host;
+})();
+"#;
+
+/// Build the page-theme menu JS with the active slug (`system`/`light`/`dark`)
+/// marked. See [`APPEARANCE_MENU_JS`].
+pub fn appearance_menu_js(current: &str) -> String {
+    let cur = serde_json::to_string(current).unwrap_or_else(|_| "\"system\"".to_string());
+    APPEARANCE_MENU_JS.replace("__OX_CURRENT__", &cur)
+}
+
+/// Profiles dropdown, injected in-page when the toolbar's profile button is
+/// clicked (same in-page rationale as the theme menu). Lists every cookie-
+/// isolated profile with a ✓ + a highlighted row on the active one, then a
+/// "New Profile…" action below a divider. Selecting a profile posts
+/// `switch_profile`; the action posts `new_profile`. `__OX_PROFILES__` is
+/// substituted by [`profile_menu_js`] with a JSON array of `{id, name, active}`
+/// (the host owns the list, so the page can't fabricate a profile).
+const PROFILE_MENU_JS: &str = r#"
+(function () {
+  if (window.__oxProfileMenu) { window.__oxProfileMenu.remove(); window.__oxProfileMenu = null; }
+  var ITEMS = __OX_PROFILES__;
+  var host = document.createElement('div');
+  host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;';
+  var rs = host.attachShadow({ mode: 'open' });
+  var st = document.createElement('style');
+  st.textContent =
+    '.backdrop{position:fixed;inset:0;pointer-events:auto;}'
+    + '.menu{position:fixed;top:8px;right:10px;min-width:204px;max-width:320px;pointer-events:auto;'
+    + 'background:rgba(38,38,42,0.98);color:#fff;border:0.5px solid rgba(255,255,255,0.16);'
+    + 'border-radius:10px;padding:5px;font:13px -apple-system,system-ui,sans-serif;'
+    + 'box-shadow:0 14px 38px rgba(0,0,0,0.5);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);'
+    + 'transform-origin:top right;animation:oxpop .13s cubic-bezier(.2,.8,.2,1);}'
+    + '@keyframes oxpop{from{opacity:0;transform:scale(.95) translateY(-6px);}to{opacity:1;transform:none;}}'
+    + '.head{padding:4px 9px 7px;font:11px ui-monospace,monospace;color:rgba(255,255,255,0.5);'
+    + 'border-bottom:0.5px solid rgba(255,255,255,0.1);margin-bottom:4px;}'
+    + '.item{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:6px;cursor:pointer;white-space:nowrap;}'
+    + '.item.active{background:rgba(255,255,255,0.08);}'
+    + '.item:hover{background:#3478f6;color:#fff;}'
+    + '.tick{width:13px;text-align:center;color:#34c759;font-size:12px;flex:0 0 auto;}'
+    + '.item:hover .tick{color:#fff;}'
+    + '.lbl{flex:1;overflow:hidden;text-overflow:ellipsis;}'
+    + '.sep{height:0.5px;margin:5px 6px;background:rgba(255,255,255,0.12);}';
+  rs.appendChild(st);
+  var bd = document.createElement('div'); bd.className = 'backdrop';
+  bd.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); cleanup(); }, true);
+  rs.appendChild(bd);
+  var menu = document.createElement('div'); menu.className = 'menu';
+  var head = document.createElement('div'); head.className = 'head'; head.textContent = 'Profiles'; menu.appendChild(head);
+  function post(m) { window.ipc.postMessage(JSON.stringify(m)); cleanup(); }
+  ITEMS.forEach(function (it) {
+    var row = document.createElement('div'); row.className = 'item' + (it.active ? ' active' : '');
+    var tk = document.createElement('span'); tk.className = 'tick'; tk.textContent = (it.active ? '✓' : ''); row.appendChild(tk);
+    var lb = document.createElement('span'); lb.className = 'lbl'; lb.textContent = it.name; row.appendChild(lb);
+    row.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); post({ kind: 'switch_profile', id: it.id }); }, true);
+    menu.appendChild(row);
+  });
+  var sep = document.createElement('div'); sep.className = 'sep'; menu.appendChild(sep);
+  var nw = document.createElement('div'); nw.className = 'item';
+  nw.appendChild(document.createElement('span')).className = 'tick';
+  var nwlb = document.createElement('span'); nwlb.className = 'lbl'; nwlb.textContent = 'New Profile…'; nw.appendChild(nwlb);
+  nw.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); post({ kind: 'new_profile' }); }, true);
+  menu.appendChild(nw);
+  rs.appendChild(menu);
+  document.documentElement.appendChild(host);
+  function cleanup() { window.removeEventListener('keydown', esc, true); host.remove(); window.__oxProfileMenu = null; }
+  function esc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cleanup(); } }
+  window.addEventListener('keydown', esc, true);
+  window.__oxProfileMenu = host;
+})();
+"#;
+
+/// Build the profiles menu JS from a JSON array of `{id, name, active}` rows.
+/// See [`PROFILE_MENU_JS`].
+pub fn profile_menu_js(items_json: &str) -> String {
+    PROFILE_MENU_JS.replace("__OX_PROFILES__", items_json)
+}
+
 /// Inject the element-picker shadow-overlay. Hover highlights
-/// `elementFromPoint`; `C` copies the element payload, `A` sends it to the
-/// active agent terminal, `S` screenshots its rect, `Esc` cancels. Listeners
-/// are capture-phase + `stopPropagation` so the page's own handlers never see
-/// the picker's keys.
+/// `elementFromPoint`; a **click copies a screenshot of the element by
+/// default** (the most generally useful grab) and drops a white "✓ Copied"
+/// chip with a **⋯ More** button. The ⋯ opens a small popover with the other
+/// facets — copy the element (full markdown / HTML / styles / text), copy the
+/// image again, or send it to the agent. The chip + popover live in their own
+/// shadow root (a host-drawn popover would render *under* the native webview).
+/// Bare `C` / `A` / `S` keyboard accelerators still copy element / send to
+/// agent / screenshot directly while hovering; `Esc` cancels. Listeners are
+/// capture-phase + `stopPropagation` so the page's own handlers never see the
+/// picker's clicks or keys.
 pub const PICKER_JS: &str = r#"
 (function () {
   if (window.__oxPicker) { window.__oxPicker.stop(); }
@@ -139,25 +319,13 @@ pub const PICKER_JS: &str = r#"
   var label = document.createElement('div');
   label.style.cssText = 'position:fixed;pointer-events:none;font:12px monospace;background:#111;color:#fff;padding:2px 6px;border-radius:3px;white-space:nowrap;';
   var hint = document.createElement('div');
-  hint.textContent = 'C copy · A → agent · S shot · Esc';
+  hint.textContent = 'Click to copy image · ⋯ for more · C element · A → agent · Esc';
   hint.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);pointer-events:none;font:11px system-ui,sans-serif;background:rgba(17,17,17,0.92);color:#fff;padding:4px 10px;border-radius:999px;white-space:nowrap;';
   shadow.appendChild(box);
   shadow.appendChild(label);
   shadow.appendChild(hint);
   document.documentElement.appendChild(host);
-  // A short-lived "Copied" bubble shown at the picked element after the
-  // overlay tears down, so the action reads as spatially connected.
-  function confirmBubble(el, text) {
-    var r = el.getBoundingClientRect();
-    var b = document.createElement('div');
-    b.textContent = '✓ ' + text;
-    b.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;font:12px system-ui,sans-serif;background:rgba(17,17,17,0.95);color:#fff;padding:3px 9px;border-radius:999px;white-space:nowrap;transition:opacity 0.2s ease-out;';
-    b.style.left = Math.max(4, r.left) + 'px';
-    b.style.top = Math.max(4, r.top - 26) + 'px';
-    document.documentElement.appendChild(b);
-    setTimeout(function () { b.style.opacity = '0'; }, 700);
-    setTimeout(function () { b.remove(); }, 950);
-  }
+
   var cur = null;
   function sel(el) {
     if (el.id) return '#' + CSS.escape(el.id);
@@ -205,6 +373,117 @@ pub const PICKER_JS: &str = r#"
              html: (el.outerHTML || '').slice(0, 4096), text: (el.textContent || '').trim().slice(0, 500),
              styles: styles, rect: { x: r.left, y: r.top, w: r.width, h: r.height } };
   }
+  function copyImage(rect) {
+    window.ipc.postMessage(JSON.stringify({ kind: 'pick_shot', rect: rect }));
+  }
+  function emitPart(p, part) { var m = Object.assign({}, p); m.kind = 'pick'; m.part = part; window.ipc.postMessage(JSON.stringify(m)); }
+  function emitAgent(p) { var m = Object.assign({}, p); m.kind = 'pick_to_agent'; window.ipc.postMessage(JSON.stringify(m)); }
+
+  // After the default image copy, show a white "✓ Copied" chip anchored above
+  // the element with a "⋯ More" button. The chip + its popover get their own
+  // shadow root so they survive the picking overlay's teardown and stay clear
+  // of page CSS. `p`/`rect` snapshot the clicked element for the deferred
+  // options.
+  function showResult(rect, p) {
+    var rHost = document.createElement('div');
+    rHost.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;';
+    var rs = rHost.attachShadow({ mode: 'open' });
+    var st = document.createElement('style');
+    st.textContent =
+      '.pill{position:fixed;display:inline-flex;align-items:center;gap:6px;pointer-events:auto;'
+      + 'font:12px -apple-system,system-ui,sans-serif;font-weight:600;color:#1d1d1f;background:#fff;'
+      + 'padding:4px 5px 4px 7px;border-radius:999px;box-shadow:0 6px 22px rgba(0,0,0,0.4);white-space:nowrap;}'
+      + '.badge{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;'
+      + 'border-radius:50%;background:#34c759;color:#fff;font-size:11px;line-height:1;}'
+      + '.more{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:20px;'
+      + 'margin-left:1px;border-radius:999px;background:rgba(0,0,0,0.06);color:#3478f6;font-weight:700;'
+      + 'cursor:pointer;letter-spacing:1.5px;}'
+      + '.more:hover{background:rgba(52,120,246,0.16);}'
+      + '.backdrop{position:fixed;inset:0;pointer-events:auto;}'
+      + '.menu{position:fixed;min-width:188px;pointer-events:auto;background:rgba(38,38,42,0.98);color:#fff;'
+      + 'border:0.5px solid rgba(255,255,255,0.16);border-radius:10px;padding:5px;'
+      + 'font:13px -apple-system,system-ui,sans-serif;box-shadow:0 12px 34px rgba(0,0,0,0.5);'
+      + '-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);}'
+      + '.head{padding:4px 9px 7px;font:11px ui-monospace,monospace;color:rgba(255,255,255,0.5);'
+      + 'border-bottom:0.5px solid rgba(255,255,255,0.1);margin-bottom:4px;white-space:nowrap;'
+      + 'overflow:hidden;text-overflow:ellipsis;max-width:260px;}'
+      + '.item{display:flex;justify-content:space-between;gap:24px;align-items:center;'
+      + 'padding:5px 9px;border-radius:6px;cursor:pointer;white-space:nowrap;}'
+      + '.item:hover{background:#3478f6;color:#fff;}'
+      + '.sep{height:0.5px;margin:4px 6px;background:rgba(255,255,255,0.12);}'
+      + '.key{opacity:0.4;font:11px system-ui,sans-serif;}';
+    rs.appendChild(st);
+
+    var pill = document.createElement('div'); pill.className = 'pill';
+    var badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = '✓'; pill.appendChild(badge);
+    var txt = document.createElement('span'); txt.textContent = 'Copied'; pill.appendChild(txt);
+    var more = document.createElement('span'); more.className = 'more'; more.textContent = '···'; more.title = 'More copy options'; pill.appendChild(more);
+    rs.appendChild(pill);
+    document.documentElement.appendChild(rHost);
+
+    var pw = pill.offsetWidth;
+    var pleft = Math.min(Math.max(8, rect.x + rect.w / 2 - pw / 2), window.innerWidth - pw - 8);
+    var ptop = Math.max(6, rect.y - 34);
+    pill.style.left = pleft + 'px'; pill.style.top = ptop + 'px';
+
+    var killT = setTimeout(cleanup, 4200);
+    function cleanup() { clearTimeout(killT); window.removeEventListener('keydown', esc, true); rHost.remove(); }
+    function esc(e) { if (e.key === 'Escape') { cleanup(); e.preventDefault(); e.stopPropagation(); } }
+    window.addEventListener('keydown', esc, true);
+
+    var ITEMS = [
+      { t: 'Copy element', k: 'C', f: function () { emitPart(p, 'all'); } },
+      { t: 'Copy HTML', k: '', f: function () { emitPart(p, 'html'); } },
+      { t: 'Copy styles', k: '', f: function () { emitPart(p, 'styles'); } },
+      { t: 'Copy text', k: '', f: function () { emitPart(p, 'text'); } },
+      { sep: true },
+      { t: 'Copy image again', k: 'S', f: function () { copyImage(rect); } },
+      { t: 'Send to agent', k: 'A', f: function () { emitAgent(p); } }
+    ];
+    var expanded = false;
+    more.addEventListener('click', function (e) {
+      e.preventDefault(); e.stopPropagation(); clearTimeout(killT);
+      if (!expanded) openMore();
+    }, true);
+    function openMore() {
+      expanded = true;
+      more.style.background = 'rgba(52,120,246,0.16)'; // keep the ⋯ lit while open
+      // Backdrop catches outside clicks to dismiss; the chip itself stays put.
+      var bd = document.createElement('div'); bd.className = 'backdrop';
+      bd.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); cleanup(); }, true);
+      rs.appendChild(bd);
+      var menu = document.createElement('div'); menu.className = 'menu';
+      var head = document.createElement('div'); head.className = 'head'; head.textContent = p.selector || ''; menu.appendChild(head);
+      ITEMS.forEach(function (it) {
+        if (it.sep) { var s = document.createElement('div'); s.className = 'sep'; menu.appendChild(s); return; }
+        var row = document.createElement('div'); row.className = 'item';
+        var a = document.createElement('span'); a.textContent = it.t; row.appendChild(a);
+        if (it.k) { var k = document.createElement('span'); k.className = 'key'; k.textContent = it.k; row.appendChild(k); }
+        row.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); it.f(); cleanup(); }, true);
+        menu.appendChild(row);
+      });
+      rs.appendChild(menu);
+      // Expand directly under the chip (which stays visible), aligned to its
+      // left edge and clamped on-screen.
+      var mw = menu.offsetWidth, mh = menu.offsetHeight, ph = pill.offsetHeight;
+      var ml = Math.min(Math.max(6, pleft), window.innerWidth - mw - 6);
+      var mt = ptop + ph + 6;
+      if (mt + mh > window.innerHeight - 6) mt = Math.max(6, ptop - mh - 6);
+      menu.style.left = ml + 'px'; menu.style.top = mt + 'px';
+    }
+  }
+
+  // Block the page from seeing the picker's mousedown (no drag-start, focus
+  // steal, or mousedown-driven control); the click still fires for us.
+  function down(e) { e.preventDefault(); e.stopPropagation(); }
+  function click(e) {
+    if (!cur) return;
+    var p = payload(cur);
+    copyImage(p.rect);     // default action: copy a screenshot of the element
+    stop();                // tear down the picking overlay
+    showResult(p.rect, p); // chip + ⋯ for the other facets
+    e.preventDefault(); e.stopPropagation();
+  }
   function key(e) {
     if (e.key === 'Escape') {
       window.ipc.postMessage(JSON.stringify({ kind: 'pick_cancel' }));
@@ -214,27 +493,22 @@ pub const PICKER_JS: &str = r#"
     // picker only claims the bare C / A / S keys.
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (!cur) return;
-    if (e.key === 'c' || e.key === 'C') {
-      var p = payload(cur); p.kind = 'pick';
-      window.ipc.postMessage(JSON.stringify(p));
-      confirmBubble(cur, 'Copied'); stop(); e.preventDefault(); e.stopPropagation();
-    } else if (e.key === 'a' || e.key === 'A') {
-      var pa = payload(cur); pa.kind = 'pick_to_agent';
-      window.ipc.postMessage(JSON.stringify(pa));
-      confirmBubble(cur, 'Sent to agent'); stop(); e.preventDefault(); e.stopPropagation();
-    } else if (e.key === 's' || e.key === 'S') {
-      var r = cur.getBoundingClientRect();
-      window.ipc.postMessage(JSON.stringify({ kind: 'pick_shot', rect: { x: r.left, y: r.top, w: r.width, h: r.height } }));
-      stop(); e.preventDefault(); e.stopPropagation();
-    }
+    var p = payload(cur);
+    if (e.key === 'c' || e.key === 'C') { emitPart(p, 'all'); stop(); showResult(p.rect, p); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === 'a' || e.key === 'A') { emitAgent(p); stop(); showResult(p.rect, p); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === 's' || e.key === 'S') { copyImage(p.rect); stop(); showResult(p.rect, p); e.preventDefault(); e.stopPropagation(); }
   }
   function stop() {
     host.remove();
     window.removeEventListener('mousemove', move, true);
+    window.removeEventListener('mousedown', down, true);
+    window.removeEventListener('click', click, true);
     window.removeEventListener('keydown', key, true);
     window.__oxPicker = null;
   }
   window.addEventListener('mousemove', move, true);
+  window.addEventListener('mousedown', down, true);
+  window.addEventListener('click', click, true);
   window.addEventListener('keydown', key, true);
   window.__oxPicker = { stop: stop };
 })();
@@ -284,6 +558,22 @@ pub struct DomSnapshot {
     pub entries: Vec<DomEntry>,
 }
 
+/// Which facet of a picked element the copy-options menu requested. Defaults
+/// to the full agent-oriented markdown when absent (keyboard `C`, older IPC).
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PickPart {
+    /// Full markdown block (identity + styles + HTML) — agent context.
+    #[default]
+    All,
+    /// Raw `outerHTML` only.
+    Html,
+    /// The probed computed styles as a CSS declaration block.
+    Styles,
+    /// The element's text content only.
+    Text,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PickPayload {
     #[serde(default)]
@@ -296,7 +586,21 @@ pub struct PickPayload {
     pub text: String,
     #[serde(default)]
     pub styles: BTreeMap<String, String>,
+    /// Facet to copy (menu choice); `All` for the keyboard `C` accelerator.
+    #[serde(default)]
+    pub part: PickPart,
     pub rect: PickRect,
+}
+
+/// Page color-scheme chosen from the in-page theme menu. Maps to the host's
+/// `PageAppearance` (see `super::mod`); kept here so the IPC layer can
+/// deserialize it directly.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceValue {
+    System,
+    Light,
+    Dark,
 }
 
 /// One message from the injected probes, tagged by `kind`.
@@ -320,6 +624,17 @@ pub enum IpcMessage {
     /// Picker dismissed with `Esc` — no payload, just a signal to hand the
     /// keyboard back to the host.
     PickCancel,
+    /// Page color-scheme picked from the in-page theme menu.
+    SetAppearance {
+        value: AppearanceValue,
+    },
+    /// A profile chosen from the in-page profiles menu. `id` is a profile UUID
+    /// string, or `"default"` for the shared store.
+    SwitchProfile {
+        id: String,
+    },
+    /// "New Profile…" chosen from the profiles menu.
+    NewProfile,
 }
 
 impl IpcMessage {
@@ -426,6 +741,24 @@ pub fn format_pick(p: &PickPayload) -> String {
     out
 }
 
+/// Format a picked element for the clipboard per the menu's chosen facet. The
+/// full `All` facet reuses [`format_pick`] (agent-oriented markdown); the
+/// narrower facets copy the bare value so it pastes directly where it's wanted
+/// (raw HTML, a CSS declaration block, or plain text).
+pub fn format_pick_part(p: &PickPayload) -> String {
+    match p.part {
+        PickPart::All => format_pick(p),
+        PickPart::Html => p.html.clone(),
+        PickPart::Styles => p
+            .styles
+            .iter()
+            .map(|(k, v)| format!("{}: {};", k.trim(), v.trim()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        PickPart::Text => p.text.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,23 +839,109 @@ mod tests {
         assert!(fenced_block("text", "hi").starts_with("```text\n"));
     }
 
-    #[test]
-    fn pick_formats_styles_and_html() {
+    fn sample_pick(part: PickPart) -> PickPayload {
         let mut styles = BTreeMap::new();
         styles.insert("color".to_string(), "rgb(0, 0, 0)".to_string());
-        let p = PickPayload {
+        styles.insert("display".to_string(), "block".to_string());
+        PickPayload {
             selector: "#go".into(),
             css_path: "body > #go".into(),
             html: "<a id=\"go\">x</a>".into(),
             text: "x".into(),
             styles,
+            part,
             rect: PickRect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 },
-        };
-        let md = format_pick(&p);
+        }
+    }
+
+    #[test]
+    fn pick_formats_styles_and_html() {
+        let md = format_pick(&sample_pick(PickPart::All));
         assert!(md.contains("selector: `#go`"));
         assert!(md.contains("path: `body > #go`"));
         assert!(md.contains("rect: 30×40 at (1, 2)"));
         assert!(md.contains("- color: rgb(0, 0, 0)"));
         assert!(md.contains("```html"));
+    }
+
+    #[test]
+    fn pick_part_copies_bare_facets() {
+        // `All` is the full agent markdown; the narrower facets copy the bare
+        // value so it pastes directly where the user wants it.
+        assert!(format_pick_part(&sample_pick(PickPart::All)).contains("## Picked element"));
+        assert_eq!(format_pick_part(&sample_pick(PickPart::Html)), "<a id=\"go\">x</a>");
+        assert_eq!(format_pick_part(&sample_pick(PickPart::Text)), "x");
+        // Styles render as a CSS declaration block (BTreeMap → sorted keys).
+        assert_eq!(
+            format_pick_part(&sample_pick(PickPart::Styles)),
+            "color: rgb(0, 0, 0);\ndisplay: block;"
+        );
+    }
+
+    #[test]
+    fn confirm_toast_embeds_json_encoded_label() {
+        // The label is substituted as a JSON string so it can't break out of
+        // the JS literal, and the placeholder is fully consumed.
+        let js = confirm_toast_js("Screenshot copied");
+        assert!(js.contains(r#"x.textContent = "Screenshot copied";"#));
+        assert!(!js.contains("__OX_LABEL__"));
+        // A label with a quote stays safely escaped inside the literal.
+        let tricky = confirm_toast_js("a\"b");
+        assert!(tricky.contains(r#""a\"b""#));
+    }
+
+    #[test]
+    fn appearance_menu_marks_active_slug() {
+        // The active slug is JSON-encoded into the menu so its row shows the ✓,
+        // and the placeholder is fully consumed.
+        let js = appearance_menu_js("dark");
+        assert!(js.contains(r#"var CUR = "dark";"#));
+        assert!(!js.contains("__OX_CURRENT__"));
+    }
+
+    #[test]
+    fn parses_set_appearance() {
+        // The theme menu posts the chosen slug; it deserializes to the value
+        // the host maps onto its `PageAppearance`.
+        let body = r#"{"kind":"set_appearance","value":"light"}"#;
+        match IpcMessage::parse(body).expect("parse") {
+            IpcMessage::SetAppearance { value } => assert_eq!(value, AppearanceValue::Light),
+            _ => panic!("wrong variant"),
+        }
+        assert!(IpcMessage::parse(r#"{"kind":"set_appearance","value":"bogus"}"#).is_none());
+    }
+
+    #[test]
+    fn profile_menu_embeds_items_and_parses_actions() {
+        // The host-built profile list is spliced in verbatim (valid JSON → valid
+        // JS array literal); the placeholder is fully consumed.
+        let js = profile_menu_js(r#"[{"id":"default","name":"Default","active":true}]"#);
+        assert!(js.contains(r#"var ITEMS = [{"id":"default","name":"Default","active":true}];"#));
+        assert!(!js.contains("__OX_PROFILES__"));
+        // Both menu actions round-trip through the IPC layer.
+        match IpcMessage::parse(r#"{"kind":"switch_profile","id":"default"}"#).expect("parse") {
+            IpcMessage::SwitchProfile { id } => assert_eq!(id, "default"),
+            _ => panic!("wrong variant"),
+        }
+        assert!(matches!(
+            IpcMessage::parse(r#"{"kind":"new_profile"}"#),
+            Some(IpcMessage::NewProfile)
+        ));
+    }
+
+    #[test]
+    fn pick_part_defaults_to_all_when_absent() {
+        // Older IPC / the keyboard `C` accelerator omit `part`.
+        let body = r##"{"kind":"pick","selector":"#go","rect":{"x":1,"y":2,"w":3,"h":4}}"##;
+        match IpcMessage::parse(body).expect("parse") {
+            IpcMessage::Pick(p) => assert_eq!(p.part, PickPart::All),
+            _ => panic!("wrong variant"),
+        }
+        // A menu choice carries the facet through.
+        let html = r##"{"kind":"pick","part":"html","selector":"#go","rect":{"x":1,"y":2,"w":3,"h":4}}"##;
+        match IpcMessage::parse(html).expect("parse") {
+            IpcMessage::Pick(p) => assert_eq!(p.part, PickPart::Html),
+            _ => panic!("wrong variant"),
+        }
     }
 }
