@@ -4,6 +4,23 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-14 — Browser toolbar menus: native `NSMenu` dropdowns replacing injected in-page panels
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/native_menu.rs` (new — `NSMenu` helper), `native.rs` (anchored pop-up + coordinate mapping), `mod.rs` (deferred open + apply), `render.rs` (button-bounds capture), `agent_context.rs` (JS menus demoted to off-macOS fallback), `Cargo.toml` (`NSMenu`/`NSMenuItem`/`NSEvent` features)
+
+The page-theme and profiles dropdowns were HTML injected into the page's shadow DOM — the only layer guaranteed to sit above the native webview, since anything GPUI paints lands *under* it. They now render as real native `NSMenu` dropdowns (system font, native ✓, vibrancy), the way the rest of the OS draws button menus.
+
+- **Why injection was needed, and why a native menu sidesteps it:** GPUI paints to one Metal canvas with the webview layered on top, so a GPUI-drawn menu would hide behind the page. `NSMenu` pops in its **own window** that the window server composites above everything — both the canvas and the webview — so no in-page injection.
+- **Crash fixed (double-borrow):** `popUp` runs a nested run loop that pumps the app's main-thread tasks. Calling it inside the click handler — which holds the GPUI `App` `RefCell` borrow — let a pumped task re-enter `App::update` and abort (`panic_already_borrowed`). The menu now opens from a deferred foreground task, so the handler returns (releasing the borrow) first.
+- **Anchored under the button:** a zero-cost measuring `canvas` behind each trigger button records its window-relative bounds each paint; the menu maps those into the window-root view's space (reusing the webview-pin Y-flip) and drops from the button's bottom-right with a small gap, falling back to the mouse if bounds aren't captured yet.
+- **Callbacks:** a small `define_class!` `NSMenuItem` target records the picked row's tag; the appearance pick applies inline, the profile pick routes through the existing deferred-to-render path (a profile switch rebuilds the webview, which needs a `Window`).
+- **Off-macOS** keeps the injected-HTML menus as a fallback (no AppKit menu to pop there). The element picker stays in-page by necessity — it reads DOM under the cursor, not chrome.
+
+Verified: clean build (zero warnings), 22 browser_view tests green, adversarial review clean, live-verified placement.
+
+---
+
 ### 2026-06-14 — Browser DevTools: docked inside the pane (page over inspector) replacing a standalone window
 
 **Commits**: _(local, pending)_
