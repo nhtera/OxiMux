@@ -4,6 +4,26 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Browser agent-context (v1 — DOM / console / screenshot / element-pick → clipboard)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/` (new: agent_context.rs; +native.rs, mod.rs, render.rs), `crates/app/Cargo.toml` (+`objc2-app-kit`, `objc2-web-kit`, `objc2-core-foundation`), `crates/app/src/assets.rs`, `crates/app/assets/icons/camera.svg` (new)
+
+The *why* of the browser tab: hand the live page to an AI agent as pasteable context. Four read-only probes on the existing `wry` webview — **no CDP, no network capture** — each copying to the system clipboard. All driven through the webview's JS bridge (`window.ipc.postMessage` → one `with_ipc_handler` → entity event loop); screenshot is the one macOS-specific call.
+
+- **Console / errors** (`INIT_SCRIPT`): a document-start script hooks `console.*` / `onerror` / `unhandledrejection` into capped (512) ring buffers — re-run per navigation, idempotent on SPA soft-nav. The **list-tree** button reads them back as a fenced block.
+- **DOM snapshot** (`SNAPSHOT_JS` → **file-code** button): a depth-bounded tree-walker emits the interactive / landmark elements (selector · role · name, capped 200) plus title/url and an innerText snippet; the host numbers them `@ref1…` so an agent can name them back compactly.
+- **Screenshot** (`native::screenshot` → **camera** button): `WKWebView.takeSnapshot` → `NSBitmapImageRep` PNG re-encode → `ClipboardItem::new_image`. The picker's `S` routes an element rect through the same path.
+- **Element picker** (`PICKER_JS` → **crosshair** button): an injected shadow-root overlay highlights the element under the cursor; `C` copies a markdown payload (selector · CSS path · computed-style subset · clamped HTML · rect), `S` screenshots its rect, `Esc` cancels. Capture-phase listeners + `stopPropagation` keep the page from seeing the picker's keys; OS chords (Cmd/Ctrl/Alt) are left to the page. Hand-written — no remote-fetched lib.
+
+Page payloads are treated as untrusted: clamped in the injected JS, the host only ever writes them to the clipboard as inert text (markdown-injection hardened — fenced blocks grow past any inner backtick run, page text is newline-collapsed), and the IPC parser fails closed on foreign messages. `wry`-pulled `objc2-app-kit` / `objc2-web-kit` / `objc2-core-foundation` are flipped to direct deps only to enable the snapshot feature flags — no new crate builds.
+
+Verified: full workspace suite green (1150 tests, 0 fail) incl. 7 new unit tests (IPC parse + the three markdown formatters + fence-escape); clippy clean on new code; full debug build links the objc2 FFI. Code-reviewed — fixed markdown fence/newline injection via page content, a screenshot double-fire window, picker hijacking of Cmd+C/S, and added a cross-platform stub. **Live-GUI-verified** on the bundled app against real pages: DOM snapshot copies 200 `@ref`-numbered elements; the camera button lands a real PNG of the page on the clipboard (incl. on `file://`); the picker highlights the hovered element and `C` copies its selector / CSS path / styles / HTML, then tears the overlay down cleanly; the console capture round-trips both the empty-state block and a **non-empty** capture (`console.log/warn/error` + `unhandledrejection` + an uncaught `throw` via `window.onerror`, backticks/quotes intact in the fence).
+
+**Webview focus handoff** (`native::focus_parent` = `makeFirstResponder` of the GPUI surface; `wry`'s `focus_parent`): a native webview that takes macOS first-responder — by a click into the page or the picker's `focus()` — keeps it when hidden (`isHidden` doesn't resign first-responder), which previously swallowed keyboard input. Now the webview hands first-responder back to the GPUI surface in three spots: on hide (`set_active(false)`), on picker end (`C`/`S`/`Esc` — the picker posts a `pick_cancel` IPC on `Esc`), and on the rising edge of the address bar gaining focus. **Verified live:** typing in the address bar after clicking into the page now lands in the bar (navigated to several URLs cleanly) and the non-empty console capture round-trips (`console.log/warn/error` + `unhandledrejection` + uncaught `throw` via `window.onerror`). **Not a browser bug (ruled out via control):** switching to a terminal *tab* and typing only reaches the terminal after a click into its body — but this is identical for a terminal→terminal tab switch with no browser involved, so it's pre-existing general behaviour (terminal panes take keyboard focus on a body click, not a tab activation; possibly only observable under synthetic input), not a webview/agent-context regression. **Also:** the JS-bridge probes (DOM/console/picker) need an http(s) origin — `file://` pages don't get `window.ipc` (the native screenshot still works there).
+
+---
+
 ### 2026-06-13 — Inline browser tab (v1 — browsing; `wry` webview over GPUI)
 
 **Commits**: _(local, pending)_
