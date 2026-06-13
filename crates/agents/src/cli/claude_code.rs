@@ -107,6 +107,10 @@ impl CliAgentAdapter for ClaudeCodeAdapter {
             args.push(effort.to_string());
         }
 
+        // User-configured launch flags (e.g. a skip-permissions default)
+        // go after model/effort and before the positional prompt.
+        args.extend(cfg.extra_args.iter().cloned());
+
         if let Some(prompt) = cfg.prompt.as_deref().filter(|s| !s.trim().is_empty()) {
             args.push(prompt.to_string());
         }
@@ -147,6 +151,7 @@ mod tests {
             prompt: None,
             model: None,
             effort: None,
+            extra_args: Vec::new(),
             env: Vec::new(),
             cols: 80,
             rows: 24,
@@ -226,6 +231,35 @@ mod tests {
             ],
             "expected model, effort, then prompt as trailing positional"
         );
+    }
+
+    #[test]
+    fn build_command_appends_extra_args_before_prompt() {
+        // Launch-config flags land after model/effort and before the
+        // positional prompt, so claude parses them as flags not as the
+        // prompt text.
+        let mut c = cfg();
+        c.model = Some("opus".into());
+        c.extra_args = vec!["--dangerously-skip-permissions".into()];
+        c.prompt = Some("do it".into());
+        let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
+        assert_eq!(
+            spec.args,
+            vec![
+                "--model".to_string(),
+                "opus".into(),
+                "--dangerously-skip-permissions".into(),
+                "do it".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_command_extra_args_only() {
+        let mut c = cfg();
+        c.extra_args = vec!["--foo".into(), "bar".into()];
+        let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
+        assert_eq!(spec.args, vec!["--foo".to_string(), "bar".into()]);
     }
 
     #[test]

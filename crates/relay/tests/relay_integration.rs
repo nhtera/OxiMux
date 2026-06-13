@@ -135,6 +135,7 @@ async fn hello_handshake_then_echo_command() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -181,6 +182,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -279,6 +281,7 @@ async fn notify_fans_out_attention_to_subscribers() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -444,6 +447,7 @@ async fn shutdown_refused_while_ptys_alive() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -475,6 +479,7 @@ async fn stats_endpoint_returns_per_pty_counters() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -604,6 +609,7 @@ async fn multi_attach_min_size_and_detach_grows_back() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -726,6 +732,7 @@ async fn two_simultaneous_subscribers_both_receive_output() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -801,6 +808,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -899,6 +907,7 @@ async fn close_request_removes_pty_from_list() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![],
         },
     )
@@ -955,6 +964,7 @@ async fn spawn_env_reaches_child_process() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
+            args: Vec::new(),
             env: vec![
                 ("OXIMUX_WORKSPACE_ID".into(), "WS_ENV_MARKER_42".into()),
                 ("OXIMUX_SURFACE_ID".into(), "SURF_ENV_MARKER_7".into()),
@@ -986,4 +996,44 @@ async fn spawn_env_reaches_child_process() {
         "child env missing injected vars; got {text:?}"
     );
     assert!(exit.is_some(), "expected Exit notification");
+}
+
+// Spawn.args (v5) must reach the spawned program's argv. The daemon runs the
+// named program DIRECTLY with these args (registry.rs `command.arg` loop), so
+// an agent launch can pass its flags without a shell wrapper. Spawns
+// `/bin/echo MARKER` and asserts the marker — only present if argv actually
+// reached `echo`. This is the only end-to-end check of the argv path; every
+// other Spawn here passes an empty args vec.
+#[tokio::test]
+async fn spawn_args_reach_child_process() {
+    let relay = boot_relay().await;
+    let (mut s, mut buf) = connect_and_hello(&relay).await;
+    let pty_id = match req(
+        &mut s,
+        &mut buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            // Run echo directly (not a shell) so the marker can ONLY come
+            // from argv, never from a typed/echoed command line.
+            shell: Some("/bin/echo".into()),
+            args: vec!["ARG_REACHES_CHILD_123".into()],
+            env: Vec::new(),
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn: {other:?}"),
+    };
+
+    let (out, exit) = collect_output(&mut s, &mut buf, &pty_id, Duration::from_secs(5)).await;
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ARG_REACHES_CHILD_123"),
+        "child argv missing the spawned arg; got {text:?}"
+    );
+    assert!(exit.is_some(), "expected Exit notification after echo");
 }

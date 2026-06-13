@@ -29,6 +29,11 @@ pub struct AgentSessionConfig {
     /// Optional reasoning effort hint (e.g. `high`). Adapter ignores when
     /// the CLI has no analog.
     pub effort: Option<String>,
+    /// User-configured extra CLI flags (from `agent_launch.toml`), already
+    /// split into argv tokens. Each adapter appends these after its own
+    /// model/effort flags and before any positional prompt, so a launch
+    /// default like a skip-permissions flag reaches the spawned binary.
+    pub extra_args: Vec<String>,
     /// Extra env vars layered onto the PTY spawn env. Keys here override
     /// inherited env; do NOT inject secrets here — use the OS keychain
     /// path (Phase 4 storage) and have the adapter reference them.

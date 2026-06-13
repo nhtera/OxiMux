@@ -1593,6 +1593,17 @@ impl WorkspaceRoot {
         let Some(panes) = self.active_project_panes() else {
             return;
         };
+        // Apply per-agent launch defaults from `agent_launch.toml`: fill the
+        // model when the caller didn't pin one, and append the configured
+        // extra flags (e.g. a skip-permissions default). The global is unset
+        // until the settings layer seeds it, in which case defaults are empty.
+        let (model, extra_args) = {
+            let defaults = cx.try_global::<oximux_settings::AgentLaunchSettings>();
+            (
+                model.or_else(|| defaults.and_then(|d| d.model_for(adapter_id))),
+                defaults.map(|d| d.args_for(adapter_id)).unwrap_or_default(),
+            )
+        };
         let runtime = self.cli_runtime.clone();
         let cwd_for_tab = cwd.clone();
 
@@ -1607,6 +1618,7 @@ impl WorkspaceRoot {
                 prompt: None,
                 model: model.clone(),
                 effort: effort.clone(),
+                extra_args,
                 env: Vec::new(),
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,

@@ -35,16 +35,16 @@ pub enum SupervisorError {
     Other(#[from] anyhow::Error),
 }
 
-// Bumped to v4 alongside `PROTOCOL_VERSION` for multi-client attach:
-// `attachment_id` was added to `AttachOk`/`SpawnOk`/`Resize` and a new
-// `Request::Detach` variant landed (v3 added Notify/Attention; v2 added
-// `AttachOk` dims). The bincode wire format isn't self-describing, so a
-// fresh client must NOT reuse an older daemon that can't decode the new
-// shapes. A new socket name guarantees the new client spawns a new
-// daemon; any stale older daemon idles out on its own socket.
-const SOCKET_FILENAME: &str = "relay-v4.sock";
-const TOKEN_FILENAME: &str = "relay-v4.token";
-const PID_FILENAME: &str = "relay-v4.pid";
+// Bumped to v5 alongside `PROTOCOL_VERSION`: `Request::Spawn` gained an
+// `args` field (direct agent argv). Earlier bumps: v4 multi-client attach
+// (`attachment_id` + `Detach`), v3 Notify/Attention, v2 `AttachOk` dims.
+// The bincode wire format isn't self-describing, so a fresh client must NOT
+// reuse an older daemon that can't decode the new shapes. A new socket name
+// guarantees the new client spawns a new daemon; any stale older daemon
+// idles out on its own socket.
+const SOCKET_FILENAME: &str = "relay-v5.sock";
+const TOKEN_FILENAME: &str = "relay-v5.token";
+const PID_FILENAME: &str = "relay-v5.pid";
 
 const HANDSHAKE_QUICK_TIMEOUT: Duration = Duration::from_millis(500);
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -454,9 +454,9 @@ mod tests {
     #[test]
     fn supervisor_paths_under_runtime_dir() {
         let s = RelaySupervisor::new(PathBuf::from("/tmp/runtime"), PathBuf::from("/tmp/logs"));
-        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v4.sock"));
-        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v4.token"));
-        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v4.pid"));
+        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v5.sock"));
+        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v5.token"));
+        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v5.pid"));
         assert_eq!(s.log_path(), PathBuf::from("/tmp/logs/relay.log"));
     }
 

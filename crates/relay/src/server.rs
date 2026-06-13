@@ -444,12 +444,14 @@ async fn handle_request(
             cols,
             rows,
             shell,
+            args,
             env,
         } => match registry.spawn(SpawnArgs {
             cwd: PathBuf::from(cwd),
             cols,
             rows,
             shell,
+            args,
             env,
         }) {
             Ok(pty_id) => {

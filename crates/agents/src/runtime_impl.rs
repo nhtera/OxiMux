@@ -280,37 +280,36 @@ impl AgentRuntime for CliRuntime {
         };
 
         let (backend, term_id): (SharedBackend, TerminalSessionId) = if let Some(shared) = shared {
-            // Relay path. The daemon's Spawn RPC names a single program with
-            // no argv, so a *plain* launch (no flags, no stdin prompt — the
-            // common one-click default) spawns the agent binary directly as
-            // the PTY's foreground process: nothing wraps it, so nothing
-            // echoes a command line — the terminal shows only the agent's own
-            // banner. An absolute path is required because the detached
-            // daemon's PATH may not include the agent (resolved here via the
-            // app's PATH, which already located it at detection time).
+            // Relay path. The v5 Spawn RPC carries argv, so the agent binary
+            // is spawned DIRECTLY as the PTY's foreground process — its own
+            // flags ride along, nothing wraps it, and the terminal shows only
+            // the agent's banner (no echoed command line). An absolute path is
+            // required because the detached daemon's PATH may not include the
+            // agent (resolved here via the app's PATH, which already located it
+            // at detection time).
             //
-            // When the launch carries argv (a restored session's model/effort)
-            // or a stdin prompt seed, fall back to spawning the login shell
-            // and `exec`-ing the full command into it — the shell both carries
-            // the argv and resolves PATH from the user's profile. Either way
-            // the agent ends up as the PTY leaf (so cancel's process-group
+            // Fallback: if abs-path resolution fails, spawn the login shell and
+            // `exec` the full command into it via a launch line — the shell
+            // resolves PATH from the user's profile and carries argv. Either
+            // way the agent ends up as the PTY leaf (so cancel's process-group
             // SIGTERM and exit→EOF status both reach it), and the daemon owns
             // the PTY so it survives an app restart and re-attaches on launch.
-            let direct_program = if spec.args.is_empty() && stdin_seed.is_none() {
-                resolve_program_abs(&spec.program).await
-            } else {
-                None
-            };
+            // A stdin prompt seed (aider) is written after spawn in both cases.
+            let direct_program = resolve_program_abs(&spec.program).await;
             let relay_cfg = SpawnConfig {
                 shell: direct_program
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(wrapper_shell),
-                args: Vec::new(),
+                args: if direct_program.is_some() {
+                    spec.args.clone()
+                } else {
+                    Vec::new()
+                },
                 ..spawn_cfg.clone()
             };
-            // No wrapper → no launch line to write (the binary is the process
-            // itself). Otherwise build the `exec <program> <args…>` line.
+            // Direct spawn → the binary IS the process, no launch line to
+            // write. Wrapper fallback → write the `exec <program> <args…>` line.
             let launch =
                 direct_program.is_none().then(|| build_launch_line(&spec.program, &spec.args));
             let shared_for_spawn = shared.clone();
@@ -605,6 +604,7 @@ mod tests {
             prompt: None,
             model: None,
             effort: None,
+            extra_args: Vec::new(),
             env: Vec::new(),
             cols: 80,
             rows: 24,

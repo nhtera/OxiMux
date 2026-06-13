@@ -78,6 +78,7 @@ mod tests {
             prompt: None,
             model: None,
             effort: None,
+            extra_args: Vec::new(),
             env: Vec::new(),
             cols: 80,
             rows: 24,

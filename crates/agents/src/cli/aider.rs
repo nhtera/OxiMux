@@ -82,6 +82,11 @@ impl CliAgentAdapter for AiderAdapter {
             args.push(model.to_string());
         }
 
+        // User-configured launch flags (e.g. a yes-always default) go
+        // after the model flag. Aider takes the prompt via stdin, so
+        // there is no positional to precede.
+        args.extend(cfg.extra_args.iter().cloned());
+
         // Prompt → stdin_seed (terminated with `\n` so the REPL treats
         // it as a submitted line). Trimming only the empty/whitespace
         // case keeps multi-line prompts intact for the runtime to write.
@@ -120,6 +125,7 @@ mod tests {
             prompt: None,
             model: None,
             effort: None,
+            extra_args: Vec::new(),
             env: Vec::new(),
             cols: 80,
             rows: 24,

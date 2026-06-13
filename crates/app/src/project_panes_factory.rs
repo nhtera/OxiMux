@@ -478,18 +478,27 @@ fn restore_agent_tab(
         tracing::info!("agent restore: skipping Custom adapter (non-deterministic argv)");
         return;
     }
+    let adapter_id: &'static str = static_adapter_id(persisted.adapter);
+    // On a respawn (PTY no longer alive in the daemon) re-apply the current
+    // per-agent launch flags so a restored agent comes back with the same
+    // defaults a fresh launch would use. Ignored on warm re-attach, which
+    // adopts the already-running process and never reads cfg.
+    let extra_args = cx
+        .try_global::<oximux_settings::AgentLaunchSettings>()
+        .map(|d| d.args_for(adapter_id))
+        .unwrap_or_default();
     let cfg = AgentSessionConfig {
         adapter: persisted.adapter,
         worktree_path: PathBuf::from(&persisted.worktree_path),
         prompt: None,
         model: persisted.model.clone(),
         effort: persisted.effort.clone(),
+        extra_args,
         env: Vec::new(),
         cols: DEFAULT_AGENT_COLS,
         rows: DEFAULT_AGENT_ROWS,
         custom_command: None,
     };
-    let adapter_id: &'static str = static_adapter_id(persisted.adapter);
     let persisted_clone = persisted.clone();
     cx.spawn_in(window, async move |root, cx| {
         // Warm re-attach: if the agent's PTY is still alive in the relay

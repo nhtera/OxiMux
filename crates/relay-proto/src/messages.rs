@@ -13,7 +13,14 @@ use crate::error::ErrCode;
 // daemon recomputes the effective PTY size as the element-wise `min`
 // across attachments, "smallest screen wins"); `Request::Detach` lets one
 // attachment drop out without killing the PTY.
-pub const PROTOCOL_VERSION: u32 = 4;
+//
+// v5: `Request::Spawn` carries `args` (the program's argv) so an agent
+// launch can pass its flags directly — the daemon runs `program args…` as
+// the PTY leaf, with no login-shell `exec` wrapper echoing a command line.
+// Bincode isn't self-describing, so the added field is a wire break: the
+// socket name bumps to `relay-v5.sock`, a fresh client spawns a fresh
+// daemon, and any stale v4 daemon idles out on its own socket.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -61,6 +68,10 @@ pub enum Request {
         cols: u16,
         rows: u16,
         shell: Option<String>,
+        // Argv for the spawned program (excluding argv[0]). Empty for a
+        // plain shell. When set, the daemon runs `shell args…` directly so
+        // an agent's flags reach it without a wrapper command line.
+        args: Vec<String>,
         env: Vec<(String, String)>,
     },
     Attach {

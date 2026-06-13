@@ -77,6 +77,10 @@ impl CliAgentAdapter for CodexAdapter {
             args.push(model.to_string());
         }
 
+        // User-configured launch flags (e.g. a skip-approvals default)
+        // go after the model flag and before the positional prompt.
+        args.extend(cfg.extra_args.iter().cloned());
+
         if let Some(prompt) = cfg.prompt.as_deref().filter(|s| !s.trim().is_empty()) {
             args.push(prompt.to_string());
         }
@@ -112,6 +116,7 @@ mod tests {
             prompt: None,
             model: None,
             effort: None,
+            extra_args: Vec::new(),
             env: Vec::new(),
             cols: 80,
             rows: 24,

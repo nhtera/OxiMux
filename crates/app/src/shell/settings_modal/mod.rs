@@ -15,6 +15,7 @@ mod nav;
 mod segmented;
 mod pane_about;
 mod pane_agents;
+mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
 mod pane_terminal;
@@ -30,7 +31,9 @@ use gpui::{
     Subscription, Window, point, px,
 };
 use gpui_component::input::{InputEvent, InputState};
-use oximux_settings::{CommitMessageAiSettings, Density, TerminalSettings, Theme, Typography};
+use oximux_settings::{
+    AgentLaunchSettings, CommitMessageAiSettings, Density, TerminalSettings, Theme, Typography,
+};
 use oximux_storage::SettingsRepo;
 
 use crate::notifier::{AgentNotifySettings, Notifier};
@@ -60,6 +63,10 @@ pub struct SettingsModal {
     pub(crate) terminal: TerminalSettings,
     /// Working copy of the AI commit-message settings; same contract.
     pub(crate) ai: CommitMessageAiSettings,
+    /// Working copy of the per-agent launch defaults; reseeded from the live
+    /// global at each `open()`. Edits mutate this, then write
+    /// `agent_launch.toml`; the watcher reloads + swaps the global.
+    pub(crate) agent_launch: AgentLaunchSettings,
     /// Live notification prefs shared with the notifier. The Agents pane
     /// toggles flip these atomics directly (interior mutability) so the
     /// change takes effect on the next dispatch without a reload.
@@ -114,6 +121,7 @@ impl SettingsModal {
             typography,
             terminal: TerminalSettings::default(),
             ai: CommitMessageAiSettings::default(),
+            agent_launch: AgentLaunchSettings::default(),
             notify,
             notify_repo,
             notifier,
@@ -148,6 +156,10 @@ impl SettingsModal {
             .unwrap_or_default();
         self.ai = cx
             .try_global::<CommitMessageAiSettings>()
+            .cloned()
+            .unwrap_or_default();
+        self.agent_launch = cx
+            .try_global::<AgentLaunchSettings>()
             .cloned()
             .unwrap_or_default();
         // Reseed the keybinding overrides from disk (hand edits since boot
@@ -233,6 +245,15 @@ impl SettingsModal {
     pub(super) fn persist_ai(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::commit_message_ai_settings::save(&self.ai) {
             tracing::warn!(%err, "settings modal: failed to write commit_message_ai.toml");
+        }
+        cx.notify();
+    }
+
+    /// Persist the per-agent launch working copy to `agent_launch.toml`. The
+    /// watcher reloads + swaps the global; we never set the global here.
+    pub(super) fn persist_agent_launch(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = crate::agent_launch_settings::save(&self.agent_launch) {
+            tracing::warn!(%err, "settings modal: failed to write agent_launch.toml");
         }
         cx.notify();
     }

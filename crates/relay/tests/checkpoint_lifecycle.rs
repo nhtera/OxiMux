@@ -20,6 +20,7 @@ fn spawn_args() -> SpawnArgs {
         cols: 80,
         rows: 24,
         shell: Some("/bin/sh".into()),
+        args: Vec::new(),
         env: Vec::new(),
     }
 }

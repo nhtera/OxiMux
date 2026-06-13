@@ -197,6 +197,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 shell: Some("/bin/zsh".into()),
+                args: vec!["--flag".into()],
                 env: vec![("FOO".into(), "bar".into())],
             },
             Request::Attach {

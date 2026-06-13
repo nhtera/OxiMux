@@ -336,6 +336,7 @@ impl TerminalBackend for RelayBackend {
             cols: cfg.cols,
             rows: cfg.rows,
             shell: Some(cfg.shell),
+            args: cfg.args,
             env: cfg.env,
         })?;
         let (relay_pty_id, attachment_id) = match resp {

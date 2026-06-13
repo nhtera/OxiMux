@@ -63,6 +63,9 @@ pub struct SpawnArgs {
     pub cols: u16,
     pub rows: u16,
     pub shell: Option<String>,
+    /// Argv for the spawned program (excluding argv[0]). Empty for a plain
+    /// shell; set when an agent launch passes its flags directly.
+    pub args: Vec<String>,
     pub env: Vec<(String, String)>,
 }
 
@@ -166,6 +169,11 @@ impl PtyRegistry {
         // tell the daemon which pane to raise attention on.
         let pty_id = Uuid::new_v4().to_string();
         let mut command = CommandBuilder::new(&shell);
+        // Program argv (excluding argv[0]). Empty for a plain shell; set
+        // when an agent launch is spawned directly with its flags.
+        for a in &args.args {
+            command.arg(a);
+        }
         command.cwd(&args.cwd);
         // Terminal identity defaults. The daemon is spawned detached, so it
         // has no TERM in its own environment; without this the shell child

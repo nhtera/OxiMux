@@ -26,28 +26,77 @@ pub(super) fn render(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
+    let ai_card = entries_card(
+        theme,
+        density,
+        typography,
+        ai_entries(modal, theme, density, typography, cx),
+    );
+    let launch_card = entries_card(
+        theme,
+        density,
+        typography,
+        super::pane_agents_launch::entries(modal, theme, density, typography, cx),
+    );
     div()
         .flex()
         .flex_col()
-        .child(entries_card(
-            theme,
-            density,
-            typography,
-            entries(modal, theme, density, typography, cx),
-        ))
+        .gap(px(16.0))
+        .child(ai_card)
         .child(
             div()
-                .pt(px(12.0))
+                .pt(px(4.0))
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
                 .child(hint(modal.ai.mode)),
         )
+        .child(section_header("Launch defaults", theme, typography))
+        .child(launch_card)
+        .child(
+            div()
+                .pt(px(4.0))
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child(
+                    "One-click launch applies these. Hand-edit agent_launch.toml for arbitrary flags.",
+                ),
+        )
         .into_any_element()
 }
 
-/// The Agents/AI pane's settings as reusable entries. Agent + Model rows only
-/// appear in Agent mode (they don't apply otherwise).
+/// A small muted section header dividing the two cards.
+fn section_header(
+    label: &'static str,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    div()
+        .pt(px(4.0))
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.fg_muted)
+        .child(label)
+        .into_any_element()
+}
+
+/// All Agents-pane entries (commit-message AI + launch defaults), unioned so
+/// global search covers both sections.
 pub(super) fn entries(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    let mut all = ai_entries(modal, theme, density, typography, cx);
+    all.extend(super::pane_agents_launch::entries(
+        modal, theme, density, typography, cx,
+    ));
+    all
+}
+
+/// The commit-message AI rows. Agent + Model rows only appear in Agent mode
+/// (they don't apply otherwise).
+fn ai_entries(
     modal: &SettingsModal,
     theme: Theme,
     density: Density,

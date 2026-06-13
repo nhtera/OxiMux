@@ -20,7 +20,7 @@ use gpui::{
 };
 use oximux_agents::{AdapterRegistry, RegistryEntry};
 use oximux_core::AgentAdapter;
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
 use crate::ui::FloatingSurface;
 
@@ -189,19 +189,32 @@ impl AdapterPicker {
     }
 }
 
-/// Pure helper: filter Custom out of the visible row set. Custom needs a
-/// `(program, args)` config flow that's out of scope for step 10 — the row
-/// is hidden entirely until that surface lands.
+/// Pure helper: compute the visible, ordered row set. Filters out Custom
+/// (needs a `(program, args)` config flow that's out of scope here) and any
+/// agent the user disabled in `agent_launch.toml`, then floats the configured
+/// default agent to the top (stable: every other row keeps registration
+/// order).
 ///
 /// INVARIANT: the cache (`AdapterPicker::entries`) holds **all** entries
 /// returned by `AdapterRegistry::detect_available`, including Custom. This
 /// helper is the only path that filters Custom. Any future code touching
 /// the cache directly must NOT assume cache contents equal display rows.
-fn render_rows(entries: &[RegistryEntry]) -> Vec<&RegistryEntry> {
-    entries
+fn render_rows<'a>(
+    entries: &'a [RegistryEntry],
+    launch: &AgentLaunchSettings,
+) -> Vec<&'a RegistryEntry> {
+    let mut rows: Vec<&RegistryEntry> = entries
         .iter()
         .filter(|e| e.adapter_enum != AgentAdapter::Custom)
-        .collect()
+        .filter(|e| !launch.is_disabled(e.adapter_id))
+        .collect();
+    let default = launch.default_agent.as_str();
+    if !default.is_empty() {
+        // Stable sort: the default sorts to key 0, everything else to 1,
+        // preserving the registry order among the non-default rows.
+        rows.sort_by_key(|e| u8::from(e.adapter_id != default));
+    }
+    rows
 }
 
 /// Card container shared by the list + params stages: the styled overlay
@@ -356,17 +369,25 @@ fn append_adapter_rows(
     typography: Typography,
     cx: &mut Context<AdapterPicker>,
 ) -> gpui::Div {
-    for (ix, entry) in render_rows(entries).into_iter().enumerate() {
+    // Per-agent launch defaults drive which rows show and which is the
+    // default. Cloned out of the global up front so the listener borrows
+    // below don't conflict with the immutable global borrow.
+    let launch = cx
+        .try_global::<AgentLaunchSettings>()
+        .cloned()
+        .unwrap_or_default();
+    let default_agent = launch.default_agent.clone();
+    for (ix, entry) in render_rows(entries, &launch).into_iter().enumerate() {
         let kind = entry.adapter_enum;
         let id = entry.adapter_id;
         let label = SharedString::from(entry.display_name);
-        let (state, hint) = if entry.available {
-            (RowState::Active, None)
+        let is_default = !default_agent.is_empty() && id == default_agent;
+        let (state, hint) = if !entry.available {
+            (RowState::Disabled, Some(SharedString::from("not installed")))
+        } else if is_default {
+            (RowState::Active, Some(SharedString::from("default")))
         } else {
-            (
-                RowState::Disabled,
-                Some(SharedString::from("not installed")),
-            )
+            (RowState::Active, None)
         };
         let handler = cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             if matches!(state, RowState::Active) {
@@ -531,13 +552,28 @@ mod tests {
             entry("aider", "Aider", AgentAdapter::Aider, true),
             entry("custom", "Custom Command", AgentAdapter::Custom, true),
         ];
-        let visible = render_rows(&entries);
+        let visible = render_rows(&entries, &AgentLaunchSettings::default());
         assert_eq!(visible.len(), 3);
         assert!(
             visible
                 .iter()
                 .all(|e| e.adapter_enum != AgentAdapter::Custom)
         );
+    }
+
+    #[test]
+    fn render_rows_hides_disabled_and_floats_default() {
+        let entries = vec![
+            entry("claude-code", "Claude Code", AgentAdapter::ClaudeCode, true),
+            entry("codex", "Codex", AgentAdapter::Codex, true),
+            entry("aider", "Aider", AgentAdapter::Aider, true),
+        ];
+        let mut launch = AgentLaunchSettings::default();
+        launch.entry_mut("aider").disabled = true; // hidden
+        launch.default_agent = "codex".to_string(); // floats to front
+        let visible = render_rows(&entries, &launch);
+        let order: Vec<&str> = visible.iter().map(|e| e.adapter_id).collect();
+        assert_eq!(order, vec!["codex", "claude-code"]);
     }
 
     #[test]
@@ -548,7 +584,7 @@ mod tests {
             entry("codex", "Codex", AgentAdapter::Codex, true),
             entry("aider", "Aider", AgentAdapter::Aider, true),
         ];
-        let visible = render_rows(&entries);
+        let visible = render_rows(&entries, &AgentLaunchSettings::default());
         let order: Vec<&str> = visible.iter().map(|e| e.adapter_id).collect();
         assert_eq!(order, vec!["claude-code", "codex", "aider"]);
     }
@@ -556,7 +592,7 @@ mod tests {
     #[test]
     fn render_rows_handles_empty_input() {
         let entries: Vec<RegistryEntry> = Vec::new();
-        let visible = render_rows(&entries);
+        let visible = render_rows(&entries, &AgentLaunchSettings::default());
         assert!(visible.is_empty());
     }
 

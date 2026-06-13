@@ -201,6 +201,11 @@ fn main() {
         // first click after launch sees the user's configured mode (heuristic
         // by default; agent when configured).
         oximux_app::commit_message_ai_settings::install(cx);
+        // Per-agent launch defaults (extra CLI flags, default model, enabled
+        // agents, default agent). The picker + agent runtime read the global
+        // at launch time, so installing here means the first launch after
+        // boot already honours the user's configured defaults.
+        oximux_app::agent_launch_settings::install(cx);
         // Resolve the reduced-motion preference once and install the Motion
         // global before any window opens, so the first animated surface reads
         // the right durations.
