@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-13 — Inline browser tab (v1 — browsing; `wry` webview over GPUI)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/` (new: mod.rs, native.rs, render.rs), `crates/app/Cargo.toml` (+`wry`), `crates/app/src/shell/{mod.rs, pane_content.rs, pane_group/mod.rs, pane_group/render.rs, project_panes/mod.rs}`, `crates/app/src/{actions.rs, keymap_registry/inventory.rs, persisted_terminals.rs, project_panes_factory.rs, workspace_root.rs, assets.rs}`, `crates/app/src/shell/left_rail/project_menu.rs`, `crates/app/assets/icons/{globe,arrow-left,arrow-right}.svg` (new)
+
+An embedded **browser tab** as a first-class pane-group leaf — open with **⌘⇧B** (or the command palette). Built on a native `wry` webview attached as a child of GPUI's Metal surface (the layering was de-risked in a throwaway P0 spike: the webview composites above the GPU canvas, lands on the element's logical bounds with no scale math, hides on demand, and never steals keyboard focus). Chosen over a macOS-only `objc2-web-kit` binding so a future Windows/Linux build keeps one webview API.
+
+- **`BrowserView` entity** (`browser_view/`): owns the `wry::WebView`; a compact toolbar (back / forward / reload + an address bar that parses a URL, promotes a bare domain to `https`, or falls back to a search query) above a `canvas` anchor that re-pins the native webview frame to the laid-out bounds every paint. Navigation / title / page-load events ride wry callbacks into a `cx.spawn` event loop that updates url/title/loading.
+- **Leaf integration**: a new `PaneGroupTabKind::Browser { url }` + `PaneContent::Browser(Entity<BrowserView>)` thread through every exhaustive match (open, persistence, tab chip, MRU, close) — no relay, no PTY. The tab chip shows a globe glyph and the **live page title** (URL host fallback).
+- **Visibility**: the native view floats above the GPU canvas, so a per-render sweep in `PaneGroup` hides it when its tab isn't active, a `WebviewSuppressed` global hides it whenever any modal/overlay/context-menu/floating-terminal covers the panes, and the project-switch hide-all path hides it for backgrounded projects.
+- **Persistence**: only the URL is stored (`PersistedTabKind::Browser { url }`); snapshot reads the live URL from the view so a restored tab reopens where the user left off (single-group + multi-group restore paths).
+
+Verified: full workspace suite green (845 lib tests, 0 fail) + 6 new unit tests for URL normalization/host/encoding; clippy clean on new code; runtime AppKit-hierarchy introspection confirmed the webview attaches + shows (screen-capture being unavailable this session). Code-reviewed — fixed a project-switch webview leak, overlay-suppression gaps, and a 1-frame restore flash. Agent-context (DOM / console / screenshot / element-pick) is the next milestone (P2) on this same webview.
+
+---
+
 ### 2026-06-13 — Settings pane visual polish (carded sections + rich agent rows)
 
 **Commits**: _(local, pending)_  
