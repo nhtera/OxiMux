@@ -93,7 +93,7 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 # Phase 4 prep
 rusqlite = { version = "0.31", features = ["bundled"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # Phase 5 editor + LSP. Pinned to match gpui-component's transitive

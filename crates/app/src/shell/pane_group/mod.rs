@@ -1251,6 +1251,7 @@ impl PaneGroup {
     pub fn open_browser_tab(
         &mut self,
         url: impl Into<String>,
+        profile_id: Option<uuid::Uuid>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1262,6 +1263,7 @@ impl PaneGroup {
         let view = cx.new(|cx| {
             crate::shell::browser_view::BrowserView::new(
                 url_for_view,
+                profile_id,
                 theme,
                 density,
                 typography,
@@ -1975,7 +1977,7 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_browser_tab(crate::shell::browser_view::DEFAULT_URL, window, cx);
+        self.open_browser_tab(crate::shell::browser_view::DEFAULT_URL, None, window, cx);
     }
 
     /// Open the scrollback search overlay on the active tab's active terminal

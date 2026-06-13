@@ -13,7 +13,8 @@ use gpui_component::{
     input::{Enter as InputEnter, Input},
 };
 
-use super::BrowserView;
+use super::{BrowserView, CopyKind, PageAppearance};
+use crate::actions::SendTextToActiveAgent;
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -39,11 +40,40 @@ impl Render for BrowserView {
         }
         self.address_focused = editing;
 
+        // Deliver a picked element to the active agent terminal. Stashed in the
+        // IPC callback (which has no `Window`); dispatched here where one
+        // exists, via the same action the terminal/diff views use.
+        if let Some(text) = self.pending_agent_text.take() {
+            window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+        }
+
+        // Tooltip labels for the cycle-on-click profile + appearance controls.
+        let appearance_label = match self.appearance {
+            PageAppearance::System => "System",
+            PageAppearance::Light => "Light",
+            PageAppearance::Dark => "Dark",
+        };
+        let profile_name = self.profile_name(cx);
+        let devtools_open = self.devtools_open;
+
         let nav_btn = |id: &'static str, icon: &'static str| {
             Button::new(id)
                 .icon(Icon::default().path(icon))
                 .ghost()
                 .small()
+        };
+
+        // A probe button that swaps to a green check while its result is the
+        // active confirmation, so a copy is never silent.
+        let confirmed = self.confirmed;
+        let probe_btn = move |id: &'static str, icon: &'static str, kind: CopyKind| {
+            let lit = confirmed.is_some_and(|c| c.lights_button(kind));
+            let path = if lit { "icons/check.svg" } else { icon };
+            let mut icon_el = Icon::default().path(path);
+            if lit {
+                icon_el = icon_el.text_color(theme.status_ok);
+            }
+            Button::new(id).icon(icon_el).ghost().small()
         };
 
         let toolbar = div()
@@ -80,29 +110,83 @@ impl Render for BrowserView {
                     }))
                     .child(Input::new(&self.address).small()),
             )
-            // Agent-context probes — each copies pasteable page context to the
-            // clipboard for an AI agent. Picker reads keys in the page, so it
-            // focuses the webview; the others read on demand.
+            // Agent-context probes — each hands pasteable page context to an AI
+            // agent. The firing button briefly turns into a green check (see
+            // `probe_btn`) and a "copied" pill appears so the action isn't
+            // silent. Picker reads keys in the page, so it focuses the webview.
             .child(
-                nav_btn("browser-pick", "icons/crosshair.svg")
-                    .tooltip("Pick element → clipboard")
+                probe_btn("browser-pick", "icons/crosshair.svg", CopyKind::Pick)
+                    .tooltip("Pick element (C copy · A → agent)")
                     .on_click(cx.listener(|this, _, _window, _cx| this.start_element_picker())),
             )
             .child(
-                nav_btn("browser-shot", "icons/camera.svg")
-                    .tooltip("Screenshot → clipboard")
+                probe_btn("browser-shot", "icons/camera.svg", CopyKind::Screenshot)
+                    .tooltip("Screenshot page (image → clipboard)")
                     .on_click(cx.listener(|this, _, _window, _cx| this.capture_screenshot(None))),
             )
             .child(
-                nav_btn("browser-dom", "icons/file-code.svg")
-                    .tooltip("Copy DOM snapshot")
+                probe_btn("browser-dom", "icons/file-code.svg", CopyKind::Dom)
+                    .tooltip("Copy DOM outline (text → clipboard)")
                     .on_click(cx.listener(|this, _, _window, _cx| this.copy_dom_snapshot())),
             )
             .child(
-                nav_btn("browser-console", "icons/list-tree.svg")
-                    .tooltip("Copy console log")
+                probe_btn("browser-console", "icons/list-tree.svg", CopyKind::Console)
+                    .tooltip("Copy console log (text → clipboard)")
                     .on_click(cx.listener(|this, _, _window, _cx| this.copy_console())),
-            );
+            )
+            // Page controls: inspector, color-scheme override, and the
+            // cookie-isolated profile (cycle-on-click + a new-profile button).
+            .child({
+                let mut icon = Icon::default().path("icons/wrench.svg");
+                if devtools_open {
+                    icon = icon.text_color(theme.status_ok);
+                }
+                Button::new("browser-devtools")
+                    .icon(icon)
+                    .ghost()
+                    .small()
+                    .tooltip("Toggle DevTools")
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_devtools(cx)))
+            })
+            .child(
+                nav_btn("browser-appearance", "icons/contrast.svg")
+                    .tooltip(SharedString::from(format!(
+                        "Page theme: {appearance_label} (click to cycle)"
+                    )))
+                    .on_click(cx.listener(|this, _, _window, cx| this.cycle_appearance(cx))),
+            )
+            .child(
+                nav_btn("browser-profile", "icons/user.svg")
+                    .tooltip(SharedString::from(format!(
+                        "Profile: {profile_name} (click to switch)"
+                    )))
+                    .on_click(cx.listener(|this, _, window, cx| this.cycle_profile(window, cx))),
+            )
+            .child(
+                nav_btn("browser-profile-new", "icons/plus.svg")
+                    .tooltip("New isolated profile")
+                    .on_click(cx.listener(|this, _, window, cx| this.new_profile(window, cx))),
+            )
+            .children(self.confirmed.map(|kind| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(density.gap_inline * 0.5))
+                    .px(px(density.pad_panel * 0.6))
+                    .py(px(density.pad_panel * 0.25))
+                    .rounded_full()
+                    .bg(theme.bg_panel_alt)
+                    .text_color(theme.fg_muted)
+                    .text_size(px(typography.t_body_sm))
+                    .child(
+                        Icon::default()
+                            .path("icons/check.svg")
+                            .small()
+                            .text_color(theme.status_ok),
+                    )
+                    .child(SharedString::from(kind.pill_label()))
+            }));
 
         let body: gpui::AnyElement = match &self.native {
             Some(native) => {

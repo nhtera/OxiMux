@@ -125,6 +125,18 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/camera.svg",
         include_bytes!("../assets/icons/camera.svg"),
     ),
+    // Copy-confirmation check; devtools (wrench), page appearance (contrast),
+    // and browser profile (user) toolbar controls.
+    ("icons/check.svg", include_bytes!("../assets/icons/check.svg")),
+    (
+        "icons/wrench.svg",
+        include_bytes!("../assets/icons/wrench.svg"),
+    ),
+    (
+        "icons/contrast.svg",
+        include_bytes!("../assets/icons/contrast.svg"),
+    ),
+    ("icons/user.svg", include_bytes!("../assets/icons/user.svg")),
 ];
 
 impl AssetSource for AppAssets {

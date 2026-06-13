@@ -201,6 +201,9 @@ fn main() {
         // first click after launch sees the user's configured mode (heuristic
         // by default; agent when configured).
         oximux_app::commit_message_ai_settings::install(cx);
+        // Browser profiles (cookie/cache-isolated webview stores); the browser
+        // toolbar reads this global to enumerate + switch profiles.
+        oximux_app::browser_profiles::install(cx);
         // Per-agent launch defaults (extra CLI flags, default model, enabled
         // agents, default agent). The picker + agent runtime read the global
         // at launch time, so installing here means the first launch after

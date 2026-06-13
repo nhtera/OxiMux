@@ -82,6 +82,11 @@ objc2-app-kit = { version = "0.3", features = [
   "NSImage",
   "NSImageRep",
   "NSBitmapImageRep",
+  # Page color-scheme override: NSAppearanceCustomization::setAppearance on the
+  # webview's NSView drives the embedded page's prefers-color-scheme.
+  "NSAppearance",
+  "NSResponder",
+  "NSView",
 ] }
 objc2-web-kit = { version = "0.3", features = [
   "WKWebView",

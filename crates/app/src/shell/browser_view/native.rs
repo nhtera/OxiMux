@@ -49,10 +49,15 @@ where
 impl NativeWebview {
     /// Build a webview as a child of `window`'s native surface, loading
     /// `url`. `init_script` runs at document-start on every navigation.
+    ///
+    /// `data_store_id` selects an isolated cookie/cache store (a browser
+    /// profile); `None` uses the shared default store. The id is the profile
+    /// UUID's bytes — distinct ids never see each other's cookies.
     pub fn build<N, T, L, I>(
         window: &Window,
         url: &str,
         init_script: &str,
+        data_store_id: Option<[u8; 16]>,
         callbacks: WebviewCallbacks<N, T, L, I>,
     ) -> wry::Result<Self>
     where
@@ -62,7 +67,7 @@ impl NativeWebview {
         I: Fn(String) + 'static,
     {
         let on_ipc = callbacks.on_ipc;
-        let webview = WebViewBuilder::new()
+        let mut builder = WebViewBuilder::new()
             .with_url(url)
             .with_initialization_script(init_script)
             // Start hidden — the owning view's first render sweep shows it only
@@ -72,14 +77,25 @@ impl NativeWebview {
             // Don't grab first responder on creation — keyboard stays with
             // the GPUI views until the user clicks into the page.
             .with_focused(false)
+            // Inspector available on demand (toggled from the toolbar wrench).
+            .with_devtools(true)
             .with_back_forward_navigation_gestures(true)
             .with_navigation_handler(callbacks.on_navigation)
             .with_document_title_changed_handler(callbacks.on_title)
             .with_on_page_load_handler(callbacks.on_load)
             .with_ipc_handler(move |req: wry::http::Request<String>| {
                 on_ipc(req.into_body());
-            })
-            .build_as_child(window)?;
+            });
+        // Per-profile cookie/cache isolation is a macOS WKWebsiteDataStore
+        // feature; off-platform the id is ignored (single shared store).
+        #[cfg(target_os = "macos")]
+        if let Some(id) = data_store_id {
+            use wry::WebViewBuilderExtDarwin;
+            builder = builder.with_data_store_identifier(id);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = data_store_id;
+        let webview = builder.build_as_child(window)?;
         Ok(Self { webview })
     }
 
@@ -148,6 +164,43 @@ impl NativeWebview {
     pub fn focus_parent(&self) {
         let _ = self.webview.focus_parent();
     }
+
+    /// Open / close / query the WebKit inspector for this page.
+    pub fn open_devtools(&self) {
+        self.webview.open_devtools();
+    }
+
+    pub fn close_devtools(&self) {
+        self.webview.close_devtools();
+    }
+
+    pub fn is_devtools_open(&self) -> bool {
+        self.webview.is_devtools_open()
+    }
+
+    /// Override the page color-scheme (drives `prefers-color-scheme`) by
+    /// setting the webview's native appearance. `System` clears the override.
+    /// macOS-only; a no-op elsewhere (wry exposes no portable theme setter).
+    #[cfg(target_os = "macos")]
+    pub fn set_appearance(&self, appearance: super::PageAppearance) {
+        use objc2_app_kit::{
+            NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+        };
+        use wry::WebViewExtMacOS;
+
+        let named = match appearance {
+            super::PageAppearance::System => None,
+            super::PageAppearance::Light => unsafe { NSAppearance::appearanceNamed(NSAppearanceNameAqua) },
+            super::PageAppearance::Dark => unsafe {
+                NSAppearance::appearanceNamed(NSAppearanceNameDarkAqua)
+            },
+        };
+        let webview = self.webview.webview();
+        webview.setAppearance(named.as_deref());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_appearance(&self, _appearance: super::PageAppearance) {}
 
     /// Capture the webview to PNG bytes and deliver them to `on_png` (fired on
     /// the main thread once the async snapshot completes). `rect` snapshots a

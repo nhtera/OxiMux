@@ -244,12 +244,13 @@ pub(crate) fn build_project_panes(
                     p.open_or_activate_editor_tab(path_buf, window, cx);
                 });
             }
-            PersistedTabKind::Browser { url } => {
+            PersistedTabKind::Browser { url, profile_id } => {
                 let url = url.clone();
+                let profile_id = *profile_id;
                 panes_entity.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
                         group.update(cx, |g, cx| {
-                            g.open_browser_tab(url, window, cx);
+                            g.open_browser_tab(url, profile_id, window, cx);
                         });
                     }
                 });
@@ -386,10 +387,11 @@ fn restore_multi_group(
                         p.open_editor_in_group_restore(group_id, path_buf, window, cx);
                     });
                 }
-                PersistedTabKind::Browser { url } => {
+                PersistedTabKind::Browser { url, profile_id } => {
                     let url = url.clone();
+                    let profile_id = *profile_id;
                     panes_entity.update(cx, |p, cx| {
-                        p.open_browser_in_group_restore(group_id, url, window, cx);
+                        p.open_browser_in_group_restore(group_id, url, profile_id, window, cx);
                     });
                 }
                 PersistedTabKind::Terminal => {

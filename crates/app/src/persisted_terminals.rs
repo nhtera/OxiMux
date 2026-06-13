@@ -213,8 +213,15 @@ pub enum PersistedTabKind {
     /// reopens the file (or surfaces a missing-file warning if gone).
     Editor { path: String },
     /// Embedded browser tab — `url` is the last-known address. Restore
-    /// reopens a browser tab navigated to it.
-    Browser { url: String },
+    /// reopens a browser tab navigated to it. `profile_id` selects the
+    /// isolated cookie/cache store (a browser profile); absent / `None`
+    /// restores into the shared default store (back-compat for tabs saved
+    /// before profiles existed).
+    Browser {
+        url: String,
+        #[serde(default)]
+        profile_id: Option<uuid::Uuid>,
+    },
 }
 
 /// Per-tab agent metadata sufficient to respawn the same CLI session on

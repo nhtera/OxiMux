@@ -111,10 +111,23 @@ pub const SNAPSHOT_JS: &str = r#"
 })();
 "#;
 
+/// Briefly flash the page white to signal a screenshot was captured. Injected
+/// *after* the snapshot lands so it's never in the shot itself. Self-removing.
+pub const SCREENSHOT_FLASH_JS: &str = r#"
+(function () {
+  var f = document.createElement('div');
+  f.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;background:#fff;opacity:0.5;transition:opacity 0.2s ease-out;';
+  document.documentElement.appendChild(f);
+  requestAnimationFrame(function () { f.style.opacity = '0'; });
+  setTimeout(function () { f.remove(); }, 240);
+})();
+"#;
+
 /// Inject the element-picker shadow-overlay. Hover highlights
-/// `elementFromPoint`; `C` copies the element payload, `S` screenshots its
-/// rect, `Esc` cancels. Listeners are capture-phase + `stopPropagation` so
-/// the page's own handlers never see the picker's keys.
+/// `elementFromPoint`; `C` copies the element payload, `A` sends it to the
+/// active agent terminal, `S` screenshots its rect, `Esc` cancels. Listeners
+/// are capture-phase + `stopPropagation` so the page's own handlers never see
+/// the picker's keys.
 pub const PICKER_JS: &str = r#"
 (function () {
   if (window.__oxPicker) { window.__oxPicker.stop(); }
@@ -125,9 +138,26 @@ pub const PICKER_JS: &str = r#"
   box.style.cssText = 'position:fixed;pointer-events:none;border:2px solid #4c8bf5;background:rgba(76,139,245,0.15);';
   var label = document.createElement('div');
   label.style.cssText = 'position:fixed;pointer-events:none;font:12px monospace;background:#111;color:#fff;padding:2px 6px;border-radius:3px;white-space:nowrap;';
+  var hint = document.createElement('div');
+  hint.textContent = 'C copy · A → agent · S shot · Esc';
+  hint.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);pointer-events:none;font:11px system-ui,sans-serif;background:rgba(17,17,17,0.92);color:#fff;padding:4px 10px;border-radius:999px;white-space:nowrap;';
   shadow.appendChild(box);
   shadow.appendChild(label);
+  shadow.appendChild(hint);
   document.documentElement.appendChild(host);
+  // A short-lived "Copied" bubble shown at the picked element after the
+  // overlay tears down, so the action reads as spatially connected.
+  function confirmBubble(el, text) {
+    var r = el.getBoundingClientRect();
+    var b = document.createElement('div');
+    b.textContent = '✓ ' + text;
+    b.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;font:12px system-ui,sans-serif;background:rgba(17,17,17,0.95);color:#fff;padding:3px 9px;border-radius:999px;white-space:nowrap;transition:opacity 0.2s ease-out;';
+    b.style.left = Math.max(4, r.left) + 'px';
+    b.style.top = Math.max(4, r.top - 26) + 'px';
+    document.documentElement.appendChild(b);
+    setTimeout(function () { b.style.opacity = '0'; }, 700);
+    setTimeout(function () { b.remove(); }, 950);
+  }
   var cur = null;
   function sel(el) {
     if (el.id) return '#' + CSS.escape(el.id);
@@ -181,12 +211,17 @@ pub const PICKER_JS: &str = r#"
       stop(); e.preventDefault(); e.stopPropagation(); return;
     }
     // Leave OS chords (Cmd/Ctrl+C, Cmd/Ctrl+S, …) to the page / browser — the
-    // picker only claims the bare C / S keys.
+    // picker only claims the bare C / A / S keys.
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (!cur) return;
     if (e.key === 'c' || e.key === 'C') {
-      window.ipc.postMessage(JSON.stringify(payload(cur)));
-      stop(); e.preventDefault(); e.stopPropagation();
+      var p = payload(cur); p.kind = 'pick';
+      window.ipc.postMessage(JSON.stringify(p));
+      confirmBubble(cur, 'Copied'); stop(); e.preventDefault(); e.stopPropagation();
+    } else if (e.key === 'a' || e.key === 'A') {
+      var pa = payload(cur); pa.kind = 'pick_to_agent';
+      window.ipc.postMessage(JSON.stringify(pa));
+      confirmBubble(cur, 'Sent to agent'); stop(); e.preventDefault(); e.stopPropagation();
     } else if (e.key === 's' || e.key === 'S') {
       var r = cur.getBoundingClientRect();
       window.ipc.postMessage(JSON.stringify({ kind: 'pick_shot', rect: { x: r.left, y: r.top, w: r.width, h: r.height } }));
@@ -276,6 +311,9 @@ pub enum IpcMessage {
     },
     Dom(DomSnapshot),
     Pick(PickPayload),
+    /// Picked element routed to the active agent terminal instead of the
+    /// clipboard (`A` in the picker).
+    PickToAgent(PickPayload),
     PickShot {
         rect: PickRect,
     },
@@ -411,6 +449,17 @@ mod tests {
         assert!(matches!(IpcMessage::parse(pick), Some(IpcMessage::Pick(_))));
         let shot = r#"{"kind":"pick_shot","rect":{"x":0,"y":0,"w":10,"h":10}}"#;
         assert!(matches!(IpcMessage::parse(shot), Some(IpcMessage::PickShot { .. })));
+    }
+
+    #[test]
+    fn parses_pick_to_agent() {
+        // The picker's `A` key tags the same payload `pick_to_agent` so it
+        // routes to the agent terminal instead of the clipboard.
+        let body = r##"{"kind":"pick_to_agent","selector":"#go","rect":{"x":1,"y":2,"w":3,"h":4}}"##;
+        match IpcMessage::parse(body).expect("parse") {
+            IpcMessage::PickToAgent(p) => assert_eq!(p.selector, "#go"),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

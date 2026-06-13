@@ -1136,14 +1136,16 @@ impl ProjectPanes {
                     // BrowserView) so a restored tab reopens where the user
                     // left off, including link-click navigations.
                     PaneGroupTabKind::Browser { url } => {
-                        let live = if let crate::shell::pane_content::PaneContent::Browser(view) =
-                            &tab.content
-                        {
-                            view.read(cx).current_url()
-                        } else {
-                            url.clone()
-                        };
-                        (None, PersistedTabKind::Browser { url: live })
+                        let (live, profile_id) =
+                            if let crate::shell::pane_content::PaneContent::Browser(view) =
+                                &tab.content
+                            {
+                                let v = view.read(cx);
+                                (v.current_url(), v.profile_id())
+                            } else {
+                                (url.clone(), None)
+                            };
+                        (None, PersistedTabKind::Browser { url: live, profile_id })
                     }
                     PaneGroupTabKind::Agent {
                         adapter,
@@ -1492,6 +1494,7 @@ impl ProjectPanes {
         &mut self,
         group_id: PaneGroupId,
         url: String,
+        profile_id: Option<uuid::Uuid>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1499,7 +1502,7 @@ impl ProjectPanes {
             return;
         };
         group.update(cx, |g, cx| {
-            g.open_browser_tab(url, window, cx);
+            g.open_browser_tab(url, profile_id, window, cx);
         });
     }
 
