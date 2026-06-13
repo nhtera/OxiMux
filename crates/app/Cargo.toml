@@ -65,6 +65,13 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
+# Embedded browser-tab engine: one Rust API over the platform webview
+# (WKWebView on macOS). `build_as_child` attaches the webview to GPUI's
+# native window surface via the `raw-window-handle` already in the graph; no
+# `tao`/gtk pulled in on macOS (those are Linux-only optional features).
+# Chosen for future cross-platform (WebView2 / WebKitGTK) over a macOS-only
+# objc2-web-kit binding.
+wry = "0.55"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

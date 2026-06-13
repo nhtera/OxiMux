@@ -326,6 +326,9 @@ actions!(
         FocusPrevPane,
         /// Open a new terminal tab at the workspace (group) level.
         NewTab,
+        /// Open a new embedded browser tab at the workspace (group) level.
+        /// Bound to Cmd+Shift+B.
+        NewBrowserTab,
         /// Open a new terminal tab INSIDE the active split pane (leaf),
         /// adding it to that pane's own tab strip. Bound to Cmd+Shift+T.
         NewTabInPane,

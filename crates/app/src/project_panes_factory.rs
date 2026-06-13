@@ -244,6 +244,16 @@ pub(crate) fn build_project_panes(
                     p.open_or_activate_editor_tab(path_buf, window, cx);
                 });
             }
+            PersistedTabKind::Browser { url } => {
+                let url = url.clone();
+                panes_entity.update(cx, |p, cx| {
+                    if let Some(group) = p.active_group() {
+                        group.update(cx, |g, cx| {
+                            g.open_browser_tab(url, window, cx);
+                        });
+                    }
+                });
+            }
             PersistedTabKind::Terminal => {
                 if let Some(agent) = &tab.agent {
                     restore_agent_tab(
@@ -374,6 +384,12 @@ fn restore_multi_group(
                     }
                     panes_entity.update(cx, |p, cx| {
                         p.open_editor_in_group_restore(group_id, path_buf, window, cx);
+                    });
+                }
+                PersistedTabKind::Browser { url } => {
+                    let url = url.clone();
+                    panes_entity.update(cx, |p, cx| {
+                        p.open_browser_in_group_restore(group_id, url, window, cx);
                     });
                 }
                 PersistedTabKind::Terminal => {

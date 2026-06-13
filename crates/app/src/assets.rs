@@ -108,6 +108,16 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/keyboard.svg",
         include_bytes!("../assets/icons/keyboard.svg"),
     ),
+    // Browser tab glyphs: globe marks the tab kind; arrows drive back/forward.
+    ("icons/globe.svg", include_bytes!("../assets/icons/globe.svg")),
+    (
+        "icons/arrow-left.svg",
+        include_bytes!("../assets/icons/arrow-left.svg"),
+    ),
+    (
+        "icons/arrow-right.svg",
+        include_bytes!("../assets/icons/arrow-right.svg"),
+    ),
 ];
 
 impl AssetSource for AppAssets {

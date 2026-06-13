@@ -78,7 +78,7 @@ use crate::actions::{
     OpenAddProjectDialog,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
-    NewTab, OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt,
+    NewBrowserTab, NewTab, OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt,
     OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, Search, SelectExplorerTab,
     SelectFilesTab,
     SelectSearchTab,
@@ -2029,6 +2029,28 @@ impl Render for WorkspaceRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Push sidebar data down before LeftRail::render runs in the tree.
         self.refresh_left_rail(cx);
+
+        // Tell the panes whether a modal/overlay is covering them this frame,
+        // so any embedded browser webview (a native view above the GPU canvas)
+        // hides instead of floating over the modal. Set before the panes
+        // render below.
+        let panes_covered = self.palette.read(cx).is_open()
+            || self.project_picker.read(cx).is_open()
+            || self.settings_modal.read(cx).is_open()
+            || self.workspace_dialog.read(cx).is_open()
+            || self.add_project_dialog.read(cx).is_open()
+            || self.adapter_picker.read(cx).is_open()
+            || self.pane_actions.read(cx).is_open()
+            || self.tab_context_menu.read(cx).is_open()
+            || self.file_tree_context_menu.read(cx).is_open()
+            || self.git_row_context_menu.read(cx).is_open()
+            || self.commit_context_menu.read(cx).is_open()
+            || self.row_menu.read(cx).is_open()
+            || self.project_menu.read(cx).is_open()
+            || self.floating_terminal_visible
+            || self.confirm_dialog.is_some()
+            || self.rename_tab_dialog.is_some();
+        cx.set_global(crate::shell::browser_view::WebviewSuppressed(panes_covered));
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
@@ -3068,6 +3090,19 @@ impl Render for WorkspaceRoot {
                 panes.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
                         group.update(cx, |g, cx| g.on_new_tab(&NewTab, window, cx));
+                    }
+                });
+            }))
+            // Root-level handler for NewBrowserTab (⌘⇧B) — routes to the
+            // active group like the NewTab fallback so the keybind works
+            // regardless of which surface holds focus.
+            .on_action(cx.listener(|this, _: &NewBrowserTab, window, cx| {
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                panes.update(cx, |p, cx| {
+                    if let Some(group) = p.active_group() {
+                        group.update(cx, |g, cx| g.on_new_browser_tab(&NewBrowserTab, window, cx));
                     }
                 });
             }))

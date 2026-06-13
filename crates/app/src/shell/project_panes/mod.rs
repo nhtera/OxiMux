@@ -1132,6 +1132,19 @@ impl ProjectPanes {
                     | PaneGroupTabKind::Commit { .. }
                     | PaneGroupTabKind::BranchFile { .. }
                     | PaneGroupTabKind::CombinedDiff { .. } => continue,
+                    // Browser tabs persist their LIVE url (read from the
+                    // BrowserView) so a restored tab reopens where the user
+                    // left off, including link-click navigations.
+                    PaneGroupTabKind::Browser { url } => {
+                        let live = if let crate::shell::pane_content::PaneContent::Browser(view) =
+                            &tab.content
+                        {
+                            view.read(cx).current_url()
+                        } else {
+                            url.clone()
+                        };
+                        (None, PersistedTabKind::Browser { url: live })
+                    }
                     PaneGroupTabKind::Agent {
                         adapter,
                         adapter_id,
@@ -1471,6 +1484,22 @@ impl ProjectPanes {
         };
         group.update(cx, |g, cx| {
             g.open_or_activate_editor_tab(path, window, cx);
+        });
+    }
+
+    /// Restore a browser tab into a SPECIFIC group (multi-group restore).
+    pub fn open_browser_in_group_restore(
+        &mut self,
+        group_id: PaneGroupId,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(&group_id).cloned() else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            g.open_browser_tab(url, window, cx);
         });
     }
 

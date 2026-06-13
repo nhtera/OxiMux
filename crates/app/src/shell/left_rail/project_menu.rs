@@ -66,6 +66,11 @@ pub struct ProjectRowMenu {
 }
 
 impl ProjectRowMenu {
+    /// `true` while the menu is pinned open for a project row.
+    pub fn is_open(&self) -> bool {
+        self.open_for.is_some()
+    }
+
     pub fn new(
         theme: Theme,
         density: Density,

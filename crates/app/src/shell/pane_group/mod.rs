@@ -35,8 +35,9 @@ use oximux_pty::TerminalSessionId;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewTab, NextTab, PrevTab,
-    RequestOpenAdapterPicker, Search, SplitSubPaneDown, SplitSubPaneRight, ToggleZoomSubPane,
+    CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewBrowserTab, NewTab, NextTab,
+    PrevTab, RequestOpenAdapterPicker, Search, SplitSubPaneDown, SplitSubPaneRight,
+    ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
 use crate::shell::agent_status_task::spawn_status_task;
@@ -91,6 +92,12 @@ pub enum PaneGroupTabKind {
     /// persisted (regenerates from current git state on click).
     CombinedDiff {
         scope_key: SharedString,
+    },
+    /// Embedded browser tab. `url` is the seed/last-known address —
+    /// persistence reads the live URL from the `BrowserView` at snapshot,
+    /// and restore re-navigates here. No relay, no PTY.
+    Browser {
+        url: String,
     },
 }
 
@@ -667,7 +674,7 @@ impl PaneGroup {
             PaneContent::Terminal(tree) => tree
                 .iter_all_views()
                 .any(|(_, _, v)| v.read(cx).session_id() == session),
-            PaneContent::Editor(_) | PaneContent::Diff(_) => false,
+            PaneContent::Editor(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => false,
         })
     }
 
@@ -820,12 +827,20 @@ impl PaneGroup {
     /// throttle). Output keeps draining; only the poll cadence + repaints drop.
     /// Clears the visibility cache so the next render reconciles back to the
     /// real shown-set when this group is on screen again.
+    ///
+    /// Also hides any browser tab's native webview — an off-screen project's
+    /// PaneGroups never render again until reactivated, so the per-render
+    /// visibility sweep can't fire; without this the webview (a native view
+    /// above the GPU canvas) keeps floating over the incoming project's pane.
     pub fn hide_all_terminals(&mut self, cx: &mut Context<Self>) {
         for tab in self.tabs.iter() {
             if let PaneContent::Terminal(tree) = &tab.content {
                 for (_, _, view) in tree.iter_all_views() {
                     view.update(cx, |v, vcx| v.set_visible(false, vcx));
                 }
+            }
+            if let PaneContent::Browser(view) = &tab.content {
+                view.update(cx, |v, _| v.set_active(false));
             }
         }
         // No cx.notify() — this group is off-screen, so a repaint would be
@@ -1230,6 +1245,53 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open a new embedded browser tab at `url`. Unlike editor/diff tabs,
+    /// browser tabs don't dedup — every call appends a fresh tab, like a
+    /// new terminal. Mirrors the diff opener's mount/activate sequence.
+    pub fn open_browser_tab(
+        &mut self,
+        url: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let url = url.into();
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let url_for_view = url.clone();
+        let view = cx.new(|cx| {
+            crate::shell::browser_view::BrowserView::new(
+                url_for_view,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let label = crate::shell::browser_view::host_label(&url);
+        let tab = PaneGroupTab {
+            label: SharedString::from(label),
+            content: PaneContent::Browser(view),
+            kind: PaneGroupTabKind::Browser { url },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     /// Open or activate a commit-detail tab. Dedup key is the full
     /// SHA — clicking the same commit row twice activates the
     /// existing tab. `short_oid` and `subject` are display-only and
@@ -1549,6 +1611,8 @@ impl PaneGroup {
             PaneContent::Editor(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
             // Diff tabs notify the host the same way as editor tabs.
             PaneContent::Diff(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
+            // Browser tabs notify the host on title/URL/loading changes.
+            PaneContent::Browser(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
         };
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
@@ -1803,7 +1867,8 @@ impl PaneGroup {
             | PaneGroupTabKind::Diff { .. }
             | PaneGroupTabKind::Commit { .. }
             | PaneGroupTabKind::BranchFile { .. }
-            | PaneGroupTabKind::CombinedDiff { .. } => false,
+            | PaneGroupTabKind::CombinedDiff { .. }
+            | PaneGroupTabKind::Browser { .. } => false,
         }) else {
             return false;
         };
@@ -1850,9 +1915,9 @@ impl PaneGroup {
         let tab = self.tabs.get(self.active)?;
         match &tab.content {
             PaneContent::Editor(view) => Some(view.read(cx).file_path().to_path_buf()),
-            // Diff tabs aren't editors and don't surface a file path the
-            // host's editor-tracking flows treat as an editable target.
-            PaneContent::Terminal(_) | PaneContent::Diff(_) => None,
+            // Diff/Browser tabs aren't editors and don't surface a file path
+            // the host's editor-tracking flows treat as an editable target.
+            PaneContent::Terminal(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => None,
         }
     }
 
@@ -1874,11 +1939,12 @@ impl PaneGroup {
                         .unwrap_or_default();
                     out.push(bytes);
                 }
-                // Editor and Diff tabs have no PTY scrollback. Diff tabs
-                // are also not persisted across restarts, but we still
-                // push an empty slot so the index alignment with `tabs`
+                // Editor / Diff / Browser tabs have no PTY scrollback, but we
+                // still push an empty slot so the index alignment with `tabs`
                 // is preserved for the duration of this collection call.
-                PaneContent::Editor(_) | PaneContent::Diff(_) => out.push(Vec::new()),
+                PaneContent::Editor(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => {
+                    out.push(Vec::new())
+                }
             }
         }
         out
@@ -1891,7 +1957,9 @@ impl PaneGroup {
                 PaneContent::Terminal(tree) => {
                     out.push(tree.active_view().and_then(|v| v.read(cx).external_id()));
                 }
-                PaneContent::Editor(_) | PaneContent::Diff(_) => out.push(None),
+                PaneContent::Editor(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => {
+                    out.push(None)
+                }
             }
         }
         out
@@ -1899,6 +1967,15 @@ impl PaneGroup {
 
     pub(crate) fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         self.open_terminal_tab(window, cx);
+    }
+
+    pub(crate) fn on_new_browser_tab(
+        &mut self,
+        _: &NewBrowserTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_browser_tab(crate::shell::browser_view::DEFAULT_URL, window, cx);
     }
 
     /// Open the scrollback search overlay on the active tab's active terminal

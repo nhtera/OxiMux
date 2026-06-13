@@ -97,6 +97,19 @@ impl Render for PaneGroup {
             self.last_visible_ids = desired;
         }
 
+        // Browser visibility sweep: the native webview floats over the GPU
+        // canvas, so it must be hidden whenever its tab isn't the active one
+        // OR a modal covers the panes. Cheap — `set_active` early-returns
+        // when unchanged. Runs every render so tab switches / modal toggles
+        // take effect on the next frame.
+        let webview_suppressed = crate::shell::browser_view::webview_suppressed(cx);
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if let PaneContent::Browser(view) = &tab.content {
+                let show = idx == self.active && !webview_suppressed;
+                view.update(cx, |v, _| v.set_active(show));
+            }
+        }
+
         let entity = cx.entity().clone();
         let focus_handle = self.focus_handle_clone();
         let theme = self.theme;
@@ -116,6 +129,9 @@ impl Render for PaneGroup {
             // pane content — same pattern as Editor. The DiffView owns
             // its own scroll, header, and per-hunk layout.
             PaneContent::Diff(view) => view.clone().into_any_element(),
+            // Browser tabs render the BrowserView entity directly — its
+            // toolbar + anchor canvas; the native webview floats over it.
+            PaneContent::Browser(view) => view.clone().into_any_element(),
         });
 
         // Empty-pane placeholder: when the user closes the last tab of
@@ -154,6 +170,7 @@ impl Render for PaneGroup {
             .size_full()
             .relative()
             .on_action(cx.listener(PaneGroup::on_new_tab))
+            .on_action(cx.listener(PaneGroup::on_new_browser_tab))
             .on_action(cx.listener(PaneGroup::on_new_tab_in_pane))
             .on_action(cx.listener(PaneGroup::on_close_tab))
             .on_action(cx.listener(PaneGroup::on_next_tab))
@@ -214,10 +231,17 @@ pub fn build_tab_strip_for(
             PaneGroupTabHeader {
                 tab_idx: idx,
                 label: t.custom_title.clone().unwrap_or_else(|| {
-                    ambient
-                        .as_ref()
-                        .map(|a| a.label.into())
-                        .unwrap_or_else(|| t.label.clone())
+                    // Browser tabs show the live page title (falling back to the
+                    // URL host) read from the BrowserView, so the chip tracks
+                    // navigation. A user-set custom title still wins above.
+                    if let PaneContent::Browser(view) = &t.content {
+                        view.read(cx).chrome_label()
+                    } else {
+                        ambient
+                            .as_ref()
+                            .map(|a| a.label.into())
+                            .unwrap_or_else(|| t.label.clone())
+                    }
                 }),
                 kind_marker: ambient
                     .as_ref()
@@ -285,6 +309,8 @@ enum PaneTabKindMarker {
     /// status badge) but keep their own marker so future visual
     /// differentiation (e.g. a `±` adornment) is a single-line change.
     Diff,
+    /// Browser tabs — globe glyph, no agent status badge.
+    Browser,
 }
 
 /// A recognized agent running inside a plain terminal tab, detected live from
@@ -343,6 +369,7 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         | PaneGroupTabKind::Commit { .. }
         | PaneGroupTabKind::BranchFile { .. }
         | PaneGroupTabKind::CombinedDiff { .. } => PaneTabKindMarker::Diff,
+        PaneGroupTabKind::Browser { .. } => PaneTabKindMarker::Browser,
     }
 }
 
@@ -914,6 +941,7 @@ fn render_tab_chip(
         // diff icon ships (deferred — see plan phase 04 file-type icons).
         PaneTabKindMarker::Editor | PaneTabKindMarker::Diff => "icons/file.svg",
         PaneTabKindMarker::Terminal => "icons/square-terminal.svg",
+        PaneTabKindMarker::Browser => "icons/globe.svg",
         PaneTabKindMarker::Agent(adapter_id) => agent_icon(adapter_id),
     };
     let icon_color = if is_active {
@@ -1389,6 +1417,7 @@ fn render_mru_hud(
             | PaneGroupTabKind::BranchFile { .. }
             | PaneGroupTabKind::CombinedDiff { .. } => "icons/file.svg",
             PaneGroupTabKind::Terminal => "icons/square-terminal.svg",
+            PaneGroupTabKind::Browser { .. } => "icons/globe.svg",
             // Match the tab chip: brand the agent by its adapter glyph so
             // the Ctrl+Tab switcher reads the same as the strip.
             PaneGroupTabKind::Agent { adapter_id, .. } => agent_icon(adapter_id),

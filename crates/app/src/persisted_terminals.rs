@@ -212,6 +212,9 @@ pub enum PersistedTabKind {
     /// Editor tab — `path` is the absolute filesystem path. Restore
     /// reopens the file (or surfaces a missing-file warning if gone).
     Editor { path: String },
+    /// Embedded browser tab — `url` is the last-known address. Restore
+    /// reopens a browser tab navigated to it.
+    Browser { url: String },
 }
 
 /// Per-tab agent metadata sufficient to respawn the same CLI session on

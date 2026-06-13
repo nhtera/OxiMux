@@ -13,8 +13,9 @@ use super::{ActionSpec, Category};
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
     DismissOverlay, FindNextMatch, FindPrevMatch, FocusNextPane, FocusNextSubPane, FocusPrevPane,
-    FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent, NewTab,
-    NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog, OpenProjectPicker, OpenQuickOpen,
+    FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent,
+    NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
+    OpenProjectPicker, OpenQuickOpen,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
     ReloadCustomCommands, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
@@ -73,6 +74,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     entry!("minimize_window", "Minimize window", Global, "cmd-m", Minimize),
     // ---- Tabs -------------------------------------------------------
     entry!("new_tab", "New tab", Tabs, "cmd-t", NewTab),
+    entry!("new_browser_tab", "New browser tab", Tabs, "cmd-shift-b", NewBrowserTab),
     // cmd-w closes the active sub-pane when the focused tab has multiple
     // sub-panes, else the per-pane tab, else the whole tab (cascade lives
     // in `PaneGroup::on_close_tab`).

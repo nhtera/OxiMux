@@ -12,6 +12,7 @@ use std::path::Path;
 use gpui::{App, Entity, FocusHandle, Focusable};
 use oximux_editor::EditorView;
 
+use crate::shell::browser_view::BrowserView;
 use crate::shell::diff_view::DiffView;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::terminal_view::TerminalView;
@@ -28,6 +29,9 @@ pub enum PaneContent {
     /// view, and so the tab kind survives same-file editor + diff
     /// being open simultaneously.
     Diff(Entity<DiffView>),
+    /// In-process embedded browser leaf. Owns a native webview layered over
+    /// the GPU canvas; persists only its URL. No PTY, no relay.
+    Browser(Entity<BrowserView>),
 }
 
 impl PaneContent {
@@ -41,6 +45,7 @@ impl PaneContent {
                 .unwrap_or_else(|| cx.focus_handle()),
             Self::Editor(view) => view.read(cx).focus_handle(cx),
             Self::Diff(view) => view.read(cx).focus_handle(cx),
+            Self::Browser(view) => view.read(cx).focus_handle(cx),
         }
     }
 
@@ -55,6 +60,10 @@ impl PaneContent {
             // `false` so a diff-tab being active never claims "focused"
             // semantics that callers would route input to.
             Self::Diff(_) => false,
+            // The webview owns native first-responder when the user clicks
+            // into the page; GPUI's per-leaf focus bookkeeping doesn't route
+            // input to it, so report `false` like the diff view.
+            Self::Browser(_) => false,
         }
     }
 
@@ -64,7 +73,7 @@ impl PaneContent {
 
     pub fn editor_path<'a>(&'a self, cx: &'a App) -> Option<&'a Path> {
         match self {
-            Self::Terminal(_) | Self::Diff(_) => None,
+            Self::Terminal(_) | Self::Diff(_) | Self::Browser(_) => None,
             Self::Editor(view) => Some(view.read(cx).file_path()),
         }
     }
@@ -76,7 +85,7 @@ impl PaneContent {
     pub fn terminal_active_view(&self) -> Option<&Entity<TerminalView>> {
         match self {
             Self::Terminal(tree) => tree.active_view(),
-            Self::Editor(_) | Self::Diff(_) => None,
+            Self::Editor(_) | Self::Diff(_) | Self::Browser(_) => None,
         }
     }
 }
