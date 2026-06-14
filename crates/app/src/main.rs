@@ -336,6 +336,13 @@ fn install_app_lifecycle(
     // tears down its `WorkspaceRoot` and SIGTERMs only its own PTYs (because
     // APP_QUITTING stays clear), leaving the other windows untouched.
     cx.on_window_closed(move |cx, window_id| {
+        // Transient non-workspace windows (the usage-popover panel, editor
+        // spike windows) aren't tracked — closing one must not count toward
+        // the "last workspace window → quit" decision below, or dismissing the
+        // popover would quit the whole app.
+        if !window_registry::is_registered(cx, window_id) {
+            return;
+        }
         if window_registry::remaining(cx) <= 1 {
             oximux_app::shell::terminal_view::APP_QUITTING
                 .store(true, std::sync::atomic::Ordering::SeqCst);

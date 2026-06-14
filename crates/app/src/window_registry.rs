@@ -211,6 +211,15 @@ pub fn remove(cx: &mut App, window_id: WindowId) -> Option<RegisteredWindow> {
         .map(|pos| reg.windows.remove(pos))
 }
 
+/// Whether `window_id` is a tracked workspace window. `false` for transient
+/// non-workspace windows (the usage-popover panel, editor spike windows) —
+/// the close/quit observers use this to ignore those, so closing one never
+/// counts toward the "last workspace window → quit" decision.
+pub fn is_registered(cx: &App, window_id: WindowId) -> bool {
+    cx.try_global::<WindowRegistry>()
+        .is_some_and(|reg| reg.windows.iter().any(|w| w.window_id == window_id))
+}
+
 /// How many workspace windows remain tracked.
 pub fn remaining(cx: &App) -> usize {
     cx.try_global::<WindowRegistry>()
