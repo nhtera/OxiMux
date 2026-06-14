@@ -172,7 +172,7 @@ impl Render for BrowserView {
             // silent. Picker reads keys in the page, so it focuses the webview.
             .child(
                 probe_btn("browser-pick", "icons/crosshair.svg", CopyKind::Pick)
-                    .tooltip("Pick element — click copies an image, then ⋯ for more (C · A → agent)")
+                    .tooltip("Pick element — click copies its context, then ⋯ for more (S screenshot · A → agent)")
                     .on_click(cx.listener(|this, _, _window, _cx| this.start_element_picker())),
             )
             .child(

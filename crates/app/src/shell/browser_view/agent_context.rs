@@ -302,16 +302,18 @@ pub fn profile_menu_js(items_json: &str) -> String {
 }
 
 /// Inject the element-picker shadow-overlay. Hover highlights
-/// `elementFromPoint`; a **click copies a screenshot of the element by
-/// default** (the most generally useful grab) and drops a white "✓ Copied"
-/// chip with a **⋯ More** button. The ⋯ opens a small popover with the other
-/// facets — copy the element (full markdown / HTML / styles / text), copy the
-/// image again, or send it to the agent. The chip + popover live in their own
-/// shadow root (a host-drawn popover would render *under* the native webview).
-/// Bare `C` / `A` / `S` keyboard accelerators still copy element / send to
-/// agent / screenshot directly while hovering; `Esc` cancels. Listeners are
-/// capture-phase + `stopPropagation` so the page's own handlers never see the
-/// picker's clicks or keys.
+/// `elementFromPoint`; a **click copies the element's context as text by
+/// default** (tag, role, accessible name, selector, dimensions, text, nearby
+/// context, computed styles, HTML, ancestor + full DOM path — the most
+/// generally useful grab) and drops a white "✓ Copied" chip with a **⋯ More**
+/// button. The ⋯ opens a small popover with the other facets — copy the
+/// element, HTML, styles, or text, copy a screenshot of its rect, or send it
+/// to the agent. The chip + popover live in their own shadow root (a
+/// host-drawn popover would render *under* the native webview). Bare `C` / `A`
+/// / `S` keyboard accelerators copy element / send to agent / screenshot
+/// directly while hovering; `Esc` cancels. Listeners are capture-phase +
+/// `stopPropagation` so the page's own handlers never see the picker's clicks
+/// or keys.
 pub const PICKER_JS: &str = r#"
 (function () {
   if (window.__oxPicker) { window.__oxPicker.stop(); }
@@ -323,7 +325,7 @@ pub const PICKER_JS: &str = r#"
   var label = document.createElement('div');
   label.style.cssText = 'position:fixed;pointer-events:none;font:12px monospace;background:#111;color:#fff;padding:2px 6px;border-radius:3px;white-space:nowrap;';
   var hint = document.createElement('div');
-  hint.textContent = 'Click to copy image · ⋯ for more · C element · A → agent · Esc';
+  hint.textContent = 'Click to copy element · ⋯ for more · S screenshot · A → agent · Esc';
   hint.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);pointer-events:none;font:11px system-ui,sans-serif;background:rgba(17,17,17,0.92);color:#fff;padding:4px 10px;border-radius:999px;white-space:nowrap;';
   shadow.appendChild(box);
   shadow.appendChild(label);
@@ -339,13 +341,67 @@ pub const PICKER_JS: &str = r#"
     }
     return s;
   }
-  function cssPath(el) {
-    var parts = [];
-    while (el && el.nodeType === 1 && parts.length < 8) {
-      var part = sel(el);
-      if (part.charAt(0) === '#') { parts.unshift(part); break; }
-      parts.unshift(part);
-      el = el.parentElement;
+  var ROLES = { A: 'link', BUTTON: 'button', INPUT: 'input', SELECT: 'select', TEXTAREA: 'textarea',
+                H1: 'heading', H2: 'heading', H3: 'heading', H4: 'heading',
+                NAV: 'navigation', MAIN: 'main', FORM: 'form', LABEL: 'label', IMG: 'img' };
+  function roleOf(el) { return el.getAttribute('role') || ROLES[el.tagName] || ''; }
+  function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+  // tag#id or tag.class.class — always tag-qualified (the hover `sel` drops the
+  // tag for an id; payload selectors and DOM paths want the full form).
+  function fullSel(el) {
+    var s = el.tagName.toLowerCase();
+    if (el.id) return s + '#' + CSS.escape(el.id);
+    if (el.classList && el.classList.length) {
+      s += '.' + Array.prototype.slice.call(el.classList, 0, 3).map(function (c) { return CSS.escape(c); }).join('.');
+    }
+    return s;
+  }
+  // ARIA accessible name: aria-label(ledby), then text for button/link/label,
+  // then title / alt / placeholder. Bounded so a huge subtree can't blow it up.
+  function accName(el) {
+    var n = clean(el.getAttribute('aria-label'));
+    if (!n) {
+      var lb = el.getAttribute('aria-labelledby');
+      if (lb) { var ps = []; lb.split(/\s+/).forEach(function (id) { var t = document.getElementById(id); if (t) ps.push(clean(t.textContent)); }); n = clean(ps.join(' ')); }
+    }
+    var tag = el.tagName.toLowerCase();
+    if (!n && (tag === 'button' || tag === 'a' || tag === 'label')) n = clean(el.textContent).slice(0, 100);
+    if (!n) n = clean(el.getAttribute('title') || el.getAttribute('alt') || el.getAttribute('placeholder') || '');
+    return n.slice(0, 120);
+  }
+  // A few short strings that contextualize the element: its label(s),
+  // described-by text, placeholder, and immediate siblings (own text excluded).
+  // Capped at 5 entries × 140 chars.
+  function nearby(el) {
+    var out = [], seen = {};
+    function add(s) { s = clean(s); if (s && s.length <= 140 && !seen[s] && out.length < 5) { seen[s] = 1; out.push(s); } }
+    if (el.id) { try { document.querySelectorAll('label[for="' + CSS.escape(el.id) + '"]').forEach(function (l) { add(l.textContent); }); } catch (e) {} }
+    var lab = el.closest ? el.closest('label') : null; if (lab) add(lab.textContent);
+    var db = el.getAttribute('aria-describedby');
+    if (db) db.split(/\s+/).forEach(function (id) { var t = document.getElementById(id); if (t) add(t.textContent); });
+    add(el.getAttribute('placeholder'));
+    if (el.previousElementSibling) add(el.previousElementSibling.textContent);
+    if (el.nextElementSibling) add(el.nextElementSibling.textContent);
+    var own = clean(el.textContent);
+    return out.filter(function (s) { return s !== own; });
+  }
+  // Ancestor chain (element excluded), each `tag` or `tag[role=…]`, root-first.
+  function ancestorPath(el) {
+    var parts = [], n = el.parentElement, hops = 0;
+    while (n && n.nodeType === 1 && hops < 12) {
+      var r = n.getAttribute('role');
+      parts.unshift(r ? n.tagName.toLowerCase() + '[role=' + r + ']' : n.tagName.toLowerCase());
+      n = n.parentElement; hops++;
+    }
+    return parts.join(' > ');
+  }
+  // Full selector path from the nearest body/html down to the element.
+  function fullPath(el) {
+    var parts = [], n = el, hops = 0;
+    while (n && n.nodeType === 1 && hops < 16) {
+      parts.unshift(fullSel(n));
+      if (n.tagName === 'BODY' || n.tagName === 'HTML') break;
+      n = n.parentElement; hops++;
     }
     return parts.join(' > ');
   }
@@ -373,9 +429,12 @@ pub const PICKER_JS: &str = r#"
     ['color', 'background-color', 'font-size', 'font-family', 'display', 'padding', 'margin'].forEach(function (k) {
       styles[k] = cs.getPropertyValue(k);
     });
-    return { kind: 'pick', selector: sel(el), css_path: cssPath(el),
-             html: (el.outerHTML || '').slice(0, 4096), text: (el.textContent || '').trim().slice(0, 500),
-             styles: styles, rect: { x: r.left, y: r.top, w: r.width, h: r.height } };
+    return { kind: 'pick', url: location.href, tag: el.tagName.toLowerCase(),
+             role: roleOf(el), name: accName(el), selector: fullSel(el),
+             text: clean(el.textContent).slice(0, 500), nearby: nearby(el),
+             styles: styles, html: (el.outerHTML || '').slice(0, 4096),
+             ancestor_path: ancestorPath(el), full_path: fullPath(el),
+             rect: { x: r.left, y: r.top, w: r.width, h: r.height } };
   }
   function copyImage(rect) {
     window.ipc.postMessage(JSON.stringify({ kind: 'pick_shot', rect: rect }));
@@ -441,7 +500,7 @@ pub const PICKER_JS: &str = r#"
       { t: 'Copy styles', k: '', f: function () { emitPart(p, 'styles'); } },
       { t: 'Copy text', k: '', f: function () { emitPart(p, 'text'); } },
       { sep: true },
-      { t: 'Copy image again', k: 'S', f: function () { copyImage(rect); } },
+      { t: 'Copy screenshot', k: 'S', f: function () { copyImage(rect); } },
       { t: 'Send to agent', k: 'A', f: function () { emitAgent(p); } }
     ];
     var expanded = false;
@@ -483,9 +542,9 @@ pub const PICKER_JS: &str = r#"
   function click(e) {
     if (!cur) return;
     var p = payload(cur);
-    copyImage(p.rect);     // default action: copy a screenshot of the element
+    emitPart(p, 'all');    // default action: copy the element's context as text
     stop();                // tear down the picking overlay
-    showResult(p.rect, p); // chip + ⋯ for the other facets
+    showResult(p.rect, p); // chip + ⋯ for the other facets (incl. screenshot)
     e.preventDefault(); e.stopPropagation();
   }
   function key(e) {
@@ -567,7 +626,8 @@ pub struct DomSnapshot {
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PickPart {
-    /// Full markdown block (identity + styles + HTML) — agent context.
+    /// Full browser-context block (identity + styles + HTML + DOM paths) —
+    /// agent context.
     #[default]
     All,
     /// Raw `outerHTML` only.
@@ -580,16 +640,36 @@ pub enum PickPart {
 
 #[derive(Debug, Deserialize)]
 pub struct PickPayload {
+    /// Page URL the element was grabbed from (query/fragment stripped on format).
+    #[serde(default)]
+    pub url: String,
+    /// Lowercase tag name (`textarea`, `a`, `img`, …).
+    #[serde(default)]
+    pub tag: String,
+    /// ARIA role — explicit `role` attribute or the implicit role for the tag.
+    #[serde(default)]
+    pub role: String,
+    /// ARIA accessible name (aria-label / labelled text / title / alt / …).
+    #[serde(default)]
+    pub name: String,
+    /// Tag-qualified selector for the element itself (`textarea#APjFqb`).
     #[serde(default)]
     pub selector: String,
     #[serde(default)]
-    pub css_path: String,
-    #[serde(default)]
-    pub html: String,
-    #[serde(default)]
     pub text: String,
+    /// Short strings that contextualize the element (labels, sibling text).
+    #[serde(default)]
+    pub nearby: Vec<String>,
     #[serde(default)]
     pub styles: BTreeMap<String, String>,
+    #[serde(default)]
+    pub html: String,
+    /// Ancestor chain (element excluded), each `tag` or `tag[role=…]`.
+    #[serde(default)]
+    pub ancestor_path: String,
+    /// Full selector path from the nearest body/html down to the element.
+    #[serde(default)]
+    pub full_path: String,
     /// Facet to copy (menu choice); `All` for the keyboard `C` accelerator.
     #[serde(default)]
     pub part: PickPart,
@@ -717,30 +797,62 @@ pub fn format_dom_snapshot(snap: &DomSnapshot) -> String {
     out
 }
 
-/// Format a picked element as a markdown block: identity, styles, and a
-/// clamped HTML excerpt.
+/// Strip the query string and fragment from a URL so the grabbed-from header
+/// can't leak search terms / tokens that ride in those parts. Best-effort
+/// string split (the page-supplied URL is treated as inert text either way).
+fn sanitize_url(url: &str) -> String {
+    url.split(['?', '#']).next().unwrap_or(url).trim().to_string()
+}
+
+/// Format a picked element as a pasteable text block: where it came from, its
+/// identity (tag, role, accessible name, selector, dimensions), text content,
+/// nearby context, computed styles, a clamped HTML excerpt, and its ancestor +
+/// full DOM paths. Plain text (not markdown) so it pastes cleanly into a search
+/// box, an editor, or an agent prompt alike.
 pub fn format_pick(p: &PickPayload) -> String {
-    let mut out = String::from("## Picked element\n\n");
-    out.push_str(&format!("- selector: `{}`\n", p.selector));
-    if !p.css_path.is_empty() {
-        out.push_str(&format!("- path: `{}`\n", p.css_path));
+    let mut out = String::new();
+    if !p.url.is_empty() {
+        out.push_str(&format!("Attached browser context from {}\n\n", sanitize_url(&p.url)));
     }
-    out.push_str(&format!(
-        "- rect: {:.0}×{:.0} at ({:.0}, {:.0})\n",
-        p.rect.w, p.rect.h, p.rect.x, p.rect.y
-    ));
+    out.push_str("Selected element:\n");
+    out.push_str(if p.tag.is_empty() { "element" } else { &p.tag });
+    out.push('\n');
+    if !p.name.is_empty() {
+        out.push_str(&format!("Accessible name: \"{}\"\n", one_line(&p.name)));
+    }
+    if !p.role.is_empty() {
+        out.push_str(&format!("Role: {}\n", one_line(&p.role)));
+    }
+    if !p.selector.is_empty() {
+        out.push_str(&format!("Selector: {}\n", one_line(&p.selector)));
+    }
+    out.push_str(&format!("Dimensions: {:.0}x{:.0}\n", p.rect.w, p.rect.h));
     if !p.text.is_empty() {
-        out.push_str(&format!("- text: {}\n", one_line(&p.text)));
+        out.push_str(&format!("\nText content:\n{}\n", one_line(&p.text)));
     }
-    if !p.styles.is_empty() {
-        out.push_str("\n### Computed styles\n\n");
-        for (k, v) in &p.styles {
-            out.push_str(&format!("- {}: {}\n", one_line(k), one_line(v)));
+    if !p.nearby.is_empty() {
+        out.push_str("\nNearby context:\n");
+        for n in &p.nearby {
+            out.push_str(&format!("- {}\n", one_line(n)));
+        }
+    }
+    let styles: Vec<_> = p.styles.iter().filter(|(_, v)| !v.trim().is_empty()).collect();
+    if !styles.is_empty() {
+        out.push_str("\nComputed styles:\n");
+        for (k, v) in styles {
+            out.push_str(&format!("  {}: {}\n", one_line(k), one_line(v)));
         }
     }
     if !p.html.is_empty() {
-        out.push_str("\n### HTML\n\n");
-        out.push_str(&fenced_block("html", &p.html));
+        out.push_str("\nHTML:\n");
+        out.push_str(p.html.trim());
+        out.push('\n');
+    }
+    if !p.ancestor_path.is_empty() {
+        out.push_str(&format!("\nAncestor path: {}\n", one_line(&p.ancestor_path)));
+    }
+    if !p.full_path.is_empty() {
+        out.push_str(&format!("Full DOM path: {}\n", one_line(&p.full_path)));
     }
     out
 }
@@ -848,31 +960,46 @@ mod tests {
         styles.insert("color".to_string(), "rgb(0, 0, 0)".to_string());
         styles.insert("display".to_string(), "block".to_string());
         PickPayload {
-            selector: "#go".into(),
-            css_path: "body > #go".into(),
-            html: "<a id=\"go\">x</a>".into(),
+            url: "https://x.dev/search?q=secret#frag".into(),
+            tag: "a".into(),
+            role: "link".into(),
+            name: "Go home".into(),
+            selector: "a#go".into(),
             text: "x".into(),
+            nearby: vec!["primary navigation".into()],
             styles,
+            html: "<a id=\"go\">x</a>".into(),
+            ancestor_path: "nav > body".into(),
+            full_path: "body > nav > a#go".into(),
             part,
             rect: PickRect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 },
         }
     }
 
     #[test]
-    fn pick_formats_styles_and_html() {
+    fn pick_formats_identity_styles_and_paths() {
         let md = format_pick(&sample_pick(PickPart::All));
-        assert!(md.contains("selector: `#go`"));
-        assert!(md.contains("path: `body > #go`"));
-        assert!(md.contains("rect: 30×40 at (1, 2)"));
-        assert!(md.contains("- color: rgb(0, 0, 0)"));
-        assert!(md.contains("```html"));
+        // Header strips the query/fragment so search terms / tokens don't leak.
+        assert!(md.contains("Attached browser context from https://x.dev/search"));
+        assert!(!md.contains("secret"));
+        assert!(md.contains("Selected element:\na\n"));
+        assert!(md.contains("Accessible name: \"Go home\""));
+        assert!(md.contains("Role: link"));
+        assert!(md.contains("Selector: a#go"));
+        assert!(md.contains("Dimensions: 30x40"));
+        assert!(md.contains("Text content:\nx"));
+        assert!(md.contains("Nearby context:\n- primary navigation"));
+        assert!(md.contains("  color: rgb(0, 0, 0)"));
+        assert!(md.contains("HTML:\n<a id=\"go\">x</a>"));
+        assert!(md.contains("Ancestor path: nav > body"));
+        assert!(md.contains("Full DOM path: body > nav > a#go"));
     }
 
     #[test]
     fn pick_part_copies_bare_facets() {
-        // `All` is the full agent markdown; the narrower facets copy the bare
-        // value so it pastes directly where the user wants it.
-        assert!(format_pick_part(&sample_pick(PickPart::All)).contains("## Picked element"));
+        // `All` is the full browser-context text; the narrower facets copy the
+        // bare value so it pastes directly where the user wants it.
+        assert!(format_pick_part(&sample_pick(PickPart::All)).contains("Selected element:"));
         assert_eq!(format_pick_part(&sample_pick(PickPart::Html)), "<a id=\"go\">x</a>");
         assert_eq!(format_pick_part(&sample_pick(PickPart::Text)), "x");
         // Styles render as a CSS declaration block (BTreeMap → sorted keys).

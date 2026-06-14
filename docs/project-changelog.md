@@ -4,6 +4,20 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-15 — Element picker: default click copies the element's context as text (not a screenshot)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/agent_context.rs` (picker JS payload + `format_pick`/`PickPayload`), `browser_view/render.rs` (picker tooltip)
+
+The inline browser's element picker (crosshair) used to copy a **screenshot of the element** on a plain left-click, with the text context only reachable via the `C` key. That's now flipped to match the reference cockpit: a left-click copies the element's **context as pasteable text** by default, and a screenshot is the secondary action (`S` key or the ⋯ menu's "Copy screenshot"). The text copy is the generally-useful grab — it drops straight into a search box, an editor, or an agent prompt.
+
+- **Enriched, plain-text format** (was a terse markdown stub): a `Attached browser context from <url>` header (query/fragment stripped so search terms / tokens don't ride along), then `Selected element:` with tag, **accessible name** (ARIA `aria-label`/labelledby → button/link/label text → title/alt/placeholder), **role** (explicit or implicit), tag-qualified **selector** (`textarea#APjFqb`), **dimensions**, text content, **nearby context** (associated labels, `aria-describedby`, placeholder, sibling text), computed styles, an HTML excerpt, and the element's **ancestor path** (`tag[role=…]` chain) + **full DOM path** (selector chain from `body`).
+- The ⋯ chip still offers the narrower facets (Copy element / HTML / styles / text), now plus **Copy screenshot**; bare `C`/`A`/`S` accelerators and the standalone camera button are unchanged. The page-controlled payload stays clamped and is treated as inert text.
+
+Verified: clean build (zero warnings), clippy clean (touched files), picker/context lib tests green (incl. the rewritten format test asserting the header strips the query string).
+
+---
+
 ### 2026-06-14 — Browser cookie import: cascade menu, Chromium + Firefox → active profile
 
 **Commits**: _(local, pending)_
