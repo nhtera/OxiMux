@@ -4,6 +4,18 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-15 — Inline browser: send a modern Safari User-Agent (sites stop serving the legacy page)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/native.rs` (`BROWSER_USER_AGENT` + `WebViewBuilder::with_user_agent`)
+
+The inline browser sent no explicit User-Agent, so `wry`/WKWebView used its bare default — which omits the trailing `Version/<n> Safari/<build>` token. Major sites (Google especially) read that absence as an unknown/legacy browser and fall back to a stripped-down page that also ignores `prefers-color-scheme` (why Google rendered the old light-only results layout instead of the modern SPA). The webview now sends a current desktop **Safari** UA (`…AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15`).
+
+- **Safari, not Chrome.** The reference cockpit spoofs a Chrome UA because it *is* Chromium; OxiMux's engine is WebKit, so a Safari UA is honest to the engine. A Chrome UA on WebKit would invite Blink-only code paths and `sec-ch-ua` client-hint mismatches the engine can't satisfy. The `Intel Mac OS X 10_15_7` platform token is what real Safari reports on every Mac (incl. Apple Silicon) by design.
+- Applied at build time for every profile/webview; bump the `Version/` number as Safari advances.
+
+---
+
 ### 2026-06-15 — Element picker: default click copies the element's context as text (not a screenshot)
 
 **Commits**: _(local, pending)_

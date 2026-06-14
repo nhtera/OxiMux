@@ -19,6 +19,19 @@ use wry::{
 
 use super::agent_context::PickRect;
 
+/// User-Agent for the inline browser. WKWebView's *default* UA omits the
+/// trailing `Version/<n> Safari/<build>` token, and major sites (Google,
+/// among others) read that absence as an unknown/legacy browser and fall back
+/// to a stripped-down page that also ignores `prefers-color-scheme`. We send a
+/// current desktop **Safari** UA — honest to the underlying WebKit engine (a
+/// Chrome UA would invite Blink-only code paths and client-hint mismatches the
+/// engine can't satisfy) — so sites serve their modern layout and respect the
+/// page's light/dark preference. The `Intel Mac OS X 10_15_7` platform token
+/// is what real Safari reports on every Mac (including Apple Silicon), by
+/// design. Bump the `Version/` number as Safari advances.
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15";
+
 /// Owns the live `wry::WebView`. `!Send` — only ever touched on the GPUI
 /// main thread (construction, frame updates, navigation, teardown-on-drop).
 pub struct NativeWebview {
@@ -88,6 +101,7 @@ impl NativeWebview {
         let on_ipc = callbacks.on_ipc;
         let mut builder = WebViewBuilder::new()
             .with_url(url)
+            .with_user_agent(BROWSER_USER_AGENT)
             .with_initialization_script(init_script)
             // Start hidden — the owning view's first render sweep shows it only
             // if its tab is active+uncovered. Avoids a 1-frame flash of every
