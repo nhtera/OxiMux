@@ -53,6 +53,8 @@ pub mod tab_context_menu;
 pub mod floating_terminal_host;
 pub mod floating_terminal_persistence;
 pub mod usage_meter;
+#[cfg(target_os = "macos")]
+pub mod usage_popover;
 pub mod tasks_view;
 pub mod terminal_canvas;
 pub mod terminal_links;

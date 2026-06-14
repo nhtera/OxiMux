@@ -335,11 +335,16 @@ pub struct WorkspaceRoot {
     /// refreshed by `_agent_activity_task` for Running primary-CLI
     /// sessions and pushed to the rail via `refresh_left_rail`.
     pub(crate) agent_activity: HashMap<String, String>,
-    /// Latest usage-meter sample. `None` hides the status-bar meter
-    /// entirely (no account config / unknown tier).
-    pub(crate) usage_snapshot: Option<oximux_agents::session_log::usage::UsageSnapshot>,
-    /// Whether the usage popover (click on the meter) is open.
+    /// Latest usage-meter state. `None` only before the first sample lands
+    /// (then it is always `Available` or `Unavailable`).
+    pub(crate) usage_state: Option<oximux_agents::session_log::usage::UsageState>,
+    /// Whether the in-window usage popover is open (non-macOS fallback render).
     pub(crate) usage_popover_open: bool,
+    /// The open usage-popover panel window, if any (macOS floats it above the
+    /// inline webview). `None` when closed.
+    #[cfg(target_os = "macos")]
+    pub(crate) usage_popover_window:
+        Option<gpui::WindowHandle<crate::shell::usage_popover::UsagePopover>>,
     /// Workspace id whose normal delete failed at the worktree-removal
     /// step. The next delete request for the SAME workspace offers the
     /// Force Delete variant (force-remove + always drop the DB row,
@@ -372,6 +377,79 @@ pub struct WorkspaceRoot {
 }
 
 impl WorkspaceRoot {
+    /// Toggle the usage-meter popover from the status-bar chip.
+    ///
+    /// On macOS the popover is a separate `WindowKind::PopUp` panel window
+    /// (`shell::usage_popover`): an inline-browser webview is a native view
+    /// layered above the GPU canvas, so an in-window GPUI card would render
+    /// *behind* a visible page, and hiding the whole webview to surface it
+    /// blanks the page. A popup panel composites above everything, leaving the
+    /// page visible. A second chip click closes the open panel; a short
+    /// debounce keeps the same click that dismisses it (by resigning the
+    /// panel's key status) from immediately reopening it. Off macOS there is no
+    /// such layering, so the in-window GPUI popover is toggled directly.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn toggle_usage_popover(
+        owner: &WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        // Already open → this chip click resigns the panel's key status, so its
+        // own observer dismisses it. Just don't open a second one.
+        if owner
+            .update(cx, |this, _| this.usage_popover_window.is_some())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        // Swallow the same click that just dismissed the panel (resign-key →
+        // close), so it doesn't immediately reopen.
+        let since_close = oximux_agents::session_log::now_unix_ms()
+            - crate::shell::usage_popover::LAST_CLOSED_MS
+                .load(std::sync::atomic::Ordering::SeqCst);
+        if since_close < crate::shell::usage_popover::REOPEN_DEBOUNCE_MS {
+            return;
+        }
+        // Snapshot the data + styling, then open the panel.
+        let Ok(Some((state, theme, density, typography))) = owner.update(cx, |this, _| {
+            this.usage_state
+                .clone()
+                .map(|s| (s, this.theme, this.density, this.typography.clone()))
+        }) else {
+            return;
+        };
+        if let Some(handle) = crate::shell::usage_popover::open(
+            state,
+            theme,
+            density,
+            typography,
+            owner.clone(),
+            window,
+            cx,
+        ) {
+            let _ = owner.update(cx, |this, _| this.usage_popover_window = Some(handle));
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn toggle_usage_popover(
+        owner: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        let _ = owner.update(cx, |this, cx| {
+            this.usage_popover_open = !this.usage_popover_open;
+            cx.notify();
+        });
+    }
+
+    /// Called by the popup panel when it self-dismisses (resign-key / Escape)
+    /// so the chip toggle sees it as closed and can reopen on the next click.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn note_usage_popover_closed(&mut self) {
+        self.usage_popover_window = None;
+    }
+
     pub fn new(
         repo: Option<Repository>,
         app_state: AppState,
@@ -744,9 +822,9 @@ impl WorkspaceRoot {
         });
 
         // Periodic usage-meter sample. Sample immediately (so the meter is
-        // present right after boot), then every `USAGE_METER_TICK`. The
-        // probe caches per-file tallies, so steady-state ticks only
-        // re-parse logs that changed.
+        // present right after boot), then every `USAGE_METER_TICK`. Each
+        // sample is a blocking Keychain + network read, so it runs on the
+        // background executor.
         use oximux_agents::session_log::usage_probe::UsageProbe as _;
         let usage_probe: std::sync::Arc<
             oximux_agents::session_log::usage_probe::SessionLogUsageProbe,
@@ -758,14 +836,14 @@ impl WorkspaceRoot {
         let usage_meter_task = cx.spawn(async move |weak, cx| {
             loop {
                 let probe = usage_probe.clone();
-                let snapshot = cx
+                let state = cx
                     .background_executor()
                     .spawn(async move { probe.sample() })
                     .await;
                 let alive = weak
                     .update(cx, |this, cx| {
-                        if this.usage_snapshot != snapshot {
-                            this.usage_snapshot = snapshot;
+                        if this.usage_state.as_ref() != Some(&state) {
+                            this.usage_state = Some(state);
                             cx.notify();
                         }
                     })
@@ -916,8 +994,10 @@ impl WorkspaceRoot {
             rail_latest_status: HashMap::new(),
             rail_latest_adapter: HashMap::new(),
             agent_activity: HashMap::new(),
-            usage_snapshot: None,
+            usage_state: None,
             usage_popover_open: false,
+            #[cfg(target_os = "macos")]
+            usage_popover_window: None,
             rail_dirty: false,
             rail_refresh_inflight: false,
             diff_refresh_focused: true,
@@ -2054,7 +2134,8 @@ impl Render for WorkspaceRoot {
             || self.project_menu.read(cx).is_open()
             || self.floating_terminal_visible
             || self.confirm_dialog.is_some()
-            || self.rename_tab_dialog.is_some();
+            || self.rename_tab_dialog.is_some()
+            || self.push_stash_dialog.is_some();
         cx.set_global(crate::shell::browser_view::WebviewSuppressed(panes_covered));
         let theme = self.theme;
         let density = self.density;
@@ -3266,7 +3347,7 @@ impl Render for WorkspaceRoot {
                     agent_count,
                     git_state.as_ref(),
                     primary,
-                    self.usage_snapshot.as_ref(),
+                    self.usage_state.as_ref(),
                     move |window, cx| {
                         if let Some(sc) = scm_for_click.clone() {
                             sc.update(cx, |panel, cx| {
@@ -3274,11 +3355,8 @@ impl Render for WorkspaceRoot {
                             });
                         }
                     },
-                    move |_window, cx| {
-                        let _ = weak_for_usage.update(cx, |this, cx| {
-                            this.usage_popover_open = !this.usage_popover_open;
-                            cx.notify();
-                        });
+                    move |window, cx| {
+                        WorkspaceRoot::toggle_usage_popover(&weak_for_usage, window, cx);
                     },
                 )
             })
@@ -3287,12 +3365,12 @@ impl Render for WorkspaceRoot {
             // outside click; z-band above the floating terminal, below the
             // palette overlays that follow.
             .when(self.usage_popover_open, |parent| {
-                let Some(snapshot) = self.usage_snapshot.as_ref() else {
+                let Some(state) = self.usage_state.as_ref() else {
                     return parent;
                 };
                 let weak_close = cx.entity().downgrade();
                 let card = crate::shell::usage_meter::render_usage_popover(
-                    snapshot,
+                    state,
                     oximux_agents::session_log::now_unix_ms(),
                     theme,
                     density,

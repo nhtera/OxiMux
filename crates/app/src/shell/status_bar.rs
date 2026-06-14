@@ -12,7 +12,7 @@ use gpui::{
     App, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
-use oximux_agents::session_log::usage::UsageSnapshot;
+use oximux_agents::session_log::usage::UsageState;
 use oximux_core::GitState;
 use oximux_git::PollState;
 use oximux_settings::{Density, Theme, Typography};
@@ -109,7 +109,7 @@ pub fn view<F, G>(
     agent_count: usize,
     git_state: Option<&PollState>,
     primary: Option<PrimaryAction>,
-    usage: Option<&UsageSnapshot>,
+    usage: Option<&UsageState>,
     on_primary_click: F,
     on_usage_click: G,
 ) -> impl IntoElement
@@ -180,12 +180,20 @@ where
         zone
     };
 
-    // Usage meter — present only when the probe produced a snapshot
-    // (account config + known tier). "~" marks the numbers as estimates;
-    // the click popover carries the full disclosure.
-    let usage_chip = usage.map(|snapshot| {
-        let label = usage_meter::meter_label(snapshot);
-        let color = usage_meter::meter_color(snapshot, theme);
+    // Usage meter — present once the probe has produced a state. An available
+    // reading shows exact `NN% 5h · NN% wk`; an unavailable one shows a
+    // warn-colored "Usage unavailable" chip. The click popover carries the
+    // window detail or the failure reason.
+    let usage_chip = usage.map(|state| {
+        let (label, color) = match state {
+            UsageState::Available(snapshot) => (
+                usage_meter::meter_label(snapshot),
+                usage_meter::meter_color(snapshot, theme),
+            ),
+            UsageState::Unavailable { .. } => {
+                (usage_meter::UNAVAILABLE_LABEL.to_string(), theme.status_warn)
+            }
+        };
         let hover_bg = theme.hover_overlay;
         div()
             .id("status-bar-usage-meter")
@@ -198,10 +206,10 @@ where
             .text_color(color)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
-            .tooltip(|window, cx| {
-                gpui_component::tooltip::Tooltip::new("Estimated agent usage — click for details")
-                    .build(window, cx)
-            })
+            // No hover tooltip: an in-window element can't composite above the
+            // inline browser's native surface, so a tooltip here is occluded by
+            // an active page. The chip is clearly clickable and opens a floating
+            // detail card (its own higher-level window), which carries the info.
             .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
                 on_usage_click(window, cx);
             })

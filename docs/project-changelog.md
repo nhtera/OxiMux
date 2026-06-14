@@ -4,6 +4,37 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-15 — Usage popover: floating themed card above the inline browser
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/usage_popover.rs` (new — `UsagePopover` panel-window view + `open`), `crates/app/src/shell/mod.rs` (module), `crates/app/src/shell/usage_meter.rs` (card redesign: progress bars, "% left", Session/Weekly, freshness), `crates/app/src/workspace_root.rs` (`toggle_usage_popover` + panel-window state; `push_stash_dialog` added to `panes_covered`)
+
+Clicking the status-bar usage chip while an inline-browser tab was open showed the popover *behind* the page — the webview is a single native view layered above the GPU canvas, so a GPUI-drawn card lands underneath it, and hiding the whole webview to surface it blanks the page.
+
+The popover is now a separate **`WindowKind::PopUp` panel window** (the app's first secondary window). macOS composites it at the popup window level, above every normal window's native child views, so the themed card floats over the page with the page still visible. The card matches the reference cockpit's status panel: a gauge-icon **"Agent usage"** header with an "Updated just now" freshness line, then a **green→amber→red headroom bar** per window (colored by remaining), a **"NN% left … Resets in X"** row, and a muted "Account usage API · Max 5x" footer. The unavailable state shows the header + "Unavailable" + the reason.
+
+- **Dismiss** (GPUI has no cross-window outside-click event): the panel opens focused and closes when it resigns key — i.e. the moment you click anything else — plus Escape. A short re-open debounce keeps the same chip click that dismisses it (by resigning key) from instantly reopening it; the panel calls back to clear the owner's handle on self-dismiss.
+- The shared card renderer (`usage_meter::render_usage_popover`) is reused; off macOS it still renders in-window (no native layering to fight).
+- Also folded the **push-stash dialog** into `panes_covered` — a full-window opaque dialog (like the confirm/rename dialogs already listed), so hiding the webview under it is correct.
+- Path not taken: a native `NSMenu` (works above the webview, low risk) was prototyped first but can't draw progress bars — menu items are text/icon only — so the floating card was chosen to match the reference layout.
+
+---
+
+### 2026-06-15 — Usage meter: drop the local-log estimate; show "Usage unavailable" when signed out
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/agents/src/session_log/usage.rs` (model gutted to `UsageWindow`/`UsageSnapshot`/new `UsageState`; estimate math removed), `crates/agents/src/session_log/usage_probe.rs` (tally/budget/file-scan machinery removed; `sample()` now returns `UsageState`), `crates/agents/src/session_log/usage_oauth.rs` (`FetchError` splits `Unauthorized(msg)`/`Unreachable`/`NoToken`; 401/403 body → API error message), `crates/app/src/shell/usage_meter.rs` (Unavailable popover + plain-percent rendering), `crates/app/src/shell/status_bar.rs` (Unavailable chip), `crates/app/src/workspace_root.rs` (`usage_state` field)
+
+When the CLI's OAuth token is invalid/expired (e.g. the user signed out), the meter used to fall back to a **local-session-log estimate** — which guesses a per-tier budget from this machine's logs and routinely floored at `~100%`, presenting a fabricated number as if it were real. That estimate is now gone entirely. The exact account usage API is the only data source; a recent exact reading still stands in for up to 30 min during a brief token refresh (unchanged), but past that the meter reports **"Usage unavailable"** with the cause, matching the reference cockpit.
+
+- **New state model.** `UsageState` is `Available(snapshot)` or `Unavailable { reason }`. The status-bar chip shows exact `NN% 5h · NN% wk` when available (no more `~` prefix — the estimate that justified it is gone) or a warn-colored **"Usage unavailable"** chip otherwise; the popover shows window detail or the failure reason.
+- **Reason names the cause.** `401/403` → the API's own message (e.g. *"Invalid authentication credentials"*); no stored token → *"Not signed in"*; offline/timeout → *"Usage data is temporarily unavailable"*. A long backoff on the no-token case still avoids re-prompting the Keychain every tick.
+- **Removed:** `UsageSource`, `budget_for_tier`/`TierBudget`, `weighted_tokens`, the 5-hour/weekly token-bucket windows, the `.claude/projects/**/*.jsonl` scan + per-file tally cache, and all their tests — the meter no longer reads session logs at all.
+
+Verified: clean build (zero warnings), clippy clean (touched files), 31 agent + 21 app usage/status-bar tests green (new: unavailable-without-token, fresh-cache-serves, stale-cache→unavailable, per-cause reason map, 401-body parse). GUI screenshot verify of the live signed-out state outstanding.
+
+---
+
 ### 2026-06-15 — Inline browser: send a modern Safari User-Agent (sites stop serving the legacy page)
 
 **Commits**: _(local, pending)_
