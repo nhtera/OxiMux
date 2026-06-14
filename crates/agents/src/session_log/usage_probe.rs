@@ -49,6 +49,15 @@ pub struct SessionLogUsageProbe {
     /// Don't re-attempt the API before this instant after a failure: a
     /// Keychain decline would otherwise re-prompt on every 60 s tick.
     oauth_backoff_until_ms: Mutex<i64>,
+    /// The most recent exact (account-API) snapshot plus the unix-ms instant
+    /// it was taken. When a later tick can't reach the API (expired token
+    /// mid-refresh, brief offline), this beats the local estimate: the
+    /// percentages are slightly stale but its reset timestamps are absolute
+    /// (still count down correctly), whereas the estimate is a different,
+    /// often wildly-off number. Only honored while younger than
+    /// `LAST_GOOD_MAX_AGE_MS` — past that the reading is too stale to pass off
+    /// as current, and we fall through to the estimate (or hide).
+    last_good: Mutex<Option<(UsageSnapshot, i64)>>,
 }
 
 struct FileTally {
@@ -57,8 +66,19 @@ struct FileTally {
     buckets: HourBuckets,
 }
 
-/// After a failed API attempt, stay on the estimate path this long.
-const OAUTH_BACKOFF_MS: i64 = 15 * 60_000;
+/// Backoff after a failed API attempt. A missing/declined token is a
+/// standing condition — back off long so we don't re-prompt the Keychain
+/// every tick. A rejected (expired) token or an unreachable endpoint is
+/// transient — the official CLI refreshes the token on its next
+/// authenticated call, so retry within a tick and let `last_good` cover the
+/// brief gap.
+const OAUTH_BACKOFF_NOTOKEN_MS: i64 = 15 * 60_000;
+const OAUTH_BACKOFF_TRANSIENT_MS: i64 = 60_000;
+
+/// How long a cached exact reading may stand in for a live one. Past this the
+/// percentages are too stale to present as current (mirrors the reference
+/// tool's 30-minute stale-data window).
+const LAST_GOOD_MAX_AGE_MS: i64 = 30 * 60_000;
 
 impl SessionLogUsageProbe {
     pub fn new(home: PathBuf) -> Self {
@@ -67,6 +87,7 @@ impl SessionLogUsageProbe {
             cache: Mutex::new(HashMap::new()),
             oauth_enabled: true,
             oauth_backoff_until_ms: Mutex::new(0),
+            last_good: Mutex::new(None),
         }
     }
 
@@ -93,7 +114,7 @@ impl SessionLogUsageProbe {
             }
         }
         match super::usage_oauth::fetch(&self.home) {
-            Some(usage) => {
+            Ok(usage) => {
                 let tier = read_account_tier(&self.home.join(".claude.json")).unwrap_or_default();
                 Some(UsageSnapshot {
                     five_hour: UsageWindow {
@@ -108,17 +129,32 @@ impl SessionLogUsageProbe {
                     },
                     tier,
                     source: UsageSource::AccountApi,
+                    captured_at_ms: None,
                 })
             }
-            None => {
+            Err(err) => {
+                let backoff = match err {
+                    super::usage_oauth::FetchError::NoToken => OAUTH_BACKOFF_NOTOKEN_MS,
+                    super::usage_oauth::FetchError::Transient => OAUTH_BACKOFF_TRANSIENT_MS,
+                };
                 let mut until = self
                     .oauth_backoff_until_ms
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *until = now_ms + OAUTH_BACKOFF_MS;
+                *until = now_ms + backoff;
                 None
             }
         }
+    }
+
+    /// Test-only injector for the last-known-good exact snapshot (the real
+    /// path fills this from a successful account-API fetch).
+    #[cfg(test)]
+    fn seed_last_good(&self, snapshot: UsageSnapshot, cached_at_ms: i64) {
+        *self
+            .last_good
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((snapshot, cached_at_ms));
     }
 
     /// Test-only inspector for the eviction contract.
@@ -135,9 +171,38 @@ impl UsageProbe for SessionLogUsageProbe {
     fn sample(&self) -> Option<UsageSnapshot> {
         let now = now_unix_ms();
         if let Some(snapshot) = self.sample_oauth(now) {
+            *self
+                .last_good
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((snapshot.clone(), now));
             return Some(snapshot);
         }
-        let tier = read_account_tier(&self.home.join(".claude.json"))?;
+
+        let tier = read_account_tier(&self.home.join(".claude.json"));
+
+        // Exact path unreachable this tick (expired token mid-refresh, brief
+        // offline). As long as an account still exists and the last exact
+        // reading is recent enough, it beats the local estimate — its
+        // percentages are slightly stale but its reset timestamps stay
+        // accurate, and normal CLI use refreshes the token within a tick or
+        // two. Once the reading ages past the stale window, or there is no
+        // account config / no prior exact reading, fall through to the
+        // estimate (or hide).
+        if tier.is_some()
+            && let Some((mut good, cached_at)) = self
+                .last_good
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            && now - cached_at <= LAST_GOOD_MAX_AGE_MS
+        {
+            // Mark it cached so the UI can disclose "updated N ago" instead of
+            // presenting a slightly-old reading as live.
+            good.captured_at_ms = Some(cached_at);
+            return Some(good);
+        }
+
+        let tier = tier?;
         let budget = budget_for_tier(&tier)?;
 
         let projects_dir = self.home.join(".claude").join("projects");
@@ -200,6 +265,7 @@ impl UsageProbe for SessionLogUsageProbe {
             weekly: weekly_window(&merged, now, budget.weekly_tokens),
             tier,
             source: UsageSource::LocalEstimate,
+            captured_at_ms: None,
         })
     }
 }
@@ -471,6 +537,108 @@ mod tests {
         assert!(snap.five_hour.resets_at_ms.is_some());
         assert_eq!(snap.weekly.used_tokens, 1800.0);
         assert_eq!(snap.weekly.budget_tokens, 33_000_000.0);
+    }
+
+    #[test]
+    fn last_known_good_exact_beats_local_estimate() {
+        // With real logs present (so the estimate would render a non-zero,
+        // different number) but a prior exact snapshot cached, the meter must
+        // keep showing the exact reading rather than the estimate when the
+        // live API path is unavailable this tick.
+        let home = fixture_home("default_claude_max_5x");
+        write_log(
+            home.path(),
+            "s1.jsonl",
+            &[assistant_usage_line(
+                &recent_ts(10),
+                "claude-sonnet-4-6",
+                5000,
+                1000,
+            )],
+        );
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
+        let exact = UsageSnapshot {
+            five_hour: UsageWindow {
+                used_tokens: 26.0,
+                budget_tokens: 100.0,
+                resets_at_ms: Some(99_000_000),
+            },
+            weekly: UsageWindow {
+                used_tokens: 27.0,
+                budget_tokens: 100.0,
+                resets_at_ms: Some(600_000_000),
+            },
+            tier: "default_claude_max_5x".to_string(),
+            source: UsageSource::AccountApi,
+            captured_at_ms: None,
+        };
+        probe.seed_last_good(exact.clone(), now_unix_ms());
+        let snap = probe.sample().expect("snapshot");
+        assert_eq!(snap.source, UsageSource::AccountApi);
+        assert_eq!(snap.five_hour, exact.five_hour);
+        assert_eq!(snap.weekly, exact.weekly);
+        // The reading is served from cache → marked so the UI discloses it.
+        assert!(
+            snap.captured_at_ms.is_some(),
+            "cached exact reading must carry a capture time"
+        );
+    }
+
+    #[test]
+    fn stale_exact_reading_falls_through_to_estimate() {
+        // A cached exact reading older than the stale window must not stand in
+        // for a live one — the meter drops to the (clearly-marked) estimate.
+        let home = fixture_home("default_claude_max_5x");
+        write_log(
+            home.path(),
+            "s1.jsonl",
+            &[assistant_usage_line(
+                &recent_ts(10),
+                "claude-sonnet-4-6",
+                5000,
+                1000,
+            )],
+        );
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
+        let exact = UsageSnapshot {
+            five_hour: UsageWindow {
+                used_tokens: 26.0,
+                budget_tokens: 100.0,
+                resets_at_ms: Some(99_000_000),
+            },
+            weekly: UsageWindow {
+                used_tokens: 27.0,
+                budget_tokens: 100.0,
+                resets_at_ms: Some(600_000_000),
+            },
+            tier: "default_claude_max_5x".to_string(),
+            source: UsageSource::AccountApi,
+            captured_at_ms: None,
+        };
+        // Cached 31 minutes ago — past the 30-minute window.
+        probe.seed_last_good(exact, now_unix_ms() - 31 * 60_000);
+        let snap = probe.sample().expect("snapshot");
+        assert_eq!(snap.source, UsageSource::LocalEstimate);
+    }
+
+    #[test]
+    fn local_estimate_used_when_no_prior_exact_reading() {
+        // Same setup but no cached exact snapshot → the estimate renders.
+        let home = fixture_home("default_claude_max_5x");
+        write_log(
+            home.path(),
+            "s1.jsonl",
+            &[assistant_usage_line(
+                &recent_ts(10),
+                "claude-sonnet-4-6",
+                5000,
+                1000,
+            )],
+        );
+        let probe = SessionLogUsageProbe::new_estimate_only(home.path().to_path_buf());
+        let snap = probe.sample().expect("snapshot");
+        assert_eq!(snap.source, UsageSource::LocalEstimate);
+        assert_eq!(snap.five_hour.used_tokens, 6000.0);
     }
 
     #[test]

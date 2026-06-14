@@ -53,38 +53,97 @@ pub struct OauthUsage {
     pub seven_day: OauthWindow,
 }
 
-/// Fetch the account's exact usage windows. `None` on ANY failure (no
-/// credentials, Keychain declined, offline, drifted response shape) — the
-/// caller falls back to the local estimate.
-pub fn fetch(home: &Path) -> Option<OauthUsage> {
-    let token = read_oauth_token(home)?;
-    let body = curl_usage_endpoint(&token)?;
-    parse_usage_response(&body)
+/// Why a fetch did not return usage — the caller picks its backoff and
+/// fallback from this. The distinction matters: a missing/declined token is
+/// a standing condition (back off long so we don't re-prompt the Keychain
+/// every tick), while a rejected token or an unreachable endpoint is
+/// transient (the CLI refreshes the token on its next authenticated call,
+/// so retry soon and let the last-known-good snapshot cover the gap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchError {
+    /// No usable bearer token (absent credential or a declined Keychain
+    /// prompt). The exact path is unavailable until the user re-auths.
+    NoToken,
+    /// A token was sent but the endpoint rejected it (HTTP 401 — expired),
+    /// or the request could not complete (offline, timeout, response drift).
+    Transient,
+}
+
+/// Fetch the account's exact usage windows.
+///
+/// IMPORTANT (account-safety): this performs ONLY the read-only
+/// `GET /api/oauth/usage` using the token the official CLI already minted —
+/// it never mints, refreshes, or rotates credentials, and never writes the
+/// Keychain. Refreshing an expired token is delegated to the official CLI
+/// (which the user runs normally); OxiMux must never call the OAuth token
+/// endpoint itself.
+pub fn fetch(home: &Path) -> Result<OauthUsage, FetchError> {
+    let Some(token) = read_oauth_token(home) else {
+        return Err(FetchError::NoToken);
+    };
+    match curl_usage_endpoint(&token) {
+        Some((200, body)) => parse_usage_response(&body).ok_or(FetchError::Transient),
+        _ => Err(FetchError::Transient),
+    }
 }
 
 /// Bearer token from the Keychain item, falling back to the on-disk
 /// credentials file some setups use.
+///
+/// Credential layout mirrors the official CLI (and matching reference
+/// tools): when `CLAUDE_CONFIG_DIR` is set, CLI 2.1+ scopes its Keychain
+/// service by that directory (`Claude Code-credentials-<8 hex of sha256>`),
+/// so we try the scoped item first, then the legacy unsuffixed one; the
+/// on-disk fallback lives under the same config dir. Read-only throughout.
 fn read_oauth_token(home: &Path) -> Option<String> {
-    if let Some(raw) = read_keychain_credentials() {
-        if let Some(token) = token_from_credentials_json(&raw) {
+    for service in keychain_services() {
+        if let Some(raw) = read_keychain_credentials(&service)
+            && let Some(token) = token_from_credentials_json(&raw)
+        {
             return Some(token);
         }
     }
-    let raw = std::fs::read_to_string(home.join(".claude").join(".credentials.json")).ok()?;
+    let raw = std::fs::read_to_string(claude_config_dir(home).join(".credentials.json")).ok()?;
     token_from_credentials_json(&raw)
 }
 
-fn read_keychain_credentials() -> Option<String> {
+/// The CLI's config root: `$CLAUDE_CONFIG_DIR` if set, else `<home>/.claude`.
+fn claude_config_dir(home: &Path) -> std::path::PathBuf {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => home.join(".claude"),
+    }
+}
+
+/// Keychain service names to try, in priority order. With `CLAUDE_CONFIG_DIR`
+/// set the CLI writes a scoped item — try it before the legacy name; when
+/// unset only the legacy name is used.
+fn keychain_services() -> Vec<String> {
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            vec![scoped_keychain_service(&dir), KEYCHAIN_SERVICE.to_string()]
+        }
+        _ => vec![KEYCHAIN_SERVICE.to_string()],
+    }
+}
+
+/// The CLI 2.1+ per-config-dir Keychain service name:
+/// `Claude Code-credentials-<first 8 hex of sha256(config_dir)>`.
+fn scoped_keychain_service(config_dir: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(config_dir.as_bytes());
+    let mut suffix = String::with_capacity(8);
+    for byte in &digest[..4] {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{KEYCHAIN_SERVICE}-{suffix}")
+}
+
+fn read_keychain_credentials(service: &str) -> Option<String> {
     let user = std::env::var("USER").ok()?;
     let out = Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            &user,
-            "-w",
-        ])
+        .args(["find-generic-password", "-s", service, "-a", &user, "-w"])
         .stdin(Stdio::null())
         .output()
         .ok()?;
@@ -102,15 +161,18 @@ fn token_from_credentials_json(raw: &str) -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
-/// GET the usage endpoint. The Authorization header travels via curl's
-/// stdin config, never argv.
-fn curl_usage_endpoint(token: &str) -> Option<String> {
+/// GET the usage endpoint, returning `(http_status, body)`. The
+/// Authorization header travels via curl's stdin config, never argv.
+/// `None` only when curl itself could not run; an HTTP error (e.g. 401 from
+/// an expired token) returns its status + body so the caller can react. The
+/// `fail` flag is intentionally omitted so the status line is observable.
+fn curl_usage_endpoint(token: &str) -> Option<(u16, String)> {
     let config = format!(
         "url = \"{USAGE_URL}\"\n\
          silent\n\
          show-error\n\
-         fail\n\
          max-time = {CURL_MAX_TIME_SECS}\n\
+         write-out = \"\\n%{{http_code}}\"\n\
          header = \"Authorization: Bearer {token}\"\n\
          header = \"anthropic-beta: {OAUTH_BETA_HEADER}\"\n\
          header = \"User-Agent: {USER_AGENT}\"\n"
@@ -127,7 +189,11 @@ fn curl_usage_endpoint(token: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    let raw = String::from_utf8_lossy(&out.stdout);
+    // `write-out` appended "\n<code>" after the body; split it back off.
+    let (body, code) = raw.rsplit_once('\n')?;
+    let status: u16 = code.trim().parse().ok()?;
+    Some((status, body.to_string()))
 }
 
 /// Parse the response body. Pure — unit-tested against a captured fixture.
@@ -201,6 +267,16 @@ mod tests {
     fn utilization_clamped() {
         let usage = parse_usage_response(r#"{"five_hour": {"utilization": 130.5}}"#).unwrap();
         assert_eq!(usage.five_hour.utilization, 100.0);
+    }
+
+    #[test]
+    fn scoped_keychain_service_matches_cli_derivation() {
+        // sha256("/Users/x/.claude") → first 8 hex chars form the suffix.
+        // Value cross-checked against the official CLI's scoped item layout.
+        assert_eq!(
+            scoped_keychain_service("/Users/nguyenhongtien/.claude"),
+            "Claude Code-credentials-01fd4c59"
+        );
     }
 
     #[test]

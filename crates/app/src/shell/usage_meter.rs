@@ -66,6 +66,49 @@ pub fn format_reset_in(resets_at_ms: i64, now_ms: i64) -> Option<String> {
     })
 }
 
+/// `"just now"` / `"5m ago"` / `"2h ago"` — coarse age of a cached reading,
+/// matching the reference cockpit's freshness wording.
+pub fn format_time_ago(captured_at_ms: i64, now_ms: i64) -> String {
+    let diff = now_ms - captured_at_ms;
+    if diff < 60_000 {
+        return "just now".to_string();
+    }
+    let mins = diff / 60_000;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    format!("{}h ago", mins / 60)
+}
+
+/// Popover title + footer, derived from the snapshot source and freshness.
+/// A cached exact reading (live fetch unavailable this tick) keeps the
+/// numbers visible but discloses "updated N ago" rather than passing the
+/// reading off as live — the same freshness contract the reference cockpit
+/// uses for its stale bars.
+fn popover_caption(snapshot: &UsageSnapshot, now_ms: i64) -> (&'static str, String) {
+    let tier_suffix = if snapshot.tier.is_empty() {
+        String::new()
+    } else {
+        format!(" · tier {}", snapshot.tier)
+    };
+    match (snapshot.source, snapshot.captured_at_ms) {
+        (UsageSource::AccountApi, Some(captured)) => (
+            "Agent usage",
+            format!(
+                "Showing cached usage · updated {}{tier_suffix}",
+                format_time_ago(captured, now_ms)
+            ),
+        ),
+        (UsageSource::AccountApi, None) => {
+            ("Agent usage", format!("From the account usage API{tier_suffix}"))
+        }
+        (UsageSource::LocalEstimate, _) => (
+            "Agent usage (estimated)",
+            format!("Estimated from local session logs{tier_suffix}"),
+        ),
+    }
+}
+
 /// `139k` / `2.2M` / `980` — compact token counts for the popover.
 pub fn format_tokens(tokens: f64) -> String {
     if tokens >= 1_000_000.0 {
@@ -123,20 +166,7 @@ pub fn render_usage_popover(
         .map(|in_| format!("resets in {in_}"))
         .unwrap_or_else(|| "rolling 7 days".to_string());
     let weekly_line = window_line(&snapshot.weekly, "Weekly", weekly_reset, snapshot.source);
-    let (title, footer) = match snapshot.source {
-        UsageSource::AccountApi => (
-            "Agent usage",
-            if snapshot.tier.is_empty() {
-                "From the account usage API".to_string()
-            } else {
-                format!("From the account usage API · tier {}", snapshot.tier)
-            },
-        ),
-        UsageSource::LocalEstimate => (
-            "Agent usage (estimated)",
-            format!("Estimated from local session logs · tier {}", snapshot.tier),
-        ),
-    };
+    let (title, footer) = popover_caption(snapshot, now_ms);
 
     div()
         .flex()
@@ -191,6 +221,7 @@ mod tests {
             },
             tier: "default_claude_max_5x".to_string(),
             source: UsageSource::LocalEstimate,
+            captured_at_ms: None,
         }
     }
 
@@ -208,7 +239,43 @@ mod tests {
             },
             tier: "default_claude_max_5x".to_string(),
             source: UsageSource::AccountApi,
+            captured_at_ms: None,
         }
+    }
+
+    fn stale_exact_snapshot(captured_at_ms: i64) -> UsageSnapshot {
+        let mut s = exact_snapshot(26.0, 27.0);
+        s.captured_at_ms = Some(captured_at_ms);
+        s
+    }
+
+    #[test]
+    fn format_time_ago_buckets() {
+        assert_eq!(format_time_ago(1_000_000, 1_030_000), "just now"); // 30s
+        assert_eq!(format_time_ago(1_000_000, 1_300_000), "5m ago"); // 5m
+        assert_eq!(format_time_ago(1_000_000, 1_000_000 + 2 * 3_600_000), "2h ago");
+    }
+
+    #[test]
+    fn popover_caption_discloses_cached_reading() {
+        // Fresh exact → plain account-API caption.
+        let (title, footer) = popover_caption(&exact_snapshot(26.0, 27.0), 0);
+        assert_eq!(title, "Agent usage");
+        assert_eq!(footer, "From the account usage API · tier default_claude_max_5x");
+
+        // Cached exact (captured 5m ago) → discloses staleness, keeps numbers.
+        let now = 1_000_000_000;
+        let (title, footer) = popover_caption(&stale_exact_snapshot(now - 300_000), now);
+        assert_eq!(title, "Agent usage");
+        assert_eq!(
+            footer,
+            "Showing cached usage · updated 5m ago · tier default_claude_max_5x"
+        );
+
+        // Estimate keeps its own caption.
+        let (title, footer) = popover_caption(&snapshot(0.6, 0.4), 0);
+        assert_eq!(title, "Agent usage (estimated)");
+        assert_eq!(footer, "Estimated from local session logs · tier default_claude_max_5x");
     }
 
     #[test]

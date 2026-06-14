@@ -4,6 +4,27 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-14 — Usage meter: exact-path resilience (no more false ~100%), account-safe
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/agents/src/session_log/usage_oauth.rs` (read-only fetch returns `Result<_, FetchError>` distinguishing no-token vs transient; curl surfaces HTTP status; `CLAUDE_CONFIG_DIR`-scoped Keychain service name), `crates/agents/src/session_log/usage_probe.rs` (last-known-good exact cache with 30-min staleness cap, failure-kind-keyed backoff), `crates/agents/src/session_log/usage.rs` (`UsageSnapshot.captured_at_ms` freshness field), `crates/app/src/shell/usage_meter.rs` (`format_time_ago` + cached-reading popover disclosure), `crates/agents/Cargo.toml` (`sha2`)
+
+The status-bar usage meter was pinned at "~100% estimated" while the real account panel read ~17–26%. Root cause: the exact account-API path (`GET /api/oauth/usage`) silently falls back to a local session-log *estimate* whenever the CLI's OAuth access token is expired (it lives ~8 h and the call 401s) — and that estimate can never match the server number (it sees only this machine's logs and guesses per-tier budgets + a model weighting), so it floored at 100%.
+
+The fix keeps the meter on the exact number and is strictly **account-safe** — it never mints, refreshes, rotates, or writes credentials, and never calls the OAuth token endpoint (doing so impersonates the official client and risks an account ban). It only (a) reads the token the official CLI already minted and (b) makes the read-only usage GET.
+
+- **Last-known-good exact cache.** A successful account-API reading is cached; when a later tick can't reach the API (token expired mid-refresh, brief offline), the meter keeps showing that exact reading instead of dropping to the estimate. The cached percentages are slightly stale but the reset timestamps are absolute (still count down correctly), and normal CLI use refreshes the token within a tick or two. The local estimate now renders only when there is genuinely no prior exact reading and no way to get one.
+- **Failure-kind-keyed backoff.** A missing/declined token backs off long (15 min — avoids re-prompting the Keychain every tick); an expired/unreachable token backs off one tick (60 s) so the meter recovers promptly once the official CLI refreshes the token during normal use. The fetch now distinguishes the two via the HTTP status (`curl` reports `%{http_code}` instead of swallowing it under `--fail`).
+- **`CLAUDE_CONFIG_DIR`-scoped Keychain.** CLI 2.1+ scopes its OAuth Keychain item by config dir (`Claude Code-credentials-<8 hex of sha256(dir)>`); with `CLAUDE_CONFIG_DIR` set we now try the scoped item before the legacy unsuffixed one (and read the on-disk fallback under the same dir). Previously such setups never reached the exact path at all.
+- **30-minute staleness cap** on the last-known-good reading, so a very old exact value isn't presented as current — past the window the meter drops to the marked estimate.
+- **Freshness disclosed in the popover** (following the Electron cockpit's status pattern). A cached exact reading now carries a capture time (`UsageSnapshot.captured_at_ms`); the popover keeps the real numbers but its footer reads "Showing cached usage · updated *N* ago" (`just now` / `Nm ago` / `Nh ago`) instead of passing the reading off as live. Fresh readings and the estimate keep their existing captions. The capture time is deliberately kept out of the per-tick change-detection path (it only flips when freshness actually changes) so the meter doesn't repaint every tick.
+
+Refresh of an expired token is **delegated to the official `claude` CLI** (which the user runs constantly in this cockpit) — OxiMux reads the CLI credential read-only and never writes it, mints, or rotates it. This matches what two mature reference tools actually ship: a menubar tool (owner-aware read-only + delegated refresh) and an Electron cockpit (read-only API + last-known-good "stale" bars ≤30 min, passive refresh, no background CLI spawn). Neither direct-refreshes the CLI's token; this design follows the latter. Validated endpoint/flow facts and the account-ban rationale are recorded in project memory.
+
+Verified: clean build, clippy clean, 230 agents lib tests + 871 app lib tests, incl. 6 new (`last_known_good_exact_beats_local_estimate`, `local_estimate_used_when_no_prior_exact_reading`, `stale_exact_reading_falls_through_to_estimate`, `scoped_keychain_service_matches_cli_derivation`, `format_time_ago_buckets`, `popover_caption_discloses_cached_reading`). Live: confirmed the read-only usage GET returns the real windows (5 h 26 %, 7 d 27 %) once the token is valid; confirmed this machine carries both a plain and a scoped Keychain item.
+
+---
+
 ### 2026-06-14 — DnD + split-panel stability: cross-group strip drop, mouse-capture dividers, drag polish
 
 **Commits**: _(local, pending)_

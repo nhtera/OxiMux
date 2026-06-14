@@ -59,6 +59,13 @@ pub struct UsageSnapshot {
     /// not need budgets).
     pub tier: String,
     pub source: UsageSource,
+    /// `Some(t)` when this is a *cached* exact reading captured at unix-ms `t`
+    /// (the live fetch was unavailable this tick) — the UI keeps showing the
+    /// numbers but discloses "updated N ago". `None` means the reading is
+    /// current (a fresh fetch, or a freshly-computed estimate). Kept out of
+    /// the per-tick churn path: it only flips when freshness actually changes,
+    /// never advancing every tick, so it doesn't force needless repaints.
+    pub captured_at_ms: Option<i64>,
 }
 
 /// Estimated weighted-token budgets for one account tier.
