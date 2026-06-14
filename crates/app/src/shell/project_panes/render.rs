@@ -8,15 +8,17 @@
 //! call `notify()`, so they can't re-trigger a render.
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, AppContext, Context, DragMoveEvent, ElementId, Entity,
-    ExternalPaths, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    Animation, AnimationExt, AnyElement, App, Context, DragMoveEvent, ElementId, Entity,
+    ExternalPaths, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Render, SharedString, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use std::time::Duration;
 
 use std::collections::HashSet;
 
 use super::{ProjectPanes, TabDragHoveredTarget};
+use crate::shell::divider::{ActiveDivider, DividerBoundsCache, split_row_bounds_canvas};
 use crate::shell::pane_group::file_drag::FilePathDragPayload;
 use crate::shell::pane_group::render::{build_tab_strip_for, filter_droppable_files};
 use crate::shell::pane_group::tab_drag::TabDragPayload;
@@ -31,31 +33,6 @@ const DIVIDER_THICKNESS_PX: f32 = 1.0;
 /// is forgiving — the visible line stays 1 px but the draggable hitbox
 /// is `DIVIDER_THICKNESS_PX + 2 * DIVIDER_HIT_PAD_PX` wide.
 const DIVIDER_HIT_PAD_PX: f32 = 3.0;
-
-/// Drag payload for a group-divider resize. Carries the path to the
-/// split node, which divider within it (children[i] / children[i+1]),
-/// the split axis, and the weights captured at drag-start so the
-/// move handler can recompute new weights without losing precision
-/// across many fast moves.
-#[derive(Clone, Debug)]
-struct DividerDragPayload {
-    split_path: Vec<usize>,
-    divider_idx: usize,
-    axis: Axis,
-    initial_weights: Vec<f32>,
-}
-
-/// Zero-sized placeholder for the drag visual. GPUI requires `on_drag`
-/// to return an Entity that renders the floating cursor preview; for a
-/// resize handle there's no preview — the divider itself moves on every
-/// `on_drag_move` tick.
-struct DividerDragGhost;
-
-impl Render for DividerDragGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(0.0)).h(px(0.0))
-    }
-}
 
 /// Walk the tree's TOP horizontal-layer leaves with their weights.
 ///
@@ -113,7 +90,11 @@ impl ProjectPanes {
     /// whose width matches that leaf's column in the body below. Lower
     /// vertical-split rows keep their strips inline (rendered by
     /// `render_tree`'s inline branch).
-    pub fn topmost_tab_strip(&self, cx: &App) -> Option<AnyElement> {
+    pub fn topmost_tab_strip(
+        &self,
+        project_panes: Entity<ProjectPanes>,
+        cx: &App,
+    ) -> Option<AnyElement> {
         let tree = self.manager().group_tree();
         let entries = collect_top_row_leaves(tree);
         if entries.is_empty() {
@@ -152,8 +133,16 @@ impl ProjectPanes {
             };
             let frac = weight / sum;
             let is_focused = id == active_id;
-            let strip =
-                build_tab_strip_for(entity, id, is_focused, true, theme, self.workspace_tint, cx);
+            let strip = build_tab_strip_for(
+                entity,
+                id,
+                is_focused,
+                true,
+                theme,
+                self.workspace_tint,
+                project_panes.clone(),
+                cx,
+            );
             row = row.child(
                 div()
                     .w(gpui::relative(frac))
@@ -230,7 +219,19 @@ impl Render for ProjectPanes {
             &[],
             cx,
         );
-        div().flex().flex_col().size_full().child(body)
+        // While a divider is held, a topmost occluding overlay captures
+        // all moves (so the resize tracks past the divider hitbox and no
+        // stray events reach the terminals beneath) until release.
+        let capture = self
+            .active_divider()
+            .map(|active| divider_capture_overlay(cx.entity().clone(), active.axis));
+        div()
+            .flex()
+            .flex_col()
+            .relative()
+            .size_full()
+            .child(body)
+            .when_some(capture, |s, overlay| s.child(overlay))
     }
 }
 
@@ -290,6 +291,7 @@ fn render_tree(
                         true,
                         theme,
                         panes.workspace_tint,
+                        project_panes_entity.clone(),
                         cx,
                     ))
                     .child(group_body)
@@ -308,64 +310,25 @@ fn render_tree(
             weights,
         } => {
             let split_axis = *axis;
-            // Path owned for the move handler so it survives the render
-            // closure dropping. Cheap clone — usually 0..3 entries deep.
+            // Path owned for the bounds canvas / divider handlers so it
+            // survives the render closure dropping. Cheap clone — usually
+            // 0..3 entries deep.
             let split_path = path.to_vec();
             let weights_snapshot = weights.clone();
-            let move_path = split_path.clone();
-            let move_axis = split_axis;
-            let move_panes = project_panes_entity.clone();
-            let mut row = div()
-                .flex()
-                .size_full()
-                .overflow_hidden()
-                .on_drag_move::<DividerDragPayload>(
-                    move |ev: &DragMoveEvent<DividerDragPayload>, _window, cx| {
-                        // Snapshot what we need from the active drag BEFORE
-                        // calling cx.update: `ev.drag(cx)` borrows the payload
-                        // immutably from `cx.active_drag`, and `update`
-                        // requires mutable access to the same `cx`.
-                        let (split_path, divider_idx, initial_weights, p_axis) = {
-                            let payload = ev.drag(cx);
-                            (
-                                payload.split_path.clone(),
-                                payload.divider_idx,
-                                payload.initial_weights.clone(),
-                                payload.axis,
-                            )
-                        };
-                        // Each split row registers a move listener; the
-                        // payload's path filters back to the originating
-                        // row so unrelated splits don't fire.
-                        if split_path != move_path || p_axis != move_axis {
-                            return;
-                        }
-                        let bounds = ev.bounds;
-                        let pos = ev.event.position;
-                        let (axis_pos, axis_size) = match move_axis {
-                            Axis::Horizontal => (
-                                f32::from(pos.x - bounds.origin.x),
-                                f32::from(bounds.size.width),
-                            ),
-                            Axis::Vertical => (
-                                f32::from(pos.y - bounds.origin.y),
-                                f32::from(bounds.size.height),
-                            ),
-                        };
-                        if axis_size <= 0.0 {
-                            return;
-                        }
-                        let frac = (axis_pos / axis_size).clamp(0.0, 1.0);
-                        let new_weights = redistribute_weights(&initial_weights, divider_idx, frac);
-                        move_panes.update(cx, |p, cx| {
-                            p.set_split_weights(&split_path, new_weights, cx);
-                        });
-                    },
-                );
+            // `.relative()` anchors the bounds-recording canvas (absolute,
+            // size_full) to this split row so it measures the row's own
+            // geometry. The canvas records into the shared cache keyed by
+            // `split_path`; the divider MouseDown looks it up to seed the
+            // mouse-capture resize.
+            let mut row = div().flex().relative().size_full().overflow_hidden();
             row = match split_axis {
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
             };
+            row = row.child(split_row_bounds_canvas(
+                panes.divider_bounds_cache(),
+                split_path.clone(),
+            ));
             let sum: f32 = weights_snapshot.iter().sum();
             let sum = if sum > 0.0 { sum } else { 1.0 };
             for (i, (child, weight)) in children.iter().zip(weights_snapshot.iter()).enumerate() {
@@ -403,6 +366,8 @@ fn render_tree(
                         split_axis,
                         weights_snapshot.clone(),
                         theme,
+                        project_panes_entity.clone(),
+                        panes.divider_bounds_cache(),
                     ));
                 }
             }
@@ -459,7 +424,7 @@ fn rim_flash_overlay(id: PaneGroupId, token: u64, theme: oximux_settings::Theme)
 /// pane-resize semantics every other tiling tool uses. The returned
 /// vector still passes through `PaneTree::set_split_weights`, which
 /// clamps each entry to `MIN_FLEX` so a drag can't shrink a pane to zero.
-fn redistribute_weights(initial: &[f32], divider_idx: usize, frac: f32) -> Vec<f32> {
+pub(super) fn redistribute_weights(initial: &[f32], divider_idx: usize, frac: f32) -> Vec<f32> {
     let mut out = initial.to_vec();
     if divider_idx + 1 >= initial.len() {
         return out;
@@ -482,16 +447,20 @@ fn redistribute_weights(initial: &[f32], divider_idx: usize, frac: f32) -> Vec<f
 
 /// Interactive resize handle between two sibling groups. The visible
 /// stripe is 1 px (matching `divider`) but a transparent padded area on
-/// each side widens the hitbox for forgiving cursor pickup. Dragging
-/// fires `on_drag` with a `DividerDragPayload`; the matching
-/// `on_drag_move` lives on the parent split row (which captures the
-/// parent's pixel bounds via `ev.bounds`).
+/// each side widens the hitbox for forgiving cursor pickup. Resize uses
+/// direct mouse capture: MouseDown arms the divider on `ProjectPanes`
+/// (seeding the parent split-row bounds from `bounds_cache`), a topmost
+/// capture overlay resizes on MouseMove, and MouseUp disarms. Double-click
+/// resets the split to equal weights.
+#[allow(clippy::too_many_arguments)]
 fn interactive_divider(
     path: Vec<usize>,
     divider_idx: usize,
     axis: Axis,
     weights: Vec<f32>,
     theme: oximux_settings::Theme,
+    panes: Entity<ProjectPanes>,
+    bounds_cache: DividerBoundsCache,
 ) -> AnyElement {
     let id_string = format!(
         "divider-{}-{}",
@@ -501,12 +470,6 @@ fn interactive_divider(
             .join("-"),
         divider_idx,
     );
-    let payload = DividerDragPayload {
-        split_path: path,
-        divider_idx,
-        axis,
-        initial_weights: weights,
-    };
     let stripe = div().flex_shrink_0().bg(theme.border_active);
     let stripe = match axis {
         Axis::Horizontal => stripe.w(px(DIVIDER_THICKNESS_PX)).h_full(),
@@ -533,11 +496,83 @@ fn interactive_divider(
             .h(px(DIVIDER_THICKNESS_PX + 2.0 * DIVIDER_HIT_PAD_PX))
             .cursor_row_resize(),
     };
-    handle
-        .child(stripe)
-        .on_drag(payload, |_payload, _offset, _window, cx| {
-            cx.new(|_| DividerDragGhost)
+    handle.child(stripe).on_mouse_down(
+        MouseButton::Left,
+        move |ev: &MouseDownEvent, _window, cx| {
+            // Double-click resets the split to equal weights — don't arm.
+            if ev.click_count >= 2 {
+                let path = path.clone();
+                panes.update(cx, |p, cx| p.reset_split_to_equal(&path, cx));
+                cx.stop_propagation();
+                return;
+            }
+            // First frame may have no cached bounds yet — ignore the press
+            // (the next one will have a populated cache).
+            let Some(bounds) = bounds_cache.borrow().get(&path).copied() else {
+                return;
+            };
+            let active = ActiveDivider {
+                split_path: path.clone(),
+                divider_idx,
+                axis,
+                initial_weights: weights.clone(),
+                container_origin: bounds.origin,
+                container_size: bounds.size,
+            };
+            panes.update(cx, |p, cx| p.arm_divider(active, cx));
+            cx.stop_propagation();
+        },
+    )
+    .into_any_element()
+}
+
+/// Full-area capture overlay rendered on top of `ProjectPanes` while a
+/// divider is armed. Occluding + topmost so MouseMove only reaches it
+/// (not the terminals beneath — no stray events), and it resizes on every
+/// move. MouseUp (over it or elsewhere in-window) disarms; an off-window
+/// release is caught by the next move's released-button check.
+fn divider_capture_overlay(panes: Entity<ProjectPanes>, axis: Axis) -> AnyElement {
+    let mut overlay = div().absolute().inset_0().occlude();
+    overlay = match axis {
+        Axis::Horizontal => overlay.cursor_col_resize(),
+        Axis::Vertical => overlay.cursor_row_resize(),
+    };
+    let move_panes = panes.clone();
+    let down_panes = panes.clone();
+    let up_panes = panes.clone();
+    let up_out_panes = panes.clone();
+    overlay
+        // The second click of a double-click on a divider lands on THIS
+        // overlay (it was raised by the first click's arm), so the divider
+        // hitbox never sees it. Handle the reset here too.
+        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _window, cx| {
+            if ev.click_count >= 2 {
+                down_panes.update(cx, |p, cx| p.reset_split_double_click(cx));
+            }
         })
+        .on_mouse_move(move |ev: &MouseMoveEvent, _window, cx| {
+            // A move with the primary button no longer down means the
+            // release happened off-window; disarm defensively.
+            if ev.pressed_button != Some(MouseButton::Left) {
+                move_panes.update(cx, |p, cx| p.disarm_divider(cx));
+                return;
+            }
+            move_panes.update(cx, |p, cx| {
+                p.resize_active_divider(ev.position, cx);
+            });
+        })
+        .on_mouse_up(
+            MouseButton::Left,
+            move |_ev: &MouseUpEvent, _window, cx| {
+                up_panes.update(cx, |p, cx| p.disarm_divider(cx));
+            },
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            move |_ev: &MouseUpEvent, _window, cx| {
+                up_out_panes.update(cx, |p, cx| p.disarm_divider(cx));
+            },
+        )
         .into_any_element()
 }
 
@@ -584,6 +619,14 @@ fn leaf_body(
                 return;
             }
             let payload = ev.drag(cx);
+            // Prevent, don't explain: a pinned source tab can't be torn
+            // out (`take_tab` refuses it), so a split would silently roll
+            // back. Suppress the split overlay entirely for a pinned
+            // source rather than show an affordance that can't land.
+            if payload.source_pinned {
+                hover_panes.update(cx, |p, cx| p.set_hovered_drop_target(None, cx));
+                return;
+            }
             // Suppress overlay when dropping a tab back on its own
             // group's body would be a layout no-op (single-tab group
             // dragged onto itself can't split anywhere visible).
@@ -721,27 +764,52 @@ fn leaf_body(
             });
         })
         .child(group)
-        .when_some(active_zone, |s, zone| s.child(zone_overlay(zone, theme)))
+        .when_some(active_zone, |s, zone| {
+            s.child(zone_overlay(group_id, zone, theme))
+        })
         .into_any_element()
+}
+
+/// Target opacity of the active drop-zone overlay (animated up to this).
+const ZONE_OVERLAY_OPACITY: f32 = 0.18;
+
+/// Stable slug per zone — keys the cross-fade animation id so it restarts
+/// only on a real zone change, not on every `on_drag_move` frame.
+fn zone_slug(zone: Zone) -> &'static str {
+    match zone {
+        Zone::Center => "center",
+        Zone::Left => "left",
+        Zone::Right => "right",
+        Zone::Up => "up",
+        Zone::Down => "down",
+    }
 }
 
 /// Semi-transparent overlay rectangle for the active drop zone.
 /// Sized per zone — half-width / half-height for edge zones, full body
 /// for center merge. Positioned absolutely inside the body container.
-fn zone_overlay(zone: Zone, theme: oximux_settings::Theme) -> impl IntoElement {
+/// Cross-fades in (~80ms) on each zone change instead of hard-snapping;
+/// the animation id is keyed on (group, zone) so it restarts only when the
+/// zone actually changes and otherwise settles at full opacity.
+fn zone_overlay(group_id: PaneGroupId, zone: Zone, theme: oximux_settings::Theme) -> AnyElement {
     let base = div()
         .absolute()
         .bg(theme.focus_ring)
-        .opacity(0.18)
         .border_2()
         .border_color(theme.focus_ring);
-    match zone {
+    let base = match zone {
         Zone::Center => base.inset_0(),
         Zone::Left => base.top_0().left_0().h_full().w(gpui::relative(0.5)),
         Zone::Right => base.top_0().right_0().h_full().w(gpui::relative(0.5)),
         Zone::Up => base.top_0().left_0().w_full().h(gpui::relative(0.5)),
         Zone::Down => base.bottom_0().left_0().w_full().h(gpui::relative(0.5)),
-    }
+    };
+    base.with_animation(
+        ElementId::Name(format!("zone-overlay-{}-{}", group_id.0, zone_slug(zone)).into()),
+        Animation::new(Duration::from_millis(80)),
+        |el, delta| el.opacity(ZONE_OVERLAY_OPACITY * delta),
+    )
+    .into_any_element()
 }
 
 #[cfg(test)]

@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-14 — DnD + split-panel stability: cross-group strip drop, mouse-capture dividers, drag polish
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/divider.rs` (new — shared armed-divider state + bounds cache + fraction math + bounds canvas), `project_panes/mod.rs` (`transfer_tab_at`, divider arm/resize/disarm/reset, single-terminal split spawn), `project_panes/render.rs` (mouse-capture workspace divider + capture overlay, zone-overlay cross-fade), `pane_group/render.rs` (cross-group strip drop wiring, foreign hover preview, mouse-capture sub-pane divider + overlay, ghost icon/color), `pane_group/mod.rs` (sub-divider state + methods), `pane_group/tab_drag.rs` (`source_pinned` payload field, ghost icon/color), `shell/mod.rs` (register `divider`)
+
+Two stability defects + drag/drop polish parity. The DnD geometry already matched the reference; the gaps were structural.
+
+- **P0 — cross-group strip drop now works.** Dropping a tab from pane A onto pane B's *tab strip* was a silent no-op (the chip `on_drop` early-returned on a same-group guard); only drops on the pane *body* moved the tab. A foreign-source drop on a destination chip now moves the tab into B at the exact insertion-bar slot under the cursor (drop on the trailing gap appends), via a new `ProjectPanes::transfer_tab_at` (append then slide to slot). The insertion bar previews the destination slot during a cross-group hover. The drop is handled on the **chip itself** (not just the strip body): GPUI's `on_drop` consumes the active drag and stops propagation on the first hovered drop-listener, so a chip that early-returns still eats the drag — the chip therefore performs the cross-group move directly (`ProjectPanes` threaded into the chip).
+- **P1 — divider resize is direct mouse-capture, not drag-and-drop.** Resizing a split divider was modeled as a drag op, inheriting the framework's drag-activation dead-zone (sticky start) and broadcast-to-every-divider filtering. It's now MouseDown-arms / topmost-overlay-MouseMove-resizes / MouseUp-disarms: no dead-zone, tracks past the hitbox, and the occluding capture overlay keeps stray events off the terminals beneath. Double-click resets the split to equal. Applies to both workspace and within-tab sub-pane dividers. Parent-row bounds are captured each paint by a zero-cost measuring canvas keyed by split path.
+- **P2 — drag polish.** The drop-zone overlay cross-fades (opacity, ~80ms) on zone change instead of hard-snapping; the drag ghost shows the tab's icon + color dot (and tracks the grab point — this gpui already anchors the preview at `cursor − grab_offset`); a pinned source tab now suppresses the cross-group insertion bar *and* the body-zone split overlay (prevent, don't explain — pinned tabs refuse `take_tab`).
+- **P3 — single-terminal split spawns a fresh terminal.** Drag-to-edge splitting a pane whose only tab is a terminal moved that tab, emptying (and purging) the source pane. It now leaves the original terminal in place and spawns a new terminal in the new pane (focus follows). Multi-tab panes and non-terminal tabs keep move semantics. (The menu/keyboard split path already spawned a fresh terminal, so it was unchanged.)
+
+Verified: clean build (zero warnings), clippy clean, 869 lib tests + 6 new tests green (`fraction_along` math ×4, cross-group slot landing, pinned-cluster clamp). **Live GUI run** confirmed: cross-group strip drop lands at the cursor slot + insertion-bar preview, drag-to-edge split, both workspace and sub-pane divider mouse-capture resize (no dead-zone), divider double-click reset, and the ghost icon/label. GUI testing surfaced — and fixed — two defects the build/tests missed: (1) the chip eating the foreign drop (above); (2) the divider double-click being swallowed by the transient capture overlay — fixed by giving the overlay its own `click_count≥2` handler that resolves the target via a remembered last-armed path. P3 drag-to-edge (single-terminal → spawn) is code-verified; its niche cross-group edge-drop wasn't isolated in the automation harness (zone-targeting), but the primary single-terminal-split path (menu/keyboard) was already spawn-fresh and is unchanged.
+
+---
+
 ### 2026-06-14 — New-tab picker: "New Browser Tab" entry + command-palette polish
 
 **Commits**: _(local, pending)_

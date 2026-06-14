@@ -664,3 +664,100 @@ async fn keymap_apply_live_moves_a_binding_and_kills_the_old_chord(cx: &mut Test
         crate::keymap_registry::apply_live(cx, &std::collections::BTreeMap::new());
     });
 }
+
+// ── cross-group drop slot landing: append-then-move-to-slot ───────────────
+//
+// `ProjectPanes::transfer_tab_at` appends the stolen tab to the END of the
+// destination's visible order (via `push_existing_tab`) then slides it back
+// to the slot the insertion bar previewed with `move_tab(last, slot)`. This
+// pins the visible ordering that operation produces for slots 0 / middle /
+// end so a cross-group strip drop lands where the cursor aimed.
+
+/// Visible tab labels in order — the strip's left-to-right reading.
+fn visible_labels(group: &PaneGroup) -> Vec<String> {
+    group
+        .visible_tabs()
+        .map(|(_, t)| t.label.to_string())
+        .collect()
+}
+
+#[gpui::test]
+async fn move_appended_tab_lands_at_requested_slot(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    for _ in 0..3 {
+        window
+            .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+            .expect("window update ok");
+    }
+    cx.run_until_parked();
+
+    // Baseline visible order is the spawn order.
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            visible_labels(group),
+            vec!["Terminal 1", "Terminal 2", "Terminal 3"],
+        );
+    });
+
+    // The just-appended tab sits at the last visible slot (idx 2). Sliding
+    // it to slot 0 mirrors a cross-group drop on the FIRST chip.
+    window
+        .update(cx, |group, _win, _cx| group.move_tab(2, 0))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            visible_labels(group),
+            vec!["Terminal 3", "Terminal 1", "Terminal 2"],
+            "drop on first chip must land the moved tab at slot 0",
+        );
+    });
+
+    // Slide it to a middle slot (1) — drop on the SECOND chip.
+    window
+        .update(cx, |group, _win, _cx| group.move_tab(0, 1))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            visible_labels(group),
+            vec!["Terminal 1", "Terminal 3", "Terminal 2"],
+            "drop on the middle chip must land the moved tab at slot 1",
+        );
+    });
+}
+
+#[gpui::test]
+async fn move_into_pinned_cluster_clamps_to_unpinned_zone(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    for _ in 0..3 {
+        window
+            .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+            .expect("window update ok");
+    }
+    cx.run_until_parked();
+
+    // Pin the first tab (insertion idx 0). It clusters at the front; an
+    // unpinned tab can't slide ahead of it.
+    window
+        .update(cx, |group, _win, cx| group.toggle_pin(0, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+
+    // Try to drop the last tab (Terminal 3) ahead of the pinned one (slot 0).
+    // `move_tab` clamps to the unpinned bucket → it lands at slot 1, just
+    // after the pinned cluster, never inside it.
+    window
+        .update(cx, |group, _win, _cx| group.move_tab(2, 0))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        let labels = visible_labels(group);
+        assert_eq!(labels[0], "Terminal 1", "pinned tab stays at the front");
+        assert_eq!(
+            labels[1], "Terminal 3",
+            "unpinned tab clamps to the first unpinned slot, not into the pinned cluster",
+        );
+    });
+}

@@ -40,6 +40,7 @@ use crate::actions::{
     ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
+use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
 use crate::shell::context_env::SurfaceIds;
@@ -283,6 +284,16 @@ pub struct PaneGroup {
     /// listener would never fire in a multi-group layout where the user
     /// releases Ctrl while focus is on a sibling group.
     _mru_focus_out_sub: Option<Subscription>,
+    /// The within-tab sub-pane divider currently being resized via mouse
+    /// capture. `Some` only while the button is held.
+    active_sub_divider: Option<ActiveDivider>,
+    /// Per-render cache of sub-pane split-row bounds, keyed by `split_path`,
+    /// so the sub-pane divider MouseDown can seed the resize geometry.
+    sub_divider_bounds: DividerBoundsCache,
+    /// Path of the most-recently-armed sub-pane divider — lets the capture
+    /// overlay resolve a double-click-reset target after the first click's
+    /// arm was already disarmed.
+    last_sub_divider_path: Option<Vec<usize>>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -331,6 +342,9 @@ impl PaneGroup {
             mru: Vec::new(),
             mru_switcher: None,
             _mru_focus_out_sub: None,
+            active_sub_divider: None,
+            sub_divider_bounds: DividerBoundsCache::default(),
+            last_sub_divider_path: None,
         }
     }
 
@@ -2439,6 +2453,84 @@ impl PaneGroup {
         }
         cx.notify();
         true
+    }
+
+    /// Shared bounds-cache handle for the render pass to record sub-pane
+    /// split-row geometry into (one `Rc` clone per render).
+    pub fn sub_divider_bounds_cache(&self) -> DividerBoundsCache {
+        self.sub_divider_bounds.clone()
+    }
+
+    /// The sub-pane divider currently being resized, if any.
+    pub fn active_sub_divider(&self) -> Option<&ActiveDivider> {
+        self.active_sub_divider.as_ref()
+    }
+
+    /// Arm a sub-pane divider for mouse-capture resize.
+    pub fn arm_sub_divider(&mut self, active: ActiveDivider, cx: &mut Context<Self>) {
+        self.last_sub_divider_path = Some(active.split_path.clone());
+        self.active_sub_divider = Some(active);
+        cx.notify();
+    }
+
+    /// Reset the sub-pane split the user just double-clicked. Resolves the
+    /// target from the armed divider, or the most-recently-armed path when
+    /// the first click's arm was already disarmed (so the reset still lands
+    /// when the capture overlay is under the second click).
+    pub fn reset_sub_divider_double_click(&mut self, cx: &mut Context<Self>) {
+        let path = self
+            .active_sub_divider
+            .as_ref()
+            .map(|a| a.split_path.clone())
+            .or_else(|| self.last_sub_divider_path.clone());
+        if let Some(path) = path {
+            self.reset_sub_split_to_equal(&path, cx);
+        }
+        self.disarm_sub_divider(cx);
+    }
+
+    /// Apply a resize for the armed sub-pane divider from the cursor
+    /// position. No-op when nothing is armed.
+    pub fn resize_active_sub_divider(
+        &mut self,
+        pos: Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(active) = self.active_sub_divider.clone() else {
+            return false;
+        };
+        let Some(frac) = crate::shell::divider::fraction_along(&active, pos) else {
+            return false;
+        };
+        let new_weights = render::redistribute_sub_pane_weights(
+            &active.initial_weights,
+            active.divider_idx,
+            frac,
+        );
+        self.set_active_sub_pane_weights(&active.split_path, new_weights, cx)
+    }
+
+    /// Disarm the active sub-pane divider (mouse released).
+    pub fn disarm_sub_divider(&mut self, cx: &mut Context<Self>) {
+        if self.active_sub_divider.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Reset the active tab's sub-pane split at `path` to equal weights
+    /// (double-click a sub-pane divider).
+    pub fn reset_sub_split_to_equal(&mut self, path: &[usize], cx: &mut Context<Self>) {
+        let Some(active_tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let PaneContent::Terminal(tree) = &active_tab.content else {
+            return;
+        };
+        let Some(weights) = tree.split_weights(path) else {
+            return;
+        };
+        let equal = vec![1.0; weights.len()];
+        self.set_active_sub_pane_weights(path, equal, cx);
     }
 
     pub(crate) fn on_toggle_zoom_sub_pane(

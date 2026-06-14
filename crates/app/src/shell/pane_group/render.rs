@@ -13,9 +13,9 @@
 
 use gpui::{
     AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths, InteractiveElement,
-    IntoElement, ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
-    prelude::FluentBuilder, px, svg,
+    IntoElement, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::Theme;
 
@@ -26,9 +26,11 @@ use crate::actions::{
     ActivateGroupTab, OpenPaneActionsAt, OpenTabContextMenuAt, RequestOpenAdapterPicker,
 };
 use crate::shell::agent_status_badge::render_dot;
+use crate::shell::divider::{ActiveDivider, DividerBoundsCache, split_row_bounds_canvas};
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::file_drag::FilePathDragPayload;
 use crate::shell::pane_tree::PaneGroupId;
+use crate::shell::project_panes::ProjectPanes;
 
 pub const TAB_STRIP_HEIGHT_PX: f32 = 28.0;
 const TAB_PAD_X_PX: f32 = 12.0;
@@ -123,7 +125,12 @@ impl Render for PaneGroup {
 
         let group_entity = entity.clone();
         let active_content: Option<AnyElement> = self.active_tab().map(|tab| match &tab.content {
-            PaneContent::Terminal(tree) => render_sub_pane_tree(tree, group_entity.clone(), theme),
+            PaneContent::Terminal(tree) => render_sub_pane_tree(
+                tree,
+                group_entity.clone(),
+                theme,
+                self.sub_divider_bounds_cache(),
+            ),
             PaneContent::Editor(view) => view.clone().into_any_element(),
             // Diff tabs render the DiffView entity directly as the active
             // pane content — same pattern as Editor. The DiffView owns
@@ -158,6 +165,13 @@ impl Render for PaneGroup {
         let mru_overlay: Option<AnyElement> = self.mru_switcher().map(|state| {
             render_mru_hud(state.snapshot.as_slice(), state.cursor, &self.tabs, theme)
         });
+
+        // While a sub-pane divider is held, a topmost occluding overlay
+        // captures all moves (so resize tracks past the divider hitbox and
+        // no stray events reach the terminals beneath) until release.
+        let sub_divider_capture: Option<AnyElement> = self
+            .active_sub_divider()
+            .map(|active| sub_divider_capture_overlay(entity.clone(), active.axis));
 
         div()
             .id(SharedString::from(format!(
@@ -194,6 +208,7 @@ impl Render for PaneGroup {
                 }
             }))
             .child(body)
+            .when_some(sub_divider_capture, |s, overlay| s.child(overlay))
             .when_some(mru_overlay, |s, overlay| s.child(overlay))
     }
 }
@@ -207,6 +222,7 @@ impl Render for PaneGroup {
 /// the focused group shows it, matching the reference editor's
 /// behavior). `show_pane_actions` is `false` for the hoisted topmost
 /// strip — the top bar already renders its own "..." button there.
+#[allow(clippy::too_many_arguments)]
 pub fn build_tab_strip_for(
     entity: Entity<PaneGroup>,
     group_id: PaneGroupId,
@@ -214,6 +230,7 @@ pub fn build_tab_strip_for(
     show_pane_actions: bool,
     theme: Theme,
     workspace_tint: Option<super::TabColor>,
+    project_panes: Entity<ProjectPanes>,
     cx: &App,
 ) -> AnyElement {
     let group = entity.read(cx);
@@ -272,6 +289,7 @@ pub fn build_tab_strip_for(
         theme,
         workspace_tint,
         scroll_handle,
+        project_panes,
     )
 }
 
@@ -421,10 +439,13 @@ fn build_tab_strip_from_headers(
     theme: Theme,
     workspace_tint: Option<super::TabColor>,
     scroll_handle: gpui::ScrollHandle,
+    project_panes: Entity<ProjectPanes>,
 ) -> AnyElement {
     let entity_id = entity.entity_id();
     let strip_hover_entity = entity.clone();
     let strip_drop_entity = entity.clone();
+    // Cross-group strip drop needs `ProjectPanes` to steal+insert the tab.
+    let strip_drop_panes = project_panes.clone();
     let strip_file_hover_entity = entity.clone();
     let strip_file_drop_entity = entity.clone();
     // F4.6: parallel pair for the OS-level (Finder) native drop. GPUI
@@ -470,20 +491,44 @@ fn build_tab_strip_from_headers(
         // cursor that has left every chip (over the `+`, the trailing
         // spacer, or outside the strip entirely) doesn't keep the last
         // chip's insertion bar pinned on. Each chip's own on_drag_move
-        // re-sets the hover when the cursor is inside its bounds.
-        .on_drag_move::<TabDragPayload>(move |ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
-            let payload = ev.drag(cx);
-            if payload.source_group != group_id {
-                return;
-            }
+        // re-sets the hover when the cursor is inside its bounds. Applies
+        // to foreign-source drags too (cross-group strip drop) so the
+        // insertion bar can preview the destination slot.
+        .on_drag_move::<TabDragPayload>(move |_ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
             strip_hover_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
         })
-        // Catch a drop that lands inside the strip but not over a chip
-        // (e.g. on the `+` button gap or the trailing spacer) so the
-        // hover state is always cleared at drop time. Same-group reorder
-        // is handled by the chip-level on_drop; here we just zero out.
-        .on_drop::<TabDragPayload>(move |_payload: &TabDragPayload, _window, cx| {
+        // Strip drop handler. Same-group reorder is performed by the
+        // chip-level on_drop (which also fires on the bubble path) — here
+        // we only zero the hover for it. A FOREIGN source dropped on this
+        // strip moves its tab INTO this group at the slot the insertion
+        // bar previewed (cross-group strip drop). A drop with no live
+        // hover (over the `+` gap / trailing spacer) appends.
+        .on_drop::<TabDragPayload>(move |payload: &TabDragPayload, window, cx| {
+            if payload.source_group == group_id {
+                strip_drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+                return;
+            }
+            // Resolve the destination visible slot from the live hover
+            // hint before clearing it. No hover → append at the end.
+            let dest = strip_drop_entity.read(cx);
+            let visible_slot = dest
+                .drag_hover()
+                .map(|h| match h.side {
+                    TabInsertSide::Before => h.target_visible_idx,
+                    TabInsertSide::After => h.target_visible_idx + 1,
+                })
+                .unwrap_or_else(|| dest.tab_count());
             strip_drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+            strip_drop_panes.update(cx, |p, cx| {
+                p.transfer_tab_at(
+                    payload.source_group,
+                    payload.source_tab_idx,
+                    group_id,
+                    visible_slot,
+                    window,
+                    cx,
+                );
+            });
         })
         // File-tree drag passing through the strip — same capture-pass
         // clear so a cursor that's left every chip (over `+`, trailing
@@ -572,6 +617,7 @@ fn build_tab_strip_from_headers(
             theme,
             workspace_tint,
             entity.clone(),
+            project_panes.clone(),
         ));
     }
     let _ = tab_count;
@@ -655,6 +701,7 @@ fn render_sub_pane_tree(
     tree: &TerminalSplitTree,
     group: Entity<PaneGroup>,
     theme: Theme,
+    bounds_cache: DividerBoundsCache,
 ) -> AnyElement {
     // Zoom fast path: bypass tree traversal entirely.
     if let Some(idx) = tree.zoomed()
@@ -662,7 +709,7 @@ fn render_sub_pane_tree(
     {
         return view.clone().into_any_element();
     }
-    build_sub_pane_node(tree.tree(), tree, group, theme, &[])
+    build_sub_pane_node(tree.tree(), tree, group, theme, &[], &bounds_cache)
         .unwrap_or_else(|| div().size_full().into_any_element())
 }
 
@@ -677,6 +724,7 @@ fn build_sub_pane_node(
     group: Entity<PaneGroup>,
     theme: Theme,
     path: &[usize],
+    bounds_cache: &DividerBoundsCache,
 ) -> Option<AnyElement> {
     use crate::shell::pane_tree::{Axis, PaneTree};
     match node {
@@ -689,58 +737,23 @@ fn build_sub_pane_node(
             let split_axis = *axis;
             let sum: f32 = weights.iter().sum();
             let sum = if sum > 0.0 { sum } else { 1.0 };
-            // Path owned for the move handler so it survives the render
-            // closure dropping. Cheap clone — usually 0..3 entries deep.
+            // Path owned for the bounds canvas / divider handlers so it
+            // survives the render closure dropping. Cheap clone — usually
+            // 0..3 entries deep.
             let split_path = path.to_vec();
             let weights_snapshot = weights.clone();
-            let move_path = split_path.clone();
-            let move_axis = split_axis;
-            let move_group = group.clone();
-            let mut row = div()
-                .flex()
-                .size_full()
-                .overflow_hidden()
-                .on_drag_move::<SubPaneDividerPayload>(
-                    move |ev: &DragMoveEvent<SubPaneDividerPayload>, _window, cx| {
-                        let (split_path_p, divider_idx, initial_weights, p_axis) = {
-                            let payload = ev.drag(cx);
-                            (
-                                payload.split_path.clone(),
-                                payload.divider_idx,
-                                payload.initial_weights.clone(),
-                                payload.axis,
-                            )
-                        };
-                        if split_path_p != move_path || p_axis != move_axis {
-                            return;
-                        }
-                        let bounds = ev.bounds;
-                        let pos = ev.event.position;
-                        let (axis_pos, axis_size) = match move_axis {
-                            Axis::Horizontal => (
-                                f32::from(pos.x - bounds.origin.x),
-                                f32::from(bounds.size.width),
-                            ),
-                            Axis::Vertical => (
-                                f32::from(pos.y - bounds.origin.y),
-                                f32::from(bounds.size.height),
-                            ),
-                        };
-                        if axis_size <= 0.0 {
-                            return;
-                        }
-                        let frac = (axis_pos / axis_size).clamp(0.0, 1.0);
-                        let new_weights =
-                            redistribute_sub_pane_weights(&initial_weights, divider_idx, frac);
-                        move_group.update(cx, |g, cx| {
-                            g.set_active_sub_pane_weights(&split_path_p, new_weights, cx);
-                        });
-                    },
-                );
+            // `.relative()` anchors the bounds-recording canvas to this
+            // sub-pane split row; the canvas records its geometry into the
+            // group's cache so the divider MouseDown can seed the resize.
+            let mut row = div().flex().relative().size_full().overflow_hidden();
             row = match split_axis {
                 Axis::Horizontal => row.flex_row(),
                 Axis::Vertical => row.flex_col(),
             };
+            row = row.child(split_row_bounds_canvas(
+                bounds_cache.clone(),
+                split_path.clone(),
+            ));
             for (i, (child, weight)) in children.iter().zip(weights_snapshot.iter()).enumerate() {
                 let frac = weight / sum;
                 let mut slot = div()
@@ -756,7 +769,7 @@ fn build_sub_pane_node(
                 let mut child_path = split_path.clone();
                 child_path.push(i);
                 if let Some(child_el) =
-                    build_sub_pane_node(child, tree, group.clone(), theme, &child_path)
+                    build_sub_pane_node(child, tree, group.clone(), theme, &child_path, bounds_cache)
                 {
                     row = row.child(slot.child(child_el));
                 } else {
@@ -769,6 +782,8 @@ fn build_sub_pane_node(
                         split_axis,
                         weights_snapshot.clone(),
                         theme,
+                        group.clone(),
+                        bounds_cache.clone(),
                     ));
                 }
             }
@@ -791,39 +806,23 @@ fn render_leaf(idx: usize, tree: &TerminalSplitTree) -> Option<AnyElement> {
 /// workspace-level divider so the drag-pickup feel is consistent.
 const SUB_PANE_DIVIDER_HIT_PAD_PX: f32 = 3.0;
 
-/// Drag payload for a sub-pane divider resize. Kept distinct from the
-/// workspace `DividerDragPayload` so the two on_drag_move handlers
-/// never cross-fire (different type ID → GPUI dispatches separately).
-#[derive(Clone, Debug)]
-struct SubPaneDividerPayload {
-    split_path: Vec<usize>,
-    divider_idx: usize,
-    axis: crate::shell::pane_tree::Axis,
-    initial_weights: Vec<f32>,
-}
-
-/// Zero-sized drag visual placeholder. GPUI requires `on_drag` to return
-/// an Entity; for a resize handle there's no preview because the divider
-/// itself moves on each `on_drag_move` tick.
-struct SubPaneDividerGhost;
-
-impl Render for SubPaneDividerGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(0.0)).h(px(0.0))
-    }
-}
-
 /// Build an interactive resize handle for a sub-pane divider. A flush 1 px
 /// hairline (only 1 px of layout, so panes stay edge-to-edge) plus a
 /// transparent hit overlay extended `SUB_PANE_DIVIDER_HIT_PAD_PX` past the
-/// line on each side; cursor flips to col/row-resize over it; drag fires the
-/// shared on_drag_move on the parent split row.
+/// line on each side; cursor flips to col/row-resize over it. Resize uses
+/// direct mouse capture: MouseDown arms the divider on `PaneGroup` (seeding
+/// the parent split-row bounds from `bounds_cache`); the group's capture
+/// overlay resizes on MouseMove and disarms on MouseUp. Double-click resets
+/// the split to equal.
+#[allow(clippy::too_many_arguments)]
 fn sub_pane_divider(
     path: Vec<usize>,
     divider_idx: usize,
     axis: crate::shell::pane_tree::Axis,
     weights: Vec<f32>,
     theme: Theme,
+    group: Entity<PaneGroup>,
+    bounds_cache: DividerBoundsCache,
 ) -> AnyElement {
     use crate::shell::pane_tree::Axis;
     let id_string = format!(
@@ -834,12 +833,6 @@ fn sub_pane_divider(
             .join("-"),
         divider_idx,
     );
-    let payload = SubPaneDividerPayload {
-        split_path: path,
-        divider_idx,
-        axis,
-        initial_weights: weights,
-    };
     let pad = SUB_PANE_DIVIDER_HIT_PAD_PX;
     let span = px(1.0 + 2.0 * pad);
     // A flush 1px hairline: it consumes only 1px of layout, so the two panes
@@ -870,10 +863,83 @@ fn sub_pane_divider(
             .h(span)
             .cursor_row_resize(),
     };
-    line.child(hot.on_drag(payload, |_payload, _offset, _window, cx| {
-        cx.new(|_| SubPaneDividerGhost)
-    }))
+    line.child(
+        hot.on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _window, cx| {
+            // Double-click resets the split to equal weights — don't arm.
+            if ev.click_count >= 2 {
+                let path = path.clone();
+                group.update(cx, |g, cx| g.reset_sub_split_to_equal(&path, cx));
+                cx.stop_propagation();
+                return;
+            }
+            // First frame may have no cached bounds yet — ignore the press.
+            let Some(bounds) = bounds_cache.borrow().get(&path).copied() else {
+                return;
+            };
+            let active = ActiveDivider {
+                split_path: path.clone(),
+                divider_idx,
+                axis,
+                initial_weights: weights.clone(),
+                container_origin: bounds.origin,
+                container_size: bounds.size,
+            };
+            group.update(cx, |g, cx| g.arm_sub_divider(active, cx));
+            cx.stop_propagation();
+        }),
+    )
     .into_any_element()
+}
+
+/// Full-area capture overlay rendered on top of a `PaneGroup` body while a
+/// sub-pane divider is armed. Occluding + topmost so MouseMove only reaches
+/// it (no stray events to the terminals beneath), resizing on every move.
+/// MouseUp (over it or elsewhere in-window) disarms; an off-window release
+/// is caught by the next move's released-button check.
+fn sub_divider_capture_overlay(
+    group: Entity<PaneGroup>,
+    axis: crate::shell::pane_tree::Axis,
+) -> AnyElement {
+    use crate::shell::pane_tree::Axis;
+    let mut overlay = div().absolute().inset_0().occlude();
+    overlay = match axis {
+        Axis::Horizontal => overlay.cursor_col_resize(),
+        Axis::Vertical => overlay.cursor_row_resize(),
+    };
+    let move_group = group.clone();
+    let down_group = group.clone();
+    let up_group = group.clone();
+    let up_out_group = group.clone();
+    overlay
+        // Catch the second click of a double-click here — it lands on this
+        // overlay (raised by the first click's arm), not the divider hitbox.
+        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _window, cx| {
+            if ev.click_count >= 2 {
+                down_group.update(cx, |g, cx| g.reset_sub_divider_double_click(cx));
+            }
+        })
+        .on_mouse_move(move |ev: &MouseMoveEvent, _window, cx| {
+            if ev.pressed_button != Some(MouseButton::Left) {
+                move_group.update(cx, |g, cx| g.disarm_sub_divider(cx));
+                return;
+            }
+            move_group.update(cx, |g, cx| {
+                g.resize_active_sub_divider(ev.position, cx);
+            });
+        })
+        .on_mouse_up(
+            MouseButton::Left,
+            move |_ev: &MouseUpEvent, _window, cx| {
+                up_group.update(cx, |g, cx| g.disarm_sub_divider(cx));
+            },
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            move |_ev: &MouseUpEvent, _window, cx| {
+                up_out_group.update(cx, |g, cx| g.disarm_sub_divider(cx));
+            },
+        )
+        .into_any_element()
 }
 
 /// Compute new sub-pane weights when divider `divider_idx` is dragged
@@ -883,7 +949,11 @@ fn sub_pane_divider(
 /// `redistribute_weights` in project_panes/render.rs; duplicated here
 /// because the two callers operate on different leaf-id types and the
 /// math itself is identical and tiny.
-fn redistribute_sub_pane_weights(initial: &[f32], divider_idx: usize, frac: f32) -> Vec<f32> {
+pub(super) fn redistribute_sub_pane_weights(
+    initial: &[f32],
+    divider_idx: usize,
+    frac: f32,
+) -> Vec<f32> {
     let mut out = initial.to_vec();
     if divider_idx + 1 >= initial.len() {
         return out;
@@ -935,6 +1005,7 @@ fn render_tab_chip(
     theme: Theme,
     workspace_tint: Option<super::TabColor>,
     entity: Entity<PaneGroup>,
+    project_panes: Entity<ProjectPanes>,
 ) -> impl IntoElement {
     let icon_path = match marker {
         // Diff tabs reuse the editor "file" glyph until a dedicated
@@ -971,6 +1042,12 @@ fn render_tab_chip(
     let activate_entity = entity.clone();
     let hover_entity = entity.clone();
     let drop_entity = entity.clone();
+    // Cross-group strip drop: GPUI's `on_drop` consumes the active drag and
+    // stops propagation as soon as a hovered element with a matching drop
+    // listener is found — so a foreign tab dropped ON a chip is eaten by
+    // THIS chip before the strip-body handler can run. The chip therefore
+    // must move the foreign tab itself, which needs `ProjectPanes`.
+    let drop_panes = project_panes.clone();
     let file_hover_entity = entity.clone();
     let file_drop_entity = entity.clone();
     // F4.6: separate clones for the OS-native (Finder) drop variants —
@@ -1002,8 +1079,11 @@ fn render_tab_chip(
         source_group: group_id,
         source_tab_idx: ix,
         source_visible_idx: visible_idx,
+        source_pinned: is_pinned,
     };
     let preview_label = label.clone();
+    let preview_icon = SharedString::from(icon_path);
+    let preview_color = color_tag;
     let preview_theme = theme;
 
     // Optional left-edge color bar (2px) when the user has assigned a
@@ -1073,24 +1153,38 @@ fn render_tab_chip(
             },
         )
         .on_drag(drag_payload, move |_payload, _offset, _window, cx| {
-            cx.new(|_| TabDragPreview::new(preview_label.clone(), preview_theme))
+            cx.new(|_| {
+                TabDragPreview::new(
+                    preview_label.clone(),
+                    preview_icon.clone(),
+                    preview_color,
+                    preview_theme,
+                )
+            })
         })
         .on_drag_move::<TabDragPayload>(move |ev: &DragMoveEvent<TabDragPayload>, _window, cx| {
             // Mid-bounds split: cursor left of center → insert before
-            // this chip; right of center → insert after. Cross-group
-            // drags (Phase D) ignore the per-chip hover and route via
-            // the body-level zone overlay instead.
+            // this chip; right of center → insert after. A foreign-source
+            // drag (from another group) also previews the insertion bar
+            // here so a cross-group strip drop shows where it will land;
+            // the strip-level on_drop performs the actual move.
             let payload = ev.drag(cx);
-            if payload.source_group != group_id {
+            // Pinned source can't be torn out of its group (`take_tab`
+            // refuses it), so the cross-group move would silently fail —
+            // suppress the affordance entirely rather than letting the
+            // user aim at an action that can't land.
+            if payload.source_group != group_id && payload.source_pinned {
                 return;
             }
             // Drop-on-self silence: when the user drags a chip across
-            // its own bounds, do NOT re-set the hover. The strip-level
-            // capture pass already cleared it, so leaving it cleared
-            // means the insertion bar disappears over the source chip
-            // (where dropping would be a no-op layout move) instead of
-            // briefly painting on the chip itself.
-            if payload.source_tab_idx == ix {
+            // its OWN bounds (same group), do NOT re-set the hover. The
+            // strip-level capture pass already cleared it, so leaving it
+            // cleared means the insertion bar disappears over the source
+            // chip (where dropping would be a no-op layout move) instead
+            // of briefly painting on the chip itself. Only applies to the
+            // source chip in its own group — a foreign chip at the same
+            // visible index must still preview.
+            if payload.source_group == group_id && payload.source_tab_idx == ix {
                 return;
             }
             // GPUI fires on_drag_move on EVERY registered listener for
@@ -1117,13 +1211,42 @@ fn render_tab_chip(
             });
             hover_entity.update(cx, |g, cx| g.set_drag_hover(hover, cx));
         })
-        .on_drop::<TabDragPayload>(move |payload: &TabDragPayload, _window, cx| {
+        .on_drop::<TabDragPayload>(move |payload: &TabDragPayload, window, cx| {
+            // Foreign-source drop landing ON this chip: move the tab into
+            // THIS group at the previewed slot. GPUI consumes the drag on
+            // the first matching hovered drop listener (this chip), so the
+            // strip-body handler would never see it — the chip has to move
+            // it. A pinned source can't be torn out, so it's a clean no-op.
             if payload.source_group != group_id {
+                if payload.source_pinned {
+                    drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+                    return;
+                }
+                let dest = drop_entity.read(cx);
+                let visible_slot = dest
+                    .drag_hover()
+                    .map(|h| match h.side {
+                        TabInsertSide::Before => h.target_visible_idx,
+                        TabInsertSide::After => h.target_visible_idx + 1,
+                    })
+                    .unwrap_or_else(|| dest.tab_count());
+                drop_entity.update(cx, |g, cx| g.set_drag_hover(None, cx));
+                drop_panes.update(cx, |p, cx| {
+                    p.transfer_tab_at(
+                        payload.source_group,
+                        payload.source_tab_idx,
+                        group_id,
+                        visible_slot,
+                        window,
+                        cx,
+                    );
+                });
                 return;
             }
-            // Resolve destination visible idx from the live hover hint
-            // (set by the most-recent on_drag_move). Falling back to the
-            // chip's own visible idx keeps the no-op case safe.
+            // Same-group reorder. Resolve destination visible idx from the
+            // live hover hint (set by the most-recent on_drag_move).
+            // Falling back to the chip's own visible idx keeps the no-op
+            // case safe.
             drop_entity.update(cx, |g, cx| {
                 let Some(hover) = g.drag_hover() else {
                     g.set_drag_hover(None, cx);

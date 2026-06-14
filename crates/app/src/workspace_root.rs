@@ -2167,7 +2167,7 @@ impl Render for WorkspaceRoot {
         // split rows render their strips inline above their bodies.
         let workspace_tab_strip: Option<AnyElement> = active_panes
             .as_ref()
-            .and_then(|panes| panes.read(cx).topmost_tab_strip(cx));
+            .and_then(|panes| panes.read(cx).topmost_tab_strip((*panes).clone(), cx));
         // Drag-claim band (below) is only needed when there are tab
         // chips to protect from AppKit title-bar drag hijack. When
         // there are no tabs (welcome state), skipping the band trims

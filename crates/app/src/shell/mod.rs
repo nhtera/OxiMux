@@ -20,6 +20,7 @@ pub mod confirm_dialog;
 pub mod context_env;
 pub mod cwd_resolver;
 pub mod diff_view;
+pub mod divider;
 pub mod file_explorer;
 pub mod forge;
 pub mod floating_terminal;

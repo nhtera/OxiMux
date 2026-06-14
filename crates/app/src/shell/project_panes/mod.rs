@@ -35,6 +35,7 @@ use crate::persisted_terminals::{
     PersistedAgentTab, PersistedGroup, PersistedLeafTab, PersistedSubPane, PersistedTab,
     PersistedTabKind, PersistedTabs, PersistedTree, snapshot_tree,
 };
+use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::layout_presets::Preset;
 use crate::shell::pane_group::tab_drag_zones::Zone;
@@ -105,6 +106,19 @@ pub struct ProjectPanes {
     /// rim-flash animation id so a fresh focus restarts the flash; a stable
     /// token lets it settle (the animation ends transparent).
     rim_flash_token: u64,
+    /// The workspace divider currently being resized via mouse capture.
+    /// `Some` only while the button is held; the capture overlay's
+    /// move/up handlers read and clear it.
+    active_divider: Option<ActiveDivider>,
+    /// Per-render cache of split-row bounds, keyed by `split_path`. Each
+    /// split row records its bounds here so the divider MouseDown can seed
+    /// the [`ActiveDivider`] with the parent container's geometry.
+    divider_bounds: DividerBoundsCache,
+    /// Path of the most-recently-armed workspace divider. Lets the capture
+    /// overlay resolve a double-click-reset target even after the first
+    /// click's arm was already disarmed on its mouse-up (the overlay may
+    /// still be the element under the second click).
+    last_divider_path: Option<Vec<usize>>,
 }
 
 impl ProjectPanes {
@@ -165,6 +179,9 @@ impl ProjectPanes {
             next_terminal_n: 1,
             last_active_group: None,
             rim_flash_token: 0,
+            active_divider: None,
+            divider_bounds: DividerBoundsCache::default(),
+            last_divider_path: None,
         }
     }
 
@@ -461,9 +478,49 @@ impl ProjectPanes {
         true
     }
 
+    /// Move a tab from `source` into `target` at a precise visible slot.
+    /// Wraps [`Self::transfer_tab`] (which appends the stolen tab to the
+    /// end of `target`) and then slides the appended tab to `visible_slot`
+    /// so a cross-group strip drop lands where the insertion bar previewed
+    /// rather than always at the end. Returns `false` when the transfer was
+    /// refused (e.g. the source tab is pinned). Pinned clamps inside
+    /// `move_tab` keep the moved tab within its bucket.
+    pub fn transfer_tab_at(
+        &mut self,
+        source: PaneGroupId,
+        source_tab_idx: usize,
+        target: PaneGroupId,
+        visible_slot: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.transfer_tab(source, source_tab_idx, target, window, cx) {
+            return false;
+        }
+        let Some(target_entity) = self.groups.get(&target).cloned() else {
+            return false;
+        };
+        target_entity.update(cx, |g, cx| {
+            // `transfer_tab` appended the stolen tab to the end of the
+            // visible order; its position is the last visible slot. Slide
+            // it back to where the cursor previewed the insertion bar.
+            let appended = g.tab_count().saturating_sub(1);
+            g.move_tab(appended, visible_slot.min(appended));
+            cx.notify();
+        });
+        true
+    }
+
     /// Drag-to-split: insert a new sibling group next to `target` along
-    /// the axis implied by `zone`, then transfer the dragged tab into it.
-    /// `Zone::Center` is a no-op here (merge is handled by `transfer_tab`).
+    /// the axis implied by `zone`, then populate it.
+    ///
+    /// Normally the dragged tab is **moved** into the new group. The one
+    /// exception: splitting a pane whose ONLY tab is a terminal would empty
+    /// the source pane (purged immediately), defeating the split — so in
+    /// that case the source terminal stays put and a **fresh** terminal is
+    /// spawned in the new pane instead (two populated panes, focus on the
+    /// new terminal). Multi-tab panes and non-terminal tabs keep move
+    /// semantics. `Zone::Center` is a no-op here (merge is `transfer_tab`).
     pub fn split_and_move_tab(
         &mut self,
         source: PaneGroupId,
@@ -480,14 +537,28 @@ impl ProjectPanes {
             Zone::Up => (Axis::Vertical, SplitInsert::Before),
             Zone::Down => (Axis::Vertical, SplitInsert::After),
         };
+        // Decide spawn-vs-move BEFORE mutating the tree: spawn a fresh
+        // terminal only when the source pane holds exactly one tab and it
+        // is a terminal (moving it would leave an empty, purged pane).
+        let spawn_new_terminal = self
+            .groups
+            .get(&source)
+            .map(|g| {
+                let g = g.read(cx);
+                g.tab_count() == 1
+                    && matches!(
+                        g.tabs().get(source_tab_idx).map(|t| &t.kind),
+                        Some(PaneGroupTabKind::Terminal)
+                    )
+            })
+            .unwrap_or(false);
         // 1. Allocate the new sibling group in the layout tree.
         let Some(GroupSplitOutcome { new_group, .. }) =
             self.manager.split_at_target(target, axis, insert)
         else {
             return false;
         };
-        // 2. Create the matching PaneGroup entity (empty — we fill it via
-        // the transferred tab next).
+        // 2. Create the matching PaneGroup entity (empty — populated below).
         let group = build_group(
             self.cwd.clone(),
             self.theme,
@@ -505,7 +576,30 @@ impl ProjectPanes {
         self._observers.insert(new_group, group_observer);
         self._focus_observers
             .insert(new_group, group_focus_observer);
-        // 3. Steal the tab from source into the new group.
+        // 3a. Single-terminal source → spawn a fresh terminal in the new
+        // pane and leave the original in place. Focus follows the new one.
+        if spawn_new_terminal {
+            let n = self.take_next_terminal_n(cx);
+            let spawned = self
+                .groups
+                .get(&new_group)
+                .map(|g| {
+                    g.update(cx, |g, cx| {
+                        g.set_next_terminal_n(n);
+                        g.open_terminal_tab(window, cx).is_some()
+                    })
+                })
+                .unwrap_or(false);
+            if !spawned {
+                // PTY spawn failed — roll back the empty new group.
+                let _ = self.close_group_by_id(new_group, window, cx);
+                return false;
+            }
+            self.set_active_group(new_group, window, cx);
+            cx.notify();
+            return true;
+        }
+        // 3b. Otherwise steal the dragged tab into the new group.
         let moved = self.transfer_tab(source, source_tab_idx, new_group, window, cx);
         if !moved {
             // Roll back the empty new group — purge_empty_groups will
@@ -537,6 +631,74 @@ impl ProjectPanes {
         }
         cx.notify();
         true
+    }
+
+    /// Shared bounds cache handle for the render pass to record split-row
+    /// geometry into (one `Rc` clone per render).
+    pub fn divider_bounds_cache(&self) -> DividerBoundsCache {
+        self.divider_bounds.clone()
+    }
+
+    /// The divider currently being resized, if any.
+    pub fn active_divider(&self) -> Option<&ActiveDivider> {
+        self.active_divider.as_ref()
+    }
+
+    /// Arm a workspace divider for mouse-capture resize. Called from the
+    /// divider hitbox MouseDown once the parent split-row bounds are known.
+    pub fn arm_divider(&mut self, active: ActiveDivider, cx: &mut Context<Self>) {
+        self.last_divider_path = Some(active.split_path.clone());
+        self.active_divider = Some(active);
+        cx.notify();
+    }
+
+    /// Reset the split the user just double-clicked. Resolves the target
+    /// from the armed divider, or — if the first click's arm was already
+    /// disarmed — the most-recently-armed path, so the reset still lands
+    /// when the capture overlay is the element under the second click.
+    pub fn reset_split_double_click(&mut self, cx: &mut Context<Self>) {
+        let path = self
+            .active_divider
+            .as_ref()
+            .map(|a| a.split_path.clone())
+            .or_else(|| self.last_divider_path.clone());
+        if let Some(path) = path {
+            self.reset_split_to_equal(&path, cx);
+        }
+        self.disarm_divider(cx);
+    }
+
+    /// Apply a resize for the armed divider from the cursor position.
+    /// No-op when nothing is armed. Returns `true` if weights changed.
+    pub fn resize_active_divider(
+        &mut self,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(active) = self.active_divider.clone() else {
+            return false;
+        };
+        let Some(frac) = crate::shell::divider::fraction_along(&active, pos) else {
+            return false;
+        };
+        let new_weights = render::redistribute_weights(&active.initial_weights, active.divider_idx, frac);
+        self.set_split_weights(&active.split_path, new_weights, cx)
+    }
+
+    /// Disarm the active divider (mouse released). No-op when nothing armed.
+    pub fn disarm_divider(&mut self, cx: &mut Context<Self>) {
+        if self.active_divider.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Reset the split at `path` to equal weights (double-click a divider).
+    pub fn reset_split_to_equal(&mut self, path: &[usize], cx: &mut Context<Self>) {
+        let Some(weights) = self.manager.group_tree().split_weights(path) else {
+            return;
+        };
+        let equal = vec![1.0; weights.len()];
+        self.set_split_weights(path, equal, cx);
     }
 
     pub fn split_active_group(
