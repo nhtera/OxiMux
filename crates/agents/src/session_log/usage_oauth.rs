@@ -3,8 +3,9 @@
 //! The CLI's OAuth deployment exposes `GET /api/oauth/usage` returning the
 //! account's REAL rate-limit window utilization (the same numbers its own
 //! `/usage` panel renders) — exact percentages and reset timestamps,
-//! account-wide across devices. This beats any local session-log estimate,
-//! so the probe tries this first and falls back to the tally.
+//! account-wide across devices. This is the meter's only data source: when
+//! it can't be reached or authenticated the meter reports "unavailable"
+//! with the reason rather than guessing from local logs.
 //!
 //! Auth: the CLI stores its OAuth credentials as a macOS Keychain generic
 //! password (service `Claude Code-credentials`, account = the macOS
@@ -21,7 +22,7 @@
 //! ad-hoc-signed dev bundle gets a NEW identity every reseal, so the
 //! prompt returns after each rebuild; a stable `OXIMUX_SIGN_ID` identity
 //! makes "Always Allow" stick. A decline simply fails the fetch and the
-//! caller backs off to the estimate path.
+//! caller surfaces "unavailable".
 
 use std::io::Write;
 use std::path::Path;
@@ -53,20 +54,24 @@ pub struct OauthUsage {
     pub seven_day: OauthWindow,
 }
 
-/// Why a fetch did not return usage — the caller picks its backoff and
-/// fallback from this. The distinction matters: a missing/declined token is
-/// a standing condition (back off long so we don't re-prompt the Keychain
-/// every tick), while a rejected token or an unreachable endpoint is
-/// transient (the CLI refreshes the token on its next authenticated call,
+/// Why a fetch did not return usage — the caller picks its backoff and its
+/// user-facing reason from this. The distinction matters: a missing/declined
+/// token is a standing condition (back off long so we don't re-prompt the
+/// Keychain every tick), while a rejected token or an unreachable endpoint
+/// is transient (the CLI refreshes the token on its next authenticated call,
 /// so retry soon and let the last-known-good snapshot cover the gap).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
     /// No usable bearer token (absent credential or a declined Keychain
-    /// prompt). The exact path is unavailable until the user re-auths.
+    /// prompt) — the CLI isn't signed in on this machine.
     NoToken,
-    /// A token was sent but the endpoint rejected it (HTTP 401 — expired),
-    /// or the request could not complete (offline, timeout, response drift).
-    Transient,
+    /// A token was sent but the endpoint rejected it (HTTP 401/403). Carries
+    /// the API's own error message when the body provides one (e.g.
+    /// "Invalid authentication credentials").
+    Unauthorized(String),
+    /// The request could not complete (offline, timeout, response drift) or
+    /// the endpoint returned an unexpected status.
+    Unreachable,
 }
 
 /// Fetch the account's exact usage windows.
@@ -82,9 +87,27 @@ pub fn fetch(home: &Path) -> Result<OauthUsage, FetchError> {
         return Err(FetchError::NoToken);
     };
     match curl_usage_endpoint(&token) {
-        Some((200, body)) => parse_usage_response(&body).ok_or(FetchError::Transient),
-        _ => Err(FetchError::Transient),
+        Some((200, body)) => parse_usage_response(&body).ok_or(FetchError::Unreachable),
+        // An expired/revoked token (signed out, rotated away) — surface the
+        // API's own message so the meter can name the cause.
+        Some((401 | 403, body)) => Err(FetchError::Unauthorized(parse_error_message(&body))),
+        _ => Err(FetchError::Unreachable),
     }
+}
+
+/// Pull the human-readable error string from a JSON error body
+/// (`{"error":{"message":"Invalid authentication credentials"}}`), falling
+/// back to a generic auth message when the body lacks one.
+fn parse_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "Invalid authentication credentials".to_string())
 }
 
 /// Bearer token from the Keychain item, falling back to the on-disk
@@ -277,6 +300,19 @@ mod tests {
             scoped_keychain_service("/Users/nguyenhongtien/.claude"),
             "Claude Code-credentials-01fd4c59"
         );
+    }
+
+    #[test]
+    fn error_message_pulled_from_body_or_defaulted() {
+        assert_eq!(
+            parse_error_message(
+                r#"{"error":{"type":"authentication_error","message":"Invalid authentication credentials"}}"#
+            ),
+            "Invalid authentication credentials"
+        );
+        // No usable message → generic auth fallback.
+        assert_eq!(parse_error_message("{}"), "Invalid authentication credentials");
+        assert_eq!(parse_error_message("not json"), "Invalid authentication credentials");
     }
 
     #[test]
