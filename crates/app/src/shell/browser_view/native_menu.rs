@@ -47,11 +47,6 @@ impl MenuItem {
     pub fn new(label: impl Into<String>, checked: bool) -> Self {
         Self { label: label.into(), checked, separator_before: false }
     }
-
-    pub fn with_separator(mut self) -> Self {
-        self.separator_before = true;
-        self
-    }
 }
 
 /// Interior-mutable slot the action selector writes the picked tag into. The
@@ -137,10 +132,17 @@ pub fn popup(anchor: Option<Anchor>, header: Option<&str>, items: &[MenuItem]) -
         menu.addItem(&row);
     }
 
-    // Anchored: position the menu's top-right under the button's bottom-right,
-    // dropping downward with a small gap (a button drop-down). `size` forces
-    // AppKit to lay the menu out so we know its width for the right-align.
-    // Unanchored: fall back to the mouse (screen) location.
+    present(&menu, &target, anchor).map(|tag| tag as usize)
+}
+
+/// Lay out + pop a built menu and return the picked item's tag (or `None` if
+/// dismissed). Shared by the flat [`popup`] and the nested [`popup_tree`].
+///
+/// Anchored: position the menu's top-right under the button's bottom-right,
+/// dropping downward with a small gap (a button drop-down). `size` forces
+/// AppKit to lay the menu out so we know its width for the right-align.
+/// Unanchored: fall back to the mouse (screen) location.
+fn present(menu: &NSMenu, target: &MenuTarget, anchor: Option<Anchor>) -> Option<isize> {
     const GAP: f64 = 5.0;
     let (location, in_view): (CGPoint, Option<&NSView>) = match &anchor {
         Some(a) => {
@@ -158,5 +160,113 @@ pub fn popup(anchor: Option<Anchor>, header: Option<&str>, items: &[MenuItem]) -
     let _: bool = menu.popUpMenuPositioningItem_atLocation_inView(None, location, in_view);
 
     let picked = target.ivars().selected.get();
-    (picked >= 0).then_some(picked as usize)
+    (picked >= 0).then_some(picked)
+}
+
+/// A node in a nested menu tree: either a leaf row carrying a caller-supplied
+/// `id` (returned when picked) or a submenu holding more entries.
+pub enum MenuEntry {
+    Item { label: String, checked: bool, id: u32, separator_before: bool },
+    Submenu { label: String, children: Vec<MenuEntry>, separator_before: bool },
+}
+
+impl MenuEntry {
+    /// A selectable leaf; `id` is what [`popup_tree`] returns when it's chosen.
+    pub fn item(label: impl Into<String>, checked: bool, id: u32) -> Self {
+        Self::Item { label: label.into(), checked, id, separator_before: false }
+    }
+
+    /// A submenu row expanding to `children`.
+    pub fn submenu(label: impl Into<String>, children: Vec<MenuEntry>) -> Self {
+        Self::Submenu { label: label.into(), children, separator_before: false }
+    }
+
+    /// Draw a separator line above this entry (groups sections off).
+    pub fn with_separator(mut self) -> Self {
+        match &mut self {
+            MenuEntry::Item { separator_before, .. }
+            | MenuEntry::Submenu { separator_before, .. } => *separator_before = true,
+        }
+        self
+    }
+}
+
+/// Recursively build an `NSMenu` from a [`MenuEntry`] slice. Leaf rows wire the
+/// shared `target`+`menuItemPicked:` selector with their `id` as the tag;
+/// submenu rows attach a child menu (no action — they just expand).
+fn build_tree(
+    mtm: MainThreadMarker,
+    target: &MenuTarget,
+    entries: &[MenuEntry],
+) -> Retained<NSMenu> {
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(""));
+    menu.setAutoenablesItems(false);
+    for entry in entries {
+        match entry {
+            MenuEntry::Item { label, checked, id, separator_before } => {
+                if *separator_before {
+                    menu.addItem(&NSMenuItem::separatorItem(mtm));
+                }
+                let row = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &NSString::from_str(label),
+                        Some(sel!(menuItemPicked:)),
+                        &NSString::from_str(""),
+                    )
+                };
+                unsafe { row.setTarget(Some(target)) };
+                row.setTag(*id as isize);
+                row.setEnabled(true);
+                if *checked {
+                    let _: () = unsafe { msg_send![&row, setState: 1isize] };
+                }
+                menu.addItem(&row);
+            }
+            MenuEntry::Submenu { label, children, separator_before } => {
+                if *separator_before {
+                    menu.addItem(&NSMenuItem::separatorItem(mtm));
+                }
+                let item = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &NSString::from_str(label),
+                        None,
+                        &NSString::from_str(""),
+                    )
+                };
+                item.setEnabled(true);
+                let child = build_tree(mtm, target, children);
+                item.setSubmenu(Some(&child));
+                menu.addItem(&item);
+            }
+        }
+    }
+    menu
+}
+
+/// Pop a nested dropdown (with submenus) and block until dismissed. Returns the
+/// chosen leaf's `id`, or `None` if dismissed without a pick. `header`, when
+/// set, is a disabled title row at the top. Main-thread only.
+pub fn popup_tree(
+    anchor: Option<Anchor>,
+    header: Option<&str>,
+    entries: &[MenuEntry],
+) -> Option<u32> {
+    let mtm = MainThreadMarker::new()?;
+    let target = MenuTarget::new();
+    let menu = build_tree(mtm, &target, entries);
+    if let Some(text) = header {
+        let head = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(text),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        head.setEnabled(false);
+        menu.insertItem_atIndex(&head, 0);
+    }
+    present(&menu, &target, anchor).map(|tag| tag as u32)
 }

@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-14 — Browser cookie import: cascade menu, Chromium + Firefox → active profile
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/browser_view/cookie_import/` (new module — `mod.rs` types+orchestration, `catalog.rs` browser table, `detect.rs` detection+profile enumeration, `read.rs` SQLite readers, `decrypt.rs` Chromium AES, `from_file.rs` JSON-export parser, `inject.rs` pure helpers), `browser_view/native.rs` (`import_cookies` objc2 `WKHTTPCookieStore` write, `popup_menu_tree`, `menu_anchor`), `browser_view/native_menu.rs` (nested-submenu `MenuEntry`/`popup_tree`), `browser_view/mod.rs` (`open_profile_menu` cascade + dispatch + `apply_import_result`), `crates/app/Cargo.toml` (`rusqlite`, `tempfile`, `aes`/`cbc`/`pbkdf2`/`sha1`/`hmac`; objc2 cookie features)
+
+The inline browser can now import session cookies from installed browsers into the **active** webview profile, so the user lands logged-in without re-authenticating. The entry point is a cascade in the existing native profile menu (modeled on the reference cockpit, not a modal wizard): **Import Cookies → From `<Browser>` → `<source profile>`**, plus **From File…**. A browser with a single profile collapses to one row; multi-profile browsers expand to a submenu of their named profiles. The submenu only appears when at least one importable browser is detected.
+
+- **Sources (v1):** the Chromium family — Chrome, Brave, Edge, Arc, Comet, Vivaldi, Opera, Chromium — and Firefox. Safari is excluded (its cookies use the `Cookies.binarycookies` binary format, not a SQLite DB). Detection requires a real cookie DB on disk (a never-launched browser is skipped); profiles come from Chromium's `Local State` → `profile.info_cache` name map and Firefox's `Profiles/` directories.
+- **Reading is lock-safe.** Each source cookie DB (+ its `-wal`/`-shm` sidecars) is copied to a temp dir and opened read-only, so a *running* browser's WAL lock never blocks the import and the source is never touched.
+- **Chromium decryption.** Encrypted (`v10`/`v11`) cookie values are decrypted with AES-128-CBC under a key derived from the browser's macOS Keychain item (`<Browser> Safe Storage`) via `PBKDF2-HMAC-SHA1(secret, "saltysalt", 1003)`; the Chromium-127+ 32-byte per-host HMAC prefix is stripped. Reading the Keychain triggers a one-time macOS access prompt — always user-initiated (the menu pick). Firefox values are plaintext. Cookie values are never logged.
+- **Injection** goes through the live webview's own per-profile data store (`configuration().websiteDataStore().httpCookieStore()`), so cookies land in exactly the active isolated profile `wry` bound at build time and persist across reloads. `secure`, `sameSite` (lax/strict), and absolute expiry are carried over; Google "integrity" cookies (`SIDCC`, `__Secure-1PSIDCC`, `__Secure-3PSIDCC`, `__Secure-STRP`, `AEC`) are dropped — they're bound to the source browser's TLS fingerprint and would reject the transplanted session.
+- **From File…** imports a browser-extension cookie export (Cookie-Editor / EditThisCookie JSON array): `domain`/`name`/`value` required, `path`/`secure`/`httpOnly`/`sameSite`/`expirationDate` optional, lenient about field types.
+- A confirmation toast floats over the page after import ("Imported N cookies from `<Browser>` — reload to apply"); failures (Keychain denied, no DB) surface as a toast too. The read+decrypt runs on a background thread; only the WebKit cookie write runs on the main thread.
+- **Infrastructure:** `native_menu` gained nested-submenu support (a `MenuEntry` tree whose leaves carry caller ids; `popup_tree` returns the chosen id) shared with the flat menu via a new `present` helper. macOS-only (Keychain + `WKWebsiteDataStore`); the cascade is omitted off-platform.
+
+Verified: clean build (zero warnings), clippy clean (new code), 884 app lib tests incl. 13 new cookie-import tests (decrypt v10 round-trip + 127-HMAC strip, Local-State profile parse, Chromium/Firefox readers, expired-drop, Google integrity filter, JSON-export parse). **Live GUI run confirmed end-to-end**: the profile menu's 3-level cascade opens without crash (Profiles → Import Cookies → From Google Chrome → every Chrome profile enumerated by name; Brave + Comet also detected), and importing a Chrome profile's cookies into the active OxiMux profile then navigating to Gmail logged straight in as that account — no re-auth, Keychain decryption path working, even Google's session surviving the integrity-cookie filter. The earlier latent double-borrow risk (NSMenu modal loop pumping a queued GPUI task) did not fire — the `cx.spawn` deferral opens the menu outside the event-handler borrow, and the longer-open cascade did not reproduce it.
+
+---
+
 ### 2026-06-14 — Usage meter: exact-path resilience (no more false ~100%), account-safe
 
 **Commits**: _(local, pending)_

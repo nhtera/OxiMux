@@ -240,9 +240,33 @@ impl NativeWebview {
         header: Option<&str>,
         items: &[super::native_menu::MenuItem],
     ) -> Option<usize> {
+        super::native_menu::popup(self.menu_anchor(anchor_bounds), header, items)
+    }
+
+    /// Pop a nested native dropdown (submenus) and return the chosen leaf's
+    /// caller id. Same anchoring as [`Self::popup_menu`]; drives the profile
+    /// menu's cascading "Import Cookies" tree.
+    #[cfg(target_os = "macos")]
+    pub fn popup_menu_tree(
+        &self,
+        anchor_bounds: Option<Bounds<Pixels>>,
+        header: Option<&str>,
+        entries: &[super::native_menu::MenuEntry],
+    ) -> Option<u32> {
+        super::native_menu::popup_tree(self.menu_anchor(anchor_bounds), header, entries)
+    }
+
+    /// Map a button's window-relative bounds into the AppKit view `wry`
+    /// positions the child webview against, producing a drop-down anchor.
+    /// `None` when there are no bounds (open at the mouse) or no host view.
+    #[cfg(target_os = "macos")]
+    fn menu_anchor(
+        &self,
+        anchor_bounds: Option<Bounds<Pixels>>,
+    ) -> Option<super::native_menu::Anchor> {
+        use objc2::rc::Retained;
         use objc2_app_kit::NSView;
         use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-        use objc2::rc::Retained;
         use wry::WebViewExtMacOS;
 
         let host: Option<Retained<NSView>> = self
@@ -251,7 +275,7 @@ impl NativeWebview {
             .map(|d| d.host.clone())
             .or_else(|| unsafe { self.webview.webview().superview() });
 
-        let anchor = anchor_bounds.zip(host).map(|(b, host)| {
+        anchor_bounds.zip(host).map(|(b, host)| {
             let bx = f32::from(b.origin.x) as f64;
             let by = f32::from(b.origin.y) as f64;
             let bw = f32::from(b.size.width) as f64;
@@ -267,8 +291,69 @@ impl NativeWebview {
                 rect: CGRect::new(CGPoint::new(bx, view_y), CGSize::new(bw, bh)),
                 flipped,
             }
-        });
-        super::native_menu::popup(anchor, header, items)
+        })
+    }
+
+    /// Inject imported cookies into this webview's active-profile cookie store.
+    /// The data store is the one `wry` bound to this profile at build time, so
+    /// the cookies land in the right isolated store and survive reloads. WebKit
+    /// cookie APIs are main-thread; callers invoke this on the main thread.
+    /// Google integrity cookies (bound to the source browser's TLS fingerprint)
+    /// are dropped — they'd reject the transplanted session. Returns the number
+    /// of cookies submitted. Values are never logged.
+    #[cfg(target_os = "macos")]
+    pub fn import_cookies(&self, cookies: &[super::cookie_import::ParsedCookie]) -> usize {
+        use objc2::runtime::{AnyObject, ProtocolObject};
+        use objc2_foundation::{
+            NSDate, NSHTTPCookie, NSHTTPCookieDomain, NSHTTPCookieExpires, NSHTTPCookieName,
+            NSHTTPCookiePath, NSHTTPCookiePropertyKey, NSHTTPCookieSameSiteLax,
+            NSHTTPCookieSameSitePolicy, NSHTTPCookieSameSiteStrict, NSHTTPCookieSecure,
+            NSHTTPCookieValue, NSMutableDictionary, NSString,
+        };
+        use wry::WebViewExtMacOS;
+
+        use super::cookie_import::{SameSite, inject};
+
+        let webview = self.webview.webview();
+        let store = unsafe { webview.configuration().websiteDataStore().httpCookieStore() };
+
+        let mut count = 0usize;
+        for c in cookies {
+            if !inject::should_import(&c.host, &c.name) {
+                continue;
+            }
+            let dict = NSMutableDictionary::<NSHTTPCookiePropertyKey, AnyObject>::new();
+            let domain = NSString::from_str(&c.host);
+            let name = NSString::from_str(&c.name);
+            let value = NSString::from_str(&c.value);
+            let path = NSString::from_str(if c.path.is_empty() { "/" } else { &c.path });
+            unsafe {
+                dict.setObject_forKey(&domain, ProtocolObject::from_ref(NSHTTPCookieDomain));
+                dict.setObject_forKey(&name, ProtocolObject::from_ref(NSHTTPCookieName));
+                dict.setObject_forKey(&value, ProtocolObject::from_ref(NSHTTPCookieValue));
+                dict.setObject_forKey(&path, ProtocolObject::from_ref(NSHTTPCookiePath));
+                if c.secure {
+                    let yes = NSString::from_str("TRUE");
+                    dict.setObject_forKey(&yes, ProtocolObject::from_ref(NSHTTPCookieSecure));
+                }
+                match c.same_site {
+                    SameSite::Lax => dict
+                        .setObject_forKey(NSHTTPCookieSameSiteLax, ProtocolObject::from_ref(NSHTTPCookieSameSitePolicy)),
+                    SameSite::Strict => dict
+                        .setObject_forKey(NSHTTPCookieSameSiteStrict, ProtocolObject::from_ref(NSHTTPCookieSameSitePolicy)),
+                    SameSite::None | SameSite::Unspecified => {}
+                }
+                if let Some(secs) = c.expires_unix_s {
+                    let when = NSDate::dateWithTimeIntervalSince1970(secs as f64);
+                    dict.setObject_forKey(&when, ProtocolObject::from_ref(NSHTTPCookieExpires));
+                }
+                if let Some(cookie) = NSHTTPCookie::cookieWithProperties(&dict) {
+                    store.setCookie_completionHandler(&cookie, None);
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     /// Open the WebKit inspector docked *inside the browser pane* (page on top,

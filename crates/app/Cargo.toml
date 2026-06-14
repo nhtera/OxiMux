@@ -44,6 +44,21 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
+# Browser cookie import (read installed browsers' cookie SQLite DBs → inject
+# into the active webview profile's WKWebsiteDataStore). rusqlite reads the
+# source DBs (copied to a temp dir first so a running browser's WAL lock never
+# blocks us); tempfile owns that scratch dir. The RustCrypto trio decrypts
+# Chromium's AES-128-CBC cookie values (key derived from the macOS Keychain
+# "<Browser> Safe Storage" item via PBKDF2-HMAC-SHA1). All small, pure-Rust,
+# no system crypto linkage.
+rusqlite = { workspace = true }
+tempfile = "3"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = { version = "0.12", default-features = false }
+sha1 = "0.10"
+hmac = "0.12"
+
 # Relay supervisor's `pre_exec` calls libc::umask so the bundled
 # socket/token files come out 0600. libc is already in the transitive
 # graph via nix/tokio but pulling it explicitly is cheaper than the
@@ -62,7 +77,18 @@ objc2 = "0.6"
 # Desktop notifications (`notifier::mac`) ride UNUserNotificationCenter;
 # foundation + block2 supply NSString/NSBundle and the completion-handler
 # blocks. All three are already in the transitive graph via gpui-component.
-objc2-foundation = { version = "0.3", features = ["NSUserDefaults"] }
+objc2-foundation = { version = "0.3", features = [
+  "NSUserDefaults",
+  # Cookie import: build NSHTTPCookie objects from imported rows and hand
+  # them to a WKHTTPCookieStore. NSURL/NSDate/NSString/NSDictionary supply
+  # the cookie properties; NSArray iterates the store's existing cookies.
+  "NSHTTPCookie",
+  "NSURL",
+  "NSDate",
+  "NSString",
+  "NSDictionary",
+  "NSArray",
+] }
 objc2-user-notifications = "0.3"
 block2 = "0.6"
 # Embedded browser-tab engine: one Rust API over the platform webview
@@ -96,6 +122,11 @@ objc2-app-kit = { version = "0.3", features = [
 objc2-web-kit = { version = "0.3", features = [
   "WKWebView",
   "WKSnapshotConfiguration",
+  # Cookie import injection: reach the live webview's per-profile data store
+  # (via its configuration) and push imported NSHTTPCookies into its cookie store.
+  "WKWebViewConfiguration",
+  "WKWebsiteDataStore",
+  "WKHTTPCookieStore",
   "block2",
   "objc2-app-kit",
   "objc2-core-foundation",

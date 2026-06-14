@@ -10,6 +10,8 @@
 //! PTY: a pure in-process leaf like the editor / diff views.
 
 mod agent_context;
+#[cfg(target_os = "macos")]
+mod cookie_import;
 mod native;
 #[cfg(target_os = "macos")]
 mod native_menu;
@@ -158,6 +160,27 @@ enum ProfileRequest {
     Switch(Option<uuid::Uuid>),
     /// Create a fresh isolated profile and switch to it.
     New,
+}
+
+/// A profiles-menu pick, indexed by the cascading menu's leaf id. Profile
+/// switches defer to the next render (they rebuild the webview); cookie imports
+/// run inline (no `&Window` needed — they only write the live data store).
+#[cfg(target_os = "macos")]
+enum MenuAction {
+    Profile(ProfileRequest),
+    /// Import cookies from `(browser, source profile)` into the active profile.
+    ImportSource { browser_id: &'static str, profile_dir: String },
+    /// Import cookies from a browser-extension JSON export.
+    ImportFile,
+}
+
+/// Append `action` to the routing table and return its leaf id (the table
+/// index). Keeps the menu tree and its action list in lockstep.
+#[cfg(target_os = "macos")]
+fn push_action(actions: &mut Vec<MenuAction>, action: MenuAction) -> u32 {
+    let id = actions.len() as u32;
+    actions.push(action);
+    id
 }
 
 pub struct BrowserView {
@@ -595,32 +618,132 @@ impl BrowserView {
             return;
         };
         let anchor = self.profile_anchor.get();
-        // Parallel lists: `targets[i]` is the action for menu row `i`. Row 0 is
-        // the shared default store; then one row per profile; last is "New".
         let active = self.profile_id;
-        let mut items = vec![native_menu::MenuItem::new("Default", active.is_none())];
-        let mut targets: Vec<ProfileRequest> = vec![ProfileRequest::Switch(None)];
+
+        // `actions[id]` is the routing for the leaf with that id. Rows: shared
+        // default, one per profile, "New Profile…", then the "Import Cookies"
+        // cascade (one submenu per installed browser → its source profiles).
+        let mut actions: Vec<MenuAction> = Vec::new();
+        let mut entries: Vec<native_menu::MenuEntry> = Vec::new();
+
+        let id = push_action(&mut actions, MenuAction::Profile(ProfileRequest::Switch(None)));
+        entries.push(native_menu::MenuEntry::item("Default", active.is_none(), id));
         if let Some(g) = cx.try_global::<BrowserProfiles>() {
             for p in &g.profiles {
-                items.push(native_menu::MenuItem::new(p.name.clone(), Some(p.id) == active));
-                targets.push(ProfileRequest::Switch(Some(p.id)));
+                let id =
+                    push_action(&mut actions, MenuAction::Profile(ProfileRequest::Switch(Some(p.id))));
+                entries.push(native_menu::MenuEntry::item(p.name.clone(), Some(p.id) == active, id));
             }
         }
-        items.push(native_menu::MenuItem::new("New Profile…", false).with_separator());
-        targets.push(ProfileRequest::New);
+        let id = push_action(&mut actions, MenuAction::Profile(ProfileRequest::New));
+        entries.push(native_menu::MenuEntry::item("New Profile…", false, id).with_separator());
+
+        // Cookie-import cascade — only when at least one browser is installed.
+        let detected = cookie_import::detect_installed_browsers();
+        if !detected.is_empty() {
+            let mut import_children: Vec<native_menu::MenuEntry> = Vec::new();
+            for b in &detected {
+                let label = format!("From {}", b.descriptor.label);
+                if b.profiles.len() > 1 {
+                    let mut rows = Vec::new();
+                    for p in &b.profiles {
+                        let id = push_action(
+                            &mut actions,
+                            MenuAction::ImportSource {
+                                browser_id: b.descriptor.id,
+                                profile_dir: p.directory.clone(),
+                            },
+                        );
+                        rows.push(native_menu::MenuEntry::item(p.name.clone(), false, id));
+                    }
+                    import_children.push(native_menu::MenuEntry::submenu(label, rows));
+                } else {
+                    let id = push_action(
+                        &mut actions,
+                        MenuAction::ImportSource {
+                            browser_id: b.descriptor.id,
+                            profile_dir: b.profiles[0].directory.clone(),
+                        },
+                    );
+                    import_children.push(native_menu::MenuEntry::item(label, false, id));
+                }
+            }
+            let id = push_action(&mut actions, MenuAction::ImportFile);
+            import_children.push(native_menu::MenuEntry::item("From File…", false, id).with_separator());
+            entries
+                .push(native_menu::MenuEntry::submenu("Import Cookies", import_children).with_separator());
+        }
 
         cx.spawn(async move |this, cx| {
-            let Some(idx) = native.popup_menu(anchor, Some("Profiles"), &items) else {
+            let Some(id) = native.popup_menu_tree(anchor, Some("Profiles"), &entries) else {
                 return;
             };
-            let mut targets = targets;
-            let req = targets.swap_remove(idx);
-            let _ = this.update(cx, |view, cx| {
-                view.pending_profile = Some(req);
-                cx.notify();
-            });
+            let mut actions = actions;
+            match actions.swap_remove(id as usize) {
+                MenuAction::Profile(req) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.pending_profile = Some(req);
+                        cx.notify();
+                    });
+                }
+                MenuAction::ImportSource { browser_id, profile_dir } => {
+                    let label =
+                        cookie_import::catalog::by_id(browser_id).map(|d| d.label).unwrap_or("browser");
+                    let collected = cx
+                        .background_executor()
+                        .spawn(async move {
+                            cookie_import::collect_from_source(browser_id, &profile_dir)
+                        })
+                        .await;
+                    let _ =
+                        this.update(cx, move |view, _cx| view.apply_import_result(collected, label));
+                }
+                MenuAction::ImportFile => {
+                    let picked = rfd::AsyncFileDialog::new()
+                        .add_filter("Cookie export (JSON)", &["json"])
+                        .pick_file()
+                        .await;
+                    let Some(file) = picked else { return };
+                    let path = file.path().to_path_buf();
+                    let collected = cx
+                        .background_executor()
+                        .spawn(async move { cookie_import::collect_from_file(&path) })
+                        .await;
+                    let _ =
+                        this.update(cx, move |view, _cx| view.apply_import_result(collected, "file"));
+                }
+            }
         })
         .detach();
+    }
+
+    /// Inject a collected cookie set into the active profile's data store and
+    /// float a confirmation toast over the page. Runs on the main thread (where
+    /// WebKit's cookie store must be touched). Errors surface as a toast too.
+    #[cfg(target_os = "macos")]
+    fn apply_import_result(
+        &mut self,
+        result: Result<cookie_import::Collected, cookie_import::ImportError>,
+        label: &str,
+    ) {
+        let Some(native) = self.native.clone() else { return };
+        match result {
+            Ok(collected) => {
+                let imported = native.import_cookies(&collected.cookies);
+                let plural = if imported == 1 { "" } else { "s" };
+                let mut msg = format!("Imported {imported} cookie{plural} from {label}");
+                if collected.skipped > 0 {
+                    msg.push_str(&format!(" · {} skipped", collected.skipped));
+                }
+                msg.push_str(" — reload to apply");
+                native.eval_script(&agent_context::confirm_toast_js(&msg));
+            }
+            Err(e) => {
+                native.eval_script(&agent_context::confirm_toast_js(&format!(
+                    "Cookie import failed: {e}"
+                )));
+            }
+        }
     }
 
     /// Off macOS the profiles menu is injected into the page (a GPUI menu would

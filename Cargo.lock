@@ -5095,8 +5095,10 @@ dependencies = [
 name = "oximux-app"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "block2",
+ "cbc",
  "dirs 5.0.1",
  "futures",
  "gpui",
@@ -5104,6 +5106,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_macros",
  "gpui_platform",
+ "hmac",
  "libc",
  "notify-debouncer-full",
  "objc2",
@@ -5122,10 +5125,13 @@ dependencies = [
  "oximux-relay-proto",
  "oximux-settings",
  "oximux-storage",
+ "pbkdf2",
  "regex",
  "rfd",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
  "similar",
  "syntect",
  "tempfile",
@@ -6926,6 +6932,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
 dependencies = [
  "stable_deref_trait",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]
