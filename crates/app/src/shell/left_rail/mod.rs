@@ -20,6 +20,7 @@
 //! `open_row_menu`), which fire on user events after render completes.
 
 pub mod nav_section;
+pub mod project_drag;
 pub mod project_group;
 pub mod project_menu;
 pub mod resize;
@@ -574,7 +575,7 @@ fn render_workspace_list(
         .h_full()
         .overflow_y_scroll()
         .track_scroll(&list_scroll);
-    for project in projects {
+    for (project_index, project) in projects.into_iter().enumerate() {
         let workspaces = workspaces_by_project
             .get(&project.id)
             .cloned()
@@ -627,6 +628,8 @@ fn render_workspace_list(
         col = col.child(render_project_group(
             plan,
             project,
+            project_index,
+            sort_mode,
             workspaces,
             latest_status_for,
             latest_adapter_for,

@@ -191,6 +191,8 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
                 archived_at: None,
                 linked_issue: None,
                 tint: None,
+                // Synthesized primary row; always pinned first, never reordered.
+                sort_order: 0.0,
             },
         );
     }
@@ -467,10 +469,63 @@ impl WorkspaceRoot {
     /// touched (picker) so the in-memory snapshot stays in sync with the
     /// persisted order.
     pub(crate) fn refresh_recent_projects(&mut self) {
-        match self.app_state.project_repo.list_recent(20) {
+        // Manual (sort_order) order, not recency — opening/adding a project
+        // appends or leaves it in place rather than floating it to the top.
+        match self.app_state.project_repo.list_ordered(20) {
             Ok(list) => self.app_state.recent_projects = list,
-            Err(err) => tracing::warn!(?err, "refresh_recent_projects: list_recent failed"),
+            Err(err) => tracing::warn!(?err, "refresh_recent_projects: list_ordered failed"),
         }
+    }
+
+    /// Persist a drag-reorder of the project list: write `moved_id`'s new rank
+    /// adjacent to the project at `target_index`, then re-pull the ordered list
+    /// and re-render the rail. A drop in place is already filtered by the drop
+    /// handler; an unknown id is a benign no-op at the repo layer.
+    pub(crate) fn reorder_project(
+        &mut self,
+        moved_id: String,
+        target_index: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(err) = self
+            .app_state
+            .project_repo
+            .reorder_to(&moved_id, target_index)
+        {
+            tracing::warn!(?err, project_id = %moved_id, "reorder_project: persist failed");
+            return;
+        }
+        self.refresh_recent_projects();
+        // The rail snapshots `recent_projects` at the top of render; notify so
+        // the new order paints this frame.
+        cx.notify();
+    }
+
+    /// Persist a drag-reorder of a workspace row within its project group:
+    /// write `moved_id`'s new rank next to `target_id`, then re-gather the
+    /// rail's row cache so the new order paints. Cross-group drops are already
+    /// rejected at the card; a missing id is a benign no-op at the repo layer.
+    pub(crate) fn reorder_workspace(
+        &mut self,
+        moved_id: String,
+        target_id: String,
+        project_id: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(err) = self.app_state.workspace_repo.reorder_to_target(
+            &moved_id,
+            &target_id,
+            &project_id,
+        ) {
+            tracing::warn!(?err, %moved_id, "reorder_workspace: persist failed");
+            return;
+        }
+        // Workspace rows live in the rail's background-gathered cache; mark it
+        // dirty so the new sort_order is re-read, then notify to repaint.
+        self.mark_rail_dirty(cx);
+        cx.notify();
     }
 
     /// Register a folder dropped onto the left rail and make it the active
@@ -1075,6 +1130,7 @@ impl WorkspaceRoot {
             archived_at: None,
             linked_issue: None,
             tint: None,
+            sort_order: 0.0,
         };
         self.activate_workspace(workspace, window, cx);
     }

@@ -83,10 +83,6 @@ pub fn sort_workspaces(
     mode: WorkspaceSortMode,
     attention_for: impl Fn(&Workspace) -> u8,
 ) -> Vec<Workspace> {
-    if mode == WorkspaceSortMode::Manual {
-        return workspaces.to_vec();
-    }
-
     let (mut primary, mut rest): (Vec<Workspace>, Vec<Workspace>) = workspaces
         .iter()
         .cloned()
@@ -97,7 +93,12 @@ pub fn sort_workspaces(
         WorkspaceSortMode::Smart => rest.sort_by_key(|ws| attention_for(ws)),
         // created_at is an RFC3339 UTC string; lexicographic desc = newest first.
         WorkspaceSortMode::Recent => rest.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-        WorkspaceSortMode::Manual => unreachable!("handled by early return"),
+        // Drag-assigned rank, ascending. `total_cmp` keeps the sort total even
+        // if a rank is ever NaN (it never should be). Equal ranks keep input
+        // order (stable sort).
+        WorkspaceSortMode::Manual => {
+            rest.sort_by(|a, b| a.sort_order.total_cmp(&b.sort_order))
+        }
     }
 
     primary.extend(rest);
@@ -339,6 +340,7 @@ mod tests {
             archived_at: None,
             linked_issue: None,
             tint: None,
+            sort_order: 0.0,
         }
     }
 
@@ -367,7 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn manual_sort_preserves_input_order() {
+    fn manual_sort_equal_ranks_preserve_input_order() {
+        // With all ranks equal (0.0), the stable sort keeps input order and
+        // the primary is pinned first.
         let root = "/tmp/p1";
         let list = vec![
             ws("primary", root, "2026-01-01T00:00:00+00:00"),
@@ -377,6 +381,25 @@ mod tests {
         let out = sort_workspaces(&list, root, WorkspaceSortMode::Manual, |_| 0);
         let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(ids, ["primary", "b", "a"]);
+    }
+
+    #[test]
+    fn manual_sort_orders_by_sort_order_with_primary_pinned() {
+        let root = "/tmp/p1";
+        let mut primary = ws("primary", root, "2026-01-01T00:00:00+00:00");
+        primary.sort_order = 99.0; // primary stays first regardless of rank
+        let mut a = ws("a", "/tmp/p1/a", "2026-02-01T00:00:00+00:00");
+        a.sort_order = 3.0;
+        let mut b = ws("b", "/tmp/p1/b", "2026-03-01T00:00:00+00:00");
+        b.sort_order = 1.0;
+        let mut c = ws("c", "/tmp/p1/c", "2026-04-01T00:00:00+00:00");
+        c.sort_order = 2.0;
+        // Input deliberately out of rank order.
+        let list = vec![primary, a, b, c];
+        let out = sort_workspaces(&list, root, WorkspaceSortMode::Manual, |_| 0);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        // Primary pinned first; rest by ascending sort_order: b(1) c(2) a(3).
+        assert_eq!(ids, ["primary", "b", "c", "a"]);
     }
 
     #[test]

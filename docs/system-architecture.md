@@ -546,6 +546,32 @@ Every spawned terminal receives an `OXIMUX_*` env block minted at spawn time:
 
 ---
 
+## Left-rail drag-to-reorder
+
+Project groups and workspace rows support drag reorder. The interaction follows Zed's stateless GPUI idiom — no drag entity; state lives in the payload type.
+
+```
+on_drag(ProjectDragPayload { id, original_index })
+  │
+  drag_over(target row)
+    insertion_side(pointer_y, row_bounds) → Above | Below
+    paint_insertion_line(bounds, side, cx)   ← 2px accent, full-width
+  │
+on_drop
+  reorder_slot_value(neighbors) → f64   ← midpoint between neighbors
+  ProjectRepo::reorder_to(id, index)
+    or WorkspaceRepo::reorder_to_target(id, neighbor_id, side)
+    ↳ normalize_ranks() if float precision exhausted
+```
+
+**Sort order model**: `projects.sort_order REAL` (V014) and `workspaces.sort_order REAL` (V015); sparse-float (gaps of 1.0 between rows), narrowed by repeated insertions, renormalized to integer spacing when gap < f64::EPSILON. `ProjectRepo::list_ordered` replaces the old recency (`last_opened_at DESC`) query — project list is now **manual-sticky**; opening a project does not reorder it.
+
+**Escape cancel**: `DismissOverlay` handler calls `cx.stop_active_drag` as its first branch, cancelling any in-flight drag before closing overlays.
+
+**Constraints**: drop indicator is full-width only (GPUI `drag_over` is style-only; pixel-inset requires a separate overlay entity, deferred). Workspace drag disabled outside `Manual` sort mode; primary workspace row not draggable.
+
+---
+
 ## Deferred / not in v1
 
 | Feature | Deferred to |

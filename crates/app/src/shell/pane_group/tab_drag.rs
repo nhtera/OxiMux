@@ -2,9 +2,10 @@
 //!
 //! The chip's `.on_drag` hands a `TabDragPayload` to GPUI; matching
 //! `.on_drag_move::<TabDragPayload>` / `.on_drop::<TabDragPayload>`
-//! handlers on the same chip (and, in Phase D, on other groups' bodies)
-//! consume it. Cross-group drag lives in Phase D — for now the drop
-//! handler asserts the source group equals the dropping group.
+//! handlers on the same chip (and on other groups' strip bodies) consume
+//! it. Same-group drops reorder via `move_tab`; cross-group drops transfer
+//! the tab into the destination group, while a pinned source refuses the
+//! cross-group move (its destination affordance is suppressed).
 
 use gpui::{
     Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,

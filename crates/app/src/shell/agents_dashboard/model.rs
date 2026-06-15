@@ -205,6 +205,7 @@ mod tests {
             default_branch: "main".to_string(),
             created_at: "2026-06-01T00:00:00Z".to_string(),
             last_opened_at: None,
+            sort_order: 0.0,
         }
     }
 
@@ -221,6 +222,7 @@ mod tests {
             archived_at: None,
             linked_issue: None,
             tint: None,
+            sort_order: 0.0,
         }
     }
 

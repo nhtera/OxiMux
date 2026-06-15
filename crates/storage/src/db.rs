@@ -55,9 +55,23 @@ pub fn open(path: &Path) -> Result<Db, StorageError> {
     let mut conn = Connection::open_with_flags(path, flags).map_err(StorageError::Open)?;
     set_pragmas(&conn, /* expect_wal = */ true)?;
     run_migrations(&mut conn, MIGRATIONS)?;
-    Ok(Db {
+    let db = Db {
         conn: Arc::new(Mutex::new(conn)),
-    })
+    };
+    backfill_sort_orders(&db)?;
+    Ok(db)
+}
+
+/// Seed manual `sort_order` ranks for any rows the migration left at the `0.0`
+/// sentinel, so the left rail's drag-to-reorder has a stable initial order
+/// matching the pre-migration display. Both calls are idempotent (they only
+/// touch `0.0` rows), so running this on every open is cheap and a no-op once
+/// seeded.
+fn backfill_sort_orders(db: &Db) -> Result<(), StorageError> {
+    use crate::repositories::{ProjectRepo, WorkspaceRepo};
+    ProjectRepo::new(db.clone()).backfill_sort_order()?;
+    WorkspaceRepo::new(db.clone()).backfill_sort_order()?;
+    Ok(())
 }
 
 /// Open an in-memory database. **Test helper — do not use in production.**
@@ -69,9 +83,11 @@ pub fn open_memory() -> Result<Db, StorageError> {
     let mut conn = Connection::open_in_memory().map_err(StorageError::Open)?;
     set_pragmas(&conn, /* expect_wal = */ false)?;
     run_migrations(&mut conn, MIGRATIONS)?;
-    Ok(Db {
+    let db = Db {
         conn: Arc::new(Mutex::new(conn)),
-    })
+    };
+    backfill_sort_orders(&db)?;
+    Ok(db)
 }
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;

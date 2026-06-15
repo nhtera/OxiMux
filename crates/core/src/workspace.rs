@@ -5,7 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally not derived: `sort_order: f64` is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
     pub project_id: String,
@@ -28,6 +29,12 @@ pub struct Workspace {
     /// back-compat with pre-field snapshots.
     #[serde(default)]
     pub tint: Option<String>,
+    /// Sparse manual display rank within the workspace's project group (lower
+    /// = higher). Only consulted in `Manual` sort mode; the primary row stays
+    /// pinned first regardless. `#[serde(default)]` for back-compat with
+    /// pre-field snapshots (defaults to `0.0`, treated as not-yet-ranked).
+    #[serde(default)]
+    pub sort_order: f64,
 }
 
 /// Per-worktree SCM scratch state, persisted in the V006

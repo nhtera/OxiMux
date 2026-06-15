@@ -385,6 +385,7 @@ mod tests {
             archived_at: None,
             linked_issue: None,
             tint: None,
+            sort_order: 0.0,
         }
     }
 
@@ -578,6 +579,7 @@ mod tests {
             archived_at: None,
             linked_issue: None,
             tint: None,
+            sort_order: 0.0,
         }
     }
 

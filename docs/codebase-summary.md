@@ -64,7 +64,9 @@ src/
     │   │                   status_dot_color delegates to agent_verb for color parity
     │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
     │   │                   CARD_HEIGHT_MULT = 2.2 × h_row (design-guidelines approved exception)
-    │   ├── project_group.rs renders project groups; threads diff_counts snapshot into card builder
+    │   ├── project_group.rs renders project groups; threads diff_counts snapshot into card builder; on_drag/drag_over/on_drop wired for reorder
+    │   ├── project_drag.rs drag payloads, insertion_side, paint_insertion_line (2px accent line),
+    │   │                   SidebarDragPreview ghost chip, WorkspaceDragConfig, reorder_slot_value
     │   └── toolbar.rs      Add Project + settings (stubs)
     ├── agents_dashboard/   all-agents view rendered when the Agents nav item is active
     │   ├── model.rs        pure: AgentRow, attention_rank, sort_agent_rows, build_agent_rows,
@@ -344,6 +346,8 @@ src/
 | `repositories/settings.rs` | `SettingsRepo`: get / set (upsert) / delete; caller enforces ≤ 64 KiB |
 | `migrations/V001__init.sql` | 5 tables (projects, workspaces, agent_sessions [+ exit_code, status_detail for AgentStatus payloads], pane_sessions [ON DELETE SET NULL on agent FK], settings) + 3 FK-support indexes |
 | `migrations/V005__per_window_persistence.sql` | Adds `window_id TEXT NOT NULL DEFAULT 'main'` to `pane_buffers` and `pane_relay_ids`; rebuilds PKs to include `window_id`; backward compatible with existing rows |
+| `migrations/V014__project_sort_order.sql` | Adds `sort_order REAL` to `projects`; backfilled at `db::open` from display order |
+| `migrations/V015__workspace_sort_order.sql` | Adds `sort_order REAL` to `workspaces`; same backfill pattern. Migration ladder now at 15. |
 
 `r2d2` deliberately **not** adopted in v1 — single `Arc<Mutex<Connection>>` over WAL is sufficient for the single-writer model. Read-pool split (write conn + N readers) is the documented upgrade path if profiling shows contention.
 

@@ -54,7 +54,9 @@ const AGENT_CHOICES: &[AgentAdapter] = &[
 /// enum small — `Workspace` is ~216 bytes and would otherwise force
 /// every `Create`-mode dialog to carry a 216-byte tail of zeros (clippy
 /// `large_enum_variant` flag).
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Eq` is intentionally not derived: `Workspace` carries an `f64` rank, so it
+// is only `PartialEq`.
+#[derive(Clone, Debug, PartialEq)]
 pub enum WorkspaceDialogMode {
     Create,
     Rename(Box<Workspace>),
@@ -702,6 +704,7 @@ mod tests {
             archived_at: None,
             linked_issue: None,
             tint: None,
+            sort_order: 0.0,
         }
     }
 
@@ -713,6 +716,7 @@ mod tests {
             default_branch: "main".to_string(),
             created_at: "now".to_string(),
             last_opened_at: None,
+            sort_order: 0.0,
         }
     }
 

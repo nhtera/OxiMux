@@ -58,8 +58,14 @@ pub struct Migration {
 /// last-used model + reasoning-effort so the launch picker can
 /// preselect. V010 adds `diff_review_notes` — per-line diff review
 /// notes keyed by a `(repo, diff_ref, path, side, line)` anchor so a
-/// review survives tab close + restart. Future migrations append;
-/// never reorder, never rewrite.
+/// review survives tab close + restart. V011 links a workspace to the
+/// GitHub issue/PR it was created from; V012 adds an optional per-
+/// workspace identifier hue; V013 drops the `agent_sessions` workspace
+/// FK. V014 adds `projects.sort_order` and V015 adds
+/// `workspaces.sort_order` — sparse REAL ranks driving manual
+/// drag-to-reorder in the left rail; a one-shot Rust backfill seeds
+/// existing rows from their current display order. Future migrations
+/// append; never reorder, never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -125,6 +131,16 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 13,
         name: "agent_sessions_drop_workspace_fk",
         sql: include_str!("../migrations/V013__agent_sessions_drop_workspace_fk.sql"),
+    },
+    Migration {
+        version: 14,
+        name: "projects_sort_order",
+        sql: include_str!("../migrations/V014__projects_sort_order.sql"),
+    },
+    Migration {
+        version: 15,
+        name: "workspaces_sort_order",
+        sql: include_str!("../migrations/V015__workspaces_sort_order.sql"),
     },
 ];
 

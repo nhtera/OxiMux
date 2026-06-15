@@ -3233,7 +3233,14 @@ impl Render for WorkspaceRoot {
                     p.split_active_group(axis, insert, window, cx);
                 });
             }))
-            .on_action(cx.listener(|this, _: &DismissOverlay, _window, cx| {
+            .on_action(cx.listener(|this, _: &DismissOverlay, window, cx| {
+                // An in-flight drag takes priority: Escape cancels it (clears
+                // the active drag, no drop side-effect) and consumes the key.
+                // Only when no drag is active does Escape fall through to
+                // overlay dismissal, preserving its existing behaviour.
+                if cx.stop_active_drag(window) {
+                    return;
+                }
                 // Close every transient overlay so a single Escape dismisses
                 // whichever popover is currently visible. Modal dialogs
                 // (project picker / workspace create / palette) own their
@@ -3250,6 +3257,8 @@ impl Render for WorkspaceRoot {
                     || this.git_row_context_menu.read(cx).is_open()
                     || this.commit_context_menu.read(cx).is_open()
                     || this.adapter_picker.read(cx).is_open()
+                    || this.row_menu.read(cx).is_open()
+                    || this.project_menu.read(cx).is_open()
                     || this.usage_popover_open;
                 if !any_open {
                     cx.propagate();
@@ -3261,6 +3270,8 @@ impl Render for WorkspaceRoot {
                 this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                 this.commit_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                this.row_menu.update(cx, |m, cx| m.close(cx));
+                this.project_menu.update(cx, |m, cx| m.close(cx));
                 if this.usage_popover_open {
                     this.usage_popover_open = false;
                     cx.notify();

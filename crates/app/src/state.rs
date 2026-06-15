@@ -109,7 +109,10 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
     // threading a Db through every intermediate constructor.
     crate::shell::diff_view::note_repo_handle::init_note_repo(DiffReviewNoteRepo::new(db.clone()));
 
-    let recent_projects = project_repo.list_recent(RECENT_PROJECTS_LIMIT)?;
+    // Manual display order for the rail: by `sort_order`, not recency. Opening
+    // a project does not reshuffle the list — the order is sticky until a drag
+    // rewrites it. The picker reads the same snapshot.
+    let recent_projects = project_repo.list_ordered(RECENT_PROJECTS_LIMIT)?;
 
     let mut workspaces: HashMap<String, Vec<Workspace>> =
         HashMap::with_capacity(recent_projects.len());
@@ -247,13 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_recent_projects_ordered_by_last_opened() {
+    fn hydrate_recent_projects_manual_sticky_ignores_last_opened() {
         let db = fresh_db();
         let project_repo = ProjectRepo::new(db.clone());
-        let _p1 = project_repo.insert("p1", "/p1", "main").expect("p1");
+        let p1 = project_repo.insert("p1", "/p1", "main").expect("p1");
         let p2 = project_repo.insert("p2", "/p2", "main").expect("p2");
-        let _p3 = project_repo.insert("p3", "/p3", "main").expect("p3");
-        // Bump p2 forward — it should now lead the recent list.
+        let p3 = project_repo.insert("p3", "/p3", "main").expect("p3");
+        // Opening p2 must NOT float it to the top: the rail order is manual-
+        // sticky (by sort_order = insertion order here), not recency.
         project_repo
             .update_last_opened_at(&p2.id)
             .expect("touch p2");
@@ -261,10 +265,14 @@ mod tests {
         let state = hydrate(db).expect("hydrate");
 
         assert_eq!(state.recent_projects.len(), 3);
-        assert_eq!(state.recent_projects[0].id, p2.id);
-        // p1 still has no last_opened_at; whether it lands at index 1 or 2
-        // depends only on the `ORDER BY last_opened_at IS NULL` tiebreaker,
-        // which leaves the two NULL rows in `created_at DESC` order.
+        let ids: Vec<&str> = state
+            .recent_projects
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        // Insertion order assigns sort_order 1.0, 2.0, 3.0; touching p2 leaves
+        // it untouched.
+        assert_eq!(ids, [p1.id.as_str(), p2.id.as_str(), p3.id.as_str()]);
     }
 
     #[test]

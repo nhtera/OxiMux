@@ -6,7 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally not derived: `sort_order: f64` is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -14,4 +15,11 @@ pub struct Project {
     pub default_branch: String,
     pub created_at: String,
     pub last_opened_at: Option<String>,
+    /// Sparse manual display rank for the left-rail project list (lower =
+    /// higher). Independent of `last_opened_at`: opening a project does not
+    /// change its rank, so a hand-ordered list stays put. `#[serde(default)]`
+    /// so snapshots written before this field still deserialize (defaults to
+    /// `0.0`, treated as not-yet-ranked by the backfill).
+    #[serde(default)]
+    pub sort_order: f64,
 }

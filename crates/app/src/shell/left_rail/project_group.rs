@@ -6,8 +6,8 @@
 //! whether the project was already active when the user clicked.
 
 use gpui::{
-    Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, div, px, svg,
+    AppContext, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, div, px, svg,
 };
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
@@ -15,7 +15,11 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::actions::OpenWorkspaceCreate;
 use crate::shell::agent_presentation::AmbientAgent;
 use crate::shell::left_rail::LeftRail;
+use crate::shell::left_rail::project_drag::{
+    ProjectDragPayload, SidebarDragPreview, insertion_side, paint_insertion_line,
+};
 use crate::shell::left_rail::workspace_card::render_workspace_card;
+use crate::shell::left_rail::workspace_list_render::WorkspaceSortMode;
 use crate::shell::left_rail::workspace_row::{DiffCounts, build_workspace_card_plan};
 use crate::workspace_root::WorkspaceRoot;
 
@@ -69,6 +73,8 @@ pub fn build_project_group_plan(
 pub fn render_project_group(
     plan: ProjectGroupPlan,
     project: Project,
+    project_index: usize,
+    sort_mode: WorkspaceSortMode,
     workspaces: Vec<Workspace>,
     latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
     latest_adapter_for: impl Fn(&str) -> Option<&'static str>,
@@ -91,6 +97,7 @@ pub fn render_project_group(
     let header = build_header(
         plan,
         project.clone(),
+        project_index,
         group_name.clone(),
         rail,
         weak_root.clone(),
@@ -107,7 +114,7 @@ pub fn render_project_group(
         return col;
     }
 
-    for workspace in workspaces {
+    for (row_index, workspace) in workspaces.into_iter().enumerate() {
         let row_group: SharedString = format!("ws-row-{}", workspace.id).into();
         let is_active = active_workspace_id == Some(workspace.id.as_str());
         // The main worktree lives at the project root; that row is the
@@ -181,12 +188,37 @@ pub fn render_project_group(
                     .update(cx, |root, cx| root.activate_workspace(workspace, window, cx));
             };
 
+        // Drag-to-reorder is offered only for non-primary rows while the rail
+        // is in Manual sort mode (Smart/Recent are computed orders — dragging
+        // there would be immediately overwritten). The pinned primary row is
+        // never draggable and never a drop target.
+        let drag_config = (!is_primary && sort_mode == WorkspaceSortMode::Manual).then(|| {
+            let weak_root_for_reorder = weak_root.clone();
+            let project_id_for_reorder = project.id.clone();
+            crate::shell::left_rail::project_drag::WorkspaceDragConfig {
+                workspace_id: workspace.id.clone(),
+                project_id: project.id.clone(),
+                src_index: row_index,
+                accent: theme.selection,
+                ghost_label: workspace.name.clone().into(),
+                on_reorder: std::rc::Rc::new(
+                    move |moved_id: String, target_id: String, window: &mut gpui::Window, cx: &mut gpui::App| {
+                        let project_id = project_id_for_reorder.clone();
+                        let _ = weak_root_for_reorder.update(cx, |root, cx| {
+                            root.reorder_workspace(moved_id, target_id, project_id, window, cx);
+                        });
+                    },
+                ),
+            }
+        });
+
         col = col.child(render_workspace_card(
             card_plan,
             row_id,
             row_group,
             !is_primary,
             locate_glow_seq,
+            drag_config,
             theme,
             density,
             typography,
@@ -202,6 +234,7 @@ pub fn render_project_group(
 fn build_header(
     plan: ProjectGroupPlan,
     project: Project,
+    project_index: usize,
     group_name: SharedString,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
@@ -373,6 +406,17 @@ fn build_header(
     let header_id: SharedString = format!("project-header-{}", project.id).into();
     let weak_for_header = weak_root.clone();
     let project_for_header = project.clone();
+    // Drag payload + ghost: dragging a header reorders the project list. The
+    // payload carries the start index; the drop handler recomputes from the
+    // live list by id, so a concurrent reorder can't misplace it.
+    let drag_payload = ProjectDragPayload {
+        project_id: project.id.clone(),
+        src_index: project_index,
+    };
+    let ghost_label = project.name.clone();
+    let accent = theme.selection;
+    let weak_for_drop = weak_root.clone();
+    let project_id_for_drop = project.id.clone();
     div()
         .id(header_id)
         .group(group_name)
@@ -391,6 +435,32 @@ fn build_header(
             let project = project_for_header.clone();
             let _ = weak_for_header.update(cx, |root, cx| {
                 root.set_active_project(project, window, cx);
+            });
+        })
+        .on_drag(drag_payload, move |_p, _offset, _window, cx| {
+            cx.new(|_| SidebarDragPreview::new(ghost_label.clone(), theme))
+        })
+        // Stateless insertion indicator: a 2px accent line on the edge the
+        // dragged header would land on. Suppressed on the source row itself
+        // (dropping in place is a no-op).
+        .drag_over::<ProjectDragPayload>(move |style, payload, _window, _cx| {
+            if payload.src_index == project_index {
+                return style;
+            }
+            paint_insertion_line(
+                style,
+                insertion_side(payload.src_index, project_index),
+                accent,
+            )
+        })
+        .on_drop::<ProjectDragPayload>(move |payload: &ProjectDragPayload, window, cx| {
+            // Drop in place: no write, no flicker.
+            if payload.project_id == project_id_for_drop {
+                return;
+            }
+            let moved_id = payload.project_id.clone();
+            let _ = weak_for_drop.update(cx, |root, cx| {
+                root.reorder_project(moved_id, project_index, window, cx);
             });
         })
         .child(icon_slot)
@@ -413,6 +483,7 @@ mod tests {
             default_branch: "main".to_string(),
             created_at: "2026-05-21T00:00:00Z".to_string(),
             last_opened_at: None,
+            sort_order: 0.0,
         }
     }
 
@@ -429,6 +500,7 @@ mod tests {
             archived_at: None,
             linked_issue: None,
             tint: None,
+            sort_order: 0.0,
         }
     }
 

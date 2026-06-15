@@ -4,6 +4,26 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-15 — Left-rail drag-to-reorder: projects and workspaces, persisted via sparse-float sort_order
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/storage/migrations/V014__project_sort_order.sql` (adds `sort_order REAL`), `V015__workspace_sort_order.sql` (same), `crates/storage/repositories/project.rs` (`reorder_to`, `list_ordered`, `normalize_ranks`), `crates/storage/repositories/workspace.rs` (`reorder_to_target`, `normalize_ranks`), `crates/core/src/project.rs` + `workspace.rs` (`sort_order: f64`; dropped `Eq`), `crates/app/src/shell/left_rail/project_drag.rs` (new module), `crates/app/src/shell/left_rail/project_group.rs` + `workspace_row.rs` (drag wiring), `crates/app/src/actions.rs`
+
+Projects and workspaces in the left rail can now be reordered by dragging. A sparse-float `sort_order` column (REAL) is added to both `projects` and `workspaces` via migrations V014 and V015 (migration ladder is now at 15). A one-shot Rust backfill at `db::open` seeds existing rows from current display order so no manual migration step is needed.
+
+**New module** `shell/left_rail/project_drag.rs`: drag payloads, `insertion_side` helper, `paint_insertion_line` (solid 2 px accent full-width drop indicator), `SidebarDragPreview` ghost chip, `WorkspaceDragConfig`. Uses Zed's stateless GPUI idiom (`on_drag` / `drag_over` / `on_drop`); `reorder_slot_value` pure helper computes the new float rank between neighbors.
+
+**Behavioral changes:**
+- Project list is now **manual-sticky** — ordered by `sort_order` via `ProjectRepo::list_ordered`, not recency. Opening a project no longer floats it to the top.
+- Workspace drag is only active in `Manual` sort mode; the primary workspace row is not draggable.
+- Escape cancels an in-flight drag via `cx.stop_active_drag` (first branch of `DismissOverlay` handler).
+
+`Project` and `Workspace` core structs gained `sort_order: f64` and dropped `#[derive(Eq)]` (f64 is `PartialEq` only).
+
+Status: build + clippy clean, unit/integration tests green. Hands-on live GUI verification outstanding. Drop indicator is full-width — GPUI `drag_over` is style-only, inset not achievable without a custom overlay.
+
+---
+
 ### 2026-06-15 — Usage popover: floating themed card above the inline browser
 
 **Commits**: _(local, pending)_

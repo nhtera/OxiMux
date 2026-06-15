@@ -15,11 +15,16 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
+    Animation, AnimationExt, AppContext, ElementId, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    div, prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::shell::left_rail::project_drag::{
+    SidebarDragPreview, WorkspaceDragConfig, WorkspaceDragPayload, insertion_side,
+    paint_insertion_line,
+};
 use crate::shell::left_rail::workspace_row::{
     FOLDER_ICON_SIZE, STATUS_DOT_SIZE, TRAILING_BTN_SIZE, WorkspaceCardPlan,
 };
@@ -47,6 +52,7 @@ pub fn render_workspace_card(
     group_name: SharedString,
     show_menu: bool,
     locate_glow_seq: u64,
+    drag: Option<WorkspaceDragConfig>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -286,7 +292,45 @@ pub fn render_workspace_card(
                 .child(line2),
         )
         .children(trailing_btn)
-        .on_mouse_down(MouseButton::Left, on_row_click);
+        .on_mouse_down(MouseButton::Left, on_row_click)
+        // Drag-to-reorder (Manual mode, non-primary rows only). Stateless
+        // idiom: the payload carries the source index, `drag_over` paints the
+        // insertion line, `on_drop` validates same-group then persists.
+        .when_some(drag, |el, cfg| {
+            let this_index = cfg.src_index;
+            let accent = cfg.accent;
+            let ghost = cfg.ghost_label.clone();
+            let over_project = cfg.project_id.clone();
+            let drop_project = cfg.project_id.clone();
+            let this_workspace_id = cfg.workspace_id.clone();
+            let on_reorder = cfg.on_reorder.clone();
+            el.on_drag(
+                WorkspaceDragPayload {
+                    workspace_id: cfg.workspace_id.clone(),
+                    project_id: cfg.project_id.clone(),
+                    src_index: cfg.src_index,
+                },
+                move |_p, _offset, _window, cx| {
+                    cx.new(|_| SidebarDragPreview::new(ghost.clone(), theme))
+                },
+            )
+            .drag_over::<WorkspaceDragPayload>(move |style, payload, _window, _cx| {
+                // Only react to rows from the same group; a foreign-group drag
+                // never lands here (drop rejects it), so draw no line.
+                if payload.project_id != over_project || payload.src_index == this_index {
+                    return style;
+                }
+                paint_insertion_line(style, insertion_side(payload.src_index, this_index), accent)
+            })
+            .on_drop::<WorkspaceDragPayload>(move |payload: &WorkspaceDragPayload, window, cx| {
+                // Reorder-only: reject a drop from a different project group or
+                // onto the source row itself.
+                if payload.project_id != drop_project || payload.workspace_id == this_workspace_id {
+                    return;
+                }
+                on_reorder(payload.workspace_id.clone(), this_workspace_id.clone(), window, cx);
+            })
+        });
 
     // Locate glow: the scroll-to-current affordance replays a one-shot
     // ring fade over the ACTIVE card, keyed on the bump sequence so it

@@ -10,7 +10,8 @@
 use oximux_core::{AgentSession, AgentStatus, PaneSession, Project, Workspace, WorktreeSettings};
 use rusqlite::Row;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is intentionally not derived: `sort_order: f64` is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectRow {
     pub id: String,
     pub name: String,
@@ -18,6 +19,7 @@ pub struct ProjectRow {
     pub default_branch: String,
     pub created_at: String,
     pub last_opened_at: Option<String>,
+    pub sort_order: f64,
 }
 
 impl ProjectRow {
@@ -29,6 +31,7 @@ impl ProjectRow {
             default_branch: row.get("default_branch")?,
             created_at: row.get("created_at")?,
             last_opened_at: row.get("last_opened_at")?,
+            sort_order: row.get("sort_order")?,
         })
     }
 }
@@ -42,11 +45,13 @@ impl From<ProjectRow> for Project {
             default_branch: r.default_branch,
             created_at: r.created_at,
             last_opened_at: r.last_opened_at,
+            sort_order: r.sort_order,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is intentionally not derived: `sort_order: f64` is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceRow {
     pub id: String,
     pub project_id: String,
@@ -59,6 +64,7 @@ pub struct WorkspaceRow {
     pub archived_at: Option<String>,
     pub linked_issue: Option<String>,
     pub tint: Option<String>,
+    pub sort_order: f64,
 }
 
 impl WorkspaceRow {
@@ -75,6 +81,7 @@ impl WorkspaceRow {
             archived_at: row.get("archived_at")?,
             linked_issue: row.get("linked_issue")?,
             tint: row.get("tint")?,
+            sort_order: row.get("sort_order")?,
         })
     }
 }
@@ -93,6 +100,7 @@ impl From<WorkspaceRow> for Workspace {
             archived_at: r.archived_at,
             linked_issue: r.linked_issue,
             tint: r.tint,
+            sort_order: r.sort_order,
         }
     }
 }
