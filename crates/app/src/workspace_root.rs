@@ -2111,7 +2111,7 @@ impl WorkspaceRoot {
 // the same reason.
 
 impl Render for WorkspaceRoot {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Push sidebar data down before LeftRail::render runs in the tree.
         self.refresh_left_rail(cx);
 
@@ -3510,6 +3510,11 @@ impl Render for WorkspaceRoot {
             // layer is non-interactive and bottom-right, so it doesn't steal
             // clicks from whatever is beneath it.
             .child(self.toast_layer.clone())
+            // gpui-component notification layer. `Root::render` does not mount
+            // it automatically, so leaf views that call `push_notification`
+            // (e.g. the editor breadcrumb's copy/reveal actions) need it here
+            // or their toasts never paint.
+            .children(gpui_component::Root::render_notification_layer(window, cx))
     }
 }
 

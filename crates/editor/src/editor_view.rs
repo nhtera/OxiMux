@@ -204,8 +204,8 @@ pub struct EditorView {
     /// only — not persisted, so every reopen of a `.md` starts in Preview.
     /// Meaningless (and unused) when `is_markdown` is false.
     md_mode: MarkdownViewMode,
-    /// Whether the breadcrumb "Open in…" dropdown is showing. View-lifetime.
-    open_in_menu_open: bool,
+    /// Whether the breadcrumb "⋯" actions dropdown is showing. View-lifetime.
+    actions_menu_open: bool,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
 }
@@ -267,7 +267,7 @@ impl EditorView {
             focused: false,
             is_markdown,
             md_mode,
-            open_in_menu_open: false,
+            actions_menu_open: false,
             _focus_sub,
             _blur_sub,
         }
@@ -279,14 +279,14 @@ impl EditorView {
         self.focused
     }
 
-    /// Flip the breadcrumb "Open in…" dropdown open/closed.
-    pub(crate) fn toggle_open_in_menu(&mut self) {
-        self.open_in_menu_open = !self.open_in_menu_open;
+    /// Flip the breadcrumb "⋯" actions dropdown open/closed.
+    pub(crate) fn toggle_actions_menu(&mut self) {
+        self.actions_menu_open = !self.actions_menu_open;
     }
 
-    /// Dismiss the breadcrumb "Open in…" dropdown.
-    pub(crate) fn close_open_in_menu(&mut self) {
-        self.open_in_menu_open = false;
+    /// Dismiss the breadcrumb "⋯" actions dropdown.
+    pub(crate) fn close_actions_menu(&mut self) {
+        self.actions_menu_open = false;
     }
 
     /// The live buffer text for text content; `None` for image/binary. Read at
@@ -512,17 +512,9 @@ impl Render for EditorView {
                 &self.file_path,
                 cx,
             ))
-            // Spacer pushes the actions + toggle to the row's trailing edge.
+            // Spacer pushes the toggle + actions to the row's trailing edge.
             .child(gpui::div().flex_1())
-            // File actions for every file: copy contents (text only), reveal in
-            // Finder, "Open in…" external editor.
-            .child(editor_header::action_buttons(
-                &self.file_path,
-                self.is_text(),
-                self.open_in_menu_open,
-                cx,
-            ))
-            // Markdown-only: the Source/Preview/Split toggle, far right.
+            // Markdown-only: the Source/Preview/Split toggle.
             .when(self.is_markdown, |row| {
                 row.child(
                     markdown_preview::mode_toggle(self.md_mode, cx.entity_id()).on_click(cx.listener(
@@ -536,7 +528,10 @@ impl Render for EditorView {
                         },
                     )),
                 )
-            });
+            })
+            // A single "⋯" overflow menu (far right) holding every file action:
+            // copy contents, reveal in Finder, open in an external editor.
+            .child(editor_header::actions_button(self.actions_menu_open, cx));
 
         // Snapshot the colors we need before constructing children — the
         // theme borrow is released here so the body match can re-borrow
@@ -626,9 +621,13 @@ impl Render for EditorView {
             )
             .child(breadcrumb)
             .child(body)
-            // "Open in…" dropdown: backdrop + card, painted above the body.
-            .when(self.open_in_menu_open, |this| {
-                this.child(editor_header::open_in_overlay(&self.file_path, cx))
+            // "⋯" actions dropdown: backdrop + card, painted above the body.
+            .when(self.actions_menu_open, |this| {
+                this.child(editor_header::actions_overlay(
+                    &self.file_path,
+                    self.is_text(),
+                    cx,
+                ))
             })
     }
 }
