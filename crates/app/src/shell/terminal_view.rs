@@ -1457,7 +1457,14 @@ impl TerminalView {
         let id = self.session_id;
         match self.with_backend(|be| be.cwd_hint(id)) {
             Some(cwd) => cwd.join(path),
-            None => path.to_path_buf(),
+            // No OSC 7 cwd (the shell never emitted one — the default on a
+            // bare macOS zsh). Fall back to the shell's live cwd via libproc on
+            // its pid, matching how cwd is resolved elsewhere; only if that
+            // also fails do we leave the path relative.
+            None => match self.os_pid().and_then(crate::shell::cwd_resolver::cwd_of_pid) {
+                Some(cwd) => cwd.join(path),
+                None => path.to_path_buf(),
+            },
         }
     }
 
