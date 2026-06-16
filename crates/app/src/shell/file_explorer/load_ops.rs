@@ -49,6 +49,9 @@ impl FileExplorer {
                             me.root_loaded = true;
                         }
                         me.recompute_rows();
+                        // A reveal may have been waiting on this directory's
+                        // children to materialize the target row.
+                        me.try_scroll_pending_reveal();
                         cx.notify();
                     });
                 })

@@ -43,6 +43,16 @@ use crate::markdown_preview::{self, MarkdownViewMode};
 
 actions!(oximux, [SaveFile]);
 
+/// Reveal the editor's file in the workspace file-tree sidebar. Dispatched
+/// from the breadcrumb actions menu and handled by the host shell, which
+/// owns the file tree. `PathBuf` isn't a valid action payload, so the path
+/// travels as a `String`.
+#[derive(Clone, Debug, Default, PartialEq, gpui::Action)]
+#[action(namespace = oximux, no_json)]
+pub struct RevealInExplorer {
+    pub path: String,
+}
+
 /// Map a file extension or well-known basename to the `gpui-component`
 /// language-registry key. Returns `"plain"` for anything we don't have a
 /// tree-sitter grammar mapping for — the editor still renders, just without

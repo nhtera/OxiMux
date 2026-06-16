@@ -20,11 +20,14 @@ use crate::shell::file_explorer::row_render::build_row_plan;
 use crate::shell::file_explorer::status_display::{
     BadgeStatus, build_folder_status_map, build_status_map,
 };
-use crate::shell::file_explorer::tree_state::{DirCache, TreeNode, filter_visible, flatten};
+use crate::shell::file_explorer::tree_state::{
+    DirCache, TreeNode, ancestor_dirs, filter_visible, flatten,
+};
 use crate::shell::file_tree_view::OnOpenFile;
 use gpui::{
-    AnyElement, App, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Subscription, Task, UniformListScrollHandle, Window, div, px, uniform_list,
+    AnyElement, App, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    ScrollStrategy, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px,
+    uniform_list,
 };
 use oximux_core::FileStatus;
 use oximux_git::PollState;
@@ -76,6 +79,11 @@ pub struct FileExplorer {
     /// basename; the row builder swaps the matching path's label for an
     /// `Input` widget bound to this entity. See `rename_ops.rs`.
     pub(crate) renaming: Option<rename_ops::RenameState>,
+    /// Path queued by `reveal_path` to be scrolled into view. Ancestor
+    /// directory loads are async, so the target row may not exist yet when
+    /// reveal is requested; the scroll is retried after each load lands and
+    /// cleared once it succeeds.
+    pending_reveal: Option<PathBuf>,
 }
 
 impl FileExplorer {
@@ -121,6 +129,7 @@ impl FileExplorer {
             _activation_sub: activation_sub,
             on_open,
             renaming: None,
+            pending_reveal: None,
         };
 
         // Kick off root directory load on mount.
@@ -250,6 +259,52 @@ impl FileExplorer {
         } else {
             self.recompute_rows();
             cx.notify();
+        }
+    }
+
+    /// Reveal `path` in the tree: expand every ancestor directory, mark the
+    /// row selected, and scroll it into view. Ancestor directory loads are
+    /// async, so the scroll is deferred via `pending_reveal` and retried as
+    /// each load lands (see `try_scroll_pending_reveal`). Bypasses the
+    /// `toggle_dir` depth guard — an explicit reveal is always honored.
+    pub(crate) fn reveal_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let ancestors = ancestor_dirs(&self.repo_root, &path);
+        let mut pending_loads = Vec::new();
+        for dir in &ancestors {
+            self.expanded.insert(dir.clone());
+            let needs_load = self
+                .cache
+                .get(dir)
+                .map(|c| !c.loaded && !c.loading)
+                .unwrap_or(true);
+            if needs_load {
+                pending_loads.push(dir.clone());
+            }
+        }
+        self.selected = Some(path.clone());
+        self.pending_reveal = Some(path);
+        for dir in pending_loads {
+            let repo_root = self.repo_root.clone();
+            let task = self.spawn_load_dir(dir, repo_root, false, cx);
+            self.push_task(task);
+        }
+        self.recompute_rows();
+        // Scroll now if the chain is already loaded; otherwise the async
+        // load completions will retry until the row exists.
+        self.try_scroll_pending_reveal();
+        cx.notify();
+    }
+
+    /// If a reveal is pending and its row is now present in the flat list,
+    /// scroll it into view and clear the request. No-op otherwise. Called
+    /// after every directory-load completion.
+    pub(super) fn try_scroll_pending_reveal(&mut self) {
+        let Some(target) = self.pending_reveal.clone() else {
+            return;
+        };
+        if let Some(ix) = self.rows.iter().position(|n| n.path == target) {
+            self.list_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+            self.pending_reveal = None;
         }
     }
 

@@ -36,6 +36,27 @@ pub fn should_include(name: &str) -> bool {
     !matches!(name, ".git" | "node_modules" | "target")
 }
 
+/// Directory paths between `repo_root` (exclusive) and `target`'s parent
+/// (inclusive), shallowest first — the directories that must be expanded for
+/// `target`'s row to become visible. The root is always loaded, and the
+/// target's own basename is excluded (a file isn't a directory to expand).
+/// Returns empty when `target` isn't under `repo_root` or sits directly in
+/// the root.
+pub fn ancestor_dirs(repo_root: &Path, target: &Path) -> Vec<PathBuf> {
+    let Ok(rel) = target.strip_prefix(repo_root) else {
+        return Vec::new();
+    };
+    let comps: Vec<_> = rel.components().collect();
+    let mut out = Vec::new();
+    let mut cur = repo_root.to_path_buf();
+    // Skip the last component: it's the revealed leaf itself.
+    for comp in comps.iter().take(comps.len().saturating_sub(1)) {
+        cur = cur.join(comp);
+        out.push(cur.clone());
+    }
+    out
+}
+
 /// Build the flat visible-row list from the cache + expanded set.
 ///
 /// Walk is breadth-at-depth — for each level, emit dirs first (alphabetically,
@@ -152,6 +173,34 @@ mod tests {
         assert!(should_include("README.md"));
         assert!(should_include("Cargo.toml"));
         assert!(should_include(".gitignore")); // dotfiles that are not .git are fine
+    }
+
+    // ── ancestor_dirs ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ancestor_dirs_nested_file_lists_parent_chain() {
+        let root = Path::new("/repo");
+        let target = Path::new("/repo/docs/sub/file.md");
+        assert_eq!(
+            ancestor_dirs(root, target),
+            vec![
+                PathBuf::from("/repo/docs"),
+                PathBuf::from("/repo/docs/sub"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestor_dirs_root_level_file_is_empty() {
+        let root = Path::new("/repo");
+        // A file directly in the root needs no directory expanded.
+        assert!(ancestor_dirs(root, Path::new("/repo/README.md")).is_empty());
+    }
+
+    #[test]
+    fn ancestor_dirs_outside_root_is_empty() {
+        let root = Path::new("/repo");
+        assert!(ancestor_dirs(root, Path::new("/other/file.md")).is_empty());
     }
 
     // ── flatten ─────────────────────────────────────────────────────────────

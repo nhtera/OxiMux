@@ -157,6 +157,27 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
         }),
     ));
 
+    // Reveal in OxiMux's own file-tree sidebar (expand ancestors + scroll to
+    // the row). The editor crate doesn't own the tree, so dispatch an action
+    // the host shell handles.
+    let explorer_target = path.to_path_buf();
+    card = card.child(menu_row(
+        ("ed-m-reveal-tree", view_id),
+        "Reveal in Explorer View",
+        accent,
+        fg,
+        cx.listener(move |view, _, window, cx| {
+            window.dispatch_action(
+                Box::new(crate::editor_view::RevealInExplorer {
+                    path: explorer_target.to_string_lossy().into_owned(),
+                }),
+                cx,
+            );
+            view.close_actions_menu();
+            cx.notify();
+        }),
+    ));
+
     let editors = installed_editors();
     if !editors.is_empty() {
         card = card.child(separator(border));

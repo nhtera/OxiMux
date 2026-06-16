@@ -1389,6 +1389,29 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Reveal `path` in the file-tree sidebar: open the sidebar if collapsed,
+    /// switch to the Explorer tab, then expand the path's ancestors and scroll
+    /// to its row. Drives the editor breadcrumb's "Reveal in Explorer View"
+    /// action. No-ops when no right sidebar is mounted.
+    pub(crate) fn reveal_path_in_explorer(
+        &self,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rs) = self.right_sidebar.clone() else {
+            return;
+        };
+        rs.update(cx, |sidebar, cx| {
+            if !sidebar.open {
+                sidebar.toggle(cx);
+            }
+            sidebar.select_tab(crate::shell::right_sidebar::tab::RightTab::Explorer, cx);
+            sidebar
+                .file_explorer
+                .update(cx, |fe, cx| fe.reveal_path(path, cx));
+        });
+    }
+
     /// Mount a `ConfirmDialog` for the SCM panel's pending discard
     /// request. Builds the prompt copy from the panel's snapshot,
     /// wires `on_confirm` to `confirmed_discard_path` and `on_cancel`
@@ -2522,6 +2545,11 @@ impl Render for WorkspaceRoot {
                         window,
                         cx,
                     );
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &oximux_editor::RevealInExplorer, _window, cx| {
+                    this.reveal_path_in_explorer(std::path::PathBuf::from(&action.path), cx);
                 },
             ))
             .on_action(cx.listener(
