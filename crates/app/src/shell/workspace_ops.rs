@@ -193,6 +193,7 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
                 tint: None,
                 // Synthesized primary row; always pinned first, never reordered.
                 sort_order: 0.0,
+                pinned: false,
             },
         );
     }
@@ -1131,6 +1132,7 @@ impl WorkspaceRoot {
             linked_issue: None,
             tint: None,
             sort_order: 0.0,
+            pinned: false,
         };
         self.activate_workspace(workspace, window, cx);
     }
@@ -1621,8 +1623,10 @@ impl WorkspaceRoot {
         .detach();
     }
 
-    /// Rename a workspace (DB only — no git or filesystem changes).
-    fn rename_workspace_now(
+    /// Rename a workspace (DB only — no git or filesystem changes). Shared by
+    /// the rename dialog and the left rail's inline double-click rename, so the
+    /// trim + empty-guard + error-toast contract stays in one place.
+    pub(crate) fn rename_workspace_now(
         &mut self,
         workspace: Workspace,
         new_name: String,
@@ -1685,6 +1689,28 @@ impl WorkspaceRoot {
             tracing::warn!(?err, workspace_id, "set_workspace_tint failed");
             return;
         }
+        self.mark_rail_dirty(cx);
+        cx.notify();
+    }
+
+    /// Toggle a workspace's pin flag. Pinned rows float to the top of their
+    /// project group in every sort mode. Persists the new flag, then re-reads
+    /// the rail so the row re-sorts. A pin is a structural change and applies
+    /// immediately (it is not subject to the Smart sort-settle window).
+    pub(crate) fn toggle_workspace_pin(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
+        // Synthesized primary rows aren't real DB rows — pinning is meaningless
+        // there (the primary is already anchored first).
+        if workspace.id.starts_with("primary:") {
+            return;
+        }
+        let next = !workspace.pinned;
+        if let Err(err) = self.app_state.workspace_repo.set_pinned(&workspace.id, next) {
+            tracing::warn!(?err, workspace_id = %workspace.id, "toggle_workspace_pin failed");
+            return;
+        }
+        // A pin restructures the group order — clear any pending sort-settle so
+        // the change is not held back by the debounce window.
+        self.left_rail.update(cx, |rail, _| rail.clear_sort_settle());
         self.mark_rail_dirty(cx);
         cx.notify();
     }

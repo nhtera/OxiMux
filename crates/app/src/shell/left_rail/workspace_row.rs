@@ -122,6 +122,9 @@ pub struct WorkspaceCardPlan {
     /// Optional identifier hue, resolved from the workspace's stored swatch
     /// slug. Painted as a thin left-edge accent on the row. `None` = default.
     pub tint: Option<TabColor>,
+    /// `true` when this workspace is pinned — the card shows a small pin glyph
+    /// and the row floats to the top of its group in every sort mode.
+    pub pinned: bool,
 }
 
 /// Resolve the status-dot color for a workspace given its latest agent
@@ -223,6 +226,7 @@ pub fn build_workspace_card_plan(
         pr: None, // GitHub integration is out of scope
         linked_issue: workspace.linked_issue.clone(),
         tint: workspace.tint.as_deref().and_then(TabColor::from_slug),
+        pinned: workspace.pinned,
     }
 }
 
@@ -386,6 +390,7 @@ mod tests {
             linked_issue: None,
             tint: None,
             sort_order: 0.0,
+            pinned: false,
         }
     }
 
@@ -580,6 +585,7 @@ mod tests {
             linked_issue: None,
             tint: None,
             sort_order: 0.0,
+            pinned: false,
         }
     }
 

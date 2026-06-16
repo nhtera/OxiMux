@@ -64,8 +64,10 @@ pub struct Migration {
 /// FK. V014 adds `projects.sort_order` and V015 adds
 /// `workspaces.sort_order` — sparse REAL ranks driving manual
 /// drag-to-reorder in the left rail; a one-shot Rust backfill seeds
-/// existing rows from their current display order. Future migrations
-/// append; never reorder, never rewrite.
+/// existing rows from their current display order. V016 adds
+/// `workspaces.pinned` — a per-workspace flag that floats the row to
+/// the top of its project group in every sort mode (additive, DEFAULT 0,
+/// no backfill). Future migrations append; never reorder, never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -141,6 +143,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "workspaces_sort_order",
         sql: include_str!("../migrations/V015__workspaces_sort_order.sql"),
+    },
+    Migration {
+        version: 16,
+        name: "workspaces_pinned",
+        sql: include_str!("../migrations/V016__workspaces_pinned.sql"),
     },
 ];
 

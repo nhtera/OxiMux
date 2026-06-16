@@ -65,6 +65,7 @@ pub struct WorkspaceRow {
     pub linked_issue: Option<String>,
     pub tint: Option<String>,
     pub sort_order: f64,
+    pub pinned: bool,
 }
 
 impl WorkspaceRow {
@@ -82,6 +83,7 @@ impl WorkspaceRow {
             linked_issue: row.get("linked_issue")?,
             tint: row.get("tint")?,
             sort_order: row.get("sort_order")?,
+            pinned: row.get("pinned")?,
         })
     }
 }
@@ -101,6 +103,7 @@ impl From<WorkspaceRow> for Workspace {
             linked_issue: r.linked_issue,
             tint: r.tint,
             sort_order: r.sort_order,
+            pinned: r.pinned,
         }
     }
 }

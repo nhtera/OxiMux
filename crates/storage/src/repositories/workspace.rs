@@ -59,6 +59,7 @@ impl WorkspaceRepo {
             linked_issue: None,
             tint: None,
             sort_order,
+            pinned: false,
         })
     }
 
@@ -139,6 +140,21 @@ impl WorkspaceRepo {
         Ok(())
     }
 
+    /// Set a workspace's pin flag. A pinned row floats to the top of its
+    /// project group in every sort mode. Warns if no row matched.
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<(), StorageError> {
+        let affected = self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE workspaces SET pinned = ?1 WHERE id = ?2",
+                params![pinned, id],
+            )
+        })?;
+        if affected == 0 {
+            tracing::warn!(workspace_id = %id, "set_pinned matched no workspace row");
+        }
+        Ok(())
+    }
+
     /// Set (or clear) the GitHub issue/PR reference a workspace links back to.
     /// Used by the Tasks page's "create workspace from this" action after the
     /// row is inserted; a no-op `None` clears it.
@@ -164,7 +180,7 @@ impl WorkspaceRepo {
     pub fn get_by_id(&self, id: &str) -> Result<Option<Workspace>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
                  FROM workspaces WHERE id = ?1",
                 [id],
                 WorkspaceRow::from_row,
@@ -181,7 +197,7 @@ impl WorkspaceRepo {
     pub fn get_by_worktree_path(&self, path: &str) -> Result<Option<Workspace>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
                  FROM workspaces \
                  WHERE worktree_path = ?1 AND archived_at IS NULL \
                  ORDER BY created_at DESC LIMIT 1",
@@ -197,7 +213,7 @@ impl WorkspaceRepo {
     pub fn list_for_project(&self, project_id: &str) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NULL \
                  ORDER BY created_at DESC",
@@ -252,7 +268,7 @@ impl WorkspaceRepo {
     ) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NULL \
                  ORDER BY sort_order ASC, created_at ASC",
@@ -444,6 +460,31 @@ mod tests {
         repo.reorder_to_target(&a.id, &x.id, &p1).expect("noop");
         assert_eq!(ordered_ids(&repo, &p1), [a.id, b.id]);
         assert_eq!(ordered_ids(&repo, &p2), [x.id]);
+    }
+
+    #[test]
+    fn set_pinned_round_trips_via_get_by_id() {
+        let db = open_memory().expect("db");
+        let p = project(&db);
+        let repo = WorkspaceRepo::new(db);
+        let a = ws(&repo, &p, "a");
+        // New rows default to unpinned.
+        assert!(!a.pinned);
+        repo.set_pinned(&a.id, true).expect("pin");
+        assert!(
+            repo.get_by_id(&a.id)
+                .expect("get")
+                .expect("some")
+                .pinned
+        );
+        repo.set_pinned(&a.id, false).expect("unpin");
+        assert!(
+            !repo
+                .get_by_id(&a.id)
+                .expect("get")
+                .expect("some")
+                .pinned
+        );
     }
 
     #[test]

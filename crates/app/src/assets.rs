@@ -144,6 +144,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/user.svg", include_bytes!("../assets/icons/user.svg")),
     // Address-bar security indicator for https pages.
     ("icons/lock.svg", include_bytes!("../assets/icons/lock.svg")),
+    // Pin marker for pinned workspace rows in the left rail.
+    ("icons/pin.svg", include_bytes!("../assets/icons/pin.svg")),
 ];
 
 impl AssetSource for AppAssets {

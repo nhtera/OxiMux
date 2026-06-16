@@ -705,6 +705,7 @@ mod tests {
             linked_issue: None,
             tint: None,
             sort_order: 0.0,
+            pinned: false,
         }
     }
 

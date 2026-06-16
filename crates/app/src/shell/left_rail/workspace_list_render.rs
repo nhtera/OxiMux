@@ -68,40 +68,50 @@ impl WorkspaceSortMode {
 
 /// Order one project group's workspace rows for display.
 ///
-/// The primary row (`worktree_path == project_root`) is pinned first; the
-/// remaining rows are sorted per `mode`. `attention_for` resolves a row's
-/// attention tier (lower = higher priority) — injected so this stays pure and
-/// free of the status / live-worktree maps. Sorts are stable, so equal-tier /
-/// equal-timestamp rows keep their input order.
+/// Display order is `[primary] , [pinned…] , [unpinned…]`: the primary row
+/// (`worktree_path == project_root`) always anchors first, then explicitly
+/// pinned rows float above unpinned ones — in *every* mode — and the active
+/// `mode` orders the rows *within* each of the pinned and unpinned groups.
+/// `attention_for` resolves a row's attention tier (lower = higher priority) —
+/// injected so this stays pure and free of the status / live-worktree maps.
+/// Sorts are stable, so equal-tier / equal-timestamp rows keep their input
+/// order.
 ///
 /// Partition contract: if no row matches `project_root`, all rows fall into
-/// the sorted tail. If several rows match (not expected — the synthesized
-/// primary is unique), all are pinned first in their input order.
+/// the pinned/unpinned tail. If several rows match (not expected — the
+/// synthesized primary is unique), all are pinned first in their input order.
 pub fn sort_workspaces(
     workspaces: &[Workspace],
     project_root: &str,
     mode: WorkspaceSortMode,
     attention_for: impl Fn(&Workspace) -> u8,
 ) -> Vec<Workspace> {
-    let (mut primary, mut rest): (Vec<Workspace>, Vec<Workspace>) = workspaces
+    let (mut primary, rest): (Vec<Workspace>, Vec<Workspace>) = workspaces
         .iter()
         .cloned()
         .partition(|ws| ws.worktree_path == project_root);
 
-    match mode {
+    // Pinned rows float above unpinned ones regardless of mode; the active
+    // mode orders within each group so a pin never scrambles the ordering the
+    // user already sees.
+    let (mut pinned, mut unpinned): (Vec<Workspace>, Vec<Workspace>) =
+        rest.into_iter().partition(|ws| ws.pinned);
+
+    let order_group = |list: &mut Vec<Workspace>| match mode {
         // Stable sort by ascending attention tier floats action-needing rows up.
-        WorkspaceSortMode::Smart => rest.sort_by_key(|ws| attention_for(ws)),
+        WorkspaceSortMode::Smart => list.sort_by_key(|ws| attention_for(ws)),
         // created_at is an RFC3339 UTC string; lexicographic desc = newest first.
-        WorkspaceSortMode::Recent => rest.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+        WorkspaceSortMode::Recent => list.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
         // Drag-assigned rank, ascending. `total_cmp` keeps the sort total even
         // if a rank is ever NaN (it never should be). Equal ranks keep input
         // order (stable sort).
-        WorkspaceSortMode::Manual => {
-            rest.sort_by(|a, b| a.sort_order.total_cmp(&b.sort_order))
-        }
-    }
+        WorkspaceSortMode::Manual => list.sort_by(|a, b| a.sort_order.total_cmp(&b.sort_order)),
+    };
+    order_group(&mut pinned);
+    order_group(&mut unpinned);
 
-    primary.extend(rest);
+    primary.extend(pinned);
+    primary.extend(unpinned);
     primary
 }
 
@@ -341,6 +351,7 @@ mod tests {
             linked_issue: None,
             tint: None,
             sort_order: 0.0,
+            pinned: false,
         }
     }
 
@@ -429,6 +440,61 @@ mod tests {
         let out = sort_workspaces(&list, root, WorkspaceSortMode::Recent, |_| 0);
         let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
         assert_eq!(ids, ["primary", "new", "old"]);
+    }
+
+    #[test]
+    fn pinned_rows_float_above_unpinned_in_every_mode() {
+        let root = "/tmp/p1";
+        let mut primary = ws("primary", root, "2026-01-01T00:00:00+00:00");
+        primary.sort_order = 50.0;
+        // "z" is pinned but otherwise sorts last in every mode (oldest, highest
+        // manual rank, idle attention) — pinning must still float it to second.
+        let mut z = ws("z", "/tmp/p1/z", "2026-01-02T00:00:00+00:00");
+        z.sort_order = 9.0;
+        z.pinned = true;
+        let mut a = ws("a", "/tmp/p1/a", "2026-05-01T00:00:00+00:00");
+        a.sort_order = 1.0;
+        let mut b = ws("b", "/tmp/p1/b", "2026-04-01T00:00:00+00:00");
+        b.sort_order = 2.0;
+        let list = vec![primary, a, b, z];
+
+        // Manual: primary, then pinned group (z), then unpinned by rank (a,b).
+        let manual = sort_workspaces(&list, root, WorkspaceSortMode::Manual, |_| 0);
+        assert_eq!(
+            manual.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            ["primary", "z", "a", "b"]
+        );
+
+        // Recent: primary, pinned (z), then unpinned newest-first (a newer than b).
+        let recent = sort_workspaces(&list, root, WorkspaceSortMode::Recent, |_| 0);
+        assert_eq!(
+            recent.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            ["primary", "z", "a", "b"]
+        );
+
+        // Smart: pinned floats up even though its attention tier is worst.
+        let attention = |w: &Workspace| if w.id == "a" { 0 } else { 2 };
+        let smart = sort_workspaces(&list, root, WorkspaceSortMode::Smart, attention);
+        assert_eq!(smart.first().map(|w| w.id.as_str()), Some("primary"));
+        assert_eq!(smart.get(1).map(|w| w.id.as_str()), Some("z"));
+    }
+
+    #[test]
+    fn multiple_pinned_rows_keep_within_group_mode_order() {
+        let root = "/tmp/p1";
+        let primary = ws("primary", root, "2026-01-01T00:00:00+00:00");
+        let mut p_old = ws("p_old", "/tmp/p1/po", "2026-02-01T00:00:00+00:00");
+        p_old.pinned = true;
+        let mut p_new = ws("p_new", "/tmp/p1/pn", "2026-06-01T00:00:00+00:00");
+        p_new.pinned = true;
+        let u = ws("u", "/tmp/p1/u", "2026-03-01T00:00:00+00:00");
+        let list = vec![primary, p_old, p_new, u];
+        // Recent: within the pinned group, newest first → p_new before p_old.
+        let out = sort_workspaces(&list, root, WorkspaceSortMode::Recent, |_| 0);
+        assert_eq!(
+            out.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            ["primary", "p_new", "p_old", "u"]
+        );
     }
 
     #[test]

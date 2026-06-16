@@ -172,6 +172,45 @@ impl WorkspaceRowMenu {
         });
     }
 
+    /// A single Pin / Unpin row. The label reflects the workspace's current
+    /// pin state; dispatching floats (or releases) the row to the top of its
+    /// project group in every sort mode. Synthesized primary rows are omitted
+    /// (the primary already anchors first).
+    fn render_pin_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some((workspace, ..)) = self.open_for.clone() else {
+            return div().into_any_element();
+        };
+        if workspace.id.starts_with("primary:") {
+            return div().into_any_element();
+        }
+        let theme = self.theme;
+        let label = if workspace.pinned { "Unpin" } else { "Pin" };
+        div()
+            .id("row-menu-pin")
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(ROW_MENU_ITEM_H))
+            .px(px(ROW_PADDING_X))
+            .rounded(px(self.density.r_xs))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.hover_overlay))
+            .text_size(px(self.typography.t_body_md))
+            .text_color(theme.fg_base)
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    let ws = workspace.clone();
+                    let _ = this
+                        .weak_root
+                        .update(cx, |root, cx| root.toggle_workspace_pin(ws, cx));
+                    this.close(cx);
+                }),
+            )
+            .into_any_element()
+    }
+
     /// A "Color" swatch row (clear + the 9-swatch palette) for tagging the
     /// workspace with an identifier hue. Each swatch dispatches
     /// `set_workspace_tint` and closes the menu. The current tint gets a
@@ -278,6 +317,10 @@ impl Render for WorkspaceRowMenu {
             .border_color(theme.border_active)
             .rounded(px(density.r_card))
             .shadow_lg();
+
+        // Pin / Unpin sits at the top — it's the most reached-for management
+        // action and the label reflects the row's current pin state.
+        card = card.child(self.render_pin_row(cx));
 
         for (ix, &action) in actions.iter().enumerate() {
             let fg = if action.is_destructive() {

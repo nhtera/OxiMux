@@ -35,6 +35,13 @@ pub struct Workspace {
     /// pre-field snapshots (defaults to `0.0`, treated as not-yet-ranked).
     #[serde(default)]
     pub sort_order: f64,
+    /// Whether this workspace is pinned to the top of its project group. A
+    /// pinned row floats above unpinned rows in *every* sort mode, with the
+    /// active mode's ordering preserved within each group; the primary row
+    /// stays first regardless. `#[serde(default)]` for back-compat with
+    /// pre-field snapshots (defaults to `false`).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Per-worktree SCM scratch state, persisted in the V006

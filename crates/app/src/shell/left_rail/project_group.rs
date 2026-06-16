@@ -9,6 +9,7 @@ use gpui::{
     AppContext, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, div, px, svg,
 };
+use gpui_component::input::InputState;
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
@@ -18,13 +19,30 @@ use crate::shell::left_rail::LeftRail;
 use crate::shell::left_rail::project_drag::{
     ProjectDragPayload, SidebarDragPreview, insertion_side, paint_insertion_line,
 };
-use crate::shell::left_rail::workspace_card::render_workspace_card;
+use crate::shell::left_rail::workspace_card::{RowRenameConfig, render_workspace_card};
 use crate::shell::left_rail::workspace_list_render::WorkspaceSortMode;
 use crate::shell::left_rail::workspace_row::{DiffCounts, build_workspace_card_plan};
 use crate::workspace_root::WorkspaceRoot;
 
 /// Chevron / folder glyph size in the header.
 const CHEVRON_ICON_SIZE: f32 = 12.0;
+
+/// Diameter of the per-project identity hue dot in the header.
+const IDENTITY_DOT_SIZE: f32 = 6.0;
+
+/// Deterministic low-saturation identity hue for a project, derived from its
+/// id so the same project always shows the same accent across restarts (the
+/// hash is stable within a given build; a future toolchain could in principle
+/// re-seed `DefaultHasher` and reshuffle the palette, which is purely
+/// cosmetic). Low saturation + mid lightness keeps the accent calm and legible
+/// on the dark rail without competing with the workspace status dots.
+fn project_identity_hue(project_id: &str) -> gpui::Hsla {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    project_id.hash(&mut hasher);
+    let hue = (hasher.finish() % 360) as f32 / 360.0;
+    gpui::hsla(hue, 0.45, 0.62, 1.0)
+}
 
 /// Header height in CSS pixels (matches WORKSPACES section header).
 const HEADER_HEIGHT: f32 = 28.0;
@@ -87,6 +105,8 @@ pub fn render_project_group(
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
     on_project_menu: impl Fn(Project, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
     locate_glow_seq: u64,
+    renaming_id: Option<&str>,
+    rename_input: Option<Entity<InputState>>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -99,7 +119,7 @@ pub fn render_project_group(
         project.clone(),
         project_index,
         group_name.clone(),
-        rail,
+        rail.clone(),
         weak_root.clone(),
         on_project_menu,
         theme,
@@ -175,24 +195,48 @@ pub fn render_project_group(
                 );
             };
 
+        // This row is the one being renamed inline — its title becomes an edit
+        // field and its activate/drag handlers are suppressed so typing and
+        // clicking inside the field don't switch workspaces or start a drag.
+        let is_renaming = renaming_id == Some(workspace.id.as_str());
+
         // Clicking a card activates the workspace: switch to its project,
         // select it (highlight), and focus the agent tab running in its
         // worktree. `update` + outer `window` — `update_in` returns Err
-        // from a mouse-callback context.
+        // from a mouse-callback context. Suppressed while renaming.
         let weak_root_for_row = weak_root.clone();
         let workspace_for_row = workspace.clone();
         let row_handler =
             move |_ev: &MouseDownEvent, window: &mut gpui::Window, cx: &mut gpui::App| {
+                if is_renaming {
+                    return;
+                }
                 let workspace = workspace_for_row.clone();
                 let _ = weak_root_for_row
                     .update(cx, |root, cx| root.activate_workspace(workspace, window, cx));
             };
 
+        // Inline-rename wiring for non-primary rows: carries the rail entity +
+        // this row's workspace (the double-click begin payload) and, when this
+        // row is the active one, the shared edit field.
+        let rename_config = (!is_primary).then(|| RowRenameConfig {
+            rail: rail.clone(),
+            workspace: workspace.clone(),
+            active_input: if is_renaming { rename_input.clone() } else { None },
+        });
+
         // Drag-to-reorder is offered only for non-primary rows while the rail
         // is in Manual sort mode (Smart/Recent are computed orders — dragging
         // there would be immediately overwritten). The pinned primary row is
-        // never draggable and never a drop target.
-        let drag_config = (!is_primary && sort_mode == WorkspaceSortMode::Manual).then(|| {
+        // never draggable and never a drop target. A row being renamed is not
+        // draggable. Pinned rows are excluded too: they float to the top of
+        // their group regardless of rank, so a free-drag would silently no-op
+        // on the display.
+        let drag_config = (!is_primary
+            && !workspace.pinned
+            && sort_mode == WorkspaceSortMode::Manual
+            && !is_renaming)
+            .then(|| {
             let weak_root_for_reorder = weak_root.clone();
             let project_id_for_reorder = project.id.clone();
             crate::shell::left_rail::project_drag::WorkspaceDragConfig {
@@ -219,6 +263,7 @@ pub fn render_project_group(
             !is_primary,
             locate_glow_seq,
             drag_config,
+            rename_config,
             theme,
             density,
             typography,
@@ -252,18 +297,17 @@ fn build_header(
 
     // Leading icon slot — matches the reference UX: the folder icon shows at rest
     // and is replaced in-place by a disclosure chevron on header hover
-    // (no layout shift, folder stays flush-left). Clicking the chevron
-    // toggles collapse; stop_propagation keeps it off the header's
-    // activate-project handler. Chevron points right when collapsed,
-    // down when expanded.
+    // (no layout shift, folder stays flush-left). The chevron is a pure
+    // visual indicator — the collapse toggle lives on the whole header row
+    // (see the header's `on_click`), so clicking anywhere on the header
+    // expands/collapses. Chevron points right when collapsed, down when
+    // expanded.
     let chevron_id: SharedString = format!("project-chevron-{}", project.id).into();
     let chevron_path = if is_collapsed {
         "icons/chevron-right.svg"
     } else {
         "icons/chevron-down.svg"
     };
-    let rail_for_chevron = rail.clone();
-    let project_id_for_chevron = project.id.clone();
     let icon_slot = div()
         .relative()
         .flex_shrink_0()
@@ -295,25 +339,25 @@ fn build_header(
                 .items_center()
                 .justify_center()
                 .invisible()
-                .cursor_pointer()
                 .text_color(theme.fg_muted)
-                .hover(|s| s.text_color(theme.fg_base))
                 .group_hover(group_name.clone(), |s| s.visible())
                 .child(
                     svg()
                         .path(chevron_path)
                         .size(px(CHEVRON_ICON_SIZE))
                         .text_color(theme.fg_muted),
-                )
-                .tooltip(|window, cx| {
-                    gpui_component::tooltip::Tooltip::new("Collapse / expand").build(window, cx)
-                })
-                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                    cx.stop_propagation();
-                    let id = project_id_for_chevron.clone();
-                    rail_for_chevron.update(cx, |r, cx| r.toggle_collapsed(id, cx));
-                }),
+                ),
         );
+
+    // Per-project identity dot — a small deterministic hue derived from the
+    // project id, giving each project a stable color anchor instead of an
+    // identical mono folder. Sits just before the title, set apart from the
+    // workspace status dots that live on the cards below.
+    let identity_dot = div()
+        .size(px(IDENTITY_DOT_SIZE))
+        .rounded_full()
+        .flex_shrink_0()
+        .bg(project_identity_hue(&project.id));
 
     let title = div()
         .text_size(px(typography.t_body_sm))
@@ -342,6 +386,11 @@ fn build_header(
         .size(px(PLUS_BTN_SIZE))
         .rounded(px(density.r_xs))
         .text_color(theme.fg_muted)
+        // Hidden at rest, revealed on header hover (matching the `…` button and
+        // the chevron). The count chip + identity dot stay visible — they carry
+        // information, not actions.
+        .invisible()
+        .group_hover(group_name.clone(), |s| s.visible())
         .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
         .child(
             svg()
@@ -368,6 +417,10 @@ fn build_header(
     // project popover (Reveal / Copy / Remove) anchored at the click point.
     let menu_id: SharedString = format!("project-menu-{}", project.id).into();
     let project_for_menu = project.clone();
+    // Right-click anywhere on the header opens the same project popover at the
+    // cursor (DRY — identical actions to the `…` button).
+    let on_project_menu_ctx = on_project_menu.clone();
+    let project_for_ctx = project.clone();
     let menu_btn = div()
         .id(menu_id)
         .flex()
@@ -401,11 +454,17 @@ fn build_header(
         });
 
     // Click anywhere on the header (folder / title / count chip / gap) to
-    // activate this project. The "+" button stop-propagates so it stays
-    // a workspace-create shortcut, not an activate-and-open one.
+    // activate this project AND toggle its collapse state, matching the reference UX's
+    // whole-row disclosure. Activate fires on mouse-down (so a drag-reorder
+    // still focuses the project); the collapse toggle fires on `on_click`,
+    // which GPUI suppresses after a drag — so reordering a header never
+    // collapses it. The "+" / "…" buttons stop-propagate so they stay their
+    // own shortcuts, not activate-and-toggle ones.
     let header_id: SharedString = format!("project-header-{}", project.id).into();
     let weak_for_header = weak_root.clone();
     let project_for_header = project.clone();
+    let rail_for_toggle = rail.clone();
+    let project_id_for_toggle = project.id.clone();
     // Drag payload + ghost: dragging a header reorders the project list. The
     // payload carries the start index; the drop handler recomputes from the
     // live list by id, so a concurrent reorder can't misplace it.
@@ -437,6 +496,22 @@ fn build_header(
                 root.set_active_project(project, window, cx);
             });
         })
+        .on_click(move |_ev, window, cx| {
+            let id = project_id_for_toggle.clone();
+            rail_for_toggle
+                .update(cx, |r, cx| r.toggle_collapsed(id, window, cx));
+        })
+        .on_mouse_down(MouseButton::Right, move |ev: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            let pos = ev.position;
+            on_project_menu_ctx(
+                project_for_ctx.clone(),
+                f32::from(pos.x),
+                f32::from(pos.y),
+                window,
+                cx,
+            );
+        })
         .on_drag(drag_payload, move |_p, _offset, _window, cx| {
             cx.new(|_| SidebarDragPreview::new(ghost_label.clone(), theme))
         })
@@ -451,6 +526,7 @@ fn build_header(
                 style,
                 insertion_side(payload.src_index, project_index),
                 accent,
+                theme.bg_rail,
             )
         })
         .on_drop::<ProjectDragPayload>(move |payload: &ProjectDragPayload, window, cx| {
@@ -464,6 +540,7 @@ fn build_header(
             });
         })
         .child(icon_slot)
+        .child(identity_dot)
         .child(title)
         .child(count_chip)
         .child(div().flex_1())
@@ -501,6 +578,7 @@ mod tests {
             linked_issue: None,
             tint: None,
             sort_order: 0.0,
+            pinned: false,
         }
     }
 

@@ -31,12 +31,15 @@ pub mod workspace_list_render;
 pub mod workspace_row;
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, UniformListScrollHandle, WeakEntity, Window, div, px, svg,
+    AppContext, Bounds, Context, DragMoveEvent, Entity, Focusable, Hsla, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
+    div, point, px, svg,
 };
+use gpui_component::input::{InputEvent, InputState};
 use oximux_core::{AgentStatus, Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
@@ -58,9 +61,63 @@ use crate::workspace_root::WorkspaceRoot;
 
 const HEADER_ICON_SIZE: f32 = 14.0;
 
+/// How long a Smart-sorted group holds its displayed row order after a
+/// score-affecting change, so rows don't reshuffle under the cursor.
+const SMART_SETTLE: Duration = Duration::from_secs(3);
+
+/// Distance (px) from a list bound within which a drag triggers auto-scroll.
+const AUTOSCROLL_BAND: f32 = 24.0;
+/// Constant scroll step applied per auto-scroll tick (no acceleration — KISS).
+const AUTOSCROLL_STEP: f32 = 14.0;
+/// Auto-scroll tick interval while the cursor sits in an edge band.
+const AUTOSCROLL_TICK: Duration = Duration::from_millis(16);
+
 /// Snapshot of the latest agent-session status for a single workspace.
 /// `None` means no sessions have ever been started for that workspace.
 pub type LatestStatusMap = HashMap<String, Option<AgentStatus>>;
+
+/// One project group's held Smart-sort order plus when it was locked. Within
+/// `SMART_SETTLE` of the lock time, the group renders this order instead of a
+/// freshly-computed one, so agent-status changes don't reshuffle visible rows.
+struct SettleEntry {
+    /// Workspace ids in the order last shown (real rows; the synthesized
+    /// primary is re-prepended by the sort each render).
+    order: Vec<String>,
+    /// Sorted ids of the rows pinned at lock time. A pin/unpin changes this
+    /// set without changing membership, so it is compared separately — a pin
+    /// must re-rank immediately rather than waiting out the settle window
+    /// (an attention-only status change leaves it unchanged, so that still
+    /// debounces).
+    pinned: Vec<String>,
+    /// When this order was locked in.
+    at: Instant,
+}
+
+/// `true` when two id lists contain the same set of ids (ignoring order). A
+/// changed membership (workspace created/removed) re-locks a fresh order so a
+/// new row appears immediately rather than waiting out the settle window.
+fn same_membership(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().collect::<HashSet<_>>() == b.iter().collect::<HashSet<_>>()
+}
+
+/// Reorder `list` so its rows follow `order` (by id); any row not named in
+/// `order` keeps its relative position at the tail. Used to apply a held
+/// settle order on top of a freshly-sorted list.
+fn reorder_to_id_sequence(list: Vec<Workspace>, order: &[String]) -> Vec<Workspace> {
+    let mut by_id: HashMap<String, Workspace> = list.into_iter().map(|w| (w.id.clone(), w)).collect();
+    let mut out: Vec<Workspace> = Vec::with_capacity(by_id.len());
+    for id in order {
+        if let Some(w) = by_id.remove(id) {
+            out.push(w);
+        }
+    }
+    // Any rows not in `order` (shouldn't happen while membership matches) keep
+    // a stable tail position.
+    for w in by_id.into_values() {
+        out.push(w);
+    }
+    out
+}
 
 pub struct LeftRail {
     /// Which nav page is open, or `None` for the home view (workspace list,
@@ -140,6 +197,29 @@ pub struct LeftRail {
     /// Tasks page entity (GitHub issue/PR browser), mounted when the Tasks nav
     /// is active. Owns its own async fetch + filter state.
     tasks_view: Entity<TasksView>,
+    /// Per-project held Smart-sort order during the settle window (item:
+    /// Smart rows don't reshuffle under the cursor right after a status
+    /// change). Keyed by project id. Not persisted.
+    smart_settle: HashMap<String, SettleEntry>,
+    /// `true` while a settle-expiry re-render timer is pending, so render
+    /// arms at most one.
+    settle_timer_armed: bool,
+    /// Active drag auto-scroll step: `+` scrolls toward the top of the list,
+    /// `-` toward the bottom, `0` = no auto-scroll. Set from the cursor's
+    /// position relative to the list bounds during a drag.
+    autoscroll: f32,
+    /// `true` while the auto-scroll tick loop is running, so it is armed once.
+    autoscroll_armed: bool,
+    /// The workspace currently being renamed inline (double-click on its
+    /// title), or `None`. Carries the full row so the commit reuses the
+    /// shared rename path. While set, that row renders an editable field
+    /// instead of its title and suppresses its activate/drag handlers.
+    renaming_workspace: Option<Workspace>,
+    /// Shared text-input field backing the inline rename. Created lazily on
+    /// first rename (needs a `Window`, which `new` does not have).
+    rename_input: Option<Entity<InputState>>,
+    /// Subscription that commits the inline rename when the field loses focus.
+    _rename_sub: Option<Subscription>,
 }
 
 impl LeftRail {
@@ -178,7 +258,257 @@ impl LeftRail {
             locate_glow_seq: 0,
             agents_unread: 0,
             tasks_view,
+            smart_settle: HashMap::new(),
+            settle_timer_armed: false,
+            autoscroll: 0.0,
+            autoscroll_armed: false,
+            renaming_workspace: None,
+            rename_input: None,
+            _rename_sub: None,
         }
+    }
+
+    /// The id of the workspace being renamed inline, if any. Read by the row
+    /// renderer to swap that row's title for the edit field.
+    fn renaming_workspace_id(&self) -> Option<&str> {
+        self.renaming_workspace.as_ref().map(|w| w.id.as_str())
+    }
+
+    /// Begin an inline rename of `workspace`: lazily create + focus the shared
+    /// edit field, seed it with the current name, and select it for replace.
+    /// Primary (synthesized) rows are not renamable and are ignored.
+    pub(crate) fn begin_rename_workspace(
+        &mut self,
+        workspace: Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if workspace.id.starts_with("primary:") {
+            return;
+        }
+        // Lazily build the field (and wire its blur→commit) the first time.
+        if self.rename_input.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            let sub = cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
+                // Losing focus commits the edit — but only if a rename is still
+                // in flight (Enter/Escape clear it first, so their blur is a
+                // no-op and Escape stays a cancel).
+                if matches!(event, InputEvent::Blur) {
+                    this.commit_rename(cx);
+                }
+            });
+            self.rename_input = Some(input);
+            self._rename_sub = Some(sub);
+        }
+        if let Some(input) = self.rename_input.clone() {
+            input.update(cx, |state, cx| {
+                state.set_value(&workspace.name, window, cx);
+            });
+            let focus = input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        self.renaming_workspace = Some(workspace);
+        cx.notify();
+    }
+
+    /// Commit the in-flight inline rename via the shared rename path, then
+    /// dismiss the field. No-op when nothing is being renamed.
+    pub(crate) fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.renaming_workspace.take() else {
+            return;
+        };
+        let new_name = self
+            .rename_input
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string())
+            .unwrap_or_default();
+        // Skip the DB write + rail refresh when nothing actually changed (e.g.
+        // the field lost focus without an edit).
+        if new_name.trim() != workspace.name {
+            let _ = self
+                .weak_root
+                .update(cx, |root, cx| root.rename_workspace_now(workspace, new_name, cx));
+        }
+        cx.notify();
+    }
+
+    /// Cancel the in-flight inline rename, discarding the edit. No-op when
+    /// nothing is being renamed.
+    pub(crate) fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_workspace.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Clear all held Smart-sort orders so the next render re-locks fresh
+    /// orders. Called when a structural change (e.g. a pin toggle) must apply
+    /// immediately rather than waiting out the settle window.
+    pub(crate) fn clear_sort_settle(&mut self) {
+        self.smart_settle.clear();
+    }
+
+    /// Reconcile the per-project Smart-sort settle and return id-order
+    /// overrides to apply this render. For each project, compares the
+    /// freshly-computed Smart order against the held one: within the settle
+    /// window and with unchanged membership, the held order wins (and a single
+    /// expiry timer is armed); otherwise a fresh order is locked. Returns an
+    /// empty map outside Smart mode.
+    fn compute_settle_overrides(&mut self, cx: &mut Context<Self>) -> HashMap<String, Vec<String>> {
+        let mut overrides = HashMap::new();
+        // Settle applies to Smart only — Recent/Manual orders don't move when an
+        // agent status changes. Leaving Smart drops stale state so a later
+        // return to Smart re-locks fresh.
+        if self.sort_mode != WorkspaceSortMode::Smart {
+            self.smart_settle.clear();
+            return overrides;
+        }
+        // Snapshot the freshly-sorted id order + pinned set per project under
+        // an immutable borrow, then reconcile against the cache (mutable) in a
+        // second pass.
+        let fresh: Vec<(String, Vec<String>, Vec<String>)> = self
+            .projects
+            .iter()
+            .map(|p| {
+                let ws = self
+                    .workspaces_by_project
+                    .get(&p.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut pinned_now: Vec<String> =
+                    ws.iter().filter(|w| w.pinned).map(|w| w.id.clone()).collect();
+                pinned_now.sort();
+                let sorted = sort_workspaces(&ws, &p.root_path, WorkspaceSortMode::Smart, |w| {
+                    let status = self.latest_status.get(&w.id).cloned().flatten();
+                    attention_rank(
+                        status.as_ref(),
+                        self.live_worktrees.contains(&w.worktree_path),
+                    )
+                });
+                (
+                    p.id.clone(),
+                    sorted.into_iter().map(|w| w.id).collect(),
+                    pinned_now,
+                )
+            })
+            .collect();
+
+        let mut within_window = false;
+        for (pid, ids_now, pinned_now) in fresh {
+            match self.smart_settle.get(&pid) {
+                // Hold the prior order only while the rows AND the pinned set
+                // are unchanged — a pin/unpin re-ranks immediately.
+                Some(entry)
+                    if entry.at.elapsed() < SMART_SETTLE
+                        && entry.pinned == pinned_now
+                        && same_membership(&entry.order, &ids_now) =>
+                {
+                    overrides.insert(pid, entry.order.clone());
+                    within_window = true;
+                }
+                _ => {
+                    self.smart_settle.insert(
+                        pid,
+                        SettleEntry {
+                            order: ids_now,
+                            pinned: pinned_now,
+                            at: Instant::now(),
+                        },
+                    );
+                }
+            }
+        }
+        if within_window {
+            self.arm_settle_timer(cx);
+        }
+        overrides
+    }
+
+    /// Arm a single timer that fires at the end of the settle window to drop
+    /// expired held orders and repaint, so a Smart group re-sorts once the
+    /// window passes even if no other event would have triggered a render.
+    fn arm_settle_timer(&mut self, cx: &mut Context<Self>) {
+        if self.settle_timer_armed {
+            return;
+        }
+        self.settle_timer_armed = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SMART_SETTLE).await;
+            let _ = this.update(cx, |this, cx| {
+                this.settle_timer_armed = false;
+                this.smart_settle.retain(|_, e| e.at.elapsed() < SMART_SETTLE);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Update the drag auto-scroll direction from the cursor's window Y
+    /// relative to the list viewport `bounds`: near the top edge scroll up,
+    /// near the bottom edge scroll down, otherwise stop. Arms the tick loop
+    /// when a direction is set.
+    fn note_autoscroll_cursor(
+        &mut self,
+        cursor_y: f32,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let top = f32::from(bounds.top());
+        let bottom = f32::from(bounds.bottom());
+        let dir = if cursor_y < top + AUTOSCROLL_BAND {
+            AUTOSCROLL_STEP
+        } else if cursor_y > bottom - AUTOSCROLL_BAND {
+            -AUTOSCROLL_STEP
+        } else {
+            0.0
+        };
+        self.autoscroll = dir;
+        if dir != 0.0 {
+            self.arm_autoscroll(cx);
+        }
+    }
+
+    /// Run the auto-scroll tick loop while a drag holds the cursor in an edge
+    /// band. Stops when the drag ends, the cursor leaves the band
+    /// (`autoscroll` reset to 0 by `note_autoscroll_cursor`), or the list hits
+    /// a scroll extent.
+    fn arm_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscroll_armed {
+            return;
+        }
+        self.autoscroll_armed = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_TICK).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if !cx.has_active_drag() || this.autoscroll == 0.0 {
+                            this.autoscroll = 0.0;
+                            this.autoscroll_armed = false;
+                            return false;
+                        }
+                        let off = this.list_scroll.offset();
+                        // Valid scroll range is [-max_offset.y, 0]; clamp so a
+                        // runaway tick can't push past either extent.
+                        let max_y = f32::from(this.list_scroll.max_offset().y);
+                        let cur_y = f32::from(off.y);
+                        let new_y = (cur_y + this.autoscroll).clamp(-max_y, 0.0);
+                        if (new_y - cur_y).abs() < 0.01 {
+                            // At an extent — nothing more to reveal this way.
+                            this.autoscroll = 0.0;
+                            this.autoscroll_armed = false;
+                            return false;
+                        }
+                        this.list_scroll.set_offset(point(off.x, px(new_y)));
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Scroll the workspace list so the active project's group is in view
@@ -251,12 +581,55 @@ impl LeftRail {
 
     /// Toggle the collapsed state of a project group, persist the new
     /// set, and re-render.
-    pub(crate) fn toggle_collapsed(&mut self, project_id: String, cx: &mut Context<Self>) {
+    ///
+    /// Pins the toggled header in place across the relayout: collapsing or
+    /// expanding a group changes total content height, which can otherwise
+    /// snap the viewport (e.g. when scrolled near the end). Records the
+    /// header's screen position before the toggle and, on the next frame
+    /// (after the new layout), nudges the scroll offset so the header returns
+    /// to where it was.
+    pub(crate) fn toggle_collapsed(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let anchor_top = self
+            .projects
+            .iter()
+            .position(|p| p.id == project_id)
+            .and_then(|ix| self.list_scroll.bounds_for_item(ix))
+            .map(|b| f32::from(b.top()));
+
         if !self.collapsed.remove(&project_id) {
-            self.collapsed.insert(project_id);
+            self.collapsed.insert(project_id.clone());
         }
         self.persist_collapsed();
         cx.notify();
+
+        let Some(target_top) = anchor_top else {
+            return;
+        };
+        let entity = cx.entity();
+        window.on_next_frame(move |_window, cx| {
+            entity.update(cx, |this, cx| {
+                let Some(ix) = this.projects.iter().position(|p| p.id == project_id) else {
+                    return;
+                };
+                let Some(bounds) = this.list_scroll.bounds_for_item(ix) else {
+                    return;
+                };
+                let delta = f32::from(bounds.top()) - target_top;
+                // Sub-pixel drift isn't worth a correcting repaint.
+                if delta.abs() < 0.5 {
+                    return;
+                }
+                let off = this.list_scroll.offset();
+                this.list_scroll
+                    .set_offset(point(off.x, px(f32::from(off.y) - delta)));
+                cx.notify();
+            });
+        });
     }
 
     /// Current rail width — read by `WorkspaceRoot` for pane reflow.
@@ -438,6 +811,11 @@ impl Render for LeftRail {
                 .child(self.tasks_view.clone())
                 .into_any_element()
         } else {
+            // Reconcile the Smart-sort settle before building rows so held
+            // orders override the freshly-computed ones for this render.
+            let settle_overrides = self.compute_settle_overrides(cx);
+            let renaming_id = self.renaming_workspace_id().map(str::to_string);
+            let rename_input = self.rename_input.clone();
             let workspace_list = render_workspace_list(
                 self.projects.clone(),
                 self.active_project_id.clone(),
@@ -454,6 +832,9 @@ impl Render for LeftRail {
                 self.weak_root.clone(),
                 self.locate_glow_seq,
                 self.list_scroll.clone(),
+                settle_overrides,
+                renaming_id,
+                rename_input,
                 theme,
                 density,
                 &typography,
@@ -556,6 +937,9 @@ fn render_workspace_list(
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
     list_scroll: ScrollHandle,
+    settle_overrides: HashMap<String, Vec<String>>,
+    renaming_id: Option<String>,
+    rename_input: Option<Entity<InputState>>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -563,6 +947,13 @@ fn render_workspace_list(
     if projects.is_empty() {
         return open_project_cta(theme, density, typography).into_any_element();
     }
+
+    // Drag auto-scroll: while a workspace- or project-reorder drag holds the
+    // cursor near a list edge, nudge the scroll offset so off-screen rows are
+    // reachable. The move listeners read the cursor against this container's
+    // bounds; the rail's tick loop does the actual scrolling.
+    let rail_for_ws_scroll = rail.clone();
+    let rail_for_proj_scroll = rail.clone();
 
     // The column is the scroll container: its direct children are the
     // project groups, so `ScrollHandle::scroll_to_item(project_index)`
@@ -574,7 +965,31 @@ fn render_workspace_list(
         .w_full()
         .h_full()
         .overflow_y_scroll()
-        .track_scroll(&list_scroll);
+        .track_scroll(&list_scroll)
+        .on_drag_move::<crate::shell::left_rail::project_drag::WorkspaceDragPayload>(
+            move |ev: &DragMoveEvent<
+                crate::shell::left_rail::project_drag::WorkspaceDragPayload,
+            >,
+                  _window,
+                  cx| {
+                let cursor_y = f32::from(ev.event.position.y);
+                let bounds = ev.bounds;
+                rail_for_ws_scroll
+                    .update(cx, |r, cx| r.note_autoscroll_cursor(cursor_y, bounds, cx));
+            },
+        )
+        .on_drag_move::<crate::shell::left_rail::project_drag::ProjectDragPayload>(
+            move |ev: &DragMoveEvent<
+                crate::shell::left_rail::project_drag::ProjectDragPayload,
+            >,
+                  _window,
+                  cx| {
+                let cursor_y = f32::from(ev.event.position.y);
+                let bounds = ev.bounds;
+                rail_for_proj_scroll
+                    .update(cx, |r, cx| r.note_autoscroll_cursor(cursor_y, bounds, cx));
+            },
+        );
     for (project_index, project) in projects.into_iter().enumerate() {
         let workspaces = workspaces_by_project
             .get(&project.id)
@@ -587,6 +1002,12 @@ fn render_workspace_list(
             let status = latest_status.get(&ws.id).cloned().flatten();
             attention_rank(status.as_ref(), live_worktrees.contains(&ws.worktree_path))
         });
+        // Apply a held Smart-sort order, if the settle window is keeping this
+        // group's rows from reshuffling under the cursor.
+        let workspaces = match settle_overrides.get(&project.id) {
+            Some(order) => reorder_to_id_sequence(workspaces, order),
+            None => workspaces,
+        };
         let is_active = active_project_id.as_deref() == Some(project.id.as_str());
         let is_collapsed = collapsed.contains(&project.id);
         let plan = build_project_group_plan(&project, &workspaces, is_active, is_collapsed);
@@ -642,6 +1063,8 @@ fn render_workspace_list(
             on_row_menu,
             on_project_menu,
             locate_glow_seq,
+            renaming_id.as_deref(),
+            rename_input.clone(),
             theme,
             density,
             typography,
@@ -782,4 +1205,68 @@ fn collapse_all_icon(rail: gpui::Entity<LeftRail>, theme: Theme) -> impl IntoEle
                 .size(px(HEADER_ICON_SIZE))
                 .text_color(theme.fg_muted),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reorder_to_id_sequence, same_membership};
+    use oximux_core::Workspace;
+
+    fn ws(id: &str) -> Workspace {
+        Workspace {
+            id: id.to_string(),
+            project_id: "p".to_string(),
+            name: id.to_string(),
+            slug: id.to_string(),
+            branch: format!("oximux/{id}"),
+            worktree_path: format!("/tmp/{id}"),
+            status: "active".to_string(),
+            created_at: "2026-06-16T00:00:00+00:00".to_string(),
+            archived_at: None,
+            linked_issue: None,
+            tint: None,
+            sort_order: 0.0,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn same_membership_ignores_order() {
+        let a = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let b = vec!["z".to_string(), "x".to_string(), "y".to_string()];
+        assert!(same_membership(&a, &b));
+    }
+
+    #[test]
+    fn same_membership_detects_added_or_removed_row() {
+        let a = vec!["x".to_string(), "y".to_string()];
+        let added = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let removed = vec!["x".to_string()];
+        assert!(!same_membership(&a, &added));
+        assert!(!same_membership(&a, &removed));
+    }
+
+    #[test]
+    fn reorder_applies_held_sequence() {
+        // A held settle order pins the displayed positions even though the
+        // input list is in a different (freshly-sorted) order.
+        let fresh = vec![ws("b"), ws("c"), ws("a")];
+        let held = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let out = reorder_to_id_sequence(fresh, &held);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn reorder_keeps_unlisted_rows_at_tail() {
+        // A row not named in the held order (shouldn't happen while membership
+        // matches) still renders rather than vanishing.
+        let fresh = vec![ws("a"), ws("b"), ws("new")];
+        let held = vec!["b".to_string(), "a".to_string()];
+        let out = reorder_to_id_sequence(fresh, &held);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(&ids[..2], ["b", "a"]);
+        assert!(ids.contains(&"new"));
+        assert_eq!(ids.len(), 3);
+    }
 }

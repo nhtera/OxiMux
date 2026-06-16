@@ -12,8 +12,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, Hsla, IntoElement, ParentElement, Render, SharedString, StyleRefinement, Styled,
-    Window, div, px,
+    App, BoxShadow, Context, Hsla, IntoElement, ParentElement, Render, SharedString,
+    StyleRefinement, Styled, Window, div, point, px,
 };
 use oximux_settings::Theme;
 
@@ -63,15 +63,27 @@ pub fn insertion_side(src_index: usize, this_index: usize) -> InsertionSide {
 /// — the border sits on the padded container so it already clears the rail
 /// edge by the container's horizontal padding. Shared by the project-header
 /// and workspace-row indicators so both read identically.
+///
+/// A 1px `knockout`-colored casing (a hard, blur-free shadow offset just past
+/// the accent edge) hugs the line so it stays legible over a tinted card — the
+/// caret reads as "punched through" adjacent content instead of blending into
+/// the row color underneath. Pass the rail surface color as `knockout`.
 pub fn paint_insertion_line(
     style: StyleRefinement,
     side: InsertionSide,
     accent: gpui::Hsla,
+    knockout: gpui::Hsla,
 ) -> StyleRefinement {
-    match side {
-        InsertionSide::Top => style.border_t(px(2.0)).border_color(accent),
-        InsertionSide::Bottom => style.border_b(px(2.0)).border_color(accent),
-    }
+    let (bordered, casing_offset) = match side {
+        InsertionSide::Top => (style.border_t(px(2.0)), point(px(0.0), px(-1.0))),
+        InsertionSide::Bottom => (style.border_b(px(2.0)), point(px(0.0), px(1.0))),
+    };
+    bordered.border_color(accent).shadow(vec![BoxShadow {
+        color: knockout,
+        offset: casing_offset,
+        blur_radius: px(0.0),
+        spread_radius: px(0.0),
+    }])
 }
 
 /// Reorder callback: `(moved_workspace_id, target_workspace_id, window, app)`.

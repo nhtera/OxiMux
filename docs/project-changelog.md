@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-16 — Left-rail parity batch 2: pinning, drag UX, visual finish, row interactions
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/storage/migrations/V016__workspaces_pinned.sql` (new — `pinned INTEGER DEFAULT 0`, ladder → 16), `crates/storage/src/{migrations.rs,model.rs}`, `crates/storage/src/repositories/workspace.rs` (`set_pinned`, SELECT cols), `crates/core/src/workspace.rs` (`pinned: bool`), `crates/app/src/shell/left_rail/{mod.rs,workspace_list_render.rs,row_menu.rs,workspace_card.rs,workspace_row.rs,project_group.rs,project_drag.rs}`, `crates/app/src/shell/workspace_ops.rs` (`toggle_workspace_pin`, `rename_workspace_now` pub), `crates/app/src/assets.rs` (register `pin.svg`), `crates/app/assets/icons/pin.svg` (new)
+
+Implements all 12 research recommendations plus **workspace pinning** (the reference UX's model). Sort mode stays global; free drag-reorder stays gated to Manual.
+
+**Pinning:** migration V016 adds `workspaces.pinned`; a pinned workspace floats to the top of its project group in *every* sort mode (`sort_workspaces` now orders `[primary, pinned…by mode, unpinned…by mode]`). Pin/Unpin sits at the top of the row menu (and right-click), shows a pin glyph, persists across restart, and is excluded from free-drag (it's already anchored). Pinned rows are tracked in the Smart-sort settle entry so a pin re-ranks immediately while attention changes still debounce.
+
+**Drag UX:** edge auto-scroll during a drag (re-arming tick on `list_scroll` driven by `on_drag_move` band detection) lets a row drop onto a previously off-screen position; a ~3s Smart sort-settle stops rows reshuffling under the cursor; the click-vs-drag threshold is engine-provided (`DRAG_THRESHOLD = 2px`).
+
+**Visual finish:** knockout-ring drop caret (`paint_insertion_line` gains a `bg_rail` box-shadow casing); deterministic per-project identity hue dot (`project_identity_hue`); the warm-wash investigation found the rail already renders flat opaque (no fix needed). The rail open/close **width tween (#9) was deferred** — the rail is mounted/unmounted via `left_rail_open`, not resized, so a tween would need a risky restructure for the lowest-priority P2.
+
+**Row interactions:** `+` / `…` hidden at rest and revealed on hover; inline double-click rename (mounts a focused `gpui_component` Input, `capture_action(InputEnter/InputEscape)` + blur-commit, reuses `rename_workspace_now`); right-click context menus on workspace rows and project headers; collapse no-jump scroll anchor (`on_next_frame` offset restore).
+
+Status: full workspace build + clippy clean, all tests pass; code-reviewed (1 medium settle/pin race + 4 minor findings applied). Live GUI-verified on a bundled debug `.app` — pinning, auto-scroll, drag-reorder, inline rename, right-click menus, and identity dots all confirmed; a missing `pin.svg` asset registration was caught live and fixed. Escape-to-cancel rename is not keyboard-testable here (macOS IME eats Escape; wiring matches the working dialog).
+
+---
+
 ### 2026-06-15 — Left-rail drag-to-reorder: projects and workspaces, persisted via sparse-float sort_order
 
 **Commits**: _(local, pending)_

@@ -15,16 +15,32 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, AppContext, ElementId, Hsla, InteractiveElement, IntoElement,
+    Animation, AnimationExt, AppContext, ElementId, Entity, Hsla, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     div, prelude::FluentBuilder, px, svg,
 };
+use gpui_component::input::{Enter as InputEnter, Escape as InputEscape, Input, InputState};
+use oximux_core::Workspace;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::shell::left_rail::LeftRail;
 use crate::shell::left_rail::project_drag::{
     SidebarDragPreview, WorkspaceDragConfig, WorkspaceDragPayload, insertion_side,
     paint_insertion_line,
 };
+
+/// Inline-rename wiring for one workspace row. Built by `project_group` for
+/// every non-primary row.
+pub struct RowRenameConfig {
+    /// The rail entity, for the begin / commit / cancel callbacks.
+    pub rail: Entity<LeftRail>,
+    /// This row's workspace — the double-click "begin rename" payload.
+    pub workspace: Workspace,
+    /// `Some(field)` when THIS row is the one being renamed: the title is
+    /// replaced by this edit field. `None` = render the title with a
+    /// double-click-to-rename affordance.
+    pub active_input: Option<Entity<InputState>>,
+}
 use crate::shell::left_rail::workspace_row::{
     FOLDER_ICON_SIZE, STATUS_DOT_SIZE, TRAILING_BTN_SIZE, WorkspaceCardPlan,
 };
@@ -53,6 +69,7 @@ pub fn render_workspace_card(
     show_menu: bool,
     locate_glow_seq: u64,
     drag: Option<WorkspaceDragConfig>,
+    rename: Option<RowRenameConfig>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -60,6 +77,11 @@ pub fn render_workspace_card(
     on_menu_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     let menu_id: SharedString = format!("{row_id}-menu").into();
+
+    // The menu-open callback is reached from two affordances — the `…` button
+    // and a right-click on the row — so it is shared via `Rc`.
+    let on_menu_click = std::rc::Rc::new(on_menu_click);
+    let on_menu_click_btn = on_menu_click.clone();
 
     // Trailing "…" button — invisible at rest, revealed on row hover via
     // `group_hover`. Primary (main worktree) rows suppress this because the
@@ -87,7 +109,7 @@ pub fn render_workspace_card(
             })
             .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                 cx.stop_propagation();
-                on_menu_click(ev, window, cx);
+                on_menu_click_btn(ev, window, cx);
             })
     });
 
@@ -149,17 +171,70 @@ pub fn render_workspace_card(
             .child("Folder")
     });
 
+    // Pin glyph — a small marker on pinned rows. Sits right after the name so
+    // it reads as a property of the row, distinct from the leading status dot.
+    let pin_indicator = plan.pinned.then(|| {
+        svg()
+            .path("icons/pin.svg")
+            .size(px(11.0))
+            .flex_shrink_0()
+            .text_color(theme.fg_muted)
+    });
+
+    // Name slot — normally the row title, but swapped for an inline edit field
+    // while this row is being renamed. A non-active rename config makes the
+    // title double-clickable to begin a rename.
+    let name_element: gpui::AnyElement = match rename {
+        // This row is actively being renamed → show the edit field. Enter/Escape
+        // are captured before the Input's own handling so Escape stays a cancel
+        // (it clears the rename first, so the resulting blur is a no-op).
+        Some(RowRenameConfig {
+            rail,
+            active_input: Some(input),
+            ..
+        }) => {
+            let rail_commit = rail.clone();
+            let rail_cancel = rail.clone();
+            div()
+                .flex_1()
+                .min_w_0()
+                .capture_action(move |_: &InputEnter, _window, cx| {
+                    rail_commit.update(cx, |r, cx| r.commit_rename(cx));
+                })
+                .capture_action(move |_: &InputEscape, _window, cx| {
+                    rail_cancel.update(cx, |r, cx| r.cancel_rename(cx));
+                })
+                .child(Input::new(&input))
+                .into_any_element()
+        }
+        // Renamable row at rest → title with double-click-to-rename.
+        Some(RowRenameConfig { rail, workspace, .. }) => div()
+            .text_size(px(typography.t_body_sm))
+            .text_color(plan.row.fg)
+            .child(plan.row.name.clone())
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                if ev.click_count >= 2 {
+                    cx.stop_propagation();
+                    let workspace = workspace.clone();
+                    rail.update(cx, |r, cx| r.begin_rename_workspace(workspace, window, cx));
+                }
+            })
+            .into_any_element(),
+        // Primary / non-renamable row → plain title.
+        None => div()
+            .text_size(px(typography.t_body_sm))
+            .text_color(plan.row.fg)
+            .child(plan.row.name.clone())
+            .into_any_element(),
+    };
+
     let line1 = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(density.gap_inline))
-        .child(
-            div()
-                .text_size(px(typography.t_body_sm))
-                .text_color(plan.row.fg)
-                .child(plan.row.name),
-        )
+        .child(name_element)
+        .children(pin_indicator)
         .children(primary_badge)
         .children(branch_chip)
         .children(issue_chip)
@@ -237,13 +312,16 @@ pub fn render_workspace_card(
     // Card shell — two-line tall. Active cards render inset with a rounded
     // border; inactive cards sit flush and lift on hover. Mirrors the
     // existing workspace row active/inactive treatment.
+    // No explicit `w_full` here: the flex-column wrapper (below) stretches the
+    // card to fill the rail width on the cross axis, which — unlike `w_full` —
+    // correctly shrinks the box by the active row's horizontal margins instead
+    // of overflowing past the right edge (which would clip the right corners).
     let base = div()
         .id(row_id)
         .group(group_name)
         .flex()
         .flex_row()
         .items_center()
-        .w_full()
         .h(px(density.h_row * CARD_HEIGHT_MULT))
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
@@ -263,14 +341,28 @@ pub fn render_workspace_card(
             .bg(gpui::rgb(c.rgb()))
     });
 
+    // Every row uses the same inset + rounded card shape so the active fill and
+    // the hover highlight share one geometry (matching the reference app): the
+    // active row adds a border + persistent fill, an inactive row stays
+    // transparent at rest and only tints (still rounded + inset) on hover. Both
+    // are inset by the same margin, so content alignment never shifts between
+    // states.
+    //
+    // Only a LEFT margin is applied (not `mx`): the rail's right edge is taken
+    // up by the resize handle's hit-pad (an equal-width strip of rail surface),
+    // so the card runs flush to the body's right edge and that hit-pad becomes
+    // the right gap — keeping the visible left/right gaps symmetric. The flex
+    // wrapper means this no longer overflows, so all four corners still round.
     let shell = if plan.row.is_active {
-        base.mx(px(density.gap_inline))
+        base.ml(px(density.gap_inline))
             .rounded(px(density.r_card))
             .border_1()
             .border_color(theme.border_inactive)
             .bg(plan.row.bg)
     } else {
-        base.bg(plan.row.bg).hover(|s| s.bg(theme.hover_overlay))
+        base.ml(px(density.gap_inline))
+            .rounded(px(density.r_card))
+            .hover(|s| s.bg(theme.hover_overlay))
     };
 
     let card = shell
@@ -293,6 +385,14 @@ pub fn render_workspace_card(
         )
         .children(trailing_btn)
         .on_mouse_down(MouseButton::Left, on_row_click)
+        // Right-click opens the same row popover at the cursor (DRY with the
+        // `…` button). Gated to rows that have a menu (non-primary).
+        .when(show_menu, |el| {
+            el.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                cx.stop_propagation();
+                on_menu_click(ev, window, cx);
+            })
+        })
         // Drag-to-reorder (Manual mode, non-primary rows only). Stateless
         // idiom: the payload carries the source index, `drag_over` paints the
         // insertion line, `on_drop` validates same-group then persists.
@@ -320,7 +420,12 @@ pub fn render_workspace_card(
                 if payload.project_id != over_project || payload.src_index == this_index {
                     return style;
                 }
-                paint_insertion_line(style, insertion_side(payload.src_index, this_index), accent)
+                paint_insertion_line(
+                    style,
+                    insertion_side(payload.src_index, this_index),
+                    accent,
+                    theme.bg_rail,
+                )
             })
             .on_drop::<WorkspaceDragPayload>(move |payload: &WorkspaceDragPayload, window, cx| {
                 // Reorder-only: reject a drop from a different project group or
@@ -343,9 +448,9 @@ pub fn render_workspace_card(
         div()
             .absolute()
             .inset_0()
-            // Match the active card's inset + radius so the ring traces
+            // Match the active card's left inset + radius so the ring traces
             // the card edge, not the full-width wrapper.
-            .mx(px(density.gap_inline))
+            .ml(px(density.gap_inline))
             .rounded(px(density.r_card))
             .border_1()
             .with_animation(
@@ -358,8 +463,12 @@ pub fn render_workspace_card(
 
     // Outer wrapper carries the tint accent so it sits at a consistent
     // rail-left for every row (the active card's own margin doesn't shift it).
+    // Flex-column so the in-flow card stretches to the wrapper width minus its
+    // own horizontal margins (the absolute tint/glow children stay out of flow).
     div()
         .relative()
+        .flex()
+        .flex_col()
         .w_full()
         .children(tint_bar)
         .child(card)
