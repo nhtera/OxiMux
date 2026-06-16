@@ -92,11 +92,13 @@ const TERMINAL_KEY_CONTEXT: &str = "OximuxTerminal";
 /// Binding the same chords to a no-op in a context that only the terminal
 /// carries wins on dispatch-depth (a descendant context outranks the root's),
 /// and a no-op binding leaves the keystroke unhandled — so it falls through to
-/// the view's `on_key_down`, which forwards `\t` / backtab to the PTY. When the
-/// terminal is NOT focused the context is absent and the host's navigation
-/// bindings work as before.
+/// the view's `on_key_down`, which forwards `\t` / backtab to the PTY. The
+/// context only participates in dispatch while focus is inside the terminal
+/// subtree, so when another surface is focused the host's navigation bindings
+/// resolve as before.
 ///
-/// Call once at boot, after the host's own key bindings are installed.
+/// Call once at boot. Order vs. the host's own `bind_keys` is irrelevant —
+/// precedence is by dispatch depth, not registration order.
 pub fn register_terminal_key_bindings(cx: &mut App) {
     cx.bind_keys([
         gpui::KeyBinding::new("tab", gpui::NoAction, Some(TERMINAL_KEY_CONTEXT)),

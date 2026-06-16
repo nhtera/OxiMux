@@ -79,6 +79,10 @@ pub fn take_boot_warnings() -> Vec<String> {
 pub fn install(cx: &mut App) {
     let (overrides, mut warnings) = load_overrides();
     warnings.extend(keymap_registry::install(cx, &overrides));
+    // Co-install the terminal's Tab/Shift+Tab shadow bindings alongside the
+    // global keymap they shadow, so the two can never desync (e.g. a second
+    // window/host that installs the keymap but forgets the shadow).
+    crate::shell::terminal_view::register_terminal_key_bindings(cx);
     for warning in &warnings {
         tracing::warn!(%warning, "keybinding override problem");
     }

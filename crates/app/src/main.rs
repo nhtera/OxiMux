@@ -235,13 +235,10 @@ fn main() {
         // before `set_menus`: GPUI reads the keymap when it builds the menu
         // to render each item's ⌘ glyph, and never re-reads it for a static
         // menu. Bind first, then build.
+        // Installs the effective keymap plus the terminal's Tab/Shift+Tab
+        // shadow bindings (so `cd <Tab>` reaches the shell instead of cycling
+        // UI focus). Must run before `set_menus`.
         oximux_app::keybindings_settings::install(cx);
-        // Shadow the component host's global Tab / Shift+Tab focus-navigation
-        // bindings inside the terminal's key context, so those keys reach the
-        // shell (e.g. `cd <Tab>` completion) instead of cycling UI focus. Must
-        // run after the keymap install above so the descendant-context binding
-        // is registered alongside the host's root binding.
-        oximux_app::shell::terminal_view::register_terminal_key_bindings(cx);
         // Install the application menu so the macOS menu bar reads "OxiMux"
         // (not the launching process's name) and carries the standard
         // About / Hide / Quit / Window items. `Quit` routes through
