@@ -23,11 +23,12 @@ use std::sync::Arc;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription, Window,
-    img, px,
+    img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme,
     input::{Input, InputState, TabSize},
+    resizable::{h_resizable, resizable_panel},
 };
 
 use gpui::actions;
@@ -37,6 +38,7 @@ use lsp_types::Uri;
 use crate::binary::{image_mime_for_path, is_binary_buffer};
 use crate::lsp::{LspClient, path_to_file_uri};
 use crate::lsp_bridge::spawn_attach_lsp;
+use crate::markdown_preview::{self, MarkdownViewMode};
 
 actions!(oximux, [SaveFile]);
 
@@ -96,6 +98,20 @@ pub fn language_for_path(path: &Path) -> &'static str {
         Some("diff" | "patch") => "diff",
         _ => "plain",
     }
+}
+
+/// `true` for files that should get the markdown preview: `.md`/`.markdown`
+/// only. `.mdx` is intentionally excluded (it keeps the plain code editor) —
+/// hence this tests the extension directly rather than reusing
+/// `language_for_path`, which also maps `.mdx` to `"markdown"`.
+pub fn is_markdown_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("md" | "markdown")
+    )
 }
 
 /// Returned by `decide_change_propagation` when a buffer mutation should be
@@ -179,6 +195,14 @@ pub struct EditorView {
     /// Mirrors platform focus state into a local field so the host's
     /// per-leaf observer can read focus without a `&Window`.
     focused: bool,
+    /// `true` for `.md`/`.markdown` text files (extension-gated — `.mdx` is
+    /// deliberately excluded and keeps the plain code-editor view). Drives
+    /// the header mode toggle and the rendered-preview body arm.
+    is_markdown: bool,
+    /// Active markdown view (Source / Preview / Split). View-lifetime state
+    /// only — not persisted, so every reopen of a `.md` starts in Preview.
+    /// Meaningless (and unused) when `is_markdown` is false.
+    md_mode: MarkdownViewMode,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
 }
@@ -222,6 +246,15 @@ impl EditorView {
             Ok(bytes) => decide_content(&path, bytes, window, cx),
         };
 
+        // Markdown preview applies only to text-mode `.md`/`.markdown`. Default
+        // to Preview (read-first); this resets on every reopen (not persisted).
+        let is_markdown = matches!(content, EditorContent::Text(_)) && is_markdown_path(&path);
+        let md_mode = if is_markdown {
+            MarkdownViewMode::Preview
+        } else {
+            MarkdownViewMode::Source
+        };
+
         Self {
             uri,
             content,
@@ -229,6 +262,8 @@ impl EditorView {
             lsp_client: None,
             file_path: path,
             focused: false,
+            is_markdown,
+            md_mode,
             _focus_sub,
             _blur_sub,
         }
@@ -447,13 +482,67 @@ impl Render for EditorView {
             .border_color(theme.border)
             .text_size(gpui::px(11.0))
             .text_color(theme.muted_foreground)
-            .child(format!("{path_str}{dirty_suffix}{kind_suffix}"));
+            .child(format!("{path_str}{dirty_suffix}{kind_suffix}"))
+            // Markdown-only: a right-aligned Source/Preview/Split toggle. The
+            // `flex_1` spacer pushes it to the row's trailing edge.
+            .when(self.is_markdown, |row| {
+                row.child(gpui::div().flex_1()).child(
+                    markdown_preview::mode_toggle(self.md_mode, cx.entity_id()).on_click(cx.listener(
+                        |this, clicks: &Vec<usize>, _window, cx| {
+                            if let Some(mode) =
+                                clicks.first().and_then(|&i| MarkdownViewMode::from_index(i))
+                            {
+                                this.md_mode = mode;
+                                cx.notify();
+                            }
+                        },
+                    )),
+                )
+            });
 
         // Snapshot the colors we need before constructing children — the
         // theme borrow is released here so the body match can re-borrow
         // `cx` mutably if it needs to (e.g., for `cx.listener`).
         let muted_fg = theme.muted_foreground;
         let body: gpui::AnyElement = match &self.content {
+            // Markdown text: branch on the active view mode. Source reuses the
+            // plain editor; Preview/Split render via the GFM renderer. The
+            // preview reads `state.value()` at render time, so the existing
+            // `cx.observe(&state)` → `cx.notify()` already keeps it live.
+            EditorContent::Text(t) if self.is_markdown => {
+                let dir = self.file_path.parent();
+                let input = Input::new(&t.state)
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(theme.mono_font_size)
+                    .size_full();
+                let view_id = cx.entity_id();
+                match self.md_mode {
+                    MarkdownViewMode::Source => input.into_any_element(),
+                    MarkdownViewMode::Preview => {
+                        let value = t.state.read(cx).value().to_string();
+                        markdown_preview::render_preview(&value, dir, view_id)
+                    }
+                    MarkdownViewMode::Split => {
+                        let value = t.state.read(cx).value().to_string();
+                        // Bound the split's height to the region below the 28px
+                        // breadcrumb: `h_resizable` is `size_full`, so without a
+                        // `flex_1`/`min_h_0` wrapper it would overflow the header.
+                        gpui::div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(
+                                h_resizable(("md-split", view_id))
+                                    .child(resizable_panel().child(input))
+                                    .child(
+                                        resizable_panel().child(
+                                            markdown_preview::render_preview(&value, dir, view_id),
+                                        ),
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                }
+            }
             EditorContent::Text(t) => Input::new(&t.state)
                 .font_family(theme.mono_font_family.clone())
                 .text_size(theme.mono_font_size)
@@ -588,6 +677,17 @@ mod tests {
         assert_eq!(language_for_path(&PathBuf::from("Dockerfile")), "bash");
         assert_eq!(language_for_path(&PathBuf::from("Makefile")), "make");
         assert_eq!(language_for_path(&PathBuf::from("Cargo.toml")), "toml");
+    }
+
+    #[test]
+    fn is_markdown_path_matches_md_and_markdown_only() {
+        assert!(is_markdown_path(&PathBuf::from("README.md")));
+        assert!(is_markdown_path(&PathBuf::from("doc.markdown")));
+        assert!(is_markdown_path(&PathBuf::from("DOC.MD"))); // case-insensitive
+        // .mdx is deliberately excluded — keeps the plain code-editor view.
+        assert!(!is_markdown_path(&PathBuf::from("page.mdx")));
+        assert!(!is_markdown_path(&PathBuf::from("main.rs")));
+        assert!(!is_markdown_path(&PathBuf::from("README")));
     }
 
     #[test]

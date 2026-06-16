@@ -153,6 +153,11 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // Replace gpui's default `NullHttpClient` (fails every request) with a
+        // file:// reader so markdown-preview images that resolve to local repo
+        // paths actually load — the image element fetches every URL through the
+        // http client, never the filesystem.
+        cx.set_http_client(oximux_app::file_http_client::FileHttpClient::shared());
         // Warm the syntect grammar + theme sets (~30 ms) during idle boot
         // so the first diff paint never pays the lazy-init cost.
         cx.background_executor()

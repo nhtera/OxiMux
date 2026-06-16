@@ -17,9 +17,11 @@ pub mod editor_view;
 pub mod file_tree;
 pub mod lsp;
 pub mod lsp_bridge;
+pub mod markdown_preview;
 
 pub use autosave::{pause_autosave, resume_autosave};
 pub use binary::{image_mime_for_path, is_binary_buffer, is_previewable_image};
 pub use editor_view::{EditorView, SaveFile, language_for_path};
+pub use markdown_preview::MarkdownViewMode;
 pub use file_tree::{FileTree, FileTreeEvent, FileTreeNode, TreeNodeId};
 pub use lsp::{LspClient, LspHoverProvider, path_to_file_uri};

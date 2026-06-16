@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-06-06  
-**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal) shipped
+**Updated**: 2026-06-16  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped
 
 ---
 
@@ -275,6 +275,45 @@ Key design decisions locked in spike:
 - `REQUEST_TIMEOUT = 5s` via `tokio::time::timeout`; no `$/cancelRequest`.
 - Missing binary → `tracing::warn` + editor renders without LSP; no panic.
 - Spike is read-only: no `didChange`, no save round-trip (step 2 owns that).
+
+### Markdown rendered preview
+
+`.md` / `.markdown` files open in a rendered view; `.mdx` keeps the plain code editor.
+
+```
+EditorView::new(path, cx)
+  is_markdown_path(path) → true for .md / .markdown (not .mdx)
+  md_mode: MarkdownViewMode  (Source | Preview | Split)  default = Preview
+  │
+  ├── header: mode_toggle() — segmented button row, right-aligned, markdown-only
+  │
+  └── body match md_mode:
+        Source  → gpui-component Input (normal code editor)
+        Preview → render_preview()
+        Split   → h_resizable(source_pane | preview_pane)
+
+render_preview()
+  absolutize_image_paths(text, file_path)
+    rewrites repo-relative ![](path) → file:// URI (pure fn)
+  gpui-component text::markdown (GFM renderer)
+    headings / bold / italic / inline-code / tables / task lists /
+    blockquotes / links / fenced code blocks / images
+```
+
+**FileHttpClient** (`crates/app/src/file_http_client.rs`):
+
+gpui defaults to `NullHttpClient` — its image element loads image URLs through the http client, never the filesystem. `FileHttpClient` is a `file://`-only `gpui::HttpClient` impl installed at app startup via `cx.set_http_client(Arc::new(FileHttpClient))`. It overrides `get()` because `http::Uri` rejects `file:///path` (empty authority) in the default path. HTTP/HTTPS requests are not forwarded (rejected).
+
+```
+main.rs
+  cx.set_http_client(Arc::new(FileHttpClient))   ← installed once at boot
+    └── FileHttpClient::get(file:///abs/path)
+          read file bytes → Response with Content-Type image/*
+```
+
+**Deferred** (not in v1): WYSIWYG editing, scroll-sync, TOC, mode-cycle keybinding, remote http(s) image rendering, `.mdx` preview.
+
+---
 
 ### Step 2 — save round-trip + LSP textDocument lifecycle (go, smoke green)
 
@@ -580,6 +619,9 @@ on_drop
 | Side-by-side diff | Phase 6 |
 | Blame, file history, commit graph | Phase 6 |
 | Editor + LSP full integration | Phase 5 step 6+ (steps 1-5 shipped; step 6+ = keybindings, multi-file, LSP completions) |
+| Markdown WYSIWYG / scroll-sync / TOC / keybinding | follow-on (basic preview shipped) |
+| Remote http(s) image rendering in markdown preview | follow-on (FileHttpClient is file:// only) |
+| `.mdx` preview | follow-on (kept as plain code editor) |
 | SQLite persistence / session restore | Phase 4 |
 | Multi-agent dashboard | Phase 7 |
 | embeddable terminal library terminal backend | v2 (ADR in brief.md) |

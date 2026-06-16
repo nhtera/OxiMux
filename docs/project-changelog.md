@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-16 — Editor: markdown rendered preview (Source / Preview / Split)
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/editor/src/markdown_preview.rs` (new), `crates/editor/src/editor_view.rs`, `crates/editor/src/lib.rs`, `crates/app/src/file_http_client.rs` (new), `crates/app/src/main.rs`, `crates/app/src/lib.rs`
+
+`.md` and `.markdown` files now open in a rendered preview instead of a raw code editor.
+
+**View-mode toggle** in the breadcrumb header (segmented buttons, right-aligned, markdown-only): **Source** (plain Input), **Preview** (full GFM render), **Split** (resizable source-left / preview-right via `h_resizable`). Default on open = Preview. Mode is view-lifetime — resets to Preview on reopen, not persisted. `.mdx` files and all non-markdown paths are unchanged.
+
+**Renderer** uses `gpui-component`'s existing `text::markdown` (GFM): headings, bold/italic/inline-code, tables, task lists, blockquotes, clickable links, fenced code blocks with syntax highlighting, and images.
+
+**Local image rendering**: `gpui` defaults to `NullHttpClient` (no image loads). A new `FileHttpClient` (`file://`-only `gpui::HttpClient` impl) is installed in `main.rs` via `cx.set_http_client(...)`. `markdown_preview.rs` rewrites repo-relative `![](path)` URLs to `file://` URIs (`absolutize_image_paths`) before passing the rendered text to the widget.
+
+**New modules**:
+- `crates/editor/src/markdown_preview.rs` — `MarkdownViewMode` enum, `mode_toggle()` render helper, `render_preview()`, `absolutize_image_paths()` (pure)
+- `crates/app/src/file_http_client.rs` — `FileHttpClient` struct; overrides `get()` because `http::Uri` rejects `file:///path` (empty authority) in the default path
+
+---
+
 ### 2026-06-16 — Left-rail parity batch 2: pinning, drag UX, visual finish, row interactions
 
 **Commits**: _(local, pending)_

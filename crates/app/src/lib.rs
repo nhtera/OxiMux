@@ -12,6 +12,7 @@ pub mod agent_launch_settings;
 pub mod browser_profiles;
 pub mod commit_message_ai_settings;
 pub mod custom_commands_loader;
+pub mod file_http_client;
 pub mod git_state_cache;
 pub mod keybindings_settings;
 pub mod keymap_registry;

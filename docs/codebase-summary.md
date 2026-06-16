@@ -30,8 +30,13 @@ oximux/
 ```
 src/
 ├── main.rs                 boots tokio runtime; opens Repository at cwd (Option);
-│                           registers keybindings; opens GPUI window
+│                           registers keybindings; opens GPUI window;
+│                           installs FileHttpClient via cx.set_http_client(...)
 ├── lib.rs                  re-exports for integration tests
+├── file_http_client.rs     FileHttpClient — file://-only gpui::HttpClient impl;
+│                           required because gpui defaults to NullHttpClient (no image loads);
+│                           overrides get() (http::Uri rejects file:///path empty authority);
+│                           used by markdown preview to load local images
 ├── actions.rs              all GPUI Action structs (SplitHorizontal, Search, NewWindow,
 │                           MoveTabToNewWindow, NewTabInPane, etc.)
 ├── assets.rs              CompositeAssets — local SVGs (git-branch) + gpui-component bundle
@@ -361,12 +366,13 @@ src/
 ```
 src/
 ├── lib.rs                  re-exports EditorView, SaveFile action, lsp module
-├── editor_view.rs          EditorView GPUI entity (step 1+2)
+├── editor_view.rs          EditorView GPUI entity (step 1+2 + markdown preview)
 │                           Fields: file_path, uri (lsp_types::Uri, parse-once),
 │                             state (Entity<InputState>), focus_handle,
 │                             lsp_client (Option<Arc<LspClient>>),
 │                             dirty (bool), doc_version (i32, starts at 1),
-│                             last_sent_text (String), _observe_sub
+│                             last_sent_text (String), _observe_sub,
+│                             is_markdown (bool), md_mode (MarkdownViewMode)
 │                           Step 1: gpui-component Input in code_editor("rust") mode;
 │                             attach_lsp → HoverProvider + publishDiagnostics pump
 │                           Step 2: cx.observe wired in new(); SaveFile action
@@ -374,6 +380,14 @@ src/
 │                             file via fs::write, sends didSave; window title shows
 │                             " •" dirty badge; impl Drop sends didClose via sync mpsc
 │                           Keyed by --editor-spike CLI flag
+│                           Markdown: is_markdown_path() detects .md/.markdown (not .mdx);
+│                             header toggle renders Source/Preview/Split segmented buttons;
+│                             body dispatches on md_mode (Source=Input / Preview / Split)
+├── markdown_preview.rs     MarkdownViewMode enum (Source | Preview | Split);
+│                           mode_toggle() — segmented button row (right-aligned, markdown-only);
+│                           render_preview() — gpui-component text::markdown GFM renderer;
+│                           absolutize_image_paths(text, file_path) — pure fn: rewrites
+│                             repo-relative ![](path) → file:// URIs for local image loads
 ├── lsp_bridge.rs           spawn_attach_lsp (factored from editor_view.rs)
 │                           Runs LSP handshake on tokio; calls set_lsp_client on
 │                           EditorView entity; passes did_open_text for catch-up
