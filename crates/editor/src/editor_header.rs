@@ -121,13 +121,12 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
     let mut card = v_flex()
         // Definite width (not `min_w`): a shrink-wrapped card sizes to its
         // widest row, so `w_full` on a shorter row resolves against an
-        // indefinite width and collapses to that row's own text — leaving its
-        // hover highlight inset. A fixed width lets every row fill edge-to-edge.
+        // indefinite width and collapses to that row's own text. A fixed width
+        // lets every row fill the inner content box uniformly.
         .w(px(240.0))
-        // Vertical padding only: rows run full-bleed so their hover highlight
-        // spans the card edge-to-edge. `overflow_hidden` clips that highlight
-        // to the card's rounded corners on the first/last rows.
-        .py(px(4.0))
+        // Uniform padding on all sides so each row's rounded hover highlight
+        // sits inset from the card edges rather than touching them.
+        .p(px(4.0))
         .bg(popover)
         .border_1()
         .border_color(border)
@@ -232,7 +231,8 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
         .into_any_element()
 }
 
-/// A 1px divider between menu groups.
+/// A 1px divider between menu groups. Slight horizontal inset so it lines up
+/// with the inset hover highlight of the rows above and below.
 fn separator(border: Hsla) -> impl IntoElement {
     div().h(px(1.0)).my(px(3.0)).mx(px(4.0)).bg(border)
 }
@@ -250,10 +250,12 @@ fn menu_row(
         .w_full()
         .flex()
         .items_center()
-        // Full-bleed row: no rounding, so the hover background fills the
-        // card's full width (the card clips the corners).
-        .px(px(12.0))
+        // Inset rounded row: the card's padding keeps the hover highlight a few
+        // px in from the card edges, and the rounding gives it soft corners —
+        // the standard contextual-menu look.
+        .px(px(8.0))
         .py(px(6.0))
+        .rounded(px(6.0))
         .text_size(px(12.0))
         .text_color(fg)
         .cursor_pointer()
