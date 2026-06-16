@@ -13,6 +13,7 @@
 
 pub mod autosave;
 pub mod binary;
+pub mod editor_header;
 pub mod editor_view;
 pub mod file_tree;
 pub mod lsp;

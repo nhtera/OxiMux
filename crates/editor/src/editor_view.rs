@@ -36,6 +36,7 @@ use gpui::actions;
 use lsp_types::Uri;
 
 use crate::binary::{image_mime_for_path, is_binary_buffer};
+use crate::editor_header;
 use crate::lsp::{LspClient, path_to_file_uri};
 use crate::lsp_bridge::spawn_attach_lsp;
 use crate::markdown_preview::{self, MarkdownViewMode};
@@ -203,6 +204,8 @@ pub struct EditorView {
     /// only — not persisted, so every reopen of a `.md` starts in Preview.
     /// Meaningless (and unused) when `is_markdown` is false.
     md_mode: MarkdownViewMode,
+    /// Whether the breadcrumb "Open in…" dropdown is showing. View-lifetime.
+    open_in_menu_open: bool,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
 }
@@ -264,6 +267,7 @@ impl EditorView {
             focused: false,
             is_markdown,
             md_mode,
+            open_in_menu_open: false,
             _focus_sub,
             _blur_sub,
         }
@@ -273,6 +277,25 @@ impl EditorView {
     /// `on_focus`/`on_blur` subscriptions installed in `new`.
     pub fn focused(&self) -> bool {
         self.focused
+    }
+
+    /// Flip the breadcrumb "Open in…" dropdown open/closed.
+    pub(crate) fn toggle_open_in_menu(&mut self) {
+        self.open_in_menu_open = !self.open_in_menu_open;
+    }
+
+    /// Dismiss the breadcrumb "Open in…" dropdown.
+    pub(crate) fn close_open_in_menu(&mut self) {
+        self.open_in_menu_open = false;
+    }
+
+    /// The live buffer text for text content; `None` for image/binary. Read at
+    /// click time by the breadcrumb "copy contents" action.
+    pub(crate) fn current_text(&self, cx: &App) -> Option<String> {
+        match &self.content {
+            EditorContent::Text(t) => Some(t.state.read(cx).value().to_string()),
+            _ => None,
+        }
     }
 
     /// Editor state entity — exposed so callers can install provider
@@ -475,6 +498,7 @@ impl Render for EditorView {
             .flex()
             .flex_row()
             .items_center()
+            .gap(gpui::px(6.0))
             .h(gpui::px(28.0))
             .px(gpui::px(12.0))
             .bg(theme.background)
@@ -482,11 +506,25 @@ impl Render for EditorView {
             .border_color(theme.border)
             .text_size(gpui::px(11.0))
             .text_color(theme.muted_foreground)
-            .child(format!("{path_str}{dirty_suffix}{kind_suffix}"))
-            // Markdown-only: a right-aligned Source/Preview/Split toggle. The
-            // `flex_1` spacer pushes it to the row's trailing edge.
+            // The path is one click from the clipboard (with a toast).
+            .child(editor_header::clickable_path(
+                format!("{path_str}{dirty_suffix}{kind_suffix}"),
+                &self.file_path,
+                cx,
+            ))
+            // Spacer pushes the actions + toggle to the row's trailing edge.
+            .child(gpui::div().flex_1())
+            // File actions for every file: copy contents (text only), reveal in
+            // Finder, "Open in…" external editor.
+            .child(editor_header::action_buttons(
+                &self.file_path,
+                self.is_text(),
+                self.open_in_menu_open,
+                cx,
+            ))
+            // Markdown-only: the Source/Preview/Split toggle, far right.
             .when(self.is_markdown, |row| {
-                row.child(gpui::div().flex_1()).child(
+                row.child(
                     markdown_preview::mode_toggle(self.md_mode, cx.entity_id()).on_click(cx.listener(
                         |this, clicks: &Vec<usize>, _window, cx| {
                             if let Some(mode) =
@@ -567,6 +605,8 @@ impl Render for EditorView {
             .flex()
             .flex_col()
             .size_full()
+            // Anchors the absolutely-positioned "Open in…" overlay below.
+            .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::on_save))
@@ -586,6 +626,10 @@ impl Render for EditorView {
             )
             .child(breadcrumb)
             .child(body)
+            // "Open in…" dropdown: backdrop + card, painted above the body.
+            .when(self.open_in_menu_open, |this| {
+                this.child(editor_header::open_in_overlay(&self.file_path, cx))
+            })
     }
 }
 
