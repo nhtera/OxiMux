@@ -75,6 +75,35 @@ const fn poll_interval_ms(visible: bool) -> u64 {
 pub const DEFAULT_COLS: u16 = 100;
 pub const DEFAULT_ROWS: u16 = 32;
 
+/// Key-dispatch context set on the focused terminal's root element. Used only
+/// to shadow the host's global Tab / Shift+Tab focus-navigation bindings (see
+/// [`register_terminal_key_bindings`]) so those keys reach the shell instead
+/// of cycling UI focus.
+const TERMINAL_KEY_CONTEXT: &str = "OximuxTerminal";
+
+/// Bind Tab / Shift+Tab to no-ops within the terminal's key context.
+///
+/// The component host installs a global `tab` → focus-next (and `shift-tab` →
+/// focus-prev) binding so keyboard users can walk the UI's focusable controls.
+/// That binding consumes the keystroke before it can reach the focused
+/// terminal, so pressing Tab at a shell prompt jumped focus to a side panel
+/// instead of triggering completion (`cd <Tab>` should list directories).
+///
+/// Binding the same chords to a no-op in a context that only the terminal
+/// carries wins on dispatch-depth (a descendant context outranks the root's),
+/// and a no-op binding leaves the keystroke unhandled — so it falls through to
+/// the view's `on_key_down`, which forwards `\t` / backtab to the PTY. When the
+/// terminal is NOT focused the context is absent and the host's navigation
+/// bindings work as before.
+///
+/// Call once at boot, after the host's own key bindings are installed.
+pub fn register_terminal_key_bindings(cx: &mut App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("tab", gpui::NoAction, Some(TERMINAL_KEY_CONTEXT)),
+        gpui::KeyBinding::new("shift-tab", gpui::NoAction, Some(TERMINAL_KEY_CONTEXT)),
+    ]);
+}
+
 /// Read the live terminal settings global, falling back to defaults when it
 /// isn't installed (headless tests, early startup before `set_global`).
 pub fn terminal_settings(cx: &App) -> TerminalSettings {
@@ -2413,6 +2442,11 @@ impl Render for TerminalView {
         let mut root = div()
             .id("oximux-terminal-view")
             .track_focus(&focus_handle)
+            // Carries the terminal key context so Tab / Shift+Tab resolve to
+            // the no-op bindings in `register_terminal_key_bindings` (shadowing
+            // the host's focus-navigation) and fall through to `on_key_down`,
+            // which forwards them to the shell for completion.
+            .key_context(TERMINAL_KEY_CONTEXT)
             .flex()
             .flex_col()
             .h_full()

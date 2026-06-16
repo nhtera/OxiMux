@@ -23,6 +23,14 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: InputMode) -> Vec<u8> {
         return Vec::new();
     }
 
+    // Shift+Tab is backtab (CSI Z) — what shells map to reverse menu
+    // completion. The Raw classifier below is modifier-blind and would emit a
+    // plain `\t`, so the shifted form is handled explicitly here. Require no
+    // Ctrl/Alt so the MRU-tab shortcuts (Ctrl[+Shift]+Tab) never reach here.
+    if ks.key == "tab" && ks.modifiers.shift && !ks.modifiers.control && !ks.modifiers.alt {
+        return b"\x1b[Z".to_vec();
+    }
+
     if let Some(seq) = classify(&ks.key) {
         return encode_special(seq, ks, mode);
     }
@@ -230,6 +238,25 @@ mod tests {
         assert_eq!(
             keystroke_to_bytes(&ks("backspace", None, Modifiers::default()), off()),
             b"\x7f"
+        );
+    }
+
+    #[test]
+    fn tab_and_backtab() {
+        // Plain Tab → HT, what the shell consumes for forward completion.
+        assert_eq!(
+            keystroke_to_bytes(&ks("tab", None, Modifiers::default()), off()),
+            b"\t"
+        );
+        // Shift+Tab → CSI Z (backtab), for reverse menu completion — must not
+        // collapse to a plain `\t`.
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keystroke_to_bytes(&ks("tab", None, shift), off()),
+            b"\x1b[Z"
         );
     }
 
