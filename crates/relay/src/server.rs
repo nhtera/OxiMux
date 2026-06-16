@@ -402,11 +402,21 @@ async fn dispatch_loop(
     notif_tx: &mpsc::Sender<Notification>,
     shutdown: &Arc<Notify>,
 ) -> Result<()> {
-    loop {
+    // Attachments this connection created (Spawn auto-attaches; Attach attaches
+    // explicitly). Tracked so that if the client disconnects WITHOUT an explicit
+    // Detach — an app crash, kill, or any unclean socket drop — teardown can
+    // still release them. The PTY's effective size is the MIN cols/rows across
+    // all live attachments, so a leaked attachment stuck at a stale (often the
+    // default 100-col) size would pin the shell to that width forever, regardless
+    // of the real pane size. Releasing on drop matches a terminal multiplexer's
+    // client-disconnect behaviour; the PTY itself stays alive (only Close ends it).
+    let mut owned: Vec<(String, u64)> = Vec::new();
+
+    let result = loop {
         let frame = match read_frame(read_half, buf).await {
             Ok(f) => f,
-            Err(CodecError::Eof) => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(CodecError::Eof) => break Ok(()),
+            Err(e) => break Err(e.into()),
         };
         let Frame::Request {
             request_id,
@@ -417,15 +427,56 @@ async fn dispatch_loop(
             continue;
         };
 
+        // Capture the bits needed to track attachment lifecycle before the
+        // request is consumed: an Attach's target PTY (its id isn't echoed in
+        // AttachOk), and an explicit Detach so we stop tracking that pair.
+        let attach_pty = match &request {
+            Request::Attach { pty_id } => Some(pty_id.clone()),
+            _ => None,
+        };
+        let detached = match &request {
+            Request::Detach {
+                pty_id,
+                attachment_id,
+            } => Some((pty_id.clone(), *attachment_id)),
+            _ => None,
+        };
+
         let response = handle_request(registry, notif_tx, shutdown, request).await;
+
+        match &response {
+            Response::SpawnOk {
+                pty_id,
+                attachment_id,
+            } => owned.push((pty_id.clone(), *attachment_id)),
+            Response::AttachOk { attachment_id, .. } => {
+                if let Some(pty_id) = attach_pty {
+                    owned.push((pty_id, *attachment_id));
+                }
+            }
+            _ => {}
+        }
+        if let Some(key) = detached {
+            owned.retain(|pair| *pair != key);
+        }
+
         let frame = Frame::Response {
             request_id,
             response,
         };
         if outbound_tx.send(frame).await.is_err() {
-            return Ok(());
+            break Ok(());
         }
+    };
+
+    // Release any attachments still held when the connection ends so a dropped
+    // client can no longer pin the PTY's (min-across-clients) size. Detach keeps
+    // the PTY alive; a NotFound here just means it was already closed — ignore.
+    for (pty_id, attachment_id) in owned {
+        let _ = registry.detach(&pty_id, attachment_id);
     }
+
+    result
 }
 
 async fn handle_request(

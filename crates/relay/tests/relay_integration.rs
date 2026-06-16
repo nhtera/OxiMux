@@ -713,6 +713,103 @@ async fn multi_attach_min_size_and_detach_grows_back() {
     );
 }
 
+// A client that drops its socket WITHOUT sending Detach (app crash, kill, or
+// any unclean disconnect) must not leave its attachment pinning the PTY's
+// (min-across-clients) size forever. The daemon releases a connection's
+// attachments when the connection ends, so the PTY grows back to the
+// surviving client's size.
+#[tokio::test]
+async fn unclean_disconnect_releases_attachment_and_grows_back() {
+    let relay = boot_relay().await;
+
+    // Client A spawns at 80x24 and stays connected.
+    let (mut a, mut a_buf) = connect_and_hello(&relay).await;
+    let pty_id = match req(
+        &mut a,
+        &mut a_buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            args: Vec::new(),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn: {other:?}"),
+    };
+
+    let effective = |descs: Vec<oximux_relay_proto::PtyDescriptor>| -> (u16, u16) {
+        let d = descs
+            .into_iter()
+            .find(|d| d.pty_id == pty_id)
+            .expect("pty listed");
+        (d.cols, d.rows)
+    };
+
+    // Client B attaches and shrinks to 40x10 → effective size = min.
+    let (mut b, mut b_buf) = connect_and_hello(&relay).await;
+    let aid_b = match req(
+        &mut b,
+        &mut b_buf,
+        2,
+        Request::Attach {
+            pty_id: pty_id.clone(),
+        },
+    )
+    .await
+    {
+        Response::AttachOk { attachment_id, .. } => attachment_id,
+        other => panic!("attach: {other:?}"),
+    };
+    let resp = req(
+        &mut b,
+        &mut b_buf,
+        3,
+        Request::Resize {
+            pty_id: pty_id.clone(),
+            attachment_id: aid_b,
+            cols: 40,
+            rows: 10,
+        },
+    )
+    .await;
+    assert!(matches!(resp, Response::Ok), "resize got {resp:?}");
+    let listed = match req(&mut a, &mut a_buf, 3, Request::ListPtys).await {
+        Response::PtyList(v) => v,
+        other => panic!("list: {other:?}"),
+    };
+    assert_eq!(effective(listed), (40, 10), "B's smaller size wins");
+
+    // B vanishes WITHOUT Detach — simulate a crashed/killed client.
+    drop(b);
+    drop(b_buf);
+
+    // The daemon notices the dropped connection and releases B's attachment,
+    // so the PTY grows back to A's 80x24. Poll (the cleanup is async on the
+    // server's connection task) with a bounded retry.
+    let mut grew_back = false;
+    for seq in 4..24 {
+        let listed = match req(&mut a, &mut a_buf, seq, Request::ListPtys).await {
+            Response::PtyList(v) => v,
+            other => panic!("list: {other:?}"),
+        };
+        if effective(listed) == (80, 24) {
+            grew_back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        grew_back,
+        "an unclean disconnect must release the attachment and grow the PTY back to 80x24"
+    );
+}
+
 // Two clients attached to the same PTY simultaneously: output written by
 // one must arrive on BOTH streams. This verifies that the daemon's fan-out
 // loop delivers Output notifications to every active subscriber, not only
