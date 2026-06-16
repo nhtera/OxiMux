@@ -119,13 +119,20 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
     let fg = theme.foreground;
 
     let mut card = v_flex()
-        .min_w(px(210.0))
-        .p(px(4.0))
-        .gap(px(1.0))
+        // Definite width (not `min_w`): a shrink-wrapped card sizes to its
+        // widest row, so `w_full` on a shorter row resolves against an
+        // indefinite width and collapses to that row's own text — leaving its
+        // hover highlight inset. A fixed width lets every row fill edge-to-edge.
+        .w(px(240.0))
+        // Vertical padding only: rows run full-bleed so their hover highlight
+        // spans the card edge-to-edge. `overflow_hidden` clips that highlight
+        // to the card's rounded corners on the first/last rows.
+        .py(px(4.0))
         .bg(popover)
         .border_1()
         .border_color(border)
         .rounded(radius)
+        .overflow_hidden()
         .shadow_md();
 
     if has_text {
@@ -243,9 +250,10 @@ fn menu_row(
         .w_full()
         .flex()
         .items_center()
-        .px(px(8.0))
-        .py(px(4.0))
-        .rounded(px(4.0))
+        // Full-bleed row: no rounding, so the hover background fills the
+        // card's full width (the card clips the corners).
+        .px(px(12.0))
+        .py(px(6.0))
         .text_size(px(12.0))
         .text_color(fg)
         .cursor_pointer()
