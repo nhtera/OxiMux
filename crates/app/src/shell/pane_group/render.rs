@@ -611,6 +611,7 @@ fn build_tab_strip_from_headers(
             header.agent_status.as_ref(),
             header.attention,
             tab_idx == active,
+            is_focused,
             drag_edge,
             header.color,
             header.pinned,
@@ -627,14 +628,12 @@ fn build_tab_strip_from_headers(
     // `chips` div takes flex_1 so it absorbs all remaining width while
     // the trailing buttons stay flex-shrink-0.
     //
-    // Bottom-border doubles as the focused-group highlight: 2px accent
-    // when this group has focus, 2px subtle border otherwise. Same width
-    // in both states so focus toggling doesn't reflow the strip.
-    let border_color = if is_focused {
-        theme.focus_ring
-    } else {
-        theme.border_inactive
-    };
+    // The strip's bottom edge is a single neutral divider separating the
+    // tab row from the content below — it never carries the accent. Focus
+    // and the active tab are signalled by the active chip's own bottom
+    // indicator (see `render_tab_chip`), so there's one localized accent
+    // cue under the active tab instead of a full-width colored line.
+    let border_color = theme.border_inactive;
     // Scroll-edge fade hints. Subtle 8px gradients painted absolutely
     // over the strip's left and right edges of the SCROLLING region
     // (right edge offset by the trailing cluster so the fade doesn't
@@ -999,6 +998,7 @@ fn render_tab_chip(
     agent_status: Option<&oximux_core::AgentStatus>,
     attention: bool,
     is_active: bool,
+    is_focused: bool,
     drag_edge: Option<TabInsertSide>,
     color_tag: Option<super::TabColor>,
     is_pinned: bool,
@@ -1025,18 +1025,28 @@ fn render_tab_chip(
     } else {
         theme.fg_muted
     };
-    // The active tab's top edge carries the active workspace's tint when one is
-    // set (a workspace identifier), falling back to the focus ring otherwise.
-    // The tint is workspace-level, so in a split every group's active tab wears
-    // it — deliberate (it identifies the workspace, not the focused pane).
-    let top_accent = if is_active {
-        match workspace_tint {
+    // The active tab's bottom edge carries a 2px accent underline (the
+    // active-tab indicator), in the active workspace's tint when one is set
+    // (a workspace identifier), falling back to the focus ring otherwise.
+    // The tint is workspace-level, so in a split every group's active tab
+    // wears it — deliberate (it identifies the workspace, not the focused
+    // pane). The unfocused group's underline is dimmed so the focused
+    // group's active tab still reads as the brightest cue.
+    let active_indicator: Option<AnyElement> = is_active.then(|| {
+        let accent: gpui::Hsla = match workspace_tint {
             Some(c) => gpui::rgb(c.rgb()).into(),
             None => theme.focus_ring,
-        }
-    } else {
-        gpui::transparent_black()
-    };
+        };
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .h(px(2.0))
+            .bg(accent)
+            .when(!is_focused, |s| s.opacity(0.45))
+            .into_any_element()
+    });
 
     let group_name = SharedString::from(format!("pane-group-tab-{entity_id_raw}-{ix}"));
     let activate_entity = entity.clone();
@@ -1111,17 +1121,20 @@ fn render_tab_chip(
         .gap(px(5.0))
         .h_full()
         .px(px(TAB_PAD_X_PX))
-        .border_t_2()
-        .border_color(top_accent)
         .text_size(px(11.0))
         .text_color(text_color)
         .flex_shrink_0()
         .cursor_pointer()
         .relative()
+        // Active tab takes the content-canvas background so it reads as
+        // connected to the surface below it; inactive tabs sit on the
+        // strip background and only fill on hover.
+        .when(is_active, |s| s.bg(theme.bg_base))
         .when(!is_active, |s| {
             s.hover(|s| s.text_color(theme.fg_base).bg(theme.hover_overlay))
         })
         .when_some(color_bar, |s, bar| s.child(bar))
+        .when_some(active_indicator, |s, bar| s.child(bar))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
             // Activate the chip's tab within its OWN group, then dispatch
             // an `ActivateGroupTab` so the workspace also switches active
