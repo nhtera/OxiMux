@@ -146,6 +146,13 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ("icons/lock.svg", include_bytes!("../assets/icons/lock.svg")),
     // Pin marker for pinned workspace rows in the left rail.
     ("icons/pin.svg", include_bytes!("../assets/icons/pin.svg")),
+    // Markdown editor view-mode toggle: `</>` (source) and a two-column glyph
+    // (split). Preview reuses the bundled eye icon.
+    ("icons/code.svg", include_bytes!("../assets/icons/code.svg")),
+    (
+        "icons/columns.svg",
+        include_bytes!("../assets/icons/columns.svg"),
+    ),
 ];
 
 impl AssetSource for AppAssets {

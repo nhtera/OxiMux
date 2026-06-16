@@ -21,11 +21,15 @@ use std::path::{Component, Path, PathBuf};
 
 use gpui::{
     AnyElement, EntityId, InteractiveElement, IntoElement, ParentElement, Styled, div,
+    prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{
-    Selectable, Sizable,
+    ActiveTheme, Icon, IconName, Selectable, Sizable,
     button::{Button, ButtonGroup},
-    text::TextView,
+    clipboard::Clipboard,
+    h_flex,
+    highlighter::HighlightTheme,
+    text::{TextView, TextViewStyle},
 };
 
 /// Which view a markdown file is showing. `Copy` so it lives as a plain field
@@ -58,27 +62,44 @@ impl MarkdownViewMode {
 /// mutate state, which can't be expressed here). Single-select is the
 /// `ButtonGroup` default, so exactly one button reads as selected.
 ///
-/// `view_id` scopes the element id to the owning view so two open `.md` tabs
-/// never share toggle state.
+/// Icon-only with hover tooltips — a compact segmented control that reads as
+/// chrome rather than competing with the document. `view_id` scopes the
+/// element id to the owning view so two open `.md` tabs never share state.
 pub fn mode_toggle(mode: MarkdownViewMode, view_id: EntityId) -> ButtonGroup {
     ButtonGroup::new(("md-mode", view_id))
         .compact()
         .xsmall()
         .child(
             Button::new("md-mode-source")
-                .label("Source")
+                .icon(Icon::empty().path("icons/code.svg"))
+                .tooltip("Source")
                 .selected(mode == MarkdownViewMode::Source),
         )
         .child(
             Button::new("md-mode-preview")
-                .label("Preview")
+                .icon(IconName::Eye)
+                .tooltip("Preview")
                 .selected(mode == MarkdownViewMode::Preview),
         )
         .child(
             Button::new("md-mode-split")
-                .label("Split")
+                .icon(Icon::empty().path("icons/columns.svg"))
+                .tooltip("Split")
                 .selected(mode == MarkdownViewMode::Split),
         )
+}
+
+/// Styling for the rendered preview. The renderer defaults to a *light* code
+/// highlight theme, but the app runs dark — so the syntax colors must be the
+/// dark set or code blocks read washed-out. Also opens up the paragraph
+/// rhythm a touch so long docs breathe.
+fn preview_style() -> TextViewStyle {
+    TextViewStyle {
+        is_dark: true,
+        highlight_theme: HighlightTheme::default_dark(),
+        ..Default::default()
+    }
+    .paragraph_gap(rems(1.1))
 }
 
 /// Render the markdown preview element: absolutize relative image paths, then
@@ -103,6 +124,24 @@ pub fn render_preview(source: &str, base_dir: Option<&Path>, view_id: EntityId) 
         .overflow_hidden()
         .child(
             TextView::markdown(("md-preview-text", view_id), rendered)
+                .style(preview_style())
+                // Code blocks get a language tag + one-click copy, the way a
+                // polished doc viewer surfaces fenced code.
+                .code_block_actions(|code_block, _window, cx| {
+                    let code = code_block.code();
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .when_some(code_block.lang(), |this, lang| {
+                            this.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(lang),
+                            )
+                        })
+                        .child(Clipboard::new("md-code-copy").value(code))
+                })
                 .h_full()
                 .p_5()
                 .scrollable(true)
