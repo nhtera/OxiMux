@@ -495,7 +495,14 @@ fn group_runs(
         // post-text vector pass strokes them directly. Diagonals
         // (U+2571..=U+2573) have no segment-model expression and fall
         // through to the font face instead of rendering blank.
-        let ch = if cell.ch == '\0' || box_drawing::has_vector_impl(cell.ch) {
+        //
+        // Control characters (NUL, and especially the literal TAB that the
+        // grid stores in a tab's start cell) carry ~zero advance, which makes
+        // the forced-width layout collapse the tab and its trailing filler
+        // into a single column — drifting every glyph after it left of its
+        // true grid column. Render them as a one-column space so each cell
+        // occupies exactly one column and content stays aligned to the grid.
+        let ch = if cell.ch.is_control() || box_drawing::has_vector_impl(cell.ch) {
             ' '
         } else {
             cell.ch
