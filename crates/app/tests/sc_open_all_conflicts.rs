@@ -100,7 +100,7 @@ async fn open_all_conflicts_dispatches_on_open_file_per_path(cx: &mut TestAppCon
     // the panel dispatched.
     let opens: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
     let opens_for_cb = opens.clone();
-    let on_open_file: OnOpenFile = Arc::new(move |path, _window, _app| {
+    let on_open_file: OnOpenFile = Arc::new(move |path, _preview, _window, _app| {
         opens_for_cb.lock().expect("opens lock").push(path);
     });
 

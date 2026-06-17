@@ -6,6 +6,7 @@
 //! Phase 0 ships dark-only. Light mode is a Phase 8+ decision.
 
 pub mod agent_launch;
+pub mod autosave;
 pub mod commit_message_ai;
 pub mod custom_commands;
 pub mod density;
@@ -17,6 +18,7 @@ pub mod theme;
 pub mod typography;
 
 pub use agent_launch::{AgentLaunchSettings, PerAgentLaunch, split_args};
+pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
 pub use custom_commands::{CustomCommand, CustomCommandsFile, load_and_merge};
 pub use density::Density;

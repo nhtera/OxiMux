@@ -89,14 +89,20 @@ pub fn mode_toggle(mode: MarkdownViewMode, view_id: EntityId) -> ButtonGroup {
         )
 }
 
-/// Styling for the rendered preview. The renderer defaults to a *light* code
-/// highlight theme, but the app runs dark — so the syntax colors must be the
-/// dark set or code blocks read washed-out. Also opens up the paragraph
-/// rhythm a touch so long docs breathe.
-fn preview_style() -> TextViewStyle {
+/// Styling for the rendered preview. The renderer's own default is a *light*
+/// code highlight theme, so the syntax set and surface must follow the active
+/// app theme (`is_dark`) or code blocks read washed-out under dark and
+/// over-bright under light. Also opens up the paragraph rhythm a touch so long
+/// docs breathe.
+fn preview_style(is_dark: bool) -> TextViewStyle {
+    let highlight_theme = if is_dark {
+        HighlightTheme::default_dark()
+    } else {
+        HighlightTheme::default_light()
+    };
     TextViewStyle {
-        is_dark: true,
-        highlight_theme: HighlightTheme::default_dark(),
+        is_dark,
+        highlight_theme,
         ..Default::default()
     }
     .paragraph_gap(rems(1.1))
@@ -111,8 +117,15 @@ fn preview_style() -> TextViewStyle {
 /// (file at filesystem root, no parent) image paths are left untouched.
 ///
 /// `view_id` scopes the element ids (wrapper + `TextView`) to the owning view
-/// so two open `.md` tabs never share the renderer's keyed state.
-pub fn render_preview(source: &str, base_dir: Option<&Path>, view_id: EntityId) -> AnyElement {
+/// so two open `.md` tabs never share the renderer's keyed state. `is_dark`
+/// follows the active app theme so preview surface + code-block syntax track
+/// dark/light.
+pub fn render_preview(
+    source: &str,
+    base_dir: Option<&Path>,
+    view_id: EntityId,
+    is_dark: bool,
+) -> AnyElement {
     let rendered = match base_dir {
         Some(dir) => absolutize_image_paths(source, dir),
         None => source.to_owned(),
@@ -124,7 +137,7 @@ pub fn render_preview(source: &str, base_dir: Option<&Path>, view_id: EntityId) 
         .overflow_hidden()
         .child(
             TextView::markdown(("md-preview-text", view_id), rendered)
-                .style(preview_style())
+                .style(preview_style(is_dark))
                 // Code blocks get a language tag + one-click copy, the way a
                 // polished doc viewer surfaces fenced code.
                 .code_block_actions(|code_block, _window, cx| {

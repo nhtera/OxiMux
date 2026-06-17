@@ -291,9 +291,10 @@ fn build_row_card(
     //   Relative Path needs a project root and is hidden when the
     //   target sits outside the workspace.
     let copy_path = path.clone();
-    card = card.child(menu_row(
+    card = card.child(menu_row_with_shortcut(
         "file-ctx-copy-path",
         "Copy Path",
+        Some("⌘⌥C"),
         true,
         theme,
         density,
@@ -306,9 +307,10 @@ fn build_row_card(
         }),
     ));
     if let Some(rel_string) = relative_path_string(&path, project_root.as_ref()) {
-        card = card.child(menu_row(
+        card = card.child(menu_row_with_shortcut(
             "file-ctx-copy-relative",
             "Copy Relative Path",
+            Some("⌘⌥⇧C"),
             !rel_string.is_empty(),
             theme,
             density,
@@ -319,6 +321,28 @@ fn build_row_card(
             }),
         ));
     }
+
+    // ── Duplicate — copy the file/folder next to itself with a collision-free
+    //   " copy" name. Available for both files and directories.
+    let duplicate_path_target = path.clone();
+    card = card.child(menu_row(
+        "file-ctx-duplicate",
+        "Duplicate",
+        true,
+        theme,
+        density,
+        typography.clone(),
+        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+            let p = duplicate_path_target.clone();
+            this.close(cx);
+            window.dispatch_action(
+                Box::new(crate::actions::FileTreeDuplicate {
+                    path: p.to_string_lossy().into_owned(),
+                }),
+                cx,
+            );
+        }),
+    ));
 
     // ── 4. Find in Folder (directory-only). Seeds the Search panel's
     //   include glob with `<rel>/**` and switches the right sidebar
@@ -366,9 +390,10 @@ fn build_row_card(
     //   input + confirm-dialog wiring lands in Phase 03 behind the
     //   same action payload.
     let rename_path = path.clone();
-    card = card.child(menu_row(
+    card = card.child(menu_row_with_shortcut(
         "file-ctx-rename",
         "Rename…",
+        Some("↵"),
         true,
         theme,
         density,
@@ -388,6 +413,7 @@ fn build_row_card(
     card = card.child(menu_row_destructive(
         "file-ctx-delete",
         "Delete",
+        Some("⌘⌫"),
         theme,
         density,
         typography.clone(),
@@ -498,6 +524,26 @@ fn menu_row<H>(
 where
     H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 {
+    menu_row_with_shortcut(row_id, label, None, enabled, theme, density, typography, on_click)
+}
+
+/// `menu_row` plus an optional right-aligned shortcut hint (e.g. `⌘⌥C`). The
+/// hint is display-only — it documents the keyboard binding handled by the
+/// file explorer's key handler; it does not itself wire a binding.
+#[allow(clippy::too_many_arguments)]
+fn menu_row_with_shortcut<H>(
+    row_id: &'static str,
+    label: &'static str,
+    shortcut: Option<&'static str>,
+    enabled: bool,
+    theme: Theme,
+    density: Density,
+    typography: Typography,
+    on_click: H,
+) -> impl IntoElement
+where
+    H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+{
     let fg = if enabled {
         theme.fg_base
     } else {
@@ -514,6 +560,14 @@ where
         .text_size(px(typography.t_body_md))
         .text_color(fg)
         .child(label);
+    if let Some(shortcut) = shortcut {
+        row = row.child(div().flex_1()).child(
+            div()
+                .text_color(theme.fg_subtle)
+                .text_size(px(typography.t_body_sm))
+                .child(shortcut),
+        );
+    }
     if enabled {
         row = row
             .cursor_pointer()
@@ -525,9 +579,11 @@ where
 
 /// Same shape as `menu_row` but paints the label in `status_error` so
 /// the user has a visual brake before clicking. Used by the Delete row.
+/// Carries an optional right-aligned shortcut hint like the regular row.
 fn menu_row_destructive<H>(
     row_id: &'static str,
     label: &'static str,
+    shortcut: Option<&'static str>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -536,7 +592,7 @@ fn menu_row_destructive<H>(
 where
     H: Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 {
-    div()
+    let mut row = div()
         .id(row_id)
         .flex()
         .flex_row()
@@ -549,7 +605,16 @@ where
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(MouseButton::Left, on_click)
-        .child(label)
+        .child(label);
+    if let Some(shortcut) = shortcut {
+        row = row.child(div().flex_1()).child(
+            div()
+                .text_color(theme.fg_subtle)
+                .text_size(px(typography.t_body_sm))
+                .child(shortcut),
+        );
+    }
+    row
 }
 
 #[cfg(test)]

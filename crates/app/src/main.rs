@@ -527,7 +527,7 @@ fn run_editor_spike() {
         let _ = cx.open_window(options, move |window, cx| {
             let editor = cx.new(|cx| {
                 let mut v = EditorView::new(file_for_window.clone(), window, cx);
-                v.attach_lsp("rust-analyzer", "rust", workspace_root.clone(), cx);
+                v.attach_lsp("rust-analyzer", Vec::new(), "rust", workspace_root.clone(), cx);
                 v
             });
             let view: AnyView = editor.into();
@@ -595,14 +595,23 @@ fn run_file_tree_spike() {
         let cwd_for_window = cwd.clone();
         let _ = cx.open_window(options, move |window, cx| {
             let tree = cx.new(|cx| FileTree::new(cwd_for_window.clone(), cx));
-            let on_open: OnOpenFile = Arc::new(|path, _window, _cx| {
+            let on_open: OnOpenFile = Arc::new(|path, _preview, _window, _cx| {
                 tracing::info!(
                     target: "file_tree_spike",
                     "would open: {}",
                     path.display()
                 );
             });
-            let view = cx.new(|cx| FileTreeView::new(tree, on_open, None, window, cx));
+            let view = cx.new(|cx| {
+                FileTreeView::new(
+                    tree,
+                    oximux_settings::Theme::charcoal(),
+                    on_open,
+                    None,
+                    window,
+                    cx,
+                )
+            });
             let any: AnyView = view.into();
             cx.new(|cx| gpui_component::Root::new(any, window, cx))
         });

@@ -1861,6 +1861,7 @@ impl WorkspaceRoot {
                 on_confirm,
                 confirm_label: Some("Force Delete".into()),
                 on_cancel: None,
+                secondary: None,
             }
         } else {
             ConfirmPrompt {
@@ -1874,6 +1875,7 @@ impl WorkspaceRoot {
                 on_confirm,
                 confirm_label: None,
                 on_cancel: None,
+                secondary: None,
             }
         };
         let theme = self.theme;
@@ -1965,6 +1967,7 @@ impl WorkspaceRoot {
             on_confirm,
             confirm_label: Some("Remove".into()),
             on_cancel: None,
+            secondary: None,
         };
         let theme = self.theme;
         let density = self.density;

@@ -566,7 +566,8 @@ impl SourceControlPanel {
             let _ = cx.update(|window, app| {
                 for rel in paths {
                     let absolute = workdir.join(&rel);
-                    on_open(absolute, window, app);
+                    // Opening conflicts to resolve them → permanent tabs.
+                    on_open(absolute, false, window, app);
                 }
             });
         })

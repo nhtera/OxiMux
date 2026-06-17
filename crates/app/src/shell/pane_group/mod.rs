@@ -16,14 +16,15 @@ pub mod tab_drag_zones;
 #[cfg(test)]
 mod e2e_tests;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    AppContext, Context, FocusHandle, Focusable, Point, ScrollHandle, SharedString, Subscription,
-    Task, Window, px,
+    AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
+    Subscription, Task, Window, px,
 };
+use std::rc::Rc;
 use oximux_agents::{
     AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend, agent_label_from_title,
     classify_agent_title,
@@ -40,6 +41,7 @@ use crate::actions::{
     ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
+use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt, ConfirmSecondary};
 use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
@@ -120,8 +122,35 @@ pub struct PaneGroupTab {
     /// torn out by drag-to-split, and are skipped by Close Others /
     /// Close to Right.
     pub pinned: bool,
+    /// `true` while this is a reusable single-click "preview" tab (rendered
+    /// with an italic label). Promoted to a permanent tab on edit,
+    /// double-click, or pin. Runtime-only — never persisted, so a restored
+    /// tab is always permanent (no preview-ness survives a relaunch).
+    pub is_preview: bool,
+    /// Set when the FSEvents watcher reports this editor's backing file was
+    /// deleted or renamed on disk. Drives a strikethrough badge; the tab is
+    /// NOT auto-closed so the buffer stays available to review/save.
+    /// Runtime-only.
+    pub external_mutation: Option<ExternalMutation>,
     pub _observer: Option<Subscription>,
     pub _status_task: Option<Task<()>>,
+}
+
+/// On-disk fate of an open editor file as detected by the file-tree watcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalMutation {
+    /// The file no longer exists at its path.
+    Deleted,
+    /// The file's path disappeared but it likely moved (a sibling appeared).
+    Renamed,
+}
+
+/// Default chip label for an editor tab: the file name (or `"untitled"`).
+fn editor_tab_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("untitled")
+        .to_string()
 }
 
 /// Closed enum of user-pickable tab colors. Renders to a concrete
@@ -294,6 +323,19 @@ pub struct PaneGroup {
     /// overlay resolve a double-click-reset target after the first click's
     /// arm was already disarmed.
     last_sub_divider_path: Option<Vec<usize>>,
+    /// Unsaved-changes confirm dialog, mounted while a dirty editor tab close
+    /// awaits the user's Save / Discard / Cancel choice. `None` when idle.
+    /// Rendered as a modal overlay over this group's body.
+    dirty_close_dialog: Option<Entity<ConfirmDialog>>,
+    /// Observer that drops [`Self::dirty_close_dialog`] the moment the user
+    /// resolves it (confirm or cancel). Reset on each mount so a stale
+    /// observer never lingers.
+    _dirty_close_observer: Option<Subscription>,
+    /// Periodic sweep that flags editor tabs whose backing file vanished on
+    /// disk (external delete). Lazily started on first render; lives on the
+    /// group so it drops cleanly when the group is torn down (no orphaned
+    /// subscription across a project switch).
+    _external_mutation_task: Option<Task<()>>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -345,6 +387,55 @@ impl PaneGroup {
             active_sub_divider: None,
             sub_divider_bounds: DividerBoundsCache::default(),
             last_sub_divider_path: None,
+            dirty_close_dialog: None,
+            _dirty_close_observer: None,
+            _external_mutation_task: None,
+        }
+    }
+
+    /// Lazily start the external-mutation sweep (first render is the first
+    /// place we have a `&mut Context`). Idempotent.
+    pub(crate) fn ensure_external_mutation_sweep(&mut self, cx: &mut Context<Self>) {
+        if self._external_mutation_task.is_some() {
+            return;
+        }
+        self._external_mutation_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                if this
+                    .update(cx, |group, cx| group.sweep_external_mutations(cx))
+                    .is_err()
+                {
+                    break; // group dropped — stop sweeping.
+                }
+            }
+        }));
+    }
+
+    /// Stat each editor tab's file; flag any that vanished as `Deleted` and
+    /// clear the flag if a file reappeared (e.g. restored on disk). Rename is
+    /// folded into `Deleted` here — the path is gone either way; distinguishing
+    /// a true rename needs the watcher's paired event (a follow-up).
+    fn sweep_external_mutations(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let PaneGroupTabKind::Editor { path } = &tab.kind else {
+                continue;
+            };
+            let new_state = if path.exists() {
+                None
+            } else {
+                Some(ExternalMutation::Deleted)
+            };
+            if tab.external_mutation != new_state {
+                tab.external_mutation = new_state;
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
         }
     }
 
@@ -460,6 +551,11 @@ impl PaneGroup {
         };
         tab.pinned = !tab.pinned;
         let now_pinned = tab.pinned;
+        // Pinning a preview tab promotes it to permanent (a pinned tab the user
+        // wants to keep is no longer a throwaway browse tab).
+        if now_pinned {
+            tab.is_preview = false;
+        }
         let Some(visible_from) = self.tab_order.iter().position(|&i| i == idx) else {
             cx.notify();
             return;
@@ -901,6 +997,8 @@ impl PaneGroup {
             pinned: false,
             // Tab-level observer is unused for terminal tabs — sub-pane
             // observers inside TerminalSplitTree drive re-renders.
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         };
@@ -970,6 +1068,8 @@ impl PaneGroup {
             color: None,
             custom_title: Some(title),
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         };
@@ -989,7 +1089,99 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        self.open_or_activate_editor_tab_at(path, None, window, cx)
+        self.open_or_activate_editor_tab_at(path, None, false, window, cx)
+    }
+
+    /// Build an `EditorView` for `path` with its language server attached and
+    /// a promote-on-edit observer wired. Shared by the new-tab and the
+    /// preview-replace paths. The observer clears `is_preview` on the owning
+    /// tab the first time the buffer goes dirty, so editing a preview tab
+    /// makes it permanent.
+    fn build_editor_view(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<oximux_editor::EditorView>, Subscription) {
+        let view = cx.new(|cx| oximux_editor::EditorView::new(path.to_path_buf(), window, cx));
+        // Resolve + attach a language server (extension-keyed, PATH-resolved;
+        // unsupported language or uninstalled server is a clean no-op).
+        if let Some(server) = oximux_editor::resolve_lsp_server(path) {
+            let workspace_root = self.cwd.clone();
+            view.update(cx, |v, cx| {
+                v.attach_lsp(
+                    &server.program,
+                    server.args,
+                    server.language_id,
+                    workspace_root,
+                    cx,
+                );
+            });
+        }
+        let observer = cx.observe(&view, |this, view_entity, cx| {
+            // Promote the preview tab to permanent on first edit.
+            if view_entity.read(cx).is_dirty()
+                && let Some(idx) = this
+                    .tabs
+                    .iter()
+                    .position(|t| matches!(&t.content, PaneContent::Editor(v) if v == &view_entity))
+            {
+                this.tabs[idx].is_preview = false;
+            }
+            cx.notify();
+        });
+        (view, observer)
+    }
+
+    /// Clear the preview (italic/ephemeral) flag on the tab at `ix`, making it
+    /// a permanent tab. The double-click-the-chip gesture: a preview tab opened
+    /// by a single explorer click sticks instead of being replaced by the next
+    /// preview open. No-op if the tab is already permanent or `ix` is stale.
+    pub fn promote_tab_to_permanent(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(ix)
+            && tab.is_preview
+        {
+            tab.is_preview = false;
+            cx.notify();
+        }
+    }
+
+    /// Open `path` as a reusable single-click preview tab (italic label). If
+    /// the file is already open anywhere, just activate it. Otherwise reuse
+    /// the active group's existing preview tab in place (so browsing the tree
+    /// never piles up tabs); if none exists, open a fresh preview tab.
+    pub fn open_preview_editor_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(idx) = self.editor_tab_index(&path) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        // Reuse an existing preview tab in place, keeping its slot + preview-ness.
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.is_preview && matches!(t.kind, PaneGroupTabKind::Editor { .. }))
+        {
+            let (view, observer) = self.build_editor_view(&path, window, cx);
+            let label = editor_tab_label(&path);
+            let tab = &mut self.tabs[idx];
+            tab.content = PaneContent::Editor(view);
+            tab.kind = PaneGroupTabKind::Editor { path };
+            tab.label = SharedString::from(label);
+            tab.external_mutation = None;
+            // Reset per-tab decorations from the file we replaced — a fresh
+            // preview carries no custom title or color tag.
+            tab.custom_title = None;
+            tab.color = None;
+            tab._observer = Some(observer);
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        self.open_or_activate_editor_tab_at(path, None, true, window, cx)
     }
 
     /// Give a freshly-mounted terminal a weak handle back to this group so
@@ -1111,6 +1303,7 @@ impl PaneGroup {
         &mut self,
         path: PathBuf,
         insert_at_visible_idx: Option<usize>,
+        preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1120,6 +1313,11 @@ impl PaneGroup {
             .iter()
             .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == &path))
         {
+            // A permanent (non-preview) open of an already-previewed tab
+            // promotes it to permanent.
+            if !preview {
+                self.tabs[idx].is_preview = false;
+            }
             if let Some(visible_target) = insert_at_visible_idx
                 && let Some(from) = self.visible_position_of(idx)
             {
@@ -1141,14 +1339,8 @@ impl PaneGroup {
         }
         // New tab path — construct, push, then optionally re-slot inside
         // tab_order at the requested visible index.
-        let path_for_view = path.clone();
-        let view = cx.new(|cx| oximux_editor::EditorView::new(path_for_view, window, cx));
-        let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
-        let label = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("untitled")
-            .to_string();
+        let (view, observer) = self.build_editor_view(&path, window, cx);
+        let label = editor_tab_label(&path);
         let tab = PaneGroupTab {
             label: SharedString::from(label),
             content: PaneContent::Editor(view),
@@ -1156,7 +1348,9 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
-            _observer: observer,
+            is_preview: preview,
+            external_mutation: None,
+            _observer: Some(observer),
             _status_task: None,
         };
         self.tabs.push(tab);
@@ -1226,6 +1420,8 @@ impl PaneGroup {
             v.load(path_for_load, staged, untracked, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let label = {
             let leaf = path
@@ -1245,6 +1441,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1294,6 +1492,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1339,6 +1539,8 @@ impl PaneGroup {
             v.load_commit(sha_for_load, short_for_load, subject_for_load, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         // Tab label: short SHA + truncated subject. The tab strip
         // truncates anything long, so we keep the subject readable up
@@ -1356,6 +1558,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1405,6 +1609,8 @@ impl PaneGroup {
             v.load_range(base, head, path_for_load, title, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let label = SharedString::from(format!("{leaf} · branch"));
         let tab = PaneGroupTab {
@@ -1414,6 +1620,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1461,6 +1669,8 @@ impl PaneGroup {
             v.load_combined(scope_for_load, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let tab = PaneGroupTab {
             label,
@@ -1469,6 +1679,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1549,6 +1761,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: Some(status_task),
         });
@@ -1658,6 +1872,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         });
@@ -1694,11 +1910,129 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         });
         self.tab_order.push(self.tabs.len() - 1);
         self.pin_tab_strip_to_end();
+        cx.notify();
+    }
+
+    /// Close entry-point for user-initiated single closes (the chip "✕" and
+    /// Cmd+W). An editor tab with an unsaved buffer first prompts
+    /// Save / Discard / Cancel via a modal overlay; everything else closes
+    /// immediately. Bulk closes (Close Others / Close to Right) and the
+    /// post-confirm path call [`Self::close_tab`] directly.
+    pub fn request_close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty_editor = self.tabs.get(idx).and_then(|tab| match &tab.content {
+            PaneContent::Editor(view) if view.read(cx).is_dirty() => Some(view.clone()),
+            _ => None,
+        });
+        match dirty_editor {
+            Some(view) => self.mount_dirty_close_dialog(view, window, cx),
+            None => self.close_tab(idx, window, cx),
+        }
+    }
+
+    /// `true` while the unsaved-changes prompt is up — drives the render
+    /// overlay.
+    pub(crate) fn dirty_close_dialog(&self) -> Option<Entity<ConfirmDialog>> {
+        self.dirty_close_dialog.clone()
+    }
+
+    /// Mount the unsaved-changes prompt for a dirty editor tab. Save writes
+    /// then closes; Discard closes losing edits; Cancel keeps the tab. The
+    /// tab is re-resolved by file path at choice time so an unrelated tab
+    /// close (e.g. a terminal clean-exit) between mount and choice can't
+    /// shift the index onto the wrong tab.
+    fn mount_dirty_close_dialog(
+        &mut self,
+        view: Entity<oximux_editor::EditorView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Re-entry guard: one prompt at a time.
+        if self.dirty_close_dialog.is_some() {
+            return;
+        }
+        let path = view.read(cx).file_path().to_path_buf();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "This file".to_string());
+        let group = cx.weak_entity();
+
+        // Save → write the buffer, then close the (re-resolved) tab.
+        let on_confirm: ConfirmCallback = {
+            let group = group.clone();
+            let view = view.clone();
+            let path = path.clone();
+            Rc::new(move |window, cx| {
+                view.update(cx, |v, cx| {
+                    v.save_if_dirty(cx);
+                });
+                let _ = group.update(cx, |g, cx| {
+                    if let Some(idx) = g.editor_tab_index(&path) {
+                        g.close_tab(idx, window, cx);
+                    }
+                });
+            })
+        };
+        // Discard → close the (re-resolved) tab without saving.
+        let on_discard: ConfirmCallback = {
+            let group = group.clone();
+            let path = path.clone();
+            Rc::new(move |window, cx| {
+                let _ = group.update(cx, |g, cx| {
+                    if let Some(idx) = g.editor_tab_index(&path) {
+                        g.close_tab(idx, window, cx);
+                    }
+                });
+            })
+        };
+
+        let prompt = ConfirmPrompt {
+            title: "Unsaved changes".into(),
+            body: format!("{file_name} has unsaved changes. Save before closing?").into(),
+            // Plain confirm — no type-to-confirm; closing one tab isn't worth
+            // a typed gate.
+            expected: "".into(),
+            on_confirm,
+            confirm_label: Some("Save".into()),
+            on_cancel: None,
+            secondary: Some(ConfirmSecondary {
+                label: "Discard".into(),
+                on_click: on_discard,
+            }),
+        };
+
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog =
+            cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+
+        // Focus the dialog so Enter (Save) / Escape (Cancel) work without a
+        // click — the prompt has no inner Input to grab focus on its own.
+        dialog.read(cx).focus_handle(cx).focus(window, cx);
+
+        // Drop the dialog the moment the user resolves it. Replacing the
+        // observer cancels any stale one.
+        self._dirty_close_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |group, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    group.dirty_close_dialog = None;
+                    group._dirty_close_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.dirty_close_dialog = Some(dialog);
         cx.notify();
     }
 
@@ -2150,7 +2484,9 @@ impl PaneGroup {
                 return;
             }
         }
-        self.close_tab(active_idx, window, cx);
+        // Editor/diff/browser group tabs (and lone-leaf terminals) close the
+        // whole group tab — routed through the dirty-guard for unsaved editors.
+        self.request_close_tab(active_idx, window, cx);
     }
 
     pub(crate) fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {

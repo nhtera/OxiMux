@@ -25,12 +25,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use lsp_types::{
-    ClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, Hover, HoverParams, InitializeParams,
-    InitializeResult, InitializedParams, Position, PublishDiagnosticsParams,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, notification::Notification as _,
+    ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, PartialResultParams, Position,
+    PublishDiagnosticsParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams, notification::Notification as _,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -86,11 +87,13 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    /// Spawn `program` (e.g. `rust-analyzer`) as a stdio LSP server,
-    /// perform the `initialize` -> `initialized` handshake, and return a
-    /// ready client. `root` becomes the workspace root (`rootUri`).
-    pub async fn spawn(program: &str, root: &Path) -> Result<Self> {
+    /// Spawn `program` (e.g. `rust-analyzer`) as a stdio LSP server with
+    /// `args` (e.g. `--stdio`), perform the `initialize` -> `initialized`
+    /// handshake, and return a ready client. `root` becomes the workspace
+    /// root (`rootUri`).
+    pub async fn spawn(program: &str, args: &[String], root: &Path) -> Result<Self> {
         let mut child = Command::new(program)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -150,7 +153,16 @@ impl LspClient {
             #[allow(deprecated)]
             root_uri: Some(root_uri),
             capabilities: ClientCapabilities {
-                text_document: Some(TextDocumentClientCapabilities::default()),
+                // Advertise the document features we consume so servers enable
+                // them. Hover shipped on bare defaults; completion + definition
+                // are declared explicitly here as we wire their providers.
+                text_document: Some(TextDocumentClientCapabilities {
+                    hover: Some(Default::default()),
+                    completion: Some(Default::default()),
+                    definition: Some(Default::default()),
+                    publish_diagnostics: Some(Default::default()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             initialization_options: None,
@@ -242,6 +254,57 @@ impl LspClient {
         )
         .await
         .context("hover request timed out")??;
+        Ok(res)
+    }
+
+    /// Request completions at `position`. `context` carries the trigger kind
+    /// (invoked vs. trigger-character) the editor observed. Returns the
+    /// server's response (item list or incomplete list), or `None`.
+    pub async fn completion(
+        &self,
+        uri: Uri,
+        position: Position,
+        context: Option<CompletionContext>,
+    ) -> Result<Option<CompletionResponse>> {
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context,
+        };
+        let res = timeout(
+            REQUEST_TIMEOUT,
+            self.request::<lsp_types::request::Completion>(params),
+        )
+        .await
+        .context("completion request timed out")??;
+        Ok(res)
+    }
+
+    /// Request definition location(s) at `position`. Returns the server's
+    /// response (a scalar, array, or link form), or `None` when undefined.
+    pub async fn goto_definition(
+        &self,
+        uri: Uri,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let res = timeout(
+            REQUEST_TIMEOUT,
+            self.request::<lsp_types::request::GotoDefinition>(params),
+        )
+        .await
+        .context("definition request timed out")??;
         Ok(res)
     }
 

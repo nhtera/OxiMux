@@ -109,7 +109,12 @@ pub fn file_header_row(
     let kind = if sticky { "sticky" } else { "list" };
     let id = gpui::ElementId::Name(format!("diff-header-{kind}-{file_idx}").into());
     let copy_id = gpui::ElementId::Name(format!("diff-header-copy-{kind}-{file_idx}").into());
+    let open_id = gpui::ElementId::Name(format!("diff-header-open-{kind}-{file_idx}").into());
     let copy_path = path.clone();
+    let open_path = path.clone();
+    // Second weak handle for the open-in-editor click (the row-fold click
+    // below consumes the original).
+    let weak_open = weak.clone();
     let hover_bg = theme.hover_overlay;
     let chevron = if folded {
         "icons/chevron-right.svg"
@@ -158,7 +163,30 @@ pub fn file_header_row(
         row = row.child(stats_chips(added, removed, theme, typography));
     }
     let copy_tooltip: SharedString = "Click to copy path".into();
-    row.child(div().flex_1()).child(
+    let open_tooltip: SharedString = "Open in editor".into();
+    row.child(div().flex_1())
+        .child(
+            // Open-in-editor glyph — opens the diffed file as an editor tab.
+            // Stops propagation so it doesn't also toggle the fold.
+            div()
+                .id(open_id)
+                .cursor_pointer()
+                .tooltip(move |window, cx| Tooltip::new(open_tooltip.clone()).build(window, cx))
+                .on_click(move |_: &ClickEvent, window, cx: &mut App| {
+                    let path = open_path.to_string();
+                    let _ = weak_open.update(cx, |view, cx| {
+                        view.open_file_in_editor(&path, window, cx);
+                    });
+                    cx.stop_propagation();
+                })
+                .child(
+                    Icon::default()
+                        .path("icons/file-code.svg")
+                        .xsmall()
+                        .text_color(theme.fg_subtle),
+                ),
+        )
+        .child(
         // Copy glyph — its own click handler stops propagation so copying
         // the path doesn't also toggle the fold.
         div()

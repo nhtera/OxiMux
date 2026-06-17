@@ -55,6 +55,20 @@ pub struct ConfirmPrompt {
     /// Use it to clear any host-side "pending request" state so the
     /// dialog can re-mount on the next click.
     pub on_cancel: Option<ConfirmCallback>,
+    /// Optional middle action, turning the dialog into a three-way choice
+    /// (e.g. unsaved-changes: Save / Discard / Cancel). When present the
+    /// primary confirm button renders as the safe default (`primary`) and
+    /// this secondary button takes the destructive `danger` styling. Firing
+    /// it runs the callback and resolves the dialog like confirm. `None`
+    /// keeps the classic two-button (Cancel + danger Confirm) layout.
+    pub secondary: Option<ConfirmSecondary>,
+}
+
+/// A third "secondary" action for [`ConfirmPrompt`] (the destructive middle
+/// option in a three-way prompt).
+pub struct ConfirmSecondary {
+    pub label: SharedString,
+    pub on_click: ConfirmCallback,
 }
 
 pub struct ConfirmDialog {
@@ -65,6 +79,10 @@ pub struct ConfirmDialog {
     input_state: Entity<InputState>,
     on_confirm: Option<ConfirmCallback>,
     on_cancel: Option<ConfirmCallback>,
+    /// Label + callback for the optional destructive middle action. `None`
+    /// for the classic two-button layout.
+    secondary_label: Option<SharedString>,
+    on_secondary: Option<ConfirmCallback>,
     confirmed: bool,
     cancelled: bool,
     focus_handle: FocusHandle,
@@ -89,7 +107,12 @@ impl ConfirmDialog {
             on_confirm,
             confirm_label,
             on_cancel,
+            secondary,
         } = prompt;
+        let (secondary_label, on_secondary) = match secondary {
+            Some(ConfirmSecondary { label, on_click }) => (Some(label), Some(on_click)),
+            None => (None, None),
+        };
         let placeholder = format!("Type {expected} to confirm");
         let input_state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         Self {
@@ -100,6 +123,8 @@ impl ConfirmDialog {
             input_state,
             on_confirm: Some(on_confirm),
             on_cancel,
+            secondary_label,
+            on_secondary,
             confirmed: false,
             cancelled: false,
             focus_handle: cx.focus_handle(),
@@ -147,6 +172,19 @@ impl ConfirmDialog {
         cx.notify();
     }
 
+    /// Fire the optional middle action (e.g. "Discard") and resolve the
+    /// dialog. No-op if no secondary action is registered or already resolved.
+    fn try_secondary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirmed || self.cancelled {
+            return;
+        }
+        if let Some(cb) = self.on_secondary.take() {
+            cb(window, cx);
+            self.confirmed = true;
+            cx.notify();
+        }
+    }
+
     /// Trigger the cancel pathway: fire `on_cancel` (if registered) and
     /// flip `cancelled = true` so the host's observer can drop the
     /// dialog. Idempotent — repeated calls are harmless.
@@ -178,6 +216,8 @@ impl Render for ConfirmDialog {
         let prompt = format!("Type {} to confirm:", self.expected);
 
         let confirm_label = self.confirm_label.clone();
+        let secondary_label = self.secondary_label.clone();
+        let has_secondary = secondary_label.is_some();
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(
@@ -241,10 +281,27 @@ impl Render for ConfirmDialog {
                                 dlg.cancel(window, cx);
                             })),
                     )
+                    // Destructive middle action (e.g. "Discard"), present only
+                    // for three-way prompts. Always enabled — it doesn't gate
+                    // on the type-to-confirm field.
+                    .when_some(secondary_label, |row, label| {
+                        row.child(
+                            Button::new("secondary-button")
+                                .small()
+                                .danger()
+                                .label(label)
+                                .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
+                                    dlg.try_secondary(window, cx);
+                                })),
+                        )
+                    })
                     .child(
+                        // Primary/safe default when a destructive secondary
+                        // exists (Save); otherwise this IS the destructive
+                        // action (danger) for the classic two-button prompt.
                         Button::new("confirm-button")
                             .small()
-                            .danger()
+                            .map(|b| if has_secondary { b.primary() } else { b.danger() })
                             .label(confirm_label)
                             .disabled(!can_confirm)
                             .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {

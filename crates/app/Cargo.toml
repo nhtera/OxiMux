@@ -88,6 +88,10 @@ objc2-foundation = { version = "0.3", features = [
   "NSString",
   "NSDictionary",
   "NSArray",
+  # File-tree "Delete" moves the target to the macOS Trash via
+  # `NSFileManager trashItemAtURL:` (reversible, unlike a hard unlink).
+  "NSFileManager",
+  "NSError",
 ] }
 objc2-user-notifications = "0.3"
 block2 = "0.6"

@@ -331,7 +331,10 @@ impl Render for TabContextMenu {
             typography.clone(),
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                 if let Some(group) = group_close.upgrade() {
-                    group.update(cx, |g, cx| g.close_tab(close_idx, window, cx));
+                    // Route through the dirty-close guard so an unsaved editor
+                    // tab prompts Save/Discard/Cancel rather than silently
+                    // discarding edits (the chip ✕ and Cmd+W do the same).
+                    group.update(cx, |g, cx| g.request_close_tab(close_idx, window, cx));
                 }
                 this.close(cx);
             }),

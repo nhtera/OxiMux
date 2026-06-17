@@ -22,16 +22,17 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription, Window,
-    img, prelude::FluentBuilder as _, px,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription, Task,
+    Window, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme,
     input::{Input, InputState, TabSize},
     resizable::{h_resizable, resizable_panel},
 };
+use oximux_settings::AutosaveSettings;
 
-use gpui::actions;
+use gpui::{Global, actions};
 
 use lsp_types::Uri;
 
@@ -41,7 +42,61 @@ use crate::lsp::{LspClient, path_to_file_uri};
 use crate::lsp_bridge::spawn_attach_lsp;
 use crate::markdown_preview::{self, MarkdownViewMode};
 
-actions!(oximux, [SaveFile]);
+actions!(
+    oximux,
+    [
+        SaveFile,
+        /// Increase the editor font size (Cmd+=). Editor-global.
+        EditorZoomIn,
+        /// Decrease the editor font size (Cmd+-). Editor-global.
+        EditorZoomOut,
+        /// Reset the editor font size to the theme default (Cmd+0).
+        EditorZoomReset
+    ]
+);
+
+/// Editor-global font-zoom level, held as a GPUI [`Global`]. `steps` is a
+/// signed pixel delta applied on top of the theme's mono font size; the
+/// effective size is clamped to a comfortable range. Session-scoped (resets
+/// on relaunch). Every editor view reads this on render, so a zoom action in
+/// one editor applies to all editor tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EditorZoom {
+    steps: i32,
+}
+
+impl Global for EditorZoom {}
+
+/// Smallest / largest editor font size in px after applying the zoom delta.
+const EDITOR_FONT_MIN_PX: f32 = 8.0;
+const EDITOR_FONT_MAX_PX: f32 = 32.0;
+
+impl EditorZoom {
+    fn zoomed_in(self) -> Self {
+        Self {
+            steps: self.steps + 1,
+        }
+    }
+    fn zoomed_out(self) -> Self {
+        Self {
+            steps: self.steps - 1,
+        }
+    }
+    fn reset() -> Self {
+        Self { steps: 0 }
+    }
+
+    /// Effective font size: the theme base plus the zoom delta, clamped.
+    pub fn effective_px(self, base: gpui::Pixels) -> gpui::Pixels {
+        let raw = f32::from(base) + self.steps as f32;
+        px(raw.clamp(EDITOR_FONT_MIN_PX, EDITOR_FONT_MAX_PX))
+    }
+}
+
+/// The current editor zoom (default when never set this session).
+fn current_zoom(cx: &App) -> EditorZoom {
+    cx.try_global::<EditorZoom>().copied().unwrap_or_default()
+}
 
 /// Reveal the editor's file in the workspace file-tree sidebar. Dispatched
 /// from the breadcrumb actions menu and handled by the host shell, which
@@ -216,6 +271,16 @@ pub struct EditorView {
     md_mode: MarkdownViewMode,
     /// Whether the breadcrumb "⋯" actions dropdown is showing. View-lifetime.
     actions_menu_open: bool,
+    /// Monotonic generation for the debounced autosave timer. Every buffer
+    /// change bumps it; a fired timer only writes if its captured generation
+    /// is still current (no newer edit superseded it).
+    autosave_gen: u64,
+    /// Holds the in-flight autosave debounce timer. Re-arming on each edit
+    /// drops (cancels) the prior timer, so only the last edit's timer fires.
+    _autosave_task: Option<Task<()>>,
+    /// Repaints this view when the editor-global zoom changes, so background
+    /// tabs pick up a new font size immediately (not just the focused one).
+    _zoom_sub: Subscription,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
 }
@@ -238,6 +303,9 @@ impl EditorView {
             view.focused = false;
             cx.notify();
         });
+        // Editor-global font zoom changes from any editor must repaint this
+        // one too — otherwise background tabs keep the old size until painted.
+        let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
 
         // Read bytes (not a String) so a non-UTF-8 sequence does not
         // silently produce an empty buffer. The mode-detection below
@@ -278,6 +346,9 @@ impl EditorView {
             is_markdown,
             md_mode,
             actions_menu_open: false,
+            autosave_gen: 0,
+            _autosave_task: None,
+            _zoom_sub,
             _focus_sub,
             _blur_sub,
         }
@@ -331,9 +402,11 @@ impl EditorView {
 
     /// Attach an LSP server asynchronously. No-op for non-text content
     /// (image/binary files have no buffer to feed to a language server).
+    /// `args` are the server's launch arguments (e.g. a `--stdio` flag).
     pub fn attach_lsp(
         &mut self,
         program: &str,
+        args: Vec<String>,
         language_id: &str,
         workspace_root: PathBuf,
         cx: &mut Context<Self>,
@@ -345,7 +418,7 @@ impl EditorView {
             );
             return;
         }
-        spawn_attach_lsp(self, program, language_id, workspace_root, cx);
+        spawn_attach_lsp(self, program, args, language_id, workspace_root, cx);
     }
 
     /// Called by `lsp_bridge` once the LSP handshake completes. Stores the
@@ -374,8 +447,39 @@ impl EditorView {
 
     /// Write the buffer to disk on Cmd+S. No-op for non-text content.
     fn on_save(&mut self, _: &SaveFile, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.save_to_disk(cx) {
+            cx.notify();
+        }
+    }
+
+    /// Bump the editor-global zoom and repaint. `set_global` inserts the
+    /// global on first use, so no boot-time install is needed.
+    fn apply_zoom(&mut self, next: EditorZoom, cx: &mut Context<Self>) {
+        cx.set_global(next);
+        cx.notify();
+    }
+
+    fn on_zoom_in(&mut self, _: &EditorZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        let next = current_zoom(cx).zoomed_in();
+        self.apply_zoom(next, cx);
+    }
+
+    fn on_zoom_out(&mut self, _: &EditorZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        let next = current_zoom(cx).zoomed_out();
+        self.apply_zoom(next, cx);
+    }
+
+    fn on_zoom_reset(&mut self, _: &EditorZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_zoom(EditorZoom::reset(), cx);
+    }
+
+    /// Write the buffer to disk, clear the dirty flag, and fire `didSave`.
+    /// Returns `true` when a write actually happened (text content + write
+    /// succeeded). Shared by Cmd+S and the autosave pump so both go through a
+    /// single write path — no double-fire, no divergent didSave logic.
+    fn save_to_disk(&mut self, cx: &mut Context<Self>) -> bool {
         let EditorContent::Text(t) = &mut self.content else {
-            return;
+            return false;
         };
         let text = t.state.read(cx).value().to_string();
         match std::fs::write(&self.file_path, &text) {
@@ -387,12 +491,76 @@ impl EditorView {
                 {
                     tracing::warn!(?err, "editor: didSave failed");
                 }
+                true
             }
             Err(err) => {
                 tracing::error!(?err, file = %self.file_path.display(), "editor: save failed");
+                false
             }
         }
-        cx.notify();
+    }
+
+    /// `true` when this view holds an unsaved (dirty) text buffer. Used by the
+    /// host's tab-close guard to decide whether to prompt before discarding.
+    pub fn is_dirty(&self) -> bool {
+        matches!(&self.content, EditorContent::Text(t) if t.dirty)
+    }
+
+    /// Save the buffer if dirty (no-op otherwise). Public so the host's
+    /// dirty-close guard can run "Save" without dispatching the `SaveFile`
+    /// action. Returns whether a write occurred.
+    pub fn save_if_dirty(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.is_dirty() {
+            return false;
+        }
+        let wrote = self.save_to_disk(cx);
+        if wrote {
+            cx.notify();
+        }
+        wrote
+    }
+
+    /// (Re)arm the debounced autosave timer after a buffer change. Reads the
+    /// cadence from the installed [`AutosaveSettings`] global (defaulting to
+    /// ON / 1000ms when the app hasn't installed one). A no-op when autosave
+    /// is disabled — the dirty-close guard remains the safety net then.
+    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
+        let settings = cx
+            .try_global::<AutosaveSettings>()
+            .copied()
+            .unwrap_or_default();
+        if !settings.enabled {
+            return;
+        }
+        self.autosave_gen = self.autosave_gen.wrapping_add(1);
+        let generation = self.autosave_gen;
+        let delay = settings.debounce();
+        self._autosave_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(delay).await;
+            view.update(cx, |this, cx| {
+                this.autosave_if_current(generation, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Fired by the debounce timer. Writes only when this is still the latest
+    /// scheduled save (debounce), the path isn't quiesced by an SCM
+    /// destructive op (would clobber a `git restore`), and the buffer is still
+    /// dirty.
+    fn autosave_if_current(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.autosave_gen != generation {
+            return;
+        }
+        if crate::autosave::is_autosave_paused(&self.file_path) {
+            return;
+        }
+        if !self.is_dirty() {
+            return;
+        }
+        if self.save_to_disk(cx) {
+            cx.notify();
+        }
     }
 }
 
@@ -439,22 +607,28 @@ fn decide_content(
     });
 
     let _observe_sub = cx.observe(&state, |this, _entity, cx| {
-        let EditorContent::Text(t) = &mut this.content else {
-            return;
-        };
-        let current_text = t.state.read(cx).value().to_string();
-        if let Some(prop) =
-            decide_change_propagation(&t.last_sent_text, &current_text, t.doc_version)
-        {
-            t.last_sent_text = prop.text.clone();
-            t.dirty = true;
-            t.doc_version = prop.new_version;
-            if let Some(client) = &this.lsp_client {
-                tracing::debug!(version = prop.new_version, "editor: didChange");
-                if let Err(err) = client.did_change(&this.uri, prop.new_version, prop.text) {
-                    tracing::warn!(?err, "editor: didChange failed");
+        let mut changed = false;
+        if let EditorContent::Text(t) = &mut this.content {
+            let current_text = t.state.read(cx).value().to_string();
+            if let Some(prop) =
+                decide_change_propagation(&t.last_sent_text, &current_text, t.doc_version)
+            {
+                t.last_sent_text = prop.text.clone();
+                t.dirty = true;
+                t.doc_version = prop.new_version;
+                if let Some(client) = &this.lsp_client {
+                    tracing::debug!(version = prop.new_version, "editor: didChange");
+                    if let Err(err) = client.did_change(&this.uri, prop.new_version, prop.text) {
+                        tracing::warn!(?err, "editor: didChange failed");
+                    }
                 }
+                changed = true;
             }
+        }
+        // Re-arm autosave + repaint outside the `t` borrow so `&mut this` is
+        // free for the debounce scheduler.
+        if changed {
+            this.schedule_autosave(cx);
             cx.notify();
         }
     });
@@ -547,6 +721,8 @@ impl Render for EditorView {
         // theme borrow is released here so the body match can re-borrow
         // `cx` mutably if it needs to (e.g., for `cx.listener`).
         let muted_fg = theme.muted_foreground;
+        // Editor-global font zoom applied on top of the theme's mono size.
+        let mono_size = current_zoom(cx).effective_px(theme.mono_font_size);
         let body: gpui::AnyElement = match &self.content {
             // Markdown text: branch on the active view mode. Source reuses the
             // plain editor; Preview/Split render via the GFM renderer. The
@@ -556,14 +732,15 @@ impl Render for EditorView {
                 let dir = self.file_path.parent();
                 let input = Input::new(&t.state)
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(theme.mono_font_size)
+                    .text_size(mono_size)
                     .size_full();
                 let view_id = cx.entity_id();
+                let is_dark = theme.is_dark();
                 match self.md_mode {
                     MarkdownViewMode::Source => input.into_any_element(),
                     MarkdownViewMode::Preview => {
                         let value = t.state.read(cx).value().to_string();
-                        markdown_preview::render_preview(&value, dir, view_id)
+                        markdown_preview::render_preview(&value, dir, view_id, is_dark)
                     }
                     MarkdownViewMode::Split => {
                         let value = t.state.read(cx).value().to_string();
@@ -578,7 +755,9 @@ impl Render for EditorView {
                                     .child(resizable_panel().child(input))
                                     .child(
                                         resizable_panel().child(
-                                            markdown_preview::render_preview(&value, dir, view_id),
+                                            markdown_preview::render_preview(
+                                                &value, dir, view_id, is_dark,
+                                            ),
                                         ),
                                     ),
                             )
@@ -588,7 +767,7 @@ impl Render for EditorView {
             }
             EditorContent::Text(t) => Input::new(&t.state)
                 .font_family(theme.mono_font_family.clone())
-                .text_size(theme.mono_font_size)
+                .text_size(mono_size)
                 .size_full()
                 .into_any_element(),
             EditorContent::Image { .. } => render_image_body(&self.file_path),
@@ -615,6 +794,9 @@ impl Render for EditorView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_zoom_in))
+            .on_action(cx.listener(Self::on_zoom_out))
+            .on_action(cx.listener(Self::on_zoom_reset))
             // Re-claim focus on click for Image / Binary surfaces. For
             // Text content the child `Input` widget grabs focus on its
             // own click path; this handler is the fallback so the
