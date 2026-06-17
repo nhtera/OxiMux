@@ -1316,6 +1316,24 @@ impl WorkspaceRoot {
         fe.update(cx, |fe, cx| fe.start_rename(path, window, cx));
     }
 
+    /// Begin inline creation of a new file (`is_dir == false`) or folder under
+    /// `parent`. Closes the context menu and hands off to the explorer, which
+    /// injects an editable placeholder row and creates the entry on Enter.
+    pub(crate) fn start_inline_create(
+        &mut self,
+        parent: std::path::PathBuf,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+        let Some(rs) = self.right_sidebar.as_ref() else {
+            return;
+        };
+        let fe = rs.read(cx).file_explorer.clone();
+        fe.update(cx, |fe, cx| fe.start_create(parent, is_dir, window, cx));
+    }
+
     /// Open `path` as a new editor tab in the active project's active
     /// pane group. If the file is already open in any tab of that group,
     /// activate it instead of opening a duplicate.
@@ -3089,22 +3107,22 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
-                |_this, action: &crate::actions::FileTreeNewFile, _window, _cx| {
-                    // Phase 02 stub: logs the dispatch. Phase 03 wires the
-                    // inline-input row in the file tree.
-                    tracing::info!(
-                        target: "oximux_app::file_explorer",
-                        parent = %action.parent,
-                        "FileTreeNewFile dispatched (inline input lands in Phase 03)"
+                |this, action: &crate::actions::FileTreeNewFile, window, cx| {
+                    this.start_inline_create(
+                        std::path::PathBuf::from(&action.parent),
+                        false,
+                        window,
+                        cx,
                     );
                 },
             ))
             .on_action(cx.listener(
-                |_this, action: &crate::actions::FileTreeNewFolder, _window, _cx| {
-                    tracing::info!(
-                        target: "oximux_app::file_explorer",
-                        parent = %action.parent,
-                        "FileTreeNewFolder dispatched (inline input lands in Phase 03)"
+                |this, action: &crate::actions::FileTreeNewFolder, window, cx| {
+                    this.start_inline_create(
+                        std::path::PathBuf::from(&action.parent),
+                        true,
+                        window,
+                        cx,
                     );
                 },
             ))

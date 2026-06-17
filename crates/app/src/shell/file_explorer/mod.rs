@@ -4,6 +4,7 @@
 //! directories lazily via `fs_load::load_dir_cache`. Renders via
 //! `gpui::uniform_list` for 60-fps scrolling on large trees.
 
+pub mod create_ops;
 pub mod file_icon;
 pub mod file_mutations;
 pub mod fs_load;
@@ -80,6 +81,10 @@ pub struct FileExplorer {
     /// basename; the row builder swaps the matching path's label for an
     /// `Input` widget bound to this entity. See `rename_ops.rs`.
     pub(crate) renaming: Option<rename_ops::RenameState>,
+    /// Inline-create state. `Some` while the user is naming a new file or
+    /// folder; `recompute_rows` injects a placeholder row under the parent
+    /// that the row builder mounts an `Input` on. See `create_ops.rs`.
+    pub(crate) creating: Option<create_ops::CreateState>,
     /// Path queued by `reveal_path` to be scrolled into view. Ancestor
     /// directory loads are async, so the target row may not exist yet when
     /// reveal is requested; the scroll is retried after each load lands and
@@ -135,6 +140,7 @@ impl FileExplorer {
             _activation_sub: activation_sub,
             on_open,
             renaming: None,
+            creating: None,
             pending_reveal: None,
             focus_handle: cx.focus_handle(),
         };
@@ -181,6 +187,34 @@ impl FileExplorer {
             .map(|(p, _)| p.clone())
             .collect();
         self.rows = filter_visible(all, &ignored, self.show_ignored);
+        self.inject_create_placeholder();
+    }
+
+    /// Splice the inline-create placeholder row into the flat list (no-op when
+    /// not creating). It lands as the first child under its parent directory,
+    /// or at the end of the list when creating at the repo root (whose row is
+    /// never shown). The row carries the create sentinel path so the row
+    /// builder mounts the `Input` on it.
+    fn inject_create_placeholder(&mut self) {
+        let Some(create) = self.creating.as_ref() else {
+            return;
+        };
+        let parent_depth = self
+            .rows
+            .iter()
+            .find(|n| n.path == create.parent)
+            .map(|n| n.depth);
+        let node = TreeNode {
+            name: String::new(),
+            path: create_ops::create_sentinel(&create.parent),
+            relative_path: PathBuf::new(),
+            is_directory: create.is_dir,
+            depth: parent_depth.map(|d| d + 1).unwrap_or(0),
+        };
+        match self.rows.iter().position(|n| n.path == create.parent) {
+            Some(idx) => self.rows.insert(idx + 1, node),
+            None => self.rows.push(node),
+        }
     }
 
     /// Flip the show/hide flag for ignored entries and refresh the row list.
@@ -350,9 +384,9 @@ impl FileExplorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // While an inline rename is active the Input owns keystrokes (Enter
-        // commits, Esc cancels) — don't intercept.
-        if self.renaming.is_some() {
+        // While an inline rename or create is active the Input owns keystrokes
+        // (Enter commits, Esc cancels) — don't intercept with row shortcuts.
+        if self.renaming.is_some() || self.creating.is_some() {
             return;
         }
         let Some(path) = self.selected.clone() else {
@@ -465,6 +499,13 @@ impl Render for FileExplorer {
                     // PathBuf::eq instead of touching the entity tree.
                     let rename_path = me.renaming.as_ref().map(|r| r.path.clone());
                     let rename_input = me.renaming.as_ref().map(|r| r.input.clone());
+                    // The create placeholder is matched by its sentinel path,
+                    // so the input mounts only on the injected row.
+                    let create_sentinel = me
+                        .creating
+                        .as_ref()
+                        .map(|c| create_ops::create_sentinel(&c.parent));
+                    let create_input = me.creating.as_ref().map(|c| c.input.clone());
                     range
                         .map(|i| {
                             let node = &rows[i];
@@ -484,15 +525,17 @@ impl Render for FileExplorer {
                             );
                             let path = node.path.clone();
                             let is_dir = node.is_directory;
-                            // This row gets the inline input only if it
-                            // matches the current rename target. Cloning the
-                            // entity handle is cheap (Arc bump) so we don't
-                            // bother caching it across iterations.
-                            let row_rename_input = match &rename_path {
-                                Some(p) if p == &path => rename_input.clone(),
-                                _ => None,
+                            // This row gets an inline input only when it matches
+                            // the rename target or the create sentinel. Cloning
+                            // the entity handle is cheap (Arc bump).
+                            let inline = if rename_path.as_ref() == Some(&path) {
+                                rename_input.clone().map(paint::InlineEdit::Rename)
+                            } else if create_sentinel.as_ref() == Some(&path) {
+                                create_input.clone().map(paint::InlineEdit::Create)
+                            } else {
+                                None
                             };
-                            paint_row(plan, &pctx, path, is_dir, is_loading, row_rename_input, cx)
+                            paint_row(plan, &pctx, path, is_dir, is_loading, inline, cx)
                                 .into_any_element()
                         })
                         .collect::<Vec<AnyElement>>()
@@ -535,13 +578,15 @@ impl Render for FileExplorer {
                 gpui::MouseButton::Left,
                 cx.listener(|me, _: &gpui::MouseDownEvent, _window, cx| {
                     me.cancel_rename(cx);
+                    me.cancel_create(cx);
                 }),
             )
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |me, ev: &gpui::MouseDownEvent, window, cx| {
-                    // Background right-click also discards the rename.
+                    // Background right-click also discards any inline edit.
                     me.cancel_rename(cx);
+                    me.cancel_create(cx);
                     window.dispatch_action(
                         Box::new(crate::actions::OpenFileTreeBackgroundMenuAt {
                             x: ev.position.x.into(),

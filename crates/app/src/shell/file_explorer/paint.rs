@@ -28,6 +28,22 @@ pub struct PaintCtx<'a> {
     pub typography: &'a Typography,
 }
 
+/// Which inline editor (if any) a row should mount. Both variants carry the
+/// same `InputState`; they differ only in what Escape cancels — an in-place
+/// rename of an existing entry, or naming a not-yet-created file/folder.
+pub enum InlineEdit {
+    Rename(Entity<InputState>),
+    Create(Entity<InputState>),
+}
+
+impl InlineEdit {
+    fn input(&self) -> &Entity<InputState> {
+        match self {
+            InlineEdit::Rename(i) | InlineEdit::Create(i) => i,
+        }
+    }
+}
+
 /// Paint one explorer row. Click events dispatch to the entity via
 /// `cx.listener` so `toggle_dir` / `open_file` have full entity access.
 ///
@@ -46,7 +62,7 @@ pub fn paint_row(
     path: PathBuf,
     is_dir: bool,
     is_loading: bool,
-    rename_input: Option<Entity<InputState>>,
+    inline: Option<InlineEdit>,
     cx: &mut Context<FileExplorer>,
 ) -> impl IntoElement {
     // Indent: 12px per depth level + 6px base padding. The row itself stays
@@ -127,8 +143,11 @@ pub fn paint_row(
     // owns its own clone of the path (avoids the borrow gymnastics of
     // sharing a single capture across both).
     let ctx_path = path.clone();
-    let is_renaming = rename_input.is_some();
-    // Container row. When renaming, suppress hover/selection backgrounds
+    let is_editing = inline.is_some();
+    // Escape cancels the right inline editor: a not-yet-created entry's name
+    // field discards the create; an existing row's field reverts the rename.
+    let is_create = matches!(inline, Some(InlineEdit::Create(_)));
+    // Container row. When editing, suppress hover/selection backgrounds
     // and skip both click handlers so the Input owns all pointer events.
     // The Escape key handler is hung on this row (not the Input) because
     // we need to intercept the keystroke whether the input has focus or
@@ -147,18 +166,18 @@ pub fn paint_row(
         .rounded(px(4.0))
         .text_size(px(ctx.typography.t_body_sm))
         .text_color(fg);
-    if !is_renaming {
+    if !is_editing {
         row = row
             .when(plan.selected, |s| s.bg(selection_bg))
             .hover(|s| s.bg(hover_bg))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |me, ev: &MouseDownEvent, window, cx| {
-                    // Clicking a different row while a rename is in
-                    // flight cancels the rename (matches the
-                    // user-typed-then-clicked-elsewhere = "discard"
-                    // expectation; Enter is the explicit commit).
+                    // Clicking a different row while an inline rename or create
+                    // is in flight discards it (user-typed-then-clicked-
+                    // elsewhere = "discard"; Enter is the explicit commit).
                     me.cancel_rename(cx);
+                    me.cancel_create(cx);
                     // Double-click on a file triggers inline rename. The 1st
                     // click of the double already ran the single-click branch
                     // (opening the reusable preview tab); the 2nd click
@@ -210,20 +229,24 @@ pub fn paint_row(
                 }),
             );
     } else {
-        // Escape → cancel rename. The input itself does `cx.propagate()`
-        // after its own Escape handler, so the event bubbles up to this
-        // row's listener even though the Input has key-focus.
+        // Escape → cancel the inline edit. The input itself does
+        // `cx.propagate()` after its own Escape handler, so the event bubbles
+        // up to this row's listener even though the Input has key-focus.
         //
         // The mouse_down handlers (Left + Right) just swallow the event
         // so the background-click cancel handler in the FileExplorer
-        // root doesn't fire when the user clicks within the renaming
+        // root doesn't fire when the user clicks within the editing
         // row (chevron / icon / input). The Input owns its own internal
         // click handling for cursor positioning; we never need to act
-        // on a click within the renaming row at the row level.
+        // on a click within the editing row at the row level.
         row = row
-            .on_key_down(cx.listener(|me, ev: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(move |me, ev: &KeyDownEvent, _window, cx| {
                 if ev.keystroke.key.as_str() == "escape" {
-                    me.cancel_rename(cx);
+                    if is_create {
+                        me.cancel_create(cx);
+                    } else {
+                        me.cancel_rename(cx);
+                    }
                 }
             }))
             .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, cx| {
@@ -238,8 +261,8 @@ pub fn paint_row(
     // Label vs editable input. The label keeps its italic-dim styling
     // for ignored entries; the input uses the gpui-component default
     // styling so it visually pops as "editable".
-    let name_cell: gpui::AnyElement = if let Some(state) = rename_input {
-        // Size the inline-rename input to the row's own font instead of the
+    let name_cell: gpui::AnyElement = if let Some(edit) = &inline {
+        // Size the inline input to the row's own font instead of the
         // gpui-component default (Medium → ~14px text, 32px tall), which
         // dwarfs the 11px rows. The widget derives its text size as
         // `size * 0.875`, so divide by 0.875 to land exactly on `t_body_sm`;
@@ -248,7 +271,7 @@ pub fn paint_row(
         div()
             .flex_1()
             .overflow_hidden()
-            .child(Input::new(&state).with_size(px(input_px)))
+            .child(Input::new(edit.input()).with_size(px(input_px)))
             .into_any_element()
     } else {
         div()
@@ -260,9 +283,9 @@ pub fn paint_row(
     };
     row = row.child(name_cell);
 
-    if is_renaming {
-        // Skip the right-aligned badge / ignored-slash glyph during
-        // rename so the input gets the full width of the row.
+    if is_editing {
+        // Skip the right-aligned badge / ignored-slash glyph during an inline
+        // edit so the input gets the full width of the row.
         return row;
     }
 
