@@ -1407,6 +1407,8 @@ impl PaneGroup {
             v.load(path_for_load, staged, untracked, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let label = {
             let leaf = path
@@ -1524,6 +1526,8 @@ impl PaneGroup {
             v.load_commit(sha_for_load, short_for_load, subject_for_load, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         // Tab label: short SHA + truncated subject. The tab strip
         // truncates anything long, so we keep the subject readable up
@@ -1592,6 +1596,8 @@ impl PaneGroup {
             v.load_range(base, head, path_for_load, title, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let label = SharedString::from(format!("{leaf} · branch"));
         let tab = PaneGroupTab {
@@ -1650,6 +1656,8 @@ impl PaneGroup {
             v.load_combined(scope_for_load, cx);
             v
         });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let tab = PaneGroupTab {
             label,

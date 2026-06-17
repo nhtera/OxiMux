@@ -48,7 +48,7 @@ use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore, format_
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement as _, Styled,
-    Subscription, Task, UniformListScrollHandle, Window, div, px,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, div, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, Sizable as _};
@@ -315,6 +315,10 @@ pub struct DiffView {
     /// Per-mount observer on the active popover — clears the slot when the
     /// popover closes. Reset each time a new popover mounts.
     _note_popover_observer: Option<Subscription>,
+    /// Weak handle to the hosting pane group, set after construction. Lets a
+    /// diff file-header's "open in editor" affordance open the diffed file as
+    /// an editor tab. `None` in headless tests (no live host).
+    opener: Option<WeakEntity<crate::shell::pane_group::PaneGroup>>,
 }
 
 impl DiffView {
@@ -358,7 +362,36 @@ impl DiffView {
             notes: ReviewNoteStore::new(),
             note_popover: None,
             _note_popover_observer: None,
+            opener: None,
         }
+    }
+
+    /// Give this diff view a weak handle to its hosting pane group so a
+    /// file-header "open in editor" click can open the diffed file as an
+    /// editor tab. Mirrors `TerminalView::set_opener`.
+    pub fn set_opener(&mut self, opener: WeakEntity<crate::shell::pane_group::PaneGroup>) {
+        self.opener = Some(opener);
+    }
+
+    /// Open the diffed file `rel_path` (workdir-relative, as git reports it)
+    /// as an editor tab in the hosting pane group. No-op without an opener.
+    pub fn open_file_in_editor(&self, rel_path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(opener) = self.opener.clone() else {
+            return;
+        };
+        let abs = self.repo.workdir().join(rel_path);
+        // Guard the no-such-file cases: a deleted-file header carries the old
+        // path, and a commit/branch diff's path may not exist in the current
+        // working tree (renamed/removed since). Opening the live file is right
+        // when it exists; otherwise silently no-op rather than spawn a blank
+        // editor for a path that isn't there.
+        if !std::fs::metadata(&abs).map(|m| m.is_file()).unwrap_or(false) {
+            tracing::debug!(path = %abs.display(), "diff: open-in-editor skipped; file not present in working tree");
+            return;
+        }
+        let _ = opener.update(cx, |group, cx| {
+            group.open_or_activate_editor_tab(abs, window, cx);
+        });
     }
 
     /// Fold/unfold a single file's body. Cheap — only the row set changes,
