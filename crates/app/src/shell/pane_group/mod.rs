@@ -1133,6 +1133,19 @@ impl PaneGroup {
         (view, observer)
     }
 
+    /// Clear the preview (italic/ephemeral) flag on the tab at `ix`, making it
+    /// a permanent tab. The double-click-the-chip gesture: a preview tab opened
+    /// by a single explorer click sticks instead of being replaced by the next
+    /// preview open. No-op if the tab is already permanent or `ix` is stale.
+    pub fn promote_tab_to_permanent(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(ix)
+            && tab.is_preview
+        {
+            tab.is_preview = false;
+            cx.notify();
+        }
+    }
+
     /// Open `path` as a reusable single-click preview tab (italic label). If
     /// the file is already open anywhere, just activate it. Otherwise reuse
     /// the active group's existing preview tab in place (so browsing the tree

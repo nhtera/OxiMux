@@ -1417,6 +1417,112 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Force the file explorer to re-read its cached directories from disk.
+    /// Called after a mutation (duplicate / delete) so the new tree state
+    /// shows up without waiting for the filesystem watcher.
+    fn refresh_file_explorer(&self, cx: &mut Context<Self>) {
+        if let Some(rs) = self.right_sidebar.as_ref() {
+            let fe = rs.read(cx).file_explorer.clone();
+            fe.update(cx, |fe, cx| fe.manual_refresh(cx));
+        }
+    }
+
+    /// Duplicate a file/folder next to itself, then refresh the tree and
+    /// reveal the new entry. Errors surface as a toast — duplication failures
+    /// (permissions, disk full) aren't recoverable from the UI.
+    pub(crate) fn duplicate_file_entry(
+        &mut self,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |weak, cx| {
+            // Copy off the main thread — duplicating a large folder must not
+            // freeze the UI. Re-enter the main thread only for the refresh.
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::shell::file_explorer::file_mutations::duplicate_path(&path)
+                })
+                .await;
+            weak.update(cx, |this, cx| match result {
+                Ok(new_path) => {
+                    this.refresh_file_explorer(cx);
+                    this.reveal_path_in_explorer(new_path, cx);
+                }
+                Err(err) => {
+                    this.push_toast(ToastKind::Error, format!("Duplicate failed: {err}"), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Mount a plain confirm dialog for a file-tree Delete. On confirm the
+    /// target is moved to the macOS Trash (reversible) and the tree refreshes;
+    /// an open editor tab for the path is left to the external-mutation sweep,
+    /// which flags it as deleted. Reuses the shared `confirm_dialog` slot +
+    /// observer, same as the SCM discard flow.
+    pub(crate) fn mount_file_delete_confirm(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let kind = if path.is_dir() { "folder" } else { "file" };
+        let body = format!("Move the {kind} “{name}” to the Trash? You can restore it from the Trash.");
+
+        let target = path.clone();
+        let weak = cx.entity().downgrade();
+        let on_confirm: ConfirmCallback = Rc::new(move |_window, cx| {
+            match crate::shell::file_explorer::file_mutations::move_to_trash(&target) {
+                Ok(()) => {
+                    if let Some(root) = weak.upgrade() {
+                        root.update(cx, |root, cx| root.refresh_file_explorer(cx));
+                    }
+                }
+                Err(err) => crate::shell::toast::toast_op_error(cx, "Delete", &err),
+            }
+        });
+
+        let prompt = ConfirmPrompt {
+            title: "Move to Trash".into(),
+            body: body.into(),
+            expected: "".into(),
+            on_confirm,
+            confirm_label: Some("Move to Trash".into()),
+            on_cancel: None,
+            secondary: None,
+        };
+
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+        // Cancel any in-flight observer (e.g. an SCM discard dialog) before
+        // installing this one, matching the explicit-clear pattern used at the
+        // other `confirm_dialog` mount sites.
+        self._discard_dialog_observer = None;
+        self._discard_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.confirm_dialog = None;
+                    root._discard_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.confirm_dialog = Some(dialog);
+        cx.notify();
+    }
+
     /// Mount a `ConfirmDialog` for the SCM panel's pending discard
     /// request. Builds the prompt copy from the panel's snapshot,
     /// wires `on_confirm` to `confirmed_discard_path` and `on_cancel`
@@ -3012,12 +3118,17 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
-                |_this, action: &crate::actions::FileTreeDelete, _window, _cx| {
-                    tracing::info!(
-                        target: "oximux_app::file_explorer",
-                        path = %action.path,
-                        "FileTreeDelete dispatched (confirm dialog lands in Phase 03)"
+                |this, action: &crate::actions::FileTreeDelete, window, cx| {
+                    this.mount_file_delete_confirm(
+                        std::path::PathBuf::from(&action.path),
+                        window,
+                        cx,
                     );
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &crate::actions::FileTreeDuplicate, _window, cx| {
+                    this.duplicate_file_entry(std::path::PathBuf::from(&action.path), cx);
                 },
             ))
             .on_action(

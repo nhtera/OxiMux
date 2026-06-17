@@ -225,6 +225,14 @@ pub struct FileTreeDelete {
     pub path: String,
 }
 
+/// Duplicate a file or folder next to itself with a collision-free
+/// " copy" name. Dispatched from the file-tree context menu's Duplicate row.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct FileTreeDuplicate {
+    pub path: String,
+}
+
 /// Right-click on a git_panel file row. Carries cursor coords + the
 /// clicked row's path + section flags + the current selection set so
 /// the shared `GitRowContextMenu` can pick the right scope variant

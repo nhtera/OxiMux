@@ -1165,12 +1165,21 @@ fn render_tab_chip(
         })
         .when_some(color_bar, |s, bar| s.child(bar))
         .when_some(active_indicator, |s, bar| s.child(bar))
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {
             // Activate the chip's tab within its OWN group, then dispatch
             // an `ActivateGroupTab` so the workspace also switches active
             // group focus when the chip belongs to a non-active group.
+            // Double-clicking the chip promotes a preview tab to permanent
+            // (the italic single-click preview sticks instead of being
+            // replaced by the next preview open).
             let entity = activate_entity.clone();
-            entity.update(cx, |this, cx| this.set_active(ix, window, cx));
+            let promote = ev.click_count >= 2;
+            entity.update(cx, |this, cx| {
+                this.set_active(ix, window, cx);
+                if promote {
+                    this.promote_tab_to_permanent(ix, cx);
+                }
+            });
             window.dispatch_action(
                 Box::new(ActivateGroupTab {
                     group_id: group_id.0,

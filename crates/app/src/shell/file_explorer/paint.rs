@@ -14,7 +14,7 @@ use gpui::{
     ParentElement, Styled, div, prelude::FluentBuilder, px, svg,
 };
 use gpui_component::{
-    Icon, IconName,
+    Icon, IconName, Sizable as _,
     input::{Input, InputState},
 };
 use oximux_settings::{Density, Theme, Typography};
@@ -159,24 +159,23 @@ pub fn paint_row(
                     // user-typed-then-clicked-elsewhere = "discard"
                     // expectation; Enter is the explicit commit).
                     me.cancel_rename(cx);
-                    // Double-click on a file triggers inline rename
-                    // (matches Finder's slow-double-click + the user's
-                    // request to allow filename rename without going
-                    // through the right-click menu). The 1st click of
-                    // a double already ran the single-click branch
-                    // (opening the file); the 2nd click promotes to
-                    // rename. Directories keep toggle semantics since
-                    // double-clicking a dir would otherwise expand/
-                    // collapse twice — no good rename slot for them
-                    // outside the context menu.
+                    // Double-click on a file triggers inline rename. The 1st
+                    // click of the double already ran the single-click branch
+                    // (opening the reusable preview tab); the 2nd click
+                    // promotes to rename. Promoting a preview tab to permanent
+                    // is done by double-clicking the tab chip itself, not the
+                    // explorer row. Directories keep toggle semantics.
                     if !is_dir && ev.click_count >= 2 {
                         me.start_rename(click_path.clone(), window, cx);
                         return;
                     }
+                    // Select the clicked row first (both dirs and files) so the
+                    // row-scoped keyboard shortcuts target what was just
+                    // clicked, not a stale prior selection.
+                    me.selected = Some(click_path.clone());
                     if is_dir {
                         me.toggle_dir(click_path.clone(), cx);
                     } else {
-                        me.selected = Some(click_path.clone());
                         // Route through the host callback so the file opens
                         // as an editor tab in the active pane group, not via
                         // macOS `open` (which launched the file outside the
@@ -185,6 +184,10 @@ pub fn paint_row(
                         me.open_file(click_path.clone(), window, cx);
                         cx.notify();
                     }
+                    // Keep keyboard focus in the panel (opening a file focuses
+                    // the editor) so the row-scoped shortcuts — Enter,
+                    // Cmd+Backspace, Cmd+Alt+C — land here, not in the editor.
+                    me.focus_panel(window, cx);
                 }),
             )
             .on_mouse_down(
@@ -236,10 +239,16 @@ pub fn paint_row(
     // for ignored entries; the input uses the gpui-component default
     // styling so it visually pops as "editable".
     let name_cell: gpui::AnyElement = if let Some(state) = rename_input {
+        // Size the inline-rename input to the row's own font instead of the
+        // gpui-component default (Medium → ~14px text, 32px tall), which
+        // dwarfs the 11px rows. The widget derives its text size as
+        // `size * 0.875`, so divide by 0.875 to land exactly on `t_body_sm`;
+        // the custom-px size also drops it to the compact `h_6` height.
+        let input_px = ctx.typography.t_body_sm / 0.875;
         div()
             .flex_1()
             .overflow_hidden()
-            .child(Input::new(&state))
+            .child(Input::new(&state).with_size(px(input_px)))
             .into_any_element()
     } else {
         div()

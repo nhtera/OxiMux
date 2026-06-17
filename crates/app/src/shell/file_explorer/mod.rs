@@ -5,6 +5,7 @@
 //! `gpui::uniform_list` for 60-fps scrolling on large trees.
 
 pub mod file_icon;
+pub mod file_mutations;
 pub mod fs_load;
 pub mod header_render;
 pub mod load_ops;
@@ -25,9 +26,9 @@ use crate::shell::file_explorer::tree_state::{
 };
 use crate::shell::file_tree_view::OnOpenFile;
 use gpui::{
-    AnyElement, App, Context, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollStrategy, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px,
-    uniform_list,
+    AnyElement, App, ClipboardItem, Context, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, ScrollStrategy, Styled, Subscription, Task,
+    UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use oximux_core::FileStatus;
 use oximux_git::PollState;
@@ -84,6 +85,11 @@ pub struct FileExplorer {
     /// reveal is requested; the scroll is retried after each load lands and
     /// cleared once it succeeds.
     pending_reveal: Option<PathBuf>,
+    /// Keyboard focus for the panel. Clicking a row focuses this handle so the
+    /// explorer keeps key focus (preview opens without stealing it), enabling
+    /// the row-scoped shortcuts: Enter = rename, Cmd+Backspace = delete,
+    /// Cmd+Alt+C / Cmd+Alt+Shift+C = copy absolute / relative path.
+    focus_handle: FocusHandle,
 }
 
 impl FileExplorer {
@@ -130,6 +136,7 @@ impl FileExplorer {
             on_open,
             renaming: None,
             pending_reveal: None,
+            focus_handle: cx.focus_handle(),
         };
 
         // Kick off root directory load on mount.
@@ -316,11 +323,72 @@ impl FileExplorer {
     /// contract: clicked files belong in the center pane.
     pub(crate) fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut App) {
         if let Some(cb) = self.on_open.as_ref() {
-            // Single-click opens a reusable preview tab (italic, replaced by the
-            // next single-click); editing promotes it to permanent. Double-click
-            // in this explorer is reserved for inline rename, so edit — not
-            // double-click — is the promotion path here.
+            // Single-click opens a reusable preview tab (italic, replaced by
+            // the next single-click). A preview tab is promoted to permanent
+            // by double-clicking the tab chip, or by editing it.
             (cb)(path, true, window, cx);
+        }
+    }
+
+    /// Give the panel keyboard focus. Called on row click so the explorer's
+    /// row-scoped shortcuts receive keystrokes even though opening a file
+    /// focuses the editor.
+    pub(crate) fn focus_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+    }
+
+    /// Row-scoped keyboard shortcuts, dispatched while the panel holds focus
+    /// and a row is selected. Mirrors the context-menu actions so the hints
+    /// shown there (↵, ⌘⌫, ⌘⌥C, ⌘⌥⇧C) are real:
+    /// - Enter → rename the selected entry,
+    /// - Cmd+Backspace → delete (move to Trash, with confirm),
+    /// - Cmd+Alt+C → copy absolute path,
+    /// - Cmd+Alt+Shift+C → copy path relative to the repo root.
+    fn handle_explorer_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // While an inline rename is active the Input owns keystrokes (Enter
+        // commits, Esc cancels) — don't intercept.
+        if self.renaming.is_some() {
+            return;
+        }
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        match ks.key.as_str() {
+            "enter" if !m.platform && !m.alt && !m.control && !m.shift => {
+                window.dispatch_action(
+                    Box::new(crate::actions::FileTreeRename {
+                        path: path.to_string_lossy().into_owned(),
+                    }),
+                    cx,
+                );
+            }
+            "backspace" if m.platform && !m.alt && !m.control && !m.shift => {
+                window.dispatch_action(
+                    Box::new(crate::actions::FileTreeDelete {
+                        path: path.to_string_lossy().into_owned(),
+                    }),
+                    cx,
+                );
+            }
+            "c" if m.platform && m.alt => {
+                let text = if m.shift {
+                    path.strip_prefix(&self.repo_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    path.to_string_lossy().into_owned()
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            _ => {}
         }
     }
 
@@ -446,6 +514,11 @@ impl Render for FileExplorer {
         let bg_root = self.repo_root.clone();
         div()
             .id("file-explorer-shell")
+            .track_focus(&self.focus_handle)
+            .key_context("FileExplorer")
+            .on_key_down(cx.listener(|me, ev: &KeyDownEvent, window, cx| {
+                me.handle_explorer_key(ev, window, cx);
+            }))
             .flex()
             .flex_col()
             .h_full()
