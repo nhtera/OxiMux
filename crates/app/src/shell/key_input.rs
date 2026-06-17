@@ -66,6 +66,29 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: InputMode) -> Vec<u8> {
     Vec::new()
 }
 
+/// True when this keystroke is plain printable text that the platform input
+/// method owns. Such keys are delivered to the view through the IME input
+/// handler (commit + marked-text callbacks), so the key encoder must NOT also
+/// translate them to PTY bytes — encoding them here as well would double-type
+/// the character and bypass multi-keystroke composition (e.g. Vietnamese
+/// Telex `as`→`á`, `dd`→`đ`, or any CJK input method).
+///
+/// Returns `false` for modified keys (Ctrl/Alt/Cmd combos) and for named
+/// navigation/control keys (Enter, Tab, arrows, function keys, …), which are
+/// not text and must stay on the byte-encoding path. Space is treated as text
+/// (it both inserts a space and commits an in-progress composition), so its
+/// ordering is left to the IME.
+pub fn is_ime_text_key(ks: &Keystroke) -> bool {
+    let m = &ks.modifiers;
+    if m.platform || m.control || m.alt {
+        return false;
+    }
+    if ks.key == "space" {
+        return true;
+    }
+    classify(&ks.key).is_none() && is_printable_key(&ks.key)
+}
+
 /// Shape of a named navigation key for escape-sequence encoding.
 enum KeySeq {
     /// Cursor-style with a final byte: A/B/C/D (arrows), H/F (Home/End).
@@ -258,6 +281,55 @@ mod tests {
             keystroke_to_bytes(&ks("tab", None, shift), off()),
             b"\x1b[Z"
         );
+    }
+
+    #[test]
+    fn ime_text_key_classification() {
+        let none = Modifiers::default();
+        // Plain printable text + space are owned by the IME (deferred so
+        // multi-keystroke composition works); uppercase via Shift too.
+        assert!(is_ime_text_key(&ks("a", Some("a"), none)));
+        assert!(is_ime_text_key(&ks("1", Some("1"), none)));
+        assert!(is_ime_text_key(&ks("space", Some(" "), none)));
+        assert!(is_ime_text_key(&ks(
+            "a",
+            Some("A"),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            }
+        )));
+        // Named navigation/control keys stay on the byte path.
+        assert!(!is_ime_text_key(&ks("enter", None, none)));
+        assert!(!is_ime_text_key(&ks("backspace", None, none)));
+        assert!(!is_ime_text_key(&ks("escape", None, none)));
+        assert!(!is_ime_text_key(&ks("left", None, none)));
+        assert!(!is_ime_text_key(&ks("f1", None, none)));
+        // Modified keys are shortcuts / meta combos, never IME text.
+        assert!(!is_ime_text_key(&ks(
+            "c",
+            Some("c"),
+            Modifiers {
+                control: true,
+                ..Default::default()
+            }
+        )));
+        assert!(!is_ime_text_key(&ks(
+            "a",
+            Some("a"),
+            Modifiers {
+                platform: true,
+                ..Default::default()
+            }
+        )));
+        assert!(!is_ime_text_key(&ks(
+            "a",
+            Some("å"),
+            Modifiers {
+                alt: true,
+                ..Default::default()
+            }
+        )));
     }
 
     #[test]

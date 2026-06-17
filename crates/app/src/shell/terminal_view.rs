@@ -17,16 +17,17 @@
 //! makes split sub-panes size their PTY to their own slice for free.
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task, WeakEntity, Window,
-    canvas, div, px,
+    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, InputHandler,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled,
+    Task, UTF16Selection, WeakEntity, Window, canvas, div, point, px, size,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -41,7 +42,7 @@ use crate::actions::{
 };
 use crate::shell::cell_metrics::CellMetrics;
 use crate::shell::context_env::SurfaceIds;
-use crate::shell::key_input::keystroke_to_bytes;
+use crate::shell::key_input::{is_ime_text_key, keystroke_to_bytes};
 use crate::shell::mouse_report::{MouseAction, MouseBtn, encode_button, encode_scroll, mod_bits};
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_links::{Existence, ExistenceCache, LinkMatch, LinkTarget, detect_at};
@@ -482,6 +483,13 @@ pub struct TerminalView {
     /// drag-select; that ships in a follow-up slice. Cmd+C copies the
     /// extracted text when set, then clears it.
     selection: Option<(usize, usize, usize, usize)>,
+    /// In-progress IME composition ("marked"/preedit) text, e.g. the Roman
+    /// letters shown underlined while the OS input method composes a
+    /// Vietnamese Telex syllable or a CJK character. `None` when not
+    /// composing. Set/cleared by the platform input handler
+    /// (`TerminalInputHandler`); the committed result arrives separately and
+    /// is written to the PTY. Rendered as an underlined overlay at the cursor.
+    ime_marked: Option<String>,
     /// Canvas bounds (window coords) captured by the paint closure each
     /// frame. Read by the mouse handlers to map a pixel position back to a
     /// cell via `point_to_cell`. Shared via `Rc<Cell<_>>` for the same
@@ -693,6 +701,7 @@ impl TerminalView {
             canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
+            ime_marked: None,
             selecting: None,
             opener: None,
             hovered_link: None,
@@ -881,6 +890,7 @@ impl TerminalView {
             canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
+            ime_marked: None,
             selecting: None,
             opener: None,
             hovered_link: None,
@@ -1776,6 +1786,17 @@ impl TerminalView {
         // toggle it dynamically, so fetch per keystroke rather than caching.
         let session_id = self.session_id;
         let mode = self.with_backend(|be| be.input_mode(session_id));
+        // Plain printable text and any in-progress composition belong to the
+        // platform input method (delivered via `TerminalInputHandler` →
+        // `commit_ime_text`), so the byte encoder must not also forward them:
+        // doing both double-types the character and bypasses multi-keystroke
+        // composition (e.g. Vietnamese Telex `as`→`á`, `dd`→`đ`). The IME is
+        // turned off on the alt-screen (full-screen TUIs), where keys must
+        // reach the app raw, so the deferral is skipped there.
+        let alt_screen = self.with_backend(|be| be.mouse_mode(session_id).alt_screen);
+        if !alt_screen && (self.ime_marked.is_some() || is_ime_text_key(ks)) {
+            return;
+        }
         // When Option-as-Meta is OFF, strip the Alt modifier so the encoder
         // emits the composed platform character (e.g. `å`) instead of an
         // ESC-prefixed Meta sequence. ON (default) keeps the Meta behavior.
@@ -1830,6 +1851,33 @@ impl TerminalView {
         // see it.
         self.cursor_visible = true;
         cx.notify();
+    }
+
+    /// Store the IME's in-progress composition ("marked"/preedit) text so the
+    /// canvas overlays it under the cursor. An empty string clears it.
+    fn set_ime_marked(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            self.clear_ime_marked(cx);
+            return;
+        }
+        self.ime_marked = Some(text);
+        cx.notify();
+    }
+
+    /// Drop any in-progress composition (commit, cancel, or focus loss).
+    fn clear_ime_marked(&mut self, cx: &mut Context<Self>) {
+        if self.ime_marked.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Commit finalized IME text: clear the preedit and write the composed
+    /// bytes to the PTY exactly as if they had been typed.
+    fn commit_ime_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.clear_ime_marked(cx);
+        if !text.is_empty() {
+            self.send_bytes(text.as_bytes(), cx);
+        }
     }
 
     /// F3.4: window-less variant of `respawn_if_dormant` used from
@@ -2419,6 +2467,12 @@ impl Render for TerminalView {
         let dims_typography = self.typography.clone();
         let canvas_grid = Rc::clone(&self.canvas_grid);
         let canvas_bounds = Rc::clone(&self.canvas_bounds);
+        // Captured for the per-paint IME input-handler registration (see
+        // `TerminalInputHandler`): the focused view receives composed/marked
+        // text from the platform input method through it.
+        let view_entity = cx.entity();
+        let input_focus = self.focus_handle.clone();
+        let ime_marked = self.ime_marked.clone();
         let grid_canvas = canvas(
             // Prepaint: no per-paint state to capture; return unit.
             |_bounds, _window, _cx| (),
@@ -2436,7 +2490,47 @@ impl Render for TerminalView {
                     // repaint on its own.
                     window.refresh();
                 }
+                // Cursor cell bounds in window coords, for IME placement and
+                // the preedit overlay. `(MAX, MAX)` means the cursor is
+                // suppressed (off-blink) — no anchor then.
+                let (crow, ccol) = paint_params.cursor;
+                let cursor_bounds = if crow == usize::MAX || ccol == usize::MAX {
+                    None
+                } else {
+                    let cw = metrics.cell_width;
+                    let lh = metrics.line_height;
+                    let x = f32::from(bounds.origin.x) + paint_params.pad + ccol as f32 * cw;
+                    let y = f32::from(bounds.origin.y) + paint_params.pad + crow as f32 * lh;
+                    Some(Bounds {
+                        origin: point(px(x), px(y)),
+                        size: size(px(cw), px(lh)),
+                    })
+                };
+                // Register the platform IME bridge. `handle_input` is a no-op
+                // unless this view holds focus, so only the focused terminal
+                // claims text input. This both enables multi-keystroke
+                // composition and disables the press-and-hold accent popup.
+                window.handle_input(
+                    &input_focus,
+                    TerminalInputHandler {
+                        view: view_entity.clone(),
+                        cursor_bounds,
+                    },
+                    cx,
+                );
                 paint_grid(bounds, &paint_params, window, cx);
+                // Draw the in-progress composition on top of the grid.
+                if let (Some(marked), Some(cb)) = (ime_marked.as_deref(), cursor_bounds) {
+                    crate::shell::terminal_canvas::paint_ime_preedit(
+                        marked,
+                        cb.origin,
+                        metrics.line_height_px(),
+                        &paint_params.typography,
+                        &paint_params.theme,
+                        window,
+                        cx,
+                    );
+                }
             },
         )
         .size_full();
@@ -2749,6 +2843,123 @@ fn extract_selection_text(
         }
     }
     out
+}
+
+/// Platform IME bridge for a terminal surface. Built and registered every
+/// paint (via `window.handle_input`) while the pane is focused; macOS routes
+/// composed and marked text through it (the `NSTextInputClient` protocol).
+/// This is the path that makes multi-keystroke input methods work in the
+/// terminal — Vietnamese Telex, CJK, and dead keys — which a bare
+/// `on_key_down`-to-bytes pipeline cannot do. `on_key_down` deliberately
+/// defers plain text to it. Returning `false` from `apple_press_and_hold_enabled`
+/// also disables the macOS press-and-hold accent popup, giving the terminal
+/// raw key-repeat (the popup otherwise stalls held keys, which reads as lag).
+struct TerminalInputHandler {
+    view: Entity<TerminalView>,
+    /// Cursor cell bounds in window coordinates, baked at paint time, used to
+    /// anchor the OS candidate window at the caret.
+    cursor_bounds: Option<Bounds<Pixels>>,
+}
+
+impl InputHandler for TerminalInputHandler {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        // Disable the IME on the alt-screen (full-screen TUIs — vim, less,
+        // htop — must read keys raw). Off the alt-screen, present a
+        // zero-length selection at the caret so the OS routes composition here.
+        let view = self.view.read(cx);
+        let sid = view.session_id;
+        let alt_screen = view.with_backend(|be| be.mouse_mode(sid).alt_screen);
+        if alt_screen {
+            None
+        } else {
+            Some(UTF16Selection {
+                range: 0..0,
+                reversed: false,
+            })
+        }
+    }
+
+    fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        let len = self
+            .view
+            .read(cx)
+            .ime_marked
+            .as_ref()?
+            .encode_utf16()
+            .count();
+        Some(0..len)
+    }
+
+    fn text_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<String> {
+        // The terminal exposes no queryable text buffer to the IME.
+        None
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        let text = text.to_owned();
+        self.view
+            .update(cx, |view, cx| view.commit_ime_text(&text, cx));
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        let new_text = new_text.to_owned();
+        self.view
+            .update(cx, |view, cx| view.set_ime_marked(new_text, cx));
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |view, cx| view.clear_ime_marked(cx));
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        let mut bounds = self.cursor_bounds?;
+        // Shift the candidate window by the composition offset; one cell width
+        // is `bounds.size.width` (the cursor cell).
+        bounds.origin.x += bounds.size.width * range_utf16.start as f32;
+        Some(bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
 }
 
 /// F3.4 slice 3: tiny corner chip indicating a restored-dormant sub-pane.

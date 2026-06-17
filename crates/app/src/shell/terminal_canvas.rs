@@ -446,6 +446,53 @@ pub fn paint_grid(bounds: Bounds<Pixels>, p: &PaintParams, window: &mut Window, 
     }
 }
 
+/// Paint the IME composition ("marked"/preedit) text as an underlined overlay
+/// at the cursor cell. While an input method is composing (e.g. a Vietnamese
+/// Telex syllable or a CJK character) the in-progress letters live in
+/// `TerminalView::ime_marked`, not in the PTY grid — so they're drawn here on
+/// top of the grid, over an opaque background quad so they stay readable.
+/// `cursor_origin` is the cursor cell's top-left in window pixels.
+pub fn paint_ime_preedit(
+    marked: &str,
+    cursor_origin: Point<Pixels>,
+    line_height: Pixels,
+    typography: &Typography,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if marked.is_empty() {
+        return;
+    }
+    let run = TextRun {
+        len: marked.len(),
+        font: typography.mono_font(),
+        color: theme.fg_base,
+        background_color: None,
+        underline: Some(UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(theme.fg_base),
+            wavy: false,
+        }),
+        strikethrough: None,
+    };
+    let shaped = window.text_system().shape_line(
+        SharedString::from(marked.to_owned()),
+        px(typography.t_body_lg),
+        &[run],
+        None,
+    );
+    let bg = Bounds {
+        origin: cursor_origin,
+        size: Size {
+            width: shaped.width,
+            height: line_height,
+        },
+    };
+    window.paint_quad(fill(bg, theme.bg_base));
+    let _ = shaped.paint(cursor_origin, line_height, TextAlign::Left, None, window, cx);
+}
+
 /// One styled run of consecutive cells that share fg, bg, inverse, dim,
 /// cursor-state, and match-state. Run boundary keys mirror the old
 /// flex-paint grouping in `terminal_row::group_runs` (deleted along
