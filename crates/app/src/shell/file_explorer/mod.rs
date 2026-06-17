@@ -316,8 +316,11 @@ impl FileExplorer {
     /// contract: clicked files belong in the center pane.
     pub(crate) fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut App) {
         if let Some(cb) = self.on_open.as_ref() {
-            // The secondary explorer opens permanent tabs (no preview reuse).
-            (cb)(path, false, window, cx);
+            // Single-click opens a reusable preview tab (italic, replaced by the
+            // next single-click); editing promotes it to permanent. Double-click
+            // in this explorer is reserved for inline rename, so edit — not
+            // double-click — is the promotion path here.
+            (cb)(path, true, window, cx);
         }
     }
 
