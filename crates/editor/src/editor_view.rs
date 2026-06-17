@@ -341,9 +341,11 @@ impl EditorView {
 
     /// Attach an LSP server asynchronously. No-op for non-text content
     /// (image/binary files have no buffer to feed to a language server).
+    /// `args` are the server's launch arguments (e.g. a `--stdio` flag).
     pub fn attach_lsp(
         &mut self,
         program: &str,
+        args: Vec<String>,
         language_id: &str,
         workspace_root: PathBuf,
         cx: &mut Context<Self>,
@@ -355,7 +357,7 @@ impl EditorView {
             );
             return;
         }
-        spawn_attach_lsp(self, program, language_id, workspace_root, cx);
+        spawn_attach_lsp(self, program, args, language_id, workspace_root, cx);
     }
 
     /// Called by `lsp_bridge` once the LSP handshake completes. Stores the

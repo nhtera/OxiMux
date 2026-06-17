@@ -527,7 +527,7 @@ fn run_editor_spike() {
         let _ = cx.open_window(options, move |window, cx| {
             let editor = cx.new(|cx| {
                 let mut v = EditorView::new(file_for_window.clone(), window, cx);
-                v.attach_lsp("rust-analyzer", "rust", workspace_root.clone(), cx);
+                v.attach_lsp("rust-analyzer", Vec::new(), "rust", workspace_root.clone(), cx);
                 v
             });
             let view: AnyView = editor.into();

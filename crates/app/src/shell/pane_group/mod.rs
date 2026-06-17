@@ -1155,6 +1155,22 @@ impl PaneGroup {
         // tab_order at the requested visible index.
         let path_for_view = path.clone();
         let view = cx.new(|cx| oximux_editor::EditorView::new(path_for_view, window, cx));
+        // Wire a language server for supported files. Resolution is keyed on
+        // the extension and PATH-resolves the binary, so an unsupported
+        // language or an uninstalled server is a clean no-op. `attach_lsp`
+        // itself skips non-text content. Workspace root = this group's cwd.
+        if let Some(server) = oximux_editor::resolve_lsp_server(&path) {
+            let workspace_root = self.cwd.clone();
+            view.update(cx, |v, cx| {
+                v.attach_lsp(
+                    &server.program,
+                    server.args,
+                    server.language_id,
+                    workspace_root,
+                    cx,
+                );
+            });
+        }
         let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
         let label = path
             .file_name()

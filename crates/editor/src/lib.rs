@@ -25,4 +25,6 @@ pub use binary::{image_mime_for_path, is_binary_buffer, is_previewable_image};
 pub use editor_view::{EditorView, RevealInExplorer, SaveFile, language_for_path};
 pub use markdown_preview::MarkdownViewMode;
 pub use file_tree::{FileTree, FileTreeEvent, FileTreeNode, TreeNodeId};
-pub use lsp::{LspClient, LspHoverProvider, path_to_file_uri};
+pub use lsp::{
+    LspClient, LspHoverProvider, LspServerSpec, path_to_file_uri, resolve_lsp_server,
+};

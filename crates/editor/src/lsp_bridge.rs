@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use gpui::{Context, WeakEntity};
 
-use crate::lsp::{LspClient, LspHoverProvider, path_to_file_uri};
+use crate::lsp::{
+    LspClient, LspCompletionProvider, LspDefinitionProvider, LspHoverProvider, path_to_file_uri,
+};
 
 /// Wire up an LSP server asynchronously from `EditorView::attach_lsp`.
 ///
@@ -27,6 +29,7 @@ use crate::lsp::{LspClient, LspHoverProvider, path_to_file_uri};
 pub fn spawn_attach_lsp(
     editor_view: &mut super::editor_view::EditorView,
     program: &str,
+    args: Vec<String>,
     language_id: &str,
     workspace_root: PathBuf,
     cx: &mut Context<super::editor_view::EditorView>,
@@ -48,7 +51,7 @@ pub fn spawn_attach_lsp(
     let view_weak: WeakEntity<super::editor_view::EditorView> = cx.weak_entity();
 
     cx.spawn(async move |_view, cx| {
-        let client = match LspClient::spawn(&program, &workspace_root).await {
+        let client = match LspClient::spawn(&program, &args, &workspace_root).await {
             Ok(c) => Arc::new(c),
             Err(err) => {
                 tracing::warn!(
@@ -113,17 +116,18 @@ pub fn spawn_attach_lsp(
             return;
         }
 
-        // Install the hover provider on the editor's Lsp slot. Must run on
-        // the GPUI main thread — hop via WeakEntity::update.
-        //
-        // `Rc<LspHoverProvider>` is safe here because gpui's `cx.spawn`
-        // uses a thread-local executor (no `Send` bound on the future).
-        // The Rc is consumed inside the synchronous `.update()` closure
-        // below — no await crosses it — so the local-only constraint holds.
+        // Install hover, completion, and definition providers together in one
+        // hop. Each is an `Rc` (gpui's `cx.spawn` future is thread-local, no
+        // `Send` bound); all three are consumed inside the synchronous
+        // `.update()` closure, so the local-only constraint holds.
         let hover_provider = Rc::new(LspHoverProvider::new(client.clone(), uri.clone()));
+        let completion_provider = Rc::new(LspCompletionProvider::new(client.clone(), uri.clone()));
+        let definition_provider = Rc::new(LspDefinitionProvider::new(client.clone(), uri.clone()));
         if state_weak
             .update(cx, |state, cx| {
                 state.lsp.hover_provider = Some(hover_provider);
+                state.lsp.completion_provider = Some(completion_provider);
+                state.lsp.definition_provider = Some(definition_provider);
                 cx.notify();
             })
             .is_err()
