@@ -22,14 +22,15 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription, Window,
-    img, prelude::FluentBuilder as _, px,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription, Task,
+    Window, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme,
     input::{Input, InputState, TabSize},
     resizable::{h_resizable, resizable_panel},
 };
+use oximux_settings::AutosaveSettings;
 
 use gpui::actions;
 
@@ -216,6 +217,13 @@ pub struct EditorView {
     md_mode: MarkdownViewMode,
     /// Whether the breadcrumb "⋯" actions dropdown is showing. View-lifetime.
     actions_menu_open: bool,
+    /// Monotonic generation for the debounced autosave timer. Every buffer
+    /// change bumps it; a fired timer only writes if its captured generation
+    /// is still current (no newer edit superseded it).
+    autosave_gen: u64,
+    /// Holds the in-flight autosave debounce timer. Re-arming on each edit
+    /// drops (cancels) the prior timer, so only the last edit's timer fires.
+    _autosave_task: Option<Task<()>>,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
 }
@@ -278,6 +286,8 @@ impl EditorView {
             is_markdown,
             md_mode,
             actions_menu_open: false,
+            autosave_gen: 0,
+            _autosave_task: None,
             _focus_sub,
             _blur_sub,
         }
@@ -374,8 +384,18 @@ impl EditorView {
 
     /// Write the buffer to disk on Cmd+S. No-op for non-text content.
     fn on_save(&mut self, _: &SaveFile, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.save_to_disk(cx) {
+            cx.notify();
+        }
+    }
+
+    /// Write the buffer to disk, clear the dirty flag, and fire `didSave`.
+    /// Returns `true` when a write actually happened (text content + write
+    /// succeeded). Shared by Cmd+S and the autosave pump so both go through a
+    /// single write path — no double-fire, no divergent didSave logic.
+    fn save_to_disk(&mut self, cx: &mut Context<Self>) -> bool {
         let EditorContent::Text(t) = &mut self.content else {
-            return;
+            return false;
         };
         let text = t.state.read(cx).value().to_string();
         match std::fs::write(&self.file_path, &text) {
@@ -387,12 +407,76 @@ impl EditorView {
                 {
                     tracing::warn!(?err, "editor: didSave failed");
                 }
+                true
             }
             Err(err) => {
                 tracing::error!(?err, file = %self.file_path.display(), "editor: save failed");
+                false
             }
         }
-        cx.notify();
+    }
+
+    /// `true` when this view holds an unsaved (dirty) text buffer. Used by the
+    /// host's tab-close guard to decide whether to prompt before discarding.
+    pub fn is_dirty(&self) -> bool {
+        matches!(&self.content, EditorContent::Text(t) if t.dirty)
+    }
+
+    /// Save the buffer if dirty (no-op otherwise). Public so the host's
+    /// dirty-close guard can run "Save" without dispatching the `SaveFile`
+    /// action. Returns whether a write occurred.
+    pub fn save_if_dirty(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.is_dirty() {
+            return false;
+        }
+        let wrote = self.save_to_disk(cx);
+        if wrote {
+            cx.notify();
+        }
+        wrote
+    }
+
+    /// (Re)arm the debounced autosave timer after a buffer change. Reads the
+    /// cadence from the installed [`AutosaveSettings`] global (defaulting to
+    /// ON / 1000ms when the app hasn't installed one). A no-op when autosave
+    /// is disabled — the dirty-close guard remains the safety net then.
+    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
+        let settings = cx
+            .try_global::<AutosaveSettings>()
+            .copied()
+            .unwrap_or_default();
+        if !settings.enabled {
+            return;
+        }
+        self.autosave_gen = self.autosave_gen.wrapping_add(1);
+        let generation = self.autosave_gen;
+        let delay = settings.debounce();
+        self._autosave_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(delay).await;
+            view.update(cx, |this, cx| {
+                this.autosave_if_current(generation, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Fired by the debounce timer. Writes only when this is still the latest
+    /// scheduled save (debounce), the path isn't quiesced by an SCM
+    /// destructive op (would clobber a `git restore`), and the buffer is still
+    /// dirty.
+    fn autosave_if_current(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.autosave_gen != generation {
+            return;
+        }
+        if crate::autosave::is_autosave_paused(&self.file_path) {
+            return;
+        }
+        if !self.is_dirty() {
+            return;
+        }
+        if self.save_to_disk(cx) {
+            cx.notify();
+        }
     }
 }
 
@@ -439,22 +523,28 @@ fn decide_content(
     });
 
     let _observe_sub = cx.observe(&state, |this, _entity, cx| {
-        let EditorContent::Text(t) = &mut this.content else {
-            return;
-        };
-        let current_text = t.state.read(cx).value().to_string();
-        if let Some(prop) =
-            decide_change_propagation(&t.last_sent_text, &current_text, t.doc_version)
-        {
-            t.last_sent_text = prop.text.clone();
-            t.dirty = true;
-            t.doc_version = prop.new_version;
-            if let Some(client) = &this.lsp_client {
-                tracing::debug!(version = prop.new_version, "editor: didChange");
-                if let Err(err) = client.did_change(&this.uri, prop.new_version, prop.text) {
-                    tracing::warn!(?err, "editor: didChange failed");
+        let mut changed = false;
+        if let EditorContent::Text(t) = &mut this.content {
+            let current_text = t.state.read(cx).value().to_string();
+            if let Some(prop) =
+                decide_change_propagation(&t.last_sent_text, &current_text, t.doc_version)
+            {
+                t.last_sent_text = prop.text.clone();
+                t.dirty = true;
+                t.doc_version = prop.new_version;
+                if let Some(client) = &this.lsp_client {
+                    tracing::debug!(version = prop.new_version, "editor: didChange");
+                    if let Err(err) = client.did_change(&this.uri, prop.new_version, prop.text) {
+                        tracing::warn!(?err, "editor: didChange failed");
+                    }
                 }
+                changed = true;
             }
+        }
+        // Re-arm autosave + repaint outside the `t` borrow so `&mut this` is
+        // free for the debounce scheduler.
+        if changed {
+            this.schedule_autosave(cx);
             cx.notify();
         }
     });
@@ -559,11 +649,12 @@ impl Render for EditorView {
                     .text_size(theme.mono_font_size)
                     .size_full();
                 let view_id = cx.entity_id();
+                let is_dark = theme.is_dark();
                 match self.md_mode {
                     MarkdownViewMode::Source => input.into_any_element(),
                     MarkdownViewMode::Preview => {
                         let value = t.state.read(cx).value().to_string();
-                        markdown_preview::render_preview(&value, dir, view_id)
+                        markdown_preview::render_preview(&value, dir, view_id, is_dark)
                     }
                     MarkdownViewMode::Split => {
                         let value = t.state.read(cx).value().to_string();
@@ -578,7 +669,9 @@ impl Render for EditorView {
                                     .child(resizable_panel().child(input))
                                     .child(
                                         resizable_panel().child(
-                                            markdown_preview::render_preview(&value, dir, view_id),
+                                            markdown_preview::render_preview(
+                                                &value, dir, view_id, is_dark,
+                                            ),
                                         ),
                                     ),
                             )

@@ -210,6 +210,22 @@ impl Render for PaneGroup {
             .child(body)
             .when_some(sub_divider_capture, |s, overlay| s.child(overlay))
             .when_some(mru_overlay, |s, overlay| s.child(overlay))
+            // Unsaved-changes prompt for a dirty editor tab close. Modal
+            // overlay (occludes the panes) centered over this group; built
+            // per-request, `None` when idle. Rendered last so it sits on top.
+            .when_some(self.dirty_close_dialog(), |s, dialog| {
+                s.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
     }
 }
 
@@ -1660,7 +1676,7 @@ fn close_button(
         .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
             let entity = entity.clone();
-            entity.update(cx, |this, cx| this.close_tab(ix, window, cx));
+            entity.update(cx, |this, cx| this.request_close_tab(ix, window, cx));
             cx.stop_propagation();
         })
         .child(glyph)

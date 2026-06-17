@@ -9,6 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
+# Autosave cadence (debounce/enabled) is read from `AutosaveSettings`, a GPUI
+# global installed by the app. Settings is a leaf crate — no dependency cycle.
+oximux-settings = { workspace = true }
 
 # GPUI shell + editor primitive. gpui-component already wraps tree-sitter
 # (rust/ts/js/go/json/markdown/...) and exposes the `Input` widget plus

@@ -1220,6 +1220,7 @@ impl DiffView {
             on_confirm,
             confirm_label: Some("Discard".into()),
             on_cancel: Some(on_cancel),
+            secondary: None,
         };
         let theme = self.theme;
         let density = self.density;

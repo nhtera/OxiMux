@@ -73,12 +73,23 @@ pub fn spawn_attach_lsp(
             }
         };
 
-        // didOpen carries the current on-disk text at version 1. Subsequent
-        // mutations are sent via didChange starting at version 2.
-        // We keep `did_open_text` to hand to `set_lsp_client` so it can
-        // detect whether the buffer drifted during the handshake gap and
-        // fire a catch-up didChange (Fix #3, tester L1).
-        let did_open_text = std::fs::read_to_string(&file_path).unwrap_or_default();
+        // didOpen carries the buffer text at version 1; subsequent mutations
+        // go via didChange starting at version 2. Read the live in-memory
+        // buffer — the editor already loaded the file at open time — rather
+        // than re-reading from disk here: a disk re-read races a concurrent
+        // writer and previously fell back to an empty document via
+        // `unwrap_or_default()`, silently feeding the language server a blank
+        // file for an existing, readable file. The buffer is the authoritative
+        // source. `did_open_text` is still handed to `set_lsp_client` so it
+        // can detect any drift during the handshake gap and fire a catch-up
+        // didChange.
+        let did_open_text = match state_weak.read_with(cx, |state, _| state.value().to_string()) {
+            Ok(text) => text,
+            Err(_) => {
+                // Editor entity dropped while connecting — nothing to attach.
+                return;
+            }
+        };
         if let Err(err) = client.did_open(uri.clone(), &language_id, 1, did_open_text.clone()) {
             tracing::warn!(?err, "editor: didOpen failed");
             return;

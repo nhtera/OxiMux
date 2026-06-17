@@ -258,7 +258,7 @@ impl RightSidebar {
         // retained here.
         let file_tree_view = on_open_file.map(|on_open| {
             let tree = cx.new(|cx| FileTree::new(root_path, cx));
-            cx.new(|cx| FileTreeView::new(tree, on_open, on_query_active_path, window, cx))
+            cx.new(|cx| FileTreeView::new(tree, theme, on_open, on_query_active_path, window, cx))
         });
 
         let poll_observer = Self::start_poll_observer(bar_rx, cx);

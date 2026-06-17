@@ -602,7 +602,16 @@ fn run_file_tree_spike() {
                     path.display()
                 );
             });
-            let view = cx.new(|cx| FileTreeView::new(tree, on_open, None, window, cx));
+            let view = cx.new(|cx| {
+                FileTreeView::new(
+                    tree,
+                    oximux_settings::Theme::charcoal(),
+                    on_open,
+                    None,
+                    window,
+                    cx,
+                )
+            });
             let any: AnyView = view.into();
             cx.new(|cx| gpui_component::Root::new(any, window, cx))
         });

@@ -1470,6 +1470,7 @@ impl WorkspaceRoot {
             on_confirm,
             confirm_label: Some(request.copy.confirm_label),
             on_cancel: Some(on_cancel),
+            secondary: None,
         };
 
         let theme = self.theme;

@@ -21,9 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    AppContext, Context, FocusHandle, Focusable, Point, ScrollHandle, SharedString, Subscription,
-    Task, Window, px,
+    AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
+    Subscription, Task, Window, px,
 };
+use std::rc::Rc;
 use oximux_agents::{
     AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend, agent_label_from_title,
     classify_agent_title,
@@ -40,6 +41,7 @@ use crate::actions::{
     ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
+use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt, ConfirmSecondary};
 use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
@@ -294,6 +296,14 @@ pub struct PaneGroup {
     /// overlay resolve a double-click-reset target after the first click's
     /// arm was already disarmed.
     last_sub_divider_path: Option<Vec<usize>>,
+    /// Unsaved-changes confirm dialog, mounted while a dirty editor tab close
+    /// awaits the user's Save / Discard / Cancel choice. `None` when idle.
+    /// Rendered as a modal overlay over this group's body.
+    dirty_close_dialog: Option<Entity<ConfirmDialog>>,
+    /// Observer that drops [`Self::dirty_close_dialog`] the moment the user
+    /// resolves it (confirm or cancel). Reset on each mount so a stale
+    /// observer never lingers.
+    _dirty_close_observer: Option<Subscription>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -345,6 +355,8 @@ impl PaneGroup {
             active_sub_divider: None,
             sub_divider_bounds: DividerBoundsCache::default(),
             last_sub_divider_path: None,
+            dirty_close_dialog: None,
+            _dirty_close_observer: None,
         }
     }
 
@@ -1702,6 +1714,122 @@ impl PaneGroup {
         cx.notify();
     }
 
+    /// Close entry-point for user-initiated single closes (the chip "✕" and
+    /// Cmd+W). An editor tab with an unsaved buffer first prompts
+    /// Save / Discard / Cancel via a modal overlay; everything else closes
+    /// immediately. Bulk closes (Close Others / Close to Right) and the
+    /// post-confirm path call [`Self::close_tab`] directly.
+    pub fn request_close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let dirty_editor = self.tabs.get(idx).and_then(|tab| match &tab.content {
+            PaneContent::Editor(view) if view.read(cx).is_dirty() => Some(view.clone()),
+            _ => None,
+        });
+        match dirty_editor {
+            Some(view) => self.mount_dirty_close_dialog(view, window, cx),
+            None => self.close_tab(idx, window, cx),
+        }
+    }
+
+    /// `true` while the unsaved-changes prompt is up — drives the render
+    /// overlay.
+    pub(crate) fn dirty_close_dialog(&self) -> Option<Entity<ConfirmDialog>> {
+        self.dirty_close_dialog.clone()
+    }
+
+    /// Mount the unsaved-changes prompt for a dirty editor tab. Save writes
+    /// then closes; Discard closes losing edits; Cancel keeps the tab. The
+    /// tab is re-resolved by file path at choice time so an unrelated tab
+    /// close (e.g. a terminal clean-exit) between mount and choice can't
+    /// shift the index onto the wrong tab.
+    fn mount_dirty_close_dialog(
+        &mut self,
+        view: Entity<oximux_editor::EditorView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Re-entry guard: one prompt at a time.
+        if self.dirty_close_dialog.is_some() {
+            return;
+        }
+        let path = view.read(cx).file_path().to_path_buf();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "This file".to_string());
+        let group = cx.weak_entity();
+
+        // Save → write the buffer, then close the (re-resolved) tab.
+        let on_confirm: ConfirmCallback = {
+            let group = group.clone();
+            let view = view.clone();
+            let path = path.clone();
+            Rc::new(move |window, cx| {
+                view.update(cx, |v, cx| {
+                    v.save_if_dirty(cx);
+                });
+                let _ = group.update(cx, |g, cx| {
+                    if let Some(idx) = g.editor_tab_index(&path) {
+                        g.close_tab(idx, window, cx);
+                    }
+                });
+            })
+        };
+        // Discard → close the (re-resolved) tab without saving.
+        let on_discard: ConfirmCallback = {
+            let group = group.clone();
+            let path = path.clone();
+            Rc::new(move |window, cx| {
+                let _ = group.update(cx, |g, cx| {
+                    if let Some(idx) = g.editor_tab_index(&path) {
+                        g.close_tab(idx, window, cx);
+                    }
+                });
+            })
+        };
+
+        let prompt = ConfirmPrompt {
+            title: "Unsaved changes".into(),
+            body: format!("{file_name} has unsaved changes. Save before closing?").into(),
+            // Plain confirm — no type-to-confirm; closing one tab isn't worth
+            // a typed gate.
+            expected: "".into(),
+            on_confirm,
+            confirm_label: Some("Save".into()),
+            on_cancel: None,
+            secondary: Some(ConfirmSecondary {
+                label: "Discard".into(),
+                on_click: on_discard,
+            }),
+        };
+
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog =
+            cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+
+        // Focus the dialog so Enter (Save) / Escape (Cancel) work without a
+        // click — the prompt has no inner Input to grab focus on its own.
+        dialog.read(cx).focus_handle(cx).focus(window, cx);
+
+        // Drop the dialog the moment the user resolves it. Replacing the
+        // observer cancels any stale one.
+        self._dirty_close_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |group, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    group.dirty_close_dialog = None;
+                    group._dirty_close_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.dirty_close_dialog = Some(dialog);
+        cx.notify();
+    }
+
     pub fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if idx >= self.tabs.len() {
             return;
@@ -2150,7 +2278,9 @@ impl PaneGroup {
                 return;
             }
         }
-        self.close_tab(active_idx, window, cx);
+        // Editor/diff/browser group tabs (and lone-leaf terminals) close the
+        // whole group tab — routed through the dirty-guard for unsaved editors.
+        self.request_close_tab(active_idx, window, cx);
     }
 
     pub(crate) fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {

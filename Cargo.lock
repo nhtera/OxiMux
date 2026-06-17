@@ -5162,6 +5162,7 @@ dependencies = [
  "lsp-types",
  "notify-debouncer-full",
  "oximux-core",
+ "oximux-settings",
  "serde",
  "serde_json",
  "tempfile",

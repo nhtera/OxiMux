@@ -87,6 +87,13 @@ pub struct FileTreeView {
     tree: Entity<FileTree>,
     rows: Vec<DisplayRow>,
     expanded_ids: HashSet<TreeNodeId>,
+    /// Path-keyed mirror of the user's expanded set. A watcher-driven
+    /// refresh evicts a directory's subtree and re-allocates fresh
+    /// `TreeNodeId`s for its children, so `expanded_ids` (keyed on the now-
+    /// stale ids) would silently collapse every re-expanded subdir. We
+    /// re-resolve the open set by path on each `Loaded` so expansion
+    /// survives a refresh. Kept in sync with `expanded_ids` on click.
+    expanded_paths: HashSet<PathBuf>,
     selected: Option<TreeNodeId>,
     scroll: UniformListScrollHandle,
     on_open: OnOpenFile,
@@ -95,12 +102,17 @@ pub struct FileTreeView {
     /// row separately from the click-selection. `None` until the host
     /// provides a query.
     on_query_active_path: Option<OnQueryActivePath>,
+    /// Active app palette, threaded from the host (same `Theme` the rest of
+    /// the shell uses) rather than constructed locally — so the file tree
+    /// tracks the app theme instead of pinning a hardcoded dark palette.
+    theme: Theme,
     _sub: Subscription,
 }
 
 impl FileTreeView {
     pub fn new(
         tree: Entity<FileTree>,
+        theme: Theme,
         on_open: OnOpenFile,
         on_query_active_path: Option<OnQueryActivePath>,
         window: &mut Window,
@@ -118,8 +130,11 @@ impl FileTreeView {
         );
 
         let root_id = tree.read(cx).root_id();
+        let root_path = tree.read(cx).root_path().to_path_buf();
         let mut expanded_ids = HashSet::new();
         expanded_ids.insert(root_id);
+        let mut expanded_paths = HashSet::new();
+        expanded_paths.insert(root_path);
 
         // Kick off root walk; result arrives async as `FileTreeEvent::Loaded`.
         tree.update(cx, |t, cx| t.expand(root_id, cx));
@@ -128,6 +143,8 @@ impl FileTreeView {
             tree,
             rows: Vec::new(),
             expanded_ids,
+            expanded_paths,
+            theme,
             selected: None,
             scroll: UniformListScrollHandle::new(),
             on_open,
@@ -138,24 +155,47 @@ impl FileTreeView {
 
     fn handle_tree_event(&mut self, ev: &FileTreeEvent, cx: &mut Context<Self>) {
         match ev {
-            FileTreeEvent::Loaded { .. } => {
+            FileTreeEvent::Loaded { children, .. } => {
+                self.reconcile_expanded(children, cx);
                 self.rebuild_rows(cx);
                 cx.notify();
             }
             FileTreeEvent::Refresh(id) => {
-                // TODO(step-5): after Refresh, step-3's `remove_subtree` evicts
-                // and reallocates child `TreeNodeId`s — any stale ids still in
-                // `expanded_ids` will be ignored by `build_rows_recursive`
-                // (nodes(id) → None → silent), causing previously-expanded
-                // subdirs to collapse. Fix when step 5 wires the real workspace:
-                //   self.expanded_ids
-                //       .retain(|id| self.tree.read(cx).node(*id).is_some());
+                // Re-walk the invalidated dir. `store_children` evicts the old
+                // subtree and re-allocates child ids, so the surviving open set
+                // is reconciled by path in the `Loaded` handler below (which
+                // this expand will trigger).
                 let id = *id;
                 self.tree.update(cx, |t, cx| t.expand(id, cx));
             }
             FileTreeEvent::WatchError(msg) => {
                 tracing::warn!(target: "oximux_app::file_tree_view", "watch error: {msg}");
             }
+        }
+    }
+
+    /// Re-resolve the user's open set by path after a directory's children
+    /// are (re)loaded. A refresh re-allocates child `TreeNodeId`s, so:
+    ///   1. drop ids that no longer resolve (their subtree was evicted), then
+    ///   2. for each freshly-loaded dir whose path the user had open, re-insert
+    ///      its new id and re-expand it if unloaded — which cascades the same
+    ///      reconcile to its own children one level deeper.
+    fn reconcile_expanded(&mut self, children: &[FileTreeNode], cx: &mut Context<Self>) {
+        {
+            let tree = self.tree.read(cx);
+            self.expanded_ids.retain(|id| tree.node(*id).is_some());
+        }
+        let mut to_expand: Vec<TreeNodeId> = Vec::new();
+        for child in children {
+            if child.is_dir && self.expanded_paths.contains(&child.path) {
+                self.expanded_ids.insert(child.id);
+                if !child.loaded {
+                    to_expand.push(child.id);
+                }
+            }
+        }
+        for id in to_expand {
+            self.tree.update(cx, |t, cx| t.expand(id, cx));
         }
     }
 
@@ -167,8 +207,16 @@ impl FileTreeView {
     }
 
     fn handle_dir_click(&mut self, id: TreeNodeId, loaded: bool, cx: &mut Context<Self>) {
+        // Mirror the toggle into the path-keyed set so the open state survives
+        // a refresh that re-allocates this node's id. Descendant paths are left
+        // intact on collapse so re-expanding restores the prior subtree (the
+        // same behavior the id-keyed set gave).
+        let dir_path = self.tree.read(cx).node(id).map(|n| n.path.clone());
         if self.expanded_ids.contains(&id) {
             self.expanded_ids.remove(&id);
+            if let Some(path) = &dir_path {
+                self.expanded_paths.remove(path);
+            }
             // Clear `selected` if it pointed inside the subtree we just
             // collapsed — otherwise the highlight returns when the dir is
             // re-expanded, which is surprising. We can't cheaply tell if
@@ -178,6 +226,9 @@ impl FileTreeView {
             self.rebuild_rows(cx);
         } else {
             self.expanded_ids.insert(id);
+            if let Some(path) = dir_path {
+                self.expanded_paths.insert(path);
+            }
             self.selected = Some(id);
             if !loaded {
                 // Walker will fire `Loaded` later; rebuild now so the
@@ -297,7 +348,7 @@ impl Render for FileTreeView {
         // Theme / typography are resolved per-render and threaded into
         // render_row so the closure captures stable Copy values rather
         // than re-instantiating per row.
-        let theme = Theme::charcoal();
+        let theme = self.theme;
         let typography = Typography::cockpit();
         // Resolve the focused-editor file path once per render. Cached
         // into the uniform_list closure so every row's match check is a

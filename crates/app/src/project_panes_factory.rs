@@ -216,24 +216,24 @@ pub(crate) fn build_project_panes(
     // which is exactly how V004 stores legacy rows.
     let mut pane_buffers = pane_buffers;
     let mut ordinal: u32 = 0;
-    for tab in &snap.tabs {
+    // Number of tabs dropped (missing-file editor tabs) whose flat index
+    // precedes the saved active index. Every such skip shifts the surviving
+    // tabs — and therefore the active tab — down by one slot, so the saved
+    // `active` must be decremented by this count or the wrong tab ends up
+    // focused on first paint.
+    let mut dropped_before_active: usize = 0;
+    for (flat_idx, tab) in snap.tabs.iter().enumerate() {
         match &tab.kind {
             PersistedTabKind::Editor { path } => {
                 let path_buf = PathBuf::from(path);
                 if !path_buf.exists() {
-                    // v1 placeholder strategy: drop the tab + log. Full
-                    // "missing-file placeholder tab" is a follow-up; the
-                    // user can reopen via Cmd+P. Don't fail the entire
-                    // restore — just skip this one entry.
-                    //
-                    // KNOWN limitation: when a dropped editor tab's flat
-                    // index is < `snap.active`, the restored active tab
-                    // points to the wrong slot (snap.active stays as the
-                    // saved value; the indices behind it shift down by
-                    // one per skip). `apply_restored_state` clamps to
-                    // `tab_count()` so this never panics, but the
-                    // wrong tab may end up focused on the first paint.
-                    // Acceptable for v1 — the dropped-tab case is rare.
+                    // Drop the tab + log; the user can reopen via Cmd+P.
+                    // Don't fail the entire restore — just skip this entry,
+                    // and track whether it sat ahead of the active tab so
+                    // the active index stays aligned with the survivors.
+                    if flat_idx < snap.active {
+                        dropped_before_active += 1;
+                    }
                     tracing::warn!(
                         ?path,
                         "editor tab restore: file no longer exists; skipping tab"
@@ -316,8 +316,9 @@ pub(crate) fn build_project_panes(
         }
     }
     let tab_order = snap.tab_order.clone();
+    let active = snap.active.saturating_sub(dropped_before_active);
     panes_entity.update(cx, |p, cx| {
-        p.apply_restored_state(snap.active, snap.next_label_n, tab_order, window, cx);
+        p.apply_restored_state(active, snap.next_label_n, tab_order, window, cx);
     });
     (panes_entity, pending)
 }
