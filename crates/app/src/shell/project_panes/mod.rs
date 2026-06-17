@@ -878,6 +878,38 @@ impl ProjectPanes {
         Some(target.update(cx, |g, cx| g.open_or_activate_editor_tab(path, window, cx)))
     }
 
+    /// Single-click preview open: activate an already-open tab in any group,
+    /// otherwise open/reuse a reusable preview tab in the active group.
+    pub fn open_preview_editor_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .editor_tab_index(path.as_path())
+                .map(|idx| (*id, idx))
+        });
+        if let Some((id, idx)) = existing {
+            self.set_active_group(id, window, cx);
+            let group = self.groups.get(&id)?.clone();
+            return Some(group.update(cx, |g, cx| {
+                g.set_active(idx, window, cx);
+                idx
+            }));
+        }
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied())?;
+        self.set_active_group(target_id, window, cx);
+        let target = self.groups.get(&target_id)?.clone();
+        Some(target.update(cx, |g, cx| g.open_preview_editor_tab(path, window, cx)))
+    }
+
     /// Focus the agent tab already running in `worktree_path`, if one
     /// exists in any group. Returns `true` when a matching tab was found
     /// and activated; `false` when no tab matches (caller decides whether

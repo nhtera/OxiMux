@@ -316,7 +316,8 @@ impl FileExplorer {
     /// contract: clicked files belong in the center pane.
     pub(crate) fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut App) {
         if let Some(cb) = self.on_open.as_ref() {
-            (cb)(path, window, cx);
+            // The secondary explorer opens permanent tabs (no preview reuse).
+            (cb)(path, false, window, cx);
         }
     }
 

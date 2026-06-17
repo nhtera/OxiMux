@@ -595,7 +595,7 @@ fn run_file_tree_spike() {
         let cwd_for_window = cwd.clone();
         let _ = cx.open_window(options, move |window, cx| {
             let tree = cx.new(|cx| FileTree::new(cwd_for_window.clone(), cx));
-            let on_open: OnOpenFile = Arc::new(|path, _window, _cx| {
+            let on_open: OnOpenFile = Arc::new(|path, _preview, _window, _cx| {
                 tracing::info!(
                     target: "file_tree_spike",
                     "would open: {}",

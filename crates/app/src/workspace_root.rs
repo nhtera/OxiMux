@@ -1326,6 +1326,7 @@ impl WorkspaceRoot {
     pub fn open_file_in_active_pane(
         &self,
         path: std::path::PathBuf,
+        preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1340,7 +1341,11 @@ impl WorkspaceRoot {
             return;
         };
         panes.update(cx, |p, cx| {
-            p.open_or_activate_editor_tab(path, window, cx);
+            if preview {
+                p.open_preview_editor_tab(path, window, cx);
+            } else {
+                p.open_or_activate_editor_tab(path, window, cx);
+            }
         });
     }
 
@@ -1587,9 +1592,9 @@ impl WorkspaceRoot {
     pub(crate) fn build_on_open_file_callback(
         weak: WeakEntity<Self>,
     ) -> crate::shell::file_tree_view::OnOpenFile {
-        Arc::new(move |path, window, cx| {
+        Arc::new(move |path, preview, window, cx| {
             let _ = weak.update(cx, |this, cx| {
-                this.open_file_in_active_pane(path, window, cx);
+                this.open_file_in_active_pane(path, preview, window, cx);
             });
         })
     }

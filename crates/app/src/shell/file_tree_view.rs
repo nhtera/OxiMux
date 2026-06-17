@@ -27,7 +27,9 @@ use crate::shell::pane_group::file_drag::{FilePathDragPayload, FilePathDragPrevi
 /// `Send` is deliberately dropped (the callback only ever fires from the
 /// GPUI main thread inside `handle_file_click`); none of the background
 /// executor or tokio paths capture this Arc.
-pub type OnOpenFile = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + 'static>;
+/// `(path, preview, window, app)`. `preview = true` for a single-click open
+/// (reusable italic preview tab); `false` for a double-click (permanent tab).
+pub type OnOpenFile = Arc<dyn Fn(PathBuf, bool, &mut Window, &mut App) + 'static>;
 
 /// Diff open callback. Same shape as `OnOpenFile` but carries two
 /// discriminators: `staged` (index-vs-HEAD when true, worktree-vs-index
@@ -244,11 +246,12 @@ impl FileTreeView {
         &mut self,
         id: TreeNodeId,
         path: PathBuf,
+        preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.selected = Some(id);
-        (self.on_open)(path, window, cx);
+        (self.on_open)(path, preview, window, cx);
         cx.notify();
     }
 }
@@ -539,8 +542,11 @@ fn render_row(
             let click_path = path.clone();
             el = el.on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |me, _: &MouseDownEvent, window, cx| {
-                    me.handle_file_click(id, click_path.clone(), window, cx);
+                cx.listener(move |me, ev: &MouseDownEvent, window, cx| {
+                    // Single-click opens a reusable preview tab; double-click
+                    // (or more) opens it as a permanent tab.
+                    let preview = ev.click_count < 2;
+                    me.handle_file_click(id, click_path.clone(), preview, window, cx);
                 }),
             );
             // Drag-from-sidebar wiring. GPUI's drag activation distance

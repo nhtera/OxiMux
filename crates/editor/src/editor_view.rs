@@ -32,7 +32,7 @@ use gpui_component::{
 };
 use oximux_settings::AutosaveSettings;
 
-use gpui::actions;
+use gpui::{Global, actions};
 
 use lsp_types::Uri;
 
@@ -42,7 +42,61 @@ use crate::lsp::{LspClient, path_to_file_uri};
 use crate::lsp_bridge::spawn_attach_lsp;
 use crate::markdown_preview::{self, MarkdownViewMode};
 
-actions!(oximux, [SaveFile]);
+actions!(
+    oximux,
+    [
+        SaveFile,
+        /// Increase the editor font size (Cmd+=). Editor-global.
+        EditorZoomIn,
+        /// Decrease the editor font size (Cmd+-). Editor-global.
+        EditorZoomOut,
+        /// Reset the editor font size to the theme default (Cmd+0).
+        EditorZoomReset
+    ]
+);
+
+/// Editor-global font-zoom level, held as a GPUI [`Global`]. `steps` is a
+/// signed pixel delta applied on top of the theme's mono font size; the
+/// effective size is clamped to a comfortable range. Session-scoped (resets
+/// on relaunch). Every editor view reads this on render, so a zoom action in
+/// one editor applies to all editor tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EditorZoom {
+    steps: i32,
+}
+
+impl Global for EditorZoom {}
+
+/// Smallest / largest editor font size in px after applying the zoom delta.
+const EDITOR_FONT_MIN_PX: f32 = 8.0;
+const EDITOR_FONT_MAX_PX: f32 = 32.0;
+
+impl EditorZoom {
+    fn zoomed_in(self) -> Self {
+        Self {
+            steps: self.steps + 1,
+        }
+    }
+    fn zoomed_out(self) -> Self {
+        Self {
+            steps: self.steps - 1,
+        }
+    }
+    fn reset() -> Self {
+        Self { steps: 0 }
+    }
+
+    /// Effective font size: the theme base plus the zoom delta, clamped.
+    pub fn effective_px(self, base: gpui::Pixels) -> gpui::Pixels {
+        let raw = f32::from(base) + self.steps as f32;
+        px(raw.clamp(EDITOR_FONT_MIN_PX, EDITOR_FONT_MAX_PX))
+    }
+}
+
+/// The current editor zoom (default when never set this session).
+fn current_zoom(cx: &App) -> EditorZoom {
+    cx.try_global::<EditorZoom>().copied().unwrap_or_default()
+}
 
 /// Reveal the editor's file in the workspace file-tree sidebar. Dispatched
 /// from the breadcrumb actions menu and handled by the host shell, which
@@ -224,6 +278,9 @@ pub struct EditorView {
     /// Holds the in-flight autosave debounce timer. Re-arming on each edit
     /// drops (cancels) the prior timer, so only the last edit's timer fires.
     _autosave_task: Option<Task<()>>,
+    /// Repaints this view when the editor-global zoom changes, so background
+    /// tabs pick up a new font size immediately (not just the focused one).
+    _zoom_sub: Subscription,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
 }
@@ -246,6 +303,9 @@ impl EditorView {
             view.focused = false;
             cx.notify();
         });
+        // Editor-global font zoom changes from any editor must repaint this
+        // one too — otherwise background tabs keep the old size until painted.
+        let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
 
         // Read bytes (not a String) so a non-UTF-8 sequence does not
         // silently produce an empty buffer. The mode-detection below
@@ -288,6 +348,7 @@ impl EditorView {
             actions_menu_open: false,
             autosave_gen: 0,
             _autosave_task: None,
+            _zoom_sub,
             _focus_sub,
             _blur_sub,
         }
@@ -389,6 +450,27 @@ impl EditorView {
         if self.save_to_disk(cx) {
             cx.notify();
         }
+    }
+
+    /// Bump the editor-global zoom and repaint. `set_global` inserts the
+    /// global on first use, so no boot-time install is needed.
+    fn apply_zoom(&mut self, next: EditorZoom, cx: &mut Context<Self>) {
+        cx.set_global(next);
+        cx.notify();
+    }
+
+    fn on_zoom_in(&mut self, _: &EditorZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        let next = current_zoom(cx).zoomed_in();
+        self.apply_zoom(next, cx);
+    }
+
+    fn on_zoom_out(&mut self, _: &EditorZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        let next = current_zoom(cx).zoomed_out();
+        self.apply_zoom(next, cx);
+    }
+
+    fn on_zoom_reset(&mut self, _: &EditorZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_zoom(EditorZoom::reset(), cx);
     }
 
     /// Write the buffer to disk, clear the dirty flag, and fire `didSave`.
@@ -639,6 +721,8 @@ impl Render for EditorView {
         // theme borrow is released here so the body match can re-borrow
         // `cx` mutably if it needs to (e.g., for `cx.listener`).
         let muted_fg = theme.muted_foreground;
+        // Editor-global font zoom applied on top of the theme's mono size.
+        let mono_size = current_zoom(cx).effective_px(theme.mono_font_size);
         let body: gpui::AnyElement = match &self.content {
             // Markdown text: branch on the active view mode. Source reuses the
             // plain editor; Preview/Split render via the GFM renderer. The
@@ -648,7 +732,7 @@ impl Render for EditorView {
                 let dir = self.file_path.parent();
                 let input = Input::new(&t.state)
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(theme.mono_font_size)
+                    .text_size(mono_size)
                     .size_full();
                 let view_id = cx.entity_id();
                 let is_dark = theme.is_dark();
@@ -683,7 +767,7 @@ impl Render for EditorView {
             }
             EditorContent::Text(t) => Input::new(&t.state)
                 .font_family(theme.mono_font_family.clone())
-                .text_size(theme.mono_font_size)
+                .text_size(mono_size)
                 .size_full()
                 .into_any_element(),
             EditorContent::Image { .. } => render_image_body(&self.file_path),
@@ -710,6 +794,9 @@ impl Render for EditorView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_zoom_in))
+            .on_action(cx.listener(Self::on_zoom_out))
+            .on_action(cx.listener(Self::on_zoom_reset))
             // Re-claim focus on click for Image / Binary surfaces. For
             // Text content the child `Input` widget grabs focus on its
             // own click path; this handler is the fallback so the

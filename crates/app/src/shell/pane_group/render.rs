@@ -64,6 +64,9 @@ impl Render for PaneGroup {
         // window + cx + focus_handle in the same scope. Subsequent calls
         // are idempotent.
         self.ensure_mru_focus_out_sub(window, cx);
+        // Lazily start the background sweep that flags editor tabs whose file
+        // was deleted on disk (renders a strikethrough badge).
+        self.ensure_external_mutation_sweep(cx);
 
         // Push on-screen state down to every TerminalView so hidden tabs can
         // throttle their PTY poll. The shown set = the per-leaf active views of
@@ -287,6 +290,8 @@ pub fn build_tab_strip_for(
                 attention: attention_for(&t.content, cx),
                 color: t.color,
                 pinned: t.pinned,
+                is_preview: t.is_preview,
+                external_mutation: t.external_mutation,
             }
         })
         .collect();
@@ -330,6 +335,11 @@ struct PaneGroupTabHeader {
     /// Pinned state — drives the pin-icon-in-place-of-close button on
     /// the chip.
     pinned: bool,
+    /// Reusable single-click preview tab — rendered with an italic label.
+    is_preview: bool,
+    /// On-disk mutation of the backing file (deleted/renamed) — rendered as a
+    /// strikethrough label plus a trailing suffix.
+    external_mutation: Option<super::ExternalMutation>,
 }
 
 #[derive(Clone, Copy)]
@@ -563,7 +573,7 @@ fn build_tab_strip_from_headers(
             let path = payload.path.clone();
             strip_file_drop_entity.update(cx, |g, cx| {
                 g.set_drag_hover(None, cx);
-                g.open_or_activate_editor_tab_at(path, None, window, cx);
+                g.open_or_activate_editor_tab_at(path, None, false, window, cx);
             });
         })
         // F4.6: OS-native Finder drop variant. GPUI synthesises an
@@ -580,7 +590,7 @@ fn build_tab_strip_from_headers(
                 // Multi-file Finder drops append in sequence so the
                 // user reads them left-to-right in the strip.
                 for path in paths {
-                    g.open_or_activate_editor_tab_at(path, None, window, cx);
+                    g.open_or_activate_editor_tab_at(path, None, false, window, cx);
                 }
             });
         })
@@ -631,6 +641,8 @@ fn build_tab_strip_from_headers(
             drag_edge,
             header.color,
             header.pinned,
+            header.is_preview,
+            header.external_mutation,
             theme,
             workspace_tint,
             entity.clone(),
@@ -1018,6 +1030,8 @@ fn render_tab_chip(
     drag_edge: Option<TabInsertSide>,
     color_tag: Option<super::TabColor>,
     is_pinned: bool,
+    is_preview: bool,
+    external_mutation: Option<super::ExternalMutation>,
     theme: Theme,
     workspace_tint: Option<super::TabColor>,
     entity: Entity<PaneGroup>,
@@ -1332,7 +1346,7 @@ fn render_tab_chip(
                     TabInsertSide::After => h.target_visible_idx + 1,
                 });
                 g.set_drag_hover(None, cx);
-                g.open_or_activate_editor_tab_at(path, visible_target, window, cx);
+                g.open_or_activate_editor_tab_at(path, visible_target, false, window, cx);
             });
         })
         // F4.6: chip-level OS-native drop. Mirrors the FilePathDragPayload
@@ -1367,7 +1381,7 @@ fn render_tab_chip(
                 g.set_drag_hover(None, cx);
                 for (offset, path) in paths.into_iter().enumerate() {
                     let target = base_target.map(|t| t + offset);
-                    g.open_or_activate_editor_tab_at(path, target, window, cx);
+                    g.open_or_activate_editor_tab_at(path, target, false, window, cx);
                 }
             });
         })
@@ -1379,7 +1393,27 @@ fn render_tab_chip(
         )
         .when_some(agent_dot, |s, dot| s.child(dot))
         .when_some(attention_dot, |s, dot| s.child(dot))
-        .child(div().child(label))
+        .child(
+            div()
+                // Preview tabs read italic; an on-disk delete/rename strikes
+                // the label through so the tab clearly flags the mismatch.
+                .when(is_preview, |d| d.italic())
+                .when(external_mutation.is_some(), |d| d.line_through())
+                .child(label),
+        )
+        // Trailing "deleted"/"renamed" suffix for an externally-mutated file.
+        .when_some(external_mutation, |s, mutation| {
+            let suffix = match mutation {
+                super::ExternalMutation::Deleted => "deleted",
+                super::ExternalMutation::Renamed => "renamed",
+            };
+            s.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.fg_subtle)
+                    .child(suffix),
+            )
+        })
         .child(if is_pinned {
             pin_indicator(entity_id_raw, ix, theme).into_any_element()
         } else {

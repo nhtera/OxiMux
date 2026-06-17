@@ -23,7 +23,7 @@ use crate::actions::{
     ToggleRightSidebar, ToggleZoomSubPane,
 };
 use crate::menu::{HideApp, HideOthers, Minimize, Quit};
-use oximux_editor::SaveFile;
+use oximux_editor::{EditorZoomIn, EditorZoomOut, EditorZoomReset, SaveFile};
 
 /// Shorthand for the per-entry bind fn — each closure is non-capturing so
 /// it coerces to a `fn` pointer and the table stays `const`.
@@ -61,6 +61,9 @@ pub const ACTIONS: &[ActionSpec] = &[
         ToggleFloatingTerminal
     ),
     entry!("save_file", "Save file", Global, "cmd-s", SaveFile),
+    entry!("editor_zoom_in", "Zoom in editor", Global, "cmd-=", EditorZoomIn),
+    entry!("editor_zoom_out", "Zoom out editor", Global, "cmd--", EditorZoomOut),
+    entry!("editor_zoom_reset", "Reset editor zoom", Global, "cmd-0", EditorZoomReset),
     entry!(
         "reload_custom_commands",
         "Reload custom commands",

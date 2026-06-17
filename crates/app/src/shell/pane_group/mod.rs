@@ -16,7 +16,7 @@ pub mod tab_drag_zones;
 #[cfg(test)]
 mod e2e_tests;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -122,8 +122,35 @@ pub struct PaneGroupTab {
     /// torn out by drag-to-split, and are skipped by Close Others /
     /// Close to Right.
     pub pinned: bool,
+    /// `true` while this is a reusable single-click "preview" tab (rendered
+    /// with an italic label). Promoted to a permanent tab on edit,
+    /// double-click, or pin. Runtime-only — never persisted, so a restored
+    /// tab is always permanent (no preview-ness survives a relaunch).
+    pub is_preview: bool,
+    /// Set when the FSEvents watcher reports this editor's backing file was
+    /// deleted or renamed on disk. Drives a strikethrough badge; the tab is
+    /// NOT auto-closed so the buffer stays available to review/save.
+    /// Runtime-only.
+    pub external_mutation: Option<ExternalMutation>,
     pub _observer: Option<Subscription>,
     pub _status_task: Option<Task<()>>,
+}
+
+/// On-disk fate of an open editor file as detected by the file-tree watcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalMutation {
+    /// The file no longer exists at its path.
+    Deleted,
+    /// The file's path disappeared but it likely moved (a sibling appeared).
+    Renamed,
+}
+
+/// Default chip label for an editor tab: the file name (or `"untitled"`).
+fn editor_tab_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("untitled")
+        .to_string()
 }
 
 /// Closed enum of user-pickable tab colors. Renders to a concrete
@@ -304,6 +331,11 @@ pub struct PaneGroup {
     /// resolves it (confirm or cancel). Reset on each mount so a stale
     /// observer never lingers.
     _dirty_close_observer: Option<Subscription>,
+    /// Periodic sweep that flags editor tabs whose backing file vanished on
+    /// disk (external delete). Lazily started on first render; lives on the
+    /// group so it drops cleanly when the group is torn down (no orphaned
+    /// subscription across a project switch).
+    _external_mutation_task: Option<Task<()>>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -357,6 +389,53 @@ impl PaneGroup {
             last_sub_divider_path: None,
             dirty_close_dialog: None,
             _dirty_close_observer: None,
+            _external_mutation_task: None,
+        }
+    }
+
+    /// Lazily start the external-mutation sweep (first render is the first
+    /// place we have a `&mut Context`). Idempotent.
+    pub(crate) fn ensure_external_mutation_sweep(&mut self, cx: &mut Context<Self>) {
+        if self._external_mutation_task.is_some() {
+            return;
+        }
+        self._external_mutation_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                if this
+                    .update(cx, |group, cx| group.sweep_external_mutations(cx))
+                    .is_err()
+                {
+                    break; // group dropped — stop sweeping.
+                }
+            }
+        }));
+    }
+
+    /// Stat each editor tab's file; flag any that vanished as `Deleted` and
+    /// clear the flag if a file reappeared (e.g. restored on disk). Rename is
+    /// folded into `Deleted` here — the path is gone either way; distinguishing
+    /// a true rename needs the watcher's paired event (a follow-up).
+    fn sweep_external_mutations(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let PaneGroupTabKind::Editor { path } = &tab.kind else {
+                continue;
+            };
+            let new_state = if path.exists() {
+                None
+            } else {
+                Some(ExternalMutation::Deleted)
+            };
+            if tab.external_mutation != new_state {
+                tab.external_mutation = new_state;
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
         }
     }
 
@@ -472,6 +551,11 @@ impl PaneGroup {
         };
         tab.pinned = !tab.pinned;
         let now_pinned = tab.pinned;
+        // Pinning a preview tab promotes it to permanent (a pinned tab the user
+        // wants to keep is no longer a throwaway browse tab).
+        if now_pinned {
+            tab.is_preview = false;
+        }
         let Some(visible_from) = self.tab_order.iter().position(|&i| i == idx) else {
             cx.notify();
             return;
@@ -913,6 +997,8 @@ impl PaneGroup {
             pinned: false,
             // Tab-level observer is unused for terminal tabs — sub-pane
             // observers inside TerminalSplitTree drive re-renders.
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         };
@@ -982,6 +1068,8 @@ impl PaneGroup {
             color: None,
             custom_title: Some(title),
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         };
@@ -1001,7 +1089,86 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        self.open_or_activate_editor_tab_at(path, None, window, cx)
+        self.open_or_activate_editor_tab_at(path, None, false, window, cx)
+    }
+
+    /// Build an `EditorView` for `path` with its language server attached and
+    /// a promote-on-edit observer wired. Shared by the new-tab and the
+    /// preview-replace paths. The observer clears `is_preview` on the owning
+    /// tab the first time the buffer goes dirty, so editing a preview tab
+    /// makes it permanent.
+    fn build_editor_view(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<oximux_editor::EditorView>, Subscription) {
+        let view = cx.new(|cx| oximux_editor::EditorView::new(path.to_path_buf(), window, cx));
+        // Resolve + attach a language server (extension-keyed, PATH-resolved;
+        // unsupported language or uninstalled server is a clean no-op).
+        if let Some(server) = oximux_editor::resolve_lsp_server(path) {
+            let workspace_root = self.cwd.clone();
+            view.update(cx, |v, cx| {
+                v.attach_lsp(
+                    &server.program,
+                    server.args,
+                    server.language_id,
+                    workspace_root,
+                    cx,
+                );
+            });
+        }
+        let observer = cx.observe(&view, |this, view_entity, cx| {
+            // Promote the preview tab to permanent on first edit.
+            if view_entity.read(cx).is_dirty()
+                && let Some(idx) = this
+                    .tabs
+                    .iter()
+                    .position(|t| matches!(&t.content, PaneContent::Editor(v) if v == &view_entity))
+            {
+                this.tabs[idx].is_preview = false;
+            }
+            cx.notify();
+        });
+        (view, observer)
+    }
+
+    /// Open `path` as a reusable single-click preview tab (italic label). If
+    /// the file is already open anywhere, just activate it. Otherwise reuse
+    /// the active group's existing preview tab in place (so browsing the tree
+    /// never piles up tabs); if none exists, open a fresh preview tab.
+    pub fn open_preview_editor_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(idx) = self.editor_tab_index(&path) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        // Reuse an existing preview tab in place, keeping its slot + preview-ness.
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.is_preview && matches!(t.kind, PaneGroupTabKind::Editor { .. }))
+        {
+            let (view, observer) = self.build_editor_view(&path, window, cx);
+            let label = editor_tab_label(&path);
+            let tab = &mut self.tabs[idx];
+            tab.content = PaneContent::Editor(view);
+            tab.kind = PaneGroupTabKind::Editor { path };
+            tab.label = SharedString::from(label);
+            tab.external_mutation = None;
+            // Reset per-tab decorations from the file we replaced — a fresh
+            // preview carries no custom title or color tag.
+            tab.custom_title = None;
+            tab.color = None;
+            tab._observer = Some(observer);
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        self.open_or_activate_editor_tab_at(path, None, true, window, cx)
     }
 
     /// Give a freshly-mounted terminal a weak handle back to this group so
@@ -1123,6 +1290,7 @@ impl PaneGroup {
         &mut self,
         path: PathBuf,
         insert_at_visible_idx: Option<usize>,
+        preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1132,6 +1300,11 @@ impl PaneGroup {
             .iter()
             .position(|t| matches!(&t.kind, PaneGroupTabKind::Editor { path: p } if p == &path))
         {
+            // A permanent (non-preview) open of an already-previewed tab
+            // promotes it to permanent.
+            if !preview {
+                self.tabs[idx].is_preview = false;
+            }
             if let Some(visible_target) = insert_at_visible_idx
                 && let Some(from) = self.visible_position_of(idx)
             {
@@ -1153,30 +1326,8 @@ impl PaneGroup {
         }
         // New tab path — construct, push, then optionally re-slot inside
         // tab_order at the requested visible index.
-        let path_for_view = path.clone();
-        let view = cx.new(|cx| oximux_editor::EditorView::new(path_for_view, window, cx));
-        // Wire a language server for supported files. Resolution is keyed on
-        // the extension and PATH-resolves the binary, so an unsupported
-        // language or an uninstalled server is a clean no-op. `attach_lsp`
-        // itself skips non-text content. Workspace root = this group's cwd.
-        if let Some(server) = oximux_editor::resolve_lsp_server(&path) {
-            let workspace_root = self.cwd.clone();
-            view.update(cx, |v, cx| {
-                v.attach_lsp(
-                    &server.program,
-                    server.args,
-                    server.language_id,
-                    workspace_root,
-                    cx,
-                );
-            });
-        }
-        let observer = Some(cx.observe(&view, |_this, _view, cx| cx.notify()));
-        let label = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("untitled")
-            .to_string();
+        let (view, observer) = self.build_editor_view(&path, window, cx);
+        let label = editor_tab_label(&path);
         let tab = PaneGroupTab {
             label: SharedString::from(label),
             content: PaneContent::Editor(view),
@@ -1184,7 +1335,9 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
-            _observer: observer,
+            is_preview: preview,
+            external_mutation: None,
+            _observer: Some(observer),
             _status_task: None,
         };
         self.tabs.push(tab);
@@ -1273,6 +1426,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1322,6 +1477,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1384,6 +1541,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1442,6 +1601,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1497,6 +1658,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1577,6 +1740,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: Some(status_task),
         });
@@ -1686,6 +1851,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         });
@@ -1722,6 +1889,8 @@ impl PaneGroup {
             color: None,
             custom_title: None,
             pinned: false,
+            is_preview: false,
+            external_mutation: None,
             _observer: None,
             _status_task: None,
         });
