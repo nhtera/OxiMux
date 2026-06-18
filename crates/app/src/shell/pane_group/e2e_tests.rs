@@ -761,3 +761,134 @@ async fn move_into_pinned_cluster_clamps_to_unpinned_zone(cx: &mut TestAppContex
         );
     });
 }
+
+// ── Preview tab: single-click reuses one tab; edit/double-click promotes ───
+
+#[gpui::test]
+async fn preview_editor_tab_is_reused_then_promoted(cx: &mut TestAppContext) {
+    let (window, dir) = make_group(cx);
+    // Editor views are gpui-component `Input` widgets, which need the
+    // component theme global the production app installs at boot.
+    cx.update(gpui_component::init);
+    let file_a = dir.path().join("alpha.txt");
+    let file_b = dir.path().join("beta.txt");
+    std::fs::write(&file_a, "alpha\n").expect("write alpha");
+    std::fs::write(&file_b, "beta\n").expect("write beta");
+
+    // Single-click file A → exactly one italic preview tab.
+    window
+        .update(cx, |group, win, cx| {
+            group.open_preview_editor_tab(file_a.clone(), win, cx);
+        })
+        .expect("window update ok");
+    cx.run_until_parked();
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(group.tab_count(), 1, "preview open creates exactly one tab");
+        assert!(
+            group.active_tab().expect("active").is_preview,
+            "a single-click file opens as a preview tab",
+        );
+    });
+
+    // Single-click file B → reuses the SAME preview slot (browsing the tree
+    // must not pile up tabs).
+    window
+        .update(cx, |group, win, cx| {
+            group.open_preview_editor_tab(file_b.clone(), win, cx);
+        })
+        .expect("window update ok");
+    cx.run_until_parked();
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            group.tab_count(),
+            1,
+            "a second preview reuses the slot instead of opening a new tab",
+        );
+        let tab = group.active_tab().expect("active");
+        assert!(tab.is_preview, "the reused tab stays a preview");
+        assert!(
+            group.editor_tab_index(&file_b).is_some(),
+            "the preview now hosts file B",
+        );
+        assert!(
+            group.editor_tab_index(&file_a).is_none(),
+            "file A is no longer open (its preview slot was reused)",
+        );
+    });
+
+    // Promote (the edit / double-click affordance) → permanent.
+    window
+        .update(cx, |group, _win, cx| group.promote_tab_to_permanent(0, cx))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert!(
+            !group.active_tab().expect("active").is_preview,
+            "promotion clears the preview flag",
+        );
+    });
+}
+
+// ── External mutation: deleting an open file on disk flags the tab, never
+//    auto-closes it; restoring the file clears the flag. ────────────────────
+
+#[gpui::test]
+async fn external_mutation_sweep_flags_deleted_and_clears_on_restore(cx: &mut TestAppContext) {
+    use crate::shell::pane_group::ExternalMutation;
+
+    let (window, dir) = make_group(cx);
+    // Editor views need the gpui-component theme global (see preview test).
+    cx.update(gpui_component::init);
+    let file = dir.path().join("watched.txt");
+    std::fs::write(&file, "content\n").expect("write file");
+
+    window
+        .update(cx, |group, win, cx| {
+            group.open_or_activate_editor_tab(file.clone(), win, cx);
+        })
+        .expect("window update ok");
+    cx.run_until_parked();
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            group.active_tab().expect("active").external_mutation,
+            None,
+            "a live file is unflagged",
+        );
+    });
+
+    // Delete on disk, then sweep → flagged Deleted, tab + buffer preserved.
+    std::fs::remove_file(&file).expect("remove file");
+    window
+        .update(cx, |group, _win, cx| group.sweep_external_mutations(cx))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            group.tab_count(),
+            1,
+            "a deleted-on-disk file is NOT auto-closed",
+        );
+        assert_eq!(
+            group.active_tab().expect("active").external_mutation,
+            Some(ExternalMutation::Deleted),
+            "a vanished file is flagged Deleted",
+        );
+    });
+
+    // Restore on disk, sweep again → the flag clears.
+    std::fs::write(&file, "back\n").expect("rewrite file");
+    window
+        .update(cx, |group, _win, cx| group.sweep_external_mutations(cx))
+        .expect("window update ok");
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(
+            group.active_tab().expect("active").external_mutation,
+            None,
+            "a restored file clears the Deleted flag",
+        );
+    });
+}
