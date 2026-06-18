@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-18 — Editor enhancement: stability, LSP wiring, tab-lifecycle UX, diff zoom
+
+**Commits**: `aa8800f` (merge: stability + LSP + tab lifecycle + zoom + diff open-in-tab), `4213285` (file-load retry), `8bccdfd` (diff font-zoom)
+**Touches**: `crates/editor/src/{editor_view.rs,autosave.rs,lsp/*,lsp_bridge.rs,file_tree/*}`, `crates/app/src/shell/{pane_group/*,diff_view/*}`, `crates/app/src/keymap_registry/inventory.rs`
+
+Promotes the `gpui-component`-`Input`-based editor from a viewer to a working surface. The foundation decision stands: keep the `Input` code-editor widget; do NOT port a custom editor.
+
+**Stability / data safety**: debounced autosave (1000ms, clamped) with pause/resume coordination; dirty-tab close guard (Save / Discard / Cancel); file-tree refresh reconciles expanded ids by path (no collapse on save); LSP empty-`didOpen` read-race fixed; restored active-tab index clamps to a valid range.
+
+**LSP in the production open path** for Rust / TS-JS / Python (pyright) / Go: extension→server resolution table (missing-binary skips cleanly), `attach_lsp` wired at the real file-open site, plus completion, hover, and go-to-definition providers.
+
+**Tab-lifecycle UX**: single-click opens a reusable **preview tab** (italic), promoted to permanent on edit / double-click; an open file deleted/renamed on disk gets a strikethrough **external-mutation badge** and is never auto-closed (buffer preserved); transient file-read failures **retry** at 250ms/1s/2.5s with a loading/failed-retry state (terminal errors — not-found / permission — fail fast). Scroll/cursor survive tab switches (GPUI keeps background tab entities alive).
+
+**Font zoom**: Cmd+= / Cmd+- / Cmd+0 zoom editor text (editor-global, session-scoped, clamped 8–32px). The **diff body shares the same zoom**: row height + body typography scale together so larger code doesn't clip, and the sticky header, staging card, and scroll anchor track the zoomed row height; the diff section headers (copy-path, colored +N/−N, collapse, open-in-editor, sticky overlay) were already in place.
+
+GUI-screenshot verification of the diff-zoom + failed-load states is environment-blocked (ScreenCaptureKit capture unavailable); the build runs cleanly and the behaviors are covered by headless tests where testable.
+
+---
+
 ### 2026-06-16 — Editor: markdown rendered preview (Source / Preview / Split)
 
 **Commits**: _(local, pending)_
