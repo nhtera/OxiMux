@@ -153,6 +153,27 @@ pub struct PersistedTab {
     /// single-leaf trees (the default for pre-v4 blobs).
     #[serde(default)]
     pub active_sub_pane: usize,
+    /// `true` when this was a reusable single-click "preview" tab (italic
+    /// label). Restored as a preview so a browse tab stays a browse tab
+    /// across a relaunch instead of silently becoming permanent.
+    /// `#[serde(default)]` → `false` for blobs written before preview
+    /// state was persisted (their tabs restore permanent, as they did).
+    #[serde(default)]
+    pub is_preview: bool,
+    /// `true` when the user pinned this tab. Pinned tabs cluster at the
+    /// front of the strip, so persisting this keeps both the pin and the
+    /// saved order intact. `#[serde(default)]` → `false` for older blobs.
+    #[serde(default)]
+    pub pinned: bool,
+    /// User-assigned color-tag slug (`TabColor::slug()`), or `None` for no
+    /// tint. Round-trips via `TabColor::from_slug` on restore; an unknown
+    /// slug degrades to no tint. `#[serde(default)]` → `None` for older blobs.
+    #[serde(default)]
+    pub color: Option<String>,
+    /// User-assigned custom title from "Change Title". `None` → fall back
+    /// to the default label. `#[serde(default)]` → `None` for older blobs.
+    #[serde(default)]
+    pub custom_title: Option<String>,
 }
 
 /// Per-leaf state captured by `PersistedTab.sub_panes`. Carries enough
@@ -432,6 +453,51 @@ mod tests {
         // tab_order (caller infers insertion order).
         assert_eq!(parsed.tabs[0].kind, PersistedTabKind::Terminal);
         assert!(parsed.tab_order.is_empty());
+    }
+
+    #[test]
+    fn round_trip_preserves_tab_cosmetics() {
+        // Preview/pin/color/title must survive a quit→relaunch so a restored
+        // strip looks exactly as the user left it.
+        let blob = PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "README.md".into(),
+                tree: PersistedTree::Leaf,
+                agent: None,
+                kind: PersistedTabKind::Terminal,
+                is_preview: true,
+                pinned: true,
+                color: Some("teal".into()),
+                custom_title: Some("Notes".into()),
+                ..PersistedTab::default()
+            }],
+            active: 0,
+            next_label_n: 1,
+            tab_order: vec![0],
+            ..PersistedTabs::default()
+        };
+        let s = serde_json::to_string(&blob).unwrap();
+        let back: PersistedTabs = serde_json::from_str(&s).unwrap();
+        let tab = &back.tabs[0];
+        assert!(tab.is_preview);
+        assert!(tab.pinned);
+        assert_eq!(tab.color.as_deref(), Some("teal"));
+        assert_eq!(tab.custom_title.as_deref(), Some("Notes"));
+    }
+
+    #[test]
+    fn legacy_blob_without_cosmetics_defaults_to_permanent() {
+        // Blobs written before cosmetics were persisted must restore as
+        // plain permanent tabs (no preview, no pin, no color/title) instead
+        // of failing to parse.
+        let legacy =
+            r#"{"tabs":[{"label":"Terminal 1","tree":"Leaf"}],"active":0,"next_label_n":1}"#;
+        let parsed: PersistedTabs = serde_json::from_str(legacy).unwrap();
+        let tab = &parsed.tabs[0];
+        assert!(!tab.is_preview);
+        assert!(!tab.pinned);
+        assert!(tab.color.is_none());
+        assert!(tab.custom_title.is_none());
     }
 
     #[test]

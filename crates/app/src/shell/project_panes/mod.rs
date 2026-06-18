@@ -39,7 +39,7 @@ use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::layout_presets::Preset;
 use crate::shell::pane_group::tab_drag_zones::Zone;
-use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind};
+use crate::shell::pane_group::{PaneGroup, PaneGroupTabKind, RestoredTabMeta};
 use crate::shell::pane_group_manager::{CloseGroupError, GroupSplitOutcome, PaneGroupManager};
 use crate::shell::pane_tree::{Axis, PaneGroupId, SplitInsert};
 
@@ -1400,6 +1400,10 @@ impl ProjectPanes {
                     kind,
                     sub_panes,
                     active_sub_pane,
+                    is_preview: tab.is_preview,
+                    pinned: tab.pinned,
+                    color: tab.color.map(|c| c.slug().to_string()),
+                    custom_title: tab.custom_title.as_ref().map(|t| t.to_string()),
                 });
                 orig_to_emitted.insert(idx, emitted_in_group);
                 emitted_in_group += 1;
@@ -1486,6 +1490,31 @@ impl ProjectPanes {
         group.update(cx, |g, cx| g.push_restored_terminal_tab(label, view, cx));
     }
 
+    /// Re-apply restored cosmetics + visual rank to the tab just pushed
+    /// into `group_id` (or the active group when `None`). The factory calls
+    /// this right after each synchronous restore push so the tab regains its
+    /// color/title/pin/preview state and settles into its saved strip slot.
+    pub fn place_restored_last_tab(
+        &mut self,
+        group_id: Option<PaneGroupId>,
+        meta: RestoredTabMeta,
+        cx: &mut Context<Self>,
+    ) {
+        let group = match group_id {
+            Some(id) => self.groups.get(&id).cloned(),
+            None => self.active_group(),
+        };
+        let Some(group) = group else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            let count = g.tab_count();
+            if count > 0 {
+                g.place_restored_tab(count - 1, meta, cx);
+            }
+        });
+    }
+
     /// Multi-sub-pane restore: append a terminal tab whose
     /// `TerminalSplitTree` has been fully reconstructed by the factory
     /// (per-leaf views + observers + tree shape + active position).
@@ -1534,6 +1563,7 @@ impl ProjectPanes {
         status_rx: AgentStatusStream,
         backend: SharedBackend,
         term_id: TerminalSessionId,
+        meta: RestoredTabMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1541,7 +1571,7 @@ impl ProjectPanes {
             return;
         };
         group.update(cx, |g, cx| {
-            g.push_agent_tab(
+            let idx = g.push_agent_tab(
                 persisted.adapter,
                 adapter_id,
                 PathBuf::from(&persisted.worktree_path),
@@ -1555,6 +1585,10 @@ impl ProjectPanes {
                 window,
                 cx,
             );
+            // Agent tabs mount async — after the persisted `tab_order` was
+            // already applied — so this re-settles the tab into its saved
+            // visual slot (and restores its color/title/pin/preview state).
+            g.place_restored_tab(idx, meta, cx);
         });
     }
 
@@ -1715,6 +1749,7 @@ impl ProjectPanes {
         status_rx: AgentStatusStream,
         backend: SharedBackend,
         term_id: TerminalSessionId,
+        meta: RestoredTabMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1722,7 +1757,7 @@ impl ProjectPanes {
             return;
         };
         group.update(cx, |g, cx| {
-            g.push_agent_tab(
+            let idx = g.push_agent_tab(
                 persisted.adapter,
                 adapter_id,
                 PathBuf::from(&persisted.worktree_path),
@@ -1736,6 +1771,7 @@ impl ProjectPanes {
                 window,
                 cx,
             );
+            g.place_restored_tab(idx, meta, cx);
         });
     }
 

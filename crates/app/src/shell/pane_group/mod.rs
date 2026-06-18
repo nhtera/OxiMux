@@ -124,16 +124,35 @@ pub struct PaneGroupTab {
     pub pinned: bool,
     /// `true` while this is a reusable single-click "preview" tab (rendered
     /// with an italic label). Promoted to a permanent tab on edit,
-    /// double-click, or pin. Runtime-only — never persisted, so a restored
-    /// tab is always permanent (no preview-ness survives a relaunch).
+    /// double-click, or pin. Persisted so a preview tab restores as a
+    /// preview across a relaunch instead of silently becoming permanent.
     pub is_preview: bool,
     /// Set when the FSEvents watcher reports this editor's backing file was
     /// deleted or renamed on disk. Drives a strikethrough badge; the tab is
     /// NOT auto-closed so the buffer stays available to review/save.
     /// Runtime-only.
     pub external_mutation: Option<ExternalMutation>,
+    /// Saved visual position carried only during a restore. Async-mounted
+    /// tabs (agents) would otherwise append at the tail after the persisted
+    /// `tab_order` was already applied; sorting `tab_order` by this rank lets
+    /// every tab settle into its saved slot regardless of mount order. `None`
+    /// outside of restore — cleared once the strip has settled.
+    pub restore_rank: Option<usize>,
     pub _observer: Option<Subscription>,
     pub _status_task: Option<Task<()>>,
+}
+
+/// Saved per-tab state re-applied during a restore. Bundled so the many
+/// restore push sites (editor/terminal/browser/agent, single- and multi-
+/// group) thread one value instead of five positional args.
+#[derive(Clone, Debug, Default)]
+pub struct RestoredTabMeta {
+    /// Visual position in the saved strip — drives `restore_rank`.
+    pub rank: usize,
+    pub is_preview: bool,
+    pub pinned: bool,
+    pub color: Option<TabColor>,
+    pub custom_title: Option<SharedString>,
 }
 
 /// On-disk fate of an open editor file as detected by the file-tree watcher.
@@ -489,6 +508,32 @@ impl PaneGroup {
         let next = canonicalize_tab_order(order, self.tabs.len());
         debug_assert_eq!(next.len(), self.tabs.len());
         self.tab_order = next;
+    }
+
+    /// Stamp a freshly-restored tab (at insertion index `idx`) with its
+    /// saved cosmetic state and visual rank, then re-sort `tab_order` so
+    /// every ranked tab sits in its saved slot. Idempotent and order-
+    /// independent: called once per restored tab as it mounts (synchronously
+    /// for editor/terminal/browser, asynchronously for agents), it always
+    /// converges to the saved strip order. Unranked tabs (`None`) keep their
+    /// relative position at the tail via the stable sort.
+    pub fn place_restored_tab(
+        &mut self,
+        idx: usize,
+        meta: RestoredTabMeta,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.restore_rank = Some(meta.rank);
+            tab.is_preview = meta.is_preview;
+            tab.pinned = meta.pinned;
+            tab.color = meta.color;
+            tab.custom_title = meta.custom_title;
+        }
+        self.tab_order
+            .sort_by_key(|&i| self.tabs.get(i).and_then(|t| t.restore_rank).unwrap_or(usize::MAX));
+        debug_assert_eq!(self.tabs.len(), self.tab_order.len());
+        cx.notify();
     }
 
     /// Move a tab from one visible position to another. Mutates only
@@ -999,6 +1044,7 @@ impl PaneGroup {
             // observers inside TerminalSplitTree drive re-renders.
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: None,
             _status_task: None,
         };
@@ -1070,6 +1116,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: None,
             _status_task: None,
         };
@@ -1350,6 +1397,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: preview,
             external_mutation: None,
+            restore_rank: None,
             _observer: Some(observer),
             _status_task: None,
         };
@@ -1443,6 +1491,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1494,6 +1543,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1560,6 +1610,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1622,6 +1673,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1681,6 +1733,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: observer,
             _status_task: None,
         };
@@ -1763,6 +1816,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: None,
             _status_task: Some(status_task),
         });
@@ -1874,6 +1928,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: None,
             _status_task: None,
         });
@@ -1912,6 +1967,7 @@ impl PaneGroup {
             pinned: false,
             is_preview: false,
             external_mutation: None,
+            restore_rank: None,
             _observer: None,
             _status_task: None,
         });

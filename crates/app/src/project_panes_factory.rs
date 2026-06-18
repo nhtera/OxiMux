@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AppContext, Context, Entity, WeakEntity, Window};
+use gpui::{AppContext, Context, Entity, SharedString, WeakEntity, Window};
 use oximux_agents::{AgentRuntime, AgentSessionConfig, CliRuntime};
 use oximux_core::AgentAdapter;
 use oximux_settings::{Density, Theme, Typography};
@@ -30,6 +30,7 @@ use crate::persisted_terminals::{
 };
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
+use crate::shell::pane_group::{RestoredTabMeta, TabColor};
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::terminal_view::{
@@ -153,6 +154,27 @@ pub fn compute_leaf_attach_hints(
 /// daemon RPCs — the window shows the restored layout immediately and
 /// each pane's content streams in as its session attaches.
 #[allow(clippy::too_many_arguments)]
+/// Build the restored cosmetic + ordering metadata for a persisted tab.
+/// `rank` is the tab's position in its (group-local) saved visual order;
+/// the strip is re-sorted by it so async-mounted tabs (agents) settle into
+/// their saved slot instead of appending at the tail.
+fn restored_meta(tab: &PersistedTab, rank: usize) -> RestoredTabMeta {
+    RestoredTabMeta {
+        rank,
+        is_preview: tab.is_preview,
+        pinned: tab.pinned,
+        color: tab.color.as_deref().and_then(TabColor::from_slug),
+        custom_title: tab.custom_title.clone().map(SharedString::from),
+    }
+}
+
+/// Visual rank of flat/local index `idx` within a saved `tab_order`. Falls
+/// back to `idx` itself for legacy blobs (empty order = insertion order) or
+/// an absent index.
+fn rank_in(order: &[usize], idx: usize) -> usize {
+    order.iter().position(|&i| i == idx).unwrap_or(idx)
+}
+
 pub(crate) fn build_project_panes(
     cwd: PathBuf,
     snapshot: Option<PersistedTabs>,
@@ -223,6 +245,10 @@ pub(crate) fn build_project_panes(
     // focused on first paint.
     let mut dropped_before_active: usize = 0;
     for (flat_idx, tab) in snap.tabs.iter().enumerate() {
+        // Saved cosmetics (preview/pin/color/title) + visual rank for this
+        // tab. Re-applied right after each push so the strip restores
+        // looking exactly as the user left it.
+        let meta = restored_meta(tab, rank_in(&snap.tab_order, flat_idx));
         match &tab.kind {
             PersistedTabKind::Editor { path } => {
                 let path_buf = PathBuf::from(path);
@@ -242,6 +268,7 @@ pub(crate) fn build_project_panes(
                 }
                 panes_entity.update(cx, |p, cx| {
                     p.open_or_activate_editor_tab(path_buf, window, cx);
+                    p.place_restored_last_tab(None, meta, cx);
                 });
             }
             PersistedTabKind::Browser { url, profile_id } => {
@@ -253,6 +280,7 @@ pub(crate) fn build_project_panes(
                             g.open_browser_tab(url, profile_id, window, cx);
                         });
                     }
+                    p.place_restored_last_tab(None, meta, cx);
                 });
             }
             PersistedTabKind::Terminal => {
@@ -263,6 +291,7 @@ pub(crate) fn build_project_panes(
                         None,
                         cli_runtime.clone(),
                         panes_entity.downgrade(),
+                        meta,
                         window,
                         cx,
                     );
@@ -284,6 +313,7 @@ pub(crate) fn build_project_panes(
                     ) {
                         panes_entity.update(cx, |p, cx| {
                             p.push_restored_terminal_tab_with_tree(tab.label.clone(), tree, cx);
+                            p.place_restored_last_tab(None, meta, cx);
                         });
                         ordinal += 1;
                     }
@@ -309,6 +339,7 @@ pub(crate) fn build_project_panes(
                     let _ = pane_buffers.remove(&(ordinal, 0));
                     panes_entity.update(cx, |p, cx| {
                         p.push_restored_terminal_tab(tab.label.clone(), view, cx);
+                        p.place_restored_last_tab(None, meta, cx);
                     });
                     ordinal += 1;
                 }
@@ -369,11 +400,15 @@ fn restore_multi_group(
             );
             break;
         };
-        for _ in 0..group_snap.tab_count {
+        for local_idx in 0..group_snap.tab_count {
             let Some(tab) = flat_iter.next() else {
                 tracing::warn!("multi-group restore: tabs exhausted mid-group");
                 break;
             };
+            // Rank is GROUP-LOCAL here — `group_snap.tab_order` carries
+            // local indices, and `local_idx` is this tab's consumption
+            // position within the group (= its local index).
+            let meta = restored_meta(tab, rank_in(&group_snap.tab_order, local_idx));
             match &tab.kind {
                 PersistedTabKind::Editor { path } => {
                     let path_buf = PathBuf::from(path);
@@ -386,6 +421,7 @@ fn restore_multi_group(
                     }
                     panes_entity.update(cx, |p, cx| {
                         p.open_editor_in_group_restore(group_id, path_buf, window, cx);
+                        p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
                 }
                 PersistedTabKind::Browser { url, profile_id } => {
@@ -393,6 +429,7 @@ fn restore_multi_group(
                     let profile_id = *profile_id;
                     panes_entity.update(cx, |p, cx| {
                         p.open_browser_in_group_restore(group_id, url, profile_id, window, cx);
+                        p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
                 }
                 PersistedTabKind::Terminal => {
@@ -403,6 +440,7 @@ fn restore_multi_group(
                             Some(group_id),
                             cli_runtime.clone(),
                             panes_entity.downgrade(),
+                            meta,
                             window,
                             cx,
                         );
@@ -430,6 +468,7 @@ fn restore_multi_group(
                                     tree,
                                     cx,
                                 );
+                                p.place_restored_last_tab(Some(group_id), meta, cx);
                             });
                             ordinal += 1;
                         }
@@ -450,6 +489,7 @@ fn restore_multi_group(
                         let _ = pane_buffers.remove(&(ordinal, 0));
                         panes_entity.update(cx, |p, cx| {
                             p.push_restored_terminal_tab_in(group_id, tab.label.clone(), view, cx);
+                            p.place_restored_last_tab(Some(group_id), meta, cx);
                         });
                         ordinal += 1;
                     }
@@ -484,12 +524,14 @@ fn restore_multi_group(
 /// group at completion) and `Some(group_id)` for v3 multi-group
 /// restores (mount lands in the named group regardless of which group
 /// holds focus when the async work finishes).
+#[allow(clippy::too_many_arguments)]
 fn restore_agent_tab(
     persisted: &PersistedAgentTab,
     label: String,
     target_group: Option<PaneGroupId>,
     cli_runtime: Arc<CliRuntime>,
     panes: WeakEntity<ProjectPanes>,
+    meta: RestoredTabMeta,
     window: &mut Window,
     cx: &mut Context<WorkspaceRoot>,
 ) {
@@ -635,6 +677,7 @@ fn restore_agent_tab(
                 status_rx,
                 backend,
                 term_id,
+                meta,
                 window,
                 cx,
             ),
@@ -646,6 +689,7 @@ fn restore_agent_tab(
                 status_rx,
                 backend,
                 term_id,
+                meta,
                 window,
                 cx,
             ),

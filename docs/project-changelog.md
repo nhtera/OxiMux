@@ -4,6 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-19 — Tab restore: preserve preview/pin/color/title + saved order
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/persisted_terminals.rs`, `crates/app/src/shell/pane_group/mod.rs`, `crates/app/src/shell/project_panes/mod.rs`, `crates/app/src/project_panes_factory.rs`
+
+Fixes two close-and-reopen regressions reported against the tab strip.
+
+**Preview + cosmetic state survives a relaunch**: `is_preview`, `pinned`, color tag, and custom title were runtime-only and dropped at serialize, so every restored tab came back permanent, unpinned, untinted, and renamed-to-default. They are now persisted on `PersistedTab` (serde-default → older snapshots still parse) and re-applied on restore, matching the IDE convention where a reopened window looks exactly as it was left.
+
+**Saved tab order no longer changes on restart**: agent tabs mount asynchronously and were appended at the tail *after* the persisted order had already been applied, so any agent not already at the end of the strip jumped position on relaunch (terminal/editor/browser tabs, restored synchronously, were unaffected). Each restored tab now carries its saved visual rank and the strip is re-sorted by rank as tabs settle, so async-mounted tabs land in their saved slot regardless of mount order.
+
+Covered by headless tests: cosmetics serde round-trip + legacy-blob back-compat, and rank-based placement (a tab placed last still lands in its saved slot, with cosmetics restored). Live GUI close-reopen walkthrough left to a manual pass.
+
+---
+
 ### 2026-06-18 — Editor enhancement: stability, LSP wiring, tab-lifecycle UX, diff zoom
 
 **Commits**: `aa8800f` (merge: stability + LSP + tab lifecycle + zoom + diff open-in-tab), `4213285` (file-load retry), `8bccdfd` (diff font-zoom)

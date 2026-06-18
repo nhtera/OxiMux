@@ -892,3 +892,74 @@ async fn external_mutation_sweep_flags_deleted_and_clears_on_restore(cx: &mut Te
         );
     });
 }
+
+// ── Restore: tabs settle into the saved visual order regardless of mount
+//    order, and saved cosmetics (preview/pin/color/title) come back ───────
+
+#[gpui::test]
+async fn restored_tabs_settle_into_saved_order_and_cosmetics(cx: &mut TestAppContext) {
+    use crate::shell::pane_group::{RestoredTabMeta, TabColor};
+
+    let (window, _dir) = make_group(cx);
+    // Two tabs spawned in order: insertion idx 0 then 1. This mirrors a
+    // restore where a synchronous tab lands first and an async-mounted tab
+    // (an agent) lands LAST — yet the saved strip had the async tab FIRST.
+    for _ in 0..2 {
+        window
+            .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+            .expect("window update ok");
+    }
+    cx.run_until_parked();
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        assert_eq!(visible_labels(group), vec!["Terminal 1", "Terminal 2"]);
+    });
+
+    // Replay restore placement. The tab at insertion idx 1 ("Terminal 2",
+    // standing in for the agent that mounted last) was saved at visual rank
+    // 0; the idx-0 tab was saved at rank 1. Sorting by rank must reorder the
+    // strip so the late arrival lands in its saved slot.
+    window
+        .update(cx, |group, _win, cx| {
+            group.place_restored_tab(
+                0,
+                RestoredTabMeta {
+                    rank: 1,
+                    ..Default::default()
+                },
+                cx,
+            );
+            group.place_restored_tab(
+                1,
+                RestoredTabMeta {
+                    rank: 0,
+                    is_preview: true,
+                    pinned: true,
+                    color: Some(TabColor::Teal),
+                    custom_title: Some("Claude #2".into()),
+                },
+                cx,
+            );
+        })
+        .expect("window update ok");
+
+    cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        // Order: the late-mounted tab settled into saved slot 0.
+        assert_eq!(
+            visible_labels(group),
+            vec!["Terminal 2", "Terminal 1"],
+            "a tab placed last must still land in its saved visual slot",
+        );
+        // Cosmetics restored on the idx-1 tab.
+        let restored = &group.tabs()[1];
+        assert!(restored.is_preview, "preview state survives restore");
+        assert!(restored.pinned, "pin survives restore");
+        assert_eq!(restored.color, Some(TabColor::Teal), "color survives restore");
+        assert_eq!(
+            restored.custom_title.as_deref(),
+            Some("Claude #2"),
+            "custom title survives restore",
+        );
+    });
+}
