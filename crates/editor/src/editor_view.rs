@@ -19,11 +19,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled, Subscription, Task,
-    Window, img, prelude::FluentBuilder as _, px,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme,
@@ -206,6 +207,48 @@ pub(crate) fn decide_change_propagation(
     })
 }
 
+/// Backoff schedule for retrying a transient file-read failure. A file being
+/// written by another process (or a slow/networked FS) can momentarily fail
+/// to read; rather than dropping straight to a placeholder we retry on this
+/// cadence before giving up. Terminal errors (missing file, permission
+/// denied) skip retries entirely.
+const LOAD_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_millis(1000),
+    Duration::from_millis(2500),
+];
+
+/// `true` for read errors that will never succeed on retry — a missing file
+/// or a permission problem won't fix itself by waiting. Everything else
+/// (interrupted, would-block, timed-out, generic I/O) is treated as
+/// transient and retried on the backoff schedule.
+fn is_terminal_read_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{NotFound, PermissionDenied};
+    matches!(err.kind(), NotFound | PermissionDenied)
+}
+
+/// Human-readable reason for a load failure, shown in the failed-state body.
+fn load_error_message(err: &std::io::Error) -> SharedString {
+    use std::io::ErrorKind::{NotFound, PermissionDenied};
+    let reason = match err.kind() {
+        NotFound => "File not found on disk.",
+        PermissionDenied => "Permission denied reading this file.",
+        _ => "Could not read this file.",
+    };
+    SharedString::from(reason)
+}
+
+/// LSP attach parameters stashed when `attach_lsp` is called before the
+/// buffer finished loading (the async-retry path). Applied by `finish_load`
+/// once the content resolves to a real text buffer. Owned (not borrowed) so
+/// it can outlive the synchronous attach call.
+struct PendingLspAttach {
+    program: String,
+    args: Vec<String>,
+    language_id: String,
+    workspace_root: PathBuf,
+}
+
 /// Per-file content variant. The struct keeps mode-specific state here so
 /// the surrounding `EditorView` fields (`file_path`, `focus_handle`) stay
 /// universal across text/image/binary.
@@ -218,6 +261,13 @@ pub enum EditorContent {
     Image { mime: &'static str },
     /// Non-text, non-image binary — shown as a centered placeholder.
     Binary,
+    /// A transient read failure is being retried on the backoff schedule.
+    /// Shows a "Loading…" placeholder instead of a blank/binary view.
+    Loading,
+    /// The file could not be read — a terminal error or exhausted retries.
+    /// Shows the reason plus a Retry affordance so the user isn't stuck on
+    /// a silent blank.
+    LoadFailed { message: SharedString },
 }
 
 /// State carried by the `Text` content variant. Pulled out into its own
@@ -283,6 +333,14 @@ pub struct EditorView {
     _zoom_sub: Subscription,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
+    /// LSP attach request received while the buffer was still loading. The
+    /// host attaches the server right after construction; if the first read
+    /// failed transiently the content isn't text yet, so the request waits
+    /// here and `finish_load` applies it once the retry succeeds.
+    pending_lsp: Option<PendingLspAttach>,
+    /// Holds the in-flight load-retry task. Dropping it cancels any pending
+    /// retry (e.g., when the user triggers a fresh manual retry).
+    _load_task: Option<Task<()>>,
 }
 
 impl EditorView {
@@ -319,13 +377,28 @@ impl EditorView {
                 .expect("display-form URI is always valid ASCII")
         });
 
-        let content = match read_result {
-            Err(err) => {
-                tracing::warn!(?err, file = %path.display(), "editor: failed to read file; showing binary placeholder");
-                EditorContent::Binary
+        // Decide the initial content. A transient read error doesn't fall
+        // straight to a placeholder: it shows "Loading…" and a backoff retry
+        // is scheduled so a file mid-write (or a momentarily-unavailable FS)
+        // recovers on its own. Terminal errors (missing/denied) fail fast.
+        let (content, needs_retry) = match read_result {
+            Ok(bytes) => (decide_content(&path, bytes, window, cx), false),
+            Err(err) if is_terminal_read_error(&err) => {
+                tracing::warn!(?err, file = %path.display(), "editor: read failed (terminal); showing failed state");
+                (
+                    EditorContent::LoadFailed {
+                        message: load_error_message(&err),
+                    },
+                    false,
+                )
             }
-            Ok(bytes) => decide_content(&path, bytes, window, cx),
+            Err(err) => {
+                tracing::warn!(?err, file = %path.display(), "editor: read failed (transient); retrying with backoff");
+                (EditorContent::Loading, true)
+            }
         };
+        let _load_task =
+            needs_retry.then(|| schedule_load_retry_task(path.clone(), window, cx));
 
         // Markdown preview applies only to text-mode `.md`/`.markdown`. Default
         // to Preview (read-first); this resets on every reopen (not persisted).
@@ -351,6 +424,8 @@ impl EditorView {
             _zoom_sub,
             _focus_sub,
             _blur_sub,
+            pending_lsp: None,
+            _load_task,
         }
     }
 
@@ -411,14 +486,31 @@ impl EditorView {
         workspace_root: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_text() {
-            tracing::debug!(
-                file = %self.file_path.display(),
-                "editor: skipping LSP attach for non-text content"
-            );
+        if self.is_text() {
+            spawn_attach_lsp(self, program, args, language_id, workspace_root, cx);
             return;
         }
-        spawn_attach_lsp(self, program, args, language_id, workspace_root, cx);
+        // Not yet a text buffer but could still become one — a retry in flight
+        // (`Loading`) or a failed read the user may retry (`LoadFailed`). Stash
+        // the request so `finish_load` attaches the server once (if) the buffer
+        // materializes. `Image`/`Binary` are settled non-text decisions, so the
+        // request is dropped there.
+        if matches!(
+            self.content,
+            EditorContent::Loading | EditorContent::LoadFailed { .. }
+        ) {
+            self.pending_lsp = Some(PendingLspAttach {
+                program: program.to_string(),
+                args,
+                language_id: language_id.to_string(),
+                workspace_root,
+            });
+            return;
+        }
+        tracing::debug!(
+            file = %self.file_path.display(),
+            "editor: skipping LSP attach for non-text content"
+        );
     }
 
     /// Called by `lsp_bridge` once the LSP handshake completes. Stores the
@@ -562,6 +654,97 @@ impl EditorView {
             cx.notify();
         }
     }
+
+    /// Apply a successfully (re)loaded buffer: swap in the decided content,
+    /// recompute markdown-ness, and attach any LSP server that was stashed
+    /// while the file was loading. Called from the retry task once a read
+    /// succeeds.
+    fn finish_load(&mut self, content: EditorContent, cx: &mut Context<Self>) {
+        self.content = content;
+        self.is_markdown =
+            matches!(self.content, EditorContent::Text(_)) && is_markdown_path(&self.file_path);
+        // Mirror `new()`: markdown opens in Preview; anything else uses Source
+        // (where `md_mode` is inert). Set both arms so the invariant is explicit.
+        self.md_mode = if self.is_markdown {
+            MarkdownViewMode::Preview
+        } else {
+            MarkdownViewMode::Source
+        };
+        // The host requested LSP before the buffer existed — honor it now.
+        if let Some(p) = self.pending_lsp.take()
+            && self.is_text()
+        {
+            spawn_attach_lsp(self, &p.program, p.args, &p.language_id, p.workspace_root, cx);
+        }
+        cx.notify();
+    }
+
+    /// Transition to the failed state (terminal error or exhausted retries).
+    /// A stashed LSP request is deliberately retained: the user may hit Retry,
+    /// and if the file then loads as text we still want to attach the server.
+    fn fail_load(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        self.content = EditorContent::LoadFailed { message };
+        cx.notify();
+    }
+
+    /// Re-arm the load from the failed state (the "Retry" affordance). Resets
+    /// to Loading and schedules a fresh backoff sweep; dropping the prior
+    /// task cancels any straggler.
+    fn retry_load_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.content, EditorContent::LoadFailed { .. }) {
+            return;
+        }
+        self.content = EditorContent::Loading;
+        self._load_task = Some(schedule_load_retry_task(self.file_path.clone(), window, cx));
+        cx.notify();
+    }
+}
+
+/// Spawn the backoff retry loop for a transient read failure. Each tick
+/// re-reads off the buffer-loading path and, on success, rebuilds the
+/// content on the window (constructing an `InputState` needs `&mut Window`).
+/// A terminal error or an exhausted schedule transitions to the failed
+/// state. Window-rooted (`spawn_in`) so the body isn't dropped when the
+/// timer resolves outside a window context.
+fn schedule_load_retry_task(
+    path: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<EditorView>,
+) -> Task<()> {
+    cx.spawn_in(window, async move |weak, cx| {
+        for delay in LOAD_RETRY_DELAYS {
+            cx.background_executor().timer(delay).await;
+            // Read off the main thread — a slow/networked FS must not block
+            // UI repaint while the retry is in flight.
+            let path_for_read = path.clone();
+            let read = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(&path_for_read) })
+                .await;
+            match read {
+                Ok(bytes) => {
+                    let _ = weak.update_in(cx, |this, window, cx| {
+                        let content = decide_content(&path, bytes, window, cx);
+                        this.finish_load(content, cx);
+                    });
+                    return;
+                }
+                Err(err) if is_terminal_read_error(&err) => {
+                    let message = load_error_message(&err);
+                    let _ = weak.update(cx, |this, cx| this.fail_load(message, cx));
+                    return;
+                }
+                // Transient: fall through to the next backoff delay.
+                Err(_) => {}
+            }
+        }
+        let _ = weak.update(cx, |this, cx| {
+            this.fail_load(
+                SharedString::from("Could not read this file after several retries."),
+                cx,
+            )
+        });
+    })
 }
 
 /// Build the appropriate `EditorContent` from the read bytes. Pulled out
@@ -676,6 +859,8 @@ impl Render for EditorView {
         let kind_suffix = match &self.content {
             EditorContent::Image { mime } => SharedString::from(format!("  ·  {mime}")),
             EditorContent::Binary => SharedString::from("  ·  binary"),
+            EditorContent::Loading => SharedString::from("  ·  loading…"),
+            EditorContent::LoadFailed { .. } => SharedString::from("  ·  load failed"),
             EditorContent::Text(_) => SharedString::from(""),
         };
         let breadcrumb = gpui::div()
@@ -772,6 +957,34 @@ impl Render for EditorView {
                 .into_any_element(),
             EditorContent::Image { .. } => render_image_body(&self.file_path),
             EditorContent::Binary => render_binary_placeholder(muted_fg),
+            EditorContent::Loading => render_loading_placeholder(muted_fg),
+            EditorContent::LoadFailed { message } => gpui::div()
+                .flex()
+                .flex_1()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.0))
+                .text_size(px(13.0))
+                .text_color(muted_fg)
+                .child(message.clone())
+                .child(
+                    gpui::div()
+                        .id("editor-retry-load")
+                        .px(px(12.0))
+                        .py(px(5.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded(px(6.0))
+                        .text_color(theme.foreground)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.muted))
+                        .child("Retry")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.retry_load_now(window, cx);
+                        })),
+                )
+                .into_any_element(),
         };
 
         // Wire focus tracking so action dispatch (e.g. Cmd+W → CloseTab on
@@ -856,6 +1069,21 @@ fn render_binary_placeholder(muted_fg: gpui::Hsla) -> gpui::AnyElement {
         .text_size(px(13.0))
         .text_color(muted_fg)
         .child("Binary file — cannot display")
+        .into_any_element()
+}
+
+/// Centered "Loading…" placeholder shown while a transient read failure is
+/// being retried on the backoff schedule. Mirrors the binary placeholder's
+/// muted style so the look stays consistent.
+fn render_loading_placeholder(muted_fg: gpui::Hsla) -> gpui::AnyElement {
+    gpui::div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .text_size(px(13.0))
+        .text_color(muted_fg)
+        .child("Loading…")
         .into_any_element()
 }
 
@@ -964,6 +1192,40 @@ mod tests {
             last = prop.text.clone();
             version = prop.new_version;
         }
+    }
+
+    #[test]
+    fn terminal_read_errors_skip_retry() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_terminal_read_error(&Error::from(ErrorKind::NotFound)));
+        assert!(is_terminal_read_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
+    fn transient_read_errors_are_retried() {
+        use std::io::{Error, ErrorKind};
+        // Anything that could clear up on its own must be retried, not failed.
+        assert!(!is_terminal_read_error(&Error::from(ErrorKind::Interrupted)));
+        assert!(!is_terminal_read_error(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_terminal_read_error(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_terminal_read_error(&Error::from(ErrorKind::Other)));
+    }
+
+    #[test]
+    fn load_error_message_is_specific_for_known_kinds() {
+        use std::io::{Error, ErrorKind};
+        assert!(
+            load_error_message(&Error::from(ErrorKind::NotFound))
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(
+            load_error_message(&Error::from(ErrorKind::PermissionDenied))
+                .to_lowercase()
+                .contains("permission")
+        );
     }
 
     #[test]
