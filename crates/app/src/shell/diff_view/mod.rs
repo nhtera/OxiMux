@@ -53,6 +53,7 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, Sizable as _};
 use oximux_core::{CombinedDiffScope, FileDiff, FileGroup, NoteSide};
+use oximux_editor::{EditorZoom, EditorZoomIn, EditorZoomOut, EditorZoomReset};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::{HashMap, HashSet};
@@ -319,6 +320,10 @@ pub struct DiffView {
     /// diff file-header's "open in editor" affordance open the diffed file as
     /// an editor tab. `None` in headless tests (no live host).
     opener: Option<WeakEntity<crate::shell::pane_group::PaneGroup>>,
+    /// Re-render when the editor-global font zoom changes from anywhere (an
+    /// editor tab, or this diff's own Cmd+/-). The diff body shares the
+    /// editor's zoom level, so a change elsewhere must repaint this view too.
+    _zoom_sub: Subscription,
 }
 
 impl DiffView {
@@ -329,6 +334,10 @@ impl DiffView {
         typography: Typography,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Editor-global font zoom changes from any editor (or this diff's own
+        // Cmd+/-) must repaint the diff body so its code lines track the same
+        // size.
+        let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
         Self {
             repo,
             state: DiffViewState::Empty,
@@ -363,6 +372,7 @@ impl DiffView {
             note_popover: None,
             _note_popover_observer: None,
             opener: None,
+            _zoom_sub,
         }
     }
 
@@ -446,10 +456,11 @@ impl DiffView {
     }
 
     /// First-visible row index, derived from the list's pixel scroll offset
-    /// and the fixed row height. Every row is exactly `density.h_row` tall,
-    /// so this is exact. Returns 0 when nothing is scrolled or measured.
-    fn first_visible_row(&self) -> usize {
-        let h = self.density.h_row;
+    /// and the body row height. Every body row is exactly `effective_h_row`
+    /// tall (the base height scaled by the editor zoom), so this is exact.
+    /// Returns 0 when nothing is scrolled or measured.
+    fn first_visible_row(&self, cx: &App) -> usize {
+        let h = self.effective_h_row(cx);
         if h <= 0.0 {
             return 0;
         }
@@ -457,8 +468,19 @@ impl DiffView {
         ((-offset_y) / h).floor().max(0.0) as usize
     }
 
+    /// Diff-body row height after applying the editor font zoom. The body
+    /// shares the editor's Cmd+/- zoom level; scaling the fixed virtualized
+    /// row height by the same factor keeps larger code from clipping and keeps
+    /// every pixel computation (sticky header, staging card, scroll anchor)
+    /// aligned with what's painted.
+    fn effective_h_row(&self, cx: &App) -> f32 {
+        self.density.h_row * body_zoom_factor(self.typography.t_body_sm, current_zoom(cx))
+    }
+
     /// Scroll the body so `row` sits at the top of the viewport. Used by the
-    /// overview-ruler click-to-jump.
+    /// overview-ruler click-to-jump. Index-based (`scroll_to_item` resolves the
+    /// pixel offset from the row height the list rendered with), so it stays
+    /// correct across a font-zoom change without recomputation.
     pub fn scroll_to_row(&self, row: usize) {
         self.scroll_handle.scroll_to_item(row, ScrollStrategy::Top);
     }
@@ -1317,7 +1339,7 @@ impl DiffView {
     {
         // Remember where the reader is BEFORE the op so the post-op reload
         // restores their position instead of snapping to the top.
-        let anchor = self.first_visible_row();
+        let anchor = self.first_visible_row(cx);
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -1371,6 +1393,27 @@ impl DiffView {
 
     fn on_retry_diff(&mut self, _: &RetryDiff, _window: &mut Window, cx: &mut Context<Self>) {
         self.retry(cx);
+        cx.notify();
+    }
+
+    /// Cmd+/- font zoom while the diff is focused. Drives the same
+    /// editor-global zoom the editor tabs use, so code size stays consistent
+    /// across both surfaces; the global observer repaints. `set_global`
+    /// inserts the global on first use, so no boot-time install is needed.
+    fn on_zoom_in(&mut self, _: &EditorZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        let next = current_zoom(cx).zoomed_in();
+        cx.set_global(next);
+        cx.notify();
+    }
+
+    fn on_zoom_out(&mut self, _: &EditorZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        let next = current_zoom(cx).zoomed_out();
+        cx.set_global(next);
+        cx.notify();
+    }
+
+    fn on_zoom_reset(&mut self, _: &EditorZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.set_global(EditorZoom::reset());
         cx.notify();
     }
 
@@ -1615,6 +1658,46 @@ pub(crate) fn diff_ref_for(state: &DiffViewState) -> Option<String> {
     }
 }
 
+/// The current editor-global font zoom (default when never set this session).
+fn current_zoom(cx: &App) -> EditorZoom {
+    cx.try_global::<EditorZoom>().copied().unwrap_or_default()
+}
+
+/// Row-height factor the diff body scales by to track the editor's font zoom:
+/// the zoomed code-font size over the base `t_body_sm`. `1.0` when unzoomed (or
+/// the base is degenerate). The body row height multiplies by this so the
+/// fixed-height virtualized rows grow with the code and every body pixel
+/// computation (sticky header, staging card, scroll anchor) stays aligned.
+/// Typography sizes are zoomed per-field by [`scaled_typography`] (each tracks
+/// the editor's absolute px delta), so only the row height uses this ratio —
+/// anchored to `t_body_sm` because that's the code-line font the rows host.
+fn body_zoom_factor(base_pt: f32, zoom: EditorZoom) -> f32 {
+    if base_pt <= 0.0 {
+        return 1.0;
+    }
+    f32::from(zoom.effective_px(px(base_pt))) / base_pt
+}
+
+/// Clone `base` with every font size zoomed by the editor's absolute px delta
+/// — the same `effective_px` the editor applies to its mono font — so diff-body
+/// text matches editor text at the same zoom level (rather than a single ratio
+/// that would drift the larger sizes). Returns the base unchanged at the
+/// default zoom. Font families + weights are untouched.
+fn scaled_typography(base: &Typography, zoom: EditorZoom) -> Typography {
+    if zoom == EditorZoom::default() {
+        return base.clone();
+    }
+    let mut t = base.clone();
+    t.t_sub_label = f32::from(zoom.effective_px(px(t.t_sub_label)));
+    t.t_label_xs = f32::from(zoom.effective_px(px(t.t_label_xs)));
+    t.t_label_caps = f32::from(zoom.effective_px(px(t.t_label_caps)));
+    t.t_body_sm = f32::from(zoom.effective_px(px(t.t_body_sm)));
+    t.t_brand = f32::from(zoom.effective_px(px(t.t_brand)));
+    t.t_body_md = f32::from(zoom.effective_px(px(t.t_body_md)));
+    t.t_body_lg = f32::from(zoom.effective_px(px(t.t_body_lg)));
+    t
+}
+
 impl Focusable for DiffView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1759,6 +1842,21 @@ impl Render for DiffView {
             density: self.density,
             typography: &self.typography,
         };
+        // Body-only zoom: the code rows, file headers, sticky overlay, and
+        // staging card share the editor's Cmd+/- font size. Scale a body-scoped
+        // density (row height) + typography (all sizes) by the same factor so
+        // larger code doesn't clip the fixed-height virtualized rows and every
+        // body pixel computation stays aligned. The toolbar + rail keep base
+        // metrics — only the diff body zooms.
+        let zoom = current_zoom(cx);
+        let mut body_density = self.density;
+        body_density.h_row *= body_zoom_factor(self.typography.t_body_sm, zoom);
+        let body_typography = scaled_typography(&self.typography, zoom);
+        let body_rctx = RenderCtx {
+            theme: self.theme,
+            density: body_density,
+            typography: &body_typography,
+        };
         let hovered_region = self.hovered_region;
         let split = self.split;
         let split_h_offset = self.split_h_offset;
@@ -1783,7 +1881,7 @@ impl Render for DiffView {
                     split,
                     split_h_offset,
                     &self.scroll_handle,
-                    &rctx,
+                    &body_rctx,
                     weak,
                 )
                 .into_any_element()
@@ -1816,7 +1914,7 @@ impl Render for DiffView {
                     split,
                     split_h_offset,
                     &self.scroll_handle,
-                    &rctx,
+                    &body_rctx,
                     weak,
                 )
                 .into_any_element()
@@ -1838,7 +1936,7 @@ impl Render for DiffView {
                     split,
                     split_h_offset,
                     &self.scroll_handle,
-                    &rctx,
+                    &body_rctx,
                     weak,
                 )
                 .into_any_element()
@@ -1861,7 +1959,7 @@ impl Render for DiffView {
                     split,
                     split_h_offset,
                     &self.scroll_handle,
-                    &rctx,
+                    &body_rctx,
                     weak,
                 )
                 .into_any_element()
@@ -2066,7 +2164,7 @@ impl Render for DiffView {
         let rail = (multi_file && rail_open).then(|| {
             let active_file_idx = self
                 .row_owner
-                .get(self.first_visible_row())
+                .get(self.first_visible_row(cx))
                 .copied()
                 .unwrap_or(0);
             // Borrow the group tags directly from state — no per-frame clone.
@@ -2157,7 +2255,9 @@ impl Render for DiffView {
         // propagation, so the list still handles vertical scroll from the
         // same event; we only act on the horizontal component.
         if split {
-            let char_w = self.typography.t_body_sm * 0.6;
+            // Zoomed char width so the horizontal-scroll clamp + line-delta
+            // conversion track the body's actual (zoomed) glyph advance.
+            let char_w = body_typography.t_body_sm * 0.6;
             let max_off = (self.prepared_widest_chars as f32 * char_w - 80.0).max(0.0);
             body_wrap = body_wrap.on_scroll_wheel(cx.listener(
                 move |view, ev: &gpui::ScrollWheelEvent, _window, cx| {
@@ -2192,7 +2292,7 @@ impl Render for DiffView {
         // under it. Stacked above the rows but below the ruler. Gains a
         // shadow only when a real header has scrolled past the top.
         if has_body && !self.headers.is_empty() {
-            let fv = self.first_visible_row();
+            let fv = self.first_visible_row(cx);
             let file_idx = self.row_owner.get(fv).copied().unwrap_or(0);
             if let Some(header) = self.headers.iter().find(|h| h.file_idx == file_idx) {
                 // No shadow while a file's own header is flush at the top —
@@ -2206,8 +2306,8 @@ impl Render for DiffView {
                     header,
                     stuck,
                     self.theme,
-                    self.density,
-                    &self.typography,
+                    body_density,
+                    &body_typography,
                     weak_sticky,
                 ));
             }
@@ -2234,7 +2334,7 @@ impl Render for DiffView {
             && let Some(row) = self.hovered_row
             && let Some(side) = self.side_for_region(region.0)
         {
-            let h = self.density.h_row;
+            let h = body_density.h_row;
             let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
             // The hovered row's on-screen Y — the card floats right at the
             // pointer, not at the (possibly far-above) region anchor. Clamp
@@ -2248,8 +2348,8 @@ impl Render for DiffView {
                 row,
                 side,
                 self.theme,
-                self.density,
-                &self.typography,
+                body_density,
+                &body_typography,
                 weak_card,
             ) {
                 body_wrap = body_wrap.child(card);
@@ -2289,6 +2389,9 @@ impl Render for DiffView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_expand_diff))
             .on_action(cx.listener(Self::on_retry_diff))
+            .on_action(cx.listener(Self::on_zoom_in))
+            .on_action(cx.listener(Self::on_zoom_out))
+            .on_action(cx.listener(Self::on_zoom_reset))
             .relative()
             .flex()
             .flex_col()
@@ -2453,6 +2556,42 @@ mod diff_ref_tests {
             expanded: false,
         };
         assert_eq!(diff_ref_for(&untracked).as_deref(), Some("worktree:unstaged"));
+    }
+
+    #[test]
+    fn scaled_typography_is_identity_at_default_zoom() {
+        let base = Typography::default();
+        let same = scaled_typography(&base, EditorZoom::default());
+        assert_eq!(same.t_body_sm, base.t_body_sm);
+        assert_eq!(same.t_label_caps, base.t_label_caps);
+        assert_eq!(same.t_body_lg, base.t_body_lg);
+    }
+
+    #[test]
+    fn scaled_typography_applies_zoom_delta_per_field() {
+        let base = Typography::default();
+        // Two zoom-in steps = +2px absolute delta per field (the same delta the
+        // editor applies to its mono font), assuming each stays within the
+        // [8,32] clamp — true for the cockpit defaults used here.
+        let zoom = EditorZoom::default().zoomed_in().zoomed_in();
+        let bigger = scaled_typography(&base, zoom);
+        assert_eq!(bigger.t_body_sm, base.t_body_sm + 2.0);
+        assert_eq!(bigger.t_label_caps, base.t_label_caps + 2.0);
+        assert_eq!(bigger.t_sub_label, base.t_sub_label + 2.0);
+        assert_eq!(bigger.t_body_lg, base.t_body_lg + 2.0);
+        // Font families + weights are untouched — only sizes zoom.
+        assert_eq!(bigger.family_mono, base.family_mono);
+    }
+
+    #[test]
+    fn body_zoom_factor_tracks_code_font_ratio() {
+        // h_row scales by the zoomed-over-base ratio of the code font.
+        let base = 10.0_f32;
+        assert_eq!(body_zoom_factor(base, EditorZoom::default()), 1.0);
+        let inned = body_zoom_factor(base, EditorZoom::default().zoomed_in().zoomed_in());
+        assert_eq!(inned, 12.0 / 10.0);
+        // Degenerate base never divides by zero.
+        assert_eq!(body_zoom_factor(0.0, EditorZoom::default().zoomed_in()), 1.0);
     }
 
     #[test]

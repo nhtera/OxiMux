@@ -73,17 +73,22 @@ const EDITOR_FONT_MIN_PX: f32 = 8.0;
 const EDITOR_FONT_MAX_PX: f32 = 32.0;
 
 impl EditorZoom {
-    fn zoomed_in(self) -> Self {
+    /// One step larger. Public so other code surfaces that share the zoom
+    /// level (the diff body) can drive the same global from their own
+    /// zoom-in action.
+    pub fn zoomed_in(self) -> Self {
         Self {
             steps: self.steps + 1,
         }
     }
-    fn zoomed_out(self) -> Self {
+    /// One step smaller. Public for the same reason as [`Self::zoomed_in`].
+    pub fn zoomed_out(self) -> Self {
         Self {
             steps: self.steps - 1,
         }
     }
-    fn reset() -> Self {
+    /// Back to the theme default (no delta).
+    pub fn reset() -> Self {
         Self { steps: 0 }
     }
 
