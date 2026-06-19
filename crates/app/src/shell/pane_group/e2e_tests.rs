@@ -963,3 +963,65 @@ async fn restored_tabs_settle_into_saved_order_and_cosmetics(cx: &mut TestAppCon
         );
     });
 }
+
+// ── active terminal tab drains fast; background tabs throttle ──────────────
+//
+// The visibility sweep marks the active tab's view visible (foreground PTY
+// drain → low echo latency) and every other tab's view hidden (throttled).
+// This is the invariant behind responsive typing in the foreground terminal;
+// a regression here resurfaces the laggy post-restore typing symptom where a
+// reconnected tab stays stuck at the slow background drain cadence.
+#[gpui::test]
+async fn active_terminal_tab_drains_fast_background_throttles(cx: &mut TestAppContext) {
+    let (window, _dir) = make_group(cx);
+    for _ in 0..2 {
+        window
+            .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
+            .expect("window update ok");
+    }
+    cx.run_until_parked();
+
+    // Grab the active view of each tab (single-leaf trees → one view per tab).
+    let views: Vec<Entity<TerminalView>> = cx.read(|app| {
+        let group = window.read(app).expect("PaneGroup alive");
+        group
+            .tabs()
+            .iter()
+            .map(|t| match &t.content {
+                PaneContent::Terminal(tree) => {
+                    tree.active_view().expect("active view").clone()
+                }
+                _ => panic!("expected Terminal content"),
+            })
+            .collect()
+    });
+    assert_eq!(views.len(), 2, "two terminal tabs expected");
+
+    // Last-opened tab (idx 1) is active → visible; idx 0 is backgrounded.
+    cx.read(|app| {
+        assert!(
+            !views[0].read(app).is_visible(),
+            "background tab must throttle its PTY poll",
+        );
+        assert!(
+            views[1].read(app).is_visible(),
+            "active tab must drain at the fast cadence",
+        );
+    });
+
+    // Switch active to tab 0 — visibility (and thus drain cadence) flips.
+    window
+        .update(cx, |group, win, cx| group.set_active(0, win, cx))
+        .expect("window update ok");
+    cx.run_until_parked();
+    cx.read(|app| {
+        assert!(
+            views[0].read(app).is_visible(),
+            "newly-active tab must drain fast",
+        );
+        assert!(
+            !views[1].read(app).is_visible(),
+            "now-background tab must throttle",
+        );
+    });
+}

@@ -19,6 +19,31 @@ use crate::client::RelayClient;
 // preserved when an app switches between in-process and relay
 // backends mid-session (e.g., relay went down + supervisor restarted).
 const SCROLLBACK_ROWS: usize = 5000;
+const STATUS_EVENT_CAPACITY: usize = 256;
+
+/// Debug-only output-arrival probe, paired with the app-side input/echo trace.
+/// Off unless `OXIMUX_INPUT_TRACE` is set; appends to the same log file so the
+/// `send_bytes → output_arrived` gap (the remote program's own response time)
+/// can be separated from `output_arrived → echo_render` (our drain/render).
+fn arrival_trace(bytes: usize) {
+    use std::io::Write as _;
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("OXIMUX_INPUT_TRACE").is_some()) {
+        return;
+    }
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/oximux_input_trace.log")
+    {
+        let _ = writeln!(f, "{micros} output_arrived n={bytes}");
+    }
+}
 
 // Per-session event buffer. Each TerminalView consumes only its own
 // queue via `drain_events_for`, so panes can't steal each other's
@@ -26,7 +51,13 @@ const SCROLLBACK_ROWS: usize = 5000;
 // used) made tick-time draining a race: whichever pane ticked first
 // emptied the queue, leaving the actually-active pane with nothing to
 // render.
-type SessionEventQueues = Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>;
+#[derive(Default)]
+struct EventQueues {
+    renderer: HashMap<TerminalSessionId, VecDeque<TerminalEvent>>,
+    status: HashMap<TerminalSessionId, VecDeque<TerminalEvent>>,
+}
+
+type SessionEventQueues = Arc<Mutex<EventQueues>>;
 
 struct Session {
     relay_pty_id: String,
@@ -53,12 +84,17 @@ pub struct RelayBackend {
     sessions: Mutex<HashMap<TerminalSessionId, Session>>,
     next_session_id: AtomicU64,
     event_queues: SessionEventQueues,
+    /// Per-session event-driven drain signals. The pump invokes the matching
+    /// waker right after enqueuing output so the UI drains on arrival instead
+    /// of polling a (throttled) timer. Shared with each pump task by Arc clone.
+    output_wakers: Arc<Mutex<HashMap<TerminalSessionId, oximux_pty::OutputWaker>>>,
     /// Session ids inherited from a predecessor backend that died with
     /// the old daemon (crash-recovery swap). Each id yields exactly one
     /// synthetic `Exit { code: None }` from `drain_events[_for]`, so
     /// pollers of the orphaned sessions (agent status machines) learn
     /// the process is gone instead of draining nothing forever.
     inherited_dead_sessions: Mutex<std::collections::HashSet<TerminalSessionId>>,
+    status_inherited_dead_sessions: Mutex<std::collections::HashSet<TerminalSessionId>>,
 }
 
 impl RelayBackend {
@@ -73,8 +109,10 @@ impl RelayBackend {
             handle,
             sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
-            event_queues: Arc::new(Mutex::new(HashMap::new())),
+            event_queues: Arc::new(Mutex::new(EventQueues::default())),
+            output_wakers: Arc::new(Mutex::new(HashMap::new())),
             inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
+            status_inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -95,7 +133,12 @@ impl RelayBackend {
         self.next_session_id
             .fetch_max(max_inherited + 1, Ordering::Relaxed);
         lock_recover(&self.inherited_dead_sessions, "inherited sessions")
-            .extend(ids);
+            .extend(ids.iter().copied());
+        lock_recover(
+            &self.status_inherited_dead_sessions,
+            "status inherited sessions",
+        )
+        .extend(ids);
     }
 
     // Borrow the underlying client. Used by phase-06 reconciliation
@@ -206,11 +249,19 @@ impl RelayBackend {
         mut notif_rx: UnboundedReceiver<Notification>,
     ) -> JoinHandle<()> {
         let queues = Arc::clone(&self.event_queues);
+        let wakers = Arc::clone(&self.output_wakers);
         self.handle.spawn(async move {
             while let Some(n) = notif_rx.recv().await {
-                if apply_relay_notification(&state, &queues, id, &generation, my_generation, n)
-                    .is_break()
-                {
+                let flow =
+                    apply_relay_notification(&state, &queues, id, &generation, my_generation, n);
+                // Event-driven drain: nudge the UI the instant output is queued
+                // so it renders on arrival instead of waiting for the next
+                // (macOS-throttled) poll tick. Fired for every notification —
+                // an empty drain is cheap; a missed wake is felt lag.
+                if let Some(waker) = lock_recover(&wakers, "output wakers").get(&id) {
+                    waker();
+                }
+                if flow.is_break() {
                     return;
                 }
             }
@@ -286,6 +337,7 @@ fn apply_relay_notification(
                 }
                 push_event(queues, id, ev);
             }
+            arrival_trace(bytes.len());
             push_event(queues, id, TerminalEvent::Output { id, bytes });
             ControlFlow::Continue(())
         }
@@ -306,6 +358,10 @@ fn apply_relay_notification(
 impl TerminalBackend for RelayBackend {
     fn attach_existing(&mut self, external_id: &str) -> Result<TerminalSessionId> {
         self.attach_relay_pty(external_id)
+    }
+
+    fn set_output_waker(&mut self, id: TerminalSessionId, waker: oximux_pty::OutputWaker) {
+        lock_recover(&self.output_wakers, "output wakers").insert(id, waker);
     }
 
     fn external_id_of(&self, id: TerminalSessionId) -> Option<String> {
@@ -354,6 +410,12 @@ impl TerminalBackend for RelayBackend {
             cfg.scrollback,
         )));
         let id = self.mint_id();
+        if cfg.capture_status_events {
+            lock_recover(&self.event_queues, "event queues")
+                .status
+                .entry(id)
+                .or_default();
+        }
         let generation = Arc::new(AtomicU64::new(1));
         let notif_rx = self.client.subscribe_pty(&relay_pty_id);
         let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
@@ -553,9 +615,9 @@ impl TerminalBackend for RelayBackend {
         // Drains every session's queue. Used by tests + cleanup paths;
         // the per-frame render path uses `drain_events_for` instead so
         // each pane only sees its own events.
-        let mut map = lock_recover(&self.event_queues, "event queues");
+        let mut queues = lock_recover(&self.event_queues, "event queues");
         let mut out = Vec::new();
-        for q in map.values_mut() {
+        for q in queues.renderer.values_mut() {
             out.extend(q.drain(..));
         }
         // Crash-recovery: flush every inherited dead session as one
@@ -576,11 +638,53 @@ impl TerminalBackend for RelayBackend {
         if lock_recover(&self.inherited_dead_sessions, "inherited sessions").remove(&id) {
             return vec![TerminalEvent::Exit { id, code: None }];
         }
-        let mut map = lock_recover(&self.event_queues, "event queues");
-        match map.get_mut(&id) {
+        let mut queues = lock_recover(&self.event_queues, "event queues");
+        match queues.renderer.get_mut(&id) {
             Some(q) => q.drain(..).collect(),
             None => Vec::new(),
         }
+    }
+
+    fn subscribe_status_events(&mut self, id: TerminalSessionId) -> Result<()> {
+        let known = lock_recover(&self.sessions, "sessions").contains_key(&id)
+            || lock_recover(
+                &self.status_inherited_dead_sessions,
+                "status inherited sessions",
+            )
+            .contains(&id);
+        if !known {
+            return Err(anyhow!("unknown session {id:?}"));
+        }
+        let mut queues = lock_recover(&self.event_queues, "event queues");
+        register_status_queue(&mut queues, id);
+        Ok(())
+    }
+
+    fn drain_status_events_for(&mut self, id: TerminalSessionId) -> Vec<TerminalEvent> {
+        if lock_recover(
+            &self.status_inherited_dead_sessions,
+            "status inherited sessions",
+        )
+        .remove(&id)
+        {
+            return vec![TerminalEvent::Exit { id, code: None }];
+        }
+        lock_recover(&self.event_queues, "event queues")
+            .status
+            .get_mut(&id)
+            .map(|queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn unsubscribe_status_events(&mut self, id: TerminalSessionId) {
+        lock_recover(&self.event_queues, "event queues")
+            .status
+            .remove(&id);
+        lock_recover(
+            &self.status_inherited_dead_sessions,
+            "status inherited sessions",
+        )
+        .remove(&id);
     }
 
     fn live_session_ids(&self) -> Vec<TerminalSessionId> {
@@ -595,12 +699,19 @@ impl TerminalBackend for RelayBackend {
             Some(s) => s,
             None => return Ok(()),
         };
+        push_status_event_only(
+            &self.event_queues,
+            id,
+            TerminalEvent::Exit { id, code: None },
+        );
         // Supersede the pump (generation guard): once bumped, the pump
         // stops advancing the now-orphaned `TerminalState` instead of
         // draining any still-buffered Output during teardown.
         session.generation.fetch_add(1, Ordering::Release);
-        lock_recover(&self.event_queues, "event queues")
-            .remove(&id);
+        let mut queues = lock_recover(&self.event_queues, "event queues");
+        queues.renderer.remove(&id);
+        drop(queues);
+        lock_recover(&self.output_wakers, "output wakers").remove(&id);
         self.client.unsubscribe_pty(&session.relay_pty_id);
         // Defer the synchronous relay Close round-trip to a detached
         // tokio task so the outer `Arc<Mutex<Box<dyn TerminalBackend>>>`
@@ -653,12 +764,19 @@ impl TerminalBackend for RelayBackend {
             Some(s) => s,
             None => return Ok(()),
         };
+        push_status_event_only(
+            &self.event_queues,
+            id,
+            TerminalEvent::Exit { id, code: None },
+        );
         // Supersede the pump (generation guard) so it stops advancing the
         // now-detached `TerminalState` — the destination window mounts a fresh
         // session + pump against the same PTY.
         session.generation.fetch_add(1, Ordering::Release);
-        lock_recover(&self.event_queues, "event queues")
-            .remove(&id);
+        let mut queues = lock_recover(&self.event_queues, "event queues");
+        queues.renderer.remove(&id);
+        drop(queues);
+        lock_recover(&self.output_wakers, "output wakers").remove(&id);
         self.client.unsubscribe_pty(&session.relay_pty_id);
         // Release this attachment in the daemon. Detach (not Close) keeps the
         // PTY alive; it also drops this attachment from the daemon's
@@ -694,11 +812,64 @@ impl TerminalBackend for RelayBackend {
     }
 }
 
+fn register_status_queue(queues: &mut EventQueues, id: TerminalSessionId) {
+    if queues.status.contains_key(&id) {
+        return;
+    }
+    let pending = queues
+        .renderer
+        .get(&id)
+        .into_iter()
+        .flat_map(|queue| queue.iter())
+        .filter(|event| {
+            matches!(
+                event,
+                TerminalEvent::Output { .. } | TerminalEvent::Exit { .. }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut status = VecDeque::new();
+    for event in pending {
+        push_bounded_status(&mut status, event);
+    }
+    queues.status.insert(id, status);
+}
+
 fn push_event(queues: &SessionEventQueues, id: TerminalSessionId, event: TerminalEvent) {
-    lock_recover(queues, "event queues")
-        .entry(id)
-        .or_default()
-        .push_back(event);
+    let mut queues = lock_recover(queues, "event queues");
+    if matches!(
+        event,
+        TerminalEvent::Output { .. } | TerminalEvent::Exit { .. }
+    ) && let Some(status) = queues.status.get_mut(&id)
+    {
+        push_bounded_status(status, event.clone());
+    }
+    queues.renderer.entry(id).or_default().push_back(event);
+}
+
+fn push_status_event_only(
+    queues: &SessionEventQueues,
+    id: TerminalSessionId,
+    event: TerminalEvent,
+) {
+    if let Some(status) = lock_recover(queues, "event queues").status.get_mut(&id) {
+        push_bounded_status(status, event);
+    }
+}
+
+fn push_bounded_status(queue: &mut VecDeque<TerminalEvent>, event: TerminalEvent) {
+    if queue.len() >= STATUS_EVENT_CAPACITY {
+        if let Some(index) = queue
+            .iter()
+            .position(|queued| matches!(queued, TerminalEvent::Output { .. }))
+        {
+            queue.remove(index);
+        } else if matches!(event, TerminalEvent::Output { .. }) {
+            return;
+        }
+    }
+    queue.push_back(event);
 }
 
 /// Lock a mutex, recovering from poison instead of propagating the
@@ -759,6 +930,7 @@ mod tests {
         queues
             .lock()
             .unwrap()
+            .renderer
             .get(&id)
             .map(|q| q.len())
             .unwrap_or(0)
@@ -771,7 +943,7 @@ mod tests {
     fn pump_panic_is_contained_as_synthetic_exit() {
         let id = TerminalSessionId(42);
         let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
-        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
         let generation = AtomicU64::new(1);
 
         PANIC_ON_ADVANCE.with(|f| f.set(true));
@@ -790,7 +962,7 @@ mod tests {
 
         assert!(flow.is_break(), "panicked session's pump must stop");
         let guard = queues.lock().unwrap();
-        let q = guard.get(&id).expect("synthetic exit queued");
+        let q = guard.renderer.get(&id).expect("synthetic exit queued");
         assert_eq!(q.len(), 1, "exactly one synthetic event");
         assert!(
             matches!(q[0], TerminalEvent::Exit { code: None, .. }),
@@ -825,7 +997,7 @@ mod tests {
     fn generation_guard_stops_superseded_pump() {
         let id = TerminalSessionId(1);
         let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
-        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
         let generation = AtomicU64::new(1);
 
         // Matching generation → applies and emits an Output event.
@@ -872,7 +1044,7 @@ mod tests {
     fn bell_byte_in_output_emits_bell_then_output() {
         let id = TerminalSessionId(7);
         let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
-        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
         let generation = AtomicU64::new(1);
 
         let flow = apply_relay_notification(
@@ -889,7 +1061,7 @@ mod tests {
         assert!(flow.is_continue(), "live pump keeps going after a bell");
 
         let guard = queues.lock().unwrap();
-        let q = guard.get(&id).expect("events queued");
+        let q = guard.renderer.get(&id).expect("events queued");
         assert_eq!(q.len(), 2, "a BEL chunk emits Bell + Output");
         assert!(matches!(q[0], TerminalEvent::Bell { .. }), "Bell first");
         assert!(
@@ -904,7 +1076,7 @@ mod tests {
     fn exit_notification_emits_exit_and_breaks() {
         let id = TerminalSessionId(8);
         let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
-        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
         let generation = AtomicU64::new(1);
 
         let flow = apply_relay_notification(
@@ -920,7 +1092,7 @@ mod tests {
         );
         assert!(flow.is_break(), "Exit stops the pump");
         let guard = queues.lock().unwrap();
-        let q = guard.get(&id).expect("events queued");
+        let q = guard.renderer.get(&id).expect("events queued");
         assert_eq!(q.len(), 1);
         assert!(
             matches!(q[0], TerminalEvent::Exit { .. }),
@@ -934,7 +1106,7 @@ mod tests {
     fn attention_notification_emits_bell_and_continues() {
         let id = TerminalSessionId(9);
         let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
-        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
         let generation = AtomicU64::new(1);
 
         let flow = apply_relay_notification(
@@ -951,7 +1123,7 @@ mod tests {
         );
         assert!(flow.is_continue(), "Attention keeps the pump running");
         let guard = queues.lock().unwrap();
-        let q = guard.get(&id).expect("events queued");
+        let q = guard.renderer.get(&id).expect("events queued");
         assert_eq!(q.len(), 1);
         assert!(
             matches!(q[0], TerminalEvent::Bell { .. }),
@@ -970,7 +1142,7 @@ mod tests {
     fn superseded_pump_leaves_state_unadvanced() {
         let id = TerminalSessionId(10);
         let state = Arc::new(Mutex::new(TerminalState::new(80, 24, 100)));
-        let queues: SessionEventQueues = Arc::new(Mutex::new(HashMap::new()));
+        let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
         let generation = AtomicU64::new(2); // a newer attach already moved on
 
         let flow = apply_relay_notification(
@@ -990,5 +1162,67 @@ mod tests {
             !state.lock().unwrap().take_bell(),
             "stale pump must not advance the grid (BEL never reached state)"
         );
+    }
+
+    #[test]
+    fn late_status_registration_backfills_without_consuming_renderer_events() {
+        let id = TerminalSessionId(20);
+        let queues: SessionEventQueues = Arc::new(Mutex::new(EventQueues::default()));
+        push_event(
+            &queues,
+            id,
+            TerminalEvent::Output {
+                id,
+                bytes: b"STATUS_MARKER".to_vec(),
+            },
+        );
+        push_event(&queues, id, TerminalEvent::Bell { id });
+        push_event(&queues, id, TerminalEvent::Exit { id, code: Some(7) });
+
+        let mut guard = queues.lock().unwrap();
+        register_status_queue(&mut guard, id);
+        let status = guard
+            .status
+            .get_mut(&id)
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        let renderer = guard
+            .renderer
+            .get_mut(&id)
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+
+        assert_eq!(status.len(), 2, "status receives only Output and Exit");
+        assert!(matches!(status[0], TerminalEvent::Output { .. }));
+        assert!(matches!(
+            status[1],
+            TerminalEvent::Exit { code: Some(7), .. }
+        ));
+        assert_eq!(renderer.len(), 3, "backfill leaves renderer queue intact");
+        assert!(matches!(renderer[1], TerminalEvent::Bell { .. }));
+    }
+
+    #[test]
+    fn bounded_status_queue_preserves_exit_under_output_pressure() {
+        let id = TerminalSessionId(21);
+        let mut queue = VecDeque::new();
+        for byte in 0..=STATUS_EVENT_CAPACITY {
+            push_bounded_status(
+                &mut queue,
+                TerminalEvent::Output {
+                    id,
+                    bytes: vec![byte as u8],
+                },
+            );
+        }
+        push_bounded_status(&mut queue, TerminalEvent::Exit { id, code: Some(7) });
+
+        assert_eq!(queue.len(), STATUS_EVENT_CAPACITY);
+        assert!(matches!(
+            queue.back(),
+            Some(TerminalEvent::Exit { code: Some(7), .. })
+        ));
     }
 }

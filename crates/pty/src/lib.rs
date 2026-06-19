@@ -18,7 +18,9 @@ pub mod portable_pty_backend;
 pub mod snapshot;
 pub mod state;
 
-pub use backend::{InputMode, MouseMode, SpawnConfig, TerminalBackend, TerminalSessionId};
+pub use backend::{
+    InputMode, MouseMode, OutputWaker, SpawnConfig, TerminalBackend, TerminalSessionId,
+};
 pub use events::{CommandMarkKind, TerminalEvent};
 pub use grid_serializer::{
     CAPTURE_HEADER_LEN, CAPTURE_HEADER_MAGIC, SerializeOptions, build_capture_header,

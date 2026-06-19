@@ -115,6 +115,88 @@ fn spawn_write_observe_output_then_exit() {
     fx.backend.close(id).expect("close idempotent");
 }
 
+#[test]
+fn status_consumer_cannot_steal_relay_renderer_events() {
+    const MARKER: &[u8] = b"STATUS_MARKER";
+    let mut fx = boot_fixture();
+    let original_id = fx
+        .backend
+        .spawn(SpawnConfig {
+            shell: "/bin/sh".into(),
+            cwd: PathBuf::from("/tmp"),
+            ..SpawnConfig::default()
+        })
+        .expect("spawn");
+    let external_id = fx
+        .backend
+        .external_id_of(original_id)
+        .expect("relay PTY id");
+    fx.backend
+        .detach(original_id)
+        .expect("detach before restore");
+    let id = fx
+        .backend
+        .attach_existing(&external_id)
+        .expect("restore existing PTY");
+    fx.backend
+        .write(id, b"printf 'STATUS_MARKER\\n'; exit 7\n")
+        .expect("write restored command");
+
+    let output_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < output_deadline {
+        let snapshot = fx.backend.snapshot(id).expect("restored snapshot");
+        let text = snapshot
+            .cells
+            .iter()
+            .flat_map(|row| row.iter().map(|cell| cell.ch))
+            .collect::<String>();
+        if text.contains("STATUS_MARKER") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fx.backend
+        .subscribe_status_events(id)
+        .expect("late restored status registration");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut status = Vec::new();
+    let mut status_exit = None;
+    while std::time::Instant::now() < deadline && status_exit.is_none() {
+        for event in fx.backend.drain_status_events_for(id) {
+            match event {
+                TerminalEvent::Output { bytes, .. } => status.extend(bytes),
+                TerminalEvent::Exit { code, .. } => status_exit = Some(code),
+                _ => panic!("status stream must contain only Output/Exit"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let renderer = fx.backend.drain_events_for(id);
+    let mut renderer_bytes = Vec::new();
+    let mut renderer_exit = None;
+    for event in renderer {
+        match event {
+            TerminalEvent::Output { bytes, .. } => renderer_bytes.extend(bytes),
+            TerminalEvent::Exit { code, .. } => renderer_exit = Some(code),
+            _ => {}
+        }
+    }
+
+    assert!(status.windows(MARKER.len()).any(|bytes| bytes == MARKER));
+    assert_eq!(status_exit, Some(Some(7)));
+    assert!(
+        renderer_bytes
+            .windows(MARKER.len())
+            .any(|bytes| bytes == MARKER),
+        "status consumer stole relay renderer output"
+    );
+    assert_eq!(renderer_exit, Some(Some(7)));
+    fx.backend.unsubscribe_status_events(id);
+    fx.backend.close(id).expect("close idempotent");
+}
+
 // Context-env round-trip through the FULL client path: `SpawnConfig.env`
 // → wire → daemon → child environment. The sibling daemon-protocol test
 // proves the daemon honors the env; this proves the env survives
@@ -296,11 +378,16 @@ fn resize_applies_to_local_grid_synchronously() {
     );
 
     // A Resize event is emitted synchronously for the view to observe.
-    let saw_resize = fx
-        .backend
-        .drain_events()
-        .iter()
-        .any(|e| matches!(e, TerminalEvent::Resize { cols: 120, rows: 40, .. }));
+    let saw_resize = fx.backend.drain_events().iter().any(|e| {
+        matches!(
+            e,
+            TerminalEvent::Resize {
+                cols: 120,
+                rows: 40,
+                ..
+            }
+        )
+    });
     assert!(saw_resize, "no synchronous Resize event");
 
     fx.backend.write(id, b"exit\n").ok();

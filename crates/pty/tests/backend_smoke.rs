@@ -27,6 +27,7 @@ fn spawn_echo_drains_marker_and_exit() {
         cols: 80,
         rows: 24,
         scrollback: 5000,
+        capture_status_events: false,
     };
 
     let id = backend.spawn(cfg).expect("spawn shell");
@@ -70,6 +71,113 @@ fn spawn_echo_drains_marker_and_exit() {
         saw_exit,
         "did not see Exit event within {TEST_TIMEOUT:?}; got: {preview:?}"
     );
+}
+
+#[test]
+fn status_drain_does_not_consume_renderer_output_or_exit() {
+    const STATUS_MARKER: &[u8] = b"STATUS_MARKER";
+    let mut backend = PortablePtyBackend::new();
+    let id = backend
+        .spawn(SpawnConfig {
+            shell: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'STATUS_MARKER\\n'; exit 7".into()],
+            capture_status_events: true,
+            ..SpawnConfig::default()
+        })
+        .expect("spawn status test shell");
+    backend
+        .subscribe_status_events(id)
+        .expect("status registration is idempotent");
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut status_bytes = Vec::new();
+    let mut status_exit = None;
+    while Instant::now() < deadline && status_exit.is_none() {
+        for event in backend.drain_status_events_for(id) {
+            match event {
+                TerminalEvent::Output { bytes, .. } => status_bytes.extend(bytes),
+                TerminalEvent::Exit { code, .. } => status_exit = Some(code),
+                _ => panic!("status stream must contain only Output/Exit"),
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let mut renderer_bytes = Vec::new();
+    let mut renderer_exit = None;
+    while Instant::now() < deadline && renderer_exit.is_none() {
+        for event in backend.drain_events_for(id) {
+            match event {
+                TerminalEvent::Output { bytes, .. } => renderer_bytes.extend(bytes),
+                TerminalEvent::Exit { code, .. } => renderer_exit = Some(code),
+                _ => {}
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    assert!(
+        status_bytes
+            .windows(STATUS_MARKER.len())
+            .any(|bytes| bytes == STATUS_MARKER)
+    );
+    assert_eq!(status_exit, Some(Some(7)));
+    assert!(
+        renderer_bytes
+            .windows(STATUS_MARKER.len())
+            .any(|bytes| bytes == STATUS_MARKER),
+        "status consumer stole renderer output"
+    );
+    assert_eq!(renderer_exit, Some(Some(7)));
+    backend.unsubscribe_status_events(id);
+    backend.close(id).expect("close status test shell");
+}
+
+#[test]
+fn status_exit_survives_renderer_backpressure() {
+    let mut backend = PortablePtyBackend::new();
+    let id = backend
+        .spawn(SpawnConfig {
+            shell: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "yes X | head -c 2097152; printf 'STATUS_TAIL\\n'; exit 7".into(),
+            ],
+            capture_status_events: true,
+            ..SpawnConfig::default()
+        })
+        .expect("spawn high-output shell");
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut status_exit = None;
+    let mut status_bytes = Vec::new();
+    while Instant::now() < deadline && status_exit.is_none() {
+        for event in backend.drain_status_events_for(id) {
+            match event {
+                TerminalEvent::Output { bytes, .. } => status_bytes.extend(bytes),
+                TerminalEvent::Exit { code, .. } => {
+                    assert!(
+                        status_bytes
+                            .windows(b"STATUS_TAIL".len())
+                            .any(|bytes| bytes == b"STATUS_TAIL"),
+                        "status Exit overtook final PTY output"
+                    );
+                    status_exit = Some(code);
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    assert_eq!(
+        status_exit,
+        Some(Some(7)),
+        "a full renderer channel must not stall status completion"
+    );
+    let _ = backend.drain_events_for(id);
+    backend.unsubscribe_status_events(id);
+    backend.close(id).expect("close high-output shell");
 }
 
 /// F3.4 slice 2: spawn a dormant session, prefill scrollback bytes,
@@ -131,6 +239,7 @@ fn spawn_dormant_prefill_then_promote_to_live() {
                 cols: 80,
                 rows: 24,
                 scrollback: 5000,
+                capture_status_events: false,
             },
         )
         .expect("promote_to_live on dormant session");
@@ -181,6 +290,7 @@ fn promote_to_live_rejects_already_live_session() {
         cols: 80,
         rows: 24,
         scrollback: 5000,
+        capture_status_events: false,
     };
     let id = backend.spawn(cfg.clone()).expect("spawn live shell");
     let err = backend
@@ -235,6 +345,7 @@ fn write_output_rejects_live_session() {
         cols: 80,
         rows: 24,
         scrollback: 5000,
+        capture_status_events: false,
     };
     let id = backend.spawn(cfg).expect("spawn live shell");
     let err = backend
@@ -271,6 +382,7 @@ fn osc7_emission_populates_cwd_hint() {
         cols: 80,
         rows: 24,
         scrollback: 5000,
+        capture_status_events: false,
     };
     let id = backend.spawn(cfg).expect("spawn shell");
 
@@ -327,6 +439,7 @@ fn cwd_hint_is_none_before_first_osc7() {
         cols: 80,
         rows: 24,
         scrollback: 5000,
+        capture_status_events: false,
     };
     let id2 = backend.spawn(cfg).expect("spawn");
     // Drain output to ensure the watcher ran.

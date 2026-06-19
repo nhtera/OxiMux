@@ -61,6 +61,12 @@ const POLL_INTERVAL_MS: u64 = 16;
 /// far less often so N background agents don't each schedule a 60fps repaint.
 const BACKGROUND_POLL_INTERVAL_MS: u64 = 100;
 
+/// Frames a keystroke keeps the render loop self-scheduling so a straggler echo
+/// renders within one frame even if the run loop would otherwise doze between
+/// sparse keystrokes. ~10 frames ≈ 160ms at 60fps — covers a slow program's
+/// echo without pinning the CPU once typing pauses.
+const POST_INPUT_DRAIN_FRAMES: u8 = 10;
+
 /// PTY-drain cadence for a view given its on-screen state. Visible tabs drain
 /// at ~60fps; hidden tabs drain far less often (output buffers, not dropped).
 const fn poll_interval_ms(visible: bool) -> u64 {
@@ -70,6 +76,39 @@ const fn poll_interval_ms(visible: bool) -> u64 {
         BACKGROUND_POLL_INTERVAL_MS
     }
 }
+
+/// Debug-only keystroke→echo latency probe. Off unless `OXIMUX_INPUT_TRACE` is
+/// set in the environment; when on, appends `<unix_micros> <msg>` lines to
+/// `/tmp/oximux_input_trace.log` at the input-arrival and echo-render points,
+/// so a reproduction can be timed without sample-window coordination — the gaps
+/// between `key_down`/`ime_commit`/`send_bytes` and `echo_render` are the felt
+/// latency. Compiled out of release builds.
+#[cfg(debug_assertions)]
+fn input_trace(msg: &str) {
+    use std::io::Write as _;
+    use std::sync::OnceLock;
+    // Opt-in via `OXIMUX_INPUT_TRACE=1` so normal debug runs pay nothing. When
+    // set, appends the input→echo→frame timeline to `/tmp/oximux_input_trace.log`
+    // for latency profiling. Compiled out of release entirely.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("OXIMUX_INPUT_TRACE").is_some()) {
+        return;
+    }
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/oximux_input_trace.log")
+    {
+        let _ = writeln!(f, "{micros} {msg}");
+    }
+}
+#[cfg(not(debug_assertions))]
+#[inline]
+fn input_trace(_msg: &str) {}
 
 /// Default grid size on spawn. Parent-driven resize takes over on the first
 /// render.
@@ -468,6 +507,18 @@ pub struct TerminalView {
     /// (post-dormancy).
     _poll_task: Option<Task<()>>,
     _blink_task: Task<()>,
+    /// Event-driven drain task: wakes on a backend output signal (relay pump)
+    /// and drains on arrival, so echo paints ~one frame after the bytes exist
+    /// instead of waiting for the macOS-throttled poll timer. `None` for backends
+    /// that don't signal (in-process / dormant) — those fall back to the poll.
+    _output_drain_task: Option<Task<()>>,
+    /// Frames to keep self-scheduling after a keystroke. The run loop can doze
+    /// between sparse keystrokes; a straggler echo that lands just after a frame
+    /// then waits for the next wake. Each keystroke sets this, and `render`
+    /// re-requests a frame while it's positive, so the drain runs every frame
+    /// for a short window — guaranteeing the echo paints within ~one frame of
+    /// arriving. Decrements to zero (idle) so it costs nothing when not typing.
+    drain_frames: u8,
     /// Desired grid size derived from the canvas's real painted bounds.
     /// The canvas paint closure writes this `(cols, rows)` each frame and
     /// calls `window.refresh()` when it changes; `render`'s top reads it
@@ -672,6 +723,7 @@ impl TerminalView {
 
         let poll_task = Self::start_poll_task(cx);
         let blink_task = Self::start_blink_task(cx);
+        let output_drain_task = Self::start_output_drain_task(&backend, session_id, cx);
 
         Self {
             backend,
@@ -698,6 +750,8 @@ impl TerminalView {
             dormant_cwd: None,
             _poll_task: Some(poll_task),
             _blink_task: blink_task,
+            _output_drain_task: output_drain_task,
+            drain_frames: 0,
             canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
@@ -747,6 +801,9 @@ impl TerminalView {
         // task once the real session arrives. Dropping the just-armed task
         // cancels it before its first 16 ms tick fires.
         view._poll_task = None;
+        // No live session yet — the event-driven drain is armed on the live
+        // swap in `adopt_live_session`.
+        view._output_drain_task = None;
         view
     }
 
@@ -798,6 +855,9 @@ impl TerminalView {
         // the painted bounds.
         self.last_resize = (0, 0);
         self._poll_task = Some(Self::start_poll_task(cx));
+        // Arm the event-driven drain on the now-live (relay) session so echo
+        // renders on arrival — the responsive path for a reattached terminal.
+        self._output_drain_task = Self::start_output_drain_task(&self.backend, session_id, cx);
         cx.notify();
         true
     }
@@ -887,6 +947,10 @@ impl TerminalView {
             dormant_cwd: Some(cwd),
             _poll_task: None,
             _blink_task: blink_task,
+            // Local dormant placeholder doesn't signal output; the poll drains
+            // it once woken. Event-driven drain is armed on the live swap.
+            _output_drain_task: None,
+            drain_frames: 0,
             canvas_grid: Rc::new(Cell::new((DEFAULT_COLS, DEFAULT_ROWS))),
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             selection: None,
@@ -967,6 +1031,43 @@ impl TerminalView {
                 }
             }
         })
+    }
+
+    /// Event-driven drain: register a waker the backend fires the instant it
+    /// enqueues output, and `tick` on that signal. This is the responsive path
+    /// — it renders the echo ~one frame after the bytes arrive, where the timer
+    /// poll stalls 100ms–1s because macOS throttles background-executor timers
+    /// when the run loop idles between keystrokes. Returns `None` for backends
+    /// that don't signal (the in-process fallback / dormant placeholder): there
+    /// the registered waker is dropped immediately, the channel closes, and the
+    /// task exits — the poll keeps draining those.
+    fn start_output_drain_task(
+        backend: &SharedBackend,
+        session_id: TerminalSessionId,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<()>> {
+        use futures::StreamExt as _;
+        // Capacity 1 + the single retained sender coalesces a burst of arrivals
+        // into one wake; one drain consumes the whole queued batch.
+        let (tx, mut rx) = futures::channel::mpsc::channel::<()>(1);
+        let tx = std::sync::Mutex::new(tx);
+        let waker: oximux_pty::OutputWaker = std::sync::Arc::new(move || {
+            if let Ok(mut tx) = tx.lock() {
+                // Full (a wake is already pending) or closed (view gone) → drop.
+                let _ = tx.try_send(());
+            }
+        });
+        backend
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_output_waker(session_id, waker);
+        Some(cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                if this.update(cx, |view, cx| view.tick(cx)).is_err() {
+                    return;
+                }
+            }
+        }))
     }
 
     /// Cursor blink. Independent of the PTY poll so a chatty TUI doesn't bury
@@ -1689,6 +1790,7 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        input_trace(&format!("key_down key={}", event.keystroke.key));
         match self.search.handle_key(event) {
             SearchKeyOutcome::Pass => {}
             SearchKeyOutcome::Consumed => return,
@@ -1846,10 +1948,17 @@ impl TerminalView {
             tracing::warn!(?err, "pty write failed");
             return;
         }
+        input_trace(&format!("send_bytes n={} visible={}", bytes.len(), self.visible));
         // Force cursor visible on input — otherwise a blink-off tick at the
         // moment of keypress hides the cursor when the user most wants to
         // see it.
         self.cursor_visible = true;
+        // Keep the render loop self-scheduling for a short window so a straggler
+        // echo paints within one frame even if the run loop would otherwise doze
+        // before the event-driven wake lands — this removes the latency tail.
+        if self.visible {
+            self.drain_frames = POST_INPUT_DRAIN_FRAMES;
+        }
         cx.notify();
     }
 
@@ -1860,13 +1969,24 @@ impl TerminalView {
             self.clear_ime_marked(cx);
             return;
         }
+        input_trace(&format!("ime_mark len={}", text.len()));
         self.ime_marked = Some(text);
+        // IME composition (Vietnamese Telex / CJK) updates the preedit overlay
+        // per keystroke. Like send_bytes, keep the render loop self-scheduling so
+        // each composition step paints within one frame instead of stalling on a
+        // dozing run loop — otherwise the composing text lags behind the keys.
+        if self.visible {
+            self.drain_frames = POST_INPUT_DRAIN_FRAMES;
+        }
         cx.notify();
     }
 
     /// Drop any in-progress composition (commit, cancel, or focus loss).
     fn clear_ime_marked(&mut self, cx: &mut Context<Self>) {
         if self.ime_marked.take().is_some() {
+            if self.visible {
+                self.drain_frames = POST_INPUT_DRAIN_FRAMES;
+            }
             cx.notify();
         }
     }
@@ -1874,6 +1994,7 @@ impl TerminalView {
     /// Commit finalized IME text: clear the preedit and write the composed
     /// bytes to the PTY exactly as if they had been typed.
     fn commit_ime_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        input_trace(&format!("ime_commit len={}", text.len()));
         self.clear_ime_marked(cx);
         if !text.is_empty() {
             self.send_bytes(text.as_bytes(), cx);
@@ -2090,6 +2211,13 @@ impl TerminalView {
         // (its snapshot is already updated above, so it's current the instant
         // it's shown) but still repaints on an attention edge (bell / error
         // progress) so a background tab's chip can light up.
+        if had_output {
+            input_trace(&format!(
+                "echo_render had_output visible={} events={}",
+                self.visible,
+                events.len()
+            ));
+        }
         if self.visible || got_bell || exit_changed {
             cx.notify();
         }
@@ -2312,8 +2440,30 @@ impl Render for TerminalView {
         // Adopt the grid size the canvas measured from its real bounds
         // last paint, then apply it. `maybe_resize` resizes the PTY +
         // refetches the snapshot only when the size actually changed.
+        input_trace("frame");
         self.pull_canvas_grid();
         self.maybe_resize();
+
+        // Post-input frame persistence: while a recent keystroke's window is
+        // open, keep requesting frames so the per-frame drain below catches a
+        // straggler echo within one frame, even if the run loop would otherwise
+        // sleep until the next wake. Counts down to zero so an idle terminal
+        // stops repainting.
+        if self.drain_frames > 0 {
+            self.drain_frames -= 1;
+            cx.notify();
+        }
+
+        // Drive the PTY drain from the frame loop, not only the background poll
+        // timer. The keystroke that scheduled this frame echoed back by now, and
+        // frames render promptly (vsync) where the background-executor timer is
+        // throttled/coalesced when the run loop is idle between keystrokes —
+        // which left echoes sitting undrained for 100ms–1s. Draining here pulls
+        // the echo into this very frame (~one frame of latency). `tick` re-arms
+        // the next frame itself (`cx.notify` while output flows), so a live TUI
+        // keeps painting and the chain settles to idle once output stops. The
+        // background poll stays as the drain path for hidden tabs (not rendered).
+        self.tick(cx);
 
         // Cursor visibility rules:
         //   - Focused + blink on  → solid inverse block (active cursor)
@@ -3049,6 +3199,122 @@ mod poll_interval_tests {
         assert_eq!(poll_interval_ms(true), POLL_INTERVAL_MS);
         assert_eq!(poll_interval_ms(false), BACKGROUND_POLL_INTERVAL_MS);
         assert!(poll_interval_ms(false) > poll_interval_ms(true));
+    }
+}
+
+/// Restore lifecycle: a tab reconnected on app reopen must come back
+/// responsive. These pin the placeholder → live-session handoff and the
+/// visibility-driven drain cadence so a restored terminal never gets stuck
+/// at the slow background poll rate (the cause of laggy post-restore typing).
+#[cfg(test)]
+mod restore_lifecycle_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn dormant() -> (SharedBackend, TerminalSessionId) {
+        spawn_local_pty_dormant(80, 24).expect("dormant spawn (PTY fallback)")
+    }
+
+    fn restored_ids() -> SurfaceIds {
+        SurfaceIds::restored("/proj".to_string(), "surface-1".to_string(), "tab-1".to_string())
+    }
+
+    fn mount_pending_view(cx: &mut TestAppContext) -> gpui::WindowHandle<TerminalView> {
+        let (backend, sid) = dormant();
+        cx.add_window(|win, cx| {
+            TerminalView::mount_pending(
+                backend,
+                sid,
+                restored_ids(),
+                None,
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                win,
+                cx,
+            )
+        })
+    }
+
+    // A pending restore placeholder is fast-poll eligible the moment it mounts
+    // (`visible == true`), so once the reconcile delivers the live session the
+    // restored tab drains at ~60 fps rather than the background cadence.
+    #[gpui::test]
+    async fn pending_restore_view_is_fast_poll_eligible(cx: &mut TestAppContext) {
+        let window = mount_pending_view(cx);
+        cx.run_until_parked();
+
+        cx.read(|app| {
+            let v = window.read(app).expect("view alive");
+            assert!(v.is_pending_attach(), "fresh placeholder must be pending");
+            assert!(v.is_visible(), "placeholder defaults visible → polls fast");
+            assert_eq!(poll_interval_ms(v.is_visible()), POLL_INTERVAL_MS);
+        });
+    }
+
+    // `adopt_live_session` swaps the placeholder for the live session, clears
+    // the pending flag, keeps the view fast-poll eligible, and succeeds exactly
+    // once — a second (duplicate) delivery is a no-op so it can't corrupt state
+    // or double-arm the drain task.
+    #[gpui::test]
+    async fn adopt_live_session_clears_pending_and_is_idempotent(cx: &mut TestAppContext) {
+        let window = mount_pending_view(cx);
+        cx.run_until_parked();
+
+        let (live_backend, live_sid) = dormant();
+        let adopted = window
+            .update(cx, |view, _win, cx| {
+                view.adopt_live_session(live_backend, live_sid, cx)
+            })
+            .expect("window update");
+        assert!(adopted, "first adopt must succeed");
+
+        // Second adopt on a now-live view is rejected (not pending anymore).
+        let (other_backend, other_sid) = dormant();
+        let twice = window
+            .update(cx, |view, _win, cx| {
+                view.adopt_live_session(other_backend, other_sid, cx)
+            })
+            .expect("window update");
+        assert!(!twice, "second adopt on a live view must be a no-op");
+
+        cx.run_until_parked();
+        cx.read(|app| {
+            let v = window.read(app).expect("view alive");
+            assert!(!v.is_pending_attach(), "adopt must clear pending");
+            assert_eq!(v.session_id(), live_sid, "adopt must swap to the live session");
+            assert!(v.is_visible(), "adopted view stays fast-poll eligible");
+            assert_eq!(poll_interval_ms(v.is_visible()), POLL_INTERVAL_MS);
+        });
+    }
+
+    // Visibility flips drive the PTY-drain cadence: an on-screen restored tab
+    // drains at the foreground rate (low echo latency); a backgrounded one
+    // throttles. This is the invariant that keeps typing into the focused
+    // restored terminal responsive while idle background agents don't each
+    // schedule a 60 fps repaint.
+    #[gpui::test]
+    async fn visibility_drives_poll_cadence(cx: &mut TestAppContext) {
+        let window = mount_pending_view(cx);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _win, cx| view.set_visible(false, cx))
+            .expect("window update");
+        cx.read(|app| {
+            let v = window.read(app).expect("view alive");
+            assert!(!v.is_visible());
+            assert_eq!(poll_interval_ms(v.is_visible()), BACKGROUND_POLL_INTERVAL_MS);
+        });
+
+        window
+            .update(cx, |view, _win, cx| view.set_visible(true, cx))
+            .expect("window update");
+        cx.read(|app| {
+            let v = window.read(app).expect("view alive");
+            assert!(v.is_visible());
+            assert_eq!(poll_interval_ms(v.is_visible()), POLL_INTERVAL_MS);
+        });
     }
 }
 

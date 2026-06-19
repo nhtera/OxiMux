@@ -4,6 +4,50 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-20 — Restored agent terminals: eliminate status/render event theft
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/pty`, `crates/relay-client`, `crates/agents`
+
+Fixed the remaining intermittent 300–343 ms clear/redraw lag in restored tracked-agent tabs. The agent status poller and terminal renderer destructively drained the same per-session queue; live tracing showed the status poller stealing 4/30 output events, matching the delayed redraw rate.
+
+The renderer is now the sole consumer of its queue. Tracked agents opt into an independent bounded `Output`/`Exit` stream; relay restore registration atomically backfills pending lifecycle events without removing renderer events. Synthetic relay crash exits are independently delivered to both consumers. Deterministic portable and real-relay tests drain status first, then prove the renderer still receives the same output marker and exit code.
+
+Live restored Claude Code verification: 100 type→Ctrl+U trials, zero samples over 50 ms; end-to-end p50 15.8 ms, p95 29.3 ms, max 31.0 ms. Before this fix, 13% stalled for 300–343 ms.
+
+---
+
+### 2026-06-19 — Terminal: fix typing latency (App Nap run-loop throttle) — now sub-frame
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/main.rs`, `crates/pty/src/backend.rs`, `crates/relay-client/src/backend.rs`, `crates/app/src/shell/terminal_view.rs`
+
+Root-caused and fixed the post-restore typing lag with a microsecond input→echo→frame trace driven into the live app. Findings: input handling ~0.4ms and the relay transport ~0.04ms were never the problem — the GPUI **run loop / foreground executor was serviced ~75ms–1s late**, so the PTY-output drain ran long after the bytes arrived. Cause: **macOS App Nap** throttling. OxiMux only suppressed App Nap during *scoped* daemon round-trips, and it runs as a bare binary (not an `.app`), which makes App Nap apply even while frontmost.
+
+**Fixes:**
+- **Global App-Nap suppression for the whole process lifetime** (`main.rs`) — the key fix. Drain latency dropped from p50 75ms to p50 12ms.
+- **Event-driven output drain** — the relay pump wakes the view (via a new `TerminalBackend::set_output_waker`) the instant output is enqueued, instead of waiting on a (throttled) poll timer. Poll remains a fallback for hidden tabs.
+- **Post-input frame persistence** — a keystroke (and IME composition) keeps the render loop self-scheduling for ~10 frames so a straggler echo paints within one frame.
+
+**Verified on the live app** (keystroke trace): typing into a **plain shell** is now **p50 2.3ms, max 20ms, zero keystrokes >50ms** — sub-frame, native-class (was 75ms+ with 100–600ms outliers). Residual lag seen when typing into a busy **Claude Code agent** is the agent's own redraw latency (measured up to 2.2s while "crunching") — inherent to the program, not the terminal. Debug trace gated behind `OXIMUX_INPUT_TRACE`.
+
+---
+
+### 2026-06-19 — Terminal restore: regression tests for the responsive-after-reopen invariants
+
+**Commits**: _(local, pending)_
+**Touches**: `crates/app/src/shell/terminal_view.rs`, `crates/app/src/shell/pane_group/e2e_tests.rs`
+
+Investigated a report of laggy typing in a terminal reattached on app reopen. Profiling the live process showed the main thread idle at rest (no busy loop), and the restored and freshly-spawned terminals share the same backend — the responsiveness gap is the on-screen tab's PTY-drain cadence, not the restore path corrupting state. Locked that invariant with headless coverage so it can't regress into the lag symptom:
+
+- **Placeholder → live-session handoff** (`restore_lifecycle_tests`): a pending restore placeholder is fast-poll eligible the moment it mounts; `adopt_live_session` clears the pending flag, swaps to the live session, keeps the view fast-poll eligible, and is idempotent (a duplicate delivery is a no-op, so it can't double-arm the drain task or corrupt state).
+- **Visibility drives drain cadence**: an on-screen view drains at the foreground rate (low echo latency); a backgrounded one throttles.
+- **Integration guard** (`active_terminal_tab_drains_fast_background_throttles`): the active tab's view is visible (fast drain) and every other tab's view is hidden (throttled), and the two flip on a tab switch.
+
+These join the existing restore coverage (persistence round-trip of order + cosmetics + agent metadata, rank-based placement, split/multi-group tree rebuild). No hot-path behavior change in this entry.
+
+---
+
 ### 2026-06-19 — Tab restore: preserve preview/pin/color/title + saved order
 
 **Commits**: _(local, pending)_

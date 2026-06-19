@@ -27,6 +27,7 @@ fn snapshot_contains_echoed_marker() {
         cols: 80,
         rows: 24,
         scrollback: 5000,
+        capture_status_events: false,
     };
 
     let id = backend.spawn(cfg).expect("spawn shell");

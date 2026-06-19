@@ -16,10 +16,10 @@
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -31,6 +31,7 @@ use crate::snapshot::{Cell, TerminalSnapshot};
 use crate::state::TerminalState;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const STATUS_EVENT_CAPACITY: usize = 256;
 const READ_BUFFER_BYTES: usize = 4096;
 const SCROLLBACK_ROWS: usize = 5_000;
 
@@ -85,6 +86,7 @@ pub struct PortablePtyBackend {
     next_id: u64,
     event_tx: SyncSender<TerminalEvent>,
     event_rx: Receiver<TerminalEvent>,
+    status_events: Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
 }
 
 impl PortablePtyBackend {
@@ -95,6 +97,7 @@ impl PortablePtyBackend {
             next_id: 1,
             event_tx,
             event_rx,
+            status_events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -147,6 +150,13 @@ impl TerminalBackend for PortablePtyBackend {
         let writer = pair.master.take_writer().context("take writer")?;
 
         let id = self.mint_id();
+        if cfg.capture_status_events {
+            self.status_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(id)
+                .or_default();
+        }
         let state = Arc::new(Mutex::new(TerminalState::new(
             cfg.cols,
             cfg.rows,
@@ -156,8 +166,17 @@ impl TerminalBackend for PortablePtyBackend {
         let tx = self.event_tx.clone();
         let watcher_state = Arc::clone(&state);
         let watcher_cwd = Arc::clone(&cwd_hint);
+        let status_events = Arc::clone(&self.status_events);
         let watcher = std::thread::spawn(move || {
-            watch_session(id, reader, child, tx, watcher_state, watcher_cwd)
+            watch_session(
+                id,
+                reader,
+                child,
+                tx,
+                watcher_state,
+                watcher_cwd,
+                status_events,
+            )
         });
 
         self.sessions.insert(
@@ -256,10 +275,26 @@ impl TerminalBackend for PortablePtyBackend {
         let reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
         let tx = self.event_tx.clone();
+        if cfg.capture_status_events {
+            self.status_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(id)
+                .or_default();
+        }
         let watcher_state = Arc::clone(&session.state);
         let watcher_cwd = Arc::clone(&session.cwd_hint);
+        let status_events = Arc::clone(&self.status_events);
         let watcher = std::thread::spawn(move || {
-            watch_session(id, reader, child, tx, watcher_state, watcher_cwd)
+            watch_session(
+                id,
+                reader,
+                child,
+                tx,
+                watcher_state,
+                watcher_cwd,
+                status_events,
+            )
         });
 
         session.master = Some(pair.master);
@@ -481,6 +516,34 @@ impl TerminalBackend for PortablePtyBackend {
         out
     }
 
+    fn subscribe_status_events(&mut self, id: TerminalSessionId) -> Result<()> {
+        if !self.sessions.contains_key(&id) {
+            return Err(anyhow::anyhow!("unknown session {id:?}"));
+        }
+        self.status_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(id)
+            .or_default();
+        Ok(())
+    }
+
+    fn drain_status_events_for(&mut self, id: TerminalSessionId) -> Vec<TerminalEvent> {
+        self.status_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&id)
+            .map(|queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn unsubscribe_status_events(&mut self, id: TerminalSessionId) {
+        self.status_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+    }
+
     fn close(&mut self, id: TerminalSessionId) -> Result<()> {
         let Some(mut session) = self.sessions.remove(&id) else {
             return Ok(());
@@ -545,7 +608,23 @@ fn watch_session(
     tx: SyncSender<TerminalEvent>,
     state: Arc<Mutex<TerminalState>>,
     cwd_hint: Arc<Mutex<Option<PathBuf>>>,
+    status_events: Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
 ) {
+    // Reap the child independently while the reader drains through EOF. The
+    // reader's renderer notifications are nonblocking, so an absent renderer
+    // cannot stop the PTY drain. Status Exit is published below only after all
+    // preceding Output, preserving lifecycle ordering.
+    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let code = child.wait().ok().and_then(|status| {
+            if status.success() {
+                Some(0)
+            } else {
+                status.exit_code().try_into().ok()
+            }
+        });
+        let _ = exit_tx.send(code);
+    });
     let mut buf = [0u8; READ_BUFFER_BYTES];
     loop {
         match reader.read(&mut buf) {
@@ -571,26 +650,55 @@ fn watch_session(
                             }
                         }
                         other => {
-                            if tx.send(other).is_err() {
+                            if !try_send_renderer_event(&tx, other) {
                                 return;
                             }
                         }
                     }
                 }
                 let bytes = bytes_slice.to_vec();
-                if tx.send(TerminalEvent::Output { id, bytes }).is_err() {
+                let output = TerminalEvent::Output { id, bytes };
+                push_status_event(&status_events, id, &output);
+                if !try_send_renderer_event(&tx, output) {
                     return;
                 }
             }
             Err(_) => break,
         }
     }
-    let code = child.wait().ok().and_then(|status| {
-        if status.success() {
-            Some(0)
-        } else {
-            status.exit_code().try_into().ok()
+    let code = exit_rx.recv().ok().flatten();
+    let exit = TerminalEvent::Exit { id, code };
+    push_status_event(&status_events, id, &exit);
+    let _ = tx.send(exit);
+}
+
+fn try_send_renderer_event(tx: &SyncSender<TerminalEvent>, event: TerminalEvent) -> bool {
+    match tx.try_send(event) {
+        Ok(()) | Err(TrySendError::Full(_)) => true,
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn push_status_event(
+    queues: &Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
+    id: TerminalSessionId,
+    event: &TerminalEvent,
+) {
+    let mut queues = queues
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(queue) = queues.get_mut(&id) else {
+        return;
+    };
+    if queue.len() >= STATUS_EVENT_CAPACITY {
+        if let Some(index) = queue
+            .iter()
+            .position(|queued| matches!(queued, TerminalEvent::Output { .. }))
+        {
+            queue.remove(index);
+        } else if matches!(event, TerminalEvent::Output { .. }) {
+            return;
         }
-    });
-    let _ = tx.send(TerminalEvent::Exit { id, code });
+    }
+    queue.push_back(event.clone());
 }

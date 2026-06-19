@@ -64,6 +64,9 @@ pub struct SpawnConfig {
     /// Off-screen rows to retain. Sourced from `TerminalSettings` at spawn so
     /// the scrollback depth is user-tunable; defaults to the prior constant.
     pub scrollback: usize,
+    /// Retain a second, bounded Output/Exit stream for lifecycle observers.
+    /// The renderer remains the sole consumer of `drain_events_for`.
+    pub capture_status_events: bool,
 }
 
 impl Default for SpawnConfig {
@@ -76,9 +79,17 @@ impl Default for SpawnConfig {
             cols: 80,
             rows: 24,
             scrollback: 5000,
+            capture_status_events: false,
         }
     }
 }
+
+/// Callback a backend invokes — from whatever thread produces output — the
+/// moment new output is enqueued for a session. The UI registers one of these
+/// (via [`TerminalBackend::set_output_waker`]) to drain on arrival instead of
+/// polling on a timer; the closure just nudges the UI's async drain task awake.
+/// Kept as a bare `Fn` so this crate stays free of any async/channel dependency.
+pub type OutputWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Trait every terminal source implements.
 ///
@@ -143,6 +154,15 @@ pub trait TerminalBackend: Send + 'static {
     fn list_external_ids(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Register an event-driven drain signal for `session`: the backend calls
+    /// `waker` whenever it enqueues output, so the UI can drain on arrival
+    /// rather than waking on a fixed timer (which macOS throttles/coalesces
+    /// when the run loop is idle between keystrokes — the cause of echo sitting
+    /// undrained for 100ms–1s). Default is a no-op: backends that don't wire it
+    /// leave the caller on its timer poll. Passing this lets relay-backed
+    /// sessions match the responsiveness of an event-driven renderer.
+    fn set_output_waker(&mut self, _id: TerminalSessionId, _waker: OutputWaker) {}
 
     /// Local session ids this backend currently tracks. Used by the
     /// daemon-crash recovery path: when a dead relay backend is swapped
@@ -271,6 +291,25 @@ pub trait TerminalBackend: Send + 'static {
             .filter(|e| e.session_id() == id)
             .collect()
     }
+
+    /// Start independent lifecycle-event delivery for `id`. Registration is
+    /// idempotent. Backends may backfill Output/Exit still pending for the
+    /// renderer, but must never remove those renderer events.
+    fn subscribe_status_events(&mut self, _id: TerminalSessionId) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "this backend does not support status event subscriptions"
+        ))
+    }
+
+    /// Drain the independent, per-session Output/Exit stream. This must not
+    /// consume or otherwise alter events waiting for the renderer.
+    fn drain_status_events_for(&mut self, _id: TerminalSessionId) -> Vec<TerminalEvent> {
+        Vec::new()
+    }
+
+    /// Release lifecycle-observer state. Idempotent and independent of the
+    /// renderer queue so a terminal may remain visible after observation ends.
+    fn unsubscribe_status_events(&mut self, _id: TerminalSessionId) {}
 
     /// OS pid of the shell child for this session, when the backend
     /// spawned one locally. Returns `None` for remote/relay backends

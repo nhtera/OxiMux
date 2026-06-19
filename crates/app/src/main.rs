@@ -49,6 +49,17 @@ fn main() {
         .expect("tokio runtime");
     let _rt_guard = rt.enter();
 
+    // Hold an App-Nap-suppressing activity for the whole process lifetime.
+    // macOS throttles a "napped" app's run loop and coalesces its timers, which
+    // delays the GPUI foreground executor that drains PTY output — so a typed
+    // character's echo lands tens-to-hundreds of ms late even though the bytes
+    // arrived in ~0.04ms. A bare binary (not an .app bundle) is especially
+    // prone to being napped even while frontmost. The scoped `prevent` guards
+    // only cover blocking daemon round-trips; interactive responsiveness needs
+    // it held continuously. The activity still allows normal idle *system*
+    // sleep — it only keeps our own run loop from being throttled.
+    let _app_nap_guard = oximux_app::app_nap::prevent("interactive terminal cockpit");
+
     // Phase 5 step 1 spike: `--editor-spike` short-circuits the normal
     // workspace boot and opens a single editor window on this file
     // (`crates/app/src/main.rs`). The spike validates that

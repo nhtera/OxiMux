@@ -140,7 +140,7 @@ impl CliRuntime {
                 .cloned()
                 .ok_or_else(|| anyhow!("no adapter registered for {:?}", adapter_key))?
         };
-        Ok(self.register_session(adapter, backend, term_id))
+        self.register_session(adapter, backend, term_id)
     }
 
     /// Wire up the status machine + poll task for a ready `(backend,
@@ -151,7 +151,11 @@ impl CliRuntime {
         adapter: Arc<dyn CliAgentAdapter>,
         backend: SharedBackend,
         term_id: TerminalSessionId,
-    ) -> AgentSessionId {
+    ) -> Result<AgentSessionId> {
+        {
+            let mut be = lock_recover(&backend, "terminal backend");
+            be.subscribe_status_events(term_id)?;
+        }
         let patterns: Arc<[_]> = adapter.status_patterns().to_vec().into();
         let machine = StatusMachine::new(patterns);
         let (status_tx, status_rx) = watch::channel(AgentStatus::Idle);
@@ -176,7 +180,7 @@ impl CliRuntime {
                 cancel_requested,
             },
         );
-        id
+        Ok(id)
     }
 
     /// Register one adapter under its `AgentAdapter` enum. Last-write-wins
@@ -251,6 +255,7 @@ impl AgentRuntime for CliRuntime {
             cols: cfg.cols,
             rows: cfg.rows,
             scrollback: 5000,
+            capture_status_events: true,
         };
 
         // Spawn PTY + stdin_seed inside spawn_blocking — openpty + fork on
@@ -310,8 +315,9 @@ impl AgentRuntime for CliRuntime {
             };
             // Direct spawn → the binary IS the process, no launch line to
             // write. Wrapper fallback → write the `exec <program> <args…>` line.
-            let launch =
-                direct_program.is_none().then(|| build_launch_line(&spec.program, &spec.args));
+            let launch = direct_program
+                .is_none()
+                .then(|| build_launch_line(&spec.program, &spec.args));
             let shared_for_spawn = shared.clone();
             let term_id = tokio::task::spawn_blocking(move || -> Result<TerminalSessionId> {
                 let mut be = lock_recover(&shared_for_spawn, "terminal backend");
@@ -341,8 +347,7 @@ impl AgentRuntime for CliRuntime {
             (Arc::new(Mutex::new(backend_box)), term_id)
         };
 
-        let id = self.register_session(adapter, backend, term_id);
-        Ok(id)
+        self.register_session(adapter, backend, term_id)
     }
 
     async fn send_message(&self, id: AgentSessionId, msg: &str) -> Result<()> {
@@ -406,6 +411,8 @@ impl AgentRuntime for CliRuntime {
                 tracing::warn!(?id, "poll task did not exit within CANCEL_DRAIN_TIMEOUT; aborted");
             }
         }
+        let mut be = lock_recover(&entry.backend, "terminal backend");
+        be.unsubscribe_status_events(term_id);
         Ok(())
     }
 
@@ -506,11 +513,7 @@ async fn poll_loop(
         interval.tick().await;
         let events = {
             let mut be = lock_recover(&backend, "terminal backend");
-            // Per-session drain: on the shared relay backend a plain
-            // `drain_events()` would steal every other pane's events. The
-            // default impl filters by id, so this is also correct for the
-            // private single-session backend.
-            be.drain_events_for(term_id)
+            be.drain_status_events_for(term_id)
         };
         let now = Instant::now();
         let mut saw_exit = false;
@@ -546,14 +549,16 @@ async fn poll_loop(
             let _ = status_tx.send(t.to);
         }
         if saw_exit {
-            return;
+            break;
         }
         // If every subscriber dropped (session removed and UI gone), the
         // sender's `is_closed` flips to true.
         if status_tx.is_closed() {
-            return;
+            break;
         }
     }
+    let mut be = lock_recover(&backend, "terminal backend");
+    be.unsubscribe_status_events(term_id);
 }
 
 /// Lock a mutex, recovering from poison instead of propagating the
@@ -813,6 +818,92 @@ mod tests {
         let s = rt.current_status(id).expect("current_status");
         assert!(!s.is_terminal(), "session must not be killed by resize");
         let _ = rt.cancel(id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_polling_preserves_renderer_output_and_exit() {
+        const MARKER: &[u8] = b"STATUS_MARKER";
+        let rt = runtime_with_custom();
+        let id = rt
+            .start_session(echo_cfg(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    "read first; printf 'STATUS_MARKER\\n'; read second; exit 7".into(),
+                ],
+            ))
+            .await
+            .expect("start gated shell");
+        let backend = rt.backend_for(id).expect("renderer backend");
+        let term_id = rt.terminal_session_id(id).expect("terminal session id");
+        let mut status = rt.subscribe_status(id).expect("status receiver");
+
+        rt.send_message(id, "first\n")
+            .await
+            .expect("release output");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot_has_marker = {
+                    let be = lock_recover(&backend, "terminal backend");
+                    be.snapshot(term_id)
+                        .expect("terminal snapshot")
+                        .cells
+                        .iter()
+                        .flat_map(|row| row.iter().map(|cell| cell.ch))
+                        .collect::<String>()
+                        .contains("STATUS_MARKER")
+                };
+                if snapshot_has_marker {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("marker did not reach terminal state");
+        // Give the poller two complete opportunities to drain. Under the
+        // former shared-queue design this removed the marker before the
+        // renderer assertion below.
+        tokio::time::sleep(POLL_INTERVAL * 2).await;
+        assert!(matches!(&*status.borrow(), AgentStatus::Running));
+
+        let first_renderer_events = {
+            let mut be = lock_recover(&backend, "terminal backend");
+            be.drain_events_for(term_id)
+        };
+        let first_bytes = first_renderer_events
+            .into_iter()
+            .filter_map(|event| match event {
+                TerminalEvent::Output { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(
+            first_bytes
+                .windows(MARKER.len())
+                .any(|bytes| bytes == MARKER),
+            "status poller stole renderer marker"
+        );
+
+        rt.send_message(id, "second\n").await.expect("release exit");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !status.borrow().is_terminal() {
+                status.changed().await.expect("status task remains live");
+            }
+        })
+        .await
+        .expect("status did not observe exit");
+        let final_renderer_events = {
+            let mut be = lock_recover(&backend, "terminal backend");
+            be.drain_events_for(term_id)
+        };
+        assert!(
+            final_renderer_events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Exit { code: Some(7), .. }))
+        );
+        rt.cancel(id).await.expect("remove completed session");
     }
 
     #[tokio::test(flavor = "multi_thread")]
