@@ -9,6 +9,7 @@ pub mod agent_awake;
 pub mod app_nap;
 pub mod assets;
 pub mod agent_launch_settings;
+pub mod agent_status_hooks;
 pub mod browser_profiles;
 pub mod commit_message_ai_settings;
 pub mod custom_commands_loader;

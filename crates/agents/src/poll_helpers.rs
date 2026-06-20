@@ -63,6 +63,15 @@ pub fn process_poll_events(
                 // machine's current status with the structured detail. Skip
                 // once terminal — a Done/Failed session ignores late sideband.
                 if let Some(sb) = scan.event {
+                    // Observable signal that an OSC-9999 packet was received and
+                    // decoded — the one link in the emission→scanner path that
+                    // can't be unit-tested (needs a live agent emitting to the
+                    // PTY). `RUST_LOG=oximux_agents=debug` surfaces it.
+                    tracing::debug!(
+                        state = ?sb.state,
+                        tool = ?sb.detail.tool_name,
+                        "agent OSC-9999 sideband decoded"
+                    );
                     let tool = sb.detail.tool_name.clone();
                     machine.feed_sideband(sb.state, tool);
                     if !machine.current().is_terminal() {

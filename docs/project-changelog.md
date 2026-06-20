@@ -4,6 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-21 — Agents: opt-in OSC-9999 status hooks for Claude Code (makes the sideband live)
+
+**Commits**: _(local, pending; branch `feat/agent-sideband-phase1`)_
+**Touches**: `crates/app` (new `agent_status_hooks.rs`, `assets/hooks/oximux-status-emit.sh`), `crates/agents` (debug log)
+
+The producer side of the OSC-9999 status sideband. With `OXIMUX_STATUS_HOOKS=1`, launching a Claude Code agent injects a `--settings` hooks block so Claude emits structured status into its PTY, which the existing scanner reads — closing the gap where the regex status machine can't see the agent's internal tool steps.
+
+- A small POSIX-sh hook script writes `ESC]9999;{"v":1,"state":"working","tool":"Edit"}BEL` to the controlling terminal (`/dev/tty`) on `PreToolUse` (working), `PermissionRequest` (needs_approval), and `Stop` (idle). Hook stdout is captured by Claude, so the packet must go to the tty; tool name is extracted with `sed` (no `jq`/`python` dependency).
+- The hooks are passed as a `claude --settings <json-string>` at spawn — app-owned, never written into `~/.claude`. Because `--settings` replaces the `hooks` key, the user's existing global hooks are read and merged in so they keep firing. Hooks run `async` so they never slow the agent.
+- **Opt-in, default off** (`OXIMUX_STATUS_HOOKS=1`). Claude Code only for now.
+
+Tests: `cargo test -p oximux-app --lib` = 927 passed. A round-trip test runs the real hook script in a subprocess and feeds its bytes through the Phase-1 scanner, proving the emit→decode format end-to-end. The live link (Claude fires the hook → `/dev/tty` → PTY → scanner) needs a running Claude session to confirm; `RUST_LOG=oximux_agents=debug` logs each decoded packet.
+
+---
+
 ### 2026-06-21 — Agents dashboard: two-line status cards (cockpit rebuild Phase 2a)
 
 **Commits**: _(local, pending; branch `feat/agent-sideband-phase1`)_
