@@ -9,6 +9,8 @@ pub mod agent_title;
 pub mod cli;
 pub mod commit_message;
 pub mod commit_message_heuristic;
+pub mod osc_sideband;
+pub mod poll_helpers;
 pub mod registry;
 pub mod runtime;
 pub mod runtime_impl;
@@ -20,6 +22,7 @@ pub use cli::{
     AiderAdapter, ClaudeCodeAdapter, CliAgentAdapter, CodexAdapter, CommandSpec,
     CustomCommandAdapter, StatusPattern,
 };
+pub use osc_sideband::AgentOscScanner;
 pub use registry::{AdapterRegistry, RegistryEntry};
 pub use runtime::{AgentRuntime, AgentSessionConfig, AgentStatusStream};
 pub use runtime_impl::{CliRuntime, SharedBackend};

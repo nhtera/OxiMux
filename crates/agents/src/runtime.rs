@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use oximux_core::{AgentAdapter, AgentSessionId, AgentStatus};
+use oximux_core::{AgentAdapter, AgentSessionId, AgentSnapshot, AgentStatus};
 
 /// What to spawn for one agent session.
 ///
@@ -52,15 +52,21 @@ pub struct AgentSessionConfig {
 /// Multi-consumer status subscription.
 ///
 /// `tokio::sync::watch` lets pane-header badge + sidebar dot + dashboard
-/// each hold their own `Receiver` over one `Sender`-owned `AgentStatus`.
+/// each hold their own `Receiver` over one `Sender`-owned `AgentSnapshot`.
 /// The receiver always sees the latest value (no backpressure, no missed
 /// updates between polls); intermediate transitions during a tick are
 /// collapsed which is exactly the right semantic for status UI.
 ///
+/// The payload is an `AgentSnapshot` (status + optional OSC-9999 sideband
+/// `detail`), not a bare `AgentStatus`, so sideband-fed consumers can read
+/// the live tool step / message off the same channel. Consumers that only
+/// care about the lifecycle read `snapshot.status`; `current_status()` still
+/// hands back a bare `AgentStatus` for that common case.
+///
 /// Raw byte / event streams are an internal runtime concern and not
 /// exposed at this layer — adapters that need replay can plug their own
 /// channel inside the impl.
-pub type AgentStatusStream = tokio::sync::watch::Receiver<AgentStatus>;
+pub type AgentStatusStream = tokio::sync::watch::Receiver<AgentSnapshot>;
 
 /// The runtime trait. `Send + Sync + 'static` because the UI thread holds
 /// a `Box<dyn AgentRuntime>` and the per-session reader tasks run on tokio.

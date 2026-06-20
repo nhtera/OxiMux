@@ -20,7 +20,9 @@ pub mod pr_state;
 pub mod project;
 pub mod workspace;
 
-pub use agent_session::{AgentSession, AgentSessionId, AgentStatus};
+pub use agent_session::{
+    AgentSession, AgentSessionId, AgentSidebandState, AgentSnapshot, AgentStatus, SidebandDetail,
+};
 pub use conflict_kind::ConflictKind;
 pub use diff_review_note::{DiffReviewNote, NoteSide};
 pub use git_diff::{

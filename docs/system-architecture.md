@@ -166,11 +166,12 @@ CliRuntime (AgentRuntime impl)
 ├── start_session(id, config)
 │     spawn_blocking → openpty/fork via PortablePtyBackend
 │     optional stdin_seed write (warn if > MAX_SAFE_STDIN_SEED = 4096 bytes)
-│     tokio 50ms poll task
-│       drain TerminalEvent::Output → StatusMachine::feed / tick
-│       on TerminalEvent::Exit    → StatusMachine::note_exit
+│     tokio 50ms poll task → poll_helpers::process_poll_events
+│       TerminalEvent::Output → AgentOscScanner::feed (strip OSC-9999 → cleaned + SidebandEvent)
+│                               → StatusMachine::feed on cleaned bytes; sideband applies last via feed_sideband→force
+│       on TerminalEvent::Exit → StatusMachine::note_exit / note_interrupted
 │       exits when saw_exit || status_tx.is_closed()
-│     watch::channel<AgentStatus> — cloned to all subscribers (badge / sidebar / dashboard)
+│     watch::channel<AgentSnapshot> — cloned to all subscribers (badge / sidebar / dashboard)
 │
 ├── send_message(id, text)
 │     spawn_blocking → write bytes to PTY stdin
@@ -193,7 +194,9 @@ CliRuntime (AgentRuntime impl)
 
 `AiderAdapter` is the third branded adapter: builds `aider [--model M]` and routes `cfg.prompt` through `CommandSpec::stdin_seed` rather than argv — Aider's REPL has no positional-prompt argument and `--message` is one-shot incompatible with the OxiMux interactive PTY model. Aider is the first real consumer of the `stdin_seed` path the trait reserved at Phase 3 step 1. Embedded `\n` in the prompt submits each line as a discrete REPL prompt — intentional, no collapse. No `--yes` / `--auto-commits` paternalism (user's `~/.aider.conf.yml` owns). Empty `status_patterns()` with the same step-14 calibration deferral.
 
-Future ACP runtime (v1.1) will be a sibling `AgentRuntime` impl with identical `watch::Receiver<AgentStatus>` contract — UI code subscribes to the trait, not the impl.
+The status channel carries `AgentSnapshot { status: AgentStatus, detail: Option<SidebandDetail> }` (not a bare `AgentStatus`): the regex `StatusMachine` path publishes `detail: None`, while an OSC-9999 sideband event (`osc_sideband::AgentOscScanner`) attaches structured `tool` / `tool_input` / `msg` detail. This closes the Codex/Aider `EMPTY_PATTERNS` blindness — an agent (or hook) emitting `ESC]9999;{"v":1,"state":"needs_approval",...}BEL` drives status with no regex pattern needed. `current_status()` still returns a bare `AgentStatus` for the common lifecycle-only consumer.
+
+Future ACP runtime (v1.1) will be a sibling `AgentRuntime` impl with identical `watch::Receiver<AgentSnapshot>` contract — UI code subscribes to the trait, not the impl.
 
 ---
 

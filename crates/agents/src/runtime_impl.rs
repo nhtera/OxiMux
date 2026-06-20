@@ -17,10 +17,8 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use oximux_core::{AgentAdapter, AgentSessionId, AgentStatus};
-use oximux_pty::{
-    PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId,
-};
+use oximux_core::{AgentAdapter, AgentSessionId, AgentSnapshot, AgentStatus};
+use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalSessionId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +28,8 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::cli::CliAgentAdapter;
+use crate::osc_sideband::AgentOscScanner;
+use crate::poll_helpers::process_poll_events;
 use crate::runtime::{AgentRuntime, AgentSessionConfig, AgentStatusStream};
 use crate::status_machine::StatusMachine;
 
@@ -68,7 +68,7 @@ struct SessionEntry {
     term_id: TerminalSessionId,
     /// Kept so `subscribe_status` can clone — the corresponding `Sender`
     /// lives inside the poll task and survives until terminal-state exit.
-    status_rx: watch::Receiver<AgentStatus>,
+    status_rx: watch::Receiver<AgentSnapshot>,
     poll_handle: JoinHandle<()>,
     /// Set by `cancel()` before the PTY is closed so the poll task can
     /// classify the resulting Exit event as user-initiated (`Interrupted`)
@@ -158,7 +158,7 @@ impl CliRuntime {
         }
         let patterns: Arc<[_]> = adapter.status_patterns().to_vec().into();
         let machine = StatusMachine::new(patterns);
-        let (status_tx, status_rx) = watch::channel(AgentStatus::Idle);
+        let (status_tx, status_rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let poll_handle = tokio::spawn(poll_loop(
             backend.clone(),
@@ -431,7 +431,7 @@ impl AgentRuntime for CliRuntime {
             .sessions
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session {:?}", id))?;
-        Ok(entry.status_rx.borrow().clone())
+        Ok(entry.status_rx.borrow().status.clone())
     }
 }
 
@@ -504,50 +504,29 @@ async fn poll_loop(
     backend: SharedBackend,
     term_id: TerminalSessionId,
     mut machine: StatusMachine,
-    status_tx: watch::Sender<AgentStatus>,
+    status_tx: watch::Sender<AgentSnapshot>,
     cancel_requested: Arc<AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // One scanner per session — stateful so an OSC-9999 sequence split across
+    // two PTY reads still parses on the next drain.
+    let mut scanner = AgentOscScanner::new();
     loop {
         interval.tick().await;
         let events = {
             let mut be = lock_recover(&backend, "terminal backend");
             be.drain_status_events_for(term_id)
         };
-        let now = Instant::now();
-        let mut saw_exit = false;
-        // Defensive id filter. We use a per-session backend so all events
-        // here are ours, but if that invariant ever changes (shared backend
-        // experiment, fixture replay reusing a backend), this guard keeps
-        // sessions from polluting each other's status.
-        for ev in events {
-            match ev {
-                TerminalEvent::Output { id, bytes } if id == term_id => {
-                    if let Some(t) = machine.feed(&bytes, now) {
-                        let _ = status_tx.send(t.to);
-                    }
-                }
-                TerminalEvent::Exit { id, code } if id == term_id => {
-                    // A cancel-triggered exit is a user decision, not a
-                    // process outcome — publish Interrupted ("Stopped" in
-                    // the UI) instead of the Done/Failed exit-code mapping.
-                    let transition = if cancel_requested.load(Ordering::SeqCst) {
-                        machine.note_interrupted()
-                    } else {
-                        machine.note_exit(code)
-                    };
-                    if let Some(t) = transition {
-                        let _ = status_tx.send(t.to);
-                    }
-                    saw_exit = true;
-                }
-                _ => {}
-            }
-        }
-        if let Some(t) = machine.tick(now) {
-            let _ = status_tx.send(t.to);
-        }
+        let saw_exit = process_poll_events(
+            events,
+            term_id,
+            &mut machine,
+            &mut scanner,
+            &status_tx,
+            &cancel_requested,
+            Instant::now(),
+        );
         if saw_exit {
             break;
         }
@@ -578,369 +557,5 @@ fn lock_recover<'a, T: ?Sized>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cli::CustomCommandAdapter;
-    use std::path::PathBuf;
-
-    // A panic while some thread held the runtime lock must not take every
-    // later agent operation down with it: lock_recover hands back the
-    // still-consistent value instead of propagating the poison.
-    #[test]
-    fn lock_recover_survives_poisoned_mutex() {
-        let m = Arc::new(Mutex::new(5i32));
-        let m2 = m.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = m2.lock().unwrap();
-            panic!("poison the lock");
-        })
-        .join();
-        assert!(m.lock().is_err(), "mutex must be poisoned by the panic");
-        assert_eq!(*lock_recover(&m, "test"), 5, "value recovered intact");
-        // And a recovered lock keeps working for writes afterwards.
-        *lock_recover(&m, "test") = 6;
-        assert_eq!(*lock_recover(&m, "test"), 6);
-    }
-
-    fn echo_cfg(program: &str, args: Vec<String>) -> AgentSessionConfig {
-        AgentSessionConfig {
-            adapter: AgentAdapter::Custom,
-            worktree_path: PathBuf::from("/"),
-            prompt: None,
-            model: None,
-            effort: None,
-            extra_args: Vec::new(),
-            env: Vec::new(),
-            cols: 80,
-            rows: 24,
-            custom_command: Some((program.to_string(), args)),
-        }
-    }
-
-    fn runtime_with_custom() -> CliRuntime {
-        let rt = CliRuntime::new();
-        rt.register_adapter(AgentAdapter::Custom, Arc::new(CustomCommandAdapter));
-        rt
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn start_session_unknown_adapter_errors() {
-        let rt = CliRuntime::new();
-        let err = rt
-            .start_session(echo_cfg("/bin/true", vec![]))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("no adapter"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn custom_echo_runs_to_done() {
-        let rt = runtime_with_custom();
-        let id = rt
-            .start_session(echo_cfg("/bin/echo", vec!["hello".into()]))
-            .await
-            .expect("start_session");
-
-        let mut rx = rt.subscribe_status(id).expect("subscribe");
-        // Wait until status becomes terminal or 3 s elapses.
-        let result = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if rx.borrow().is_terminal() {
-                    return rx.borrow().clone();
-                }
-                if rx.changed().await.is_err() {
-                    // Sender dropped before terminal — runtime bug; surface
-                    // as a panic so the test fails loudly.
-                    panic!("status sender closed before terminal status");
-                }
-            }
-        })
-        .await;
-        let final_status = result.expect("did not reach terminal status in time");
-        match final_status {
-            AgentStatus::Done { code } => {
-                // /bin/echo exits 0
-                assert_eq!(code, Some(0), "expected exit code 0, got {code:?}");
-            }
-            other => panic!("expected Done, got {other:?}"),
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn current_status_starts_at_idle() {
-        let rt = runtime_with_custom();
-        // /bin/sleep gives us a few seconds of "running but not yet done"
-        // to query while the session is live.
-        let id = rt
-            .start_session(echo_cfg("/bin/sleep", vec!["2".into()]))
-            .await
-            .expect("start_session");
-        let initial = rt.current_status(id).expect("current_status");
-        assert!(matches!(initial, AgentStatus::Idle | AgentStatus::Running));
-        // Cleanup so the test doesn't take 2 s.
-        let _ = rt.cancel(id).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cancel_terminates_session_and_removes_entry() {
-        let rt = runtime_with_custom();
-        let id = rt
-            .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
-            .await
-            .expect("start_session");
-        // Cancel should return well before the 30 s sleep finishes.
-        let cancel_started = Instant::now();
-        rt.cancel(id).await.expect("cancel");
-        assert!(
-            cancel_started.elapsed() < Duration::from_secs(5),
-            "cancel took {:?}, expected < 5 s",
-            cancel_started.elapsed()
-        );
-        // Session is gone from the table — subscribe_status now errors.
-        let err = rt.subscribe_status(id).unwrap_err();
-        assert!(err.to_string().contains("unknown session"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn send_message_writes_to_pty() {
-        let rt = runtime_with_custom();
-        // /bin/cat echoes whatever we feed it; we just verify write() does
-        // not error and the session survives the write.
-        let id = rt
-            .start_session(echo_cfg("/bin/cat", vec![]))
-            .await
-            .expect("start_session");
-        rt.send_message(id, "ping\n").await.expect("send_message");
-        // status is still non-terminal
-        let s = rt.current_status(id).expect("current_status");
-        assert!(!s.is_terminal());
-        let _ = rt.cancel(id).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn send_message_unknown_session_errors() {
-        let rt = runtime_with_custom();
-        let bogus = AgentSessionId::new(999);
-        let err = rt.send_message(bogus, "x").await.unwrap_err();
-        assert!(err.to_string().contains("unknown session"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cancel_unknown_session_errors() {
-        let rt = runtime_with_custom();
-        let bogus = AgentSessionId::new(999);
-        let err = rt.cancel(bogus).await.unwrap_err();
-        assert!(err.to_string().contains("unknown session"));
-    }
-
-    // M2 (review 260520-1448): explicit subscribe-then-cancel coverage of
-    // the user-facing contract — UI badge holds a Receiver across a cancel
-    // and must observe the final terminal status before the session is
-    // removed from the table.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn subscribe_then_cancel_publishes_terminal_status() {
-        let rt = runtime_with_custom();
-        let id = rt
-            .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
-            .await
-            .expect("start_session");
-        let mut rx = rt.subscribe_status(id).expect("subscribe");
-        rt.cancel(id).await.expect("cancel");
-        // After cancel returns, the poll task has either exited (publishing
-        // terminal status) or been aborted. In the happy path we see a
-        // terminal state on the receiver.
-        let final_status = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let s = rx.borrow().clone();
-                if s.is_terminal() {
-                    return s;
-                }
-                if rx.changed().await.is_err() {
-                    return rx.borrow().clone();
-                }
-            }
-        })
-        .await
-        .expect("did not reach terminal status after cancel");
-        assert!(
-            final_status.is_terminal(),
-            "expected terminal, got {final_status:?}"
-        );
-        // A user cancel must read as Interrupted ("Stopped"), never as the
-        // Done/Failed exit-code mapping the kill signal would produce.
-        assert_eq!(
-            final_status,
-            AgentStatus::Interrupted,
-            "cancel must publish Interrupted, got {final_status:?}"
-        );
-    }
-
-    // M3 (review 260520-1448): double-cancel must error on the second call
-    // with the typed "unknown session" message — proves the table remove
-    // is the source of truth, not just the OS-level kill.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn double_cancel_second_call_errors() {
-        let rt = runtime_with_custom();
-        let id = rt
-            .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
-            .await
-            .expect("start_session");
-        rt.cancel(id).await.expect("first cancel");
-        let err = rt.cancel(id).await.unwrap_err();
-        assert!(err.to_string().contains("unknown session"));
-    }
-
-    // Phase 3 step 9 sub-1: the app renderer needs the same backend Arc the
-    // poll task holds so it can drain output and resize without going
-    // through `send_message`. `backend_for` hands out a clone; both
-    // callers compete on the same mutex.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn backend_for_returns_live_handle_shared_with_poll_task() {
-        let rt = runtime_with_custom();
-        let id = rt
-            .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
-            .await
-            .expect("start_session");
-        let backend = rt.backend_for(id).expect("backend_for");
-        // Arc count: one in SessionEntry, one cloned into the poll task,
-        // one we just took. Asserting an exact count would tie the test
-        // to the poll-task internals; instead prove the Arc is shared by
-        // exercising the same mutex from both sides.
-        let term_id = rt.terminal_session_id(id).expect("terminal_session_id");
-        let resize_ok = tokio::task::spawn_blocking(move || {
-            let mut be = backend.lock().expect("backend mutex poisoned");
-            be.resize(term_id, 100, 30).is_ok()
-        })
-        .await
-        .expect("spawn_blocking");
-        assert!(resize_ok, "renderer-side resize must succeed");
-        // Session is still alive and reachable through the runtime.
-        let s = rt.current_status(id).expect("current_status");
-        assert!(!s.is_terminal(), "session must not be killed by resize");
-        let _ = rt.cancel(id).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn status_polling_preserves_renderer_output_and_exit() {
-        const MARKER: &[u8] = b"STATUS_MARKER";
-        let rt = runtime_with_custom();
-        let id = rt
-            .start_session(echo_cfg(
-                "/bin/sh",
-                vec![
-                    "-c".into(),
-                    "read first; printf 'STATUS_MARKER\\n'; read second; exit 7".into(),
-                ],
-            ))
-            .await
-            .expect("start gated shell");
-        let backend = rt.backend_for(id).expect("renderer backend");
-        let term_id = rt.terminal_session_id(id).expect("terminal session id");
-        let mut status = rt.subscribe_status(id).expect("status receiver");
-
-        rt.send_message(id, "first\n")
-            .await
-            .expect("release output");
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let snapshot_has_marker = {
-                    let be = lock_recover(&backend, "terminal backend");
-                    be.snapshot(term_id)
-                        .expect("terminal snapshot")
-                        .cells
-                        .iter()
-                        .flat_map(|row| row.iter().map(|cell| cell.ch))
-                        .collect::<String>()
-                        .contains("STATUS_MARKER")
-                };
-                if snapshot_has_marker {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("marker did not reach terminal state");
-        // Give the poller two complete opportunities to drain. Under the
-        // former shared-queue design this removed the marker before the
-        // renderer assertion below.
-        tokio::time::sleep(POLL_INTERVAL * 2).await;
-        assert!(matches!(&*status.borrow(), AgentStatus::Running));
-
-        let first_renderer_events = {
-            let mut be = lock_recover(&backend, "terminal backend");
-            be.drain_events_for(term_id)
-        };
-        let first_bytes = first_renderer_events
-            .into_iter()
-            .filter_map(|event| match event {
-                TerminalEvent::Output { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        assert!(
-            first_bytes
-                .windows(MARKER.len())
-                .any(|bytes| bytes == MARKER),
-            "status poller stole renderer marker"
-        );
-
-        rt.send_message(id, "second\n").await.expect("release exit");
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !status.borrow().is_terminal() {
-                status.changed().await.expect("status task remains live");
-            }
-        })
-        .await
-        .expect("status did not observe exit");
-        let final_renderer_events = {
-            let mut be = lock_recover(&backend, "terminal backend");
-            be.drain_events_for(term_id)
-        };
-        assert!(
-            final_renderer_events
-                .iter()
-                .any(|event| matches!(event, TerminalEvent::Exit { code: Some(7), .. }))
-        );
-        rt.cancel(id).await.expect("remove completed session");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn backend_for_unknown_session_errors() {
-        let rt = runtime_with_custom();
-        let bogus = AgentSessionId::new(999);
-        // `SharedBackend` wraps a trait object so `Result<SharedBackend>`
-        // doesn't impl `Debug`; pattern-match the Err arm instead of
-        // `unwrap_err()`.
-        match rt.backend_for(bogus) {
-            Ok(_) => panic!("expected unknown-session error"),
-            Err(e) => assert!(e.to_string().contains("unknown session")),
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_session_id_unknown_session_errors() {
-        let rt = runtime_with_custom();
-        let bogus = AgentSessionId::new(999);
-        let err = rt.terminal_session_id(bogus).unwrap_err();
-        assert!(err.to_string().contains("unknown session"));
-    }
-
-    // After cancel removes the SessionEntry, backend_for must surface the
-    // typed error — proves the session table (not the OS-level handle) is
-    // the source of truth.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn backend_for_after_cancel_returns_unknown_session() {
-        let rt = runtime_with_custom();
-        let id = rt
-            .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
-            .await
-            .expect("start_session");
-        rt.cancel(id).await.expect("cancel");
-        match rt.backend_for(id) {
-            Ok(_) => panic!("expected unknown-session error after cancel"),
-            Err(e) => assert!(e.to_string().contains("unknown session")),
-        }
-    }
-}
+#[path = "runtime_impl_tests.rs"]
+mod tests;

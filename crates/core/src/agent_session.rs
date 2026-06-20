@@ -130,6 +130,72 @@ impl AgentStatus {
     }
 }
 
+/// Raw lifecycle word an agent CLI reports out-of-band via the OSC-9999
+/// sideband, before it is mapped to the richer `AgentStatus`. Mirrors the
+/// wire `state` string one-for-one so the scanner stays a dumb translator.
+///
+/// Distinct from `AgentStatus` because the wire vocabulary is a deliberately
+/// small, stable contract a hook author can emit without knowing OxideADE's
+/// internal state names; the mapping lives in the agents crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentSidebandState {
+    /// Agent is actively producing / running a tool.
+    Working,
+    /// Agent parked with nothing in flight.
+    Idle,
+    /// Agent is blocked on free-form user input.
+    Waiting,
+    /// Agent is blocked on an approve/deny decision.
+    NeedsApproval,
+    /// Agent finished its turn.
+    Done,
+}
+
+/// Structured detail extracted from one OSC-9999 sideband payload. Carried
+/// alongside `AgentStatus` in `AgentSnapshot` so the dashboard subline and
+/// approval card can show the live tool step / message without re-scanning
+/// raw PTY output. Every field is optional — a minimal payload may carry
+/// only a `state`.
+///
+/// Lengths are capped at parse time (tool 64 / input 256 / message 512 /
+/// session_id 64 bytes) so a hostile PTY process cannot bloat the UI; see
+/// the scanner.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SidebandDetail {
+    /// Tool the agent is invoking (e.g. `"Edit"`, `"Bash"`).
+    pub tool_name: Option<String>,
+    /// Short summary of the tool input (e.g. a file path).
+    pub tool_input_summary: Option<String>,
+    /// Free-form status message (e.g. `"rewriting auth"`).
+    pub last_message: Option<String>,
+    /// Agent-reported session UUID, if the payload supplied one.
+    pub session_id: Option<String>,
+}
+
+/// What the per-session watch channel publishes: the mapped `AgentStatus`
+/// plus the optional structured `detail` from the sideband that drove it.
+///
+/// Replaces the bare `AgentStatus` on the channel so sideband-fed UI can
+/// read tool/message detail without a second channel. `detail` is `None`
+/// whenever the regex/heuristic path (not a sideband event) drove the
+/// transition — stale tool text never lingers past the agent's next step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSnapshot {
+    pub status: AgentStatus,
+    pub detail: Option<SidebandDetail>,
+}
+
+impl AgentSnapshot {
+    /// Snapshot carrying just a status — the regex/heuristic path, which
+    /// has no sideband detail to attach (and clears any prior detail).
+    pub fn from_status(status: AgentStatus) -> Self {
+        Self {
+            status,
+            detail: None,
+        }
+    }
+}
+
 /// Persisted agent session — one row in the `agent_sessions` table.
 /// Distinct from the transient `AgentSessionId` runtime handle above.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

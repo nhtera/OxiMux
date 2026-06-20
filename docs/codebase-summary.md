@@ -261,14 +261,16 @@ src/
 ├── runtime.rs          AgentRuntime: Send+Sync+'static async trait (async-trait)
 │                       AgentSessionConfig { adapter, worktree_path, prompt, model, effort, env,
 │                         cols, rows, custom_command: Option<(String, Vec<String>)> }
-│                       AgentStatusStream = watch::Receiver<AgentStatus>
-│                       Methods: start_session / send_message / cancel / subscribe_status / current_status
+│                       AgentStatusStream = watch::Receiver<AgentSnapshot>  (AgentSnapshot {status, detail: Option<SidebandDetail>})
+│                       Methods: start_session / send_message / cancel / subscribe_status / current_status (still returns bare AgentStatus)
 │                       cancel() doc: SIGTERM-grace dance deferred to step 13; currently SIGKILL
 ├── runtime_impl.rs     CliRuntime — first concrete AgentRuntime impl
 │                       Adapter registry: HashMap<AgentAdapter, Arc<dyn CliAgentAdapter>>
 │                       Per-session state: own PortablePtyBackend behind Arc<Mutex<Box<dyn TerminalBackend>>>
-│                         + tokio 50ms poll task draining PTY events into StatusMachine
-│                         + watch::channel<AgentStatus> (multi-subscriber fan-out to badge / sidebar / dashboard)
+│                         + tokio 50ms poll task: poll_helpers::process_poll_events runs the
+│                           AgentOscScanner (osc_sideband.rs, OSC-9999 status sideband) before the
+│                           regex StatusMachine on OSC-stripped bytes, then drains into it
+│                         + watch::channel<AgentSnapshot> (multi-subscriber fan-out to badge / sidebar / dashboard)
 │                       start_session: spawn_blocking(openpty/fork) + optional stdin_seed write
 │                       cancel: spawn_blocking(drain_events+close) → await poll handle;
 │                         select!{sleep/handle} — aborts handle on timeout

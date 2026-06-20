@@ -4,6 +4,24 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-21 — Agents: structured OSC-9999 status sideband (cockpit rebuild Phase 1)
+
+**Commits**: _(local, pending; branch `feat/agent-sideband-phase1`)_
+**Touches**: `crates/core`, `crates/agents`, `crates/app` (5 consumer sites)
+
+Phase 1 of the agent-CLI cockpit rebuild (`plans/260620-agent-cli-cockpit-rebuild/`). A pure library change that lets an agent (or a hook) report structured status out-of-band via an OSC-9999 escape sequence — closing the Codex/Aider `EMPTY_PATTERNS` blindness where the regex `StatusMachine` can't classify the raw TUI. No relay protocol change, no UI behavior change.
+
+- **New `osc_sideband.rs`** — `AgentOscScanner`, a byte-level state machine that parses `ESC]9999;{"v":1,"state":...}BEL|ST` out of the PTY `Output` stream. It runs inside the existing 50 ms poll loop (no new `TerminalEvent` variant). It **strips only the 9999 sequences** from a `cleaned` copy of the chunk and feeds *that* to the regex machine — necessary because the regex fallback ("any output → Running") would otherwise fire on a pure-sideband chunk and clobber the reported status. CSI/SGR and all other OSCs pass through untouched. 4096-byte payload cap with truncate-and-continue; per-field caps (tool 64 / input 256 / msg 512 / session_id 64).
+- **`AgentSnapshot { status, detail: Option<SidebandDetail> }`** now flows on the per-session watch channel (was a bare `AgentStatus`); the regex path publishes `detail: None`, the sideband path attaches `tool` / `tool_input` / `msg`. `current_status()` still returns a bare `AgentStatus`.
+- **`StatusMachine::feed_sideband`** maps the sideband state and drives it through `force()`, inheriting the terminal-state guard and blocking-entry ring wipe.
+- **`poll_helpers.rs`** extracts the per-poll event processing; `runtime_impl.rs` dropped 891 → 527 LOC (cleared the 800 hard cap; its test module moved to `runtime_impl_tests.rs` via `#[path]`).
+
+Tests: 239 `oximux-agents` (15 scanner + 8 poll-helper + 3 feed_sideband new) + 917 `oximux-app` lib, all green; `clippy -D warnings` clean on core + agents. Code-reviewed (APPROVE_WITH_NITS, nits applied). OSC number = 9999.
+
+Deferred (by design): no agent emits OSC-9999 yet — that needs the hook installer (later phase). The `LatestStatusMap` → `AgentSnapshot` upgrade is deferred to Phase 2b (it is SQLite-sourced, independent of the watch channel).
+
+---
+
 ### 2026-06-20 — Restored agent terminals: eliminate status/render event theft
 
 **Commits**: _(local, pending)_

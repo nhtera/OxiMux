@@ -419,7 +419,7 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
 
 fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus> {
     if let PaneGroupTabKind::Agent { status_rx, .. } = kind {
-        Some(status_rx.borrow().clone())
+        Some(status_rx.borrow().status.clone())
     } else {
         None
     }

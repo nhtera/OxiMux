@@ -93,6 +93,12 @@ impl StatusMachine {
 
     /// Wall-clock tick — typically driven by the same 500 ms tokio timer
     /// the UI repaint uses. Decays `Running` → `Idle` after `IDLE_AFTER`.
+    ///
+    /// Note: `feed_sideband` does not touch `last_output_at` (it carries no
+    /// bytes), so a session driven purely by OSC-9999 packets never decays
+    /// here — it stays in the agent-reported state until the next sideband
+    /// packet or the exit event. That is intentional: when the agent says it
+    /// is running we trust it over the output-absence heuristic.
     pub fn tick(&mut self, now: Instant) -> Option<StatusTransition> {
         if !matches!(self.current, AgentStatus::Running) {
             return None;
@@ -140,6 +146,22 @@ impl StatusMachine {
             return None;
         }
         self.transition_to(status)
+    }
+
+    /// Apply an OSC-9999 sideband event. Maps the reported `state` (+ `tool`
+    /// for the `NeedsApproval` reason) to an `AgentStatus` and drives it
+    /// through `force()`, so the sideband path inherits every invariant the
+    /// manual override has — terminal-state guard, identity no-op, and the
+    /// blocking-entry ring wipe. Unlike the regex path it needs no matching
+    /// pattern, which is exactly what closes the `EMPTY_PATTERNS` gap for
+    /// adapters whose raw output the regex table can't classify.
+    pub fn feed_sideband(
+        &mut self,
+        state: oximux_core::AgentSidebandState,
+        tool: Option<String>,
+    ) -> Option<StatusTransition> {
+        let derived = crate::osc_sideband::map_state_to_status(state, tool);
+        self.force(derived)
     }
 
     fn push_to_ring(&mut self, bytes: &[u8]) {
@@ -394,5 +416,43 @@ mod tests {
     fn tick_before_any_output_is_noop() {
         let mut sm = StatusMachine::new(patterns(&[]));
         assert!(sm.tick(t0() + IDLE_AFTER * 2).is_none());
+    }
+
+    #[test]
+    fn feed_sideband_drives_needs_approval_without_patterns() {
+        use oximux_core::AgentSidebandState;
+        // Empty pattern table (the EMPTY_PATTERNS adapter case) — sideband
+        // still transitions the machine to NeedsApproval with its tool.
+        let mut sm = StatusMachine::new(patterns(&[]));
+        let t = sm
+            .feed_sideband(AgentSidebandState::NeedsApproval, Some("Bash".into()))
+            .unwrap();
+        assert_eq!(t.to, AgentStatus::NeedsApproval("Bash".into()));
+        assert_eq!(sm.current(), &AgentStatus::NeedsApproval("Bash".into()));
+    }
+
+    #[test]
+    fn feed_sideband_respects_terminal_guard() {
+        use oximux_core::AgentSidebandState;
+        let mut sm = StatusMachine::new(patterns(&[]));
+        sm.note_exit(Some(0));
+        // A Done session cannot be resurrected by a late sideband.
+        assert!(
+            sm.feed_sideband(AgentSidebandState::Working, None)
+                .is_none()
+        );
+        assert!(matches!(sm.current(), AgentStatus::Done { code: Some(0) }));
+    }
+
+    #[test]
+    fn feed_sideband_identity_is_noop() {
+        use oximux_core::AgentSidebandState;
+        let mut sm = StatusMachine::new(patterns(&[]));
+        sm.feed_sideband(AgentSidebandState::Working, None); // → Running
+        // Same state again — no transition emitted.
+        assert!(
+            sm.feed_sideband(AgentSidebandState::Working, None)
+                .is_none()
+        );
     }
 }

@@ -98,7 +98,7 @@ pub(crate) fn spawn_for_session(
         // Transitions may have raced ahead of the insert (subscribe happens
         // before this task runs) — sync whatever the channel holds now.
         let mut last = AgentStatus::Idle;
-        let current = status_rx.borrow_and_update().clone();
+        let current = status_rx.borrow_and_update().status.clone();
         if current != last {
             last = current.clone();
             write_status(&agent_repo, &row_id, &current, cx).await;
@@ -118,7 +118,7 @@ pub(crate) fn spawn_for_session(
                 let _ = weak.update(cx, |this, cx| this.mark_rail_dirty(cx));
                 return;
             }
-            let status = status_rx.borrow_and_update().clone();
+            let status = status_rx.borrow_and_update().status.clone();
             if status == last {
                 continue;
             }

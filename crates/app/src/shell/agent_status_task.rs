@@ -49,7 +49,7 @@ pub fn spawn_status_task(
 ) -> Task<()> {
     let mut status_rx = status_rx;
     cx.spawn(async move |weak, cx| {
-        let mut prev_status: AgentStatus = status_rx.borrow_and_update().clone();
+        let mut prev_status: AgentStatus = status_rx.borrow_and_update().status.clone();
         let mut suppress = SuppressMap::new();
         // Sleep-assertion stake for this agent; held exactly while Running.
         // The agent may already be Running at subscribe time (e.g. a watcher
@@ -60,7 +60,7 @@ pub fn spawn_status_task(
             if status_rx.changed().await.is_err() {
                 return;
             }
-            let new_status: AgentStatus = status_rx.borrow_and_update().clone();
+            let new_status: AgentStatus = status_rx.borrow_and_update().status.clone();
             // Use the label-change-aware notify: the agent status badge
             // appears/disappears with these transitions, which can change
             // chip width. The PaneGroup helper snapshots pin state +
