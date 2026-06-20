@@ -331,6 +331,10 @@ pub struct WorkspaceRoot {
     /// lifecycle as `rail_latest_status`. Gates the activity tail (only
     /// the primary CLI journals session logs).
     pub(crate) rail_latest_adapter: HashMap<String, String>,
+    /// Latest agent-session activity time per workspace id (raw RFC-3339:
+    /// `ended_at` if finished, else `started_at`) — same lifecycle as
+    /// `rail_latest_status`. Drives the dashboard's in-tier recency sort.
+    pub(crate) rail_last_active: HashMap<String, String>,
     /// Live tool-activity line per workspace id ("Bash: cargo test…"),
     /// refreshed by `_agent_activity_task` for Running primary-CLI
     /// sessions and pushed to the rail via `refresh_left_rail`.
@@ -993,6 +997,7 @@ impl WorkspaceRoot {
             rail_workspaces_by_project: HashMap::new(),
             rail_latest_status: HashMap::new(),
             rail_latest_adapter: HashMap::new(),
+            rail_last_active: HashMap::new(),
             agent_activity: HashMap::new(),
             usage_state: None,
             usage_popover_open: false,

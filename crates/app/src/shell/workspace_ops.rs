@@ -208,19 +208,29 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
 /// The adapter map (workspace id → adapter slug of the latest session)
 /// gates the activity tail: only the primary CLI journals session logs,
 /// so other adapters never get a tail attempt.
+/// Outputs of one rail DB gather, in the order the `WorkspaceRoot::rail_*`
+/// fields consume them: workspaces-by-project, latest status, latest adapter
+/// slug, and last-active timestamp — each keyed as documented on those fields.
+type RailDbData = (
+    HashMap<String, Vec<Workspace>>,
+    LatestStatusMap,
+    HashMap<String, String>,
+    HashMap<String, String>,
+);
+
 fn gather_rail_db_data(
     workspace_repo: &WorkspaceRepo,
     agent_repo: &AgentSessionRepo,
     projects: &[Project],
-) -> (
-    HashMap<String, Vec<Workspace>>,
-    LatestStatusMap,
-    HashMap<String, String>,
-) {
+) -> RailDbData {
     let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
         HashMap::with_capacity(projects.len());
     let mut latest_status: LatestStatusMap = HashMap::new();
     let mut latest_adapter: HashMap<String, String> = HashMap::new();
+    // Recency key for the dashboard's in-tier sort: a finished session's
+    // `ended_at`, else its `started_at` (still running). Raw RFC-3339 string —
+    // lexicographic ordering matches chronological for these UTC `Z` stamps.
+    let mut last_active: HashMap<String, String> = HashMap::new();
     for project in projects {
         let list = workspaces_with_primary_for(workspace_repo, project);
         for workspace in &list {
@@ -233,12 +243,24 @@ fn gather_rail_db_data(
             };
             if let Some(session) = &latest {
                 latest_adapter.insert(workspace.id.clone(), session.adapter_id.clone());
+                if let Some(ts) = session
+                    .ended_at
+                    .clone()
+                    .or_else(|| session.started_at.clone())
+                {
+                    last_active.insert(workspace.id.clone(), ts);
+                }
             }
             latest_status.insert(workspace.id.clone(), latest.map(|s| s.status));
         }
         workspaces_by_project.insert(project.id.clone(), list);
     }
-    (workspaces_by_project, latest_status, latest_adapter)
+    (
+        workspaces_by_project,
+        latest_status,
+        latest_adapter,
+        last_active,
+    )
 }
 
 /// Open the project repo, create a new worktree on branch `oximux/<slug>`,
@@ -1348,6 +1370,7 @@ impl WorkspaceRoot {
         }
         let latest_status = self.rail_latest_status.clone();
         let latest_adapter = self.rail_latest_adapter.clone();
+        let last_active = self.rail_last_active.clone();
         // Diff counts are refreshed out-of-band by the periodic, focus-gated
         // refresh loop (see `WorkspaceRoot::run_diff_refresh_round`); here we
         // only read the latest cached snapshot. Render never shells out to git.
@@ -1365,6 +1388,7 @@ impl WorkspaceRoot {
                 latest_adapter,
                 diff_counts_snapshot,
                 agent_activity_snapshot,
+                last_active,
                 cx,
             );
         });
@@ -1397,7 +1421,7 @@ impl WorkspaceRoot {
                 // All SQLite + the per-project `.git` stat run off the main
                 // thread (cx.spawn itself stays on the main thread — known
                 // footgun).
-                let (workspaces, statuses, adapters) = cx
+                let (workspaces, statuses, adapters, last_active) = cx
                     .background_executor()
                     .spawn(async move {
                         gather_rail_db_data(&workspace_repo, &agent_repo, &projects)
@@ -1407,6 +1431,7 @@ impl WorkspaceRoot {
                     this.rail_workspaces_by_project = workspaces;
                     this.rail_latest_status = statuses;
                     this.rail_latest_adapter = adapters;
+                    this.rail_last_active = last_active;
                     cx.notify();
                     if this.rail_dirty {
                         true

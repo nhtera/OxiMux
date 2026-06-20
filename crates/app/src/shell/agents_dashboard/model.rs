@@ -1,19 +1,16 @@
 //! Pure data layer for the agents dashboard — no GPUI runtime required.
 //!
 //! Provides `AgentRow` (one row per live/status-bearing workspace across all
-//! projects), `attention_rank` (priority tier for sorting), `sort_agent_rows`
-//! (stable sort by tier), and `build_agent_rows` (assembles the list from the
-//! snapshots already held by `LeftRail`).
+//! projects), `attention_rank` (priority tier for sorting), and
+//! `sort_agent_rows` (stable sort by tier, then recency within a tier).
 //!
-//! All functions are pure + testable without a window.
+//! Row assembly (`build_agent_rows`, `widest_row_index`) lives in the sibling
+//! `row_builder` module; this file is the pure `AgentRow` model + ranking and
+//! is testable without a window.
 
-use std::collections::{HashMap, HashSet};
+use oximux_core::{AgentStatus, Workspace};
 
-use oximux_core::{AgentStatus, Project, Workspace};
-use oximux_settings::Theme;
-
-use crate::shell::agent_presentation::{AgentVerb, agent_verb};
-use crate::shell::left_rail::LatestStatusMap;
+use crate::shell::agent_presentation::AgentVerb;
 use crate::shell::left_rail::workspace_row::DiffCounts;
 
 /// One row in the agents dashboard. Carries enough data to render the row
@@ -38,6 +35,17 @@ pub struct AgentRow {
     /// tailed from the agent CLI's session log on a background tick. `None`
     /// when idle, non-Running, or the log has no fresh tool call.
     pub activity: Option<String>,
+    /// Bundled SVG glyph for the workspace's latest agent adapter
+    /// (`icons/claude-code.svg` etc.), resolved once at build time so the
+    /// render closure never re-derives it. Falls back to the sparkles glyph.
+    pub icon_path: &'static str,
+    /// Recency key for the in-tier secondary sort: the latest session's
+    /// `ended_at` (terminal) else `started_at`, as the raw RFC-3339 string.
+    /// Storage stamps every value with `Utc::now().to_rfc3339()` (a `+00:00`
+    /// suffix, NOT `Z`), so all values share one format and lexicographic
+    /// ordering matches chronological — no parse to millis needed. `None`
+    /// for a live-but-never-started workspace.
+    pub last_active_at: Option<String>,
 }
 
 /// True for states a user should come look at: the session is blocked on
@@ -81,97 +89,18 @@ pub fn attention_rank(status: Option<&AgentStatus>, is_live: bool) -> u8 {
     }
 }
 
-/// Stable sort `rows` by `attention_rank`. Rows within a tier preserve their
-/// input order (`sort_by_key` is stable in Rust).
-pub fn sort_agent_rows(rows: &mut Vec<AgentRow>) {
-    rows.sort_by_key(|r| attention_rank(r.status.as_ref(), r.is_live));
-}
-
-/// Build the dashboard row list from `LeftRail`'s pushed-down snapshot fields.
-///
-/// One row per workspace that has an agent (status is `Some` OR `is_live`).
-/// Dormant workspaces (neither status nor live) are skipped. Calls
-/// `sort_agent_rows` before returning so callers get an attention-sorted list.
-pub fn build_agent_rows(
-    projects: &[Project],
-    workspaces_by_project: &HashMap<String, Vec<Workspace>>,
-    latest_status: &LatestStatusMap,
-    live_worktrees: &HashSet<String>,
-    diff_counts: &HashMap<String, DiffCounts>,
-    agent_activity: &HashMap<String, String>,
-    theme: Theme,
-) -> Vec<AgentRow> {
-    let mut rows: Vec<AgentRow> = Vec::new();
-
-    for project in projects {
-        let workspaces = match workspaces_by_project.get(&project.id) {
-            Some(ws) => ws,
-            None => continue,
-        };
-
-        for workspace in workspaces {
-            let status: Option<AgentStatus> = latest_status
-                .get(&workspace.id)
-                .cloned()
-                .flatten();
-            let is_live = live_worktrees.contains(&workspace.worktree_path);
-
-            // Skip dormant workspaces — no status and no live tab.
-            if status.is_none() && !is_live {
-                continue;
-            }
-
-            let verb = agent_verb(status.as_ref(), is_live, theme);
-            let diff = diff_counts.get(&workspace.worktree_path).cloned();
-            // Activity is only meaningful while Running — a stale "Bash: …"
-            // on a Done row would read as still-working.
-            let activity = matches!(status, Some(AgentStatus::Running))
-                .then(|| agent_activity.get(&workspace.id).cloned())
-                .flatten();
-
-            rows.push(AgentRow {
-                project_name: project.name.clone(),
-                workspace: workspace.clone(),
-                verb,
-                diff,
-                status,
-                is_live,
-                activity,
-            });
-        }
-    }
-
-    sort_agent_rows(&mut rows);
-    rows
-}
-
-/// Index of the row with the widest estimated label. Feeds `uniform_list`'s
-/// `with_width_from_item` so long rows scroll horizontally instead of clipping
-/// in the narrow rail. Pure character-count proxy — no GPUI measurement.
-pub fn widest_row_index(rows: &[AgentRow]) -> Option<usize> {
-    rows.iter()
-        .enumerate()
-        .max_by_key(|(_, r)| estimated_row_width(r))
-        .map(|(i, _)| i)
-}
-
-/// Rough rendered-width proxy for a row, in characters. Exact pixel width is
-/// irrelevant — only the relative ordering matters for picking the widest row.
-fn estimated_row_width(r: &AgentRow) -> usize {
-    let branch_len = if r.workspace.branch.is_empty() {
-        r.workspace.slug.len()
-    } else {
-        r.workspace.branch.len()
-    };
-    // Fixed budget for the diff chip when present (`+NN −NN`).
-    let diff_len = if r.diff.is_some() { 8 } else { 0 };
-    let activity_len = r.activity.as_ref().map_or(0, |a| a.len() + 3);
-    r.project_name.len()
-        + r.workspace.name.len()
-        + branch_len
-        + r.verb.label.len()
-        + diff_len
-        + activity_len
+/// Sort `rows` by `attention_rank`, then by recency (newest `last_active_at`
+/// first) within each tier. `slice::sort_by` is stable, so rows that tie on
+/// both keys (e.g. two running agents with no timestamp) keep their input
+/// order. A row with no timestamp sorts after rows that have one.
+pub fn sort_agent_rows(rows: &mut [AgentRow]) {
+    rows.sort_by(|a, b| {
+        attention_rank(a.status.as_ref(), a.is_live)
+            .cmp(&attention_rank(b.status.as_ref(), b.is_live))
+            // Descending recency: greater (newer / `Some` > `None`) RFC-3339
+            // string first, so compare b against a.
+            .then_with(|| b.last_active_at.cmp(&a.last_active_at))
+    });
 }
 
 // ─── unit tests ──────────────────────────────────────────────────────────────
@@ -179,34 +108,11 @@ fn estimated_row_width(r: &AgentRow) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::agent_presentation::agent_verb;
+    use oximux_settings::Theme;
 
     fn t() -> Theme {
         Theme::charcoal()
-    }
-
-    #[test]
-    fn needs_attention_matches_blocked_and_terminal_states() {
-        // Blocked-on-user and stopped states badge; in-flight states don't.
-        assert!(needs_attention(&AgentStatus::NeedsApproval("x".into())));
-        assert!(needs_attention(&AgentStatus::WaitingForInput));
-        assert!(needs_attention(&AgentStatus::Done { code: Some(0) }));
-        assert!(needs_attention(&AgentStatus::Done { code: None }));
-        assert!(needs_attention(&AgentStatus::Failed("boom".into())));
-        assert!(needs_attention(&AgentStatus::Interrupted));
-        assert!(!needs_attention(&AgentStatus::Running));
-        assert!(!needs_attention(&AgentStatus::Idle));
-    }
-
-    fn project(id: &str, name: &str) -> Project {
-        Project {
-            id: id.to_string(),
-            name: name.to_string(),
-            root_path: format!("/tmp/{id}"),
-            default_branch: "main".to_string(),
-            created_at: "2026-06-01T00:00:00Z".to_string(),
-            last_opened_at: None,
-            sort_order: 0.0,
-        }
     }
 
     fn workspace(id: &str, project_id: &str) -> Workspace {
@@ -227,6 +133,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn needs_attention_matches_blocked_and_terminal_states() {
+        // Blocked-on-user and stopped states badge; in-flight states don't.
+        assert!(needs_attention(&AgentStatus::NeedsApproval("x".into())));
+        assert!(needs_attention(&AgentStatus::WaitingForInput));
+        assert!(needs_attention(&AgentStatus::Done { code: Some(0) }));
+        assert!(needs_attention(&AgentStatus::Done { code: None }));
+        assert!(needs_attention(&AgentStatus::Failed("boom".into())));
+        assert!(needs_attention(&AgentStatus::Interrupted));
+        assert!(!needs_attention(&AgentStatus::Running));
+        assert!(!needs_attention(&AgentStatus::Idle));
+    }
+
     // ── attention_rank tiers ──────────────────────────────────────────────────
 
     #[test]
@@ -239,7 +158,10 @@ mod tests {
 
     #[test]
     fn tier_zero_waiting_for_input() {
-        assert_eq!(attention_rank(Some(&AgentStatus::WaitingForInput), false), 0);
+        assert_eq!(
+            attention_rank(Some(&AgentStatus::WaitingForInput), false),
+            0
+        );
     }
 
     #[test]
@@ -302,9 +224,18 @@ mod tests {
         assert_eq!(attention_rank(Some(&AgentStatus::Interrupted), false), 4);
     }
 
-    // ── sort_agent_rows — tier ordering ──────────────────────────────────────
+    // ── sort_agent_rows — tier ordering + recency ─────────────────────────────
 
     fn make_row(id: &str, status: Option<AgentStatus>, is_live: bool) -> AgentRow {
+        make_row_at(id, status, is_live, None)
+    }
+
+    fn make_row_at(
+        id: &str,
+        status: Option<AgentStatus>,
+        is_live: bool,
+        last_active_at: Option<&str>,
+    ) -> AgentRow {
         let theme = t();
         let verb = agent_verb(status.as_ref(), is_live, theme);
         AgentRow {
@@ -315,6 +246,8 @@ mod tests {
             status,
             is_live,
             activity: None,
+            icon_path: "icons/sparkles.svg",
+            last_active_at: last_active_at.map(str::to_string),
         }
     }
 
@@ -371,7 +304,7 @@ mod tests {
 
     #[test]
     fn sort_is_stable_within_tier() {
-        // Two running agents — input order must be preserved.
+        // Two running agents, no timestamps — input order must be preserved.
         let mut rows = vec![
             make_row("first", Some(AgentStatus::Running), false),
             make_row("second", Some(AgentStatus::Running), false),
@@ -379,6 +312,67 @@ mod tests {
         sort_agent_rows(&mut rows);
         assert_eq!(rows[0].workspace.id, "first");
         assert_eq!(rows[1].workspace.id, "second");
+    }
+
+    #[test]
+    fn sort_running_rows_by_recency_descending() {
+        // SC1: within the same attention tier, the newer session floats up.
+        let mut rows = vec![
+            make_row_at(
+                "older",
+                Some(AgentStatus::Running),
+                false,
+                Some("2026-06-19T08:00:00+00:00"),
+            ),
+            make_row_at(
+                "newer",
+                Some(AgentStatus::Running),
+                false,
+                Some("2026-06-21T08:00:00+00:00"),
+            ),
+        ];
+        sort_agent_rows(&mut rows);
+        assert_eq!(rows[0].workspace.id, "newer");
+        assert_eq!(rows[1].workspace.id, "older");
+    }
+
+    #[test]
+    fn sort_row_with_timestamp_floats_above_one_without() {
+        // Within a tier, a row carrying a recency timestamp beats one missing it.
+        let mut rows = vec![
+            make_row_at("no-ts", Some(AgentStatus::Running), false, None),
+            make_row_at(
+                "has-ts",
+                Some(AgentStatus::Running),
+                false,
+                Some("2026-06-20T00:00:00+00:00"),
+            ),
+        ];
+        sort_agent_rows(&mut rows);
+        assert_eq!(rows[0].workspace.id, "has-ts");
+    }
+
+    #[test]
+    fn approval_row_floats_above_newer_running() {
+        // SC2: tier-0 (NeedsApproval) beats tier-1 (Running) regardless of a
+        // newer running timestamp — the attention tier is the primary key.
+        let mut rows = vec![
+            make_row_at(
+                "running-newer",
+                Some(AgentStatus::Running),
+                false,
+                Some("2026-06-21T12:00:00+00:00"),
+            ),
+            make_row_at(
+                "approval-older",
+                Some(AgentStatus::NeedsApproval("x".into())),
+                false,
+                Some("2026-06-10T00:00:00+00:00"),
+            ),
+        ];
+        sort_agent_rows(&mut rows);
+        assert_eq!(rows[0].workspace.id, "approval-older");
+        assert_eq!(rows[1].workspace.id, "running-newer");
     }
 
     #[test]
@@ -394,191 +388,5 @@ mod tests {
         let ids: Vec<&str> = rows.iter().map(|r| r.workspace.id.as_str()).collect();
         // Expected order: d (0), c (1), e (2), a (3), b (4)
         assert_eq!(ids, vec!["d", "c", "e", "a", "b"]);
-    }
-
-    // ── build_agent_rows — filtering + assembly ───────────────────────────────
-
-    #[test]
-    fn dormant_workspaces_are_skipped() {
-        let p = project("p1", "Proj");
-        let ws = workspace("a", "p1");
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![ws]);
-        let rows = build_agent_rows(
-            &[p],
-            &wbp,
-            &HashMap::new(),   // no status
-            &HashSet::new(),   // not live
-            &HashMap::new(),
-            &HashMap::new(),
-            t(),
-        );
-        assert!(rows.is_empty(), "dormant workspace must be skipped");
-    }
-
-    #[test]
-    fn live_workspace_without_status_is_included() {
-        let p = project("p1", "Proj");
-        let ws = workspace("a", "p1");
-        let worktree_path = ws.worktree_path.clone();
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![ws]);
-        let mut live = HashSet::new();
-        live.insert(worktree_path);
-        let rows = build_agent_rows(&[p], &wbp, &HashMap::new(), &live, &HashMap::new(), &HashMap::new(), t());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].workspace.id, "a");
-    }
-
-    #[test]
-    fn status_bearing_workspace_is_included() {
-        let p = project("p1", "Proj");
-        let ws = workspace("a", "p1");
-        let mut status_map: LatestStatusMap = HashMap::new();
-        status_map.insert("a".to_string(), Some(AgentStatus::Running));
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![ws]);
-        let rows = build_agent_rows(
-            &[p],
-            &wbp,
-            &status_map,
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            t(),
-        );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].workspace.id, "a");
-    }
-
-    #[test]
-    fn diff_counts_are_carried_through() {
-        let p = project("p1", "Proj");
-        let ws = workspace("a", "p1");
-        let worktree_path = ws.worktree_path.clone();
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![ws]);
-        let mut live = HashSet::new();
-        live.insert(worktree_path.clone());
-        let mut diff_map = HashMap::new();
-        diff_map.insert(worktree_path, DiffCounts { added: 5, removed: 3 });
-        let rows = build_agent_rows(&[p], &wbp, &HashMap::new(), &live, &diff_map, &HashMap::new(), t());
-        let diff = rows[0].diff.as_ref().expect("diff must be carried");
-        assert_eq!(diff.added, 5);
-        assert_eq!(diff.removed, 3);
-    }
-
-    #[test]
-    fn verb_is_resolved_via_agent_presentation() {
-        let p = project("p1", "Proj");
-        let ws = workspace("a", "p1");
-        let mut status_map: LatestStatusMap = HashMap::new();
-        status_map.insert("a".to_string(), Some(AgentStatus::WaitingForInput));
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![ws]);
-        let rows = build_agent_rows(
-            &[p],
-            &wbp,
-            &status_map,
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            t(),
-        );
-        assert_eq!(rows[0].verb.label, "Waiting for input");
-        assert_eq!(rows[0].verb.color, t().status_warn);
-    }
-
-    #[test]
-    fn rows_are_sorted_on_return() {
-        let p = project("p1", "Proj");
-        let wa = workspace("a", "p1");
-        let wb = workspace("b", "p1");
-        let mut status_map: LatestStatusMap = HashMap::new();
-        // 'a' = Done (tier 3), 'b' = WaitingForInput (tier 0)
-        status_map.insert("a".to_string(), Some(AgentStatus::Done { code: Some(0) }));
-        status_map.insert("b".to_string(), Some(AgentStatus::WaitingForInput));
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![wa, wb]);
-        let rows = build_agent_rows(
-            &[p],
-            &wbp,
-            &status_map,
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            t(),
-        );
-        assert_eq!(rows[0].workspace.id, "b");
-        assert_eq!(rows[1].workspace.id, "a");
-    }
-
-    #[test]
-    fn activity_attached_to_running_rows_only() {
-        let p = project("p1", "Proj");
-        let run = workspace("run", "p1");
-        let done = workspace("done", "p1");
-        let mut status_map: LatestStatusMap = HashMap::new();
-        status_map.insert("run".to_string(), Some(AgentStatus::Running));
-        status_map.insert("done".to_string(), Some(AgentStatus::Done { code: Some(0) }));
-        let mut activity = HashMap::new();
-        activity.insert("run".to_string(), "Bash: cargo test".to_string());
-        // Stale entry for a finished session must NOT surface.
-        activity.insert("done".to_string(), "Bash: old".to_string());
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![run, done]);
-        let rows = build_agent_rows(
-            &[p],
-            &wbp,
-            &status_map,
-            &HashSet::new(),
-            &HashMap::new(),
-            &activity,
-            t(),
-        );
-        let running = rows.iter().find(|r| r.workspace.id == "run").unwrap();
-        let finished = rows.iter().find(|r| r.workspace.id == "done").unwrap();
-        assert_eq!(running.activity.as_deref(), Some("Bash: cargo test"));
-        assert!(finished.activity.is_none());
-    }
-
-    // ── widest_row_index ──────────────────────────────────────────────────────
-
-    #[test]
-    fn widest_row_index_empty_is_none() {
-        assert_eq!(widest_row_index(&[]), None);
-    }
-
-    #[test]
-    fn widest_row_index_picks_longest_label() {
-        let rows = vec![
-            make_row("a", Some(AgentStatus::Running), false),
-            make_row(
-                "a-much-longer-workspace-identifier-for-width",
-                Some(AgentStatus::Running),
-                false,
-            ),
-        ];
-        assert_eq!(widest_row_index(&rows), Some(1));
-    }
-
-    #[test]
-    fn project_name_is_carried_through() {
-        let p = project("p1", "MyProject");
-        let ws = workspace("a", "p1");
-        let mut status_map: LatestStatusMap = HashMap::new();
-        status_map.insert("a".to_string(), Some(AgentStatus::Running));
-        let mut wbp = HashMap::new();
-        wbp.insert("p1".to_string(), vec![ws]);
-        let rows = build_agent_rows(
-            &[p],
-            &wbp,
-            &status_map,
-            &HashSet::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            t(),
-        );
-        assert_eq!(rows[0].project_name, "MyProject");
     }
 }

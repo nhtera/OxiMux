@@ -161,6 +161,11 @@ pub struct LeftRail {
     /// and pushed down with the rest of the snapshot. Rendered on Running
     /// dashboard rows only.
     agent_activity: HashMap<String, String>,
+    /// Latest agent-session activity time per workspace id, as the raw
+    /// RFC-3339 string (`ended_at` for a finished session, else `started_at`).
+    /// Drives the dashboard's in-tier recency sort. Sourced from SQLite in
+    /// `gather_rail_db_data` and pushed down with the rest of the snapshot.
+    last_active: HashMap<String, String>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -248,6 +253,7 @@ impl LeftRail {
             live_worktrees: HashSet::new(),
             diff_counts: HashMap::new(),
             agent_activity: HashMap::new(),
+            last_active: HashMap::new(),
             width: px(density.w_left_rail),
             resizing: false,
             settings_repo: None,
@@ -663,6 +669,7 @@ impl LeftRail {
         latest_adapter: HashMap<String, String>,
         diff_counts: HashMap<String, DiffCounts>,
         agent_activity: HashMap<String, String>,
+        last_active: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) {
         let project_changed = self.active_project_id != active_project_id;
@@ -697,6 +704,7 @@ impl LeftRail {
         self.live_worktrees = live_worktrees;
         self.diff_counts = diff_counts;
         self.agent_activity = agent_activity;
+        self.last_active = last_active;
 
         // Keep the Tasks page's project in sync; re-fetch only when the active
         // project actually changes while the page is open.
@@ -796,6 +804,8 @@ impl Render for LeftRail {
                 &self.live_worktrees,
                 &self.diff_counts,
                 &self.agent_activity,
+                &self.latest_adapter,
+                &self.last_active,
                 self.weak_root.clone(),
                 &self.agents_scroll,
                 theme,

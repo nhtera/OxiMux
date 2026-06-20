@@ -8,6 +8,7 @@
 //! per-frame work inside the virtualization layer.
 
 pub mod model;
+pub mod row_builder;
 pub mod row_render;
 
 use std::collections::{HashMap, HashSet};
@@ -20,10 +21,11 @@ use gpui::{
 use oximux_core::{Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::agents_dashboard::model::{AgentRow, build_agent_rows, widest_row_index};
+use crate::shell::agents_dashboard::model::AgentRow;
+use crate::shell::agents_dashboard::row_builder::{build_agent_rows, widest_row_index};
 use crate::shell::agents_dashboard::row_render::render_agent_row;
-use crate::shell::left_rail::workspace_row::DiffCounts;
 use crate::shell::left_rail::LatestStatusMap;
+use crate::shell::left_rail::workspace_row::DiffCounts;
 use crate::workspace_root::WorkspaceRoot;
 
 /// Render the full agents dashboard body. Returns an `AnyElement` sized to
@@ -39,6 +41,8 @@ pub fn render_agents_dashboard(
     live_worktrees: &HashSet<String>,
     diff_counts: &HashMap<String, DiffCounts>,
     agent_activity: &HashMap<String, String>,
+    latest_adapter: &HashMap<String, String>,
+    last_active: &HashMap<String, String>,
     weak_root: WeakEntity<WorkspaceRoot>,
     scroll: &UniformListScrollHandle,
     theme: Theme,
@@ -53,6 +57,8 @@ pub fn render_agents_dashboard(
         live_worktrees,
         diff_counts,
         agent_activity,
+        latest_adapter,
+        last_active,
         theme,
     );
 

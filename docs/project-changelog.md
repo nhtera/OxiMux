@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-21 — Agents dashboard: two-line status cards (cockpit rebuild Phase 2a)
+
+**Commits**: _(local, pending; branch `feat/agent-sideband-phase1`)_
+**Touches**: `crates/app/src/shell/agents_dashboard/*`, `left_rail`, `workspace_ops`, `workspace_root`
+
+Phase 2a of the agent-CLI cockpit rebuild — a status-driven dashboard upgrade. Independent of Phase 1; uses existing `AgentRow` data plus two new per-workspace maps.
+
+- **Two-line agent cards** (`row_render.rs`): a 28px icon ring whose border carries the status color and whose brand glyph (claude-code / codex / aider / sparkles) is tinted to the verb color; line 1 = `project · branch` + verb chip + diff counts, line 2 = the live activity tail (Running) or a `Review →` CTA (action-required). Row height 38 → 52.
+- **Attention treatment**: tier-0 rows (NeedsApproval / WaitingForInput) get floating-card chrome plus a 2px left accent bar so they stand out.
+- **Recency secondary sort**: within an attention tier, the most-recently-active session floats to the top. The key is the latest session's `ended_at` (else `started_at`) as the raw RFC-3339 string — storage stamps one consistent format, so lexicographic ordering matches chronological (no `chrono` needed in the app crate). Sourced from SQLite in `gather_rail_db_data` and threaded like the existing adapter map.
+- **`row_builder.rs`** (new): `build_agent_rows` / `widest_row_index` extracted from `model.rs`, which drops back under the size warning. The agent icon is resolved once per row in the builder, never in the `uniform_list` render closure.
+
+Tests: `cargo test -p oximux-app --lib` = 922 passed (+5 new: recency-descending, tier-0-beats-newer-running, icon-path population). Code-reviewed (APPROVE_WITH_NITS). GUI-visual verification is environment-blocked; correctness is headless-tested.
+
+---
+
 ### 2026-06-21 — Agents: structured OSC-9999 status sideband (cockpit rebuild Phase 1)
 
 **Commits**: _(local, pending; branch `feat/agent-sideband-phase1`)_

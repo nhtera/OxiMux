@@ -1,47 +1,69 @@
 //! Single-row painter for the agents dashboard.
 //!
-//! Each row is laid out as a single nowrap horizontal strip:
+//! Each row is a two-line card:
 //!
-//!   [status dot] [project · slug/branch] [activity?] [verb chip] [+A −B chip?]
+//!   ┌──────────────────────────────────────────────────────────┐
+//!   │ (◐)  project · branch            verb-chip      +A −B     │  line 1
+//!   │      Bash: cargo test… / Review →                         │  line 2
+//!   └──────────────────────────────────────────────────────────┘
 //!
-//! Nowrap keeps the row from reflowing inside `uniform_list` so horizontal
-//! scroll works correctly when the rail is narrow.
+//! The leading element is a 28px icon ring whose border carries the status
+//! color and whose glyph is the agent's brand mark. Action-required rows
+//! (tier 0: NeedsApproval / WaitingForInput) get floating-card chrome plus a
+//! 2px left accent bar so they read as "come look at me".
 
-use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px};
+use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px, svg};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agents_dashboard::model::{AgentRow, attention_rank};
-use crate::shell::left_rail::workspace_row::STATUS_DOT_SIZE;
+use crate::ui::overlay::FloatingSurface;
 
-/// Row height used for the `uniform_list` item height. Matches workspace rows
-/// so the rail looks visually consistent when switching between views.
-pub(crate) const ROW_HEIGHT: f32 = 38.0;
+/// Row height for the `uniform_list` item. Taller than the old single-line
+/// row to fit the two-line card + 28px icon ring with breathing room.
+pub(crate) const ROW_HEIGHT: f32 = 52.0;
+
+/// Diameter of the agent icon ring.
+const ICON_RING_SIZE: f32 = 28.0;
+/// Size of the brand glyph inside the ring.
+const ICON_GLYPH_SIZE: f32 = 16.0;
 
 /// Paint one `AgentRow` into a GPUI element. Height is `ROW_HEIGHT` so all
 /// rows have the same fixed height for `uniform_list`.
-///
-/// Layout (single horizontal line, nowrap):
-///   status dot · project label · separator · slug · spacer · verb · diff chip
 pub fn render_agent_row(
     row: &AgentRow,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> Div {
-    // Status dot — reuses STATUS_DOT_SIZE from workspace_row for visual parity.
-    let dot = div()
-        .size(px(STATUS_DOT_SIZE))
-        .rounded_full()
-        .bg(row.verb.color)
-        .flex_shrink_0();
+    let verb_color = row.verb.color;
+    // Tier 0 = the user is being asked something (approval / input).
+    let is_attention = attention_rank(row.status.as_ref(), row.is_live) == 0;
 
-    // "ProjectName · slug" or "ProjectName · branch" label.
+    // Icon ring: status-color border around the agent's brand glyph. The
+    // glyph is tinted to the same status color so the ring reads as one mark.
+    let icon_ring = div()
+        .flex_shrink_0()
+        .size(px(ICON_RING_SIZE))
+        .rounded_full()
+        .border_1()
+        .border_color(verb_color)
+        .bg(theme.bg_panel)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path(row.icon_path)
+                .size(px(ICON_GLYPH_SIZE))
+                .text_color(verb_color),
+        );
+
+    // ── line 1: "Project · branch" (truncates) + verb chip + diff chip ──
     let branch_or_slug = if !row.workspace.branch.is_empty() {
         row.workspace.branch.as_str()
     } else {
         row.workspace.slug.as_str()
     };
-    let loc_text = format!("{} · {}", row.project_name, branch_or_slug);
     let loc_label = div()
         .flex_1()
         .min_w_0()
@@ -49,54 +71,20 @@ pub fn render_agent_row(
         .text_color(theme.fg_base)
         .overflow_hidden()
         .whitespace_nowrap()
-        .child(loc_text);
+        .child(format!("{} · {}", row.project_name, branch_or_slug));
 
-    // Live activity line for Running rows ("Bash: cargo test…") — dim,
-    // truncating before the verb chip so the status stays visible.
-    let activity_label = row.activity.as_ref().map(|a| {
-        div()
-            .min_w_0()
-            .max_w(px(260.))
-            .text_size(px(typography.t_sub_label))
-            .text_color(theme.fg_subtle)
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(a.clone())
-    });
-
-    // Verb chip (colored label e.g. "Running", "Waiting for input").
     let verb_chip = div()
         .flex_shrink_0()
         .text_size(px(typography.t_sub_label))
-        .text_color(row.verb.color)
+        .text_color(verb_color)
         .whitespace_nowrap()
         .child(row.verb.label);
-
-    // Review affordance: action-required rows (NeedsApproval / WaitingForInput)
-    // get a discoverable call-to-action. Clicking anywhere on the row already
-    // jumps to the agent's tab (the only place the user can act — approval is
-    // handled in the agent's own TUI, not programmatically); this chip just
-    // makes that affordance visible. Tinted with the verb color for urgency.
-    let review_chip = (attention_rank(row.status.as_ref(), row.is_live) == 0).then(|| {
-        div()
-            .flex_shrink_0()
-            .ml(px(density.gap_inline))
-            .px(px(density.gap_inline))
-            .rounded(px(density.r_chip))
-            .border_1()
-            .border_color(row.verb.color)
-            .text_size(px(typography.t_sub_label))
-            .text_color(row.verb.color)
-            .whitespace_nowrap()
-            .child("Review →")
-    });
 
     // Diff chip: "+A −B" — omitted when diff is absent or both counts are zero.
     let diff_chip = row.diff.as_ref().and_then(|d| {
         if d.added == 0 && d.removed == 0 {
             return None;
         }
-        let label = format!("+{} −{}", d.added, d.removed);
         Some(
             div()
                 .flex_shrink_0()
@@ -104,11 +92,64 @@ pub fn render_agent_row(
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
                 .whitespace_nowrap()
-                .child(label),
+                .child(format!("+{} −{}", d.added, d.removed)),
         )
     });
 
-    div()
+    let line1 = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .gap(px(density.gap_inline))
+        .child(loc_label)
+        .child(verb_chip)
+        .children(diff_chip);
+
+    // ── line 2: review CTA (tier 0) else the live activity tail ──
+    // Action-required rows surface a discoverable "Review →" — clicking the
+    // row jumps to the agent's tab (approval happens in its own TUI). Running
+    // rows show the tailed tool-activity line; everything else leaves line 2
+    // empty (the taller card still reads cleanly).
+    let line2_child = if is_attention {
+        Some(
+            div()
+                .min_w_0()
+                .text_size(px(typography.t_sub_label))
+                .text_color(verb_color)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child("Review →"),
+        )
+    } else {
+        row.activity.as_ref().map(|a| {
+            div()
+                .min_w_0()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(a.clone())
+        })
+    };
+    let line2 = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .children(line2_child);
+
+    // Stacked text column next to the icon ring.
+    let text_col = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .gap(px(2.))
+        .child(line1)
+        .child(line2);
+
+    let root = div()
         .flex()
         .flex_row()
         .items_center()
@@ -117,11 +158,23 @@ pub fn render_agent_row(
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .cursor_pointer()
-        .hover(|s| s.bg(theme.hover_overlay))
-        .child(dot)
-        .child(loc_label)
-        .children(activity_label)
-        .child(verb_chip)
-        .children(review_chip)
-        .children(diff_chip)
+        .child(icon_ring)
+        .child(text_col);
+
+    if is_attention {
+        // Floating-card chrome (relative + border + rounded + top highlight)
+        // plus a 2px left accent bar in the warn color. The bar is absolute,
+        // anchored to the `relative` context floating_chrome establishes.
+        root.floating_chrome(&theme, &density).child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(2.))
+                .bg(theme.status_warn),
+        )
+    } else {
+        root.hover(|s| s.bg(theme.hover_overlay))
+    }
 }
