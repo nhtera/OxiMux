@@ -176,9 +176,10 @@ impl Render for PaneGroup {
             .active_sub_divider()
             .map(|active| sub_divider_capture_overlay(entity.clone(), active.axis));
 
-        // Prompt composer bar, docked at the bottom of the active agent pane
-        // while open.
-        let composer_overlay: Option<AnyElement> = self.compose_bar.as_ref().map(|composer| {
+        // Prompt composer bar, docked at the bottom of the active agent pane,
+        // shown ONLY over its origin agent (so it can never render on, or submit
+        // to, a different tab).
+        let composer_overlay: Option<AnyElement> = self.composer_for_active_tab().map(|composer| {
             div()
                 .absolute()
                 .left_0()

@@ -363,6 +363,11 @@ pub struct PaneGroup {
     /// Subscription to the composer's submit/dismiss events. Held alongside the
     /// composer; dropped with it.
     _compose_sub: Option<Subscription>,
+    /// Agent session the open composer belongs to. The composer renders (and a
+    /// draft submits) ONLY while this exact agent is the active tab — switching
+    /// to another tab hides it (the draft survives) and guarantees a submit can
+    /// never misroute to a different agent.
+    compose_session: Option<AgentSessionId>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -419,6 +424,7 @@ impl PaneGroup {
             _external_mutation_task: None,
             compose_bar: None,
             _compose_sub: None,
+            compose_session: None,
         }
     }
 
@@ -2695,8 +2701,12 @@ impl PaneGroup {
             self.close_composer(cx);
             return;
         }
-        let root = match self.active_tab().map(|t| &t.kind) {
-            Some(PaneGroupTabKind::Agent { worktree_path, .. }) => worktree_path.clone(),
+        let (root, session_id) = match self.active_tab().map(|t| &t.kind) {
+            Some(PaneGroupTabKind::Agent {
+                worktree_path,
+                session_id,
+                ..
+            }) => (worktree_path.clone(), *session_id),
             _ => return,
         };
         let theme = self.theme;
@@ -2717,6 +2727,7 @@ impl PaneGroup {
         window.focus(&handle, cx);
         self.compose_bar = Some(composer);
         self._compose_sub = Some(sub);
+        self.compose_session = Some(session_id);
         cx.notify();
     }
 
@@ -2734,7 +2745,9 @@ impl PaneGroup {
             // draft lands in the agent's input and the user presses Enter.
             let bp_on = self.active_agent_bracketed_paste(cx);
             let bytes = crate::shell::compose_bar::send_formatter::format_send_bytes(draft, bp_on);
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            // `format_send_bytes` only ever emits valid UTF-8 (the payload is an
+            // already-valid String, ESC and the bracket markers are ASCII).
+            let text = String::from_utf8(bytes).expect("composer bytes are valid UTF-8");
             window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
             self.apply_first_prompt_title(draft);
         }
@@ -2744,7 +2757,22 @@ impl PaneGroup {
     fn close_composer(&mut self, cx: &mut Context<Self>) {
         self.compose_bar = None;
         self._compose_sub = None;
+        self.compose_session = None;
         cx.notify();
+    }
+
+    /// The open composer, but only while its origin agent is the active tab —
+    /// the render gate that keeps it from showing over (or submitting to) a
+    /// different tab. Returns the entity to render, or `None` to hide it.
+    fn composer_for_active_tab(&self) -> Option<&Entity<crate::shell::compose_bar::ComposerBar>> {
+        let composer = self.compose_bar.as_ref()?;
+        let session = self.compose_session?;
+        match self.active_tab().map(|t| &t.kind) {
+            Some(PaneGroupTabKind::Agent { session_id, .. }) if *session_id == session => {
+                Some(composer)
+            }
+            _ => None,
+        }
     }
 
     /// Whether the active agent tab's terminal currently has bracketed paste on.

@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder, px,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{
     Enter as InputEnter, Escape as InputEscape, Input, InputEvent, InputState, MoveDown, MoveUp,
@@ -296,32 +296,33 @@ impl Render for ComposerBar {
                     cx.propagate();
                 }
             }))
-            .capture_action(cx.listener(|this, _: &InputEnter, window, cx| {
+            // The Input context binds `enter`→Enter{secondary:false} (newline)
+            // and `⌘↵`/`ctrl+↵`→Enter{secondary:true}; both dispatch as the
+            // `Enter` action and would be consumed by the field before any
+            // `on_key_down` could see them, so submit/accept MUST live here.
+            .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
                 if this.dropdown_open {
+                    // Enter accepts the highlighted file — must not reach the
+                    // field (which would insert a newline).
                     this.accept_selected(window, cx);
+                } else if action.secondary {
+                    // ⌘↵ submits. Consumed so the field gets no trailing newline.
+                    this.submit(window, cx);
                 } else {
-                    // Bare Enter falls through to the multi-line field (newline).
+                    // Bare / Shift+Enter falls through to the field (newline).
                     cx.propagate();
                 }
             }))
             .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                // Not propagating is load-bearing: it suppresses the field's own
+                // Escape handler so the first Esc closes the dropdown and the
+                // second dismisses the bar.
                 if this.dropdown_open {
                     this.dropdown_open = false;
                     this.suggestions.clear();
                     cx.notify();
                 } else {
                     this.dismiss(window, cx);
-                }
-            }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                // ⌘↵ / Ctrl+↵ submits — but only with the dropdown closed, so an
-                // open dropdown's Enter unambiguously accepts the highlighted
-                // file (handled by the capture above) instead of also sending.
-                if !this.dropdown_open
-                    && ev.keystroke.key.as_str() == "enter"
-                    && (ev.keystroke.modifiers.platform || ev.keystroke.modifiers.control)
-                {
-                    this.submit(window, cx);
                 }
             }))
             .on_mouse_down(MouseButton::Left, |_e, _w, _cx| {
