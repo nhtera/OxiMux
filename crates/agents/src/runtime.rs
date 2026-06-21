@@ -47,6 +47,10 @@ pub struct AgentSessionConfig {
     /// and ignore the field. The launch dialog (step 10) populates it when
     /// the user picks "Custom command".
     pub custom_command: Option<(String, Vec<String>)>,
+    /// Whether this spawn resumes / forks a prior session. `None` for a fresh
+    /// launch; each adapter's `build_command` maps the variant to its own
+    /// resume/fork CLI shape.
+    pub resumption: oximux_core::SessionResumption,
 }
 
 /// Multi-consumer status subscription.

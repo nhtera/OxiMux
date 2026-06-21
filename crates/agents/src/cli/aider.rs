@@ -130,6 +130,7 @@ mod tests {
             cols: 80,
             rows: 24,
             custom_command: None,
+            resumption: oximux_core::SessionResumption::None,
         }
     }
 

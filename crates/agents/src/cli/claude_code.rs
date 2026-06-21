@@ -97,6 +97,20 @@ impl CliAgentAdapter for ClaudeCodeAdapter {
         // are self-contained per ADR-002.
         let mut args: Vec<String> = Vec::new();
 
+        // Resume / fork flags lead so the session selection is unambiguous.
+        // `--resume <id>` continues the prior conversation; `--fork-session`
+        // branches a copy that leaves the original intact; a fresh
+        // `--session-id` makes the new session's log path deterministic.
+        if let Some(id) = cfg.resumption.source_id() {
+            args.push("--resume".to_string());
+            args.push(id.to_string());
+            if cfg.resumption.is_fork() {
+                args.push("--fork-session".to_string());
+            }
+            args.push("--session-id".to_string());
+            args.push(uuid::Uuid::new_v4().to_string());
+        }
+
         if let Some(model) = cfg.model.as_deref().filter(|s| !s.trim().is_empty()) {
             args.push("--model".to_string());
             args.push(model.to_string());
@@ -156,6 +170,7 @@ mod tests {
             cols: 80,
             rows: 24,
             custom_command: None,
+            resumption: oximux_core::SessionResumption::None,
         }
     }
 
@@ -211,6 +226,29 @@ mod tests {
         c.prompt = Some("hello world".into());
         let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
         assert_eq!(spec.args, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn build_command_includes_resume_flag() {
+        let mut c = cfg();
+        c.resumption = oximux_core::SessionResumption::Resume { id: "abc".into() };
+        let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
+        // Leads with --resume <id>, no --fork-session, plus a fresh --session-id.
+        assert_eq!(&spec.args[0..2], &["--resume".to_string(), "abc".into()]);
+        assert!(!spec.args.iter().any(|a| a == "--fork-session"));
+        let sid = spec.args.iter().position(|a| a == "--session-id").expect("--session-id present");
+        assert!(spec.args.get(sid + 1).is_some_and(|v| !v.is_empty()), "uuid follows --session-id");
+    }
+
+    #[test]
+    fn build_command_includes_fork_session_flag() {
+        let mut c = cfg();
+        c.resumption = oximux_core::SessionResumption::Fork { id: "x".into() };
+        let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
+        // Fork = resume + --fork-session, before the fresh --session-id.
+        assert_eq!(&spec.args[0..3], &["--resume".to_string(), "x".into(), "--fork-session".into()]);
+        assert_eq!(spec.args.get(3).map(String::as_str), Some("--session-id"));
+        assert!(spec.args.get(4).is_some_and(|v| !v.is_empty()), "uuid follows --session-id");
     }
 
     #[test]

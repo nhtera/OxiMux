@@ -1882,6 +1882,7 @@ impl WorkspaceRoot {
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
                 custom_command: None,
+                resumption: oximux_core::SessionResumption::None,
             };
             let session_id = match runtime.start_session(cfg).await {
                 Ok(id) => id,

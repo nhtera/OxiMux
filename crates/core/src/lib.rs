@@ -18,6 +18,7 @@ pub mod git_state;
 pub mod pane_session;
 pub mod pr_state;
 pub mod project;
+pub mod session_resumption;
 pub mod workspace;
 
 pub use agent_session::{
@@ -37,6 +38,7 @@ pub use git_state::{
 pub use pane_session::PaneSession;
 pub use pr_state::{ForgeRefKind, PrState};
 pub use project::Project;
+pub use session_resumption::SessionResumption;
 pub use workspace::{ViewMode, Workspace, WorktreeSettings};
 
 use serde::{Deserialize, Serialize};

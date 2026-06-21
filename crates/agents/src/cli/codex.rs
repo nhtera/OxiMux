@@ -72,6 +72,13 @@ impl CliAgentAdapter for CodexAdapter {
         // test below.
         let mut args: Vec<String> = Vec::new();
 
+        // Resume / fork is a SUBCOMMAND for codex (the first argv token), not a
+        // flag: `codex resume <id>` / `codex fork <id>`. It must lead the argv.
+        if let Some(id) = cfg.resumption.source_id() {
+            args.push(if cfg.resumption.is_fork() { "fork" } else { "resume" }.to_string());
+            args.push(id.to_string());
+        }
+
         if let Some(model) = cfg.model.as_deref().filter(|s| !s.trim().is_empty()) {
             args.push("-m".to_string());
             args.push(model.to_string());
@@ -121,6 +128,7 @@ mod tests {
             cols: 80,
             rows: 24,
             custom_command: None,
+            resumption: oximux_core::SessionResumption::None,
         }
     }
 
@@ -180,6 +188,23 @@ mod tests {
         c.prompt = Some("refactor this module".into());
         let spec = CodexAdapter.build_command(&c).unwrap();
         assert_eq!(spec.args, vec!["refactor this module".to_string()]);
+    }
+
+    #[test]
+    fn build_command_codex_resume() {
+        let mut c = cfg();
+        c.resumption = oximux_core::SessionResumption::Resume { id: "y".into() };
+        let spec = CodexAdapter.build_command(&c).unwrap();
+        // Resume is the leading subcommand token, not a flag.
+        assert_eq!(&spec.args[0..2], &["resume".to_string(), "y".into()]);
+    }
+
+    #[test]
+    fn build_command_codex_fork() {
+        let mut c = cfg();
+        c.resumption = oximux_core::SessionResumption::Fork { id: "z".into() };
+        let spec = CodexAdapter.build_command(&c).unwrap();
+        assert_eq!(&spec.args[0..2], &["fork".to_string(), "z".into()]);
     }
 
     #[test]

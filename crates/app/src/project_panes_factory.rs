@@ -559,6 +559,7 @@ fn restore_agent_tab(
         cols: DEFAULT_AGENT_COLS,
         rows: DEFAULT_AGENT_ROWS,
         custom_command: None,
+        resumption: oximux_core::SessionResumption::None,
     };
     let persisted_clone = persisted.clone();
     cx.spawn_in(window, async move |root, cx| {

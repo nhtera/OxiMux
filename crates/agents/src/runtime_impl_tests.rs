@@ -39,6 +39,7 @@ fn echo_cfg(program: &str, args: Vec<String>) -> AgentSessionConfig {
         cols: 80,
         rows: 24,
         custom_command: Some((program.to_string(), args)),
+        resumption: oximux_core::SessionResumption::None,
     }
 }
 
