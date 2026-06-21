@@ -1,0 +1,47 @@
+# Claude Code approval-card byte verification
+
+Captured live from `claude` v2.1.185 on 2026-06-23 by driving an interactive
+session in a PTY and triggering a Bash tool-approval prompt (probe command:
+`echo PROBE-$RANDOM-$(date +%s)`). Locks `APPROVE_BYTES` / `DENY_BYTES` in
+`crates/app/src/shell/approval_card.rs`.
+
+## Approve = b"1\r"   (0x31 0x0d)
+
+The menu always lists "Yes" as option 1, pre-highlighted (the `❯` cursor sits
+on it). Pressing `1` selects it; the trailing CR (raw-mode Enter) confirms.
+Holds for both the 2-option and 3-option menu shapes.
+
+## Deny = b"\x1b"   (Esc)
+
+Pressing `Esc` cancels the prompt regardless of how many options are shown:
+the captured session printed `Interrupted · What should Claude do instead?`
+and the tool was NOT run. (Esc then drops into an OPTIONAL "what should Claude
+do instead?" free-text field, which the card's free-text input already feeds.)
+
+A fixed numeric `2` is WRONG for deny — the menu shape is command-dependent:
+
+  * command with shell expansion/substitution (cannot become an allow-rule),
+    e.g. `echo $RANDOM`        ->  2 options:  `1. Yes`   `2. No`
+  * simple static command (rule-able), e.g. `ls`
+        ->  3 options:  `1. Yes`   `2. Yes, and don't ask again`   `3. No (esc)`
+
+So `2` means "No" for the first but "Yes, and don't ask again" (an approve that
+ALSO writes a permanent allow-rule) for the second. `Esc` is the only reliable,
+universal deny.
+
+## Captured menu (verbatim, ANSI-stripped)
+
+    Bash command
+      echo PROBE-$RANDOM-$(date +%s)
+       Echo probe string with random and timestamp
+    Contains simple_expansion
+    Do you want to proceed?
+    ❯ 1. Yes
+      2. No
+      Esc to cancel · Tab to amend · ctrl+e to explain
+
+## If a future Claude Code version differs
+
+Re-run the capture (interactive `claude` in a PTY, trigger a Bash prompt) and
+update `APPROVE_BYTES` / `DENY_BYTES` + the `approve_and_deny_bytes_match_live_prompt`
+test to match, noting the version range here.

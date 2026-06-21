@@ -368,6 +368,12 @@ pub struct PaneGroup {
     /// to another tab hides it (the draft survives) and guarantees a submit can
     /// never misroute to a different agent.
     compose_session: Option<AgentSessionId>,
+    /// Quick-reply approval card, mounted over the active tab while its agent
+    /// session is blocked on an approval prompt (`NeedsApproval`). Held across
+    /// frames so its free-text field and double-send guard survive re-renders;
+    /// dropped — which resets that state — the moment the status clears or a
+    /// non-agent tab becomes active.
+    approval_card: Option<Entity<crate::shell::approval_card::ApprovalCard>>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -425,6 +431,7 @@ impl PaneGroup {
             compose_bar: None,
             _compose_sub: None,
             compose_session: None,
+            approval_card: None,
         }
     }
 

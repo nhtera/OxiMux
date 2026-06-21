@@ -8,6 +8,7 @@ pub mod agent_presentation;
 pub mod agent_session_persistence;
 pub mod agents_dashboard;
 pub mod add_project_dialog;
+pub mod approval_card;
 pub mod agent_status_badge;
 pub mod agent_status_task;
 pub mod agent_tab_label;

@@ -41,6 +41,81 @@ const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
 /// trailing button cluster stays balanced.
 const ELLIPSIS_BUTTON_WIDTH_PX: f32 = 28.0;
 
+impl PaneGroup {
+    /// Mount (or drop) the quick-reply approval card for the active tab.
+    ///
+    /// The card appears only while the ACTIVE tab hosts an agent blocked on an
+    /// approval prompt; a background agent's blocked state is surfaced by its
+    /// tab-strip dot, not an overlay over an unrelated tab. The card entity is
+    /// reused across frames for the same session (so its free-text field and
+    /// double-send guard persist) and dropped — resetting that state — as soon
+    /// as the status clears or a non-agent tab takes focus. Returns the
+    /// positioned overlay element, or `None` when no card should show.
+    fn reconcile_approval_card(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use oximux_core::{AgentAdapter, AgentSessionId, AgentStatus};
+
+        let desired: Option<(AgentSessionId, AgentAdapter, AgentStatus)> =
+            self.active_tab().and_then(|tab| match &tab.kind {
+                PaneGroupTabKind::Agent {
+                    session_id,
+                    adapter,
+                    status_rx,
+                    ..
+                } => {
+                    let status = status_rx.borrow().status.clone();
+                    matches!(status, AgentStatus::NeedsApproval(_))
+                        .then_some((*session_id, *adapter, status))
+                }
+                _ => None,
+            });
+
+        let Some((session_id, adapter, status)) = desired else {
+            self.approval_card = None;
+            return None;
+        };
+
+        let reuse = self
+            .approval_card
+            .as_ref()
+            .is_some_and(|card| card.read(cx).session_id() == session_id);
+        if !reuse {
+            let theme = self.theme;
+            let density = self.density;
+            let typography = self.typography.clone();
+            let reason = match &status {
+                AgentStatus::NeedsApproval(r) => r.clone(),
+                _ => String::new(),
+            };
+            self.approval_card = Some(cx.new(|cx| {
+                crate::shell::approval_card::ApprovalCard::new(
+                    session_id, adapter, reason, theme, density, typography, window, cx,
+                )
+            }));
+        }
+
+        let card = self.approval_card.as_ref()?.clone();
+        // Fold the live status into the card every frame (refreshes the reason
+        // and advances the double-send guard).
+        card.update(cx, |c, _| c.note_status(&status));
+
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(24.0))
+                .flex()
+                .justify_center()
+                .child(card)
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Drag-cancel cleanup: chips' `on_drag_move` fires only while a
@@ -176,21 +251,31 @@ impl Render for PaneGroup {
             .active_sub_divider()
             .map(|active| sub_divider_capture_overlay(entity.clone(), active.axis));
 
+        // Quick-reply approval card over the active agent tab when it is
+        // blocked on an approval prompt. Reconciled here so it re-evaluates on
+        // every status-driven repaint (auto-dismiss falls out for free).
+        let approval_overlay: Option<AnyElement> = self.reconcile_approval_card(window, cx);
+
         // Prompt composer bar, docked at the bottom of the active agent pane,
         // shown ONLY over its origin agent (so it can never render on, or submit
-        // to, a different tab).
-        let composer_overlay: Option<AnyElement> = self.composer_for_active_tab().map(|composer| {
-            div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom(px(12.0))
-                .px(px(24.0))
-                .flex()
-                .justify_center()
-                .child(div().w_full().max_w(px(720.0)).child(composer.clone()))
-                .into_any_element()
-        });
+        // to, a different tab). Suppressed while the approval card is showing so
+        // the two bottom-docked overlays never stack.
+        let composer_overlay: Option<AnyElement> = if approval_overlay.is_some() {
+            None
+        } else {
+            self.composer_for_active_tab().map(|composer| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(12.0))
+                    .px(px(24.0))
+                    .flex()
+                    .justify_center()
+                    .child(div().w_full().max_w(px(720.0)).child(composer.clone()))
+                    .into_any_element()
+            })
+        };
 
         div()
             .id(SharedString::from(format!(
@@ -228,6 +313,7 @@ impl Render for PaneGroup {
                 }
             }))
             .child(body)
+            .when_some(approval_overlay, |s, overlay| s.child(overlay))
             .when_some(composer_overlay, |s, overlay| s.child(overlay))
             .when_some(sub_divider_capture, |s, overlay| s.child(overlay))
             .when_some(mru_overlay, |s, overlay| s.child(overlay))

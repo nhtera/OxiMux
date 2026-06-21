@@ -151,6 +151,38 @@ async fn send_message_unknown_session_errors() {
     assert!(err.to_string().contains("unknown session"));
 }
 
+// The approval card answers a numeric prompt with a carriage-return-terminated
+// reply (`"1\r"`). This proves that contract end-to-end against a real readline:
+// `read x` only returns — letting the shell reach `exit 0` — if the CR actually
+// submits the line. A `\n`-or-nothing terminator would leave `read` blocked and
+// the session would never go terminal, timing the test out.
+#[tokio::test(flavor = "multi_thread")]
+async fn cr_terminated_reply_submits_a_readline() {
+    let rt = runtime_with_custom();
+    let id = rt
+        .start_session(echo_cfg("/bin/sh", vec!["-c".into(), "read x; exit 0".into()]))
+        .await
+        .expect("start_session");
+    let mut rx = rt.subscribe_status(id).expect("subscribe");
+    rt.send_message(id, "1\r").await.expect("send_message");
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if rx.borrow().status.is_terminal() {
+                return rx.borrow().status.clone();
+            }
+            if rx.changed().await.is_err() {
+                panic!("status sender closed before terminal status");
+            }
+        }
+    })
+    .await;
+    let final_status = result.expect("readline never returned — CR did not submit the line");
+    match final_status {
+        AgentStatus::Done { code } => assert_eq!(code, Some(0), "expected clean exit"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_unknown_session_errors() {
     let rt = runtime_with_custom();
