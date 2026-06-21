@@ -1617,6 +1617,7 @@ impl WorkspaceRoot {
                                 cwd.clone(),
                                 None,
                                 None,
+                                oximux_core::SessionResumption::None,
                                 window,
                                 cx,
                             );

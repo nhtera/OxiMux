@@ -288,6 +288,19 @@ pub struct SendTextToActiveAgent {
     pub text: String,
 }
 
+/// Payload action raised by the session-history picker to relaunch a past
+/// session. The workspace resolves the adapter slug + cwd (falling back to
+/// the active project's directory when the log omits one) and threads
+/// resume/fork into the spawn. No `Default` — `AgentAdapter` has none.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct ResumeAgentSession {
+    pub session_id: String,
+    pub adapter: oximux_core::AgentAdapter,
+    pub cwd: String,
+    pub fork: bool,
+}
+
 actions!(
     oximux,
     [
@@ -295,6 +308,9 @@ actions!(
         /// elevated multi-line draft with `@file` autocomplete. No-op when the
         /// active tab is not an agent.
         OpenComposerBar,
+        /// Open the session-history picker — a centered modal listing past
+        /// Claude Code / Codex sessions to resume or fork. Bound to Cmd+Shift+H.
+        OpenSessionHistory,
         /// Split the focused pane horizontally — new pane on the right.
         /// Alias of `SplitRight`. Kept for legacy callers; the Cmd+D
         /// keybinding now drives `SplitSubPaneRight` instead so it

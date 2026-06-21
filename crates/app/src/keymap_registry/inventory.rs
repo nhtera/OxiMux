@@ -15,7 +15,7 @@ use crate::actions::{
     DismissOverlay, FindNextMatch, FindPrevMatch, FocusNextPane, FocusNextSubPane, FocusPrevPane,
     FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent,
     NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
-    OpenComposerBar, OpenProjectPicker, OpenQuickOpen,
+    OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
     ReloadCustomCommands, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
@@ -180,6 +180,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         Navigation,
         "cmd-i",
         OpenComposerBar
+    ),
+    entry!(
+        "open_session_history",
+        "Session history (resume / fork)",
+        Navigation,
+        "cmd-shift-h",
+        OpenSessionHistory
     ),
     // Command palette uses cmd-shift-p (cmd-k is the commit dialog).
     entry!(

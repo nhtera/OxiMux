@@ -78,7 +78,8 @@ use crate::actions::{
     OpenAddProjectDialog,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
-    NewBrowserTab, NewTab, OpenProjectPicker, OpenQuickOpen, OpenSettings, OpenTabContextMenuAt,
+    NewBrowserTab, NewTab, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory, OpenSettings,
+    OpenTabContextMenuAt, ResumeAgentSession,
     OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, Search, SelectExplorerTab,
     SelectFilesTab,
     SelectSearchTab,
@@ -117,6 +118,7 @@ use crate::shell::{
     pane_actions::{PaneActionsAnchor, PaneActionsMenu},
     project_panes::ProjectPanes,
     project_picker::{OnPick, ProjectPickerEvent, ProjectPickerModal},
+    session_history::{SessionHistoryEvent, SessionHistoryModal},
     settings_modal::{SettingsModal, SettingsModalEvent},
     right_sidebar::{
         RightSidebar, activity_bar::render_tab_buttons, layout::DEFAULT_PANEL_WIDTH, tab::RightTab,
@@ -161,6 +163,7 @@ pub struct WorkspaceRoot {
     pub(crate) right_sidebar: Option<Entity<RightSidebar>>,
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
+    pub(crate) session_history: Entity<SessionHistoryModal>,
     pub(crate) pane_actions: Entity<PaneActionsMenu>,
     pub(crate) tab_context_menu: Entity<TabContextMenu>,
     /// File-tree right-click menu (Open / Open to the Side / Copy Path /
@@ -228,6 +231,7 @@ pub struct WorkspaceRoot {
     /// Same focus-restore guard for the command palette and project picker
     /// (both grab focus on open).
     pub(crate) _palette_sub: Option<Subscription>,
+    pub(crate) _session_history_sub: Option<Subscription>,
     pub(crate) _project_picker_sub: Option<Subscription>,
     /// Workspace create / rename dialog (Cmd+Shift+N + sidebar rename).
     pub(crate) workspace_dialog: Entity<WorkspaceDialog>,
@@ -581,6 +585,8 @@ impl WorkspaceRoot {
             rail.init_layout(app_state.settings_repo.clone());
         });
         let palette = cx.new(|cx| PaletteModal::new(theme, density, typography.clone(), cx));
+        let session_history =
+            cx.new(|cx| SessionHistoryModal::new(theme, density, typography.clone(), cx));
         let pane_actions = cx.new(|_| PaneActionsMenu::new(theme, density, typography.clone()));
         let tab_context_menu = cx.new(|_| TabContextMenu::new(theme, density, typography.clone()));
         let file_tree_context_menu =
@@ -617,7 +623,16 @@ impl WorkspaceRoot {
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
                     // One-click launch: always the agent's default settings.
-                    this.spawn_agent_tab(kind, id, cwd, None, None, window, cx)
+                    this.spawn_agent_tab(
+                        kind,
+                        id,
+                        cwd,
+                        None,
+                        None,
+                        oximux_core::SessionResumption::None,
+                        window,
+                        cx,
+                    )
                 }
             });
         });
@@ -692,6 +707,13 @@ impl WorkspaceRoot {
             &palette,
             window,
             |root, _palette, _ev: &PaletteEvent, window, cx| {
+                root.focus_handle.focus(window, cx);
+            },
+        );
+        let session_history_sub = cx.subscribe_in(
+            &session_history,
+            window,
+            |root, _modal, _ev: &SessionHistoryEvent, window, cx| {
                 root.focus_handle.focus(window, cx);
             },
         );
@@ -953,6 +975,7 @@ impl WorkspaceRoot {
             right_sidebar,
             left_rail,
             palette,
+            session_history,
             pane_actions,
             tab_context_menu,
             file_tree_context_menu,
@@ -981,6 +1004,7 @@ impl WorkspaceRoot {
             _floating_terminal_sub: None,
             _settings_modal_sub: Some(settings_modal_sub),
             _palette_sub: Some(palette_sub),
+            _session_history_sub: Some(session_history_sub),
             _project_picker_sub: Some(project_picker_sub),
             app_state,
             project_picker,
@@ -1838,6 +1862,7 @@ impl WorkspaceRoot {
         cwd: std::path::PathBuf,
         model: Option<String>,
         effort: Option<String>,
+        resumption: oximux_core::SessionResumption,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1882,7 +1907,7 @@ impl WorkspaceRoot {
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
                 custom_command: None,
-                resumption: oximux_core::SessionResumption::None,
+                resumption,
             };
             let session_id = match runtime.start_session(cfg).await {
                 Ok(id) => id,
@@ -2677,6 +2702,50 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenSessionHistory, window, cx| {
+                this.close_modal_overlays(cx);
+                this.session_history.update(cx, |m, cx| m.open(window, cx));
+            }))
+            .on_action(cx.listener(|this, action: &ResumeAgentSession, window, cx| {
+                let resumption = if action.fork {
+                    oximux_core::SessionResumption::Fork {
+                        id: action.session_id.clone(),
+                    }
+                } else {
+                    oximux_core::SessionResumption::Resume {
+                        id: action.session_id.clone(),
+                    }
+                };
+                let adapter_id =
+                    crate::shell::session_history::picker::adapter_slug(action.adapter);
+                // Codex index rows carry no cwd — root the relaunch at the
+                // active project so the agent lands in the right worktree.
+                let cwd = if action.cwd.is_empty() {
+                    this.active_project_panes()
+                        .map(|panes| panes.read(cx).cwd().clone())
+                        .or_else(|| {
+                            this.active_project
+                                .as_ref()
+                                .map(|p| std::path::PathBuf::from(&p.root_path))
+                        })
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        })
+                } else {
+                    std::path::PathBuf::from(&action.cwd)
+                };
+                this.spawn_agent_tab(
+                    action.adapter,
+                    adapter_id,
+                    cwd,
+                    None,
+                    None,
+                    resumption,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &OpenWorkspaceJump, window, cx| {
                 this.close_modal_overlays(cx);
@@ -3687,6 +3756,8 @@ impl Render for WorkspaceRoot {
             })
             // Palette modal — appended above the rest of the chrome.
             .child(self.palette.clone())
+            // Session-history picker — same z-level as the palette.
+            .child(self.session_history.clone())
             // Settings modal — appended last so it paints above all other
             // children (last child = topmost z-layer in GPUI).
             .child(self.settings_modal.clone())
