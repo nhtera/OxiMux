@@ -91,6 +91,17 @@ fn main() {
         std::process::exit(run_notify_cli(&rt));
     }
 
+    // `oximux agent-status --state <working|needs_approval|idle>` — structured
+    // status for the current pane, invoked by agent hooks (Claude Code
+    // `PreToolUse`/`PermissionRequest`/`Stop`). Reads the hook event JSON on
+    // stdin (for the tool name), reads OXIMUX_PTY_ID, and asks the relay to
+    // emit an OSC-9999 status packet on that PTY's stream. Hooks run with no
+    // controlling terminal, so this relay round-trip — not a `/dev/tty` write —
+    // is how status reaches the app. Short-circuits the GUI/db boot entirely.
+    if std::env::args().nth(1).as_deref() == Some("agent-status") {
+        std::process::exit(run_agent_status_cli(&rt));
+    }
+
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
     // without the git column — the rest of the shell still works.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -723,6 +734,91 @@ fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
             }
             Err(err) => {
                 eprintln!("oximux notify: request failed: {err}");
+                1
+            }
+        }
+    })
+}
+
+/// `oximux agent-status` CLI entry. Mirrors `run_notify_cli`: resolves the
+/// relay socket/token, connects, and sends `Request::AgentStatus` for the pane
+/// named by `OXIMUX_PTY_ID`. The relay frames the payload as OSC-9999 on that
+/// PTY's output stream, where the app's scanner decodes it. Returns a process
+/// exit code (0 = ok). Writes only to stderr — agent hooks capture stdout.
+fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
+    // Parse `--state <s>`. Only the tool-bearing states read stdin (the hook
+    // event JSON) to extract the tool name; `idle` (Stop) carries none.
+    let mut state = String::new();
+    let mut args = std::env::args().skip(2);
+    while let Some(a) = args.next() {
+        if a == "--state" {
+            state = args.next().unwrap_or_default();
+        }
+    }
+    let state = match state.as_str() {
+        "working" | "needs_approval" | "idle" => state,
+        _ => {
+            eprintln!(
+                "oximux agent-status: --state must be working|needs_approval|idle (got {state:?})"
+            );
+            return 1;
+        }
+    };
+    let tool = if state == "idle" {
+        None
+    } else {
+        // Only the tool-bearing states read stdin (the hook event JSON).
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_to_string(&mut buf);
+        oximux_app::agent_status_hooks::tool_name_from_hook_json(&buf)
+    };
+
+    let pty_id = match std::env::var("OXIMUX_PTY_ID") {
+        Ok(id) if !id.is_empty() => id,
+        _ => {
+            // Not inside an OxiMux pane (e.g. a plain shell): nothing to report.
+            // Exit 0 so the hook never fails the agent.
+            return 0;
+        }
+    };
+    let payload = oximux_app::agent_status_hooks::build_status_payload(&state, tool.as_deref());
+
+    let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
+        eprintln!("oximux agent-status: cannot resolve application data directory");
+        return 1;
+    };
+    let supervisor = RelaySupervisor::new(
+        data_dir.join(APP_DATA_SUBDIR),
+        home.join("Library/Logs").join(APP_DATA_SUBDIR),
+    );
+    let socket = supervisor.socket_path();
+    let token = match std::fs::read_to_string(supervisor.token_path()) {
+        Ok(t) => t.trim().to_owned(),
+        Err(err) => {
+            eprintln!("oximux agent-status: relay not reachable ({err})");
+            return 1;
+        }
+    };
+    rt.block_on(async move {
+        let client = match RelayClient::connect(&socket, &token).await {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("oximux agent-status: connect failed: {err}");
+                return 1;
+            }
+        };
+        match client
+            .request(oximux_relay_proto::Request::AgentStatus { pty_id, payload })
+            .await
+        {
+            Ok(oximux_relay_proto::Response::Ok) => 0,
+            Ok(other) => {
+                eprintln!("oximux agent-status: unexpected response: {other:?}");
+                1
+            }
+            Err(err) => {
+                eprintln!("oximux agent-status: request failed: {err}");
                 1
             }
         }

@@ -570,6 +570,12 @@ async fn handle_request(
             Ok(()) => Response::Ok,
             Err(e) => err_from(&e),
         },
+        Request::AgentStatus { pty_id, payload } => {
+            match registry.agent_status(&pty_id, &payload) {
+                Ok(()) => Response::Ok,
+                Err(e) => err_from(&e),
+            }
+        }
         Request::ListPtys => Response::PtyList(registry.list()),
         Request::Stats => Response::StatsOk(registry.stats()),
         Request::Shutdown => {

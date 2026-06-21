@@ -1,37 +1,41 @@
-//! Opt-in OSC-9999 status hooks for Claude Code.
+//! Opt-in agent status hooks for Claude Code.
 //!
 //! When `OXIMUX_STATUS_HOOKS=1`, a Claude Code agent is launched with a
-//! `--settings` block that wires three hooks to a small shell script which
-//! emits an OSC-9999 status packet to the PTY:
+//! `--settings` block that wires three hooks to the `oximux agent-status` CLI:
 //!
-//! - `PreToolUse`        → `{"state":"working","tool":<name>}`
-//! - `PermissionRequest` → `{"state":"needs_approval","tool":<name>}`
-//! - `Stop`              → `{"state":"idle"}`
+//! - `PreToolUse`        → `--state working`        (`{"state":"working","tool":<name>}`)
+//! - `PermissionRequest` → `--state needs_approval` (`{"state":"needs_approval","tool":<name>}`)
+//! - `Stop`              → `--state idle`           (`{"state":"idle"}`)
 //!
-//! OxiMux's scanner (`oximux-agents` `osc_sideband`) reads those packets from
-//! the raw PTY stream and drives structured agent status. This closes the gap
-//! where the regex status machine can't see the agent's internal tool steps.
+//! The CLI reads the hook event JSON on stdin (for the tool name), reads
+//! `OXIMUX_PTY_ID` (injected by the relay at spawn), and asks the relay to
+//! emit an OSC-9999 status packet on that PTY's output stream. OxiMux's scanner
+//! (`oximux-agents` `osc_sideband`) decodes it into structured agent status.
+//!
+//! Why a relay round-trip and not a `/dev/tty` write: Claude runs hook commands
+//! detached (new session, no controlling terminal), so `/dev/tty` is `ENXIO`.
+//! Routing the status back through the relay — keyed by the env-injected pane
+//! id — is the only path that works for a hook. (the reference UX and the reference cockpit solve the same
+//! constraint the same way: a callback to the app over an IPC channel.)
 //!
 //! Design notes:
-//! - **App-owned, non-destructive.** The hook script lives in the app data
-//!   dir; the hooks are passed as a `--settings` JSON STRING at spawn, never
-//!   written into the user's `~/.claude` config. Because `--settings` replaces
-//!   (not deep-merges) the `hooks` key, we read the user's existing global
-//!   hooks and merge ours in, so their hooks keep firing.
-//! - **Opt-in.** Off unless `OXIMUX_STATUS_HOOKS=1` — the agent's `--settings`
-//!   is only touched when the user explicitly turns this on.
+//! - **App-owned, non-destructive.** The hooks are passed as a `--settings`
+//!   JSON STRING at spawn, never written into the user's `~/.claude` config.
+//!   Because `--settings` replaces (not deep-merges) the `hooks` key, we read
+//!   the user's existing global hooks and merge ours in, so theirs keep firing.
+//! - **Opt-in.** Off unless `OXIMUX_STATUS_HOOKS=1`.
 //! - **`Stop` → `idle`, not `done`.** A finished turn is not a dead process;
 //!   the terminal `Done` state comes from the PTY exit event, not a hook.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
 
-/// The hook script, bundled at compile time and written to disk on first use.
-const HOOK_SCRIPT: &str = include_str!("../assets/hooks/oximux-status-emit.sh");
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
-const SCRIPT_NAME: &str = "oximux-status-emit.sh";
 const ENABLE_ENV: &str = "OXIMUX_STATUS_HOOKS";
+
+/// Cap the reported tool name so a pathological hook payload can't bloat the
+/// OSC-9999 packet. The scanner caps again, but trimming at the source is free.
+const MAX_TOOL_LEN: usize = 64;
 
 /// True when the user opted into status hooks (`OXIMUX_STATUS_HOOKS=1`).
 pub fn enabled() -> bool {
@@ -40,79 +44,25 @@ pub fn enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn hooks_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR).join("hooks"))
-}
-
-/// Write the bundled hook script to the app data dir (idempotent; rewrites
-/// only when the on-disk copy differs) and mark it executable. Returns the
-/// absolute path, or `None` when there is no data dir or IO fails.
-pub fn install_script() -> Option<PathBuf> {
-    let dir = hooks_dir()?;
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(%err, "status-hooks: create hooks dir failed");
-        return None;
-    }
-    let path = dir.join(SCRIPT_NAME);
-    let needs_write = std::fs::read_to_string(&path)
-        .map(|cur| cur != HOOK_SCRIPT)
-        .unwrap_or(true);
-    if needs_write && let Err(err) = std::fs::write(&path, HOOK_SCRIPT) {
-        tracing::warn!(%err, "status-hooks: write script failed");
-        return None;
-    }
-    // Fail closed: a non-executable script makes every hook invocation error,
-    // so don't hand back a path we couldn't mark runnable.
-    if !set_executable(&path) {
-        return None;
-    }
-    Some(path)
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let mut perm = meta.permissions();
-            if perm.mode() & 0o111 == 0 {
-                perm.set_mode(0o755);
-                if let Err(err) = std::fs::set_permissions(path, perm) {
-                    tracing::warn!(%err, "status-hooks: chmod +x failed");
-                    return false;
-                }
-            }
-            true
-        }
-        Err(err) => {
-            tracing::warn!(%err, "status-hooks: stat for chmod failed");
-            false
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> bool {
-    true
-}
-
 /// Build the `--settings` JSON string wiring the three status hooks to
-/// `script_path`, merging the user's existing global hooks so the key-replace
-/// semantics of `--settings` don't disable them.
-pub fn build_settings_json(script_path: &Path) -> String {
-    build_settings_json_with(read_user_hooks(), script_path)
+/// `oximux agent-status`, merging the user's existing global hooks so the
+/// key-replace semantics of `--settings` don't disable them. `binary_path` is
+/// the absolute path to the running `oximux` binary (resolved via
+/// `current_exe`) — the hook invokes it as a short-lived CLI.
+pub fn build_settings_json(binary_path: &Path) -> String {
+    build_settings_json_with(read_user_hooks(), binary_path)
 }
 
-fn build_settings_json_with(user_hooks: Option<Value>, script_path: &Path) -> String {
+fn build_settings_json_with(user_hooks: Option<Value>, binary_path: &Path) -> String {
     let mut hooks = user_hooks
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
-    // The command is the single-quoted script path (the app-data path contains
-    // a space — "Application Support") followed by the state argument. Escape
-    // any embedded single quote (`'` → `'\''`) so a home dir like `/Users/O'X`
-    // can't break out of the quoting into shell injection.
-    let quoted_path = script_path.display().to_string().replace('\'', "'\\''");
-    let cmd = |state: &str| format!("'{quoted_path}' {state}");
+    // The command single-quotes the binary path (an installed app bundle path
+    // can contain spaces, e.g. "Application Support") then appends the CLI
+    // subcommand. Escape any embedded single quote (`'` → `'\''`) so a home dir
+    // like `/Users/O'X` can't break out of the quoting into shell injection.
+    let quoted = binary_path.display().to_string().replace('\'', "'\\''");
+    let cmd = |state: &str| format!("'{quoted}' agent-status --state {state}");
     append_hook(&mut hooks, "PreToolUse", Some("*"), &cmd("working"));
     append_hook(
         &mut hooks,
@@ -170,16 +120,18 @@ fn read_user_hooks() -> Option<Value> {
     }
 }
 
-/// If status hooks are enabled, install the script and prepend
-/// `--settings <json>` to `extra_args` for a Claude Code launch. No-op when
-/// disabled or the script can't be installed.
+/// If status hooks are enabled, prepend `--settings <json>` to `extra_args` for
+/// a Claude Code launch. No-op when disabled or the binary can't be resolved.
 pub fn maybe_inject(extra_args: &mut Vec<String>) {
     if !enabled() {
         return;
     }
-    let Some(script) = install_script() else {
-        tracing::warn!("status-hooks: enabled but script install failed; skipping injection");
-        return;
+    let binary_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(%err, "status-hooks: enabled but current_exe failed; skipping injection");
+            return;
+        }
     };
     if extra_args.iter().any(|a| a == "--settings") {
         // The user already configured a --settings flag in agent_launch.toml.
@@ -188,11 +140,36 @@ pub fn maybe_inject(extra_args: &mut Vec<String>) {
             "status-hooks: a --settings flag is already configured; a second one may be ignored by claude"
         );
     }
-    let json = build_settings_json(&script);
+    let json = build_settings_json(&binary_path);
     // Prepend so it precedes any positional prompt build_command appends; order
     // relative to the user's own flags does not matter to `claude`.
     extra_args.insert(0, "--settings".to_string());
     extra_args.insert(1, json);
+}
+
+/// Extract `tool_name` from a Claude hook event JSON document. Best-effort: a
+/// parse failure or missing/empty field yields `None` (status still reports,
+/// just without a tool). The result is capped at [`MAX_TOOL_LEN`].
+pub fn tool_name_from_hook_json(stdin_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin_json).ok()?;
+    let name = value.get("tool_name")?.as_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.chars().take(MAX_TOOL_LEN).collect())
+}
+
+/// Build the OSC-9999 inner JSON payload (`{"v":1,"state":..,"tool":..}`) the
+/// relay wraps and the scanner decodes. Serialized via `serde_json` so control
+/// characters in `tool` are escaped — the relay treats the result as opaque.
+pub fn build_status_payload(state: &str, tool: Option<&str>) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("v".into(), json!(1));
+    obj.insert("state".into(), json!(state));
+    if let Some(t) = tool {
+        obj.insert("tool".into(), json!(t));
+    }
+    Value::Object(obj).to_string()
 }
 
 #[cfg(test)]
@@ -201,46 +178,51 @@ mod tests {
     use oximux_agents::AgentOscScanner;
     use oximux_core::AgentSidebandState;
 
-    fn script_path() -> &'static Path {
-        Path::new("/tmp/Application Support/oximux/oximux-status-emit.sh")
+    fn binary_path() -> &'static Path {
+        Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux")
     }
 
     #[test]
-    fn settings_json_wires_three_events_with_quoted_path() {
-        let json = build_settings_json_with(None, script_path());
+    fn settings_json_wires_three_events_to_agent_status_cli() {
+        let json = build_settings_json_with(None, binary_path());
         let v: Value = serde_json::from_str(&json).unwrap();
         let hooks = &v["hooks"];
-        // All three events present.
         assert!(hooks["PreToolUse"].is_array());
         assert!(hooks["PermissionRequest"].is_array());
         assert!(hooks["Stop"].is_array());
-        // PreToolUse: matcher "*", async true, command single-quotes the path
-        // (so the space in "Application Support" survives) and passes "working".
+        // PreToolUse: matcher "*", async true, command single-quotes the binary
+        // path and calls `agent-status --state working`.
         let pre = &hooks["PreToolUse"][0];
         assert_eq!(pre["matcher"], "*");
         let cmd = pre["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.starts_with('\''), "path must be single-quoted: {cmd}");
-        assert!(cmd.ends_with(" working"));
+        assert!(cmd.ends_with(" agent-status --state working"), "{cmd}");
         assert_eq!(pre["hooks"][0]["async"], true);
-        // Stop has no matcher field (Stop has no matcher support).
+        // Stop has no matcher (Stop has no matcher support) and reports idle.
         assert!(hooks["Stop"][0].get("matcher").is_none());
         assert!(
             hooks["Stop"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .ends_with(" idle")
+                .ends_with(" agent-status --state idle")
+        );
+        // PermissionRequest reports needs_approval.
+        assert!(
+            hooks["PermissionRequest"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" agent-status --state needs_approval")
         );
     }
 
     #[test]
     fn user_hooks_are_preserved_not_replaced() {
-        // A user PreToolUse hook must survive alongside ours.
         let user = json!({
             "PreToolUse": [
                 { "matcher": "Bash", "hooks": [{ "type": "command", "command": "user-thing" }] }
             ]
         });
-        let json = build_settings_json_with(Some(user), script_path());
+        let json = build_settings_json_with(Some(user), binary_path());
         let v: Value = serde_json::from_str(&json).unwrap();
         let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2, "user hook + ours");
@@ -249,14 +231,13 @@ mod tests {
             pre[1]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .ends_with(" working")
+                .ends_with(" agent-status --state working")
         );
     }
 
     #[test]
     fn non_object_user_hooks_falls_back_to_ours_only() {
-        // Malformed `hooks` (an array, not an object) is ignored, not merged.
-        let json = build_settings_json_with(Some(json!([1, 2, 3])), script_path());
+        let json = build_settings_json_with(Some(json!([1, 2, 3])), binary_path());
         let v: Value = serde_json::from_str(&json).unwrap();
         assert!(v["hooks"]["PreToolUse"].is_array());
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
@@ -264,61 +245,60 @@ mod tests {
 
     #[test]
     fn malformed_event_value_is_coerced_not_dropped() {
-        // A valid top-level `hooks` object but a non-array `PreToolUse` (here a
-        // JSON object) must not silently swallow our hook.
         let user = json!({ "PreToolUse": { "oops": "not an array" } });
-        let json = build_settings_json_with(Some(user), script_path());
+        let json = build_settings_json_with(Some(user), binary_path());
         let v: Value = serde_json::from_str(&json).unwrap();
         let pre = v["hooks"]["PreToolUse"]
             .as_array()
             .expect("coerced to array");
         assert_eq!(pre.len(), 1, "our hook survives the malformed entry");
-        assert!(
-            pre[0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .ends_with(" working")
-        );
     }
 
-    /// End-to-end format proof (minus live Claude): the bundled hook script's
-    /// output is exactly what the Phase-1 scanner decodes. Runs the script in a
-    /// temp dir, captures its tty write, and feeds it through `AgentOscScanner`.
     #[test]
-    fn hook_output_round_trips_through_scanner() {
-        let dir = std::env::temp_dir().join(format!("oximux-hook-rt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join(SCRIPT_NAME);
-        std::fs::write(&script, HOOK_SCRIPT).unwrap();
-        set_executable(&script);
-        let tty = dir.join("tty.out");
+    fn embedded_single_quote_in_path_is_escaped() {
+        let json = build_settings_json_with(None, Path::new("/Users/O'X/oximux"));
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("'\\''"), "single quote must be shell-escaped: {cmd}");
+    }
 
-        // Emulate a Claude PreToolUse invocation: JSON on stdin, state arg.
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg(&script)
-            .arg("working")
-            .env("OXIMUX_HOOK_TTY", &tty)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn hook");
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(br#"{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"/a"}}"#)
-            .unwrap();
-        assert!(child.wait().unwrap().success());
+    #[test]
+    fn tool_name_extracted_from_pre_tool_use_json() {
+        let stdin = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        assert_eq!(tool_name_from_hook_json(stdin).as_deref(), Some("Bash"));
+    }
 
-        let bytes = std::fs::read(&tty).expect("tty output");
+    #[test]
+    fn tool_name_absent_or_malformed_yields_none() {
+        assert_eq!(tool_name_from_hook_json(r#"{"hook_event_name":"Stop"}"#), None);
+        assert_eq!(tool_name_from_hook_json("not json"), None);
+        assert_eq!(tool_name_from_hook_json(r#"{"tool_name":""}"#), None);
+    }
+
+    /// End-to-end format proof (minus live Claude + relay): the payload the CLI
+    /// builds, once wrapped in the OSC-9999 envelope the relay adds, is exactly
+    /// what the Phase-1 scanner decodes.
+    #[test]
+    fn payload_round_trips_through_scanner() {
+        let payload = build_status_payload("working", Some("Bash"));
+        // Relay envelope: ESC ] 9999 ; <payload> BEL.
+        let mut bytes = b"\x1b]9999;".to_vec();
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.push(0x07);
+
         let mut scanner = AgentOscScanner::new();
         let scan = scanner.feed(&bytes);
         let ev = scan.event.expect("scanner decoded a sideband event");
         assert_eq!(ev.state, AgentSidebandState::Working);
-        assert_eq!(ev.detail.tool_name.as_deref(), Some("Edit"));
-        // The OSC-9999 bytes are fully consumed (stripped) from cleaned output.
-        assert!(scan.cleaned.is_empty());
+        assert_eq!(ev.detail.tool_name.as_deref(), Some("Bash"));
+        assert!(scan.cleaned.is_empty(), "OSC bytes fully stripped");
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn idle_payload_has_no_tool() {
+        let payload = build_status_payload("idle", None);
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["state"], "idle");
+        assert!(v.get("tool").is_none());
     }
 }

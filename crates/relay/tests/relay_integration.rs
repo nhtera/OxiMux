@@ -337,6 +337,75 @@ async fn notify_fans_out_attention_to_subscribers() {
 }
 
 #[tokio::test]
+async fn agent_status_fans_out_osc_output_to_subscribers() {
+    // `oximux agent-status` → Request::AgentStatus → the daemon wraps the
+    // opaque payload as an OSC-9999 sequence and fans it out on the PTY's
+    // existing Output channel, where the app's scanner decodes it. The
+    // spawning session is auto-attached, so client A is a subscriber.
+    let relay = boot_relay().await;
+    let (mut a, mut a_buf) = connect_and_hello(&relay).await;
+    let pty_id = match req(
+        &mut a,
+        &mut a_buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            args: Vec::new(),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn: {other:?}"),
+    };
+
+    let payload = r#"{"v":1,"state":"working","tool":"Bash"}"#;
+    write_frame(
+        &mut a,
+        &Frame::Request {
+            request_id: 3,
+            request: Request::AgentStatus {
+                pty_id: pty_id.clone(),
+                payload: payload.into(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got_ok = false;
+    let mut got_osc = false;
+    while (!got_ok || !got_osc) && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), read_frame(&mut a, &mut a_buf)).await
+        {
+            Ok(Ok(Frame::Response {
+                request_id: 3,
+                response: Response::Ok,
+            })) => got_ok = true,
+            Ok(Ok(Frame::Notification(Notification::Output { pty_id: p, bytes })))
+                if p == pty_id && bytes.windows(6).any(|w| w == b"]9999;") =>
+            {
+                // Exact OSC framing: ESC ] 9999 ; <payload> BEL.
+                let mut expected = b"\x1b]9999;".to_vec();
+                expected.extend_from_slice(payload.as_bytes());
+                expected.push(0x07);
+                assert_eq!(bytes, expected, "OSC envelope around payload");
+                got_osc = true;
+            }
+            // Skip the shell's startup Output / anything else.
+            _ => {}
+        }
+    }
+    assert!(got_ok, "AgentStatus did not return Ok");
+    assert!(got_osc, "subscriber never received OSC-9999 Output fan-out");
+}
+
+#[tokio::test]
 async fn bad_token_rejected_with_auth_failed() {
     let relay = boot_relay().await;
     let mut stream = UnixStream::connect(&relay.socket).await.unwrap();

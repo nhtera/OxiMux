@@ -20,7 +20,15 @@ use crate::error::ErrCode;
 // Bincode isn't self-describing, so the added field is a wire break: the
 // socket name bumps to `relay-v5.sock`, a fresh client spawns a fresh
 // daemon, and any stale v4 daemon idles out on its own socket.
-pub const PROTOCOL_VERSION: u32 = 5;
+//
+// v6: `Request::AgentStatus` lets a child process (an agent CLI hook,
+// invoked via `oximux agent-status`) report structured status. The daemon
+// frames the opaque payload as an OSC-9999 sequence and fans it out on the
+// PTY's existing output channel, so the app's status scanner decodes it
+// with no new app-side plumbing — and an agent hook can report status
+// without a controlling terminal (hooks run detached, with no `/dev/tty`).
+// New variant ⇒ wire break ⇒ socket bumps to `relay-v6.sock`.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -118,6 +126,18 @@ pub enum Request {
     Detach {
         pty_id: String,
         attachment_id: u64,
+    },
+    /// Structured agent status for a PTY — sent by the `oximux agent-status`
+    /// CLI, which an agent's hooks invoke (e.g. Claude Code `PreToolUse` /
+    /// `Stop`). `payload` is an opaque JSON object string (e.g.
+    /// `{"v":1,"state":"working","tool":"Bash"}`); the daemon does NOT parse
+    /// it — it wraps it as `ESC]9999;<payload>BEL` and fans it out on the
+    /// PTY's output channel, where the app's OSC scanner decodes it. This is
+    /// how a hook reports status despite running with no controlling terminal.
+    /// Appended last to keep existing bincode variant indices stable.
+    AgentStatus {
+        pty_id: String,
+        payload: String,
     },
 }
 

@@ -369,6 +369,36 @@ impl PtyRegistry {
         Ok(())
     }
 
+    /// Inject a structured agent-status packet into `pty_id`'s output stream —
+    /// driven by `Request::AgentStatus` (the `oximux agent-status` CLI an agent
+    /// hook invokes). `payload` is an opaque JSON object string; we wrap it as
+    /// an OSC-9999 sequence and fan it out as live `Output` to subscribers, so
+    /// the app's existing OSC scanner decodes it into agent status. The daemon
+    /// stays a dumb mux: it only adds the OSC envelope, never parses `payload`.
+    ///
+    /// Live-only on purpose (not written to the replay ring): status is
+    /// ephemeral, and a hook re-fires it after any re-attach. The envelope is
+    /// swallowed by the terminal emulator, so nothing renders on screen.
+    pub fn agent_status(&self, pty_id: &str, payload: &str) -> Result<(), RegistryError> {
+        let entry = self
+            .entries
+            .get(pty_id)
+            .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
+        // OSC 9999 ; <payload> BEL  (ESC = 0x1B, BEL = 0x07).
+        let mut bytes = Vec::with_capacity(payload.len() + 7);
+        bytes.extend_from_slice(b"\x1b]9999;");
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.push(0x07);
+        fan_out(
+            &entry.subscribers,
+            Notification::Output {
+                pty_id: pty_id.to_owned(),
+                bytes,
+            },
+        );
+        Ok(())
+    }
+
     /// Record `attachment_id`'s requested size and re-apply the effective
     /// (`min`) PTY size. "Smallest screen wins": the PTY is driven at the
     /// element-wise minimum across all attachments so no viewer clips.
