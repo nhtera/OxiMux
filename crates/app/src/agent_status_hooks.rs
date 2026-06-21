@@ -1,7 +1,10 @@
 //! Opt-in agent status hooks for Claude Code.
 //!
-//! When `OXIMUX_STATUS_HOOKS=1`, a Claude Code agent is launched with a
-//! `--settings` block that wires three hooks to the `oximux agent-status` CLI:
+//! Enabled by the **Settings → Agents** "Status hooks" toggle (persisted as
+//! `status_hooks_enabled` in `agent_launch.toml`), or by the env var
+//! `OXIMUX_STATUS_HOOKS=1` which force-enables regardless (a debug escape
+//! hatch). When on, a Claude Code agent is launched with a `--settings` block
+//! that wires three hooks to the `oximux agent-status` CLI:
 //!
 //! - `PreToolUse`        → `--state working`        (`{"state":"working","tool":<name>}`)
 //! - `PermissionRequest` → `--state needs_approval` (`{"state":"needs_approval","tool":<name>}`)
@@ -23,7 +26,7 @@
 //!   JSON STRING at spawn, never written into the user's `~/.claude` config.
 //!   Because `--settings` replaces (not deep-merges) the `hooks` key, we read
 //!   the user's existing global hooks and merge ours in, so theirs keep firing.
-//! - **Opt-in.** Off unless `OXIMUX_STATUS_HOOKS=1`.
+//! - **Opt-in.** Off unless the Settings toggle is on (or the env override).
 //! - **`Stop` → `idle`, not `done`.** A finished turn is not a dead process;
 //!   the terminal `Done` state comes from the PTY exit event, not a hook.
 
@@ -37,8 +40,11 @@ const ENABLE_ENV: &str = "OXIMUX_STATUS_HOOKS";
 /// OSC-9999 packet. The scanner caps again, but trimming at the source is free.
 const MAX_TOOL_LEN: usize = 64;
 
-/// True when the user opted into status hooks (`OXIMUX_STATUS_HOOKS=1`).
-pub fn enabled() -> bool {
+/// True when the env override forces status hooks on (`OXIMUX_STATUS_HOOKS=1`),
+/// independent of the persisted Settings toggle. A debug escape hatch — the
+/// primary control is the `status_hooks_enabled` setting, OR-combined with this
+/// at the injection site.
+pub fn env_forced() -> bool {
     std::env::var(ENABLE_ENV)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -121,9 +127,11 @@ fn read_user_hooks() -> Option<Value> {
 }
 
 /// If status hooks are enabled, prepend `--settings <json>` to `extra_args` for
-/// a Claude Code launch. No-op when disabled or the binary can't be resolved.
-pub fn maybe_inject(extra_args: &mut Vec<String>) {
-    if !enabled() {
+/// a Claude Code launch. `settings_enabled` is the persisted Settings toggle;
+/// the env override (`env_forced`) turns hooks on regardless. No-op when both
+/// are off or the binary can't be resolved.
+pub fn maybe_inject(settings_enabled: bool, extra_args: &mut Vec<String>) {
+    if !(settings_enabled || env_forced()) {
         return;
     }
     let binary_path = match std::env::current_exe() {

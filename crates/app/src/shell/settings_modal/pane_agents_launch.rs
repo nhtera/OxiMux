@@ -93,7 +93,12 @@ pub(super) fn entries(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
-    let mut out = Vec::with_capacity(LAUNCH_AGENTS.len() + 1);
+    let mut out = Vec::with_capacity(LAUNCH_AGENTS.len() + 2);
+    out.push(entry(
+        "Agent status hooks",
+        "Show the live tool on agent dashboard cards (Claude Code).",
+        status_hooks_toggle(modal, theme, cx),
+    ));
     out.push(entry(
         "Default agent",
         "Surfaced first in the launcher.",
@@ -121,7 +126,14 @@ pub(super) fn render_launch_card(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
-    let mut rows: Vec<AnyElement> = Vec::with_capacity(LAUNCH_AGENTS.len() + 1);
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(LAUNCH_AGENTS.len() + 2);
+    rows.push(setting_row_desc(
+        "Status hooks",
+        "Show the live tool each Claude Code agent is running on its dashboard card.",
+        status_hooks_toggle(modal, theme, cx),
+        theme,
+        typography,
+    ));
     rows.push(setting_row_desc(
         "Default agent",
         "Surfaced first in the launcher.",
@@ -180,6 +192,26 @@ fn default_agent_chips(
         ));
     }
     row.into_any_element()
+}
+
+/// The status-hooks toggle: when on, Claude Code launches inject the
+/// `--settings` hooks block so each agent reports its live tool to the
+/// dashboard card. Global (not per-agent) — Claude-only for now.
+fn status_hooks_toggle(
+    modal: &SettingsModal,
+    theme: Theme,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    toggle_switch(
+        "launch-status-hooks",
+        modal.agent_launch.status_hooks_enabled,
+        theme,
+        |this, _w, cx| {
+            this.agent_launch.status_hooks_enabled = !this.agent_launch.status_hooks_enabled;
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    )
 }
 
 /// One selectable icon chip used by the default-agent picker. Accent-ringed

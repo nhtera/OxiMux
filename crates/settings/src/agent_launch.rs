@@ -63,6 +63,12 @@ pub struct AgentLaunchSettings {
     /// `seed_yolo_defaults` is a no-op, so a user who clears a default flag
     /// is never re-seeded on the next launch.
     pub yolo_defaults_migrated: bool,
+    /// Enable OSC-9999 status hooks for Claude Code launches: inject the
+    /// `--settings` hooks block so each agent reports the tool it is running,
+    /// surfaced on the dashboard agent card. Off by default (no behaviour
+    /// change for a fresh install). The env var `OXIMUX_STATUS_HOOKS=1`
+    /// force-enables regardless of this flag (a debug escape hatch).
+    pub status_hooks_enabled: bool,
     /// Per-agent overrides keyed by adapter id.
     pub agents: BTreeMap<String, PerAgentLaunch>,
 }
@@ -221,6 +227,21 @@ model = "opus"
         assert!(s.for_agent("codex").is_none());
         assert!(s.args_for("codex").is_empty());
         assert_eq!(s.model_for("codex"), None);
+    }
+
+    #[test]
+    fn status_hooks_flag_defaults_off_and_round_trips() {
+        // Absent key → off (no behaviour change for a fresh install).
+        let s = AgentLaunchSettings::from_toml_str("").expect("empty parses");
+        assert!(!s.status_hooks_enabled);
+        // Set → round-trips through TOML.
+        let on = AgentLaunchSettings {
+            status_hooks_enabled: true,
+            ..Default::default()
+        };
+        let parsed =
+            AgentLaunchSettings::from_toml_str(&on.to_toml_string()).expect("round-trip");
+        assert!(parsed.status_hooks_enabled);
     }
 
     #[test]

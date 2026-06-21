@@ -1848,18 +1848,20 @@ impl WorkspaceRoot {
         // model when the caller didn't pin one, and append the configured
         // extra flags (e.g. a skip-permissions default). The global is unset
         // until the settings layer seeds it, in which case defaults are empty.
-        let (model, mut extra_args) = {
+        let (model, mut extra_args, status_hooks_on) = {
             let defaults = cx.try_global::<oximux_settings::AgentLaunchSettings>();
             (
                 model.or_else(|| defaults.and_then(|d| d.model_for(adapter_id))),
                 defaults.map(|d| d.args_for(adapter_id)).unwrap_or_default(),
+                defaults.map(|d| d.status_hooks_enabled).unwrap_or(false),
             )
         };
-        // Opt-in OSC-9999 status hooks (OXIMUX_STATUS_HOOKS=1): inject the
-        // `--settings` hooks block so Claude Code emits structured status the
-        // poll-loop scanner can read. Claude-only for now; no-op when disabled.
+        // Opt-in OSC-9999 status hooks (Settings → Agents toggle, or the
+        // OXIMUX_STATUS_HOOKS=1 env override): inject the `--settings` hooks
+        // block so Claude Code emits structured status the poll-loop scanner
+        // reads. Claude-only for now; no-op when off.
         if adapter_id == "claude-code" {
-            crate::agent_status_hooks::maybe_inject(&mut extra_args);
+            crate::agent_status_hooks::maybe_inject(status_hooks_on, &mut extra_args);
         }
         let runtime = self.cli_runtime.clone();
         let cwd_for_tab = cwd.clone();
