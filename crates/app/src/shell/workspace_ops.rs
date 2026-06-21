@@ -1376,6 +1376,7 @@ impl WorkspaceRoot {
         // only read the latest cached snapshot. Render never shells out to git.
         let diff_counts_snapshot = self.diff_counts.clone();
         let agent_activity_snapshot = self.agent_activity.clone();
+        let agent_sideband_snapshot = self.agent_sideband.clone();
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
                 projects,
@@ -1388,6 +1389,7 @@ impl WorkspaceRoot {
                 latest_adapter,
                 diff_counts_snapshot,
                 agent_activity_snapshot,
+                agent_sideband_snapshot,
                 last_active,
                 cx,
             );
@@ -1446,6 +1448,38 @@ impl WorkspaceRoot {
             }
         })
         .detach();
+    }
+
+    /// Record the live sideband detail for one workspace's agent, fed from its
+    /// status watch channel by the persistence watcher. Stores `detail` only
+    /// while the agent is `Running`; any other status clears the entry so a
+    /// stale tool step never lingers on the card. Marks the rail dirty (one
+    /// repaint) only on a visible change so a steady-state `Running` tick that
+    /// carries the same tool doesn't churn the rail.
+    pub(crate) fn note_agent_sideband(
+        &mut self,
+        workspace_key: &str,
+        status: &oximux_core::AgentStatus,
+        detail: Option<oximux_core::SidebandDetail>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = if matches!(status, oximux_core::AgentStatus::Running) {
+            detail.filter(|d| d.tool_name.is_some() || d.last_message.is_some())
+        } else {
+            None
+        };
+        if self.agent_sideband.get(workspace_key) == next.as_ref() {
+            return;
+        }
+        match next {
+            Some(d) => {
+                self.agent_sideband.insert(workspace_key.to_string(), d);
+            }
+            None => {
+                self.agent_sideband.remove(workspace_key);
+            }
+        }
+        self.mark_rail_dirty(cx);
     }
 
     /// Route a workspace-dialog submission to the right backend flow.

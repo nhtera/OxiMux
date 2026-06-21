@@ -78,6 +78,10 @@ pub(crate) fn spawn_for_session(
             return;
         };
 
+        // Keep the resolved key for the live sideband map; `workspace_key`
+        // itself is moved into the insert task below.
+        let ws_key = workspace_key.clone();
+
         let repo = agent_repo.clone();
         let (m, e) = (model.clone(), effort.clone());
         let inserted = cx
@@ -98,7 +102,13 @@ pub(crate) fn spawn_for_session(
         // Transitions may have raced ahead of the insert (subscribe happens
         // before this task runs) — sync whatever the channel holds now.
         let mut last = AgentStatus::Idle;
-        let current = status_rx.borrow_and_update().status.clone();
+        let (current, detail) = {
+            let snap = status_rx.borrow_and_update();
+            (snap.status.clone(), snap.detail.clone())
+        };
+        let _ = weak.update(cx, |this, cx| {
+            this.note_agent_sideband(&ws_key, &current, detail, cx);
+        });
         if current != last {
             last = current.clone();
             write_status(&agent_repo, &row_id, &current, cx).await;
@@ -115,10 +125,22 @@ pub(crate) fn spawn_for_session(
                 // decays to `Idle` at the prompt, which the boot sweep
                 // used to miss entirely).
                 write_status(&agent_repo, &row_id, &AgentStatus::Interrupted, cx).await;
-                let _ = weak.update(cx, |this, cx| this.mark_rail_dirty(cx));
+                let _ = weak.update(cx, |this, cx| {
+                    this.note_agent_sideband(&ws_key, &AgentStatus::Interrupted, None, cx);
+                    this.mark_rail_dirty(cx);
+                });
                 return;
             }
-            let status = status_rx.borrow_and_update().status.clone();
+            let (status, detail) = {
+                let snap = status_rx.borrow_and_update();
+                (snap.status.clone(), snap.detail.clone())
+            };
+            // The live tool subline can change WITHOUT a status edge (Bash →
+            // Edit while still Running), so refresh it every tick — not only
+            // when the status itself changes.
+            let _ = weak.update(cx, |this, cx| {
+                this.note_agent_sideband(&ws_key, &status, detail, cx);
+            });
             if status == last {
                 continue;
             }

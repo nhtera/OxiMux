@@ -40,7 +40,7 @@ use gpui::{
     div, point, px, svg,
 };
 use gpui_component::input::{InputEvent, InputState};
-use oximux_core::{AgentStatus, Project, Workspace};
+use oximux_core::{AgentStatus, Project, SidebandDetail, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
 
@@ -161,6 +161,11 @@ pub struct LeftRail {
     /// and pushed down with the rest of the snapshot. Rendered on Running
     /// dashboard rows only.
     agent_activity: HashMap<String, String>,
+    /// Live structured sideband detail per workspace id — the tool the agent
+    /// is currently invoking, fed event-driven from each session's status
+    /// watch channel. Takes precedence over `agent_activity` on Running
+    /// dashboard rows; cleared off Running so it never lingers.
+    agent_sideband: HashMap<String, SidebandDetail>,
     /// Latest agent-session activity time per workspace id, as the raw
     /// RFC-3339 string (`ended_at` for a finished session, else `started_at`).
     /// Drives the dashboard's in-tier recency sort. Sourced from SQLite in
@@ -253,6 +258,7 @@ impl LeftRail {
             live_worktrees: HashSet::new(),
             diff_counts: HashMap::new(),
             agent_activity: HashMap::new(),
+            agent_sideband: HashMap::new(),
             last_active: HashMap::new(),
             width: px(density.w_left_rail),
             resizing: false,
@@ -669,6 +675,7 @@ impl LeftRail {
         latest_adapter: HashMap<String, String>,
         diff_counts: HashMap<String, DiffCounts>,
         agent_activity: HashMap<String, String>,
+        agent_sideband: HashMap<String, SidebandDetail>,
         last_active: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) {
@@ -704,6 +711,7 @@ impl LeftRail {
         self.live_worktrees = live_worktrees;
         self.diff_counts = diff_counts;
         self.agent_activity = agent_activity;
+        self.agent_sideband = agent_sideband;
         self.last_active = last_active;
 
         // Keep the Tasks page's project in sync; re-fetch only when the active
@@ -804,6 +812,7 @@ impl Render for LeftRail {
                 &self.live_worktrees,
                 &self.diff_counts,
                 &self.agent_activity,
+                &self.agent_sideband,
                 &self.latest_adapter,
                 &self.last_active,
                 self.weak_root.clone(),

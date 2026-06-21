@@ -18,7 +18,7 @@ use gpui::{
     MouseDownEvent, ParentElement, Styled, UniformListScrollHandle, WeakEntity, Window, div, px,
     uniform_list,
 };
-use oximux_core::{Project, Workspace};
+use oximux_core::{Project, SidebandDetail, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agents_dashboard::model::AgentRow;
@@ -41,6 +41,7 @@ pub fn render_agents_dashboard(
     live_worktrees: &HashSet<String>,
     diff_counts: &HashMap<String, DiffCounts>,
     agent_activity: &HashMap<String, String>,
+    agent_sideband: &HashMap<String, SidebandDetail>,
     latest_adapter: &HashMap<String, String>,
     last_active: &HashMap<String, String>,
     weak_root: WeakEntity<WorkspaceRoot>,
@@ -57,6 +58,7 @@ pub fn render_agents_dashboard(
         live_worktrees,
         diff_counts,
         agent_activity,
+        agent_sideband,
         latest_adapter,
         last_active,
         theme,

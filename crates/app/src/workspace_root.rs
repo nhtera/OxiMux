@@ -339,6 +339,13 @@ pub struct WorkspaceRoot {
     /// refreshed by `_agent_activity_task` for Running primary-CLI
     /// sessions and pushed to the rail via `refresh_left_rail`.
     pub(crate) agent_activity: HashMap<String, String>,
+    /// Live structured sideband detail per workspace key (`workspaces.id` or
+    /// `primary:<project_id>`) — the tool the agent is currently invoking,
+    /// fed event-driven from each session's status watch channel by the
+    /// persistence watcher (`note_agent_sideband`). Holds an entry only while
+    /// the agent is `Running`; takes precedence over `agent_activity` on the
+    /// dashboard's Running rows and is pushed to the rail via `refresh_left_rail`.
+    pub(crate) agent_sideband: HashMap<String, oximux_core::SidebandDetail>,
     /// Latest usage-meter state. `None` only before the first sample lands
     /// (then it is always `Available` or `Unavailable`).
     pub(crate) usage_state: Option<oximux_agents::session_log::usage::UsageState>,
@@ -999,6 +1006,7 @@ impl WorkspaceRoot {
             rail_latest_adapter: HashMap::new(),
             rail_last_active: HashMap::new(),
             agent_activity: HashMap::new(),
+            agent_sideband: HashMap::new(),
             usage_state: None,
             usage_popover_open: false,
             #[cfg(target_os = "macos")]

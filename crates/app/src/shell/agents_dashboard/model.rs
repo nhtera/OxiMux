@@ -8,10 +8,15 @@
 //! `row_builder` module; this file is the pure `AgentRow` model + ranking and
 //! is testable without a window.
 
-use oximux_core::{AgentStatus, Workspace};
+use oximux_core::{AgentStatus, SidebandDetail, Workspace};
 
 use crate::shell::agent_presentation::AgentVerb;
 use crate::shell::left_rail::workspace_row::DiffCounts;
+
+/// Max length of the composed line-2 sideband subline, in characters. The
+/// scanner already caps the raw payload fields; this caps the joined string
+/// so a tool + input pair can't overflow the narrow card.
+const SUBLINE_MAX_CHARS: usize = 80;
 
 /// One row in the agents dashboard. Carries enough data to render the row
 /// and to activate the workspace on click — avoids re-querying any map
@@ -46,6 +51,46 @@ pub struct AgentRow {
     /// ordering matches chronological — no parse to millis needed. `None`
     /// for a live-but-never-started workspace.
     pub last_active_at: Option<String>,
+    /// Live structured detail from the agent's OSC-9999 status sideband — the
+    /// tool it is currently invoking (`Edit`, `Bash`, …) with an optional
+    /// input summary. Populated only while Running; takes precedence over the
+    /// log-tailed `activity` on line 2 of the card. `None` when no sideband
+    /// has arrived (regex/heuristic path) or the agent isn't Running.
+    pub sideband_detail: Option<SidebandDetail>,
+}
+
+/// Compose the line-2 subline for a Running agent's live sideband detail: the
+/// tool name, plus a ` · <input>` suffix when an input summary is present
+/// (e.g. `"Edit · src/lib.rs"`). Falls back to the free-form `last_message`
+/// when no tool name was reported. Returns `None` when the detail carries
+/// neither. Capped to `SUBLINE_MAX_CHARS` so a long input can't overflow the
+/// card. Shared by the row painter and the width estimator so both agree on
+/// the displayed text.
+pub fn sideband_subline(detail: &SidebandDetail) -> Option<String> {
+    let body = match (
+        detail.tool_name.as_deref(),
+        detail.tool_input_summary.as_deref(),
+    ) {
+        (Some(tool), Some(input)) if !input.is_empty() => format!("{tool} · {input}"),
+        (Some(tool), _) => tool.to_string(),
+        (None, _) => detail.last_message.clone()?,
+    };
+    if body.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&body, SUBLINE_MAX_CHARS))
+}
+
+/// Truncate `s` to at most `max` characters, appending an ellipsis when cut.
+/// Char-based (not byte-based) so a multi-byte tool input never splits a
+/// codepoint.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// True for states a user should come look at: the session is blocked on
@@ -248,7 +293,64 @@ mod tests {
             activity: None,
             icon_path: "icons/sparkles.svg",
             last_active_at: last_active_at.map(str::to_string),
+            sideband_detail: None,
         }
+    }
+
+    fn detail(tool: Option<&str>, input: Option<&str>, msg: Option<&str>) -> SidebandDetail {
+        SidebandDetail {
+            tool_name: tool.map(str::to_string),
+            tool_input_summary: input.map(str::to_string),
+            last_message: msg.map(str::to_string),
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn subline_joins_tool_and_input() {
+        let d = detail(Some("Edit"), Some("src/lib.rs"), None);
+        assert_eq!(sideband_subline(&d).as_deref(), Some("Edit · src/lib.rs"));
+    }
+
+    #[test]
+    fn subline_tool_only_when_no_input() {
+        let d = detail(Some("Bash"), None, None);
+        assert_eq!(sideband_subline(&d).as_deref(), Some("Bash"));
+        // Empty input is treated as absent, not joined.
+        let d_empty = detail(Some("Bash"), Some(""), None);
+        assert_eq!(sideband_subline(&d_empty).as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn subline_falls_back_to_message_without_tool() {
+        let d = detail(None, None, Some("rewriting auth"));
+        assert_eq!(sideband_subline(&d).as_deref(), Some("rewriting auth"));
+    }
+
+    #[test]
+    fn subline_none_when_empty() {
+        assert!(sideband_subline(&detail(None, None, None)).is_none());
+    }
+
+    #[test]
+    fn subline_truncated_at_cap() {
+        // A 200-char input yields a string capped at SUBLINE_MAX_CHARS with an
+        // ellipsis as the final char.
+        let long = "x".repeat(200);
+        let d = detail(Some("Edit"), Some(&long), None);
+        let out = sideband_subline(&d).expect("some");
+        assert_eq!(out.chars().count(), SUBLINE_MAX_CHARS);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_chars_respects_codepoint_boundaries() {
+        // Multi-byte chars must not split: 100 'é' capped to 80 stays valid
+        // UTF-8 and ends with the ellipsis.
+        let s = "é".repeat(100);
+        let out = truncate_chars(&s, SUBLINE_MAX_CHARS);
+        assert_eq!(out.chars().count(), SUBLINE_MAX_CHARS);
+        assert!(out.ends_with('…'));
     }
 
     #[test]

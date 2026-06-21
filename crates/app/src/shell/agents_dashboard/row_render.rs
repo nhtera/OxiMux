@@ -15,7 +15,7 @@
 use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px, svg};
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::agents_dashboard::model::{AgentRow, attention_rank};
+use crate::shell::agents_dashboard::model::{AgentRow, attention_rank, sideband_subline};
 use crate::ui::overlay::FloatingSurface;
 
 /// Row height for the `uniform_list` item. Taller than the old single-line
@@ -106,11 +106,12 @@ pub fn render_agent_row(
         .child(verb_chip)
         .children(diff_chip);
 
-    // ── line 2: review CTA (tier 0) else the live activity tail ──
+    // ── line 2: review CTA (tier 0) else the live tool subline ──
     // Action-required rows surface a discoverable "Review →" — clicking the
     // row jumps to the agent's tab (approval happens in its own TUI). Running
-    // rows show the tailed tool-activity line; everything else leaves line 2
-    // empty (the taller card still reads cleanly).
+    // rows show the structured sideband tool step ("Edit · src/lib.rs") when
+    // the agent reports one, falling back to the log-tailed activity line;
+    // everything else leaves line 2 empty (the taller card still reads cleanly).
     let line2_child = if is_attention {
         Some(
             div()
@@ -122,14 +123,19 @@ pub fn render_agent_row(
                 .child("Review →"),
         )
     } else {
-        row.activity.as_ref().map(|a| {
+        let subline = row
+            .sideband_detail
+            .as_ref()
+            .and_then(sideband_subline)
+            .or_else(|| row.activity.clone());
+        subline.map(|text| {
             div()
                 .min_w_0()
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .child(a.clone())
+                .child(text)
         })
     };
     let line2 = div()

@@ -8,11 +8,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use oximux_core::{AgentStatus, Project, Workspace};
+use oximux_core::{AgentStatus, Project, SidebandDetail, Workspace};
 use oximux_settings::Theme;
 
 use crate::shell::agent_presentation::{adapter_icon_path, agent_verb};
-use crate::shell::agents_dashboard::model::{AgentRow, sort_agent_rows};
+use crate::shell::agents_dashboard::model::{AgentRow, sideband_subline, sort_agent_rows};
 use crate::shell::left_rail::LatestStatusMap;
 use crate::shell::left_rail::workspace_row::DiffCounts;
 
@@ -31,6 +31,7 @@ pub fn build_agent_rows(
     live_worktrees: &HashSet<String>,
     diff_counts: &HashMap<String, DiffCounts>,
     agent_activity: &HashMap<String, String>,
+    agent_sideband: &HashMap<String, SidebandDetail>,
     latest_adapter: &HashMap<String, String>,
     last_active: &HashMap<String, String>,
     theme: Theme,
@@ -59,6 +60,13 @@ pub fn build_agent_rows(
             let activity = matches!(status, Some(AgentStatus::Running))
                 .then(|| agent_activity.get(&workspace.id).cloned())
                 .flatten();
+            // Live sideband tool step — same Running gate as the activity tail
+            // it supersedes on the card. The watcher already clears the map
+            // entry off Running, so this gate is belt-and-suspenders against a
+            // momentarily-stale DB status.
+            let sideband_detail = matches!(status, Some(AgentStatus::Running))
+                .then(|| agent_sideband.get(&workspace.id).cloned())
+                .flatten();
             // Resolve the brand glyph once here, not in the render closure.
             // Unknown / absent adapter → sparkles fallback (handled by
             // `adapter_icon_path`).
@@ -80,6 +88,7 @@ pub fn build_agent_rows(
                 activity,
                 icon_path,
                 last_active_at,
+                sideband_detail,
             });
         }
     }
@@ -108,13 +117,21 @@ fn estimated_row_width(r: &AgentRow) -> usize {
     };
     // Fixed budget for the diff chip when present (`+NN −NN`).
     let diff_len = if r.diff.is_some() { 8 } else { 0 };
-    let activity_len = r.activity.as_ref().map_or(0, |a| a.len() + 3);
+    // Line 2 shows the sideband subline when present, else the activity tail —
+    // mirror that precedence so the widest-row measurement matches the paint.
+    let subline_len = r
+        .sideband_detail
+        .as_ref()
+        .and_then(sideband_subline)
+        .map(|s| s.chars().count())
+        .or_else(|| r.activity.as_ref().map(|a| a.len()))
+        .map_or(0, |n| n + 3);
     r.project_name.len()
         + r.workspace.name.len()
         + branch_len
         + r.verb.label.len()
         + diff_len
-        + activity_len
+        + subline_len
 }
 
 #[cfg(test)]
@@ -173,6 +190,7 @@ mod tests {
             live,
             diff,
             activity,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             t(),
@@ -342,6 +360,54 @@ mod tests {
     }
 
     #[test]
+    fn sideband_detail_attached_to_running_rows_only() {
+        // The live tool subline rides only Running rows; a stale entry on a
+        // finished session must not surface (same gate as the activity tail).
+        let p = project("p1", "Proj");
+        let run = workspace("run", "p1");
+        let done = workspace("done", "p1");
+        let mut status_map: LatestStatusMap = HashMap::new();
+        status_map.insert("run".to_string(), Some(AgentStatus::Running));
+        status_map.insert(
+            "done".to_string(),
+            Some(AgentStatus::Done { code: Some(0) }),
+        );
+        let mut sideband = HashMap::new();
+        let edit_detail = SidebandDetail {
+            tool_name: Some("Edit".to_string()),
+            tool_input_summary: Some("src/lib.rs".to_string()),
+            last_message: None,
+            session_id: None,
+        };
+        sideband.insert("run".to_string(), edit_detail.clone());
+        sideband.insert("done".to_string(), edit_detail);
+        let mut wbp = HashMap::new();
+        wbp.insert("p1".to_string(), vec![run, done]);
+        let rows = build_agent_rows(
+            &[p],
+            &wbp,
+            &status_map,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &sideband,
+            &HashMap::new(),
+            &HashMap::new(),
+            t(),
+        );
+        let running = rows.iter().find(|r| r.workspace.id == "run").unwrap();
+        let finished = rows.iter().find(|r| r.workspace.id == "done").unwrap();
+        assert_eq!(
+            running
+                .sideband_detail
+                .as_ref()
+                .and_then(|d| d.tool_name.as_deref()),
+            Some("Edit")
+        );
+        assert!(finished.sideband_detail.is_none());
+    }
+
+    #[test]
     fn build_agent_rows_populates_icon_path() {
         // SC3: a claude-code adapter row resolves the branded glyph; a
         // workspace with no adapter entry falls back to sparkles.
@@ -360,6 +426,7 @@ mod tests {
             &wbp,
             &status_map,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &adapters,
@@ -388,6 +455,7 @@ mod tests {
             &wbp,
             &status_map,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
