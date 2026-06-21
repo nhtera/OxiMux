@@ -15,6 +15,8 @@
 //! (phase-2 discipline); consumers hide their UI when data is absent.
 
 pub mod activity;
+pub mod ansi_strip;
+pub mod session_index;
 pub mod usage;
 pub mod usage_oauth;
 pub mod usage_probe;
