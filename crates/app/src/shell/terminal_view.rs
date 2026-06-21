@@ -1167,6 +1167,15 @@ impl TerminalView {
         self.with_backend(|be| be.external_id_of(id))
     }
 
+    /// Whether this pane's program currently has DECSET-2004 (bracketed paste)
+    /// enabled. The composer queries it so a drafted prompt is wrapped only
+    /// when the program will honor the brackets — the same gate the paste
+    /// handler uses. `false` on a missing/pending backend.
+    pub fn bracketed_paste_active(&self) -> bool {
+        let id = self.session_id;
+        self.with_backend(|be| be.bracketed_paste(id)).unwrap_or(false)
+    }
+
     /// Relay id to PERSIST for this pane. Same as [`external_id`]
     /// (Self::external_id) for live views, but a still-pending view
     /// answers with its persisted hint — so a quit-save racing the

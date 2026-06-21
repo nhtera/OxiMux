@@ -176,6 +176,21 @@ impl Render for PaneGroup {
             .active_sub_divider()
             .map(|active| sub_divider_capture_overlay(entity.clone(), active.axis));
 
+        // Prompt composer bar, docked at the bottom of the active agent pane
+        // while open.
+        let composer_overlay: Option<AnyElement> = self.compose_bar.as_ref().map(|composer| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(12.0))
+                .px(px(24.0))
+                .flex()
+                .justify_center()
+                .child(div().w_full().max_w(px(720.0)).child(composer.clone()))
+                .into_any_element()
+        });
+
         div()
             .id(SharedString::from(format!(
                 "pane-group-{}",
@@ -195,6 +210,7 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_mru_next))
             .on_action(cx.listener(PaneGroup::on_mru_prev))
             .on_action(cx.listener(PaneGroup::on_new_agent))
+            .on_action(cx.listener(PaneGroup::on_open_composer_bar))
             .on_action(cx.listener(PaneGroup::on_split_sub_pane_right))
             .on_action(cx.listener(PaneGroup::on_split_sub_pane_down))
             .on_action(cx.listener(PaneGroup::on_focus_next_sub_pane))
@@ -211,6 +227,7 @@ impl Render for PaneGroup {
                 }
             }))
             .child(body)
+            .when_some(composer_overlay, |s, overlay| s.child(overlay))
             .when_some(sub_divider_capture, |s, overlay| s.child(overlay))
             .when_some(mru_overlay, |s, overlay| s.child(overlay))
             // Unsaved-changes prompt for a dirty editor tab close. Modal

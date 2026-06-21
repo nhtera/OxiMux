@@ -16,6 +16,7 @@ pub mod browser_view;
 pub mod cell_metrics;
 pub mod command_palette;
 pub mod commit_dialog;
+pub mod compose_bar;
 pub mod confirm_dialog;
 pub mod context_env;
 pub mod cwd_resolver;

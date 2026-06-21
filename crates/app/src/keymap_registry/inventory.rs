@@ -15,7 +15,7 @@ use crate::actions::{
     DismissOverlay, FindNextMatch, FindPrevMatch, FocusNextPane, FocusNextSubPane, FocusPrevPane,
     FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent,
     NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
-    OpenProjectPicker, OpenQuickOpen,
+    OpenComposerBar, OpenProjectPicker, OpenQuickOpen,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
     ReloadCustomCommands, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
@@ -174,6 +174,13 @@ pub const ACTIONS: &[ActionSpec] = &[
     ),
     // ---- Navigation ---------------------------------------------------
     entry!("open_quick_open", "Quick Open (files)", Navigation, "cmd-p", OpenQuickOpen),
+    entry!(
+        "open_composer_bar",
+        "Compose prompt to agent",
+        Navigation,
+        "cmd-i",
+        OpenComposerBar
+    ),
     // Command palette uses cmd-shift-p (cmd-k is the commit dialog).
     entry!(
         "open_command_palette",

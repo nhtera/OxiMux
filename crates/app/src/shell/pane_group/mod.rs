@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
     Subscription, Task, Window, px,
 };
 use std::rc::Rc;
@@ -37,7 +37,8 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
     CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewBrowserTab, NewTab, NextTab,
-    PrevTab, RequestOpenAdapterPicker, Search, SplitSubPaneDown, SplitSubPaneRight,
+    PrevTab, RequestOpenAdapterPicker, Search, SendTextToActiveAgent, SplitSubPaneDown,
+    SplitSubPaneRight,
     ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
@@ -355,6 +356,13 @@ pub struct PaneGroup {
     /// group so it drops cleanly when the group is torn down (no orphaned
     /// subscription across a project switch).
     _external_mutation_task: Option<Task<()>>,
+    /// User-opened prompt composer for the active agent tab (`⌘I`). `Some`
+    /// only while open; dropped on submit / dismiss. Suppressed while the
+    /// approval card is showing (one overlay at a time).
+    compose_bar: Option<Entity<crate::shell::compose_bar::ComposerBar>>,
+    /// Subscription to the composer's submit/dismiss events. Held alongside the
+    /// composer; dropped with it.
+    _compose_sub: Option<Subscription>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -409,6 +417,8 @@ impl PaneGroup {
             dirty_close_dialog: None,
             _dirty_close_observer: None,
             _external_mutation_task: None,
+            compose_bar: None,
+            _compose_sub: None,
         }
     }
 
@@ -2671,6 +2681,96 @@ impl PaneGroup {
         // Keyboard path — no cursor x available. `x: None` tells
         // `WorkspaceRoot` to use the post-rail fallback anchor.
         window.dispatch_action(Box::new(RequestOpenAdapterPicker { x: None }), cx);
+    }
+
+    /// Toggle the prompt composer over the active agent tab. A second press
+    /// closes it; pressing over a non-agent tab is a no-op.
+    pub(crate) fn on_open_composer_bar(
+        &mut self,
+        _: &crate::actions::OpenComposerBar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.compose_bar.is_some() {
+            self.close_composer(cx);
+            return;
+        }
+        let root = match self.active_tab().map(|t| &t.kind) {
+            Some(PaneGroupTabKind::Agent { worktree_path, .. }) => worktree_path.clone(),
+            _ => return,
+        };
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let composer = cx.new(|cx| {
+            crate::shell::compose_bar::ComposerBar::new(root, theme, density, typography, window, cx)
+        });
+        let sub = cx.subscribe_in(
+            &composer,
+            window,
+            |this, _composer, outcome: &crate::shell::compose_bar::ComposerOutcome, window, cx| {
+                this.handle_composer_outcome(outcome, window, cx);
+            },
+        );
+        // Focus the draft so the user types immediately.
+        let handle = composer.read(cx).input_focus_handle(cx);
+        window.focus(&handle, cx);
+        self.compose_bar = Some(composer);
+        self._compose_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// Send a submitted draft to the active agent and tear down the composer.
+    fn handle_composer_outcome(
+        &mut self,
+        outcome: &crate::shell::compose_bar::ComposerOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let crate::shell::compose_bar::ComposerOutcome::Submit(draft) = outcome {
+            // Wrap in bracketed paste only when the agent shell has DECSET-2004
+            // on, so a multi-line prompt lands as a single insertion rather
+            // than executing line-by-line. The bytes carry no trailing CR — the
+            // draft lands in the agent's input and the user presses Enter.
+            let bp_on = self.active_agent_bracketed_paste(cx);
+            let bytes = crate::shell::compose_bar::send_formatter::format_send_bytes(draft, bp_on);
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+            self.apply_first_prompt_title(draft);
+        }
+        self.close_composer(cx);
+    }
+
+    fn close_composer(&mut self, cx: &mut Context<Self>) {
+        self.compose_bar = None;
+        self._compose_sub = None;
+        cx.notify();
+    }
+
+    /// Whether the active agent tab's terminal currently has bracketed paste on.
+    fn active_agent_bracketed_paste(&self, cx: &App) -> bool {
+        let Some(PaneContent::Terminal(tree)) = self.active_tab().map(|t| &t.content) else {
+            return false;
+        };
+        tree.active_view()
+            .map(|view| view.read(cx).bracketed_paste_active())
+            .unwrap_or(false)
+    }
+
+    /// Name an agent tab after its first composed prompt — but never clobber a
+    /// title the user set themselves (`custom_title.is_none()` is exactly the
+    /// "first submit" gate, since this very call fills it in).
+    fn apply_first_prompt_title(&mut self, draft: &str) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !matches!(tab.kind, PaneGroupTabKind::Agent { .. }) || tab.custom_title.is_some() {
+            return;
+        }
+        let title: String = draft.trim().chars().take(50).collect();
+        if !title.is_empty() {
+            tab.custom_title = Some(SharedString::from(title));
+        }
     }
 
     /// Split the active terminal tab's CURRENTLY-FOCUSED sub-pane along

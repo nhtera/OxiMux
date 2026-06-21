@@ -291,6 +291,10 @@ pub struct SendTextToActiveAgent {
 actions!(
     oximux,
     [
+        /// Toggle the prompt composer bar over the active agent pane — an
+        /// elevated multi-line draft with `@file` autocomplete. No-op when the
+        /// active tab is not an agent.
+        OpenComposerBar,
         /// Split the focused pane horizontally — new pane on the right.
         /// Alias of `SplitRight`. Kept for legacy callers; the Cmd+D
         /// keybinding now drives `SplitSubPaneRight` instead so it
