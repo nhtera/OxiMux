@@ -4,12 +4,24 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-23 — Agents: remove the quick-reply approval card (cockpit rebuild Phase 3 reverted)
+
+**Touches**: `crates/app/src/shell/approval_card.rs` (deleted), `crates/app/src/actions.rs` (`QuickReplyToAgent` removed), `crates/app/src/workspace_root.rs` (handler removed), `crates/app/src/shell/pane_group/` (overlay wiring removed), `crates/app/tests/fixtures/claude-approval-bytes.txt` (deleted)
+
+The keystroke-send approval card (an overlay that mounted over a blocked agent's pane with Approve/Deny/free-text buttons) is removed. The mechanism carried more complexity than it earned: a per-adapter byte map (`1\r` approve / `Esc` deny) that is fragile to Claude's command-dependent menu shape, a double-send debounce state machine, and bottom-dock overlay mutual-exclusion with the composer. Agents are answered directly in their terminal, or via the `⌘I` composer.
+
+- Agent **status detection** is unchanged — `AgentStatus::NeedsApproval` still drives the tab-strip dot, the status badge, the dashboard card, and the macOS approval notification. Only the interactive overlay is gone.
+- The `⌘I` prompt composer (Phase 4) is unaffected and now the sole bottom-docked agent overlay.
+- No relay protocol change. App-crate lib tests: 965 pass (the 3 approval-card unit tests removed with the module).
+
+---
+
 ### 2026-06-22 — Agents: prompt composer bar with @file autocomplete (cockpit rebuild Phase 4)
 
 **Commits**: `19f4c20` (feat: prompt composer bar with @file autocomplete), `40f17fc` (fix: composer submit + correct agent routing)
 **Touches**: `crates/app/src/shell/compose_bar/` (new — `mention_parser`, `mention_resolver`, `send_formatter`, GPUI view, @mention dropdown), `crates/app/src/shell/`, `crates/agents`
 
-A Cmd+I composer bar docks over the active agent pane. Multi-line draft input with inline `@file` autocomplete (fuzzy over the project's `rg` index, reusing the command-palette fuzzy ranker). Cmd+Return submits: formats the draft via `send_formatter`, routes via `SendTextToActiveAgent`, and delivers bytes using `TerminalBackend::bracketed_paste()` (DECSET-2004) when the agent shell supports it. The first submit to an untitled agent tab auto-titles it from the prompt. Esc closes the dropdown then the bar; bar is suppressed while an approval card is shown.
+A Cmd+I composer bar docks over the active agent pane. Multi-line draft input with inline `@file` autocomplete (fuzzy over the project's `rg` index, reusing the command-palette fuzzy ranker). Cmd+Return submits: formats the draft via `send_formatter`, routes via `SendTextToActiveAgent`, and delivers bytes using `TerminalBackend::bracketed_paste()` (DECSET-2004) when the agent shell supports it. The first submit to an untitled agent tab auto-titles it from the prompt. Esc closes the dropdown then the bar.
 
 - `mention_parser` / `mention_resolver` / `send_formatter` are pure modules, unit-tested.
 - Submit fix (`40f17fc`): the Input widget binds secondary-Enter to its own action, so the keystroke never reached `on_key_down`; moved submit into the Enter capture handler keyed on the secondary flag — bare Enter still inserts a newline.

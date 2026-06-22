@@ -357,8 +357,7 @@ pub struct PaneGroup {
     /// subscription across a project switch).
     _external_mutation_task: Option<Task<()>>,
     /// User-opened prompt composer for the active agent tab (`⌘I`). `Some`
-    /// only while open; dropped on submit / dismiss. Suppressed while the
-    /// approval card is showing (one overlay at a time).
+    /// only while open; dropped on submit / dismiss.
     compose_bar: Option<Entity<crate::shell::compose_bar::ComposerBar>>,
     /// Subscription to the composer's submit/dismiss events. Held alongside the
     /// composer; dropped with it.
@@ -368,12 +367,6 @@ pub struct PaneGroup {
     /// to another tab hides it (the draft survives) and guarantees a submit can
     /// never misroute to a different agent.
     compose_session: Option<AgentSessionId>,
-    /// Quick-reply approval card, mounted over the active tab while its agent
-    /// session is blocked on an approval prompt (`NeedsApproval`). Held across
-    /// frames so its free-text field and double-send guard survive re-renders;
-    /// dropped — which resets that state — the moment the status clears or a
-    /// non-agent tab becomes active.
-    approval_card: Option<Entity<crate::shell::approval_card::ApprovalCard>>,
 }
 
 /// Active MRU-switcher state. Lives only while the user holds Ctrl
@@ -431,7 +424,6 @@ impl PaneGroup {
             compose_bar: None,
             _compose_sub: None,
             compose_session: None,
-            approval_card: None,
         }
     }
 
@@ -2704,10 +2696,7 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Toggle: a second ⌘I closes the composer. The composer takes render
-        // precedence over the approval card (see `render`), so opening it while
-        // an agent awaits approval is fine — it surfaces over the card to
-        // compose a reply, and closing it brings the card back.
+        // Toggle: a second ⌘I closes the composer.
         if self.compose_bar.is_some() {
             self.close_composer(cx);
             return;

@@ -79,7 +79,7 @@ use crate::actions::{
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
     NewBrowserTab, NewTab, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory, OpenSettings,
-    OpenTabContextMenuAt, QuickReplyToAgent, ResumeAgentSession,
+    OpenTabContextMenuAt, ResumeAgentSession,
     OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, Search, SelectExplorerTab,
     SelectFilesTab,
     SelectSearchTab,
@@ -2706,36 +2706,6 @@ impl Render for WorkspaceRoot {
                     handle.spawn(async move {
                         if let Err(err) = runtime.send_message(session_id, &text).await {
                             tracing::warn!(?session_id, %err, "send-to-agent failed");
-                        }
-                    });
-                },
-            ))
-            .on_action(cx.listener(
-                |this, action: &QuickReplyToAgent, _window, _cx| {
-                    // Approval-card reply: the action already carries the
-                    // exact target session, so we bypass the focus-order
-                    // routing `SendTextToActiveAgent` uses — a background
-                    // agent's card must answer ITS OWN prompt even when a
-                    // different tab is focused.
-                    let session_id = action.session_id;
-                    let reply_bytes = action.reply_bytes.clone();
-                    tracing::debug!(?session_id, bytes = reply_bytes.len(), "quick_reply");
-                    let runtime = this.cli_runtime.clone();
-                    // `send_message` offloads the PTY write via
-                    // `tokio::spawn_blocking` (needs a Tokio reactor); GPUI's
-                    // background executor has none and would abort the process.
-                    // Run on the app runtime, entered on the main thread where
-                    // this listener fires.
-                    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                        tracing::warn!(?session_id, "no tokio runtime; quick-reply dropped");
-                        return;
-                    };
-                    handle.spawn(async move {
-                        if let Err(err) = runtime.send_message(session_id, &reply_bytes).await {
-                            // Fail-open: log and leave the card up so the
-                            // user can retry rather than silently dropping
-                            // an approval.
-                            tracing::warn!(?session_id, %err, "quick-reply failed");
                         }
                     });
                 },

@@ -301,19 +301,6 @@ pub struct ResumeAgentSession {
     pub fork: bool,
 }
 
-/// Answer an agent's blocking prompt with pre-formed bytes, routed to an
-/// EXPLICIT session rather than the "active agent" preference order so a
-/// background agent's approval card always replies to its own PTY even when
-/// another tab is focused. `reply_bytes` is sent verbatim — the dispatcher
-/// has already appended the trailing carriage return and sanitized any
-/// free-text, so the workspace handler is a thin write-through.
-#[derive(Clone, Debug, PartialEq, Action)]
-#[action(namespace = oximux, no_json)]
-pub struct QuickReplyToAgent {
-    pub session_id: oximux_core::AgentSessionId,
-    pub reply_bytes: String,
-}
-
 actions!(
     oximux,
     [
