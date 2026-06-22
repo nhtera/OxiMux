@@ -1243,6 +1243,7 @@ impl WorkspaceRoot {
         self.row_menu.update(cx, |m, cx| m.close(cx));
         self.project_menu.update(cx, |m, cx| m.close(cx));
         self.add_project_dialog.update(cx, |d, cx| d.close(cx));
+        self.session_history.update(cx, |m, cx| m.close(cx));
     }
 
     /// Open the per-row action popover at the given screen coordinates.

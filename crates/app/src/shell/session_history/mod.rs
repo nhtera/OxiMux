@@ -255,6 +255,10 @@ impl SessionHistoryModal {
         cx.notify();
     }
 
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         // Guard the emit on a real open→closed transition: `close()` may run on
         // an already-closed modal (overlay teardown), and an unconditional emit

@@ -3554,6 +3554,7 @@ impl Render for WorkspaceRoot {
                     || this.adapter_picker.read(cx).is_open()
                     || this.row_menu.read(cx).is_open()
                     || this.project_menu.read(cx).is_open()
+                    || this.session_history.read(cx).is_open()
                     || this.usage_popover_open;
                 if !any_open {
                     cx.propagate();
