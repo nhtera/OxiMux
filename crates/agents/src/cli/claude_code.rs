@@ -99,16 +99,18 @@ impl CliAgentAdapter for ClaudeCodeAdapter {
 
         // Resume / fork flags lead so the session selection is unambiguous.
         // `--resume <id>` continues the prior conversation; `--fork-session`
-        // branches a copy that leaves the original intact; a fresh
-        // `--session-id` makes the new session's log path deterministic.
+        // branches a copy that leaves the original intact. The CLI rejects
+        // `--session-id` alongside `--resume` UNLESS `--fork-session` is also
+        // given, so the fresh id is fork-only — a plain resume reuses the
+        // original session id and must not pass `--session-id`.
         if let Some(id) = cfg.resumption.source_id() {
             args.push("--resume".to_string());
             args.push(id.to_string());
             if cfg.resumption.is_fork() {
                 args.push("--fork-session".to_string());
+                args.push("--session-id".to_string());
+                args.push(uuid::Uuid::new_v4().to_string());
             }
-            args.push("--session-id".to_string());
-            args.push(uuid::Uuid::new_v4().to_string());
         }
 
         if let Some(model) = cfg.model.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -233,11 +235,14 @@ mod tests {
         let mut c = cfg();
         c.resumption = oximux_core::SessionResumption::Resume { id: "abc".into() };
         let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
-        // Leads with --resume <id>, no --fork-session, plus a fresh --session-id.
+        // Plain resume = `--resume <id>` ONLY: no --fork-session, and crucially
+        // no --session-id (the CLI rejects it without --fork-session).
         assert_eq!(&spec.args[0..2], &["--resume".to_string(), "abc".into()]);
         assert!(!spec.args.iter().any(|a| a == "--fork-session"));
-        let sid = spec.args.iter().position(|a| a == "--session-id").expect("--session-id present");
-        assert!(spec.args.get(sid + 1).is_some_and(|v| !v.is_empty()), "uuid follows --session-id");
+        assert!(
+            !spec.args.iter().any(|a| a == "--session-id"),
+            "plain resume must not pass --session-id"
+        );
     }
 
     #[test]
