@@ -2692,19 +2692,26 @@ impl Render for WorkspaceRoot {
                     };
                     let runtime = this.cli_runtime.clone();
                     let text = action.text.clone();
-                    // CLI runtime call is async (writes to the agent's PTY
-                    // off-thread). Detach — UI doesn't block on the write
-                    // and Drop-on-error just surfaces in the trace log.
-                    cx.background_spawn(async move {
+                    // `send_message` offloads the PTY write via
+                    // `tokio::spawn_blocking`, which needs a live Tokio reactor.
+                    // GPUI's background executor has none, so run on the app
+                    // runtime (entered on the main thread for the app's life;
+                    // this listener fires there) — same rationale as
+                    // `run_diff_refresh_round`. `background_spawn` here aborts
+                    // the process with "no reactor running".
+                    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                        tracing::warn!(?session_id, "no tokio runtime; send-to-agent dropped");
+                        return;
+                    };
+                    handle.spawn(async move {
                         if let Err(err) = runtime.send_message(session_id, &text).await {
                             tracing::warn!(?session_id, %err, "send-to-agent failed");
                         }
-                    })
-                    .detach();
+                    });
                 },
             ))
             .on_action(cx.listener(
-                |this, action: &QuickReplyToAgent, _window, cx| {
+                |this, action: &QuickReplyToAgent, _window, _cx| {
                     // Approval-card reply: the action already carries the
                     // exact target session, so we bypass the focus-order
                     // routing `SendTextToActiveAgent` uses — a background
@@ -2714,15 +2721,23 @@ impl Render for WorkspaceRoot {
                     let reply_bytes = action.reply_bytes.clone();
                     tracing::debug!(?session_id, bytes = reply_bytes.len(), "quick_reply");
                     let runtime = this.cli_runtime.clone();
-                    cx.background_spawn(async move {
+                    // `send_message` offloads the PTY write via
+                    // `tokio::spawn_blocking` (needs a Tokio reactor); GPUI's
+                    // background executor has none and would abort the process.
+                    // Run on the app runtime, entered on the main thread where
+                    // this listener fires.
+                    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                        tracing::warn!(?session_id, "no tokio runtime; quick-reply dropped");
+                        return;
+                    };
+                    handle.spawn(async move {
                         if let Err(err) = runtime.send_message(session_id, &reply_bytes).await {
                             // Fail-open: log and leave the card up so the
                             // user can retry rather than silently dropping
                             // an approval.
                             tracing::warn!(?session_id, %err, "quick-reply failed");
                         }
-                    })
-                    .detach();
+                    });
                 },
             ))
             .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
