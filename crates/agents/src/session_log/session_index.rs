@@ -39,13 +39,24 @@ pub struct SessionEntry {
     pub path: Option<String>,
     /// Launch directory, when the log records one (Codex index omits it).
     pub cwd: Option<String>,
-    /// Row title: Claude's own `lastPrompt`, else the first user message with
+    /// Row title: the user/AI-assigned name (`customTitle`/`aiTitle`) if any,
+    /// else Claude's `lastPrompt`, else the first user message with
     /// slash-command XML unwrapped (Codex: thread name). One line, capped.
     pub title: Option<String>,
+    /// The user-rename / AI-generated title alone (`customTitle` ▸ `aiTitle`),
+    /// kept distinct from `title` so a future rename knows one already exists.
+    pub custom_title: Option<String>,
     /// Git branch the session ran on (Claude `gitBranch`; absent for Codex).
     pub git_branch: Option<String>,
+    /// User-assigned tag for the session, when present (Claude `{"type":"tag"}`).
+    pub tag: Option<String>,
+    /// First entry timestamp in unix millis — when the session started.
+    pub created_at_ms: Option<i64>,
     /// Newest entry timestamp in unix millis; the listing sort key.
     pub last_message_ts_ms: Option<i64>,
+    /// User + assistant turn count — exact when the whole log was parsed,
+    /// `None` when only the head/tail of an oversized log was read.
+    pub message_count: Option<usize>,
     /// On-disk log size in bytes (Claude only); shown in the row subtitle.
     pub size_bytes: Option<u64>,
     /// Journal line count — exact when the whole log was parsed, `None` when
@@ -181,12 +192,21 @@ fn build_claude_entry(session_id: &str, path: &Path) -> Option<SessionEntry> {
         entry.path = Some(path.to_string_lossy().into_owned());
         return Some(entry);
     }
-    // Large log: title + cwd + branch from the head, newest ts from the tail.
+    // Large log: the opening prompt, cwd, branch, and start time live in the
+    // head; titles/tags appended late (customTitle/aiTitle/tag) live in the
+    // tail; the newest timestamp is at the very end.
     let head = read_head(path, HEAD_BYTES).unwrap_or_default();
     let tail = read_tail(path, TAIL_BYTES).unwrap_or_default();
-    let title = claude_title(&head).or_else(|| claude_title(&tail));
+    let custom_title = claude_custom_title(&tail).or_else(|| claude_custom_title(&head));
+    let title = custom_title
+        .clone()
+        .or_else(|| claude_last_prompt(&head))
+        .or_else(|| claude_first_prompt(&head))
+        .or_else(|| claude_title(&tail));
     let cwd = claude_cwd(&head).or_else(|| claude_cwd(&tail));
     let git_branch = claude_git_branch(&head).or_else(|| claude_git_branch(&tail));
+    let tag = claude_tag(&tail).or_else(|| claude_tag(&head));
+    let created_at_ms = first_timestamp_ms(&head);
     let last_message_ts_ms = last_timestamp_ms(&tail).or_else(|| last_timestamp_ms(&head));
     if title.is_none() && cwd.is_none() && last_message_ts_ms.is_none() {
         return None;
@@ -197,8 +217,13 @@ fn build_claude_entry(session_id: &str, path: &Path) -> Option<SessionEntry> {
         path: Some(path.to_string_lossy().into_owned()),
         cwd,
         title,
+        custom_title,
         git_branch,
+        tag,
+        created_at_ms,
         last_message_ts_ms,
+        // A partial head/tail read can't yield an exact turn count.
+        message_count: None,
         size_bytes: Some(len),
         entry_count: None,
     })
@@ -219,18 +244,99 @@ pub fn parse_claude_jsonl(session_id: &str, content: &str) -> Option<SessionEntr
         path: None,
         cwd: claude_cwd(content),
         title: claude_title(content),
+        custom_title: claude_custom_title(content),
         git_branch: claude_git_branch(content),
+        tag: claude_tag(content),
+        created_at_ms: first_timestamp_ms(content),
         last_message_ts_ms: last_timestamp_ms(content),
+        message_count: Some(claude_message_count(content)),
         size_bytes: None,
         entry_count: Some(entry_count),
     })
 }
 
-/// Row title, matching what Claude's own `/resume` shows: prefer the
-/// `lastPrompt` Claude records (already free of command XML), else the first
-/// user message with any slash-command wrapper unwrapped.
+/// Row title, matching what Claude's own `/resume` shows: prefer a
+/// user/AI-assigned title (`customTitle`/`aiTitle`), else the `lastPrompt`
+/// Claude records (already free of command XML), else the first user message
+/// with any slash-command wrapper unwrapped.
 fn claude_title(content: &str) -> Option<String> {
-    claude_last_prompt(content).or_else(|| claude_first_prompt(content))
+    claude_custom_title(content)
+        .or_else(|| claude_last_prompt(content))
+        .or_else(|| claude_first_prompt(content))
+}
+
+/// The session's assigned name: the last `customTitle` (a user rename) if any,
+/// else the last `aiTitle` (auto-generated summary). Both are appended late in
+/// the log, so a tail read finds them. Capped like any title.
+fn claude_custom_title(content: &str) -> Option<String> {
+    let mut custom = None;
+    let mut ai = None;
+    for line in content.lines() {
+        let Some(v) = line_value(line) else { continue };
+        if let Some(t) = v
+            .get("customTitle")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            custom = Some(t.to_string());
+        }
+        if let Some(t) = v
+            .get("aiTitle")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            ai = Some(t.to_string());
+        }
+    }
+    custom.or(ai).map(|t| truncate_prompt(&t))
+}
+
+/// The session's tag, from a dedicated `{"type":"tag"}` line (last wins). The
+/// type guard avoids matching a `tag` parameter inside a tool-call input.
+fn claude_tag(content: &str) -> Option<String> {
+    let mut tag = None;
+    for line in content.lines() {
+        let Some(v) = line_value(line) else { continue };
+        if v.get("type").and_then(Value::as_str) == Some("tag")
+            && let Some(t) = v.get("tag").and_then(Value::as_str).filter(|s| !s.is_empty())
+        {
+            tag = Some(t.to_string());
+        }
+    }
+    tag
+}
+
+/// First parseable `timestamp` in the body — when the session started.
+fn first_timestamp_ms(content: &str) -> Option<i64> {
+    content.lines().find_map(|line| {
+        line_value(line)?
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp_ms)
+    })
+}
+
+/// Count of `user` + `assistant` turns (skips meta/tool_result user echoes).
+fn claude_message_count(content: &str) -> usize {
+    content
+        .lines()
+        .filter_map(line_value)
+        .filter(|v| match v.get("type").and_then(Value::as_str) {
+            Some("assistant") => true,
+            Some("user") => {
+                v.get("isMeta").and_then(Value::as_bool) != Some(true)
+                    && v.pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            !arr.iter().any(|b| {
+                                b.get("type").and_then(Value::as_str) == Some("tool_result")
+                            })
+                        })
+                        .unwrap_or(true)
+            }
+            _ => false,
+        })
+        .count()
 }
 
 /// `lastPrompt` from a `type=last-prompt` line.
@@ -395,8 +501,12 @@ pub fn parse_codex_index_line(line: &str) -> Option<SessionEntry> {
         path: None,
         cwd: None,
         title,
+        custom_title: None,
         git_branch: None,
+        tag: None,
+        created_at_ms: None,
         last_message_ts_ms,
+        message_count: None,
         size_bytes: None,
         entry_count: None,
     })
@@ -451,277 +561,5 @@ pub(super) fn read_head(path: &Path, max_bytes: u64) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn claude_user_line(ts: &str, cwd: &str, text: &str) -> String {
-        format!(
-            r#"{{"type":"user","timestamp":"{ts}","cwd":"{cwd}","message":{{"role":"user","content":"{text}"}}}}"#
-        )
-    }
-
-    fn claude_assistant_line(ts: &str) -> String {
-        format!(
-            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}}}}"#
-        )
-    }
-
-    #[test]
-    fn session_index_parses_jsonl_fixture() {
-        let content = format!(
-            "{}\n{}\n",
-            claude_user_line("2026-06-20T10:00:00Z", "/Users/x/proj", "refactor the parser"),
-            claude_assistant_line("2026-06-20T10:05:00Z"),
-        );
-        let e = parse_claude_jsonl("sess-uuid", &content).unwrap();
-        assert_eq!(e.session_id, "sess-uuid");
-        assert_eq!(e.adapter, AgentAdapter::ClaudeCode);
-        assert_eq!(e.cwd.as_deref(), Some("/Users/x/proj"));
-        assert_eq!(e.title.as_deref(), Some("refactor the parser"));
-        assert_eq!(e.last_message_ts_ms, parse_timestamp_ms("2026-06-20T10:05:00Z"));
-        assert_eq!(e.entry_count, Some(2));
-    }
-
-    #[test]
-    fn claude_first_prompt_reads_array_content_block() {
-        let line = r#"{"type":"user","timestamp":"2026-06-20T10:00:00Z","message":{"content":[{"type":"text","text":"hello there"}]}}"#;
-        let e = parse_claude_jsonl("s", line).unwrap();
-        assert_eq!(e.title.as_deref(), Some("hello there"));
-    }
-
-    #[test]
-    fn claude_first_prompt_collapses_whitespace() {
-        let line = claude_user_line("2026-06-20T10:00:00Z", "/p", "line one\\nline   two");
-        let e = parse_claude_jsonl("s", &line).unwrap();
-        // The literal "\n" in JSON decodes to a newline; preview flattens it.
-        assert_eq!(e.title.as_deref(), Some("line one line two"));
-    }
-
-    #[test]
-    fn title_prefers_last_prompt_over_first_user_message() {
-        let last_prompt = r#"{"type":"last-prompt","lastPrompt":"/cook plan.md","sessionId":"s"}"#;
-        let content = format!(
-            "{last_prompt}\n{}\n",
-            claude_user_line("2026-06-20T10:00:00Z", "/p", "the first message"),
-        );
-        let e = parse_claude_jsonl("s", &content).unwrap();
-        assert_eq!(e.title.as_deref(), Some("/cook plan.md"));
-    }
-
-    #[test]
-    fn title_unwraps_slash_command_xml() {
-        // A slash-command user message with no last-prompt line falls back to
-        // the unwrapped first message: "/cook <args>", not the raw tags.
-        let xml = "<command-message>cook</command-message><command-name>/cook</command-name><command-args>plan.md here</command-args>";
-        let line = claude_user_line("2026-06-20T10:00:00Z", "/p", xml);
-        let e = parse_claude_jsonl("s", &line).unwrap();
-        assert_eq!(e.title.as_deref(), Some("/cook plan.md here"));
-    }
-
-    #[test]
-    fn parses_git_branch_and_size() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join(".claude").join("projects").join("-p");
-        std::fs::create_dir_all(&proj).unwrap();
-        let line = format!(
-            r#"{{"type":"user","timestamp":"2026-06-20T10:00:00Z","cwd":"/p","gitBranch":"feat/x","message":{{"content":"hi"}}}}"#
-        );
-        let path = proj.join("s.jsonl");
-        std::fs::write(&path, format!("{line}\n")).unwrap();
-        let entries = SessionIndex::build(
-            &tmp.path().join(".claude"),
-            Path::new("/nonexistent"),
-            &SessionScope::AllProjects,
-        );
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].git_branch.as_deref(), Some("feat/x"));
-        assert_eq!(entries[0].size_bytes, Some(std::fs::metadata(&path).unwrap().len()));
-    }
-
-    #[test]
-    fn parse_codex_index_line_reads_id_thread_updated() {
-        let line = r#"{"id":"abc-123","thread_name":"fix flaky test","updated_at":"2026-06-19T09:00:00Z"}"#;
-        let e = parse_codex_index_line(line).unwrap();
-        assert_eq!(e.session_id, "abc-123");
-        assert_eq!(e.adapter, AgentAdapter::Codex);
-        assert_eq!(e.cwd, None);
-        assert_eq!(e.title.as_deref(), Some("fix flaky test"));
-        assert_eq!(e.last_message_ts_ms, parse_timestamp_ms("2026-06-19T09:00:00Z"));
-    }
-
-    #[test]
-    fn parse_codex_index_line_accepts_epoch_seconds() {
-        let line = r#"{"id":"x","thread_name":"t","updated_at":1718784000}"#;
-        let e = parse_codex_index_line(line).unwrap();
-        assert_eq!(e.last_message_ts_ms, Some(1_718_784_000_000));
-    }
-
-    #[test]
-    fn malformed_lines_are_skipped_without_panic() {
-        assert!(parse_claude_jsonl("s", "not json\n{bad").is_none());
-        assert!(parse_codex_index_line("garbage").is_none());
-        assert!(parse_codex_index_line(r#"{"thread_name":"no id"}"#).is_none());
-        assert!(parse_codex_index_line(r#"{"id":""}"#).is_none());
-    }
-
-    #[test]
-    fn build_scans_claude_and_codex_sorted_desc() {
-        let tmp = tempfile::tempdir().unwrap();
-        let claude = tmp.path().join(".claude");
-        let codex = tmp.path().join(".codex");
-        let proj = claude.join("projects").join("-Users-x-proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        std::fs::create_dir_all(&codex).unwrap();
-
-        std::fs::write(
-            proj.join("old.jsonl"),
-            format!("{}\n", claude_user_line("2026-06-18T08:00:00Z", "/Users/x/proj", "old task")),
-        )
-        .unwrap();
-        std::fs::write(
-            proj.join("new.jsonl"),
-            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj", "new task")),
-        )
-        .unwrap();
-        std::fs::write(
-            codex.join("session_index.jsonl"),
-            "{\"id\":\"cx\",\"thread_name\":\"codex task\",\"updated_at\":\"2026-06-19T08:00:00Z\"}\n",
-        )
-        .unwrap();
-
-        let entries = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
-        assert_eq!(entries.len(), 3);
-        // Newest first: new (06-20) > codex (06-19) > old (06-18).
-        assert_eq!(entries[0].session_id, "new");
-        assert_eq!(entries[0].title.as_deref(), Some("new task"));
-        assert_eq!(entries[1].session_id, "cx");
-        assert_eq!(entries[1].adapter, AgentAdapter::Codex);
-        assert_eq!(entries[2].session_id, "old");
-    }
-
-    #[test]
-    fn build_missing_dirs_is_empty() {
-        let entries = SessionIndex::build(
-            Path::new("/nonexistent/claude"),
-            Path::new("/nonexistent/codex"),
-            &SessionScope::AllProjects,
-        );
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn sanitize_project_path_matches_claude_slug() {
-        assert_eq!(
-            sanitize_project_path("/Users/x/Code/projects/OxiMux"),
-            "-Users-x-Code-projects-OxiMux"
-        );
-        // Every non-alphanumeric byte → '-' (spaces, dots, colons included).
-        assert_eq!(sanitize_project_path("/a/My App.v2"), "-a-My-App-v2");
-    }
-
-    #[test]
-    fn scoped_build_includes_only_the_matching_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        let claude = tmp.path().join(".claude");
-        let proj_a = claude
-            .join("projects")
-            .join(sanitize_project_path("/Users/x/proj-a"));
-        let proj_b = claude
-            .join("projects")
-            .join(sanitize_project_path("/Users/x/proj-b"));
-        std::fs::create_dir_all(&proj_a).unwrap();
-        std::fs::create_dir_all(&proj_b).unwrap();
-        std::fs::write(
-            proj_a.join("a.jsonl"),
-            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj-a", "in a")),
-        )
-        .unwrap();
-        std::fs::write(
-            proj_b.join("b.jsonl"),
-            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj-b", "in b")),
-        )
-        .unwrap();
-
-        // Scoped to proj-a → only proj-a's session.
-        let scoped = SessionIndex::build(
-            &claude,
-            Path::new("/none"),
-            &SessionScope::Projects(vec!["/Users/x/proj-a".to_string()]),
-        );
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].session_id, "a");
-
-        // All projects → both.
-        let all = SessionIndex::build(&claude, Path::new("/none"), &SessionScope::AllProjects);
-        assert_eq!(all.len(), 2);
-
-        // Empty scope matches nothing (callers pass AllProjects instead).
-        let none =
-            SessionIndex::build(&claude, Path::new("/none"), &SessionScope::Projects(vec![]));
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn scoped_build_excludes_codex_sessions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let claude = tmp.path().join(".claude");
-        let codex = tmp.path().join(".codex");
-        let proj = claude
-            .join("projects")
-            .join(sanitize_project_path("/Users/x/proj"));
-        std::fs::create_dir_all(&proj).unwrap();
-        std::fs::create_dir_all(&codex).unwrap();
-        std::fs::write(
-            proj.join("a.jsonl"),
-            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj", "hi")),
-        )
-        .unwrap();
-        std::fs::write(
-            codex.join("session_index.jsonl"),
-            "{\"id\":\"cx\",\"thread_name\":\"t\",\"updated_at\":\"2026-06-19T08:00:00Z\"}\n",
-        )
-        .unwrap();
-
-        // Codex has no cwd → only the all view shows it.
-        let scoped = SessionIndex::build(
-            &claude,
-            &codex,
-            &SessionScope::Projects(vec!["/Users/x/proj".to_string()]),
-        );
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].adapter, AgentAdapter::ClaudeCode);
-
-        let all = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
-        assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn large_claude_log_uses_bounded_path_with_no_entry_count() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join(".claude").join("projects").join("-p");
-        std::fs::create_dir_all(&proj).unwrap();
-
-        let mut content =
-            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/p", "kick off"));
-        let filler = claude_assistant_line("2026-06-20T08:01:00Z");
-        while (content.len() as u64) <= FULL_PARSE_LIMIT + 4096 {
-            content.push_str(&filler);
-            content.push('\n');
-        }
-        // A recognizable newest timestamp at the very end (within the tail).
-        content.push_str(&format!("{}\n", claude_assistant_line("2026-06-20T09:00:00Z")));
-        std::fs::write(proj.join("big.jsonl"), &content).unwrap();
-
-        let entries = SessionIndex::build(
-            &tmp.path().join(".claude"),
-            Path::new("/nonexistent"),
-            &SessionScope::AllProjects,
-        );
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
-        assert_eq!(e.session_id, "big");
-        assert_eq!(e.title.as_deref(), Some("kick off"));
-        assert_eq!(e.last_message_ts_ms, parse_timestamp_ms("2026-06-20T09:00:00Z"));
-        assert_eq!(e.entry_count, None);
-    }
-}
+#[path = "session_index_tests.rs"]
+mod tests;

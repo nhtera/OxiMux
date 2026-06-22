@@ -109,12 +109,31 @@ fn home_abbrev(path: &str, home: Option<&str>) -> String {
     path.to_string()
 }
 
-/// Filter + rank entries by `query` over their titles. Returns indices into
+/// Filter + rank entries by `query`. Matches over a per-entry haystack of
+/// title + project path + branch + tag — so a search finds sessions by what
+/// they were about OR which project/branch they ran in (most titles are a
+/// terse "hi", so metadata is what makes search useful). Returns indices into
 /// `entries`, newest-first when the query is empty (entries arrive sorted).
 pub fn filter_sessions(query: &str, entries: &[SessionEntry]) -> Vec<usize> {
-    let titles: Vec<String> = entries.iter().map(session_row_title).collect();
-    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let haystacks: Vec<String> = entries.iter().map(session_search_text).collect();
+    let refs: Vec<&str> = haystacks.iter().map(String::as_str).collect();
     filter_and_rank(query, &refs)
+}
+
+/// The searchable text for one entry: title first (so title hits rank high),
+/// then project path, branch, and tag.
+fn session_search_text(entry: &SessionEntry) -> String {
+    let mut parts: Vec<String> = vec![session_row_title(entry)];
+    if let Some(cwd) = entry.cwd.as_deref().filter(|c| !c.is_empty()) {
+        parts.push(cwd.to_string());
+    }
+    if let Some(branch) = entry.git_branch.as_deref().filter(|b| !b.is_empty()) {
+        parts.push(branch.to_string());
+    }
+    if let Some(tag) = entry.tag.as_deref().filter(|t| !t.is_empty()) {
+        parts.push(tag.to_string());
+    }
+    parts.join(" ")
 }
 
 /// Preamble prepended to stripped scrollback when forking with context.
@@ -183,8 +202,12 @@ mod tests {
             path: None,
             cwd: None,
             title: f.title.map(str::to_string),
+            custom_title: None,
             git_branch: f.branch.map(str::to_string),
+            tag: None,
+            created_at_ms: None,
             last_message_ts_ms: f.ts,
+            message_count: None,
             size_bytes: f.size,
             entry_count: None,
         }
@@ -306,6 +329,23 @@ mod tests {
         assert_eq!(filter_sessions("", &entries), vec![0, 1]);
         // No match → empty.
         assert!(filter_sessions("zzzzz", &entries).is_empty());
+    }
+
+    #[test]
+    fn filter_matches_project_path_and_branch_not_just_title() {
+        // Two same-titled "hi" sessions in different projects/branches.
+        let mut a = claude(Some("hi"));
+        a.cwd = Some("/Users/x/Code/youtube/graphify-rs".into());
+        a.git_branch = Some("main".into());
+        let mut b = claude(Some("hi"));
+        b.cwd = Some("/Users/x/Code/projects/OxiMux".into());
+        b.git_branch = Some("feat/agents".into());
+        let entries = vec![a, b];
+        // Project name matches even though both titles are "hi".
+        assert_eq!(filter_sessions("graphify", &entries), vec![0]);
+        assert_eq!(filter_sessions("oximux", &entries), vec![1]);
+        // Branch matches too.
+        assert_eq!(filter_sessions("feat/agents", &entries), vec![1]);
     }
 
     #[test]

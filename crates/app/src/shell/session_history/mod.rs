@@ -70,6 +70,10 @@ pub struct SessionHistoryModal {
     /// Bumped per preview load so a slow read can't clobber a newer selection.
     preview_gen: u64,
     _preview_task: Option<Task<()>>,
+    /// Blinking-caret phase for the search field (true = caret drawn) so it
+    /// reads as a live input. Toggled by `_caret_blink`.
+    caret_on: bool,
+    _caret_blink: Task<()>,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -93,12 +97,45 @@ impl SessionHistoryModal {
             preview_loading: false,
             preview_gen: 0,
             _preview_task: None,
+            caret_on: true,
+            _caret_blink: Self::start_caret_blink(cx),
             focus_handle: cx.focus_handle(),
             theme,
             density,
             typography,
             _load_task: None,
         }
+    }
+
+    /// Period of the query-caret blink. Matches the common text-cursor cadence.
+    const CARET_BLINK_MS: u64 = 530;
+
+    /// Toggle the caret on a fixed cadence so the search field reads as an
+    /// editable input. Runs for the entity's lifetime; only flips state +
+    /// repaints while the modal is open.
+    fn start_caret_blink(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone())
+                else {
+                    return;
+                };
+                executor
+                    .timer(std::time::Duration::from_millis(Self::CARET_BLINK_MS))
+                    .await;
+                if this
+                    .update(cx, |m, cx| {
+                        if m.open {
+                            m.caret_on = !m.caret_on;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
     }
 
     /// Open the modal, focus its query field, and scan past sessions.
@@ -110,6 +147,8 @@ impl SessionHistoryModal {
         self.open = true;
         self.query.clear();
         self.selected_idx = 0;
+        // Solid caret on open; the blink task takes over from here.
+        self.caret_on = true;
         self.now_ms = now_unix_ms();
         self.scope_paths = scope_paths;
         self.show_all = self.scope_paths.is_empty();
@@ -406,7 +445,10 @@ impl Render for SessionHistoryModal {
             .overflow_y_scroll();
         if let Some(entry) = selected_entry {
             let title = picker::session_row_title(entry);
-            let meta = picker::session_row_subtitle(entry, self.now_ms, true, home.as_deref());
+            let mut meta = picker::session_row_subtitle(entry, self.now_ms, true, home.as_deref());
+            if let Some(n) = entry.message_count {
+                meta.push_str(&format!(" · {n} message{}", if n == 1 { "" } else { "s" }));
+            }
             preview = preview.child(
                 div()
                     .flex()
@@ -470,7 +512,13 @@ impl Render for SessionHistoryModal {
             .overflow_hidden()
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_e, _window, cx| cx.stop_propagation())
-            .child(header_row(&self.query, &self.scope_label(), theme, &typography))
+            .child(header_row(
+                &self.query,
+                &self.scope_label(),
+                self.caret_on,
+                theme,
+                &typography,
+            ))
             .child(divider(theme))
             .child(body)
             .child(divider(theme))
@@ -545,22 +593,39 @@ impl Render for SessionHistoryModal {
 fn header_row(
     query: &str,
     scope: &str,
+    caret_on: bool,
     theme: Theme,
     typography: &Typography,
 ) -> impl IntoElement {
+    // Blinking text caret — fixed width whether on or off so the toggle never
+    // nudges the text; transparent on the off phase. The strongest signal that
+    // the field is focused and accepting input.
+    let caret_color = if caret_on {
+        theme.fg_base
+    } else {
+        hsla(0.0, 0.0, 0.0, 0.0)
+    };
+    let caret = div().w(px(1.5)).h(px(16.)).rounded(px(1.)).bg(caret_color);
+
+    // Query area reads as a live input: typed text then the caret, or the caret
+    // then greyed placeholder when empty.
     let query_area = div()
         .flex()
+        .flex_row()
+        .items_center()
         .flex_1()
+        .gap(px(1.))
         .text_size(px(typography.t_body_md))
+        .when(!query.is_empty(), |d| {
+            d.child(div().text_color(theme.fg_base).child(query.to_string()))
+        })
+        .child(caret)
         .when(query.is_empty(), |d| {
             d.child(
                 div()
                     .text_color(theme.fg_subtle)
                     .child("Search past sessions…"),
             )
-        })
-        .when(!query.is_empty(), |d| {
-            d.child(div().text_color(theme.fg_base).child(query.to_string()))
         });
 
     div()
