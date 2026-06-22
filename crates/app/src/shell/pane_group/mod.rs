@@ -2704,6 +2704,12 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The approval card has precedence and suppresses the composer while it
+        // shows. Ignore the open/toggle chord in that state so it can't close
+        // (and silently discard the draft of) a composer hidden behind the card.
+        if self.approval_card.is_some() {
+            return;
+        }
         if self.compose_bar.is_some() {
             self.close_composer(cx);
             return;

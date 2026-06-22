@@ -292,6 +292,10 @@ impl Render for ApprovalCard {
                 // Swallow clicks inside the card so they don't reach the
                 // terminal beneath (which would move the agent's cursor).
             })
+            .on_mouse_down(MouseButton::Right, |_event, _window, _cx| {
+                // Swallow right-clicks too, so the card body never opens the
+                // terminal context menu beneath it.
+            })
             .flex()
             .flex_col()
             .w(px(460.0))

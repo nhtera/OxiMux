@@ -110,9 +110,9 @@
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join(".claude").join("projects").join("-p");
         std::fs::create_dir_all(&proj).unwrap();
-        let line = format!(
-            r#"{{"type":"user","timestamp":"2026-06-20T10:00:00Z","cwd":"/p","gitBranch":"feat/x","message":{{"content":"hi"}}}}"#
-        );
+        let line =
+            r#"{"type":"user","timestamp":"2026-06-20T10:00:00Z","cwd":"/p","gitBranch":"feat/x","message":{"content":"hi"}}"#
+                .to_string();
         let path = proj.join("s.jsonl");
         std::fs::write(&path, format!("{line}\n")).unwrap();
         let entries = SessionIndex::build(
