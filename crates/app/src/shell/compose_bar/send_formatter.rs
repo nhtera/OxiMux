@@ -4,10 +4,10 @@
 //! When the agent's shell has DECSET-2004 (bracketed paste) enabled, the draft
 //! is wrapped in `ESC[200~ … ESC[201~` so a multi-line prompt is inserted as a
 //! single chunk — readline/zle treat it as one paste rather than executing each
-//! line. The wrapped form intentionally omits a trailing carriage return: the
-//! composer is a *draft* aid, so the text lands in the agent's input line and
-//! the user presses Enter to submit (matching the existing terminal paste
-//! path). When bracketed paste is off, the raw draft bytes are sent verbatim.
+//! line. A trailing carriage return is then appended *outside* the paste
+//! brackets so a single ⌘↵ both delivers AND submits the draft (matching the
+//! "send" affordance). When bracketed paste is off, the raw draft bytes plus
+//! the CR are sent verbatim.
 //!
 //! In every mode the ESC byte (`0x1b`) is stripped from the draft first, so a
 //! draft can never smuggle its own escape sequence (e.g. an embedded
@@ -20,19 +20,25 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Format a composed `draft` for delivery to an agent PTY.
 ///
-/// - `bp_on` true → wrap in bracketed-paste brackets, no trailing CR.
-/// - `bp_on` false → raw draft bytes, no trailing CR.
+/// - `bp_on` true → wrap in bracketed-paste brackets, then a trailing CR.
+/// - `bp_on` false → raw draft bytes, then a trailing CR.
 ///
-/// The ESC byte is removed from the draft payload in both cases.
+/// The ESC byte is removed from the draft payload in both cases. The trailing
+/// CR sits OUTSIDE the paste brackets so the agent's readline inserts the block
+/// and then executes it — one ⌘↵ delivers and submits.
 pub fn format_send_bytes(draft: &str, bp_on: bool) -> Vec<u8> {
     let payload: Vec<u8> = draft.bytes().filter(|b| *b != 0x1b).collect();
-    if !bp_on {
-        return payload;
-    }
-    let mut out = Vec::with_capacity(payload.len() + PASTE_START.len() + PASTE_END.len());
-    out.extend_from_slice(PASTE_START);
-    out.extend_from_slice(&payload);
-    out.extend_from_slice(PASTE_END);
+    let mut out = if bp_on {
+        let mut wrapped =
+            Vec::with_capacity(payload.len() + PASTE_START.len() + PASTE_END.len() + 1);
+        wrapped.extend_from_slice(PASTE_START);
+        wrapped.extend_from_slice(&payload);
+        wrapped.extend_from_slice(PASTE_END);
+        wrapped
+    } else {
+        payload
+    };
+    out.push(b'\r');
     out
 }
 
@@ -41,26 +47,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn send_formatter_bracketed_paste_no_cr() {
+    fn send_formatter_bracketed_paste_submits_with_trailing_cr() {
         let out = format_send_bytes("hello", true);
         assert!(out.starts_with(PASTE_START), "wrapped with paste-start");
-        assert!(out.ends_with(PASTE_END), "wrapped with paste-end");
-        assert!(!out.contains(&b'\r'), "no carriage return — user submits");
+        // CR is appended OUTSIDE the closing bracket, so the payload submits.
+        assert_eq!(out.last(), Some(&b'\r'), "trailing CR submits the draft");
+        assert!(
+            out[..out.len() - 1].ends_with(PASTE_END),
+            "paste-end precedes the CR",
+        );
     }
 
     #[test]
-    fn send_formatter_plain_no_bracket() {
-        // Raw bytes when bracketed paste is off — and still no CR.
-        assert_eq!(format_send_bytes("hello", false), b"hello");
+    fn send_formatter_plain_appends_cr() {
+        // Raw bytes plus the submit CR when bracketed paste is off.
+        assert_eq!(format_send_bytes("hello", false), b"hello\r");
     }
 
     #[test]
     fn send_formatter_strips_esc_from_payload() {
         let out = format_send_bytes("hello\u{1b}world", true);
-        // The ONLY ESC bytes left are the two bracket markers; the payload
-        // between them must be ESC-free.
+        // Payload sits between the brackets; the trailing byte is the CR.
         let start = PASTE_START.len();
-        let end = out.len() - PASTE_END.len();
+        let end = out.len() - PASTE_END.len() - 1;
         assert!(
             !out[start..end].contains(&0x1b),
             "payload region is ESC-free",
@@ -74,7 +83,7 @@ mod tests {
         let out = format_send_bytes("line1\nline2", true);
         // Newlines are preserved inside the bracket (bracketed paste is exactly
         // the mechanism that stops them from executing line-by-line).
-        let inner = &out[PASTE_START.len()..out.len() - PASTE_END.len()];
+        let inner = &out[PASTE_START.len()..out.len() - PASTE_END.len() - 1];
         assert_eq!(inner, b"line1\nline2");
     }
 }

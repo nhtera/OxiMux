@@ -2704,12 +2704,10 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The approval card has precedence and suppresses the composer while it
-        // shows. Ignore the open/toggle chord in that state so it can't close
-        // (and silently discard the draft of) a composer hidden behind the card.
-        if self.approval_card.is_some() {
-            return;
-        }
+        // Toggle: a second ⌘I closes the composer. The composer takes render
+        // precedence over the approval card (see `render`), so opening it while
+        // an agent awaits approval is fine — it surfaces over the card to
+        // compose a reply, and closing it brings the card back.
         if self.compose_bar.is_some() {
             self.close_composer(cx);
             return;
@@ -2754,8 +2752,8 @@ impl PaneGroup {
         if let crate::shell::compose_bar::ComposerOutcome::Submit(draft) = outcome {
             // Wrap in bracketed paste only when the agent shell has DECSET-2004
             // on, so a multi-line prompt lands as a single insertion rather
-            // than executing line-by-line. The bytes carry no trailing CR — the
-            // draft lands in the agent's input and the user presses Enter.
+            // than executing line-by-line. `format_send_bytes` appends a
+            // trailing CR (outside the brackets) so this one ⌘↵ submits.
             let bp_on = self.active_agent_bracketed_paste(cx);
             let bytes = crate::shell::compose_bar::send_formatter::format_send_bytes(draft, bp_on);
             // `format_send_bytes` only ever emits valid UTF-8 (the payload is an

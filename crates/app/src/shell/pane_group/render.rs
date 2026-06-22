@@ -251,30 +251,35 @@ impl Render for PaneGroup {
             .active_sub_divider()
             .map(|active| sub_divider_capture_overlay(entity.clone(), active.axis));
 
-        // Quick-reply approval card over the active agent tab when it is
-        // blocked on an approval prompt. Reconciled here so it re-evaluates on
-        // every status-driven repaint (auto-dismiss falls out for free).
-        let approval_overlay: Option<AnyElement> = self.reconcile_approval_card(window, cx);
+        // Reconcile the approval card every frame — this drives its entity
+        // lifecycle (mount on NeedsApproval, drop otherwise), so call it
+        // unconditionally even when the composer ends up taking the overlay.
+        let approval_card_overlay: Option<AnyElement> = self.reconcile_approval_card(window, cx);
 
         // Prompt composer bar, docked at the bottom of the active agent pane,
         // shown ONLY over its origin agent (so it can never render on, or submit
-        // to, a different tab). Suppressed while the approval card is showing so
-        // the two bottom-docked overlays never stack.
-        let composer_overlay: Option<AnyElement> = if approval_overlay.is_some() {
+        // to, a different tab).
+        let composer_overlay: Option<AnyElement> = self.composer_for_active_tab().map(|composer| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(12.0))
+                .px(px(24.0))
+                .flex()
+                .justify_center()
+                .child(div().w_full().max_w(px(720.0)).child(composer.clone()))
+                .into_any_element()
+        });
+
+        // The composer takes precedence: when the user has explicitly opened it
+        // (⌘I) to compose a reply, it surfaces over the approval card so the two
+        // bottom-docked overlays never stack. Closing the composer brings the
+        // card back if the agent is still awaiting approval.
+        let approval_overlay: Option<AnyElement> = if composer_overlay.is_some() {
             None
         } else {
-            self.composer_for_active_tab().map(|composer| {
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom(px(12.0))
-                    .px(px(24.0))
-                    .flex()
-                    .justify_center()
-                    .child(div().w_full().max_w(px(720.0)).child(composer.clone()))
-                    .into_any_element()
-            })
+            approval_card_overlay
         };
 
         div()
