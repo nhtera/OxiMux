@@ -214,17 +214,41 @@ impl Render for SessionHistoryModal {
         } else {
             for (i, &entry_idx) in order.iter().enumerate() {
                 let entry = &self.entries[entry_idx];
-                let label = picker::session_row_label(entry);
-                let detail = picker::session_row_detail(entry, self.now_ms);
+                let title = picker::session_row_title(entry);
+                let subtitle = picker::session_row_subtitle(entry, self.now_ms);
                 let is_selected = i == selected;
                 let ent = entity.clone();
+                // Each line is a flex-row wrapper holding a min-w-0 text child —
+                // the proven single-line-clip structure (a bare nowrap text in a
+                // flex-col forces full width and renders nothing). Mirrors the
+                // agents dashboard cards.
+                let title_line = div().flex().flex_row().w_full().child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(typography.t_body_md))
+                        .text_color(theme.fg_base)
+                        .child(title),
+                );
+                let subtitle_line = div().flex().flex_row().w_full().child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(typography.t_sub_label))
+                        .text_color(theme.fg_subtle)
+                        .child(subtitle),
+                );
                 list = list.child(
                     div()
                         .id(("session-row", i))
                         .flex()
                         .flex_col()
                         .justify_center()
+                        .gap(px(2.))
                         .h(px(ROW_HEIGHT))
+                        .w_full()
                         .px(px(10.))
                         .rounded(px(6.))
                         .cursor_pointer()
@@ -236,18 +260,8 @@ impl Render for SessionHistoryModal {
                                 ent.update(cx, |m, cx| m.launch(i, LaunchKind::Resume, window, cx));
                             },
                         )
-                        .child(
-                            div()
-                                .text_size(px(typography.t_body_md))
-                                .text_color(theme.fg_base)
-                                .child(label),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(typography.t_sub_label))
-                                .text_color(theme.fg_subtle)
-                                .child(detail),
-                        ),
+                        .child(title_line)
+                        .child(subtitle_line),
                 );
             }
         }
