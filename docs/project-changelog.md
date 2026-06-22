@@ -6,6 +6,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ### 2026-06-23 — Agents: remove the quick-reply approval card (cockpit rebuild Phase 3 reverted)
 
+**Commit**: `8d0749f` (chore: remove quick-reply approval card)
 **Touches**: `crates/app/src/shell/approval_card.rs` (deleted), `crates/app/src/actions.rs` (`QuickReplyToAgent` removed), `crates/app/src/workspace_root.rs` (handler removed), `crates/app/src/shell/pane_group/` (overlay wiring removed), `crates/app/tests/fixtures/claude-approval-bytes.txt` (deleted)
 
 The keystroke-send approval card (an overlay that mounted over a blocked agent's pane with Approve/Deny/free-text buttons) is removed. The mechanism carried more complexity than it earned: a per-adapter byte map (`1\r` approve / `Esc` deny) that is fragile to Claude's command-dependent menu shape, a double-send debounce state machine, and bottom-dock overlay mutual-exclusion with the composer. Agents are answered directly in their terminal, or via the `⌘I` composer.
