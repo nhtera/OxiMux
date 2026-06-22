@@ -338,9 +338,34 @@ impl Render for ComposerBar {
             .child(Input::new(&self.input))
             .child(
                 div()
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(theme.fg_subtle)
-                    .child(SharedString::from("⌘↵ send · @ mention a file · Esc close")),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(density.gap_inline))
+                    .child(
+                        div()
+                            .text_size(px(typography.t_body_sm))
+                            .text_color(theme.fg_subtle)
+                            .child(SharedString::from(
+                                "⌘↵ send · @ mention a file · ⌘I or Esc to close",
+                            )),
+                    )
+                    // Mouse close, since some input methods (e.g. Vietnamese
+                    // Telex) swallow Escape before it reaches a focused field.
+                    .child(
+                        div()
+                            .id("compose-close")
+                            .px(px(6.0))
+                            .text_size(px(typography.t_body_sm))
+                            .text_color(theme.fg_subtle)
+                            .hover(|s| s.text_color(theme.fg_base))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e, window, cx| this.dismiss(window, cx)),
+                            )
+                            .child(SharedString::from("✕ Close")),
+                    ),
             )
     }
 }
