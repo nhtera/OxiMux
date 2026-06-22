@@ -23,7 +23,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use oximux_agents::session_log::{
     now_unix_ms,
-    session_index::{SessionEntry, SessionIndex},
+    session_index::{SessionEntry, SessionIndex, SessionScope},
 };
 
 use crate::actions::ResumeAgentSession;
@@ -52,6 +52,11 @@ pub struct SessionHistoryModal {
     loading: bool,
     /// Captured at open time so row ages render consistently for the frame.
     now_ms: i64,
+    /// Active project's launch dirs (root + worktrees) — the default scope.
+    /// Empty when no project is active, which forces the all-projects view.
+    scope_paths: Vec<String>,
+    /// When true, ignore `scope_paths` and list every project (the ⌃A view).
+    show_all: bool,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -68,6 +73,8 @@ impl SessionHistoryModal {
             entries: Vec::new(),
             loading: false,
             now_ms: 0,
+            scope_paths: Vec::new(),
+            show_all: false,
             focus_handle: cx.focus_handle(),
             theme,
             density,
@@ -76,19 +83,46 @@ impl SessionHistoryModal {
         }
     }
 
-    /// Open the modal, focus its query field, and kick off a background scan
-    /// of `~/.claude` + `~/.codex` for past sessions.
-    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the modal, focus its query field, and scan past sessions.
+    ///
+    /// `scope_paths` are the active project's launch dirs (root + worktrees);
+    /// the default view lists only those, mirroring Claude Code's same-repo
+    /// `/resume`. An empty list (no active project) opens the all view.
+    pub fn open(&mut self, scope_paths: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.open = true;
         self.query.clear();
         self.selected_idx = 0;
+        self.now_ms = now_unix_ms();
+        self.scope_paths = scope_paths;
+        self.show_all = self.scope_paths.is_empty();
+        window.focus(&self.focus_handle, cx);
+        self.rescan(cx);
+        cx.notify();
+    }
+
+    /// Flip between this-project and all-projects scope, then re-scan (⌃A).
+    /// No-op without an active project — that view is already all-projects.
+    fn toggle_show_all(&mut self, cx: &mut Context<Self>) {
+        if self.scope_paths.is_empty() {
+            return;
+        }
+        self.show_all = !self.show_all;
+        self.selected_idx = 0;
+        self.rescan(cx);
+        cx.notify();
+    }
+
+    /// (Re)build the index for the current scope on the background executor,
+    /// then publish back on the main thread. `SessionIndex::build` is blocking
+    /// std::fs, so it never runs on the UI thread.
+    fn rescan(&mut self, cx: &mut Context<Self>) {
         self.entries.clear();
         self.loading = true;
-        self.now_ms = now_unix_ms();
-        window.focus(&self.focus_handle, cx);
-
-        // SessionIndex::build is blocking std::fs — run it on the background
-        // executor, then publish back on the main thread.
+        let scope = if self.show_all {
+            SessionScope::AllProjects
+        } else {
+            SessionScope::Projects(self.scope_paths.clone())
+        };
         let task = cx.spawn(async move |this, cx| {
             let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone()) else {
                 return;
@@ -97,7 +131,7 @@ impl SessionHistoryModal {
                 .spawn(async move {
                     match dirs::home_dir() {
                         Some(home) => {
-                            SessionIndex::build(&home.join(".claude"), &home.join(".codex"))
+                            SessionIndex::build(&home.join(".claude"), &home.join(".codex"), &scope)
                         }
                         None => Vec::new(),
                     }
@@ -110,7 +144,6 @@ impl SessionHistoryModal {
             });
         });
         self._load_task = Some(task);
-        cx.notify();
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
@@ -130,6 +163,23 @@ impl SessionHistoryModal {
 
     fn filtered(&self) -> Vec<usize> {
         picker::filter_sessions(&self.query, &self.entries)
+    }
+
+    /// Short scope label for the header: the project folder name when scoped,
+    /// "All projects" in the all view (or when there's no active project).
+    fn scope_label(&self) -> String {
+        if self.show_all {
+            return "All projects".to_string();
+        }
+        self.scope_paths
+            .first()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone())
+            })
+            .unwrap_or_else(|| "All projects".to_string())
     }
 
     fn move_selection(&mut self, delta: isize, row_count: usize, cx: &mut Context<Self>) {
@@ -275,11 +325,11 @@ impl Render for SessionHistoryModal {
             .overflow_hidden()
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_e, _window, cx| cx.stop_propagation())
-            .child(header_row(&self.query, theme, &typography))
+            .child(header_row(&self.query, &self.scope_label(), theme, &typography))
             .child(divider(theme))
             .child(list)
             .child(divider(theme))
-            .child(footer_hints(theme, &typography));
+            .child(footer_hints(self.show_all, self.scope_paths.is_empty(), theme, &typography));
 
         div()
             .absolute()
@@ -314,6 +364,13 @@ impl Render for SessionHistoryModal {
                         cx.notify();
                     }
                     _ => {
+                        // ⌃A toggles this-project ⇄ all-projects scope (matches
+                        // the agent CLI's resume picker). Checked before the
+                        // modifier early-return below.
+                        if event.keystroke.modifiers.control && key == "a" {
+                            this.toggle_show_all(cx);
+                            return;
+                        }
                         if event.keystroke.modifiers.control
                             || event.keystroke.modifiers.platform
                             || event.keystroke.modifiers.alt
@@ -338,7 +395,12 @@ impl Render for SessionHistoryModal {
     }
 }
 
-fn header_row(query: &str, theme: Theme, typography: &Typography) -> impl IntoElement {
+fn header_row(
+    query: &str,
+    scope: &str,
+    theme: Theme,
+    typography: &Typography,
+) -> impl IntoElement {
     let query_area = div()
         .flex()
         .flex_1()
@@ -376,6 +438,16 @@ fn header_row(query: &str, theme: Theme, typography: &Typography) -> impl IntoEl
                 .text_color(theme.fg_muted)
                 .child("History"),
         )
+        // Current scope — the project folder name, or "All projects" (⌃A).
+        .child(
+            div()
+                .max_w(px(220.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child(scope.to_string()),
+        )
         .child(query_area)
 }
 
@@ -394,7 +466,12 @@ fn divider(theme: Theme) -> impl IntoElement {
     div().w_full().h(px(1.)).bg(theme.border_inactive)
 }
 
-fn footer_hints(theme: Theme, typography: &Typography) -> impl IntoElement {
+fn footer_hints(
+    show_all: bool,
+    no_project: bool,
+    theme: Theme,
+    typography: &Typography,
+) -> impl IntoElement {
     let hint = |label: &str| -> gpui::Div {
         div()
             .text_size(px(typography.t_sub_label))
@@ -411,5 +488,13 @@ fn footer_hints(theme: Theme, typography: &Typography) -> impl IntoElement {
         .child(hint("↑↓ navigate"))
         .child(hint("↵ resume"))
         .child(hint("⇧↵ fork"))
+        // The scope toggle is meaningless with no active project (always all).
+        .when(!no_project, |d| {
+            d.child(hint(if show_all {
+                "⌃A this project"
+            } else {
+                "⌃A all projects"
+            }))
+        })
         .child(hint("esc dismiss"))
 }

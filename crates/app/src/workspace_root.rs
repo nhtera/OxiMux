@@ -1056,6 +1056,27 @@ impl WorkspaceRoot {
         this
     }
 
+    /// Launch dirs for the *active* project (its root plus each linked git
+    /// worktree) — the default same-project scope for the session-history
+    /// picker. Empty when no project is active, which the picker reads as
+    /// "show all". Synchronous SQLite reads only.
+    fn active_project_scope_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
+        if let Some(project) = &self.active_project {
+            paths.push(project.root_path.clone());
+            if let Ok(list) = self.app_state.workspace_repo.list_for_project(&project.id) {
+                for w in list {
+                    if w.worktree_path != project.root_path {
+                        paths.push(w.worktree_path);
+                    }
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// Collect every worktree path across all recent projects (the project
     /// root plus each linked worktree). Same source the rail snapshot uses;
     /// deduped so a project root that already has a workspace row is counted
@@ -2705,7 +2726,12 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|this, _: &OpenSessionHistory, window, cx| {
                 this.close_modal_overlays(cx);
-                this.session_history.update(cx, |m, cx| m.open(window, cx));
+                // Default the picker to the active project's sessions (root +
+                // worktrees), mirroring the agent CLI's same-repo /resume; an
+                // empty scope opens the all-projects view.
+                let scope = this.active_project_scope_paths();
+                this.session_history
+                    .update(cx, |m, cx| m.open(scope, window, cx));
             }))
             // Root fallback for the composer chord. `OpenComposerBar` is
             // handled at the PaneGroup level, so a Cmd+I dispatched while

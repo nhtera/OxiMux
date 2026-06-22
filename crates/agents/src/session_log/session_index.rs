@@ -60,16 +60,60 @@ const TAIL_BYTES: u64 = 16 * 1024;
 /// One-line prompt preview cap (characters, ellipsis appended past it).
 const PROMPT_MAX_CHARS: usize = 200;
 
+/// Which projects the index should cover.
+///
+/// Mirrors Claude Code's `/resume`: by default it lists only the sessions of
+/// the current repo (the launch dir plus its git worktrees), and `Ctrl+A`
+/// flips to every project on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionScope {
+    /// Every project under `<claude_dir>/projects` — the "show all" view.
+    AllProjects,
+    /// Only sessions whose Claude project directory matches one of these
+    /// launch paths (the active project root + its git worktrees). An empty
+    /// list still scopes (matches nothing) — callers fall back to
+    /// [`SessionScope::AllProjects`] when there's no active project.
+    Projects(Vec<String>),
+}
+
+/// Longest single path component most filesystems allow before Claude Code
+/// truncates the slug and appends a hash (its `MAX_SANITIZED_LENGTH`).
+const MAX_SANITIZED_LEN: usize = 200;
+
+/// Map a launch directory to its `<claude_dir>/projects` slug exactly as the
+/// agent CLI does: every non-alphanumeric byte becomes `-`
+/// (`/Users/x/My App` → `-Users-x-My-App`).
+pub fn sanitize_project_path(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Does an on-disk project-dir name correspond to a sanitized launch path?
+/// Exact match for normal paths; over-long paths get truncated + a hash we
+/// don't reproduce, so fall back to a prefix match for those.
+fn slug_matches(dir_name: &str, sanitized_target: &str) -> bool {
+    if dir_name == sanitized_target {
+        return true;
+    }
+    sanitized_target.len() > MAX_SANITIZED_LEN
+        && dir_name.starts_with(&sanitized_target[..MAX_SANITIZED_LEN])
+}
+
 /// Build the merged, newest-first session index from the two CLI state
 /// roots (normally `~/.claude` and `~/.codex`). Missing roots contribute
 /// nothing.
 pub struct SessionIndex;
 
 impl SessionIndex {
-    pub fn build(claude_dir: &Path, codex_dir: &Path) -> Vec<SessionEntry> {
+    pub fn build(claude_dir: &Path, codex_dir: &Path, scope: &SessionScope) -> Vec<SessionEntry> {
         let mut entries = Vec::new();
-        collect_claude(claude_dir, &mut entries);
-        collect_codex(codex_dir, &mut entries);
+        collect_claude(claude_dir, scope, &mut entries);
+        // Codex's compact index records no cwd, so its sessions can't be tied
+        // to a project — only surface them in the unscoped (all) view.
+        if matches!(scope, SessionScope::AllProjects) {
+            collect_codex(codex_dir, &mut entries);
+        }
         // Newest first; entries without a timestamp sort to the bottom.
         entries.sort_by_key(|e| std::cmp::Reverse(e.last_message_ts_ms));
         entries
@@ -78,15 +122,30 @@ impl SessionIndex {
 
 // --- Claude Code -----------------------------------------------------------
 
-fn collect_claude(claude_dir: &Path, out: &mut Vec<SessionEntry>) {
+fn collect_claude(claude_dir: &Path, scope: &SessionScope, out: &mut Vec<SessionEntry>) {
     let projects = claude_dir.join("projects");
     let Ok(project_dirs) = fs::read_dir(&projects) else {
         return;
+    };
+    // In scoped mode, precompute the sanitized project-dir names we accept.
+    let targets: Option<Vec<String>> = match scope {
+        SessionScope::AllProjects => None,
+        SessionScope::Projects(paths) => {
+            Some(paths.iter().map(|p| sanitize_project_path(p)).collect())
+        }
     };
     for proj in project_dirs.flatten() {
         // Skip symlinked project dirs — never follow links out of the root.
         if !proj.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
             continue;
+        }
+        // Scoped: keep only project dirs whose slug matches a target path.
+        if let Some(targets) = &targets {
+            let name = proj.file_name();
+            let name = name.to_string_lossy();
+            if !targets.iter().any(|t| slug_matches(&name, t)) {
+                continue;
+            }
         }
         let Ok(files) = fs::read_dir(proj.path()) else {
             continue;
@@ -453,7 +512,11 @@ mod tests {
         );
         let path = proj.join("s.jsonl");
         std::fs::write(&path, format!("{line}\n")).unwrap();
-        let entries = SessionIndex::build(&tmp.path().join(".claude"), Path::new("/nonexistent"));
+        let entries = SessionIndex::build(
+            &tmp.path().join(".claude"),
+            Path::new("/nonexistent"),
+            &SessionScope::AllProjects,
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].git_branch.as_deref(), Some("feat/x"));
         assert_eq!(entries[0].size_bytes, Some(std::fs::metadata(&path).unwrap().len()));
@@ -510,7 +573,7 @@ mod tests {
         )
         .unwrap();
 
-        let entries = SessionIndex::build(&claude, &codex);
+        let entries = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
         assert_eq!(entries.len(), 3);
         // Newest first: new (06-20) > codex (06-19) > old (06-18).
         assert_eq!(entries[0].session_id, "new");
@@ -522,9 +585,98 @@ mod tests {
 
     #[test]
     fn build_missing_dirs_is_empty() {
-        let entries =
-            SessionIndex::build(Path::new("/nonexistent/claude"), Path::new("/nonexistent/codex"));
+        let entries = SessionIndex::build(
+            Path::new("/nonexistent/claude"),
+            Path::new("/nonexistent/codex"),
+            &SessionScope::AllProjects,
+        );
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn sanitize_project_path_matches_claude_slug() {
+        assert_eq!(
+            sanitize_project_path("/Users/x/Code/projects/OxiMux"),
+            "-Users-x-Code-projects-OxiMux"
+        );
+        // Every non-alphanumeric byte → '-' (spaces, dots, colons included).
+        assert_eq!(sanitize_project_path("/a/My App.v2"), "-a-My-App-v2");
+    }
+
+    #[test]
+    fn scoped_build_includes_only_the_matching_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join(".claude");
+        let proj_a = claude
+            .join("projects")
+            .join(sanitize_project_path("/Users/x/proj-a"));
+        let proj_b = claude
+            .join("projects")
+            .join(sanitize_project_path("/Users/x/proj-b"));
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+        std::fs::write(
+            proj_a.join("a.jsonl"),
+            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj-a", "in a")),
+        )
+        .unwrap();
+        std::fs::write(
+            proj_b.join("b.jsonl"),
+            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj-b", "in b")),
+        )
+        .unwrap();
+
+        // Scoped to proj-a → only proj-a's session.
+        let scoped = SessionIndex::build(
+            &claude,
+            Path::new("/none"),
+            &SessionScope::Projects(vec!["/Users/x/proj-a".to_string()]),
+        );
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].session_id, "a");
+
+        // All projects → both.
+        let all = SessionIndex::build(&claude, Path::new("/none"), &SessionScope::AllProjects);
+        assert_eq!(all.len(), 2);
+
+        // Empty scope matches nothing (callers pass AllProjects instead).
+        let none =
+            SessionIndex::build(&claude, Path::new("/none"), &SessionScope::Projects(vec![]));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn scoped_build_excludes_codex_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join(".claude");
+        let codex = tmp.path().join(".codex");
+        let proj = claude
+            .join("projects")
+            .join(sanitize_project_path("/Users/x/proj"));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            proj.join("a.jsonl"),
+            format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj", "hi")),
+        )
+        .unwrap();
+        std::fs::write(
+            codex.join("session_index.jsonl"),
+            "{\"id\":\"cx\",\"thread_name\":\"t\",\"updated_at\":\"2026-06-19T08:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        // Codex has no cwd → only the all view shows it.
+        let scoped = SessionIndex::build(
+            &claude,
+            &codex,
+            &SessionScope::Projects(vec!["/Users/x/proj".to_string()]),
+        );
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].adapter, AgentAdapter::ClaudeCode);
+
+        let all = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
+        assert_eq!(all.len(), 2);
     }
 
     #[test]
@@ -544,7 +696,11 @@ mod tests {
         content.push_str(&format!("{}\n", claude_assistant_line("2026-06-20T09:00:00Z")));
         std::fs::write(proj.join("big.jsonl"), &content).unwrap();
 
-        let entries = SessionIndex::build(&tmp.path().join(".claude"), Path::new("/nonexistent"));
+        let entries = SessionIndex::build(
+            &tmp.path().join(".claude"),
+            Path::new("/nonexistent"),
+            &SessionScope::AllProjects,
+        );
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.session_id, "big");
