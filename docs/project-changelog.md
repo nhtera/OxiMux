@@ -4,6 +4,45 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-22 — Agents: prompt composer bar with @file autocomplete (cockpit rebuild Phase 4)
+
+**Commits**: `19f4c20` (feat: prompt composer bar with @file autocomplete), `40f17fc` (fix: composer submit + correct agent routing)
+**Touches**: `crates/app/src/shell/compose_bar/` (new — `mention_parser`, `mention_resolver`, `send_formatter`, GPUI view, @mention dropdown), `crates/app/src/shell/`, `crates/agents`
+
+A Cmd+I composer bar docks over the active agent pane. Multi-line draft input with inline `@file` autocomplete (fuzzy over the project's `rg` index, reusing the command-palette fuzzy ranker). Cmd+Return submits: formats the draft via `send_formatter`, routes via `SendTextToActiveAgent`, and delivers bytes using `TerminalBackend::bracketed_paste()` (DECSET-2004) when the agent shell supports it. The first submit to an untitled agent tab auto-titles it from the prompt. Esc closes the dropdown then the bar; bar is suppressed while an approval card is shown.
+
+- `mention_parser` / `mention_resolver` / `send_formatter` are pure modules, unit-tested.
+- Submit fix (`40f17fc`): the Input widget binds secondary-Enter to its own action, so the keystroke never reached `on_key_down`; moved submit into the Enter capture handler keyed on the secondary flag — bare Enter still inserts a newline.
+- Routing fix: composer renders and submits only while its origin agent is the active tab, preventing misroute on tab switch.
+- No relay protocol change.
+
+---
+
+### 2026-06-21 — Agents: emit status via relay RPC + Settings toggle for status hooks (cockpit rebuild Phase 2c)
+
+**Commits**: `c8a3de3` (feat: emit agent status via relay RPC instead of /dev/tty), `d6ea6bf` (feat: Settings toggle for agent status hooks)
+**Touches**: `crates/relay` (new `Request::AgentStatus`; protocol v5 → v6), `crates/app` (`agent_status_hooks.rs`, `pane_agents_launch.rs` Settings toggle), `agent_launch.toml` (`status_hooks_enabled`)
+
+Two connected changes that make the OSC-9999 producer path reliable and user-controllable.
+
+- **Relay RPC emission** (`c8a3de3`): Claude Code runs hook commands in a detached session (no controlling terminal), so the previous `/dev/tty` emitter never reached the agent PTY. Status now routes through the relay: a new `oximux agent-status` CLI (invoked by the hook) reads `OXIMUX_PTY_ID` and sends `Request::AgentStatus` to the daemon, which frames the payload as OSC-9999 on the PTY's output stream where the existing scanner decodes it. Registry fans the packet to live subscribers only. Shell emitter removed. Protocol bumped v5 → v6 (`relay-v6.sock`).
+- **Settings toggle** (`d6ea6bf`): the `OXIMUX_STATUS_HOOKS` env-var gate replaced by a persistent toggle in Settings → Agents ("Status hooks"). Stored as `status_hooks_enabled` in `agent_launch.toml`; read at spawn and OR-combined with the env var (debug escape hatch retained).
+
+---
+
+### 2026-06-21 — Agents dashboard: live tool subline on status cards (cockpit rebuild Phase 2b)
+
+**Commits**: `5c07a6b` (feat: show live tool on dashboard agent cards)
+**Touches**: `crates/app/src/shell/agents_dashboard/` (card render), `crates/app/src/shell/workspace_root.rs` (live `LatestStatusMap` upgrade)
+
+Line 2 of each dashboard agent card now renders the live tool step from the OSC-9999 sideband detail (`AgentSnapshot.detail`). Lands the `LatestStatusMap` → `AgentSnapshot` upgrade deferred from Phase 1.
+
+- Per-session status watcher records structured sideband detail into a live workspace-keyed map on `WorkspaceRoot`; map is threaded to the dashboard alongside the existing activity tail.
+- Detail is held only while the agent is Running and cleared otherwise — no stale tool name lingers between tool calls.
+- Card prefers the sideband detail over the log-tailed activity line when available (e.g. "Bash · cargo build" instead of raw output tail).
+
+---
+
 ### 2026-06-21 — Agents: opt-in OSC-9999 status hooks for Claude Code (makes the sideband live)
 
 **Commits**: _(local, pending; branch `feat/agent-sideband-phase1`)_
