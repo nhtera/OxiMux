@@ -22,6 +22,10 @@ use crate::db::Db;
 use crate::error::StorageError;
 use crate::repositories::now;
 
+/// One persisted leaf-tab row:
+/// `(ordinal, sub_pane, tab, relay_pty_id, relay_session)`.
+pub type PaneRelayRow = (u32, u32, u32, String, String);
+
 #[derive(Clone)]
 pub struct PaneRelayIdRepo {
     db: Db,
@@ -37,6 +41,9 @@ impl PaneRelayIdRepo {
     /// for the first/only window to match the V005 migration default.
     /// `sub_pane` is the leaf's DFS position, `tab` its per-pane tab
     /// index — both `0` for a single-leaf/single-tab terminal.
+    // Each argument maps 1:1 to a primary-key / payload column of the upsert;
+    // bundling them into a struct would only add indirection at the call sites.
+    #[allow(clippy::too_many_arguments)]
     pub fn set(
         &self,
         project_id: &str,
@@ -81,7 +88,7 @@ impl PaneRelayIdRepo {
         &self,
         project_id: &str,
         window_id: &str,
-    ) -> Result<Vec<(u32, u32, u32, String, String)>, StorageError> {
+    ) -> Result<Vec<PaneRelayRow>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT ordinal, sub_pane, tab, relay_pty_id, relay_session FROM pane_relay_ids \

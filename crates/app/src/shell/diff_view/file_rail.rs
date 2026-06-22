@@ -18,7 +18,7 @@ use gpui_component::{Icon, Sizable as _};
 use oximux_core::FileGroup;
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Fixed rail width when revealed — wide enough for a nested filename + the
 /// `+N −N` tally without crowding the body, which keeps the remaining space.
@@ -192,7 +192,7 @@ fn flatten(root: &BTreeMap<String, Node>, collapsed: &HashSet<PathBuf>) -> Vec<R
 
 fn walk(
     level: &BTreeMap<String, Node>,
-    prefix: &PathBuf,
+    prefix: &Path,
     depth: usize,
     collapsed: &HashSet<PathBuf>,
     rows: &mut Vec<Row>,

@@ -242,10 +242,10 @@ impl PtyRegistry {
         // resolve the shell's live cwd kernel-side (split inheritance)
         // without a wire round-trip. Best-effort: disk trouble must
         // not block the spawn.
-        if let Some(store) = &self.checkpoints {
-            if let Err(e) = store.open(&pty_id, &args.cwd, args.cols, args.rows, pid) {
-                tracing::warn!(?e, pty_id, "checkpoint open failed");
-            }
+        if let Some(store) = &self.checkpoints
+            && let Err(e) = store.open(&pty_id, &args.cwd, args.cols, args.rows, pid)
+        {
+            tracing::warn!(?e, pty_id, "checkpoint open failed");
         }
 
         let entry = Arc::new(Entry {
@@ -653,6 +653,10 @@ fn send_sigterm(pid: Option<u32>) {
 /// `Notification::Exit { code }` (`None` here) to a late-reconnecting client.
 const EXIT_CODE_NONE: i32 = i32::MIN;
 
+// The reader task owns the PTY's full I/O state (reader, child handle, ring,
+// subscribers, exit flags); threading it as discrete args keeps the spawn site
+// explicit rather than hiding it behind a bag struct.
+#[allow(clippy::too_many_arguments)]
 fn reader_loop(
     pty_id: String,
     mut reader: Box<dyn Read + Send>,

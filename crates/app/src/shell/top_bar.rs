@@ -52,6 +52,7 @@ pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> i
 /// the center zone is a spacer (the tab strip lives in its own row
 /// in `workspace_root.rs`, BELOW this header, so chip drag-reorder
 /// works correctly — see the layout comment there).
+#[allow(clippy::too_many_arguments)]
 pub fn center_header(
     left_open: bool,
     right_open: bool,

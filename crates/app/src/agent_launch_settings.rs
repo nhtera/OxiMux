@@ -97,10 +97,10 @@ fn batch_touches_settings(result: &DebounceEventResult) -> bool {
 /// later clears a flag is never re-seeded.
 pub fn install(cx: &mut App) {
     let mut settings = load();
-    if settings.seed_yolo_defaults() {
-        if let Err(err) = save(&settings) {
-            tracing::warn!(%err, "could not persist seeded agent_launch.toml defaults");
-        }
+    if settings.seed_yolo_defaults()
+        && let Err(err) = save(&settings)
+    {
+        tracing::warn!(%err, "could not persist seeded agent_launch.toml defaults");
     }
     apply(cx, settings);
 

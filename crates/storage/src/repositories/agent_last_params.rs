@@ -9,6 +9,9 @@ use crate::db::Db;
 use crate::error::StorageError;
 use crate::repositories::now;
 
+/// One saved row: `(adapter_id, model, effort)`.
+pub type AgentLastParamsRow = (String, Option<String>, Option<String>);
+
 #[derive(Clone)]
 pub struct AgentLastParamsRepo {
     db: Db,
@@ -21,7 +24,7 @@ impl AgentLastParamsRepo {
 
     /// Every saved row as `(adapter_id, model, effort)`. Used at boot to
     /// preload the picker's preselect cache.
-    pub fn list_all(&self) -> Result<Vec<(String, Option<String>, Option<String>)>, StorageError> {
+    pub fn list_all(&self) -> Result<Vec<AgentLastParamsRow>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt =
                 c.prepare("SELECT adapter_id, model, effort FROM agent_last_params")?;

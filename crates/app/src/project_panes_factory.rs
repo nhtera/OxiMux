@@ -118,12 +118,12 @@ pub fn compute_attach_hints(
 ) -> AttachHints {
     pane_relay_ids
         .iter()
-        .filter_map(|(ord, sub_pane, tab, pty_id, session)| {
-            (*sub_pane == 0
+        .filter(|&(_ord, sub_pane, tab, pty_id, session)| {
+            *sub_pane == 0
                 && *tab == 0
-                && relay_row_survives(session, pty_id, live_external_ids, current_external_session))
-            .then(|| (*ord, pty_id.clone()))
+                && relay_row_survives(session, pty_id, live_external_ids, current_external_session)
         })
+        .map(|(ord, _sub_pane, _tab, pty_id, _session)| (*ord, pty_id.clone()))
         .collect()
 }
 
@@ -138,10 +138,10 @@ pub fn compute_leaf_attach_hints(
 ) -> LeafAttachHints {
     pane_relay_ids
         .iter()
-        .filter_map(|(ord, sub_pane, tab, pty_id, session)| {
+        .filter(|&(_ord, _sub_pane, _tab, pty_id, session)| {
             relay_row_survives(session, pty_id, live_external_ids, current_external_session)
-                .then(|| ((*ord, *sub_pane, *tab), pty_id.clone()))
         })
+        .map(|(ord, sub_pane, tab, pty_id, _session)| ((*ord, *sub_pane, *tab), pty_id.clone()))
         .collect()
 }
 
@@ -175,6 +175,10 @@ fn rank_in(order: &[usize], idx: usize) -> usize {
     order.iter().position(|&i| i == idx).unwrap_or(idx)
 }
 
+// The factory threads the full project-pane construction context (cwd,
+// snapshot, runtime handles, callbacks); a bag struct would only relocate the
+// argument list without simplifying the single call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_project_panes(
     cwd: PathBuf,
     snapshot: Option<PersistedTabs>,
@@ -1090,17 +1094,16 @@ pub(crate) fn spawn_attach_reconcile(
             };
             let delivered = entry.view.update(cx, |view, cx| {
                 let adopted = view.adopt_live_session(backend.clone(), session_id, cx);
-                if adopted {
-                    if let Some((restore, _)) = &cold
-                        && !restore.bytes.is_empty()
-                    {
-                        // Prefill BEFORE the first poll tick drains the fresh
-                        // shell's prompt: recovered history paints first, the
-                        // live prompt then appends below the restored marker.
-                        // A cwd-only restore (no replayable scrollback) skips
-                        // this — blank grid, recovered spawn dir.
-                        view.prefill_grid(&restore.bytes);
-                    }
+                if adopted
+                    && let Some((restore, _)) = &cold
+                    && !restore.bytes.is_empty()
+                {
+                    // Prefill BEFORE the first poll tick drains the fresh
+                    // shell's prompt: recovered history paints first, the
+                    // live prompt then appends below the restored marker.
+                    // A cwd-only restore (no replayable scrollback) skips
+                    // this — blank grid, recovered spawn dir.
+                    view.prefill_grid(&restore.bytes);
                 }
                 adopted
             });

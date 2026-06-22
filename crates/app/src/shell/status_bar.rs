@@ -132,50 +132,50 @@ where
             .text_color(theme.fg_muted)
             .child(git_label);
 
-        if show_primary {
-            if let Some(action) = primary {
-                let label = action.label.clone();
-                let title = action.title.clone();
-                let disabled = action.disabled;
-                let fg = if disabled { theme.fg_subtle } else { theme.fg_muted };
-                let hover_bg = theme.hover_overlay;
-                let btn = div()
-                    .id("status-bar-git-primary")
-                    .flex()
-                    .items_center()
-                    .h(px(16.))
-                    .px(px(6.))
-                    .rounded(px(density.r_chip))
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(fg)
-                    .border_1()
-                    .border_color(if disabled {
-                        theme.border_inactive
-                    } else {
-                        theme.border_active
-                    })
-                    .child(label)
-                    // Surface the resolver's context (commit counts, or the
-                    // reason the next step is unavailable) on hover.
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx)
-                    });
-
-                // Wire click only when enabled.
-                let btn = if disabled {
-                    btn
+        if show_primary
+            && let Some(action) = primary
+        {
+            let label = action.label.clone();
+            let title = action.title.clone();
+            let disabled = action.disabled;
+            let fg = if disabled { theme.fg_subtle } else { theme.fg_muted };
+            let hover_bg = theme.hover_overlay;
+            let btn = div()
+                .id("status-bar-git-primary")
+                .flex()
+                .items_center()
+                .h(px(16.))
+                .px(px(6.))
+                .rounded(px(density.r_chip))
+                .text_size(px(typography.t_body_sm))
+                .text_color(fg)
+                .border_1()
+                .border_color(if disabled {
+                    theme.border_inactive
                 } else {
-                    btn.cursor_pointer()
-                        .hover(move |s| s.bg(hover_bg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            move |_: &MouseDownEvent, window, cx| {
-                                on_primary_click(window, cx);
-                            },
-                        )
-                };
-                zone = zone.child(btn);
-            }
+                    theme.border_active
+                })
+                .child(label)
+                // Surface the resolver's context (commit counts, or the
+                // reason the next step is unavailable) on hover.
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx)
+                });
+
+            // Wire click only when enabled.
+            let btn = if disabled {
+                btn
+            } else {
+                btn.cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        move |_: &MouseDownEvent, window, cx| {
+                            on_primary_click(window, cx);
+                        },
+                    )
+            };
+            zone = zone.child(btn);
         }
         zone
     };

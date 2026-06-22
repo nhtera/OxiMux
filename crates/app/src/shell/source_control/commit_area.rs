@@ -871,6 +871,7 @@ fn build_commit_menu(
 ///   PR / Push before PR) are the exception — their path-to-enable isn't
 ///   obvious from the label, so the reason also shows as an inline `fg_subtle`
 ///   sub-line.
+#[allow(clippy::too_many_arguments)]
 fn build_menu_item(
     window: &mut Window,
     view: &Entity<CommitArea>,

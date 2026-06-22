@@ -848,6 +848,6 @@ mod tests {
         // test verifies the slice bound directly (activate_item is not
         // callable without a window).
         let items: Vec<PaletteItem> = Vec::new();
-        assert!(items.get(0).is_none());
+        assert!(items.is_empty());
     }
 }

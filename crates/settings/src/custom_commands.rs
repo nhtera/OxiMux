@@ -18,7 +18,7 @@ pub const FILE_NAME: &str = "commands.toml";
 /// sent verbatim to the active agent session when invoked. The optional
 /// `scope` field is reserved for future per-workspace routing; it is
 /// stored but not yet acted upon in v1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CustomCommand {
     pub name: String,
@@ -26,16 +26,6 @@ pub struct CustomCommand {
     /// Optional future scope hint (e.g. "agent", "shell"). Ignored by
     /// the dispatcher in v1; parsed and preserved for forward-compat.
     pub scope: Option<String>,
-}
-
-impl Default for CustomCommand {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            prompt: String::new(),
-            scope: None,
-        }
-    }
 }
 
 /// Root wrapper for the TOML file: `[[commands]]` array of tables.

@@ -227,7 +227,7 @@ impl BranchCommitsPanel {
         let range = self.range.clone();
         let path = f.path.clone();
 
-        let row = div()
+        div()
             .id(id)
             .flex()
             .flex_row()
@@ -280,8 +280,7 @@ impl BranchCommitsPanel {
                     .text_size(px(sc_style::GRAPH_META_TEXT))
                     .text_color(badge_color)
                     .child(badge),
-            );
-        row
+            )
     }
 }
 
