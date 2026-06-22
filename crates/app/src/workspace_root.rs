@@ -75,7 +75,7 @@ use crate::state::AppState;
 use crate::actions::{
     ActivateGroupTab, ActivateWorkspaceFromJump, ApplyLayoutBottomTerminal, ApplyLayoutHorizontal,
     ApplyLayoutStacked, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
-    OpenAddProjectDialog,
+    OpenAddProjectDialog, OpenComposerBar,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
     NewBrowserTab, NewTab, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory, OpenSettings,
@@ -2706,6 +2706,21 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &OpenSessionHistory, window, cx| {
                 this.close_modal_overlays(cx);
                 this.session_history.update(cx, |m, cx| m.open(window, cx));
+            }))
+            // Root fallback for the composer chord. `OpenComposerBar` is
+            // handled at the PaneGroup level, so a Cmd+I dispatched while
+            // focus sits outside the pane tree (left rail, a just-closed
+            // modal, fresh launch) would otherwise silently no-op. GPUI
+            // consumes the action at the deepest handler, so when the pane
+            // IS focused this fallback never runs — no double-toggle.
+            .on_action(cx.listener(|this, action: &OpenComposerBar, window, cx| {
+                let Some(panes) = this.active_project_panes() else {
+                    return;
+                };
+                let Some(group) = panes.read(cx).active_group() else {
+                    return;
+                };
+                group.update(cx, |g, cx| g.on_open_composer_bar(action, window, cx));
             }))
             .on_action(cx.listener(|this, action: &ResumeAgentSession, window, cx| {
                 let resumption = if action.fork {
