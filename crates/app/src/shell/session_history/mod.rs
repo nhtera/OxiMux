@@ -24,19 +24,23 @@ use oximux_settings::{Density, Theme, Typography};
 use oximux_agents::session_log::{
     now_unix_ms,
     session_index::{SessionEntry, SessionIndex, SessionScope},
+    session_preview::{PreviewMessage, PreviewRole, load_session_preview},
 };
 
 use crate::actions::ResumeAgentSession;
 use crate::shell::session_history::picker::LaunchKind;
 use crate::ui::FloatingSurface;
 
-const MODAL_WIDTH: f32 = 620.0;
+const MODAL_WIDTH: f32 = 940.0;
+const LIST_WIDTH: f32 = 380.0;
 const MODAL_TOP_OFFSET_PX: f32 = 96.0;
 const HEADER_HEIGHT: f32 = 44.0;
 const FOOTER_HEIGHT: f32 = 30.0;
 const ROW_HEIGHT: f32 = 46.0;
 const LIST_MAX_HEIGHT: f32 = ROW_HEIGHT * 10.0;
 const SCRIM_ALPHA: f32 = 0.20;
+/// Opening turns pulled into the preview pane for the highlighted session.
+const PREVIEW_MAX_MESSAGES: usize = 8;
 
 /// Emitted when the modal closes, so `WorkspaceRoot` can reclaim keyboard
 /// focus (the modal grabs focus on open).
@@ -57,6 +61,15 @@ pub struct SessionHistoryModal {
     scope_paths: Vec<String>,
     /// When true, ignore `scope_paths` and list every project (the ⌃A view).
     show_all: bool,
+    /// Entry index the preview pane currently shows (or is loading). `None`
+    /// before the first load / when nothing is selected.
+    preview_idx: Option<usize>,
+    /// Opening turns of the highlighted session, loaded lazily off-thread.
+    preview_msgs: Vec<PreviewMessage>,
+    preview_loading: bool,
+    /// Bumped per preview load so a slow read can't clobber a newer selection.
+    preview_gen: u64,
+    _preview_task: Option<Task<()>>,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -75,6 +88,11 @@ impl SessionHistoryModal {
             now_ms: 0,
             scope_paths: Vec::new(),
             show_all: false,
+            preview_idx: None,
+            preview_msgs: Vec::new(),
+            preview_loading: false,
+            preview_gen: 0,
+            _preview_task: None,
             focus_handle: cx.focus_handle(),
             theme,
             density,
@@ -118,6 +136,10 @@ impl SessionHistoryModal {
     fn rescan(&mut self, cx: &mut Context<Self>) {
         self.entries.clear();
         self.loading = true;
+        // The previous scope's preview is stale; force a reload once the new
+        // entries land.
+        self.preview_idx = None;
+        self.preview_msgs.clear();
         let scope = if self.show_all {
             SessionScope::AllProjects
         } else {
@@ -140,10 +162,58 @@ impl SessionHistoryModal {
             let _ = this.update(cx, |this, cx| {
                 this.entries = entries;
                 this.loading = false;
+                this.refresh_preview(cx);
                 cx.notify();
             });
         });
         self._load_task = Some(task);
+    }
+
+    /// Load the highlighted session's opening exchange into the preview pane
+    /// if it isn't already shown. Reads the log off-thread; a generation guard
+    /// drops a stale result when the selection moved on before it finished.
+    fn refresh_preview(&mut self, cx: &mut Context<Self>) {
+        let order = self.filtered();
+        let Some(&entry_idx) = order.get(self.selected_idx) else {
+            self.preview_idx = None;
+            self.preview_msgs.clear();
+            self.preview_loading = false;
+            return;
+        };
+        if self.preview_idx == Some(entry_idx) {
+            return; // already showing (or loading) this session
+        }
+        let path = self.entries.get(entry_idx).and_then(|e| e.path.clone());
+        self.preview_idx = Some(entry_idx);
+        self.preview_msgs.clear();
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        let generation = self.preview_gen;
+        let Some(path) = path else {
+            // Codex rows carry no transcript file — nothing to preview.
+            self.preview_loading = false;
+            cx.notify();
+            return;
+        };
+        self.preview_loading = true;
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone()) else {
+                return;
+            };
+            let msgs = executor
+                .spawn(async move {
+                    load_session_preview(std::path::Path::new(&path), PREVIEW_MAX_MESSAGES)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.preview_gen == generation {
+                    this.preview_msgs = msgs;
+                    this.preview_loading = false;
+                    cx.notify();
+                }
+            });
+        });
+        self._preview_task = Some(task);
+        cx.notify();
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
@@ -188,6 +258,7 @@ impl SessionHistoryModal {
         }
         self.selected_idx =
             crate::shell::project_picker::wrap_index(self.selected_idx, delta, row_count);
+        self.refresh_preview(cx);
         cx.notify();
     }
 
@@ -241,15 +312,19 @@ impl Render for SessionHistoryModal {
         let row_count = order.len();
         let selected = self.selected_idx;
         let entity = cx.entity();
+        // Home dir for `~`-abbreviating cwd paths (all-mode rows + preview meta).
+        let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+        let selected_entry = order.get(selected).and_then(|&i| self.entries.get(i));
 
         let mut list = div()
             .id("session-history-list")
             .flex()
             .flex_col()
-            .w_full()
+            .w(px(LIST_WIDTH))
+            .flex_shrink_0()
             .px(px(density.pad_overlay))
             .py(px(4.))
-            .max_h(px(LIST_MAX_HEIGHT))
+            .h(px(LIST_MAX_HEIGHT))
             .overflow_y_scroll();
 
         if self.loading {
@@ -265,7 +340,8 @@ impl Render for SessionHistoryModal {
             for (i, &entry_idx) in order.iter().enumerate() {
                 let entry = &self.entries[entry_idx];
                 let title = picker::session_row_title(entry);
-                let subtitle = picker::session_row_subtitle(entry, self.now_ms);
+                let subtitle =
+                    picker::session_row_subtitle(entry, self.now_ms, self.show_all, home.as_deref());
                 let is_selected = i == selected;
                 let ent = entity.clone();
                 // Each line is a flex-row wrapper holding a min-w-0 text child —
@@ -316,6 +392,75 @@ impl Render for SessionHistoryModal {
             }
         }
 
+        // Preview pane (right): the highlighted session's opening exchange +
+        // metadata, mirroring Claude's `/resume` preview.
+        let mut preview = div()
+            .id("session-history-preview")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h(px(LIST_MAX_HEIGHT))
+            .px(px(16.))
+            .py(px(12.))
+            .gap(px(10.))
+            .overflow_y_scroll();
+        if let Some(entry) = selected_entry {
+            let title = picker::session_row_title(entry);
+            let meta = picker::session_row_subtitle(entry, self.now_ms, true, home.as_deref());
+            preview = preview.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(typography.t_body_lg))
+                            .text_color(theme.fg_base)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(typography.t_sub_label))
+                            .text_color(theme.fg_subtle)
+                            .child(meta),
+                    ),
+            );
+            preview = preview.child(divider(theme));
+            if self.preview_loading {
+                preview = preview.child(preview_hint("Loading preview…", theme, &typography));
+            } else if self.preview_msgs.is_empty() {
+                let msg = if entry.path.is_none() {
+                    "No transcript preview for this session"
+                } else {
+                    "No readable messages in this session"
+                };
+                preview = preview.child(preview_hint(msg, theme, &typography));
+            } else {
+                let assistant_label = adapter_display(entry.adapter);
+                for m in &self.preview_msgs {
+                    preview =
+                        preview.child(preview_message(m, assistant_label, theme, &typography));
+                }
+            }
+        } else {
+            preview = preview.child(preview_hint(
+                "Select a session to preview",
+                theme,
+                &typography,
+            ));
+        }
+
+        let body = div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .h(px(LIST_MAX_HEIGHT))
+            .child(list)
+            .child(div().w(px(1.)).h_full().bg(theme.border_inactive))
+            .child(preview);
+
         let dismiss_entity = entity.clone();
         let card = div()
             .flex()
@@ -327,7 +472,7 @@ impl Render for SessionHistoryModal {
             .on_mouse_down(MouseButton::Left, |_e, _window, cx| cx.stop_propagation())
             .child(header_row(&self.query, &self.scope_label(), theme, &typography))
             .child(divider(theme))
-            .child(list)
+            .child(body)
             .child(divider(theme))
             .child(footer_hints(self.show_all, self.scope_paths.is_empty(), theme, &typography));
 
@@ -361,6 +506,7 @@ impl Render for SessionHistoryModal {
                     "backspace" => {
                         this.query.pop();
                         this.selected_idx = 0;
+                        this.refresh_preview(cx);
                         cx.notify();
                     }
                     _ => {
@@ -381,6 +527,7 @@ impl Render for SessionHistoryModal {
                         if key.chars().count() == 1 {
                             this.query.push_str(key);
                             this.selected_idx = 0;
+                            this.refresh_preview(cx);
                             cx.notify();
                         }
                     }
@@ -449,6 +596,55 @@ fn header_row(
                 .child(scope.to_string()),
         )
         .child(query_area)
+}
+
+/// Friendly name for the assistant side of a previewed transcript.
+fn adapter_display(adapter: oximux_core::AgentAdapter) -> &'static str {
+    match adapter {
+        oximux_core::AgentAdapter::ClaudeCode => "Claude",
+        oximux_core::AgentAdapter::Codex => "Codex",
+        oximux_core::AgentAdapter::Aider => "Aider",
+        oximux_core::AgentAdapter::Custom => "Assistant",
+    }
+}
+
+/// A dim status line inside the preview pane (loading / empty / no-selection).
+fn preview_hint(text: &str, theme: Theme, typography: &Typography) -> impl IntoElement {
+    div()
+        .text_size(px(typography.t_body_md))
+        .text_color(theme.fg_subtle)
+        .child(text.to_string())
+}
+
+/// One previewed turn: a role label over its wrapping text body.
+fn preview_message(
+    m: &PreviewMessage,
+    assistant_label: &str,
+    theme: Theme,
+    typography: &Typography,
+) -> impl IntoElement {
+    let (label, label_color) = match m.role {
+        PreviewRole::User => ("You".to_string(), theme.focus_ring),
+        PreviewRole::Assistant => (assistant_label.to_string(), theme.fg_muted),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .w_full()
+        .child(
+            div()
+                .text_size(px(typography.t_sub_label))
+                .text_color(label_color)
+                .child(label),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_size(px(typography.t_body_md))
+                .text_color(theme.fg_base)
+                .child(m.text.clone()),
+        )
 }
 
 fn hint_row(text: &str, theme: Theme, typography: &Typography) -> impl IntoElement {

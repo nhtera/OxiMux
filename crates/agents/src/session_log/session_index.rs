@@ -33,6 +33,10 @@ pub struct SessionEntry {
     /// CLI session identifier (Claude: log file stem; Codex: index `id`).
     pub session_id: String,
     pub adapter: AgentAdapter,
+    /// On-disk path to the session log, for the preview pane. `Some` for
+    /// Claude (the `.jsonl`); `None` for Codex (the compact index has no
+    /// per-session file path).
+    pub path: Option<String>,
     /// Launch directory, when the log records one (Codex index omits it).
     pub cwd: Option<String>,
     /// Row title: Claude's own `lastPrompt`, else the first user message with
@@ -174,6 +178,7 @@ fn build_claude_entry(session_id: &str, path: &Path) -> Option<SessionEntry> {
         let content = fs::read_to_string(path).ok()?;
         let mut entry = parse_claude_jsonl(session_id, &content)?;
         entry.size_bytes = Some(len);
+        entry.path = Some(path.to_string_lossy().into_owned());
         return Some(entry);
     }
     // Large log: title + cwd + branch from the head, newest ts from the tail.
@@ -189,6 +194,7 @@ fn build_claude_entry(session_id: &str, path: &Path) -> Option<SessionEntry> {
     Some(SessionEntry {
         session_id: session_id.to_string(),
         adapter: AgentAdapter::ClaudeCode,
+        path: Some(path.to_string_lossy().into_owned()),
         cwd,
         title,
         git_branch,
@@ -209,6 +215,8 @@ pub fn parse_claude_jsonl(session_id: &str, content: &str) -> Option<SessionEntr
     Some(SessionEntry {
         session_id: session_id.to_string(),
         adapter: AgentAdapter::ClaudeCode,
+        // Filled by `build_claude_entry` (this fn is pure over content).
+        path: None,
         cwd: claude_cwd(content),
         title: claude_title(content),
         git_branch: claude_git_branch(content),
@@ -273,12 +281,19 @@ fn claude_git_branch(content: &str) -> Option<String> {
 /// Slash-command user messages arrive wrapped as
 /// `<command-message>..</command-message><command-name>/x</command-name><command-args>..</command-args>`.
 /// Unwrap to a readable `"/x args"`; otherwise strip stray tags + collapse.
+/// Title use caps the result; preview use ([`unwrap_command_xml`]) does not.
 fn clean_command_xml(s: &str) -> String {
+    truncate_prompt(&unwrap_command_xml(s))
+}
+
+/// The slash-command unwrap (and stray-tag strip) without the title cap, for
+/// the preview pane which applies its own longer limit.
+pub(super) fn unwrap_command_xml(s: &str) -> String {
     if let Some(name) = tag_inner(s, "command-name") {
         let args = tag_inner(s, "command-args").unwrap_or_default();
-        return truncate_prompt(&format!("{name} {args}"));
+        return format!("{name} {args}").trim().to_string();
     }
-    truncate_prompt(&strip_tags(s))
+    strip_tags(s)
 }
 
 /// Inner text of the first `<tag>…</tag>`, trimmed.
@@ -308,7 +323,7 @@ fn strip_tags(s: &str) -> String {
 
 /// `message.content` as text: a bare string, or the first `text` block of an
 /// array of content blocks.
-fn user_message_text(v: &Value) -> Option<String> {
+pub(super) fn user_message_text(v: &Value) -> Option<String> {
     let content = v.pointer("/message/content")?;
     if let Some(s) = content.as_str() {
         return Some(s.to_string());
@@ -377,6 +392,7 @@ pub fn parse_codex_index_line(line: &str) -> Option<SessionEntry> {
     Some(SessionEntry {
         session_id: id.to_string(),
         adapter: AgentAdapter::Codex,
+        path: None,
         cwd: None,
         title,
         git_branch: None,
@@ -411,7 +427,7 @@ fn normalize_epoch(n: i64) -> i64 {
 
 // --- shared helpers --------------------------------------------------------
 
-fn line_value(line: &str) -> Option<Value> {
+pub(super) fn line_value(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line).ok()
 }
 
@@ -426,7 +442,7 @@ fn truncate_prompt(s: &str) -> String {
     out
 }
 
-fn read_head(path: &Path, max_bytes: u64) -> Option<String> {
+pub(super) fn read_head(path: &Path, max_bytes: u64) -> Option<String> {
     use std::io::Read;
     let f = fs::File::open(path).ok()?;
     let mut buf = Vec::new();

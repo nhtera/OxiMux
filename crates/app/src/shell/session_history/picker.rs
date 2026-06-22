@@ -61,9 +61,17 @@ pub fn session_row_title(entry: &SessionEntry) -> String {
 }
 
 /// Dim subtitle, mirroring Claude's `/resume`: `relative-time · branch · size`.
-/// Codex rows carry no branch/size, so they lead with the adapter name.
-/// `now_ms` is passed in so the function stays pure (testable).
-pub fn session_row_subtitle(entry: &SessionEntry, now_ms: i64) -> String {
+/// Codex rows carry no branch/size, so they lead with the adapter name. When
+/// `show_path` is set (the all-projects view) the session's `cwd` is appended
+/// — `~`-abbreviated against `home` — so the project each row belongs to is
+/// visible; the scoped view omits it (every row shares the repo). `now_ms` and
+/// `home` are passed in so the function stays pure (testable).
+pub fn session_row_subtitle(
+    entry: &SessionEntry,
+    now_ms: i64,
+    show_path: bool,
+    home: Option<&str>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if entry.adapter != AgentAdapter::ClaudeCode {
         parts.push(adapter_tag(entry.adapter).to_string());
@@ -77,7 +85,28 @@ pub fn session_row_subtitle(entry: &SessionEntry, now_ms: i64) -> String {
     if let Some(size) = entry.size_bytes {
         parts.push(format_size(size));
     }
+    if show_path
+        && let Some(cwd) = entry.cwd.as_deref().filter(|c| !c.is_empty())
+    {
+        parts.push(home_abbrev(cwd, home));
+    }
     parts.join(" · ")
+}
+
+/// Replace a leading `home` directory with `~` (`/Users/x/Code` → `~/Code`).
+/// Leaves the path untouched when it isn't under `home`.
+fn home_abbrev(path: &str, home: Option<&str>) -> String {
+    if let Some(home) = home.filter(|h| !h.is_empty()) {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = path.strip_prefix(home)
+            && rest.starts_with('/')
+        {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
 }
 
 /// Filter + rank entries by `query` over their titles. Returns indices into
@@ -151,6 +180,7 @@ mod tests {
         SessionEntry {
             session_id: "id".into(),
             adapter: f.adapter,
+            path: None,
             cwd: None,
             title: f.title.map(str::to_string),
             git_branch: f.branch.map(str::to_string),
@@ -212,7 +242,43 @@ mod tests {
             ts: Some(now - 3 * 60 * 60 * 1000), // 3 hours ago
             size: Some(70_100),
         });
-        assert_eq!(session_row_subtitle(&e, now), "3 hours ago · main · 68.5KB");
+        // Scoped view (show_path=false): no path.
+        assert_eq!(
+            session_row_subtitle(&e, now, false, None),
+            "3 hours ago · main · 68.5KB"
+        );
+    }
+
+    #[test]
+    fn subtitle_appends_abbreviated_path_in_all_mode() {
+        let now = 10_000_000_000;
+        let mut e = entry(Fields {
+            adapter: AgentAdapter::ClaudeCode,
+            title: Some("p"),
+            branch: Some("main"),
+            ts: Some(now - 60 * 1000),
+            size: Some(1024),
+        });
+        e.cwd = Some("/Users/x/Code/proj".to_string());
+        // All-projects view (show_path=true): cwd appended, ~-abbreviated.
+        assert_eq!(
+            session_row_subtitle(&e, now, true, Some("/Users/x")),
+            "1 minute ago · main · 1.0KB · ~/Code/proj"
+        );
+        // Path outside home stays absolute.
+        assert_eq!(
+            session_row_subtitle(&e, now, true, Some("/other")),
+            "1 minute ago · main · 1.0KB · /Users/x/Code/proj"
+        );
+    }
+
+    #[test]
+    fn home_abbrev_handles_exact_and_non_home() {
+        assert_eq!(home_abbrev("/Users/x", Some("/Users/x")), "~");
+        assert_eq!(home_abbrev("/Users/x/a", Some("/Users/x")), "~/a");
+        // Not a path-boundary match — don't abbreviate a sibling prefix.
+        assert_eq!(home_abbrev("/Users/xyz/a", Some("/Users/x")), "/Users/xyz/a");
+        assert_eq!(home_abbrev("/tmp/a", None), "/tmp/a");
     }
 
     #[test]
@@ -225,7 +291,10 @@ mod tests {
             ts: Some(now - 60 * 1000), // 1 minute ago
             size: None,
         });
-        assert_eq!(session_row_subtitle(&e, now), "codex · 1 minute ago");
+        assert_eq!(
+            session_row_subtitle(&e, now, false, None),
+            "codex · 1 minute ago"
+        );
     }
 
     #[test]
