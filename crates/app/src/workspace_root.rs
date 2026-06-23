@@ -350,6 +350,12 @@ pub struct WorkspaceRoot {
     /// the agent is `Running`; takes precedence over `agent_activity` on the
     /// dashboard's Running rows and is pushed to the rail via `refresh_left_rail`.
     pub(crate) agent_sideband: HashMap<String, oximux_core::SidebandDetail>,
+    /// Live agent sessions keyed by `agent_sessions.id` UUID, fed directly
+    /// from each tab's status watch channel by the persistence watcher. Unlike
+    /// `agent_sideband` (one collapsed entry per workspace key), this holds
+    /// EVERY open agent so the rail can list multiple agents per workspace.
+    /// Entries live only while the session is non-terminal (its tab is open).
+    pub(crate) live_agents: crate::shell::session_live_store::LiveAgentMap,
     /// Latest usage-meter state. `None` only before the first sample lands
     /// (then it is always `Available` or `Unavailable`).
     pub(crate) usage_state: Option<oximux_agents::session_log::usage::UsageState>,
@@ -1031,6 +1037,7 @@ impl WorkspaceRoot {
             rail_last_active: HashMap::new(),
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
+            live_agents: HashMap::new(),
             usage_state: None,
             usage_popover_open: false,
             #[cfg(target_os = "macos")]

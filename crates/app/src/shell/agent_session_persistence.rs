@@ -26,6 +26,8 @@ use gpui::Context;
 use oximux_agents::AgentStatusStream;
 use oximux_core::AgentStatus;
 
+use crate::shell::agent_presentation::adapter_display_name;
+use crate::shell::session_live_store::LiveAgentEntry;
 use crate::workspace_root::WorkspaceRoot;
 
 /// Spawn the persistence watcher for one agent session. `worktree_path` is
@@ -90,14 +92,31 @@ pub(crate) fn spawn_for_session(
                 async move { repo.insert(&workspace_key, adapter_id, m.as_deref(), e.as_deref()) },
             )
             .await;
-        let row_id = match inserted {
-            Ok(session) => session.id,
+        let (row_id, started_at) = match inserted {
+            Ok(session) => (session.id, session.started_at.unwrap_or_default()),
             Err(err) => {
                 tracing::warn!(?err, "agent persistence: session insert failed");
                 return;
             }
         };
-        let _ = weak.update(cx, |this, cx| this.mark_rail_dirty(cx));
+
+        // Register the live entry now that the stable DB UUID exists. The rail
+        // lists every open agent by this key (and dedups it against the DB
+        // history row, which shares the same id). `register_live_agent` marks
+        // the rail dirty, so no separate repaint nudge is needed here.
+        let _ = weak.update(cx, |this, cx| {
+            this.register_live_agent(
+                row_id.clone(),
+                LiveAgentEntry {
+                    workspace_key: ws_key.clone(),
+                    adapter_id,
+                    label: adapter_display_name(adapter_id).into(),
+                    status_rx: status_rx.clone(),
+                    started_at,
+                },
+                cx,
+            );
+        });
 
         // Transitions may have raced ahead of the insert (subscribe happens
         // before this task runs) — sync whatever the channel holds now.
@@ -127,7 +146,9 @@ pub(crate) fn spawn_for_session(
                 write_status(&agent_repo, &row_id, &AgentStatus::Interrupted, cx).await;
                 let _ = weak.update(cx, |this, cx| {
                     this.note_agent_sideband(&ws_key, &AgentStatus::Interrupted, None, cx);
-                    this.mark_rail_dirty(cx);
+                    // Tab closed / session torn down — drop the live entry so
+                    // the rail falls back to the (now Interrupted) history row.
+                    this.remove_live_agent(&row_id, cx);
                 });
                 return;
             }
@@ -151,6 +172,11 @@ pub(crate) fn spawn_for_session(
             // must still happen.
             let _ = weak.update(cx, |this, cx| this.mark_rail_dirty(cx));
         }
+
+        // Terminal status reached. The session is now history (a persisted
+        // row); drop the live entry so the rail shows the single history row
+        // rather than a duplicate live + history pair.
+        let _ = weak.update(cx, |this, cx| this.remove_live_agent(&row_id, cx));
     })
     .detach();
 }
