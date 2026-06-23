@@ -6,9 +6,13 @@
 //! hatch). When on, a Claude Code agent is launched with a `--settings` block
 //! that wires three hooks to the `oximux agent-status` CLI:
 //!
-//! - `PreToolUse`        → `--state working`        (`{"state":"working","tool":<name>}`)
-//! - `PermissionRequest` → `--state needs_approval` (`{"state":"needs_approval","tool":<name>}`)
-//! - `Stop`              → `--state idle`           (`{"state":"idle"}`)
+//! - `PreToolUse`   → `--state working` (`{"state":"working","tool":<name>}`)
+//! - `Notification` → `--state needs_approval --filter-notification` — Claude
+//!   fires `Notification` (NOT `PermissionRequest`, which never fires) when it
+//!   needs the user to answer a tool-permission prompt. The `--filter-notification`
+//!   flag makes the CLI emit only when the payload's `notification_type` is a
+//!   permission prompt, ignoring the benign "waiting for your input" nudge.
+//! - `Stop`         → `--state idle` (`{"state":"idle"}`)
 //!
 //! The CLI reads the hook event JSON on stdin (for the tool name), reads
 //! `OXIMUX_PTY_ID` (injected by the relay at spawn), and asks the relay to
@@ -70,11 +74,15 @@ fn build_settings_json_with(user_hooks: Option<Value>, binary_path: &Path) -> St
     let quoted = binary_path.display().to_string().replace('\'', "'\\''");
     let cmd = |state: &str| format!("'{quoted}' agent-status --state {state}");
     append_hook(&mut hooks, "PreToolUse", Some("*"), &cmd("working"));
+    // `Notification` (no matcher — like `Stop`) is the event Claude actually
+    // fires for a tool-permission prompt; `PermissionRequest` is a dead name in
+    // current Claude. `--filter-notification` gates the emit on the payload's
+    // `notification_type` so only a real permission ask reports needs_approval.
     append_hook(
         &mut hooks,
-        "PermissionRequest",
-        Some("*"),
-        &cmd("needs_approval"),
+        "Notification",
+        None,
+        &format!("'{quoted}' agent-status --state needs_approval --filter-notification"),
     );
     append_hook(&mut hooks, "Stop", None, &cmd("idle"));
     json!({ "hooks": hooks }).to_string()
@@ -167,6 +175,37 @@ pub fn tool_name_from_hook_json(stdin_json: &str) -> Option<String> {
     Some(name.chars().take(MAX_TOOL_LEN).collect())
 }
 
+/// True when a Claude `Notification` hook payload is a tool-permission prompt
+/// (the agent is blocked, waiting for the user to approve), as opposed to a
+/// benign notification such as the idle "Claude is waiting for your input"
+/// nudge. The `--filter-notification` CLI path calls this to decide whether to
+/// emit `needs_approval` at all.
+///
+/// Primary signal: the stable typed `notification_type` field
+/// (`"permission_prompt"` for tool asks — captured from Claude 2.1.x). Fallback:
+/// a narrow scan of the human `message` for permission/trust wording, in case
+/// the typed field changes. A parse failure or no match yields `false` so a
+/// non-permission notification never spuriously flips the dot to amber.
+pub fn notification_is_permission(stdin_json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(stdin_json) else {
+        return false;
+    };
+    if value.get("notification_type").and_then(Value::as_str) == Some("permission_prompt") {
+        return true;
+    }
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|m| {
+            let m = m.to_ascii_lowercase();
+            // "permission" covers "Claude needs your permission"; "do you trust"
+            // covers the workspace-trust dialog. The idle nudge ("waiting for
+            // your input") contains neither, so it is correctly ignored.
+            m.contains("permission") || m.contains("do you trust")
+        })
+        .unwrap_or(false)
+}
+
 /// Build the OSC-9999 inner JSON payload (`{"v":1,"state":..,"tool":..}`) the
 /// relay wraps and the scanner decodes. Serialized via `serde_json` so control
 /// characters in `tool` are escaped — the relay treats the result as opaque.
@@ -196,7 +235,7 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         let hooks = &v["hooks"];
         assert!(hooks["PreToolUse"].is_array());
-        assert!(hooks["PermissionRequest"].is_array());
+        assert!(hooks["Notification"].is_array());
         assert!(hooks["Stop"].is_array());
         // PreToolUse: matcher "*", async true, command single-quotes the binary
         // path and calls `agent-status --state working`.
@@ -214,13 +253,43 @@ mod tests {
                 .unwrap()
                 .ends_with(" agent-status --state idle")
         );
-        // PermissionRequest reports needs_approval.
+        // Notification (no matcher, like Stop) reports needs_approval and is
+        // gated by --filter-notification so only permission asks emit.
+        assert!(hooks["Notification"][0].get("matcher").is_none());
         assert!(
-            hooks["PermissionRequest"][0]["hooks"][0]["command"]
+            hooks["Notification"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
-                .ends_with(" agent-status --state needs_approval")
+                .ends_with(" agent-status --state needs_approval --filter-notification")
         );
+    }
+
+    #[test]
+    fn notification_permission_type_is_detected() {
+        // The exact payload captured from a live Claude 2.1.x permission prompt.
+        let payload = r#"{"hook_event_name":"Notification","message":"Claude needs your permission","notification_type":"permission_prompt"}"#;
+        assert!(notification_is_permission(payload));
+    }
+
+    #[test]
+    fn notification_message_fallback_matches_permission_wording() {
+        // No typed field — the message-keyword fallback still fires.
+        assert!(notification_is_permission(
+            r#"{"message":"Claude needs your permission to use Bash"}"#
+        ));
+        assert!(notification_is_permission(
+            r#"{"message":"Do you trust the files in this folder?"}"#
+        ));
+    }
+
+    #[test]
+    fn notification_idle_nudge_is_not_permission() {
+        // The benign "waiting for input" notification must NOT flip to amber.
+        assert!(!notification_is_permission(
+            r#"{"message":"Claude is waiting for your input","notification_type":"idle"}"#
+        ));
+        assert!(!notification_is_permission("not json"));
+        assert!(!notification_is_permission(r#"{"hook_event_name":"Notification"}"#));
     }
 
     #[test]

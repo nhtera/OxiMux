@@ -4,7 +4,16 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-06-23 — Agents: remove the quick-reply approval card (cockpit rebuild Phase 3 reverted)
+### 2026-06-23 — Agents: fix NeedsApproval status detection (Notification hook)
+
+**Touches**: `crates/app/src/agent_status_hooks.rs`, `crates/app/src/main.rs`
+
+The agent status hooks reported `needs_approval` via a `PermissionRequest` hook event that does not fire in current Claude (verified live), so an agent blocked on a tool-permission prompt never lit the amber status dot. Replaced it with the `Notification` hook event — the event Claude actually fires for permission prompts — gated by a new `--filter-notification` CLI flag so only genuine permission asks report `needs_approval`.
+
+- The filter keys on the payload's typed `notification_type == "permission_prompt"` field (captured from a live prompt), with a narrow message-keyword fallback. The benign "waiting for your input" idle nudge is correctly ignored.
+- `notification_is_permission()` is a pure, unit-tested helper; `run_agent_status_cli` reads stdin once and gates the emit.
+- Caveat: the `Notification` hook fires on Claude's idle delay (not instantly), so it is a reliable backstop; the immediate signal remains the adapter's prompt-body regex.
+- Pixel-verified live: a permission notification drives the tab status dot to the amber `status_warn` colour; idle/non-permission notifications do not. App-crate lib tests 968 pass.
 
 **Commit**: `8d0749f` (chore: remove quick-reply approval card)
 **Touches**: `crates/app/src/shell/approval_card.rs` (deleted), `crates/app/src/actions.rs` (`QuickReplyToAgent` removed), `crates/app/src/workspace_root.rs` (handler removed), `crates/app/src/shell/pane_group/` (overlay wiring removed), `crates/app/tests/fixtures/claude-approval-bytes.txt` (deleted)

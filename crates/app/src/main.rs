@@ -749,10 +749,16 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
     // Parse `--state <s>`. Only the tool-bearing states read stdin (the hook
     // event JSON) to extract the tool name; `idle` (Stop) carries none.
     let mut state = String::new();
+    let mut filter_notification = false;
     let mut args = std::env::args().skip(2);
     while let Some(a) = args.next() {
-        if a == "--state" {
-            state = args.next().unwrap_or_default();
+        match a.as_str() {
+            "--state" => state = args.next().unwrap_or_default(),
+            // Gate a `Notification` hook: emit only when its payload is a real
+            // permission prompt (Claude also fires Notification for benign idle
+            // nudges, which must not flip the dot to amber).
+            "--filter-notification" => filter_notification = true,
+            _ => {}
         }
     }
     let state = match state.as_str() {
@@ -764,15 +770,29 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
             return 1;
         }
     };
-    let tool = if state == "idle" {
+    // Read the hook event JSON once when we'll need it — for tool extraction
+    // (working / needs_approval) or the notification filter. `idle` (Stop)
+    // carries nothing relevant, so skip the read.
+    let stdin_json = if state == "idle" {
         None
     } else {
-        // Only the tool-bearing states read stdin (the hook event JSON).
         use std::io::Read;
         let mut buf = String::new();
         let _ = std::io::stdin().read_to_string(&mut buf);
-        oximux_app::agent_status_hooks::tool_name_from_hook_json(&buf)
+        Some(buf)
     };
+    if filter_notification
+        && !stdin_json
+            .as_deref()
+            .map(oximux_app::agent_status_hooks::notification_is_permission)
+            .unwrap_or(false)
+    {
+        // Not a permission prompt — clean no-op so the hook never fails the agent.
+        return 0;
+    }
+    let tool = stdin_json
+        .as_deref()
+        .and_then(oximux_app::agent_status_hooks::tool_name_from_hook_json);
 
     let pty_id = match std::env::var("OXIMUX_PTY_ID") {
         Ok(id) if !id.is_empty() => id,
