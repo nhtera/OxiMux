@@ -100,6 +100,8 @@ pub fn render_project_group(
     live_worktrees: &std::collections::HashSet<String>,
     ambient_by_path: &std::collections::HashMap<String, AmbientAgent>,
     diff_counts: &std::collections::HashMap<String, DiffCounts>,
+    workspace_agents: &crate::shell::left_rail::WorkspaceAgentList,
+    expanded_workspaces: &std::collections::HashSet<String>,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     on_row_menu: impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
@@ -270,6 +272,25 @@ pub fn render_project_group(
             row_handler,
             menu_handler,
         ));
+
+        // Multi-agent disclosure: only when a workspace has more than one
+        // agent. A single-agent workspace keeps the row's own status dot.
+        if let Some(rows) = workspace_agents.get(&workspace.id)
+            && rows.len() > 1
+        {
+            let is_expanded = expanded_workspaces.contains(&workspace.id);
+            col = col.child(
+                crate::shell::left_rail::workspace_agent_rows::render_workspace_agent_disclosure(
+                    &workspace.id,
+                    rows,
+                    is_expanded,
+                    rail.clone(),
+                    theme,
+                    density,
+                    typography,
+                ),
+            );
+        }
     }
 
     col

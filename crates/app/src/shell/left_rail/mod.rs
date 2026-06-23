@@ -27,6 +27,7 @@ pub mod rail_agent_row;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
+pub mod workspace_agent_rows;
 pub mod workspace_card;
 pub mod workspace_list_render;
 pub mod workspace_row;
@@ -179,6 +180,10 @@ pub struct LeftRail {
     /// pushed down with the snapshot; the expandable multi-agent disclosure
     /// reads it at render. Empty until a workspace has agents.
     workspace_agents: WorkspaceAgentList,
+    /// Workspace keys whose multi-agent disclosure is expanded. Toggled by
+    /// clicking the "N agents" summary line; in-memory only (not persisted),
+    /// and survives rail rebuilds since it lives on the entity.
+    expanded_workspaces: HashSet<String>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -269,6 +274,7 @@ impl LeftRail {
             agent_sideband: HashMap::new(),
             last_active: HashMap::new(),
             workspace_agents: HashMap::new(),
+            expanded_workspaces: HashSet::new(),
             width: px(density.w_left_rail),
             resizing: false,
             settings_repo: None,
@@ -738,6 +744,14 @@ impl LeftRail {
         cx.notify();
     }
 
+    /// Flip the multi-agent disclosure for one workspace. The caller notifies;
+    /// this only mutates the in-memory expand set.
+    pub(crate) fn toggle_workspace_expanded(&mut self, workspace_key: &str) {
+        if !self.expanded_workspaces.remove(workspace_key) {
+            self.expanded_workspaces.insert(workspace_key.to_string());
+        }
+    }
+
     /// Test-only inspector for the currently-active nav item (`None` = home).
     #[doc(hidden)]
     pub fn active_nav(&self) -> Option<NavItem> {
@@ -859,6 +873,8 @@ impl Render for LeftRail {
                 self.ambient_status.clone(),
                 self.latest_adapter.clone(),
                 self.diff_counts.clone(),
+                self.workspace_agents.clone(),
+                self.expanded_workspaces.clone(),
                 self.weak_root.clone(),
                 self.locate_glow_seq,
                 self.list_scroll.clone(),
@@ -964,6 +980,8 @@ fn render_workspace_list(
     ambient_status: HashMap<String, AmbientAgent>,
     latest_adapter: HashMap<String, String>,
     diff_counts: HashMap<String, DiffCounts>,
+    workspace_agents: WorkspaceAgentList,
+    expanded_workspaces: HashSet<String>,
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
     list_scroll: ScrollHandle,
@@ -1088,6 +1106,8 @@ fn render_workspace_list(
             &live_worktrees,
             &ambient_status,
             &diff_counts,
+            &workspace_agents,
+            &expanded_workspaces,
             rail.clone(),
             weak_root.clone(),
             on_row_menu,
