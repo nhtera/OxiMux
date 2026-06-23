@@ -18,6 +18,22 @@ use crate::shell::session_live_store::LiveAgentMap;
 /// live-first sort, so this trims the oldest finished sessions.
 pub const HISTORY_CAP: usize = 20;
 
+/// History scope for a NON-live row: shown only when it is a cleanly-finished
+/// (`Done`) session whose `ended_at` is at or after the recency cutoff (or
+/// unbounded when `cutoff` is `None`). This mirrors the reference cockpit,
+/// which keeps only cleanly-completed agents as recent history — a crash,
+/// a shutdown (`Interrupted`/`Failed`), or a never-closed `idle`/`running`
+/// leftover with no live tab is not "recent work to glance at" and is dropped.
+fn is_recent_done(s: &AgentSession, cutoff: Option<&str>) -> bool {
+    if !matches!(s.status, AgentStatus::Done { .. }) {
+        return false;
+    }
+    match (cutoff, s.ended_at.as_deref()) {
+        (Some(cut), Some(ended)) => ended >= cut,
+        _ => true,
+    }
+}
+
 /// Build every workspace's agent list in one pass — the whole rail's
 /// per-workspace lists, merging each workspace's DB history with the live
 /// sessions. Workspaces with no agents are omitted (the rail keeps its
@@ -48,9 +64,11 @@ pub fn build_workspace_agent_lists(
 /// Build the sorted agent list for one workspace.
 ///
 /// `db_sessions` is `list_for_workspace` output (all rows, `started_at`
-/// DESC). `history_cutoff` is an RFC-3339 instant (`now - 24h`); terminal
-/// history rows that ended before it are dropped unless still live. Pass
-/// `None` to disable the age cull (tests, or when no clock is handy).
+/// DESC). The result is the **live + recently-completed** set: every live
+/// session plus only the cleanly-finished (`Done`) history whose `ended_at`
+/// is at or after `history_cutoff` (an RFC-3339 `now - 24h`). Stale
+/// non-terminal leftovers and interrupted/failed sessions are dropped — see
+/// [`is_recent_done`]. Pass `None` to keep all `Done` history (tests).
 pub fn merge_workspace_agents(
     workspace_key: &str,
     db_sessions: &[AgentSession],
@@ -60,18 +78,15 @@ pub fn merge_workspace_agents(
     let mut rows: Vec<RailAgentRow> = Vec::with_capacity(db_sessions.len() + 1);
 
     // 1. DB rows. A matching live entry (same UUID + workspace) upgrades the
-    //    row to live and attaches its status receiver.
+    //    row to live and attaches its status receiver. A non-live row is kept
+    //    only when it is recent cleanly-finished history (see `is_recent_done`)
+    //    — stale leftovers and crashes are dropped so the list stays the
+    //    live + recently-completed set, not the full session log.
     for s in db_sessions {
         let live = live_agents
             .get(&s.id)
             .filter(|e| e.workspace_key == workspace_key);
-        // Cull stale finished history (ended before the cutoff) — but never a
-        // live session, however old its original launch.
-        if live.is_none()
-            && s.status.is_terminal()
-            && let (Some(cutoff), Some(ended)) = (history_cutoff, s.ended_at.as_deref())
-            && ended < cutoff
-        {
+        if live.is_none() && !is_recent_done(s, history_cutoff) {
             continue;
         }
         rows.push(RailAgentRow {
@@ -174,20 +189,29 @@ mod tests {
     }
 
     #[test]
-    fn all_db_no_live_marks_history() {
+    fn non_live_keeps_only_recent_done() {
         let sessions = vec![
-            db("a", AgentStatus::Idle, "2026-06-23T10:00:00Z", None),
+            // Stale leftover (never closed) — dropped.
+            db("idle", AgentStatus::Idle, "2026-06-23T10:00:00Z", None),
+            // Crash / forced close — dropped.
             db(
-                "b",
+                "crash",
+                AgentStatus::Interrupted,
+                "2026-06-23T09:00:00Z",
+                Some("2026-06-23T09:10:00Z"),
+            ),
+            // Clean exit — kept as recent history.
+            db(
+                "done",
                 AgentStatus::Done { code: Some(0) },
                 "2026-06-23T09:00:00Z",
                 Some("2026-06-23T09:30:00Z"),
             ),
         ];
         let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None);
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| !r.is_live));
-        assert!(rows.iter().all(|r| r.status_rx.is_none()));
+        let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
+        assert_eq!(ids, vec!["done"]);
+        assert!(rows.iter().all(|r| !r.is_live && r.status_rx.is_none()));
     }
 
     #[test]
@@ -220,20 +244,23 @@ mod tests {
 
     #[test]
     fn sorts_live_first_then_started_desc() {
-        // Two history rows (older), one live (oldest launch) — live still leads.
-        let sessions = vec![
-            db("new", AgentStatus::Idle, "2026-06-23T12:00:00Z", None),
-            db("old", AgentStatus::Idle, "2026-06-23T08:00:00Z", None),
-        ];
+        // A live agent (older launch) + a recent Done history row — live leads
+        // despite its older start time.
+        let sessions = vec![db(
+            "done-new",
+            AgentStatus::Done { code: Some(0) },
+            "2026-06-23T12:00:00Z",
+            Some("2026-06-23T12:30:00Z"),
+        )];
         let (_tx, rx) = live_rx(AgentStatus::Running);
         let mut live = LiveAgentMap::new();
-        live.insert("old".into(), entry(WS, rx, "2026-06-23T08:00:00Z"));
+        live.insert("live-old".into(), entry(WS, rx, "2026-06-23T08:00:00Z"));
 
         let rows = merge_workspace_agents(WS, &sessions, &live, None);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].db_id, "old"); // live first despite older launch
+        assert_eq!(rows[0].db_id, "live-old"); // live first despite older launch
         assert!(rows[0].is_live);
-        assert_eq!(rows[1].db_id, "new");
+        assert_eq!(rows[1].db_id, "done-new");
     }
 
     #[test]
@@ -242,9 +269,9 @@ mod tests {
             .map(|i| {
                 db(
                     &format!("s{i:02}"),
-                    AgentStatus::Idle,
+                    AgentStatus::Done { code: Some(0) },
                     &format!("2026-06-23T{:02}:00:00Z", i % 24),
-                    None,
+                    Some(&format!("2026-06-23T{:02}:30:00Z", i % 24)),
                 )
             })
             .collect();
@@ -253,35 +280,47 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_drops_stale_terminal_but_keeps_live() {
+    fn history_keeps_only_recent_done() {
         let sessions = vec![
-            // Finished long before the cutoff → dropped.
+            // Clean exit but long before the cutoff → dropped by age.
             db(
-                "stale",
-                AgentStatus::Interrupted,
+                "old-done",
+                AgentStatus::Done { code: Some(0) },
                 "2026-06-20T08:00:00Z",
                 Some("2026-06-20T09:00:00Z"),
             ),
-            // Finished after the cutoff → kept.
+            // Clean exit after the cutoff → kept.
             db(
-                "recent",
+                "recent-done",
                 AgentStatus::Done { code: Some(0) },
                 "2026-06-23T08:00:00Z",
                 Some("2026-06-23T09:00:00Z"),
+            ),
+            // Recent but a crash, not a clean exit → dropped by status.
+            db(
+                "recent-crash",
+                AgentStatus::Interrupted,
+                "2026-06-23T08:00:00Z",
+                Some("2026-06-23T09:05:00Z"),
             ),
         ];
         let cutoff = "2026-06-22T00:00:00Z";
         let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), Some(cutoff));
         let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
-        assert_eq!(ids, vec!["recent"]);
+        assert_eq!(ids, vec!["recent-done"]);
     }
 
     #[test]
     fn live_in_other_workspace_is_ignored() {
-        let sessions = vec![db("a", AgentStatus::Idle, "2026-06-23T10:00:00Z", None)];
+        let sessions = vec![db(
+            "a",
+            AgentStatus::Done { code: Some(0) },
+            "2026-06-23T10:00:00Z",
+            Some("2026-06-23T10:30:00Z"),
+        )];
         let (_tx, rx) = live_rx(AgentStatus::Running);
         let mut live = LiveAgentMap::new();
-        // Same UUID but a different workspace key — must not upgrade.
+        // Same UUID but a different workspace key — must not upgrade this row.
         live.insert("a".into(), entry("primary:other", rx, "2026-06-23T10:00:00Z"));
 
         let rows = merge_workspace_agents(WS, &sessions, &live, None);
@@ -295,7 +334,12 @@ mod tests {
             HashMap::from([("proj-1".to_string(), vec![ws("ws-a"), ws("ws-empty")])]);
         let sessions = HashMap::from([(
             "ws-a".to_string(),
-            vec![db("a", AgentStatus::Idle, "2026-06-23T10:00:00Z", None)],
+            vec![db(
+                "a",
+                AgentStatus::Done { code: Some(0) },
+                "2026-06-23T10:00:00Z",
+                Some("2026-06-23T10:30:00Z"),
+            )],
         )]);
         let out = build_workspace_agent_lists(&wbp, &sessions, &LiveAgentMap::new(), None);
         // Only the workspace with sessions appears; the empty one is omitted.
