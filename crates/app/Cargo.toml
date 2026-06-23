@@ -29,6 +29,7 @@ gpui-component = { workspace = true }
 gpui-component-assets = { workspace = true }
 
 anyhow = { workspace = true }
+chrono = { workspace = true }
 dirs = { workspace = true }
 notify-debouncer-full = { workspace = true }
 regex = { workspace = true }

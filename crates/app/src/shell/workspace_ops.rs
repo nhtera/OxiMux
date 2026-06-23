@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
-use oximux_core::{AgentAdapter, Project, Workspace};
+use oximux_core::{AgentAdapter, AgentSession, Project, Workspace};
 
 use crate::shell::agent_presentation::AmbientAgent;
 use oximux_git::{Repository, derive_slug, validate_slug};
@@ -29,7 +29,7 @@ use crate::project_panes_factory::{
 };
 use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
-use crate::shell::left_rail::LatestStatusMap;
+use crate::shell::left_rail::{LatestStatusMap, WorkspaceAgentList};
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
 
@@ -210,12 +210,15 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
 /// so other adapters never get a tail attempt.
 /// Outputs of one rail DB gather, in the order the `WorkspaceRoot::rail_*`
 /// fields consume them: workspaces-by-project, latest status, latest adapter
-/// slug, and last-active timestamp — each keyed as documented on those fields.
+/// slug, last-active timestamp, and the FULL per-workspace session list
+/// (workspace id → all `agent_sessions` rows, `started_at` DESC) the
+/// live↔history merge consumes — each keyed as documented on those fields.
 type RailDbData = (
     HashMap<String, Vec<Workspace>>,
     LatestStatusMap,
     HashMap<String, String>,
     HashMap<String, String>,
+    HashMap<String, Vec<AgentSession>>,
 );
 
 fn gather_rail_db_data(
@@ -231,17 +234,21 @@ fn gather_rail_db_data(
     // `ended_at`, else its `started_at` (still running). Raw RFC-3339 string —
     // lexicographic ordering matches chronological for these UTC `Z` stamps.
     let mut last_active: HashMap<String, String> = HashMap::new();
+    // Every session per workspace (not just the most-recent) so the rail can
+    // list multiple agents; the single-row caches above still derive from the
+    // newest (`first()`), preserving today's collapsed-dot behavior.
+    let mut workspace_sessions: HashMap<String, Vec<AgentSession>> = HashMap::new();
     for project in projects {
         let list = workspaces_with_primary_for(workspace_repo, project);
         for workspace in &list {
-            let latest = match agent_repo.list_for_workspace(&workspace.id) {
-                Ok(mut sessions) => sessions.drain(..).next(),
+            let sessions = match agent_repo.list_for_workspace(&workspace.id) {
+                Ok(sessions) => sessions,
                 Err(err) => {
                     tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
-                    None
+                    Vec::new()
                 }
             };
-            if let Some(session) = &latest {
+            if let Some(session) = sessions.first() {
                 latest_adapter.insert(workspace.id.clone(), session.adapter_id.clone());
                 if let Some(ts) = session
                     .ended_at
@@ -251,7 +258,11 @@ fn gather_rail_db_data(
                     last_active.insert(workspace.id.clone(), ts);
                 }
             }
-            latest_status.insert(workspace.id.clone(), latest.map(|s| s.status));
+            latest_status.insert(
+                workspace.id.clone(),
+                sessions.first().map(|s| s.status.clone()),
+            );
+            workspace_sessions.insert(workspace.id.clone(), sessions);
         }
         workspaces_by_project.insert(project.id.clone(), list);
     }
@@ -260,6 +271,7 @@ fn gather_rail_db_data(
         latest_status,
         latest_adapter,
         last_active,
+        workspace_sessions,
     )
 }
 
@@ -1378,6 +1390,19 @@ impl WorkspaceRoot {
         let diff_counts_snapshot = self.diff_counts.clone();
         let agent_activity_snapshot = self.agent_activity.clone();
         let agent_sideband_snapshot = self.agent_sideband.clone();
+        // Merge live runtime sessions (`live_agents`) with each workspace's DB
+        // history into per-workspace agent lists. Live entries win on the
+        // shared UUID; terminal history older than 24h is culled (live rows are
+        // always kept). The single-row caches above are untouched, so the
+        // collapsed dot is unchanged until the disclosure UI lands.
+        let history_cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let workspace_agents: WorkspaceAgentList =
+            crate::shell::session_merge::build_workspace_agent_lists(
+                &workspaces_by_project,
+                &self.rail_workspace_sessions,
+                &self.live_agents,
+                Some(&history_cutoff),
+            );
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
                 projects,
@@ -1392,6 +1417,7 @@ impl WorkspaceRoot {
                 agent_activity_snapshot,
                 agent_sideband_snapshot,
                 last_active,
+                workspace_agents,
                 cx,
             );
         });
@@ -1424,7 +1450,7 @@ impl WorkspaceRoot {
                 // All SQLite + the per-project `.git` stat run off the main
                 // thread (cx.spawn itself stays on the main thread — known
                 // footgun).
-                let (workspaces, statuses, adapters, last_active) = cx
+                let (workspaces, statuses, adapters, last_active, sessions) = cx
                     .background_executor()
                     .spawn(async move {
                         gather_rail_db_data(&workspace_repo, &agent_repo, &projects)
@@ -1435,6 +1461,7 @@ impl WorkspaceRoot {
                     this.rail_latest_status = statuses;
                     this.rail_latest_adapter = adapters;
                     this.rail_last_active = last_active;
+                    this.rail_workspace_sessions = sessions;
                     cx.notify();
                     if this.rail_dirty {
                         true

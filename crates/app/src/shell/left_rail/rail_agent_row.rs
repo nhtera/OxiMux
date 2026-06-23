@@ -1,0 +1,51 @@
+//! Per-agent rail row + the per-workspace list it composes into.
+//!
+//! Today the rail shows one collapsed status per workspace. To list every
+//! agent under a workspace, the merge step (`session_merge`) produces one
+//! `RailAgentRow` per agent — live sessions (from the runtime's
+//! `LiveAgentMap`) unified with DB history rows by their shared
+//! `agent_sessions.id` UUID. Phase 3's render reads `WorkspaceAgentList`.
+
+use gpui::SharedString;
+use oximux_agents::AgentStatusStream;
+use oximux_core::AgentStatus;
+
+/// One agent in a workspace's rail list — a live session, a finished
+/// history row, or a live session whose DB insert hasn't landed yet.
+#[derive(Clone)]
+pub struct RailAgentRow {
+    /// `agent_sessions.id` UUID — the unified key across live + history.
+    pub db_id: String,
+    /// Owning workspace key (`workspaces.id` or `primary:<project_id>`).
+    pub workspace_key: String,
+    /// Adapter slug (`claude-code`, `codex`, …).
+    pub adapter_id: String,
+    /// Display label (adapter name; Phase 3 may add a per-workspace index).
+    pub label: SharedString,
+    /// `true` when a live `LiveAgentEntry` backs this row.
+    pub is_live: bool,
+    /// Live status receiver — `Some` only when `is_live`. Render reads the
+    /// current status via `status_rx.borrow()`; falls back to `db_status`.
+    pub status_rx: Option<AgentStatusStream>,
+    /// DB-persisted status (the last-known / terminal state for history).
+    pub db_status: AgentStatus,
+    /// Launch timestamp (RFC-3339), for ordering + relative-age rendering.
+    pub started_at: Option<String>,
+    /// Terminal timestamp (RFC-3339), `None` while live/non-terminal.
+    pub ended_at: Option<String>,
+}
+
+impl RailAgentRow {
+    /// Effective status for render: the live snapshot when present, else the
+    /// DB-persisted status. Live always wins — it is fresher than the row.
+    pub fn effective_status(&self) -> AgentStatus {
+        match &self.status_rx {
+            Some(rx) => rx.borrow().status.clone(),
+            None => self.db_status.clone(),
+        }
+    }
+}
+
+/// Per-workspace agent lists keyed by workspace key. Each value is sorted
+/// live-first, then most-recent `started_at` first.
+pub type WorkspaceAgentList = std::collections::HashMap<String, Vec<RailAgentRow>>;

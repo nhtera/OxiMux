@@ -47,6 +47,7 @@ pub mod right_sidebar;
 pub mod search_panel;
 pub mod session_history;
 pub mod session_live_store;
+pub mod session_merge;
 pub mod settings_modal;
 pub mod source_control;
 pub mod split_direction;

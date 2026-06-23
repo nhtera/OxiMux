@@ -23,6 +23,7 @@ pub mod nav_section;
 pub mod project_drag;
 pub mod project_group;
 pub mod project_menu;
+pub mod rail_agent_row;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
@@ -75,6 +76,8 @@ const AUTOSCROLL_TICK: Duration = Duration::from_millis(16);
 /// Snapshot of the latest agent-session status for a single workspace.
 /// `None` means no sessions have ever been started for that workspace.
 pub type LatestStatusMap = HashMap<String, Option<AgentStatus>>;
+
+pub use rail_agent_row::{RailAgentRow, WorkspaceAgentList};
 
 /// One project group's held Smart-sort order plus when it was locked. Within
 /// `SMART_SETTLE` of the lock time, the group renders this order instead of a
@@ -171,6 +174,11 @@ pub struct LeftRail {
     /// Drives the dashboard's in-tier recency sort. Sourced from SQLite in
     /// `gather_rail_db_data` and pushed down with the rest of the snapshot.
     last_active: HashMap<String, String>,
+    /// Per-workspace agent lists (live runtime sessions merged with DB
+    /// history), keyed by workspace key. Built in `refresh_left_rail` and
+    /// pushed down with the snapshot; the expandable multi-agent disclosure
+    /// reads it at render. Empty until a workspace has agents.
+    workspace_agents: WorkspaceAgentList,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -260,6 +268,7 @@ impl LeftRail {
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
             last_active: HashMap::new(),
+            workspace_agents: HashMap::new(),
             width: px(density.w_left_rail),
             resizing: false,
             settings_repo: None,
@@ -677,6 +686,7 @@ impl LeftRail {
         agent_activity: HashMap<String, String>,
         agent_sideband: HashMap<String, SidebandDetail>,
         last_active: HashMap<String, String>,
+        workspace_agents: WorkspaceAgentList,
         cx: &mut Context<Self>,
     ) {
         let project_changed = self.active_project_id != active_project_id;
@@ -713,6 +723,7 @@ impl LeftRail {
         self.agent_activity = agent_activity;
         self.agent_sideband = agent_sideband;
         self.last_active = last_active;
+        self.workspace_agents = workspace_agents;
 
         // Keep the Tasks page's project in sync; re-fetch only when the active
         // project actually changes while the page is open.

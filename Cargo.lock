@@ -5100,6 +5100,7 @@ dependencies = [
  "anyhow",
  "block2",
  "cbc",
+ "chrono",
  "dirs 5.0.1",
  "futures",
  "gpui",

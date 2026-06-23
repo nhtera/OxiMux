@@ -339,6 +339,12 @@ pub struct WorkspaceRoot {
     /// `ended_at` if finished, else `started_at`) — same lifecycle as
     /// `rail_latest_status`. Drives the dashboard's in-tier recency sort.
     pub(crate) rail_last_active: HashMap<String, String>,
+    /// Every agent session per workspace id (`agent_sessions` rows, newest
+    /// first) — same gather lifecycle as `rail_latest_status`. `refresh_left_rail`
+    /// merges this DB history with the live `live_agents` map into the rail's
+    /// per-workspace agent list. The single-row caches above stay derived from
+    /// the newest session, so existing collapsed-dot behavior is unchanged.
+    pub(crate) rail_workspace_sessions: HashMap<String, Vec<oximux_core::AgentSession>>,
     /// Live tool-activity line per workspace id ("Bash: cargo test…"),
     /// refreshed by `_agent_activity_task` for Running primary-CLI
     /// sessions and pushed to the rail via `refresh_left_rail`.
@@ -1035,6 +1041,7 @@ impl WorkspaceRoot {
             rail_latest_status: HashMap::new(),
             rail_latest_adapter: HashMap::new(),
             rail_last_active: HashMap::new(),
+            rail_workspace_sessions: HashMap::new(),
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
             live_agents: HashMap::new(),
