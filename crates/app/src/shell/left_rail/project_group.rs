@@ -296,6 +296,7 @@ pub fn render_project_group(
                     &workspace.id,
                     rows,
                     is_expanded,
+                    is_active,
                     rail.clone(),
                     weak_root.clone(),
                     theme,

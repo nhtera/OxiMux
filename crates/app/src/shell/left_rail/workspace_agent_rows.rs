@@ -67,6 +67,7 @@ pub fn render_workspace_agent_disclosure(
     workspace_key: &str,
     rows: &[RailAgentRow],
     is_expanded: bool,
+    is_active: bool,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
@@ -132,6 +133,7 @@ pub fn render_workspace_agent_disclosure(
         for row in rows {
             col = col.child(render_agent_sub_row(
                 row,
+                is_active,
                 weak_root.clone(),
                 theme,
                 density,
@@ -223,8 +225,14 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// One expanded agent sub-row, mirroring the reference cockpit's compact row:
 /// `[status dot] [adapter icon] [activity / verb]  …  [relative age]`. A live
 /// row is clickable to focus its tab; a history-only row is display-only.
+///
+/// `is_active` (the workspace is the selected one) expands the row: the
+/// descriptor WRAPS to its full text on multiple lines and the row grows,
+/// instead of clipping to a single ellipsised line. Inactive workspaces keep
+/// the compact one-line rows so the rail stays scannable.
 fn render_agent_sub_row(
     row: &RailAgentRow,
+    is_active: bool,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -237,8 +245,7 @@ fn render_agent_sub_row(
     //   live tool/message (no prompt captured yet)
     //   status verb (a row with no live detail at all)
     // The prompt leads and reads as primary text; the dot color carries the
-    // status. Composed first, then truncated as one unit so the title (the
-    // priority) survives when the trailing activity overflows.
+    // status.
     let (descriptor, descriptor_color) = match live_title(row) {
         Some(t) => (
             t.text,
@@ -250,45 +257,61 @@ fn render_agent_sub_row(
         ),
         None => (v.verb.to_string(), v.verb_color),
     };
-    let descriptor = truncate_chars(&descriptor, 48);
-    let base = div()
+    // Active workspace → wrap the full descriptor; inactive → one ellipsised
+    // line. The dot/icon/age align to the top when wrapping so they sit with
+    // the first line of text.
+    let descriptor_elem = if is_active {
+        div().flex_1().min_w_0().child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(descriptor_color)
+                .child(descriptor),
+        )
+    } else {
+        // Keep the descriptor in a flex-row so a truncating line never collapses
+        // to blank (a known flex-col text pitfall). `.truncate()` clips it to one
+        // line with an ellipsis at the row width.
+        div().flex_1().min_w_0().flex().flex_row().items_center().child(
+            div()
+                .min_w_0()
+                .text_size(px(typography.t_body_sm))
+                .text_color(descriptor_color)
+                .truncate()
+                .child(truncate_chars(&descriptor, 48)),
+        )
+    };
+    let mut base = div()
         .flex()
         .flex_row()
-        .items_center()
         .w_full()
-        .h(px(density.h_row))
         .pl(px(density.pad_panel * 3.0))
         .pr(px(density.pad_panel))
-        .gap(px(density.gap_inline))
+        .gap(px(density.gap_inline));
+    base = if is_active {
+        base.items_start()
+            .min_h(px(density.h_row))
+            .py(px(density.gap_inline))
+    } else {
+        base.items_center().h(px(density.h_row))
+    };
+    let base = base
         .child(
             div()
                 .size(px(SUB_DOT))
                 .rounded_full()
                 .bg(v.dot)
-                .flex_shrink_0(),
+                .flex_shrink_0()
+                .when(is_active, |d| d.mt(px(5.0))),
         )
         .child(
             svg()
                 .path(adapter_icon_path(&row.adapter_id))
                 .size(px(13.0))
                 .text_color(theme.fg_muted)
-                .flex_shrink_0(),
+                .flex_shrink_0()
+                .when(is_active, |d| d.mt(px(2.0))),
         )
-        .child(
-            // Keep the descriptor in a flex-row so a truncating line never
-            // collapses to blank (a known flex-col text pitfall). `.truncate()`
-            // clips it to one line with an ellipsis at the row width — a prompt
-            // is wider than the rail, and without this it wraps and overlaps
-            // the next row.
-            div().flex_1().min_w_0().flex().flex_row().items_center().child(
-                div()
-                    .min_w_0()
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(descriptor_color)
-                    .truncate()
-                    .child(descriptor),
-            ),
-        )
+        .child(descriptor_elem)
         .child(
             div()
                 .flex_shrink_0()
