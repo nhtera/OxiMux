@@ -273,6 +273,28 @@ pub fn render_workspace_card(
             .child(v.label)
     });
 
+    // A live agent's prompt is its title — it replaces the `name · verb`
+    // summary as the primary line-2 text (the dot still carries the status),
+    // matching the reference cockpit's prompt-as-title rows. Kept in a flex-row
+    // with `min_w_0` + `.truncate()` so a prompt wider than the rail clips to
+    // one line with an ellipsis instead of wrapping (a flex-col text pitfall).
+    let title_elem = plan.agent_title.as_ref().map(|title| {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_base)
+                    .truncate()
+                    .child(title.clone()),
+            )
+    });
+
     // Diff chip: "+A −B" using status_added / status_removed colors.
     // Clean worktrees (0/0) suppress the chip — an all-zero stat row is
     // noise on every resting workspace.
@@ -300,14 +322,28 @@ pub fn render_workspace_card(
             )
     });
 
-    let line2 = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(density.gap_inline))
-        .children(name_elem)
-        .children(verb_elem)
-        .children(diff_elem);
+    // When a live title is present it takes the whole line (the prompt is the
+    // headline); otherwise fall back to the `name · verb` summary. The diff
+    // chip rides along either way.
+    let line2 = if title_elem.is_some() {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .gap(px(density.gap_inline))
+            .children(title_elem)
+            .children(diff_elem)
+    } else {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline))
+            .children(name_elem)
+            .children(verb_elem)
+            .children(diff_elem)
+    };
 
     // Card shell — two-line tall. Active cards render inset with a rounded
     // border; inactive cards sit flush and lift on hover. Mirrors the

@@ -173,6 +173,41 @@ fn live_activity(row: &RailAgentRow) -> Option<String> {
     Some(text)
 }
 
+/// One agent row's composed live title: the user's prompt (the agent's title)
+/// optionally trailed by its current activity (`"add tests · Edit: foo.rs"`),
+/// or just the prompt, or just the activity. Whitespace is collapsed to a
+/// single line so a multi-line prompt never breaks the row. `None` when the row
+/// has neither — a history row, or a live agent not yet prompted since launch.
+///
+/// Shared so the single-agent workspace card and the multi-agent disclosure
+/// sub-row render the same title from the same live source.
+pub struct LiveTitle {
+    pub text: String,
+    /// `true` when a captured prompt leads the text, so callers can render it
+    /// as primary; activity-only text reads as secondary.
+    pub leads_with_prompt: bool,
+}
+
+/// Compose [`LiveTitle`] from a row's live status receiver. See the type docs.
+pub fn live_title(row: &RailAgentRow) -> Option<LiveTitle> {
+    let norm = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match (live_prompt(row), live_activity(row)) {
+        (Some(prompt), Some(activity)) => Some(LiveTitle {
+            text: norm(format!("{prompt} · {activity}")),
+            leads_with_prompt: true,
+        }),
+        (Some(prompt), None) => Some(LiveTitle {
+            text: norm(prompt),
+            leads_with_prompt: true,
+        }),
+        (None, Some(activity)) => Some(LiveTitle {
+            text: norm(activity),
+            leads_with_prompt: false,
+        }),
+        (None, None) => None,
+    }
+}
+
 /// Single-line truncation with an ellipsis, counting characters (not bytes)
 /// so multi-byte content never splits a codepoint.
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -204,11 +239,16 @@ fn render_agent_sub_row(
     // The prompt leads and reads as primary text; the dot color carries the
     // status. Composed first, then truncated as one unit so the title (the
     // priority) survives when the trailing activity overflows.
-    let (descriptor, descriptor_color) = match (live_prompt(row), live_activity(row)) {
-        (Some(prompt), Some(activity)) => (format!("{prompt} · {activity}"), theme.fg_base),
-        (Some(prompt), None) => (prompt, theme.fg_base),
-        (None, Some(activity)) => (activity, theme.fg_muted),
-        (None, None) => (v.verb.to_string(), v.verb_color),
+    let (descriptor, descriptor_color) = match live_title(row) {
+        Some(t) => (
+            t.text,
+            if t.leads_with_prompt {
+                theme.fg_base
+            } else {
+                theme.fg_muted
+            },
+        ),
+        None => (v.verb.to_string(), v.verb_color),
     };
     let descriptor = truncate_chars(&descriptor, 48);
     let base = div()
@@ -327,5 +367,69 @@ mod tests {
         let hist = row(false, AgentStatus::Done { code: Some(0) }, None);
         let done_verb = agent_verb(Some(&AgentStatus::Done { code: Some(0) }), false, theme).label;
         assert_eq!(sub_row_view(&hist, theme).verb, done_verb);
+    }
+
+    /// Build a live row whose snapshot carries the given detail. The sender is
+    /// dropped here; a `watch` receiver still reads the last value after that.
+    fn row_with_detail(detail: oximux_core::SidebandDetail) -> RailAgentRow {
+        let (tx, rx) = live_rx(AgentStatus::Running);
+        tx.send(AgentSnapshot {
+            status: AgentStatus::Running,
+            detail: Some(detail),
+        })
+        .unwrap();
+        row(true, AgentStatus::Idle, Some(rx))
+    }
+
+    #[test]
+    fn live_title_leads_with_prompt() {
+        let detail = oximux_core::SidebandDetail {
+            prompt: Some("add a readme section".into()),
+            tool_name: Some("Edit".into()),
+            tool_input_summary: Some("README.md".into()),
+            ..Default::default()
+        };
+        let t = live_title(&row_with_detail(detail)).expect("prompt yields a title");
+        assert_eq!(t.text, "add a readme section · Edit: README.md");
+        assert!(t.leads_with_prompt);
+    }
+
+    #[test]
+    fn live_title_prompt_only() {
+        let detail = oximux_core::SidebandDetail {
+            prompt: Some("  hi  ".into()),
+            ..Default::default()
+        };
+        let t = live_title(&row_with_detail(detail)).expect("prompt yields a title");
+        assert_eq!(t.text, "hi");
+        assert!(t.leads_with_prompt);
+    }
+
+    #[test]
+    fn live_title_activity_only_is_not_a_prompt() {
+        let detail = oximux_core::SidebandDetail {
+            tool_name: Some("Bash".into()),
+            tool_input_summary: Some("cargo test".into()),
+            ..Default::default()
+        };
+        let t = live_title(&row_with_detail(detail)).expect("activity yields a title");
+        assert_eq!(t.text, "Bash: cargo test");
+        assert!(!t.leads_with_prompt);
+    }
+
+    #[test]
+    fn live_title_none_for_history_row() {
+        // No status receiver (history) → no live title.
+        assert!(live_title(&row(false, AgentStatus::Idle, None)).is_none());
+    }
+
+    #[test]
+    fn live_title_collapses_multiline_prompt() {
+        let detail = oximux_core::SidebandDetail {
+            prompt: Some("fix the bug\n\nin the parser".into()),
+            ..Default::default()
+        };
+        let t = live_title(&row_with_detail(detail)).expect("prompt yields a title");
+        assert_eq!(t.text, "fix the bug in the parser");
     }
 }

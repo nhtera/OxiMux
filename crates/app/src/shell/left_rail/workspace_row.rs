@@ -110,6 +110,13 @@ pub struct WorkspaceCardPlan {
     /// verb on the status line (e.g. "Claude Code · Running"). `None` when no
     /// agent is identifiable — the line shows the verb alone.
     pub agent_name: Option<SharedString>,
+    /// The live agent's title — its captured prompt, optionally trailed by the
+    /// current activity. When present it leads the status line in place of the
+    /// `name · verb` summary (the dot still carries the status), matching the
+    /// reference cockpit's prompt-as-title rows. `Some` only for a single-agent
+    /// workspace with a live, prompted agent; `None` otherwise (multi-agent
+    /// workspaces use the disclosure, dormant ones show the verb).
+    pub agent_title: Option<SharedString>,
     /// Working-tree diff counts. `None` when not yet fetched or unavailable;
     /// card omits the `+A −B` chip gracefully.
     pub diff: Option<DiffCounts>,
@@ -187,6 +194,7 @@ pub fn build_workspace_card_plan(
     is_live: bool,
     latest_status: Option<&AgentStatus>,
     agent_name: Option<SharedString>,
+    agent_title: Option<SharedString>,
     diff: Option<DiffCounts>,
     theme: Theme,
 ) -> WorkspaceCardPlan {
@@ -222,6 +230,7 @@ pub fn build_workspace_card_plan(
         branch,
         agent_verb: agent_verb_opt,
         agent_name,
+        agent_title,
         diff,
         pr: None, // GitHub integration is out of scope
         linked_issue: workspace.linked_issue.clone(),
@@ -593,7 +602,7 @@ mod tests {
     fn card_plan_carries_branch_when_present() {
         let t = Theme::charcoal();
         let w = ws_with_branch("Feat", "feat", "oximux/feat");
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
         assert_eq!(plan.branch, Some("oximux/feat".to_string()));
     }
 
@@ -602,7 +611,7 @@ mod tests {
         let t = Theme::charcoal();
         let mut w = ws("Folder", "folder");
         w.branch = String::new();
-        let plan = build_workspace_card_plan(&w, false, true, true, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, true, true, false, None, None, None, None, t);
         assert!(plan.branch.is_none());
     }
 
@@ -610,7 +619,7 @@ mod tests {
     fn card_plan_branch_absent_when_empty() {
         let t = Theme::charcoal();
         let w = ws_with_branch("Plain", "plain", "");
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
         assert!(plan.branch.is_none());
     }
 
@@ -619,7 +628,7 @@ mod tests {
         // No status, not live → no verb line (dormant workspace).
         let t = Theme::charcoal();
         let w = ws("X", "x");
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
         assert!(plan.agent_verb.is_none());
     }
 
@@ -627,7 +636,7 @@ mod tests {
     fn card_plan_agent_verb_present_when_live() {
         let t = Theme::charcoal();
         let w = ws("X", "x");
-        let plan = build_workspace_card_plan(&w, false, false, false, true, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, false, false, true, None, None, None, None, t);
         let verb = plan.agent_verb.expect("live workspace must have verb");
         assert_eq!(verb.label, "Ready");
         assert_eq!(verb.color, t.status_ok);
@@ -644,6 +653,7 @@ mod tests {
             false,
             false,
             Some(&AgentStatus::Running),
+            None,
             None,
             None,
             t,
@@ -666,6 +676,7 @@ mod tests {
             Some(&AgentStatus::Running),
             Some("Claude Code".into()),
             None,
+            None,
             t,
         );
         assert_eq!(plan.agent_name.as_deref(), Some("Claude Code"));
@@ -675,8 +686,35 @@ mod tests {
     fn card_plan_agent_name_absent_by_default() {
         let t = Theme::charcoal();
         let w = ws("X", "x");
-        let plan = build_workspace_card_plan(&w, false, false, false, true, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, false, false, true, None, None, None, None, t);
         assert!(plan.agent_name.is_none());
+    }
+
+    #[test]
+    fn card_plan_carries_agent_title() {
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let plan = build_workspace_card_plan(
+            &w,
+            false,
+            false,
+            false,
+            true,
+            Some(&AgentStatus::Running),
+            Some("Claude Code".into()),
+            Some("add a readme section".into()),
+            None,
+            t,
+        );
+        assert_eq!(plan.agent_title.as_deref(), Some("add a readme section"));
+    }
+
+    #[test]
+    fn card_plan_agent_title_absent_by_default() {
+        let t = Theme::charcoal();
+        let w = ws("X", "x");
+        let plan = build_workspace_card_plan(&w, false, false, false, true, None, None, None, None, t);
+        assert!(plan.agent_title.is_none());
     }
 
     #[test]
@@ -684,7 +722,8 @@ mod tests {
         let t = Theme::charcoal();
         let w = ws("X", "x");
         let diff = Some(DiffCounts { added: 10, removed: 3 });
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, diff, t);
+        let plan =
+            build_workspace_card_plan(&w, false, false, false, false, None, None, None, diff, t);
         let d = plan.diff.expect("supplied diff must be carried through");
         assert_eq!(d.added, 10);
         assert_eq!(d.removed, 3);
@@ -694,7 +733,7 @@ mod tests {
     fn card_plan_diff_absent_when_not_supplied() {
         let t = Theme::charcoal();
         let w = ws("X", "x");
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
         assert!(plan.diff.is_none());
     }
 
@@ -703,7 +742,7 @@ mod tests {
         // GitHub integration is out of scope — field is reserved, never populated.
         let t = Theme::charcoal();
         let w = ws("X", "x");
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
         assert!(plan.pr.is_none());
     }
 
@@ -711,7 +750,7 @@ mod tests {
     fn card_plan_active_variant_uses_overlay_bg() {
         let t = Theme::charcoal();
         let w = ws("Active", "active");
-        let plan = build_workspace_card_plan(&w, true, false, false, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, true, false, false, false, None, None, None, None, t);
         assert_eq!(plan.row.bg, t.bg_overlay);
         assert!(plan.row.is_active);
     }
@@ -720,7 +759,7 @@ mod tests {
     fn card_plan_primary_variant_sets_flag() {
         let t = Theme::charcoal();
         let w = ws("main", "main");
-        let plan = build_workspace_card_plan(&w, false, true, false, false, None, None, None, t);
+        let plan = build_workspace_card_plan(&w, false, true, false, false, None, None, None, None, t);
         assert!(plan.row.is_primary);
         assert!(!plan.row.is_folder);
     }
