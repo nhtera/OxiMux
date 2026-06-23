@@ -24,7 +24,7 @@
 
 use gpui::Context;
 use oximux_agents::AgentStatusStream;
-use oximux_core::AgentStatus;
+use oximux_core::{AgentSessionId, AgentStatus};
 
 use crate::shell::agent_presentation::adapter_display_name;
 use crate::shell::session_live_store::LiveAgentEntry;
@@ -33,12 +33,14 @@ use crate::workspace_root::WorkspaceRoot;
 /// Spawn the persistence watcher for one agent session. `worktree_path` is
 /// the launch cwd used to resolve the owning workspace; `adapter_id` /
 /// `model` / `effort` are stored verbatim on the row.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_for_session(
     root: &WorkspaceRoot,
     worktree_path: String,
     adapter_id: &'static str,
     model: Option<String>,
     effort: Option<String>,
+    runtime_session_id: AgentSessionId,
     mut status_rx: AgentStatusStream,
     cx: &mut Context<WorkspaceRoot>,
 ) {
@@ -113,6 +115,7 @@ pub(crate) fn spawn_for_session(
                     label: adapter_display_name(adapter_id).into(),
                     status_rx: status_rx.clone(),
                     started_at,
+                    session_id: runtime_session_id,
                 },
                 cx,
             );

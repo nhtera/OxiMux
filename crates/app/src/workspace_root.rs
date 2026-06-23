@@ -2015,6 +2015,7 @@ impl WorkspaceRoot {
                     adapter_id,
                     model.clone(),
                     effort.clone(),
+                    session_id,
                     status_rx.clone(),
                     cx,
                 );

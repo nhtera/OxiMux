@@ -167,6 +167,7 @@ mod tests {
             label: "Claude Code".into(),
             status_rx: rx,
             started_at: started.into(),
+            session_id: oximux_core::AgentSessionId::new(1),
         }
     }
 

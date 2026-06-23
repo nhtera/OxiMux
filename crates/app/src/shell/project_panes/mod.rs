@@ -937,6 +937,44 @@ impl ProjectPanes {
         true
     }
 
+    /// Whether any group in these panes holds the agent tab for `session_id`.
+    /// Read-only — used to locate the owning project before switching to it.
+    pub fn has_agent_session(
+        &self,
+        session_id: oximux_core::AgentSessionId,
+        cx: &gpui::App,
+    ) -> bool {
+        self.groups
+            .values()
+            .any(|g| g.read(cx).agent_tab_index_for_session(session_id).is_some())
+    }
+
+    /// Activate the tab driving `session_id` (its group becomes active, then
+    /// the tab within it). Mirror of `focus_workspace_tab` but keyed by the
+    /// runtime session rather than the worktree, so a clicked rail sub-row
+    /// focuses that exact agent. Returns `false` if no group holds it.
+    pub fn focus_agent_session(
+        &mut self,
+        session_id: oximux_core::AgentSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .agent_tab_index_for_session(session_id)
+                .map(|idx| (*id, idx))
+        });
+        let Some((id, idx)) = existing else {
+            return false;
+        };
+        self.set_active_group(id, window, cx);
+        if let Some(group) = self.groups.get(&id).cloned() {
+            group.update(cx, |g, cx| g.set_active(idx, window, cx));
+        }
+        true
+    }
+
     /// Collect the worktree paths kept "live" by open PTY tabs across all
     /// groups (as strings, to match the sidebar's `Workspace.worktree_path`).
     /// Drives the left rail's live/idle status dot: a workspace with an

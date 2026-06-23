@@ -14,8 +14,9 @@
 
 use std::collections::HashMap;
 
-use gpui::{Context, SharedString};
+use gpui::{Context, SharedString, Window};
 use oximux_agents::AgentStatusStream;
+use oximux_core::AgentSessionId;
 
 use crate::workspace_root::WorkspaceRoot;
 
@@ -33,6 +34,8 @@ pub struct LiveAgentEntry {
     pub status_rx: AgentStatusStream,
     /// Launch timestamp (DB `started_at`), for relative-age rendering.
     pub started_at: String,
+    /// Runtime session handle — maps a clicked rail row back to its open tab.
+    pub session_id: AgentSessionId,
 }
 
 /// Live agent sessions keyed by `agent_sessions.id` UUID. Populated while a
@@ -59,6 +62,47 @@ impl WorkspaceRoot {
             self.mark_rail_dirty(cx);
         }
     }
+
+    /// Focus the live agent identified by its DB session UUID: resolve its
+    /// runtime session, switch to the owning project if it isn't active, and
+    /// activate the agent's tab. A history-only row (not in `live_agents`) has
+    /// no open tab, so this is a no-op for it.
+    pub(crate) fn focus_agent_by_db_id(
+        &mut self,
+        db_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.live_agents.get(db_id).map(|e| e.session_id) else {
+            return;
+        };
+        // The session lives in exactly one project's panes; find its owner so
+        // we switch to that project before searching it for the tab.
+        let owner = self
+            .project_panes_by_project
+            .iter()
+            .find_map(|(pid, panes)| panes.read(cx).has_agent_session(session_id, cx).then(|| pid.clone()));
+        let Some(project_id) = owner else {
+            return;
+        };
+        if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
+            match self
+                .app_state
+                .recent_projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            {
+                Some(project) => self.set_active_project(project, window, cx),
+                None => return,
+            }
+        }
+        if let Some(panes) = self.active_project_panes() {
+            panes.update(cx, |p, cx| {
+                p.focus_agent_session(session_id, window, cx);
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +118,7 @@ mod tests {
             label: "Claude Code".into(),
             status_rx: rx,
             started_at: "2026-06-23T00:00:00Z".into(),
+            session_id: AgentSessionId::new(1),
         }
     }
 

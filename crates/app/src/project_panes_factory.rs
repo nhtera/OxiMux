@@ -668,6 +668,7 @@ fn restore_agent_tab(
                 adapter_id,
                 persisted_clone.model.clone(),
                 persisted_clone.effort.clone(),
+                session_id,
                 status_rx.clone(),
                 cx,
             );

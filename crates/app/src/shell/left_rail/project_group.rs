@@ -285,6 +285,7 @@ pub fn render_project_group(
                     rows,
                     is_expanded,
                     rail.clone(),
+                    weak_root.clone(),
                     theme,
                     density,
                     typography,

@@ -11,11 +11,12 @@
 //! so the disclosure matches the tab badge and dashboard.
 
 use gpui::prelude::*;
-use gpui::{Entity, Hsla, MouseButton, SharedString, div, px};
+use gpui::{Entity, Hsla, MouseButton, SharedString, WeakEntity, div, px};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agent_presentation::agent_verb;
 use crate::shell::left_rail::{LeftRail, RailAgentRow};
+use crate::workspace_root::WorkspaceRoot;
 
 /// Max status glyphs shown in the collapsed cluster before an "+N" overflow.
 pub const MAX_GLYPHS: usize = 5;
@@ -63,11 +64,13 @@ pub fn sub_row_view(row: &RailAgentRow, theme: Theme) -> SubRowView {
 
 /// Render the disclosure for one workspace: a clickable summary line plus,
 /// when expanded, a sub-row per agent. Caller guarantees `rows.len() > 1`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_workspace_agent_disclosure(
     workspace_key: &str,
     rows: &[RailAgentRow],
     is_expanded: bool,
     rail: Entity<LeftRail>,
+    weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -129,22 +132,30 @@ pub fn render_workspace_agent_disclosure(
     let mut col = div().flex().flex_col().w_full().child(summary);
     if is_expanded {
         for row in rows {
-            col = col.child(render_agent_sub_row(row, theme, density, typography));
+            col = col.child(render_agent_sub_row(
+                row,
+                weak_root.clone(),
+                theme,
+                density,
+                typography,
+            ));
         }
     }
     col
 }
 
 /// One expanded agent sub-row: status dot + label + status verb, indented
-/// deeper than the summary line. Display-only for now.
+/// deeper than the summary line. A live row is clickable to focus its tab;
+/// a history-only row (no open tab) is display-only.
 fn render_agent_sub_row(
     row: &RailAgentRow,
+    weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
     let v = sub_row_view(row, theme);
-    div()
+    let base = div()
         .flex()
         .flex_row()
         .items_center()
@@ -173,7 +184,18 @@ fn render_agent_sub_row(
                 .text_size(px(typography.t_body_sm))
                 .text_color(v.verb_color)
                 .child(v.verb),
-        )
+        );
+    if row.is_live {
+        let db_id = row.db_id.clone();
+        base.cursor_pointer()
+            .hover(|s| s.bg(theme.hover_overlay))
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                let _ = weak_root
+                    .update(cx, |root, cx| root.focus_agent_by_db_id(&db_id, window, cx));
+            })
+    } else {
+        base
+    }
 }
 
 #[cfg(test)]

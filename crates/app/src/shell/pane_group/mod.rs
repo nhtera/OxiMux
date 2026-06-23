@@ -893,6 +893,15 @@ impl PaneGroup {
         })
     }
 
+    /// Index of the agent tab driving `session_id`, if this group holds it.
+    /// Lets the rail focus the exact agent a sub-row was clicked for, rather
+    /// than just the worktree's first agent tab.
+    pub fn agent_tab_index_for_session(&self, session_id: AgentSessionId) -> Option<usize> {
+        self.tabs.iter().position(
+            |t| matches!(&t.kind, PaneGroupTabKind::Agent { session_id: sid, .. } if *sid == session_id),
+        )
+    }
+
     /// Retained for the sidebar-width tracking plumbing (`set_chrome_width`
     /// still fires a repaint when a side panel toggles). Grid sizing no
     /// longer reads it — that moved to each TerminalView's canvas-bounds
