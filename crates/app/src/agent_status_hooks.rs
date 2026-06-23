@@ -1,11 +1,14 @@
-//! Opt-in agent status hooks for Claude Code.
+//! Agent status hooks for Claude Code (on by default).
 //!
-//! Enabled by the **Settings → Agents** "Status hooks" toggle (persisted as
-//! `status_hooks_enabled` in `agent_launch.toml`), or by the env var
-//! `OXIMUX_STATUS_HOOKS=1` which force-enables regardless (a debug escape
-//! hatch). When on, a Claude Code agent is launched with a `--settings` block
-//! that wires three hooks to the `oximux agent-status` CLI:
+//! On by default (`status_hooks_enabled` in `agent_launch.toml` defaults to
+//! `true`); disabled via the **Settings → Agents** "Status hooks" toggle. The
+//! env var `OXIMUX_STATUS_HOOKS=1` force-enables regardless of the flag (a
+//! debug escape hatch). When on, a Claude Code agent is launched with a
+//! `--settings` block that wires four hooks to the `oximux agent-status` CLI:
 //!
+//! - `UserPromptSubmit` → `--state working` (`{"state":"working","prompt":<text>}`)
+//!   — fires the instant the user submits, carrying the prompt that becomes the
+//!   agent's rail title and flipping the dot to working right away.
 //! - `PreToolUse`   → `--state working` (`{"state":"working","tool":<name>}`)
 //! - `Notification` → `--state needs_approval --filter-notification` — Claude
 //!   fires `Notification` (NOT `PermissionRequest`, which never fires) when it
@@ -14,8 +17,8 @@
 //!   permission prompt, ignoring the benign "waiting for your input" nudge.
 //! - `Stop`         → `--state idle` (`{"state":"idle"}`)
 //!
-//! The CLI reads the hook event JSON on stdin (for the tool name), reads
-//! `OXIMUX_PTY_ID` (injected by the relay at spawn), and asks the relay to
+//! The CLI reads the hook event JSON on stdin (for the tool name / prompt),
+//! reads `OXIMUX_PTY_ID` (injected by the relay at spawn), and asks the relay to
 //! emit an OSC-9999 status packet on that PTY's output stream. OxiMux's scanner
 //! (`oximux-agents` `osc_sideband`) decodes it into structured agent status.
 //!
@@ -30,7 +33,8 @@
 //!   JSON STRING at spawn, never written into the user's `~/.claude` config.
 //!   Because `--settings` replaces (not deep-merges) the `hooks` key, we read
 //!   the user's existing global hooks and merge ours in, so theirs keep firing.
-//! - **Opt-in.** Off unless the Settings toggle is on (or the env override).
+//! - **On by default.** The cockpit's status sideband; the Settings toggle (or
+//!   an explicit `status_hooks_enabled = false`) opts out.
 //! - **`Stop` → `idle`, not `done`.** A finished turn is not a dead process;
 //!   the terminal `Done` state comes from the PTY exit event, not a hook.
 

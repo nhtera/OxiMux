@@ -1913,13 +1913,16 @@ impl WorkspaceRoot {
             (
                 model.or_else(|| defaults.and_then(|d| d.model_for(adapter_id))),
                 defaults.map(|d| d.args_for(adapter_id)).unwrap_or_default(),
-                defaults.map(|d| d.status_hooks_enabled).unwrap_or(false),
+                // On by default (mirrors `AgentLaunchSettings::default`); also
+                // on when the global isn't seeded yet, so a very early launch
+                // still gets status. A user's explicit `false` flows through.
+                defaults.map(|d| d.status_hooks_enabled).unwrap_or(true),
             )
         };
-        // Opt-in OSC-9999 status hooks (Settings → Agents toggle, or the
-        // OXIMUX_STATUS_HOOKS=1 env override): inject the `--settings` hooks
-        // block so Claude Code emits structured status the poll-loop scanner
-        // reads. Claude-only for now; no-op when off.
+        // OSC-9999 status hooks (on by default; Settings → Agents toggle, or
+        // the OXIMUX_STATUS_HOOKS=1 env override): inject the `--settings`
+        // hooks block so Claude Code emits the prompt + tool + lifecycle the
+        // poll-loop scanner reads. Claude-only for now; no-op when disabled.
         if adapter_id == "claude-code" {
             crate::agent_status_hooks::maybe_inject(status_hooks_on, &mut extra_args);
         }

@@ -129,7 +129,7 @@ pub(super) fn render_launch_card(
     let mut rows: Vec<AnyElement> = Vec::with_capacity(LAUNCH_AGENTS.len() + 2);
     rows.push(setting_row_desc(
         "Status hooks",
-        "Show the live tool each Claude Code agent is running on its dashboard card.",
+        "Show each Claude Code agent's prompt, live tool, and status on the rail and dashboard. On by default.",
         status_hooks_toggle(modal, theme, cx),
         theme,
         typography,
