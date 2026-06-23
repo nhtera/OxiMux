@@ -124,10 +124,14 @@ pub(crate) fn spawn_for_session(
         // Transitions may have raced ahead of the insert (subscribe happens
         // before this task runs) — sync whatever the channel holds now.
         let mut last = AgentStatus::Idle;
+        // The agent's last persisted title (its most recent prompt). Tracked so
+        // we only write the DB when the prompt actually changes, not every tick.
+        let mut last_title: Option<String> = None;
         let (current, detail) = {
             let snap = status_rx.borrow_and_update();
             (snap.status.clone(), snap.detail.clone())
         };
+        persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
         let _ = weak.update(cx, |this, cx| {
             this.note_agent_sideband(&ws_key, &current, detail, cx);
         });
@@ -159,6 +163,7 @@ pub(crate) fn spawn_for_session(
                 let snap = status_rx.borrow_and_update();
                 (snap.status.clone(), snap.detail.clone())
             };
+            persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
             // The live tool subline can change WITHOUT a status edge (Bash →
             // Edit while still Running), so refresh it every tick — not only
             // when the status itself changes.
@@ -182,6 +187,42 @@ pub(crate) fn spawn_for_session(
         let _ = weak.update(cx, |this, cx| this.remove_live_agent(&row_id, cx));
     })
     .detach();
+}
+
+/// Persist the agent's title (its most recent prompt from the sideband) to the
+/// session row, but only when it differs from the last write — the prompt rides
+/// every snapshot once captured, so this would otherwise write every tick. A
+/// blank/absent prompt is ignored (keeps the prior title). Best-effort: a write
+/// failure is logged, never propagated.
+async fn persist_title_if_changed(
+    repo: &oximux_storage::AgentSessionRepo,
+    row_id: &str,
+    detail: &Option<oximux_core::SidebandDetail>,
+    last_title: &mut Option<String>,
+    cx: &gpui::AsyncApp,
+) {
+    let Some(title) = detail
+        .as_ref()
+        .and_then(|d| d.prompt.as_ref())
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if last_title.as_deref() == Some(title.as_str()) {
+        return;
+    }
+    *last_title = Some(title.clone());
+    let repo = repo.clone();
+    let id = row_id.to_string();
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(err) = repo.update_title(&id, &title) {
+                tracing::warn!(?err, "agent persistence: title write failed");
+            }
+        })
+        .await;
 }
 
 /// Write one status to the row (+ `ended_at` when terminal) on the

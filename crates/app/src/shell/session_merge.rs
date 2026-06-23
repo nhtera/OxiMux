@@ -132,6 +132,7 @@ pub fn merge_workspace_agents(
                 .or(s.started_at.as_deref())
                 .map(|t| relative_age(t, now))
                 .unwrap_or_default(),
+            persisted_title: s.title.clone(),
         });
     }
 
@@ -151,6 +152,9 @@ pub fn merge_workspace_agents(
                 started_at: Some(e.started_at.clone()),
                 ended_at: None,
                 age_label: relative_age(&e.started_at, now),
+                // No DB row yet → no persisted title; the live channel supplies
+                // the prompt once it arrives.
+                persisted_title: None,
             });
         }
     }
@@ -187,6 +191,7 @@ mod tests {
             status,
             started_at: Some(started.into()),
             ended_at: ended.map(Into::into),
+            title: None,
         }
     }
 

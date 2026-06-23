@@ -90,6 +90,36 @@ fn agent_session_update_status_interrupted_round_trip() {
 }
 
 #[test]
+fn agent_session_title_round_trips_and_starts_none() {
+    let (workspace_id, _, agents) = fixture();
+    let a = agents
+        .insert(&workspace_id, "claude_code", None, None)
+        .unwrap();
+    // A fresh session has no title.
+    assert!(a.title.is_none());
+    assert!(
+        agents
+            .get_by_id(&a.id)
+            .unwrap()
+            .unwrap()
+            .title
+            .is_none()
+    );
+    // Persist a title; it survives a re-read (the restart path).
+    agents
+        .update_title(&a.id, "refactor the parser")
+        .expect("update title");
+    let after = agents.get_by_id(&a.id).expect("get").expect("present");
+    assert_eq!(after.title.as_deref(), Some("refactor the parser"));
+    // A later prompt overwrites it.
+    agents.update_title(&a.id, "now write tests").unwrap();
+    assert_eq!(
+        agents.get_by_id(&a.id).unwrap().unwrap().title.as_deref(),
+        Some("now write tests")
+    );
+}
+
+#[test]
 fn agent_session_update_ended_at() {
     let (workspace_id, _, agents) = fixture();
     let a = agents.insert(&workspace_id, "codex", None, None).unwrap();

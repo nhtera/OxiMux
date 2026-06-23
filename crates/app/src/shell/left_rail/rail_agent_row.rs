@@ -37,6 +37,11 @@ pub struct RailAgentRow {
     /// "3d"). Computed at merge time against a captured `now` so render needs
     /// no clock. Empty when no timestamp is available.
     pub age_label: String,
+    /// DB-persisted title (the agent's most recent prompt). The rail title
+    /// falls back to this when the live status channel carries no prompt — so a
+    /// restored or re-adopted session keeps its title across an app restart.
+    /// `None` for a session that never captured a prompt.
+    pub persisted_title: Option<String>,
 }
 
 impl RailAgentRow {

@@ -120,6 +120,9 @@ pub struct AgentSessionRow {
     pub status_detail: Option<String>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+    /// The agent's persisted title (its most recent prompt). `None` until a
+    /// prompt has been captured for the session.
+    pub title: Option<String>,
 }
 
 impl AgentSessionRow {
@@ -135,6 +138,7 @@ impl AgentSessionRow {
             status_detail: row.get("status_detail")?,
             started_at: row.get("started_at")?,
             ended_at: row.get("ended_at")?,
+            title: row.get("title")?,
         })
     }
 }
@@ -155,6 +159,7 @@ impl From<AgentSessionRow> for AgentSession {
             status,
             started_at: r.started_at,
             ended_at: r.ended_at,
+            title: r.title,
         }
     }
 }

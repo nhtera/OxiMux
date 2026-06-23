@@ -144,17 +144,21 @@ pub fn render_workspace_agent_disclosure(
     col
 }
 
-/// The user's prompt for this agent, read live from its status receiver. This
-/// is the agent's title — the one field that distinguishes otherwise-identical
-/// idle rows. Cached across the turn by the poll loop, so it survives tool
-/// steps and idle. `None` for history rows or an agent that hasn't been
-/// prompted since launch (e.g. a restored session). Not truncated here — the
-/// caller composes it with the activity before a single truncation.
+/// The agent's title — its most recent prompt, the one field that distinguishes
+/// otherwise-identical idle rows. Prefers the LIVE prompt from the status
+/// channel (cached across the turn by the poll loop, so it survives tool steps
+/// and idle); falls back to the DB-persisted title so a restored or re-adopted
+/// session keeps its title across an app restart instead of decaying to the
+/// status verb. `None` only when neither source has a prompt. Not truncated
+/// here — the caller composes it with the activity before a single truncation.
 fn live_prompt(row: &RailAgentRow) -> Option<String> {
-    let snap = row.status_rx.as_ref()?.borrow();
-    let prompt = snap.detail.as_ref()?.prompt.as_deref()?;
-    let prompt = prompt.trim();
-    (!prompt.is_empty()).then(|| prompt.to_string())
+    let live = row
+        .status_rx
+        .as_ref()
+        .and_then(|rx| rx.borrow().detail.as_ref().and_then(|d| d.prompt.clone()));
+    let chosen = live.or_else(|| row.persisted_title.clone())?;
+    let trimmed = chosen.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Live tool/message line read straight from the agent's status receiver:
@@ -355,6 +359,7 @@ mod tests {
             started_at: Some("2026-06-23T10:00:00Z".into()),
             ended_at: None,
             age_label: "3d".into(),
+            persisted_title: None,
         }
     }
 
@@ -442,8 +447,45 @@ mod tests {
 
     #[test]
     fn live_title_none_for_history_row() {
-        // No status receiver (history) → no live title.
+        // No status receiver and no persisted title (history) → no live title.
         assert!(live_title(&row(false, AgentStatus::Idle, None)).is_none());
+    }
+
+    #[test]
+    fn live_title_falls_back_to_persisted_title() {
+        // A live row whose channel carries no prompt (e.g. just re-adopted)
+        // still shows its title from the persisted column.
+        let (_tx, rx) = live_rx(AgentStatus::Idle);
+        let mut r = row(true, AgentStatus::Idle, Some(rx));
+        r.persisted_title = Some("  resume the migration  ".into());
+        let t = live_title(&r).expect("persisted title yields a title");
+        assert_eq!(t.text, "resume the migration");
+        assert!(t.leads_with_prompt);
+    }
+
+    #[test]
+    fn live_prompt_prefers_live_over_persisted() {
+        // When both exist, the live (current-turn) prompt wins over the stale
+        // persisted one.
+        let detail = oximux_core::SidebandDetail {
+            prompt: Some("live prompt".into()),
+            ..Default::default()
+        };
+        let mut r = row_with_detail(detail);
+        r.persisted_title = Some("old persisted".into());
+        let t = live_title(&r).expect("title");
+        assert_eq!(t.text, "live prompt");
+    }
+
+    #[test]
+    fn persisted_title_shows_on_a_non_live_history_row() {
+        // A finished row with a persisted title keeps showing it.
+        let mut r = row(false, AgentStatus::Done { code: Some(0) }, None);
+        r.persisted_title = Some("ship the release".into());
+        assert_eq!(
+            live_title(&r).map(|t| t.text),
+            Some("ship the release".to_string())
+        );
     }
 
     #[test]

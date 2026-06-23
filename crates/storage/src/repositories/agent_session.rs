@@ -33,8 +33,8 @@ impl AgentSessionRepo {
         let status = AgentStatus::Idle;
         self.db.with_conn(|c| {
             c.execute(
-                "INSERT INTO agent_sessions (id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL)",
+                "INSERT INTO agent_sessions (id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at, title) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL, NULL)",
                 params![
                     id,
                     workspace_id,
@@ -56,13 +56,14 @@ impl AgentSessionRepo {
             status,
             started_at: Some(started_at),
             ended_at: None,
+            title: None,
         })
     }
 
     pub fn get_by_id(&self, id: &str) -> Result<Option<AgentSession>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at \
+                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at, title \
                  FROM agent_sessions WHERE id = ?1",
                 [id],
                 AgentSessionRow::from_row,
@@ -78,7 +79,7 @@ impl AgentSessionRepo {
     ) -> Result<Vec<AgentSession>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at \
+                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at, title \
                  FROM agent_sessions WHERE workspace_id = ?1 \
                  ORDER BY started_at DESC",
             )?;
@@ -97,6 +98,19 @@ impl AgentSessionRepo {
             c.execute(
                 "UPDATE agent_sessions SET status = ?1, exit_code = ?2, status_detail = ?3 WHERE id = ?4",
                 params![slug, exit_code, detail, id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    /// Persist the agent's title (its most recent prompt). Written as the turn
+    /// progresses so a restored session keeps its rail title across a restart.
+    pub fn update_title(&self, id: &str, title: &str) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_sessions SET title = ?1 WHERE id = ?2",
+                params![title, id],
             )
             .map(|_| ())
         })?;
@@ -132,7 +146,7 @@ impl AgentSessionRepo {
     pub fn list_unfinished_at_shutdown(&self) -> Result<Vec<AgentSession>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at \
+                "SELECT id, workspace_id, adapter_id, model, effort, status, exit_code, status_detail, started_at, ended_at, title \
                  FROM agent_sessions \
                  WHERE status IN ('idle', 'running', 'waiting_input', 'needs_approval') \
                    AND ended_at IS NULL \

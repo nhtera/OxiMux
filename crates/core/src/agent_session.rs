@@ -213,4 +213,8 @@ pub struct AgentSession {
     pub status: AgentStatus,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+    /// The agent's persisted title — its most recent user prompt, written as
+    /// the turn progresses so a restored or re-adopted session keeps its rail
+    /// title across an app restart. `None` until a prompt has been captured.
+    pub title: Option<String>,
 }
