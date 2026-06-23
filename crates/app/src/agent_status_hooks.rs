@@ -75,31 +75,65 @@ fn build_settings_json_with(user_hooks: Option<Value>, binary_path: &Path) -> St
     let mut hooks = user_hooks
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
+    for spec in status_hook_specs(binary_path) {
+        append_hook(&mut hooks, spec.event, spec.matcher, &spec.command);
+    }
+    json!({ "hooks": hooks }).to_string()
+}
+
+/// One status hook: which Claude event drives it, an optional tool matcher, and
+/// the `oximux agent-status` command line it runs.
+pub(crate) struct HookSpec {
+    pub event: &'static str,
+    pub matcher: Option<&'static str>,
+    pub command: String,
+}
+
+/// The four status hooks wiring Claude events to the `oximux agent-status` CLI.
+///
+/// The single source of truth for both the per-spawn `--settings` JSON and the
+/// global `~/.claude/settings.json` install — so the COMMAND STRINGS are
+/// byte-identical and Claude's command-string hook dedup makes a picker-launched
+/// agent (which sees both) fire each hook exactly once.
+pub(crate) fn status_hook_specs(binary_path: &Path) -> Vec<HookSpec> {
     // The command single-quotes the binary path (an installed app bundle path
     // can contain spaces, e.g. "Application Support") then appends the CLI
     // subcommand. Escape any embedded single quote (`'` → `'\''`) so a home dir
     // like `/Users/O'X` can't break out of the quoting into shell injection.
     let quoted = binary_path.display().to_string().replace('\'', "'\\''");
     let cmd = |state: &str| format!("'{quoted}' agent-status --state {state}");
-    append_hook(&mut hooks, "PreToolUse", Some("*"), &cmd("working"));
-    // `UserPromptSubmit` fires the instant the user submits a prompt — whether
-    // typed into the agent's own TUI or sent from OxiMux. It carries the prompt
-    // text, captured as the agent's rail title, and flips the dot to working
-    // immediately (a text-only reply that calls no tool would otherwise look
-    // idle for its whole turn). No matcher (like `Stop`).
-    append_hook(&mut hooks, "UserPromptSubmit", None, &cmd("working"));
-    // `Notification` (no matcher — like `Stop`) is the event Claude actually
-    // fires for a tool-permission prompt; `PermissionRequest` is a dead name in
-    // current Claude. `--filter-notification` gates the emit on the payload's
-    // `notification_type` so only a real permission ask reports needs_approval.
-    append_hook(
-        &mut hooks,
-        "Notification",
-        None,
-        &format!("'{quoted}' agent-status --state needs_approval --filter-notification"),
-    );
-    append_hook(&mut hooks, "Stop", None, &cmd("idle"));
-    json!({ "hooks": hooks }).to_string()
+    vec![
+        HookSpec {
+            event: "PreToolUse",
+            matcher: Some("*"),
+            command: cmd("working"),
+        },
+        // `UserPromptSubmit` fires the instant the user submits a prompt —
+        // whether typed into the agent's own TUI or sent from OxiMux. It carries
+        // the prompt text, captured as the agent's rail title, and flips the dot
+        // to working immediately (a text-only reply that calls no tool would
+        // otherwise look idle for its whole turn). No matcher (like `Stop`).
+        HookSpec {
+            event: "UserPromptSubmit",
+            matcher: None,
+            command: cmd("working"),
+        },
+        // `Notification` (no matcher — like `Stop`) is the event Claude actually
+        // fires for a tool-permission prompt; `PermissionRequest` is a dead name
+        // in current Claude. `--filter-notification` gates the emit on the
+        // payload's `notification_type` so only a real permission ask reports
+        // needs_approval.
+        HookSpec {
+            event: "Notification",
+            matcher: None,
+            command: format!("'{quoted}' agent-status --state needs_approval --filter-notification"),
+        },
+        HookSpec {
+            event: "Stop",
+            matcher: None,
+            command: cmd("idle"),
+        },
+    ]
 }
 
 /// Append one `{matcher?, hooks:[{type:command, command, async}]}` entry to the

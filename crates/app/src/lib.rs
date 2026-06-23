@@ -8,6 +8,7 @@ pub mod actions;
 pub mod agent_awake;
 pub mod app_nap;
 pub mod assets;
+pub mod agent_hooks_global;
 pub mod agent_launch_settings;
 pub mod agent_status_hooks;
 pub mod browser_profiles;
