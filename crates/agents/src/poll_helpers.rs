@@ -79,6 +79,7 @@ pub fn process_poll_events(
                     tracing::debug!(
                         state = ?sb.state,
                         tool = ?sb.detail.tool_name,
+                        prompt = ?sb.detail.prompt,
                         "agent OSC-9999 sideband decoded"
                     );
                     // A prompt-submit event carries the title; cache it so the

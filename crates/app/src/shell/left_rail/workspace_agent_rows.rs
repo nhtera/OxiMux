@@ -236,12 +236,16 @@ fn render_agent_sub_row(
         )
         .child(
             // Keep the descriptor in a flex-row so a truncating line never
-            // collapses to blank (a known flex-col text pitfall).
+            // collapses to blank (a known flex-col text pitfall). `.truncate()`
+            // clips it to one line with an ellipsis at the row width — a prompt
+            // is wider than the rail, and without this it wraps and overlaps
+            // the next row.
             div().flex_1().min_w_0().flex().flex_row().items_center().child(
                 div()
                     .min_w_0()
                     .text_size(px(typography.t_body_sm))
                     .text_color(descriptor_color)
+                    .truncate()
                     .child(descriptor),
             ),
         )
