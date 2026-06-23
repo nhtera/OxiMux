@@ -44,6 +44,10 @@ const ENABLE_ENV: &str = "OXIMUX_STATUS_HOOKS";
 /// OSC-9999 packet. The scanner caps again, but trimming at the source is free.
 const MAX_TOOL_LEN: usize = 64;
 
+/// Cap the captured prompt at the source. The scanner caps again (256 bytes);
+/// trimming here keeps the OSC-9999 packet small and bounds a giant paste.
+const MAX_PROMPT_LEN: usize = 200;
+
 /// True when the env override forces status hooks on (`OXIMUX_STATUS_HOOKS=1`),
 /// independent of the persisted Settings toggle. A debug escape hatch — the
 /// primary control is the `status_hooks_enabled` setting, OR-combined with this
@@ -74,6 +78,12 @@ fn build_settings_json_with(user_hooks: Option<Value>, binary_path: &Path) -> St
     let quoted = binary_path.display().to_string().replace('\'', "'\\''");
     let cmd = |state: &str| format!("'{quoted}' agent-status --state {state}");
     append_hook(&mut hooks, "PreToolUse", Some("*"), &cmd("working"));
+    // `UserPromptSubmit` fires the instant the user submits a prompt — whether
+    // typed into the agent's own TUI or sent from OxiMux. It carries the prompt
+    // text, captured as the agent's rail title, and flips the dot to working
+    // immediately (a text-only reply that calls no tool would otherwise look
+    // idle for its whole turn). No matcher (like `Stop`).
+    append_hook(&mut hooks, "UserPromptSubmit", None, &cmd("working"));
     // `Notification` (no matcher — like `Stop`) is the event Claude actually
     // fires for a tool-permission prompt; `PermissionRequest` is a dead name in
     // current Claude. `--filter-notification` gates the emit on the payload's
@@ -206,15 +216,32 @@ pub fn notification_is_permission(stdin_json: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the user's `prompt` from a Claude `UserPromptSubmit` hook event
+/// JSON. Best-effort: a parse failure or missing/empty field yields `None`.
+/// Whitespace-trimmed and capped at [`MAX_PROMPT_LEN`] chars (the scanner caps
+/// again in bytes) so a giant paste can't bloat the OSC-9999 packet.
+pub fn prompt_from_hook_json(stdin_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin_json).ok()?;
+    let prompt = value.get("prompt")?.as_str()?.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(prompt.chars().take(MAX_PROMPT_LEN).collect())
+}
+
 /// Build the OSC-9999 inner JSON payload (`{"v":1,"state":..,"tool":..}`) the
 /// relay wraps and the scanner decodes. Serialized via `serde_json` so control
-/// characters in `tool` are escaped — the relay treats the result as opaque.
-pub fn build_status_payload(state: &str, tool: Option<&str>) -> String {
+/// characters in `tool`/`prompt` are escaped — the relay treats the result as
+/// opaque. `prompt` is present only on the `UserPromptSubmit` hook.
+pub fn build_status_payload(state: &str, tool: Option<&str>, prompt: Option<&str>) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("v".into(), json!(1));
     obj.insert("state".into(), json!(state));
     if let Some(t) = tool {
         obj.insert("tool".into(), json!(t));
+    }
+    if let Some(p) = prompt {
+        obj.insert("prompt".into(), json!(p));
     }
     Value::Object(obj).to_string()
 }
@@ -230,13 +257,23 @@ mod tests {
     }
 
     #[test]
-    fn settings_json_wires_three_events_to_agent_status_cli() {
+    fn settings_json_wires_four_events_to_agent_status_cli() {
         let json = build_settings_json_with(None, binary_path());
         let v: Value = serde_json::from_str(&json).unwrap();
         let hooks = &v["hooks"];
         assert!(hooks["PreToolUse"].is_array());
         assert!(hooks["Notification"].is_array());
         assert!(hooks["Stop"].is_array());
+        // UserPromptSubmit (no matcher, like Stop) reports working and carries
+        // the prompt the CLI reads from stdin.
+        assert!(hooks["UserPromptSubmit"].is_array());
+        assert!(hooks["UserPromptSubmit"][0].get("matcher").is_none());
+        assert!(
+            hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" agent-status --state working")
+        );
         // PreToolUse: matcher "*", async true, command single-quotes the binary
         // path and calls `agent-status --state working`.
         let pre = &hooks["PreToolUse"][0];
@@ -357,7 +394,7 @@ mod tests {
     /// what the Phase-1 scanner decodes.
     #[test]
     fn payload_round_trips_through_scanner() {
-        let payload = build_status_payload("working", Some("Bash"));
+        let payload = build_status_payload("working", Some("Bash"), None);
         // Relay envelope: ESC ] 9999 ; <payload> BEL.
         let mut bytes = b"\x1b]9999;".to_vec();
         bytes.extend_from_slice(payload.as_bytes());
@@ -371,11 +408,60 @@ mod tests {
         assert!(scan.cleaned.is_empty(), "OSC bytes fully stripped");
     }
 
+    /// End-to-end proof for the prompt path: the payload the CLI builds from a
+    /// `UserPromptSubmit` hook, wrapped in the relay's OSC-9999 envelope, is
+    /// decoded by the scanner with the prompt intact.
+    #[test]
+    fn prompt_payload_round_trips_through_scanner() {
+        let prompt = prompt_from_hook_json(
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"refactor the auth module"}"#,
+        );
+        let payload = build_status_payload("working", None, prompt.as_deref());
+        let mut bytes = b"\x1b]9999;".to_vec();
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.push(0x07);
+
+        let mut scanner = AgentOscScanner::new();
+        let ev = scanner.feed(&bytes).event.expect("scanner decoded event");
+        assert_eq!(ev.state, AgentSidebandState::Working);
+        assert_eq!(ev.detail.prompt.as_deref(), Some("refactor the auth module"));
+    }
+
     #[test]
     fn idle_payload_has_no_tool() {
-        let payload = build_status_payload("idle", None);
+        let payload = build_status_payload("idle", None, None);
         let v: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["state"], "idle");
         assert!(v.get("tool").is_none());
+        assert!(v.get("prompt").is_none());
+    }
+
+    #[test]
+    fn prompt_is_extracted_trimmed_and_capped() {
+        let stdin =
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"  fix the parser bug  "}"#;
+        assert_eq!(
+            prompt_from_hook_json(stdin).as_deref(),
+            Some("fix the parser bug")
+        );
+        // Absent / empty / non-JSON → None (the hook still no-ops cleanly).
+        assert_eq!(prompt_from_hook_json(r#"{"prompt":"   "}"#), None);
+        assert_eq!(prompt_from_hook_json(r#"{"hook_event_name":"Stop"}"#), None);
+        assert_eq!(prompt_from_hook_json("not json"), None);
+        // Cap.
+        let long = "x".repeat(MAX_PROMPT_LEN + 50);
+        let payload = format!(r#"{{"prompt":"{long}"}}"#);
+        assert_eq!(
+            prompt_from_hook_json(&payload).unwrap().chars().count(),
+            MAX_PROMPT_LEN
+        );
+    }
+
+    #[test]
+    fn payload_carries_prompt_when_present() {
+        let payload = build_status_payload("working", None, Some("hello there"));
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["state"], "working");
+        assert_eq!(v["prompt"], "hello there");
     }
 }

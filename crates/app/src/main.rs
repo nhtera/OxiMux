@@ -793,6 +793,12 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
     let tool = stdin_json
         .as_deref()
         .and_then(oximux_app::agent_status_hooks::tool_name_from_hook_json);
+    // A `UserPromptSubmit` event carries the user's prompt (no tool); other
+    // working events carry a tool (no prompt). Both are read from the same
+    // stdin JSON — one of them is `None` for any given hook.
+    let prompt = stdin_json
+        .as_deref()
+        .and_then(oximux_app::agent_status_hooks::prompt_from_hook_json);
 
     let pty_id = match std::env::var("OXIMUX_PTY_ID") {
         Ok(id) if !id.is_empty() => id,
@@ -802,7 +808,11 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
             return 0;
         }
     };
-    let payload = oximux_app::agent_status_hooks::build_status_payload(&state, tool.as_deref());
+    let payload = oximux_app::agent_status_hooks::build_status_payload(
+        &state,
+        tool.as_deref(),
+        prompt.as_deref(),
+    );
 
     let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
         eprintln!("oximux agent-status: cannot resolve application data directory");

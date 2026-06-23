@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use oximux_core::AgentSnapshot;
+use oximux_core::{AgentSnapshot, AgentStatus, SidebandDetail};
 use oximux_pty::{TerminalEvent, TerminalSessionId};
 use tokio::sync::watch;
 
@@ -30,19 +30,28 @@ use crate::status_machine::StatusMachine;
 /// Process one drained batch of terminal events for `term_id`. Returns
 /// `true` when an `Exit` event was seen (the caller breaks the poll loop).
 ///
+/// `last_prompt` is the poll loop's cache of the user's most recent prompt
+/// (captured from a prompt-submit sideband). It is the agent's stable title:
+/// a prompt arrives once, but the tool-step and idle events that follow carry
+/// none, so the cached value is re-attached to every snapshot until the next
+/// prompt replaces it. The volatile tool fields are NOT cached — only the
+/// prompt rides a plain status edge.
+///
 /// Publishes on `status_tx`:
-/// - regex/heuristic transitions as `AgentSnapshot { detail: None }` (any
-///   stale sideband detail is cleared),
+/// - regex/heuristic transitions carrying only the cached prompt (stale tool
+///   detail is cleared, the title survives),
 /// - sideband events as `AgentSnapshot { detail: Some(..) }` reflecting the
 ///   machine's current status (so detail-only changes, e.g. Edit→Bash while
 ///   still Running, still propagate),
 /// - the idle-decay `tick()` transition.
+#[allow(clippy::too_many_arguments)]
 pub fn process_poll_events(
     events: Vec<TerminalEvent>,
     term_id: TerminalSessionId,
     machine: &mut StatusMachine,
     scanner: &mut AgentOscScanner,
     status_tx: &watch::Sender<AgentSnapshot>,
+    last_prompt: &mut Option<String>,
     cancel_requested: &AtomicBool,
     now: Instant,
 ) -> bool {
@@ -57,12 +66,12 @@ pub fn process_poll_events(
                 let scan = scanner.feed(&bytes);
                 // Regex path on the OSC-9999-stripped bytes only.
                 if let Some(t) = machine.feed(scan.cleaned.as_ref(), now) {
-                    let _ = status_tx.send(AgentSnapshot::from_status(t.to));
+                    let _ = status_tx.send(status_snapshot(t.to, last_prompt));
                 }
                 // Sideband path: force the reported state, then publish the
                 // machine's current status with the structured detail. Skip
                 // once terminal — a Done/Failed session ignores late sideband.
-                if let Some(sb) = scan.event {
+                if let Some(mut sb) = scan.event {
                     // Observable signal that an OSC-9999 packet was received and
                     // decoded — the one link in the emission→scanner path that
                     // can't be unit-tested (needs a live agent emitting to the
@@ -72,9 +81,17 @@ pub fn process_poll_events(
                         tool = ?sb.detail.tool_name,
                         "agent OSC-9999 sideband decoded"
                     );
+                    // A prompt-submit event carries the title; cache it so the
+                    // tool-step and idle events that follow keep surfacing it.
+                    if sb.detail.prompt.is_some() {
+                        *last_prompt = sb.detail.prompt.clone();
+                    }
                     let tool = sb.detail.tool_name.clone();
                     machine.feed_sideband(sb.state, tool);
                     if !machine.current().is_terminal() {
+                        // Re-attach the cached prompt: an event with only a tool
+                        // step (or none) still surfaces the agent's title.
+                        sb.detail.prompt = last_prompt.clone();
                         let _ = status_tx.send(AgentSnapshot {
                             status: machine.current().clone(),
                             detail: Some(sb.detail),
@@ -92,7 +109,7 @@ pub fn process_poll_events(
                     machine.note_exit(code)
                 };
                 if let Some(t) = transition {
-                    let _ = status_tx.send(AgentSnapshot::from_status(t.to));
+                    let _ = status_tx.send(status_snapshot(t.to, last_prompt));
                 }
                 saw_exit = true;
             }
@@ -100,9 +117,27 @@ pub fn process_poll_events(
         }
     }
     if let Some(t) = machine.tick(now) {
-        let _ = status_tx.send(AgentSnapshot::from_status(t.to));
+        let _ = status_tx.send(status_snapshot(t.to, last_prompt));
     }
     saw_exit
+}
+
+/// Build a snapshot for a path with no sideband detail of its own (regex
+/// transition, exit, idle decay). The volatile tool fields are dropped, but
+/// the cached prompt (the agent's title) is re-attached so a plain status
+/// edge never blanks the row's label.
+fn status_snapshot(status: AgentStatus, last_prompt: &Option<String>) -> AgentSnapshot {
+    if last_prompt.is_some() {
+        AgentSnapshot {
+            status,
+            detail: Some(SidebandDetail {
+                prompt: last_prompt.clone(),
+                ..Default::default()
+            }),
+        }
+    } else {
+        AgentSnapshot::from_status(status)
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +167,7 @@ mod tests {
     fn run(events: Vec<TerminalEvent>) -> (AgentSnapshot, bool) {
         let mut machine = empty_machine();
         let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
         let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
         let cancel = AtomicBool::new(false);
         let saw_exit = process_poll_events(
@@ -140,6 +176,7 @@ mod tests {
             &mut machine,
             &mut scanner,
             &tx,
+            &mut last_prompt,
             &cancel,
             Instant::now(),
         );
@@ -187,6 +224,7 @@ mod tests {
         // transition whose snapshot must carry detail: None.
         let mut machine = empty_machine();
         let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
         let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
         let cancel = AtomicBool::new(false);
 
@@ -200,6 +238,7 @@ mod tests {
             &mut machine,
             &mut scanner,
             &tx,
+            &mut last_prompt,
             &cancel,
             Instant::now(),
         );
@@ -216,12 +255,98 @@ mod tests {
             &mut machine,
             &mut scanner,
             &tx,
+            &mut last_prompt,
             &cancel,
             Instant::now(),
         );
         let snap = rx.borrow().clone();
         assert_eq!(snap.status, AgentStatus::Running);
-        assert!(snap.detail.is_none(), "regex transition clears detail");
+        // No prompt was ever submitted, so the regex transition carries no
+        // detail at all — stale tool info is cleared.
+        assert!(snap.detail.is_none(), "regex transition clears tool detail");
+    }
+
+    #[test]
+    fn prompt_caches_and_rides_a_later_tool_step() {
+        // A prompt-submit event carries the title; a later working event
+        // carries only a tool. The cached prompt must still be on the snapshot
+        // so the row keeps its label while the tool subline updates.
+        let mut machine = empty_machine();
+        let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
+        let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
+        let cancel = AtomicBool::new(false);
+
+        let submit = osc(r#"{"v":1,"state":"working","prompt":"fix the parser"}"#);
+        process_poll_events(
+            vec![TerminalEvent::Output { id: TERM, bytes: submit }],
+            TERM,
+            &mut machine,
+            &mut scanner,
+            &tx,
+            &mut last_prompt,
+            &cancel,
+            Instant::now(),
+        );
+        assert_eq!(last_prompt.as_deref(), Some("fix the parser"));
+
+        // Next: a tool step with no prompt field.
+        let tool = osc(r#"{"v":1,"state":"working","tool":"Edit","tool_input":"x.rs"}"#);
+        process_poll_events(
+            vec![TerminalEvent::Output { id: TERM, bytes: tool }],
+            TERM,
+            &mut machine,
+            &mut scanner,
+            &tx,
+            &mut last_prompt,
+            &cancel,
+            Instant::now(),
+        );
+        let d = rx.borrow().detail.clone().expect("detail");
+        assert_eq!(d.prompt.as_deref(), Some("fix the parser"), "title persists");
+        assert_eq!(d.tool_name.as_deref(), Some("Edit"), "tool updates");
+    }
+
+    #[test]
+    fn cached_prompt_survives_a_regex_transition() {
+        // After a prompt is cached, a plain-output regex transition must keep
+        // the prompt (the title) even though it drops the volatile tool fields.
+        let mut machine = empty_machine();
+        let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
+        let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
+        let cancel = AtomicBool::new(false);
+
+        let submit = osc(r#"{"v":1,"state":"idle","prompt":"add tests"}"#);
+        process_poll_events(
+            vec![TerminalEvent::Output { id: TERM, bytes: submit }],
+            TERM,
+            &mut machine,
+            &mut scanner,
+            &tx,
+            &mut last_prompt,
+            &cancel,
+            Instant::now(),
+        );
+        // Plain output → regex Idle→Running transition (no sideband).
+        process_poll_events(
+            vec![TerminalEvent::Output {
+                id: TERM,
+                bytes: b"some output".to_vec(),
+            }],
+            TERM,
+            &mut machine,
+            &mut scanner,
+            &tx,
+            &mut last_prompt,
+            &cancel,
+            Instant::now(),
+        );
+        let snap = rx.borrow().clone();
+        assert_eq!(snap.status, AgentStatus::Running);
+        let d = snap.detail.expect("regex snapshot keeps the cached prompt");
+        assert_eq!(d.prompt.as_deref(), Some("add tests"));
+        assert!(d.tool_name.is_none(), "tool fields stay cleared");
     }
 
     #[test]
@@ -239,6 +364,7 @@ mod tests {
     fn cancel_requested_exit_maps_to_interrupted() {
         let mut machine = empty_machine();
         let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
         let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
         let cancel = AtomicBool::new(true);
         let saw_exit = process_poll_events(
@@ -250,6 +376,7 @@ mod tests {
             &mut machine,
             &mut scanner,
             &tx,
+            &mut last_prompt,
             &cancel,
             Instant::now(),
         );
@@ -276,6 +403,7 @@ mod tests {
     fn sideband_after_terminal_is_ignored() {
         let mut machine = empty_machine();
         let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
         let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
         let cancel = AtomicBool::new(false);
         // Terminal first.
@@ -288,6 +416,7 @@ mod tests {
             &mut machine,
             &mut scanner,
             &tx,
+            &mut last_prompt,
             &cancel,
             Instant::now(),
         );
@@ -302,6 +431,7 @@ mod tests {
             &mut machine,
             &mut scanner,
             &tx,
+            &mut last_prompt,
             &cancel,
             Instant::now(),
         );

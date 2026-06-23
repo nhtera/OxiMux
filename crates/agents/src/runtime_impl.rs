@@ -512,6 +512,10 @@ async fn poll_loop(
     // One scanner per session — stateful so an OSC-9999 sequence split across
     // two PTY reads still parses on the next drain.
     let mut scanner = AgentOscScanner::new();
+    // The user's most recent prompt, cached for this session's lifetime so it
+    // rides every snapshot as the agent's title (the prompt-submit event sets
+    // it; later tool/idle events carry none).
+    let mut last_prompt: Option<String> = None;
     loop {
         interval.tick().await;
         let events = {
@@ -524,6 +528,7 @@ async fn poll_loop(
             &mut machine,
             &mut scanner,
             &status_tx,
+            &mut last_prompt,
             &cancel_requested,
             Instant::now(),
         );

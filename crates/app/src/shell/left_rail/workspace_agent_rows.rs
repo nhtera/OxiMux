@@ -142,10 +142,23 @@ pub fn render_workspace_agent_disclosure(
     col
 }
 
+/// The user's prompt for this agent, read live from its status receiver. This
+/// is the agent's title — the one field that distinguishes otherwise-identical
+/// idle rows. Cached across the turn by the poll loop, so it survives tool
+/// steps and idle. `None` for history rows or an agent that hasn't been
+/// prompted since launch (e.g. a restored session). Not truncated here — the
+/// caller composes it with the activity before a single truncation.
+fn live_prompt(row: &RailAgentRow) -> Option<String> {
+    let snap = row.status_rx.as_ref()?.borrow();
+    let prompt = snap.detail.as_ref()?.prompt.as_deref()?;
+    let prompt = prompt.trim();
+    (!prompt.is_empty()).then(|| prompt.to_string())
+}
+
 /// Live tool/message line read straight from the agent's status receiver:
 /// the tool it is invoking (`"Edit: foo.rs"`) or its last free-form message.
 /// `None` for history rows or a live agent with no current detail — the row
-/// then falls back to its status verb. Truncated to keep the row one line.
+/// then falls back to its prompt or status verb. Not truncated here.
 fn live_activity(row: &RailAgentRow) -> Option<String> {
     let snap = row.status_rx.as_ref()?.borrow();
     let detail = snap.detail.as_ref()?;
@@ -157,7 +170,7 @@ fn live_activity(row: &RailAgentRow) -> Option<String> {
     } else {
         detail.last_message.as_deref().filter(|m| !m.is_empty())?.to_string()
     };
-    Some(truncate_chars(&text, 42))
+    Some(text)
 }
 
 /// Single-line truncation with an ellipsis, counting characters (not bytes)
@@ -183,12 +196,21 @@ fn render_agent_sub_row(
     typography: &Typography,
 ) -> impl IntoElement {
     let v = sub_row_view(row, theme);
-    // Prefer the live tool/message; fall back to the status verb. The verb is
-    // tinted by status; the activity line reads as muted secondary text.
-    let (descriptor, descriptor_color) = match live_activity(row) {
-        Some(activity) => (activity, theme.fg_muted),
-        None => (v.verb.to_string(), v.verb_color),
+    // Title precedence, mirroring the reference cockpit's compact row:
+    //   prompt (the agent's title) · live tool/message
+    //   prompt
+    //   live tool/message (no prompt captured yet)
+    //   status verb (a row with no live detail at all)
+    // The prompt leads and reads as primary text; the dot color carries the
+    // status. Composed first, then truncated as one unit so the title (the
+    // priority) survives when the trailing activity overflows.
+    let (descriptor, descriptor_color) = match (live_prompt(row), live_activity(row)) {
+        (Some(prompt), Some(activity)) => (format!("{prompt} · {activity}"), theme.fg_base),
+        (Some(prompt), None) => (prompt, theme.fg_base),
+        (None, Some(activity)) => (activity, theme.fg_muted),
+        (None, None) => (v.verb.to_string(), v.verb_color),
     };
+    let descriptor = truncate_chars(&descriptor, 48);
     let base = div()
         .flex()
         .flex_row()

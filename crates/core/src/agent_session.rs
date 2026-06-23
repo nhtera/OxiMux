@@ -158,8 +158,8 @@ pub enum AgentSidebandState {
 /// only a `state`.
 ///
 /// Lengths are capped at parse time (tool 64 / input 256 / message 512 /
-/// session_id 64 bytes) so a hostile PTY process cannot bloat the UI; see
-/// the scanner.
+/// session_id 64 / prompt 256 bytes) so a hostile PTY process cannot bloat
+/// the UI; see the scanner.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SidebandDetail {
     /// Tool the agent is invoking (e.g. `"Edit"`, `"Bash"`).
@@ -170,6 +170,11 @@ pub struct SidebandDetail {
     pub last_message: Option<String>,
     /// Agent-reported session UUID, if the payload supplied one.
     pub session_id: Option<String>,
+    /// The user's most recent prompt to the agent, captured when the prompt
+    /// hook fires. Cached across the turn by the poll loop: subsequent events
+    /// (tool steps, idle) carry no prompt, so the last known value is
+    /// re-attached until a new prompt arrives. Drives the rail row's title.
+    pub prompt: Option<String>,
 }
 
 /// What the per-session watch channel publishes: the mapped `AgentStatus`
