@@ -11,10 +11,10 @@
 //! so the disclosure matches the tab badge and dashboard.
 
 use gpui::prelude::*;
-use gpui::{Entity, Hsla, MouseButton, SharedString, WeakEntity, div, px};
+use gpui::{Entity, Hsla, MouseButton, WeakEntity, div, px, svg};
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::agent_presentation::agent_verb;
+use crate::shell::agent_presentation::{adapter_icon_path, agent_verb};
 use crate::shell::left_rail::{LeftRail, RailAgentRow};
 use crate::workspace_root::WorkspaceRoot;
 
@@ -44,7 +44,6 @@ pub fn glyph_overflow(count: usize) -> usize {
 /// Display fields for one expanded sub-row.
 pub struct SubRowView {
     pub dot: Hsla,
-    pub label: SharedString,
     pub verb: &'static str,
     pub verb_color: Hsla,
 }
@@ -56,7 +55,6 @@ pub fn sub_row_view(row: &RailAgentRow, theme: Theme) -> SubRowView {
     let v = agent_verb(Some(&status), row.is_live, theme);
     SubRowView {
         dot: v.color,
-        label: row.label.clone(),
         verb: v.label,
         verb_color: v.color,
     }
@@ -144,9 +142,39 @@ pub fn render_workspace_agent_disclosure(
     col
 }
 
-/// One expanded agent sub-row: status dot + label + status verb, indented
-/// deeper than the summary line. A live row is clickable to focus its tab;
-/// a history-only row (no open tab) is display-only.
+/// Live tool/message line read straight from the agent's status receiver:
+/// the tool it is invoking (`"Edit: foo.rs"`) or its last free-form message.
+/// `None` for history rows or a live agent with no current detail — the row
+/// then falls back to its status verb. Truncated to keep the row one line.
+fn live_activity(row: &RailAgentRow) -> Option<String> {
+    let snap = row.status_rx.as_ref()?.borrow();
+    let detail = snap.detail.as_ref()?;
+    let text = if let Some(tool) = detail.tool_name.as_deref().filter(|t| !t.is_empty()) {
+        match detail.tool_input_summary.as_deref().filter(|s| !s.is_empty()) {
+            Some(input) => format!("{tool}: {input}"),
+            None => tool.to_string(),
+        }
+    } else {
+        detail.last_message.as_deref().filter(|m| !m.is_empty())?.to_string()
+    };
+    Some(truncate_chars(&text, 42))
+}
+
+/// Single-line truncation with an ellipsis, counting characters (not bytes)
+/// so multi-byte content never splits a codepoint.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() <= max {
+        return s;
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// One expanded agent sub-row, mirroring the reference cockpit's compact row:
+/// `[status dot] [adapter icon] [activity / verb]  …  [relative age]`. A live
+/// row is clickable to focus its tab; a history-only row is display-only.
 fn render_agent_sub_row(
     row: &RailAgentRow,
     weak_root: WeakEntity<WorkspaceRoot>,
@@ -155,6 +183,12 @@ fn render_agent_sub_row(
     typography: &Typography,
 ) -> impl IntoElement {
     let v = sub_row_view(row, theme);
+    // Prefer the live tool/message; fall back to the status verb. The verb is
+    // tinted by status; the activity line reads as muted secondary text.
+    let (descriptor, descriptor_color) = match live_activity(row) {
+        Some(activity) => (activity, theme.fg_muted),
+        None => (v.verb.to_string(), v.verb_color),
+    };
     let base = div()
         .flex()
         .flex_row()
@@ -172,18 +206,29 @@ fn render_agent_sub_row(
                 .flex_shrink_0(),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_base)
-                .child(v.label),
+            svg()
+                .path(adapter_icon_path(&row.adapter_id))
+                .size(px(13.0))
+                .text_color(theme.fg_muted)
+                .flex_shrink_0(),
+        )
+        .child(
+            // Keep the descriptor in a flex-row so a truncating line never
+            // collapses to blank (a known flex-col text pitfall).
+            div().flex_1().min_w_0().flex().flex_row().items_center().child(
+                div()
+                    .min_w_0()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(descriptor_color)
+                    .child(descriptor),
+            ),
         )
         .child(
             div()
+                .flex_shrink_0()
                 .text_size(px(typography.t_body_sm))
-                .text_color(v.verb_color)
-                .child(v.verb),
+                .text_color(theme.fg_subtle)
+                .child(row.age_label.clone()),
         );
     if row.is_live {
         let db_id = row.db_id.clone();
@@ -220,6 +265,7 @@ mod tests {
             db_status,
             started_at: Some("2026-06-23T10:00:00Z".into()),
             ended_at: None,
+            age_label: "3d".into(),
         }
     }
 

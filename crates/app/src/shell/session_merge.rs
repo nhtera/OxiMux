@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::DateTime;
 use oximux_core::{AgentSession, AgentStatus, Workspace};
 
 use crate::shell::agent_presentation::adapter_display_name;
@@ -24,6 +25,28 @@ pub const HISTORY_CAP: usize = 20;
 /// which keeps only cleanly-completed agents as recent history — a crash,
 /// a shutdown (`Interrupted`/`Failed`), or a never-closed `idle`/`running`
 /// leftover with no live tab is not "recent work to glance at" and is dropped.
+/// Format a relative age ("now", "5m", "3h", "2d") from an RFC-3339 timestamp
+/// against a captured `now`, mirroring the reference cockpit's thresholds:
+/// `<1m → now`, `<1h → Nm`, `<24h → Nh`, else `Nd`. Empty on unparseable input.
+fn relative_age(ts: &str, now: &str) -> String {
+    let (Ok(t), Ok(n)) = (
+        DateTime::parse_from_rfc3339(ts),
+        DateTime::parse_from_rfc3339(now),
+    ) else {
+        return String::new();
+    };
+    let secs = (n - t).num_seconds().max(0);
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 fn is_recent_done(s: &AgentSession, cutoff: Option<&str>) -> bool {
     if !matches!(s.status, AgentStatus::Done { .. }) {
         return false;
@@ -44,6 +67,7 @@ pub fn build_workspace_agent_lists(
     sessions_by_workspace: &HashMap<String, Vec<AgentSession>>,
     live_agents: &LiveAgentMap,
     history_cutoff: Option<&str>,
+    now: &str,
 ) -> WorkspaceAgentList {
     let mut out: WorkspaceAgentList = HashMap::new();
     for workspaces in workspaces_by_project.values() {
@@ -52,7 +76,7 @@ pub fn build_workspace_agent_lists(
                 .get(&ws.id)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let rows = merge_workspace_agents(&ws.id, db, live_agents, history_cutoff);
+            let rows = merge_workspace_agents(&ws.id, db, live_agents, history_cutoff, now);
             if !rows.is_empty() {
                 out.insert(ws.id.clone(), rows);
             }
@@ -74,6 +98,7 @@ pub fn merge_workspace_agents(
     db_sessions: &[AgentSession],
     live_agents: &LiveAgentMap,
     history_cutoff: Option<&str>,
+    now: &str,
 ) -> Vec<RailAgentRow> {
     let mut rows: Vec<RailAgentRow> = Vec::with_capacity(db_sessions.len() + 1);
 
@@ -101,6 +126,12 @@ pub fn merge_workspace_agents(
             db_status: s.status.clone(),
             started_at: s.started_at.clone(),
             ended_at: s.ended_at.clone(),
+            age_label: s
+                .ended_at
+                .as_deref()
+                .or(s.started_at.as_deref())
+                .map(|t| relative_age(t, now))
+                .unwrap_or_default(),
         });
     }
 
@@ -119,6 +150,7 @@ pub fn merge_workspace_agents(
                 db_status: AgentStatus::Idle,
                 started_at: Some(e.started_at.clone()),
                 ended_at: None,
+                age_label: relative_age(&e.started_at, now),
             });
         }
     }
@@ -142,6 +174,8 @@ mod tests {
     use tokio::sync::watch;
 
     const WS: &str = "primary:proj-1";
+    // Fixed clock for deterministic tests — later than every fixture timestamp.
+    const NOW: &str = "2026-06-24T00:00:00Z";
 
     fn db(id: &str, status: AgentStatus, started: &str, ended: Option<&str>) -> AgentSession {
         AgentSession {
@@ -190,6 +224,30 @@ mod tests {
     }
 
     #[test]
+    fn relative_age_thresholds() {
+        let now = "2026-06-24T00:00:00Z";
+        assert_eq!(relative_age("2026-06-24T00:00:00Z", now), "now"); // 0s
+        assert_eq!(relative_age("2026-06-23T23:59:30Z", now), "now"); // 30s
+        assert_eq!(relative_age("2026-06-23T23:45:00Z", now), "15m");
+        assert_eq!(relative_age("2026-06-23T20:00:00Z", now), "4h");
+        assert_eq!(relative_age("2026-06-21T00:00:00Z", now), "3d");
+        assert_eq!(relative_age("garbage", now), ""); // unparseable
+    }
+
+    #[test]
+    fn merge_populates_age_label() {
+        let sessions = vec![db(
+            "done",
+            AgentStatus::Done { code: Some(0) },
+            "2026-06-23T09:00:00Z",
+            Some("2026-06-23T22:00:00Z"),
+        )];
+        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None, NOW);
+        // NOW is 2026-06-24T00:00:00Z; ended_at (used for done) is 2h earlier.
+        assert_eq!(rows[0].age_label, "2h");
+    }
+
+    #[test]
     fn non_live_keeps_only_recent_done() {
         let sessions = vec![
             // Stale leftover (never closed) — dropped.
@@ -209,7 +267,7 @@ mod tests {
                 Some("2026-06-23T09:30:00Z"),
             ),
         ];
-        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None);
+        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None, NOW);
         let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
         assert_eq!(ids, vec!["done"]);
         assert!(rows.iter().all(|r| !r.is_live && r.status_rx.is_none()));
@@ -222,7 +280,7 @@ mod tests {
         let mut live = LiveAgentMap::new();
         live.insert("a".into(), entry(WS, rx, "2026-06-23T10:00:00Z"));
 
-        let rows = merge_workspace_agents(WS, &sessions, &live, None);
+        let rows = merge_workspace_agents(WS, &sessions, &live, None, NOW);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_live);
         assert!(rows[0].status_rx.is_some());
@@ -236,7 +294,7 @@ mod tests {
         let mut live = LiveAgentMap::new();
         live.insert("ghost".into(), entry(WS, rx, "2026-06-23T11:00:00Z"));
 
-        let rows = merge_workspace_agents(WS, &[], &live, None);
+        let rows = merge_workspace_agents(WS, &[], &live, None, NOW);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].db_id, "ghost");
         assert!(rows[0].is_live);
@@ -257,7 +315,7 @@ mod tests {
         let mut live = LiveAgentMap::new();
         live.insert("live-old".into(), entry(WS, rx, "2026-06-23T08:00:00Z"));
 
-        let rows = merge_workspace_agents(WS, &sessions, &live, None);
+        let rows = merge_workspace_agents(WS, &sessions, &live, None, NOW);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].db_id, "live-old"); // live first despite older launch
         assert!(rows[0].is_live);
@@ -276,7 +334,7 @@ mod tests {
                 )
             })
             .collect();
-        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None);
+        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None, NOW);
         assert_eq!(rows.len(), HISTORY_CAP);
     }
 
@@ -306,7 +364,7 @@ mod tests {
             ),
         ];
         let cutoff = "2026-06-22T00:00:00Z";
-        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), Some(cutoff));
+        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), Some(cutoff), NOW);
         let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
         assert_eq!(ids, vec!["recent-done"]);
     }
@@ -324,7 +382,7 @@ mod tests {
         // Same UUID but a different workspace key — must not upgrade this row.
         live.insert("a".into(), entry("primary:other", rx, "2026-06-23T10:00:00Z"));
 
-        let rows = merge_workspace_agents(WS, &sessions, &live, None);
+        let rows = merge_workspace_agents(WS, &sessions, &live, None, NOW);
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].is_live);
     }
@@ -342,7 +400,7 @@ mod tests {
                 Some("2026-06-23T10:30:00Z"),
             )],
         )]);
-        let out = build_workspace_agent_lists(&wbp, &sessions, &LiveAgentMap::new(), None);
+        let out = build_workspace_agent_lists(&wbp, &sessions, &LiveAgentMap::new(), None, NOW);
         // Only the workspace with sessions appears; the empty one is omitted.
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("ws-a").map(Vec::len), Some(1));

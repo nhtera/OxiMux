@@ -33,6 +33,10 @@ pub struct RailAgentRow {
     pub started_at: Option<String>,
     /// Terminal timestamp (RFC-3339), `None` while live/non-terminal.
     pub ended_at: Option<String>,
+    /// Pre-formatted relative age shown on the right of the row (e.g. "now",
+    /// "3d"). Computed at merge time against a captured `now` so render needs
+    /// no clock. Empty when no timestamp is available.
+    pub age_label: String,
 }
 
 impl RailAgentRow {

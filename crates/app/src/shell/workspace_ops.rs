@@ -1395,13 +1395,16 @@ impl WorkspaceRoot {
         // shared UUID; terminal history older than 24h is culled (live rows are
         // always kept). The single-row caches above are untouched, so the
         // collapsed dot is unchanged until the disclosure UI lands.
-        let history_cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let now = chrono::Utc::now();
+        let history_cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
+        let now_rfc3339 = now.to_rfc3339();
         let workspace_agents: WorkspaceAgentList =
             crate::shell::session_merge::build_workspace_agent_lists(
                 &workspaces_by_project,
                 &self.rail_workspace_sessions,
                 &self.live_agents,
                 Some(&history_cutoff),
+                &now_rfc3339,
             );
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
