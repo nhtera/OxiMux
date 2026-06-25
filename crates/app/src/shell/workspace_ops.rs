@@ -29,7 +29,8 @@ use crate::project_panes_factory::{
 };
 use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
-use crate::shell::left_rail::{LatestStatusMap, WorkspaceAgentList};
+use crate::shell::left_rail::{LatestStatusMap, RailAgentTarget, WorkspaceAgentList};
+use crate::shell::pane_group::FocusedRailAgent;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
 
@@ -1440,6 +1441,24 @@ impl WorkspaceRoot {
             &ambient_status,
             &mut workspace_agents,
         );
+        // The agent whose tab is the active pane keeps its disclosure row lit.
+        // Resolve it from the active project's panes, then map to the rail's row
+        // identity (`RailAgentTarget`): a tracked session by its DB id, an
+        // ambient terminal by its worktree root.
+        let focused_agent: Option<RailAgentTarget> = self
+            .active_project_panes()
+            .and_then(|panes| panes.read(cx).focused_rail_agent(cx))
+            .and_then(|focused| match focused {
+                FocusedRailAgent::Session(sid) => self
+                    .live_agents
+                    .iter()
+                    .find_map(|(db, e)| (e.session_id == sid).then(|| db.clone()))
+                    .map(|db_id| RailAgentTarget::AgentSession { db_id }),
+                FocusedRailAgent::AmbientTerminalCwd(cwd) => {
+                    workspace_path_for_ambient_terminal(&cwd.to_string_lossy(), &workspaces_by_project)
+                        .map(|worktree_path| RailAgentTarget::AmbientTerminal { worktree_path })
+                }
+            });
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
                 projects,
@@ -1455,6 +1474,7 @@ impl WorkspaceRoot {
                 agent_sideband_snapshot,
                 last_active,
                 workspace_agents,
+                focused_agent,
                 cx,
             );
         });

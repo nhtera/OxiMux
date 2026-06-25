@@ -168,6 +168,7 @@ pub fn render_workspace_agent_disclosure(
     rows: &[RailAgentRow],
     is_expanded: bool,
     is_active: bool,
+    focused_agent: Option<&RailAgentTarget>,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
@@ -262,9 +263,15 @@ pub fn render_workspace_agent_disclosure(
     let mut col = div().flex().flex_col().w_full().child(summary);
     if is_expanded {
         for row in rows {
+            // The row the user is currently looking at (its tab is the active
+            // pane) stays lit, matching the reference cockpit's focused-pane
+            // row. `RailAgentTarget` is the shared identity for both tracked and
+            // ambient rows, so one equality check covers both.
+            let is_focused = focused_agent == Some(&row.target);
             col = col.child(render_agent_sub_row(
                 row,
                 is_active,
+                is_focused,
                 weak_root.clone(),
                 theme,
                 density,
@@ -365,6 +372,7 @@ pub fn live_title(row: &RailAgentRow) -> Option<LiveTitle> {
 fn render_agent_sub_row(
     row: &RailAgentRow,
     is_active: bool,
+    is_focused: bool,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -382,10 +390,18 @@ fn render_agent_sub_row(
     let primary = collapse_ws(&live_prompt(row).unwrap_or_else(|| row.label.to_string()));
     let secondary = collapse_ws(&live_activity(row).unwrap_or_else(|| agent_state_label(&status).to_string()));
     let show_secondary = !secondary.is_empty() && secondary != primary;
-    let primary_color = if primary_is_prompt {
+    // The focused row's strong fill would wash out the dimmed text, so lift both
+    // tones toward full foreground when focused — mirroring the reference
+    // cockpit's `isFocusedPane` text treatment.
+    let primary_color = if is_focused || primary_is_prompt {
         theme.fg_base
     } else {
         theme.fg_muted
+    };
+    let secondary_color = if is_focused {
+        theme.fg_muted
+    } else {
+        theme.fg_subtle
     };
 
     // One line holding two inline-styled spans: a brighter primary (the prompt)
@@ -415,7 +431,7 @@ fn render_agent_sub_row(
                     .flex_1()
                     .min_w_0()
                     .text_size(px(typography.t_body_sm))
-                    .text_color(theme.fg_subtle)
+                    .text_color(secondary_color)
                     .truncate()
                     .child(format!(" - {secondary}")),
             )
@@ -435,6 +451,9 @@ fn render_agent_sub_row(
         .pl(px(density.pad_panel * 3.0))
         .pr(px(density.pad_panel))
         .gap(px(density.gap_inline))
+        // Focused row keeps a resting fill (a "stuck hover"), like the reference
+        // cockpit's focused-pane row; non-focused rows light only on hover.
+        .when(is_focused, |d| d.bg(theme.hover_overlay))
         .child(agent_state_indicator(&status, &row.db_id, theme))
         .child(
             svg()
@@ -448,7 +467,7 @@ fn render_agent_sub_row(
             div()
                 .flex_shrink_0()
                 .text_size(px(typography.t_sub_label))
-                .text_color(theme.fg_subtle)
+                .text_color(secondary_color)
                 .child(row.age_label.clone()),
         );
     if row.is_focusable() {

@@ -184,6 +184,10 @@ pub struct LeftRail {
     /// clicking the "N agents" summary line; in-memory only (not persisted),
     /// and survives rail rebuilds since it lives on the entity.
     expanded_workspaces: HashSet<String>,
+    /// The agent whose tab is the active pane, so its disclosure sub-row stays
+    /// lit (the reference cockpit's focused-pane row). `None` when the active
+    /// tab is not an agent surface. Pushed down with the snapshot.
+    focused_agent: Option<RailAgentTarget>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -275,6 +279,7 @@ impl LeftRail {
             last_active: HashMap::new(),
             workspace_agents: HashMap::new(),
             expanded_workspaces: HashSet::new(),
+            focused_agent: None,
             width: px(density.w_left_rail),
             resizing: false,
             settings_repo: None,
@@ -693,6 +698,7 @@ impl LeftRail {
         agent_sideband: HashMap<String, SidebandDetail>,
         last_active: HashMap<String, String>,
         workspace_agents: WorkspaceAgentList,
+        focused_agent: Option<RailAgentTarget>,
         cx: &mut Context<Self>,
     ) {
         let project_changed = self.active_project_id != active_project_id;
@@ -735,6 +741,7 @@ impl LeftRail {
             || self.agent_activity != agent_activity
             || self.agent_sideband != agent_sideband
             || self.last_active != last_active
+            || self.focused_agent != focused_agent
             || !agents_display_equal(&self.workspace_agents, &workspace_agents);
 
         self.projects = projects;
@@ -756,6 +763,7 @@ impl LeftRail {
         self.agent_sideband = agent_sideband;
         self.last_active = last_active;
         self.workspace_agents = workspace_agents;
+        self.focused_agent = focused_agent;
 
         // Keep the Tasks page's project in sync; re-fetch only when the active
         // project actually changes while the page is open.
@@ -932,6 +940,7 @@ impl Render for LeftRail {
                 self.diff_counts.clone(),
                 self.workspace_agents.clone(),
                 self.expanded_workspaces.clone(),
+                self.focused_agent.clone(),
                 self.weak_root.clone(),
                 self.locate_glow_seq,
                 self.list_scroll.clone(),
@@ -1039,6 +1048,7 @@ fn render_workspace_list(
     diff_counts: HashMap<String, DiffCounts>,
     workspace_agents: WorkspaceAgentList,
     expanded_workspaces: HashSet<String>,
+    focused_agent: Option<RailAgentTarget>,
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
     list_scroll: ScrollHandle,
@@ -1165,6 +1175,7 @@ fn render_workspace_list(
             &diff_counts,
             &workspace_agents,
             &expanded_workspaces,
+            focused_agent.as_ref(),
             rail.clone(),
             weak_root.clone(),
             on_row_menu,

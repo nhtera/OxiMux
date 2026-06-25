@@ -252,6 +252,18 @@ impl ProjectPanes {
     /// agent (most-direct routing for the common "terminal + agent side
     /// by side" layout); (2) any group's active tab that's an agent; (3)
     /// any agent tab anywhere. Returns `None` when no agent is open.
+    /// The agent whose tab is the active pane, for the rail's focused-row
+    /// highlight. Resolves the active group's active tab only — no fallback to
+    /// background tabs or other groups (unlike `target_agent_session`), so the
+    /// highlight tracks exactly what the user is looking at. `None` when the
+    /// active tab is not an agent surface.
+    pub fn focused_rail_agent(
+        &self,
+        cx: &App,
+    ) -> Option<crate::shell::pane_group::FocusedRailAgent> {
+        self.active_group()?.read(cx).focused_rail_agent(cx)
+    }
+
     pub fn target_agent_session(&self, cx: &App) -> Option<AgentSessionId> {
         if let Some(active) = self.active_group()
             && let Some(id) = active.read(cx).active_agent_session()

@@ -392,6 +392,17 @@ fn terminal_view_cwd(
         .unwrap_or_else(|| fallback.to_path_buf())
 }
 
+/// The agent the user is currently looking at, resolved from the active group's
+/// active tab. Either a tracked agent session (keyed by id) or a focused plain
+/// terminal that is running a hand-launched (ambient) agent (keyed by its cwd,
+/// which the caller normalizes to a workspace root). `WorkspaceRoot` maps this
+/// to a `RailAgentTarget` so the rail lights the matching disclosure row.
+#[derive(Clone, Debug)]
+pub enum FocusedRailAgent {
+    Session(AgentSessionId),
+    AmbientTerminalCwd(PathBuf),
+}
+
 impl PaneGroup {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -716,6 +727,37 @@ impl PaneGroup {
             PaneGroupTabKind::Agent { session_id, .. } => Some(*session_id),
             _ => None,
         })
+    }
+
+    /// The agent the user is currently looking at in this group's active tab:
+    /// a tracked agent session, or the cwd of a focused plain-terminal running
+    /// a hand-launched (ambient) agent. `None` when the active tab is not an
+    /// agent surface (plain shell, editor, diff, …) — unlike
+    /// `target_agent_session`, this never falls back to a background tab, so
+    /// the rail lights exactly the focused row or nothing.
+    pub fn focused_rail_agent(&self, cx: &gpui::App) -> Option<FocusedRailAgent> {
+        let tab = self.active_tab()?;
+        match &tab.kind {
+            PaneGroupTabKind::Agent { session_id, .. } => {
+                Some(FocusedRailAgent::Session(*session_id))
+            }
+            PaneGroupTabKind::Terminal => {
+                let PaneContent::Terminal(tree) = &tab.content else {
+                    return None;
+                };
+                let view = tree.active_view()?;
+                let now = std::time::Instant::now();
+                let v = view.read(cx);
+                // Only a terminal actually running an agent gets a rail row to
+                // light; a plain shell does not. Hook sideband or an agent title
+                // is the same presence test the rail uses to group it.
+                let is_agent = v.ambient_agent(now).is_some()
+                    || v.title().and_then(classify_agent_title).is_some();
+                is_agent
+                    .then(|| FocusedRailAgent::AmbientTerminalCwd(terminal_view_cwd(v, &self.cwd)))
+            }
+            _ => None,
+        }
     }
 
     /// Count of TTY-backed tabs (terminals + agents) in this group.
