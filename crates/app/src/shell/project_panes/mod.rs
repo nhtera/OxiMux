@@ -983,41 +983,30 @@ impl ProjectPanes {
         true
     }
 
-    /// Whether any group contains a plain terminal in `worktree_path` whose
-    /// title currently classifies as an agent.
-    pub fn has_ambient_agent_terminal(
-        &self,
-        worktree_path: &std::path::Path,
-        cx: &gpui::App,
-    ) -> bool {
-        self.groups.values().any(|group| {
-            group
-                .read(cx)
-                .ambient_agent_terminal_tab_candidate(worktree_path, cx)
-                .is_some()
-        })
+    /// Whether any group hosts the terminal PTY `pty_id` (the per-pane identity
+    /// an ambient agent rail row is keyed by).
+    pub fn has_terminal_pty(&self, pty_id: &str, cx: &gpui::App) -> bool {
+        self.groups
+            .values()
+            .any(|group| group.read(cx).terminal_tab_index_for_pty(pty_id, cx).is_some())
     }
 
-    /// Activate the best plain terminal tab advertising an agent title in
-    /// `worktree_path`. This is the ambient-terminal counterpart of
-    /// `focus_agent_session`.
+    /// Activate the terminal tab hosting the PTY `pty_id`. This is the
+    /// ambient-terminal counterpart of `focus_agent_session`, focusing the
+    /// exact pane the user clicked in the rail (per-pane identity).
     pub fn focus_ambient_agent_terminal(
         &mut self,
-        worktree_path: &std::path::Path,
+        pty_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let existing: Option<(PaneGroupId, usize, u8)> = self
-            .groups
-            .iter()
-            .filter_map(|(id, group)| {
-                group
-                    .read(cx)
-                    .ambient_agent_terminal_tab_candidate(worktree_path, cx)
-                    .map(|(idx, rank)| (*id, idx, rank))
-            })
-            .max_by_key(|(_, _, rank)| *rank);
-        let Some((id, idx, _)) = existing else {
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .terminal_tab_index_for_pty(pty_id, cx)
+                .map(|idx| (*id, idx))
+        });
+        let Some((id, idx)) = existing else {
             return false;
         };
         self.set_active_group(id, window, cx);
@@ -1041,30 +1030,20 @@ impl ProjectPanes {
         set
     }
 
-    /// Ambient agent statuses inferred from plain-terminal titles across all
-    /// groups, keyed by worktree path string (matching
-    /// `Workspace.worktree_path`). When several groups/terminals key the same
-    /// path, the strongest (most attention-worthy) reading wins. Surfaces a
-    /// hand-launched agent on the sidebar without a tracked session.
-    pub fn ambient_agent_statuses(
+    /// Every hand-launched (ambient) agent across all groups, one entry per
+    /// terminal PTY (the per-pane identity the rail lists as its own row).
+    /// Surfaces hand-launched agents on the sidebar without a tracked session;
+    /// grouping under a workspace + collapsing for the single-agent card dot is
+    /// the caller's job (it resolves each entry's cwd to a worktree root).
+    pub fn ambient_agents(
         &self,
         cx: &gpui::App,
-    ) -> std::collections::HashMap<String, crate::shell::agent_presentation::AmbientAgent> {
-        use crate::shell::agent_presentation::{AmbientAgent, ambient_status_rank};
-        let mut map: std::collections::HashMap<String, AmbientAgent> =
-            std::collections::HashMap::new();
+    ) -> Vec<crate::shell::pane_group::AmbientAgentEntry> {
+        let mut out = Vec::new();
         for group in self.groups.values() {
-            for (path, agent) in group.read(cx).ambient_agent_statuses(cx) {
-                let key = path.display().to_string();
-                let replace = map.get(&key).is_none_or(|cur| {
-                    ambient_status_rank(&agent.status) > ambient_status_rank(&cur.status)
-                });
-                if replace {
-                    map.insert(key, agent);
-                }
-            }
+            out.extend(group.read(cx).ambient_agents(cx));
         }
-        map
+        out
     }
 
     /// Open or activate a diff tab in the active group for `(path, staged)`.

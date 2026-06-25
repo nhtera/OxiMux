@@ -873,6 +873,7 @@ fn agents_display_equal(a: &WorkspaceAgentList, b: &WorkspaceAgentList) -> bool 
                         && x.label == y.label
                         && x.adapter_id == y.adapter_id
                         && x.persisted_title == y.persisted_title
+                        && x.persisted_message == y.persisted_message
                 })
         })
     })
@@ -1388,6 +1389,8 @@ mod tests {
                 ended_at: None,
                 age_label: age.into(),
                 persisted_title: title.map(str::to_string),
+                persisted_message: None,
+                ambient_detail: None,
             }
         }
         let list = |rows: Vec<RailAgentRow>| {

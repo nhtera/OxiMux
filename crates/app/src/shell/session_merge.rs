@@ -41,25 +41,25 @@ fn relative_age(ts: &str, now: &str) -> String {
     }
 }
 
-/// History scope for a NON-live row: shown when it is a TERMINAL session —
-/// cleanly `Done`, `Interrupted` by a quit/shutdown, or `Failed` — whose
-/// `ended_at` is at or after the recency cutoff (unbounded when `cutoff` is
-/// `None`). This mirrors the reference cockpit's "sleeping agents": the agents
-/// open at the last quit (the boot sweep marks them `Interrupted` and stamps
-/// the shutdown time) reappear with their persisted title after the restart,
-/// alongside recent clean exits. A terminal row with NO `ended_at` stamp is a
-/// stale legacy artifact (not a cleanly-closed session) and is dropped once a
-/// cutoff applies; a never-closed `Idle`/`Running` leftover (not terminal) is
-/// dropped too.
+/// History scope for a NON-live row: shown ONLY when it is a CLEANLY-COMPLETED
+/// session (`Done { code: 0 }`) whose `ended_at` is at or after the recency
+/// cutoff (unbounded when `cutoff` is `None`). This mirrors the reference
+/// cockpit, which retains only finished (`done && !interrupted`) agents as
+/// history — a manually closed tab, a cancelled run, or a crash (`Interrupted`
+/// / `Failed` / non-zero exit) is NOT a finished agent, so it disappears from
+/// the rail instead of lingering as a red row. An agent that was open at the
+/// last app quit comes back as a LIVE row via re-adoption (its title restored
+/// from the per-PTY persistence), not as a dead history row. A never-closed
+/// `Idle`/`Running` leftover (not terminal) is dropped too.
 fn is_recent_history(s: &AgentSession, cutoff: Option<&str>) -> bool {
-    if !s.status.is_terminal() {
+    if !matches!(s.status, AgentStatus::Done { code: Some(0) }) {
         return false;
     }
     match (cutoff, s.ended_at.as_deref()) {
         (Some(cut), Some(ended)) => ended >= cut,
-        // A cutoff is set but this terminal row never stamped its end → stale.
+        // A cutoff is set but this row never stamped its end → stale.
         (Some(_), None) => false,
-        // No cutoff (tests / unbounded) → keep all terminal history.
+        // No cutoff (tests / unbounded) → keep clean-exit history.
         (None, _) => true,
     }
 }
@@ -92,55 +92,77 @@ pub fn build_workspace_agent_lists(
     out
 }
 
-/// Add live rows for agent CLIs detected inside plain terminal tabs. These
-/// rows are intentionally ephemeral: they do not write to `agent_sessions`,
-/// but they make hand-launched Claude/Codex/etc. participate in the same
+/// One hand-launched (ambient) agent resolved to its owning workspace. `pty_id`
+/// is the per-pane identity (each terminal is its own rail row); `worktree_path`
+/// (a workspace root, as produced by the cwd→workspace resolver) groups it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AmbientRow {
+    pub pty_id: String,
+    pub worktree_path: String,
+    pub agent: AmbientAgent,
+}
+
+/// Add live rows for agent CLIs detected inside plain terminal tabs — one row
+/// per PTY, so N hand-launched agents in a worktree list as N rows (the
+/// reference cockpit's per-pane identity) rather than collapsing to one. These
+/// rows are intentionally ephemeral: they do not write to `agent_sessions`, but
+/// they make hand-launched Claude/Codex/etc. participate in the same
 /// per-workspace list as spawned agents.
 pub fn append_ambient_agent_rows(
     workspaces_by_project: &HashMap<String, Vec<Workspace>>,
-    ambient_by_path: &HashMap<String, AmbientAgent>,
+    ambient_rows: &[AmbientRow],
     workspace_agents: &mut WorkspaceAgentList,
 ) {
-    for workspaces in workspaces_by_project.values() {
-        for ws in workspaces {
-            let Some(agent) = ambient_by_path.get(&ws.worktree_path) else {
-                continue;
-            };
-            let rows = workspace_agents.entry(ws.id.clone()).or_default();
-            if rows.iter().any(|r| {
-                matches!(
-                    &r.target,
-                    RailAgentTarget::AmbientTerminal { worktree_path }
-                        if worktree_path == &ws.worktree_path
-                )
-            }) {
-                continue;
-            }
-            let label = agent.label.unwrap_or("Agent");
-            // Surface the hook detail (the user's prompt, or the live tool step)
-            // as the row's title — the reference UX's primary per-agent distinguisher. The
-            // detail rides the compared `ambient_status` map, so a change
-            // repaints the rail through the dirty-check even though the row
-            // carries no live receiver.
-            let persisted_title = agent.detail.as_ref().and_then(ambient_title_from_detail);
-            rows.push(RailAgentRow {
-                db_id: format!("ambient:{}", ws.id),
-                target: RailAgentTarget::AmbientTerminal {
-                    worktree_path: ws.worktree_path.clone(),
-                },
-                workspace_key: ws.id.clone(),
-                adapter_id: adapter_id_for_label(label).to_string(),
-                label: label.into(),
-                is_live: true,
-                status_rx: None,
-                db_status: agent.status.clone(),
-                started_at: None,
-                ended_at: None,
-                age_label: "now".to_string(),
-                persisted_title,
-            });
-            sort_and_cap_rows(rows);
+    for ambient in ambient_rows {
+        // Group under the workspace whose root is this terminal's resolved
+        // worktree path; skip if it no longer maps to a known workspace.
+        let Some(ws) = workspaces_by_project
+            .values()
+            .flat_map(|w| w.iter())
+            .find(|w| w.worktree_path == ambient.worktree_path)
+        else {
+            continue;
+        };
+        let db_id = format!("ambient:{}", ambient.pty_id);
+        let rows = workspace_agents.entry(ws.id.clone()).or_default();
+        // Dedup by PTY id — idempotent if the same terminal is seen twice.
+        if rows.iter().any(|r| r.db_id == db_id) {
+            continue;
         }
+        let label = ambient.agent.label.unwrap_or("Agent");
+        // Surface the hook detail (the user's prompt, or the live tool step) as
+        // the row's title — the reference cockpit's primary per-agent
+        // distinguisher. The persisted title is compared by
+        // `agents_display_equal`, so a change repaints through the dirty-check
+        // even though the row carries no live receiver.
+        let persisted_title = ambient
+            .agent
+            .detail
+            .as_ref()
+            .and_then(ambient_title_from_detail);
+        rows.push(RailAgentRow {
+            db_id,
+            target: RailAgentTarget::AmbientTerminal {
+                pty_id: ambient.pty_id.clone(),
+            },
+            workspace_key: ws.id.clone(),
+            adapter_id: adapter_id_for_label(label).to_string(),
+            label: label.into(),
+            is_live: true,
+            status_rx: None,
+            db_status: ambient.agent.status.clone(),
+            started_at: None,
+            ended_at: None,
+            age_label: "now".to_string(),
+            persisted_title,
+            // Ambient rows carry their reply in `ambient_detail` (re-seeded from
+            // the persisted reading on a warm re-attach), not the DB column.
+            persisted_message: None,
+            // Carries the live tool step + last assistant message so the row's
+            // secondary text and done-check render like a tracked agent.
+            ambient_detail: ambient.agent.detail.clone(),
+        });
+        sort_and_cap_rows(rows);
     }
 }
 
@@ -170,11 +192,11 @@ fn ambient_title_from_detail(detail: &oximux_core::SidebandDetail) -> Option<Str
 ///
 /// `db_sessions` is `list_for_workspace` output (all rows, `started_at`
 /// DESC). The result is the **live + recent-history** set: every live session
-/// plus any TERMINAL history (clean `Done`, quit-`Interrupted`, or `Failed`)
-/// whose end is at or after `history_cutoff` (an RFC-3339 `now - 24h`). This
-/// keeps an agent and its persisted title across a restart — see
-/// [`is_recent_history`]. Never-closed non-terminal leftovers and old history
-/// are dropped. Pass `None` to keep all terminal history (tests).
+/// plus only CLEANLY-COMPLETED history (`Done { code: 0 }`) whose end is at or
+/// after `history_cutoff` (an RFC-3339 `now - 24h`) — see [`is_recent_history`].
+/// Like the reference cockpit, a closed/interrupted/failed agent disappears
+/// rather than lingering; never-closed leftovers and old history drop too. Pass
+/// `None` to keep all clean-exit history (tests).
 pub fn merge_workspace_agents(
     workspace_key: &str,
     db_sessions: &[AgentSession],
@@ -219,6 +241,11 @@ pub fn merge_workspace_agents(
                 .map(|t| relative_age(t, now))
                 .unwrap_or_default(),
             persisted_title: s.title.clone(),
+            // Falls back to this when the live channel has no message — a
+            // restored session keeps its finished-turn reply across a restart.
+            persisted_message: s.last_message.clone(),
+            // Tracked rows read live tool/message from `status_rx`.
+            ambient_detail: None,
         });
     }
 
@@ -239,9 +266,11 @@ pub fn merge_workspace_agents(
                 started_at: Some(e.started_at.clone()),
                 ended_at: None,
                 age_label: relative_age(&e.started_at, now),
-                // No DB row yet → no persisted title; the live channel supplies
-                // the prompt once it arrives.
+                // No DB row yet → no persisted title/message; the live channel
+                // supplies the prompt + reply once they arrive.
                 persisted_title: None,
+                persisted_message: None,
+                ambient_detail: None,
             });
         }
     }
@@ -283,6 +312,7 @@ mod tests {
             started_at: Some(started.into()),
             ended_at: ended.map(Into::into),
             title: None,
+            last_message: None,
         }
     }
 
@@ -320,6 +350,23 @@ mod tests {
     }
 
     #[test]
+    fn persisted_last_message_rides_the_tracked_row_for_restart_restore() {
+        // A re-adopted (non-live) session kept as recent history carries its
+        // DB-persisted last reply onto the row, so the rail can restore the
+        // finished-turn message + done-check across a restart.
+        let mut s = db("a", AgentStatus::Done { code: Some(0) }, NOW, Some(NOW));
+        s.last_message = Some("All set — shipped the fix.".into());
+        let rows = merge_workspace_agents(WS, &[s], &LiveAgentMap::new(), None, NOW);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].persisted_message.as_deref(),
+            Some("All set — shipped the fix.")
+        );
+        // Ambient rows never use the DB column.
+        assert!(rows.iter().all(|r| r.ambient_detail.is_none()));
+    }
+
+    #[test]
     fn relative_age_thresholds() {
         let now = "2026-06-24T00:00:00Z";
         assert_eq!(relative_age("2026-06-24T00:00:00Z", now), "now"); // 0s
@@ -344,18 +391,18 @@ mod tests {
     }
 
     #[test]
-    fn non_live_keeps_recent_terminal_history() {
+    fn non_live_keeps_only_clean_exit_history() {
         let sessions = vec![
             // Never-closed leftover (no terminal mark) — dropped as stale.
             db("idle", AgentStatus::Idle, "2026-06-23T10:00:00Z", None),
-            // Quit-interrupted "sleeping" agent — KEPT (survives the restart).
+            // Interrupted (closed tab / quit) — DROPPED.
             db(
                 "interrupted",
                 AgentStatus::Interrupted,
                 "2026-06-23T09:00:00Z",
                 Some("2026-06-23T09:10:00Z"),
             ),
-            // Clean exit — kept as recent history.
+            // Clean exit — kept as recent history (the only retained kind).
             db(
                 "done",
                 AgentStatus::Done { code: Some(0) },
@@ -365,10 +412,7 @@ mod tests {
         ];
         let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None, NOW);
         let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            std::collections::HashSet::from(["interrupted", "done"])
-        );
+        assert_eq!(ids, std::collections::HashSet::from(["done"]));
         assert!(rows.iter().all(|r| !r.is_live && r.status_rx.is_none()));
     }
 
@@ -438,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn history_keeps_recent_terminal_drops_old() {
+    fn history_keeps_recent_clean_exit_drops_interrupted_and_old() {
         let sessions = vec![
             // Clean exit but long before the cutoff → dropped by age.
             db(
@@ -447,45 +491,43 @@ mod tests {
                 "2026-06-20T08:00:00Z",
                 Some("2026-06-20T09:00:00Z"),
             ),
-            // Clean exit after the cutoff → kept.
+            // Clean exit after the cutoff → kept (the only retained kind).
             db(
                 "recent-done",
                 AgentStatus::Done { code: Some(0) },
                 "2026-06-23T08:00:00Z",
                 Some("2026-06-23T09:00:00Z"),
             ),
-            // Recent quit-interrupted agent → now KEPT (was dropped before).
+            // Recent interrupted (closed tab / quit) → DROPPED: a
+            // closed agent disappears rather than lingering as a red row.
             db(
                 "recent-interrupted",
                 AgentStatus::Interrupted,
                 "2026-06-23T08:00:00Z",
                 Some("2026-06-23T09:05:00Z"),
             ),
-            // Old interrupted (before the cutoff) → still dropped by age.
+            // Recent failure → also dropped (not a finished agent).
             db(
-                "old-interrupted",
-                AgentStatus::Interrupted,
-                "2026-06-20T08:00:00Z",
-                Some("2026-06-20T09:05:00Z"),
+                "recent-failed",
+                AgentStatus::Failed("boom".into()),
+                "2026-06-23T08:00:00Z",
+                Some("2026-06-23T09:06:00Z"),
             ),
         ];
         let cutoff = "2026-06-22T00:00:00Z";
         let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), Some(cutoff), NOW);
         let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            std::collections::HashSet::from(["recent-done", "recent-interrupted"])
-        );
+        assert_eq!(ids, std::collections::HashSet::from(["recent-done"]));
     }
 
     #[test]
     fn history_drops_terminal_without_end_stamp_when_cutoff_applies() {
-        // A legacy interrupted row that never stamped `ended_at` (pre-fix boot
-        // sweep) is stale, so a recency cutoff drops it rather than falling back
-        // to its (possibly recent) start time.
+        // A clean-exit row that never stamped `ended_at` (legacy) is stale, so a
+        // recency cutoff drops it rather than falling back to its (possibly
+        // recent) start time; unbounded keeps it.
         let sessions = vec![db(
             "no-end",
-            AgentStatus::Interrupted,
+            AgentStatus::Done { code: Some(0) },
             "2026-06-23T23:00:00Z",
             None,
         )];
@@ -537,38 +579,72 @@ mod tests {
         assert!(!out.contains_key("ws-empty"));
     }
 
+    fn ambient_row(pty: &str, worktree: &str, prompt: &str) -> AmbientRow {
+        AmbientRow {
+            pty_id: pty.to_string(),
+            worktree_path: worktree.to_string(),
+            agent: AmbientAgent {
+                status: AgentStatus::Running,
+                label: Some("Claude Code"),
+                detail: Some(oximux_core::SidebandDetail {
+                    prompt: Some(prompt.to_string()),
+                    ..Default::default()
+                }),
+            },
+        }
+    }
+
     #[test]
     fn ambient_terminal_agent_is_added_as_live_workspace_row() {
         let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a")])]);
         let mut out =
             build_workspace_agent_lists(&wbp, &HashMap::new(), &LiveAgentMap::new(), None, NOW);
-        let ambient = HashMap::from([(
-            "/tmp".to_string(),
-            AmbientAgent {
-                status: AgentStatus::Running,
-                label: Some("Claude Code"),
-                detail: Some(oximux_core::SidebandDetail {
-                    prompt: Some("fix the parser".to_string()),
-                    ..Default::default()
-                }),
-            },
-        )]);
 
-        append_ambient_agent_rows(&wbp, &ambient, &mut out);
+        append_ambient_agent_rows(&wbp, &[ambient_row("pty-1", "/tmp", "fix the parser")], &mut out);
 
         let rows = out.get("ws-a").expect("ambient row creates list");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].db_id, "ambient:ws-a");
+        assert_eq!(rows[0].db_id, "ambient:pty-1");
         assert_eq!(rows[0].adapter_id, "claude-code");
-        // The hook prompt becomes the row's title (the reference UX's distinguisher).
+        // The hook prompt becomes the row's title (the per-agent distinguisher).
         assert_eq!(rows[0].persisted_title.as_deref(), Some("fix the parser"));
         assert_eq!(rows[0].effective_status(), AgentStatus::Running);
         assert!(rows[0].is_focusable());
         assert_eq!(
             rows[0].target,
             RailAgentTarget::AmbientTerminal {
-                worktree_path: "/tmp".to_string(),
+                pty_id: "pty-1".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn multiple_ambient_terminals_in_one_workspace_each_get_a_row() {
+        // The core fix: N hand-launched agents in one worktree must list as N
+        // distinct rows (per-PTY identity), not collapse to a single row.
+        let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a")])]);
+        let mut out =
+            build_workspace_agent_lists(&wbp, &HashMap::new(), &LiveAgentMap::new(), None, NOW);
+
+        append_ambient_agent_rows(
+            &wbp,
+            &[
+                ambient_row("pty-1", "/tmp", "hi 1"),
+                ambient_row("pty-2", "/tmp", "hi 2"),
+                ambient_row("pty-3", "/tmp", "hi 3"),
+                // A duplicate of pty-2 is idempotent (no extra row).
+                ambient_row("pty-2", "/tmp", "hi 2"),
+            ],
+            &mut out,
+        );
+
+        let rows = out.get("ws-a").expect("ambient rows create list");
+        assert_eq!(rows.len(), 3, "three distinct PTYs → three rows");
+        let titles: std::collections::HashSet<_> =
+            rows.iter().filter_map(|r| r.persisted_title.clone()).collect();
+        assert_eq!(
+            titles,
+            ["hi 1", "hi 2", "hi 3"].iter().map(|s| s.to_string()).collect()
         );
     }
 }

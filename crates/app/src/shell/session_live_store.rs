@@ -109,25 +109,20 @@ impl WorkspaceRoot {
         }
     }
 
-    /// Focus a hand-launched agent detected from a plain terminal title. The
-    /// row is keyed by worktree path rather than DB session id because no
-    /// tracked `agent_sessions` row exists for ambient terminal agents.
+    /// Focus a hand-launched (ambient) agent the user clicked in the rail. The
+    /// row is keyed by the terminal's PTY id (its per-pane identity) rather than
+    /// a DB session id, because no tracked `agent_sessions` row exists for an
+    /// ambient terminal agent.
     pub(crate) fn focus_ambient_agent_terminal(
         &mut self,
-        worktree_path: &str,
+        pty_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let worktree_path = std::path::PathBuf::from(worktree_path);
         let owner = self
             .project_panes_by_project
             .iter()
-            .find_map(|(pid, panes)| {
-                panes
-                    .read(cx)
-                    .has_ambient_agent_terminal(&worktree_path, cx)
-                    .then(|| pid.clone())
-            });
+            .find_map(|(pid, panes)| panes.read(cx).has_terminal_pty(pty_id, cx).then(|| pid.clone()));
         let Some(project_id) = owner else {
             return;
         };
@@ -145,7 +140,7 @@ impl WorkspaceRoot {
         }
         if let Some(panes) = self.active_project_panes() {
             panes.update(cx, |p, cx| {
-                p.focus_ambient_agent_terminal(&worktree_path, window, cx);
+                p.focus_ambient_agent_terminal(pty_id, window, cx);
             });
         }
     }

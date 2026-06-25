@@ -1382,21 +1382,33 @@ impl WorkspaceRoot {
         // (a hand-launched `claude`/`codex`/… with no tracked session). Raw
         // terminal cwd is normalized to the owning workspace root, so a shell
         // that has `cd`'d into a subdirectory still groups under the worktree.
+        // Per-PTY ambient agents: each hand-launched terminal is its own rail
+        // row (the reference cockpit's per-pane identity), grouped under its
+        // workspace by resolving the terminal's cwd to a worktree root. The
+        // collapsed worktree→strongest-status map still drives the single-agent
+        // card dot and the live (green) worktree set.
+        let mut ambient_rows: Vec<crate::shell::session_merge::AmbientRow> = Vec::new();
         let mut ambient_status: HashMap<String, AmbientAgent> = HashMap::new();
         for panes in self.project_panes_by_project.values() {
-            for (path, agent) in panes.read(cx).ambient_agent_statuses(cx) {
-                let Some(worktree_path) =
-                    workspace_path_for_ambient_terminal(&path, &workspaces_by_project)
-                else {
+            for entry in panes.read(cx).ambient_agents(cx) {
+                let Some(worktree_path) = workspace_path_for_ambient_terminal(
+                    &entry.cwd.to_string_lossy(),
+                    &workspaces_by_project,
+                ) else {
                     continue;
                 };
                 let replace = ambient_status.get(&worktree_path).is_none_or(|cur| {
-                    crate::shell::agent_presentation::ambient_status_rank(&agent.status)
+                    crate::shell::agent_presentation::ambient_status_rank(&entry.agent.status)
                         > crate::shell::agent_presentation::ambient_status_rank(&cur.status)
                 });
                 if replace {
-                    ambient_status.insert(worktree_path, agent);
+                    ambient_status.insert(worktree_path.clone(), entry.agent.clone());
                 }
+                ambient_rows.push(crate::shell::session_merge::AmbientRow {
+                    pty_id: entry.pty_id,
+                    worktree_path,
+                    agent: entry.agent,
+                });
             }
         }
         live_worktrees.extend(ambient_status.keys().cloned());
@@ -1433,18 +1445,19 @@ impl WorkspaceRoot {
         }
         // Ambient (plain-terminal) agents are cheap to detect and change with
         // their hook status, so they are appended to a CLONE of the cached merge
-        // every frame; their detail rides the compared `ambient_status` map, so
-        // the rail dirty-check repaints when one changes.
+        // every frame — one row per PTY. Their visible fields (status, prompt)
+        // are compared by `agents_display_equal`, so the rail dirty-check
+        // repaints when one appears or changes.
         let mut workspace_agents: WorkspaceAgentList = self.rail_agents_cache.clone();
         crate::shell::session_merge::append_ambient_agent_rows(
             &workspaces_by_project,
-            &ambient_status,
+            &ambient_rows,
             &mut workspace_agents,
         );
         // The agent whose tab is the active pane keeps its disclosure row lit.
         // Resolve it from the active project's panes, then map to the rail's row
         // identity (`RailAgentTarget`): a tracked session by its DB id, an
-        // ambient terminal by its worktree root.
+        // ambient terminal by its PTY id (the same per-pane key the rows use).
         let focused_agent: Option<RailAgentTarget> = self
             .active_project_panes()
             .and_then(|panes| panes.read(cx).focused_rail_agent(cx))
@@ -1454,9 +1467,8 @@ impl WorkspaceRoot {
                     .iter()
                     .find_map(|(db, e)| (e.session_id == sid).then(|| db.clone()))
                     .map(|db_id| RailAgentTarget::AgentSession { db_id }),
-                FocusedRailAgent::AmbientTerminalCwd(cwd) => {
-                    workspace_path_for_ambient_terminal(&cwd.to_string_lossy(), &workspaces_by_project)
-                        .map(|worktree_path| RailAgentTarget::AmbientTerminal { worktree_path })
+                FocusedRailAgent::AmbientTerminal { pty_id } => {
+                    Some(RailAgentTarget::AmbientTerminal { pty_id })
                 }
             });
         self.left_rail.update(cx, |rail, cx| {

@@ -12,11 +12,13 @@ use oximux_core::AgentStatus;
 
 /// What a clickable rail row should focus. Tracked agent sessions focus by
 /// their DB UUID → runtime session mapping; ambient terminal agents focus by
-/// the worktree terminal that is currently advertising an agent title.
+/// the PTY id of the exact terminal running the hand-launched agent — one row
+/// per terminal, like the reference cockpit's per-pane identity (not collapsed
+/// to one row per worktree).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RailAgentTarget {
     AgentSession { db_id: String },
-    AmbientTerminal { worktree_path: String },
+    AmbientTerminal { pty_id: String },
 }
 
 /// One agent in a workspace's rail list — a live session, a finished
@@ -24,7 +26,8 @@ pub enum RailAgentTarget {
 #[derive(Clone)]
 pub struct RailAgentRow {
     /// Stable row key. For tracked sessions this is `agent_sessions.id`; for
-    /// ambient terminal agents this is a synthetic `ambient:<workspace>` key.
+    /// ambient terminal agents this is a synthetic `ambient:<pty_id>` key, so
+    /// each hand-launched terminal is its own row.
     pub db_id: String,
     /// Focus target for live tracked rows and ambient terminal rows.
     pub target: RailAgentTarget,
@@ -54,6 +57,18 @@ pub struct RailAgentRow {
     /// restored or re-adopted session keeps its title across an app restart.
     /// `None` for a session that never captured a prompt.
     pub persisted_title: Option<String>,
+    /// DB-persisted last assistant reply for a tracked row. The rail's secondary
+    /// text + done-check fall back to this when the live status channel carries
+    /// no message — so a restored or re-adopted session keeps showing its
+    /// finished-turn reply across an app restart, instead of reverting to the
+    /// bare status verb. `None` for a session that never produced a reply, and
+    /// for ambient rows (which carry their message in `ambient_detail`).
+    pub persisted_message: Option<String>,
+    /// Hook sideband detail for an AMBIENT row (no `status_rx`): the live tool
+    /// step + last assistant message that drive the row's secondary text and the
+    /// "finished a turn" (done check) indicator. `None` for tracked rows, which
+    /// read the same fields live from `status_rx`.
+    pub ambient_detail: Option<oximux_core::SidebandDetail>,
 }
 
 impl RailAgentRow {

@@ -147,12 +147,16 @@ pub(crate) fn spawn_for_session(
         // The agent's last persisted title (its most recent prompt). Tracked so
         // we only write the DB when the prompt actually changes, not every tick.
         let mut last_title: Option<String> = None;
+        // Likewise the last persisted assistant reply, so a restored session
+        // keeps its finished-turn message across a restart.
+        let mut last_msg: Option<String> = None;
         let (current, detail) = {
             let snap = status_rx.borrow_and_update();
             (snap.status.clone(), snap.detail.clone())
         };
         let title_changed =
             persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
+        persist_message_if_changed(&agent_repo, &row_id, &detail, &mut last_msg, cx).await;
         let _ = weak.update(cx, |this, cx| {
             this.note_agent_sideband(&ws_key, &current, detail, cx);
             if title_changed {
@@ -189,6 +193,7 @@ pub(crate) fn spawn_for_session(
             };
             let title_changed =
                 persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
+            persist_message_if_changed(&agent_repo, &row_id, &detail, &mut last_msg, cx).await;
             // The live tool subline can change WITHOUT a status edge (Bash →
             // Edit while still Running), so refresh it every tick — not only
             // when the status itself changes.
@@ -257,6 +262,43 @@ async fn persist_title_if_changed(
         })
         .await;
     true
+}
+
+/// Persist the agent's last assistant reply (the sideband's `last_message`,
+/// captured on `Stop`) to the session row, but only when it differs from the
+/// last write — the reply rides every snapshot once captured (the poll loop
+/// preserves it across tool steps), so this would otherwise write every tick. A
+/// blank/absent message is ignored (keeps the prior reply). Best-effort: a write
+/// failure is logged, never propagated.
+async fn persist_message_if_changed(
+    repo: &oximux_storage::AgentSessionRepo,
+    row_id: &str,
+    detail: &Option<oximux_core::SidebandDetail>,
+    last_msg: &mut Option<String>,
+    cx: &gpui::AsyncApp,
+) {
+    let Some(message) = detail
+        .as_ref()
+        .and_then(|d| d.last_message.as_ref())
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if last_msg.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    *last_msg = Some(message.clone());
+    let repo = repo.clone();
+    let id = row_id.to_string();
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(err) = repo.update_last_message(&id, &message) {
+                tracing::warn!(?err, "agent persistence: last_message write failed");
+            }
+        })
+        .await;
 }
 
 /// Write one status to the row (+ `ended_at` when terminal) on the

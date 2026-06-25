@@ -40,12 +40,20 @@ const STATE_CHECK: f32 = 11.0;
 const SPINNER_STEPS: f32 = 12.0;
 
 /// One agent's state indicator, mirroring the reference cockpit's `AgentStateDot`:
-/// Done → a green circle-check, Working → a rotating spinner, everything else
-/// → a colored dot (idle grey, needs-approval amber, attention red).
+/// Done / finished-a-turn → a green circle-check, Working → a rotating spinner,
+/// everything else → a colored dot (idle grey, needs-approval amber, attention
+/// red).
 ///
-/// `row_key` seeds the spinner's animation id so concurrently-running agents
-/// each keep their own rotation phase instead of sharing one.
-fn agent_state_indicator(status: &AgentStatus, row_key: &str, theme: Theme) -> AnyElement {
+/// `completed_turn` marks an idle agent that has produced a reply (the reference
+/// cockpit's "done") so it renders the emerald check rather than the grey idle
+/// dot a never-run agent shows. `row_key` seeds the spinner's animation id so
+/// concurrently-running agents each keep their own rotation phase.
+fn agent_state_indicator(
+    status: &AgentStatus,
+    completed_turn: bool,
+    row_key: &str,
+    theme: Theme,
+) -> AnyElement {
     let box_el = || {
         div()
             .flex()
@@ -55,15 +63,21 @@ fn agent_state_indicator(status: &AgentStatus, row_key: &str, theme: Theme) -> A
             .flex_shrink_0()
     };
     let dot = |color: Hsla| div().size(px(STATE_DOT)).rounded_full().bg(color);
-    match status {
-        AgentStatus::Done { code: Some(0) } => box_el()
+    let done_check = || {
+        box_el()
             .child(
                 Icon::default()
                     .path("icons/circle-check.svg")
                     .size(px(STATE_CHECK))
                     .text_color(theme.status_ok),
             )
-            .into_any_element(),
+            .into_any_element()
+    };
+    match status {
+        // A cleanly-exited process OR an alive agent that finished its turn both
+        // read as "done" — the reference cockpit's emerald check.
+        AgentStatus::Done { code: Some(0) } => done_check(),
+        AgentStatus::Idle if completed_turn => done_check(),
         AgentStatus::Running => box_el()
             .child(
                 Icon::default()
@@ -132,11 +146,17 @@ fn collapsed_state_chips(rows: &[RailAgentRow], theme: Theme) -> Vec<CollapsedCh
     // [error, warn, ok, muted] — fixed severity order; adapters filled per row.
     let mut buckets: [Vec<String>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for row in rows {
-        let idx = match row.effective_status() {
-            AgentStatus::Done { code: Some(0) } => 2, // ok (done)
-            AgentStatus::Running | AgentStatus::NeedsApproval(_) => 1, // warn (working/approval)
-            AgentStatus::Idle => 3,                    // muted (idle)
-            _ => 0, // error (waiting / interrupted / failed / done-nonzero)
+        // A finished-turn agent (idle + has a reply) joins the done bucket so the
+        // collapsed cluster matches the expanded rows' emerald check.
+        let idx = if is_completed_turn(row) {
+            2 // ok (done)
+        } else {
+            match row.effective_status() {
+                AgentStatus::Done { code: Some(0) } => 2, // ok (done)
+                AgentStatus::Running | AgentStatus::NeedsApproval(_) => 1, // warn (working/approval)
+                AgentStatus::Idle => 3,                   // muted (idle)
+                _ => 0, // error (waiting / interrupted / failed / done-nonzero)
+            }
         };
         buckets[idx].push(row.adapter_id.clone());
     }
@@ -344,11 +364,44 @@ pub fn render_workspace_agent_disclosure(
 /// session keeps its title across an app restart instead of decaying to the
 /// status verb. `None` only when neither source has a prompt. Not truncated
 /// here — the caller composes it with the activity before a single truncation.
+/// The row's current sideband detail: live from the status channel for a tracked
+/// row, or the carried `ambient_detail` for an ambient row (which has no
+/// channel). Owned so callers don't hold the `watch` borrow across the render.
+fn row_detail(row: &RailAgentRow) -> Option<oximux_core::SidebandDetail> {
+    let mut detail = match &row.status_rx {
+        Some(rx) => rx.borrow().detail.clone(),
+        None => row.ambient_detail.clone(),
+    };
+    // Restore-time fallback for a tracked row: a re-adopted session's live status
+    // channel starts empty (the poll loop is fresh), so surface the DB-persisted
+    // last reply until a new turn produces one — the row keeps its finished-turn
+    // message + done-check across an app restart instead of reverting to "Idle".
+    if let Some(persisted) = row
+        .persisted_message
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+    {
+        let d = detail.get_or_insert_with(Default::default);
+        if d.last_message.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            d.last_message = Some(persisted.to_string());
+        }
+    }
+    detail
+}
+
+/// True when this row's agent FINISHED a turn — the reference cockpit's "done":
+/// it is idle but has produced an assistant reply (captured by the `Stop` hook).
+/// Drives the emerald done-check, distinguishing a completed agent from one that
+/// has never run a turn (which stays a grey idle dot).
+fn is_completed_turn(row: &RailAgentRow) -> bool {
+    matches!(row.effective_status(), AgentStatus::Idle)
+        && row_detail(row)
+            .and_then(|d| d.last_message)
+            .is_some_and(|m| !m.trim().is_empty())
+}
+
 fn live_prompt(row: &RailAgentRow) -> Option<String> {
-    let live = row
-        .status_rx
-        .as_ref()
-        .and_then(|rx| rx.borrow().detail.as_ref().and_then(|d| d.prompt.clone()));
+    let live = row_detail(row).and_then(|d| d.prompt);
     let chosen = live.or_else(|| row.persisted_title.clone())?;
     let trimmed = chosen.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -359,8 +412,7 @@ fn live_prompt(row: &RailAgentRow) -> Option<String> {
 /// `None` for history rows or a live agent with no current detail — the row
 /// then falls back to its prompt or status verb. Not truncated here.
 fn live_activity(row: &RailAgentRow) -> Option<String> {
-    let snap = row.status_rx.as_ref()?.borrow();
-    let detail = snap.detail.as_ref()?;
+    let detail = row_detail(row)?;
     let text = if let Some(tool) = detail.tool_name.as_deref().filter(|t| !t.is_empty()) {
         match detail
             .tool_input_summary
@@ -445,6 +497,15 @@ fn render_agent_sub_row(
     let primary = collapse_ws(&live_prompt(row).unwrap_or_else(|| row.label.to_string()));
     let secondary = collapse_ws(&live_activity(row).unwrap_or_else(|| agent_state_label(&status).to_string()));
     let show_secondary = !secondary.is_empty() && secondary != primary;
+    // The row truncates to one line, so the full "{primary} - {secondary}" is
+    // unreadable when it overflows. A hover tooltip restores it — mirroring the
+    // reference cockpit's native `title` on the compact row.
+    let tooltip_text: SharedString = if show_secondary {
+        format!("{primary} - {secondary}")
+    } else {
+        primary.clone()
+    }
+    .into();
     // The focused row's strong fill would wash out the dimmed text, so lift both
     // tones toward full foreground when focused — mirroring the reference
     // cockpit's `isFocusedPane` text treatment.
@@ -509,7 +570,12 @@ fn render_agent_sub_row(
         // Focused row keeps a resting fill (a "stuck hover"), like the reference
         // cockpit's focused-pane row; non-focused rows light only on hover.
         .when(is_focused, |d| d.bg(theme.hover_overlay))
-        .child(agent_state_indicator(&status, &row.db_id, theme))
+        .child(agent_state_indicator(
+            &status,
+            is_completed_turn(row),
+            &row.db_id,
+            theme,
+        ))
         .child(
             svg()
                 .path(adapter_icon_path(&row.adapter_id))
@@ -524,7 +590,10 @@ fn render_agent_sub_row(
                 .text_size(px(typography.t_sub_label))
                 .text_color(secondary_color)
                 .child(row.age_label.clone()),
-        );
+        )
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, cx)
+        });
     if row.is_focusable() {
         let target = row.target.clone();
         base.cursor_pointer()
@@ -534,8 +603,8 @@ fn render_agent_sub_row(
                     RailAgentTarget::AgentSession { db_id } => {
                         root.focus_agent_by_db_id(db_id, window, cx);
                     }
-                    RailAgentTarget::AmbientTerminal { worktree_path } => {
-                        root.focus_ambient_agent_terminal(worktree_path, window, cx);
+                    RailAgentTarget::AmbientTerminal { pty_id } => {
+                        root.focus_ambient_agent_terminal(pty_id, window, cx);
                     }
                 });
             })
@@ -569,6 +638,8 @@ mod tests {
             ended_at: None,
             age_label: "3d".into(),
             persisted_title: None,
+            persisted_message: None,
+            ambient_detail: None,
         }
     }
 
@@ -727,6 +798,87 @@ mod tests {
             live_title(&r).map(|t| t.text),
             Some("ship the release".to_string())
         );
+    }
+
+    /// A LIVE idle row whose channel carries the given detail (the post-Stop
+    /// snapshot: status Idle + last assistant message).
+    fn idle_row_with_detail(detail: oximux_core::SidebandDetail) -> RailAgentRow {
+        let (tx, rx) = live_rx(AgentStatus::Idle);
+        tx.send(AgentSnapshot {
+            status: AgentStatus::Idle,
+            detail: Some(detail),
+        })
+        .unwrap();
+        row(true, AgentStatus::Idle, Some(rx))
+    }
+
+    #[test]
+    fn finished_turn_idle_row_is_done_and_shows_the_message() {
+        // Idle + an assistant reply = the reference cockpit's "done": the row
+        // must report completed (emerald check) and surface the reply as its
+        // secondary, NOT the bare "Idle" state label.
+        let detail = oximux_core::SidebandDetail {
+            prompt: Some("hi".into()),
+            last_message: Some("All set — tests pass.".into()),
+            ..Default::default()
+        };
+        let r = idle_row_with_detail(detail);
+        assert!(is_completed_turn(&r), "idle + reply = finished turn");
+        assert_eq!(live_prompt(&r).as_deref(), Some("hi"));
+        assert_eq!(live_activity(&r).as_deref(), Some("All set — tests pass."));
+    }
+
+    #[test]
+    fn fresh_idle_row_without_a_reply_is_not_done() {
+        // A just-launched agent that has never completed a turn (no reply) stays
+        // a grey idle row, like the reference cockpit's fresh "Claude Code - Idle".
+        let r = row(true, AgentStatus::Idle, None);
+        assert!(!is_completed_turn(&r));
+        assert_eq!(live_activity(&r), None);
+    }
+
+    #[test]
+    fn ambient_row_reads_detail_for_message_and_done_state() {
+        // An ambient row has no status channel; its tool/message come from the
+        // carried `ambient_detail`. A completed ambient turn reads as done too.
+        let mut r = row(true, AgentStatus::Idle, None);
+        r.ambient_detail = Some(oximux_core::SidebandDetail {
+            prompt: Some("hi 2".into()),
+            last_message: Some("Ready when you are.".into()),
+            ..Default::default()
+        });
+        assert!(is_completed_turn(&r));
+        assert_eq!(live_prompt(&r).as_deref(), Some("hi 2"));
+        assert_eq!(live_activity(&r).as_deref(), Some("Ready when you are."));
+    }
+
+    #[test]
+    fn restored_row_surfaces_the_persisted_message_when_live_channel_is_empty() {
+        // A re-adopted tracked row: live status channel is empty (fresh poll
+        // loop), but the DB-persisted reply must restore the finished-turn
+        // message + done-check across a restart, not revert to "Idle".
+        let mut r = row(true, AgentStatus::Idle, None);
+        r.persisted_message = Some("Done — 3 files changed.".into());
+        assert!(is_completed_turn(&r), "persisted reply ⇒ finished turn");
+        assert_eq!(live_activity(&r).as_deref(), Some("Done — 3 files changed."));
+    }
+
+    #[test]
+    fn live_message_wins_over_a_stale_persisted_message() {
+        // When the agent runs a new turn after restore, the live reply must take
+        // precedence over the persisted one.
+        let (tx, rx) = live_rx(AgentStatus::Idle);
+        tx.send(AgentSnapshot {
+            status: AgentStatus::Idle,
+            detail: Some(oximux_core::SidebandDetail {
+                last_message: Some("Fresh reply.".into()),
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+        let mut r = row(true, AgentStatus::Idle, Some(rx));
+        r.persisted_message = Some("Old persisted reply.".into());
+        assert_eq!(live_activity(&r).as_deref(), Some("Fresh reply."));
     }
 
     #[test]

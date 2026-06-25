@@ -394,13 +394,25 @@ fn terminal_view_cwd(
 
 /// The agent the user is currently looking at, resolved from the active group's
 /// active tab. Either a tracked agent session (keyed by id) or a focused plain
-/// terminal that is running a hand-launched (ambient) agent (keyed by its cwd,
-/// which the caller normalizes to a workspace root). `WorkspaceRoot` maps this
+/// terminal that is running a hand-launched (ambient) agent (keyed by its PTY
+/// id, the same per-pane identity the rail rows use). `WorkspaceRoot` maps this
 /// to a `RailAgentTarget` so the rail lights the matching disclosure row.
 #[derive(Clone, Debug)]
 pub enum FocusedRailAgent {
     Session(AgentSessionId),
-    AmbientTerminalCwd(PathBuf),
+    AmbientTerminal { pty_id: String },
+}
+
+/// One hand-launched (ambient) agent detected in a plain terminal, keyed by the
+/// terminal's PTY id so each pane is its own rail row — mirroring the reference
+/// cockpit's per-pane agent identity instead of collapsing every agent in a
+/// worktree to a single row. `cwd` is carried so the rail can group the row
+/// under the owning workspace; `agent` is the status/label/detail reading.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AmbientAgentEntry {
+    pub pty_id: String,
+    pub cwd: PathBuf,
+    pub agent: AmbientAgent,
 }
 
 impl PaneGroup {
@@ -753,8 +765,13 @@ impl PaneGroup {
                 // is the same presence test the rail uses to group it.
                 let is_agent = v.ambient_agent(now).is_some()
                     || v.title().and_then(classify_agent_title).is_some();
+                // Key the focused row by the terminal's PTY id, the same per-pane
+                // identity the rail rows carry. No PTY id (pending view) → nothing
+                // to light.
                 is_agent
-                    .then(|| FocusedRailAgent::AmbientTerminalCwd(terminal_view_cwd(v, &self.cwd)))
+                    .then(|| v.external_id())
+                    .flatten()
+                    .map(|pty_id| FocusedRailAgent::AmbientTerminal { pty_id })
             }
             _ => None,
         }
@@ -806,22 +823,17 @@ impl PaneGroup {
         paths
     }
 
-    /// Agent statuses inferred live from the OSC titles of *plain* terminal
-    /// tabs — a hand-launched agent CLI (typed `claude`/`codex`/… into a
-    /// terminal) the spawn machinery never minted a tracked session for.
-    /// Keyed by each terminal view's current cwd when known, falling back to
-    /// the group's `cwd`. `Agent`-kind tabs are excluded: their
-    /// `StatusMachine` is authoritative and already feeds the sidebar.
-    ///
-    /// Multiple views in one tab can each classify; the strongest reading
-    /// (most attention-worthy) wins so a working sub-pane is not masked by an
-    /// idle sibling. The winning view's title also resolves the agent's
-    /// display name when recognizable.
-    pub fn ambient_agent_statuses(&self, cx: &gpui::App) -> Vec<(PathBuf, AmbientAgent)> {
-        use crate::shell::agent_presentation::ambient_status_rank;
+    /// One [`AmbientAgentEntry`] per terminal PTY running a hand-launched agent
+    /// CLI (typed `claude`/`codex`/… into a plain terminal) the spawn machinery
+    /// never minted a tracked session for. Each PTY is its own entry — the
+    /// reference cockpit's per-pane identity — so N agents in one worktree list
+    /// as N rows rather than collapsing to one. `Agent`-kind tabs are excluded:
+    /// their `StatusMachine` is authoritative and already feeds the sidebar. A
+    /// view with no resolvable PTY id is skipped (it can be neither persisted
+    /// nor focused without one — the same key the ambient persistence uses).
+    pub fn ambient_agents(&self, cx: &gpui::App) -> Vec<AmbientAgentEntry> {
         let now = std::time::Instant::now();
-        let mut by_path: std::collections::HashMap<PathBuf, AmbientAgent> =
-            std::collections::HashMap::new();
+        let mut out: Vec<AmbientAgentEntry> = Vec::new();
         for tab in &self.tabs {
             if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
                 continue;
@@ -853,21 +865,38 @@ impl PaneGroup {
                 }) else {
                     continue;
                 };
-                let path = terminal_view_cwd(view, &self.cwd);
-                let better = by_path.get(&path).is_none_or(|cur| {
-                    let rank = ambient_status_rank(&agent.status);
-                    let cur_rank = ambient_status_rank(&cur.status);
-                    // Higher attention wins; on a tie the hook-backed reading
-                    // (has detail) beats a title-only one.
-                    rank > cur_rank
-                        || (rank == cur_rank && agent.detail.is_some() && cur.detail.is_none())
+                let Some(pty_id) = view.external_id() else {
+                    continue;
+                };
+                out.push(AmbientAgentEntry {
+                    pty_id,
+                    cwd: terminal_view_cwd(view, &self.cwd),
+                    agent,
                 });
-                if better {
-                    by_path.insert(path, agent);
-                }
             }
         }
-        by_path.into_iter().collect()
+        out
+    }
+
+    /// Index of the terminal tab whose split tree hosts the PTY `pty_id`, if
+    /// this group owns it. Resolves a rail click on an ambient agent row to the
+    /// exact terminal running it (per-pane focus).
+    pub fn terminal_tab_index_for_pty(&self, pty_id: &str, cx: &gpui::App) -> Option<usize> {
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
+                continue;
+            }
+            let PaneContent::Terminal(tree) = &tab.content else {
+                continue;
+            };
+            if tree
+                .iter_all_views()
+                .any(|(_, _, view)| view.read(cx).external_id().as_deref() == Some(pty_id))
+            {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Count of plain-terminal tabs running a recognizable agent (any view's
@@ -971,48 +1000,6 @@ impl PaneGroup {
         self.tabs.iter().position(|t| {
             matches!(&t.kind, PaneGroupTabKind::Agent { worktree_path, .. } if worktree_path == path)
         })
-    }
-
-    /// Index of a plain terminal tab currently running a recognizable agent
-    /// (hook sideband or title). When several terminal tabs classify, focus the
-    /// most attention-worthy one (approval > running > idle), matching the
-    /// sidebar status aggregation rule.
-    pub fn ambient_agent_terminal_tab_candidate(
-        &self,
-        worktree_path: &std::path::Path,
-        cx: &gpui::App,
-    ) -> Option<(usize, u8)> {
-        use crate::shell::agent_presentation::ambient_status_rank;
-        let now = std::time::Instant::now();
-
-        let mut best: Option<(usize, u8)> = None;
-        for (idx, tab) in self.tabs.iter().enumerate() {
-            if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
-                continue;
-            }
-            let PaneContent::Terminal(tree) = &tab.content else {
-                continue;
-            };
-            let tab_rank = tree
-                .iter_all_views()
-                .filter_map(|(_, _, view)| {
-                    let view = view.read(cx);
-                    if !terminal_view_cwd(view, &self.cwd).starts_with(worktree_path) {
-                        return None;
-                    }
-                    let status = view
-                        .ambient_agent(now)
-                        .map(|sb| sb.status)
-                        .or_else(|| view.title().and_then(classify_agent_title))?;
-                    Some(ambient_status_rank(&status))
-                })
-                .max()
-                .unwrap_or(0);
-            if tab_rank > best.map(|(_, rank)| rank).unwrap_or(0) {
-                best = Some((idx, tab_rank));
-            }
-        }
-        best
     }
 
     /// Index of the agent tab driving `session_id`, if this group holds it.

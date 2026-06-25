@@ -98,6 +98,16 @@ impl AmbientAgentScan {
         } else {
             detail.prompt = self.cached_prompt.clone();
         }
+        // Carry the agent's last reply forward when this event brings none. Only
+        // a finished turn (`Stop`) supplies a message; the prompt/tool events
+        // that follow carry none and must not blank it, so the row keeps showing
+        // the last reply across the next turn instead of reverting to a bare
+        // status verb — matching the reference cockpit, which preserves the last
+        // assistant message until a newer reply replaces it. (`tool_name` is left
+        // to the incoming event so an idle row correctly drops a stale tool.)
+        if detail.last_message.is_none() {
+            detail.last_message = self.detail.last_message.clone();
+        }
         let status = map_state_to_status(state, detail.tool_name.clone());
         // The one link in the global-hook → relay → plain-terminal path that
         // can't be unit-tested (needs a live hand-typed agent emitting to this
@@ -184,6 +194,52 @@ mod tests {
         let cur = scan.current(now).expect("still detected");
         assert_eq!(cur.detail.prompt.as_deref(), Some("fix the parser"));
         assert_eq!(cur.detail.tool_name.as_deref(), Some("Edit"));
+    }
+
+    #[test]
+    fn last_assistant_message_survives_the_next_turn() {
+        let mut scan = AmbientAgentScan::new();
+        let now = Instant::now();
+        // A finished turn brings the agent's reply.
+        scan.feed(
+            &osc(r#"{"v":1,"state":"idle","msg":"All done — 3 files changed."}"#),
+            now,
+        );
+        assert_eq!(
+            scan.current(now)
+                .and_then(|c| c.detail.last_message)
+                .as_deref(),
+            Some("All done — 3 files changed.")
+        );
+        // The next prompt carries no reply — the last one must persist so the
+        // row keeps showing it instead of reverting to a bare status verb.
+        scan.feed(&osc(r#"{"v":1,"state":"working","prompt":"now add tests"}"#), now);
+        assert_eq!(
+            scan.current(now)
+                .and_then(|c| c.detail.last_message)
+                .as_deref(),
+            Some("All done — 3 files changed.")
+        );
+        // A tool step likewise carries none; the reply persists while the tool
+        // is surfaced freshly.
+        scan.feed(
+            &osc(r#"{"v":1,"state":"working","tool":"Edit","tool_input":"x.rs"}"#),
+            now,
+        );
+        let cur = scan.current(now).expect("still detected");
+        assert_eq!(
+            cur.detail.last_message.as_deref(),
+            Some("All done — 3 files changed.")
+        );
+        assert_eq!(cur.detail.tool_name.as_deref(), Some("Edit"));
+        // A newer finished turn replaces the reply.
+        scan.feed(&osc(r#"{"v":1,"state":"idle","msg":"Tests added."}"#), now);
+        assert_eq!(
+            scan.current(now)
+                .and_then(|c| c.detail.last_message)
+                .as_deref(),
+            Some("Tests added.")
+        );
     }
 
     #[test]
