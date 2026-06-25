@@ -11,14 +11,78 @@
 //! disclosure matches the tab badge and dashboard.
 
 use gpui::prelude::*;
-use gpui::{Entity, Hsla, MouseButton, SharedString, WeakEntity, div, px, svg};
+use gpui::{AnyElement, Entity, Hsla, MouseButton, SharedString, WeakEntity, div, px, svg};
+use oximux_core::AgentStatus;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agent_presentation::{adapter_icon_path, agent_verb};
 use crate::shell::left_rail::{LeftRail, RailAgentRow, RailAgentTarget};
 use crate::workspace_root::WorkspaceRoot;
 
-const SUB_DOT: f32 = 7.0;
+/// Reference-cockpit state-indicator metrics: a 10px box holding a 6px dot, an
+/// 8px spinner-style ring (Working), or a 10px check glyph (Done).
+const STATE_BOX: f32 = 10.0;
+const STATE_DOT: f32 = 6.0;
+const STATE_RING: f32 = 8.0;
+const STATE_CHECK: f32 = 11.0;
+
+/// One agent's state indicator, mirroring the reference cockpit's `AgentStateDot`:
+/// Done → a green check, Working → a hollow spinner-style ring, everything else
+/// → a colored dot (idle grey, needs-approval amber, attention red).
+fn agent_state_indicator(status: &AgentStatus, theme: Theme) -> AnyElement {
+    let box_el = || {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(STATE_BOX))
+            .flex_shrink_0()
+    };
+    let dot = |color: Hsla| div().size(px(STATE_DOT)).rounded_full().bg(color);
+    match status {
+        AgentStatus::Done { code: Some(0) } => box_el()
+            .child(
+                svg()
+                    .path("icons/check.svg")
+                    .size(px(STATE_CHECK))
+                    .text_color(theme.status_ok),
+            )
+            .into_any_element(),
+        AgentStatus::Running => box_el()
+            .child(
+                div()
+                    .size(px(STATE_RING))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(theme.status_warn),
+            )
+            .into_any_element(),
+        AgentStatus::Idle => box_el().child(dot(theme.status_muted)).into_any_element(),
+        AgentStatus::NeedsApproval(_) => box_el().child(dot(theme.status_warn)).into_any_element(),
+        // WaitingForInput / Interrupted / Failed / Done(non-zero) → attention red.
+        _ => box_el().child(dot(theme.status_error)).into_any_element(),
+    }
+}
+
+/// State label for the row's secondary text, matching the reference cockpit's
+/// vocabulary ("Idle"/"Working"/…) rather than the tab badge's "Ready".
+fn agent_state_label(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Running => "Working",
+        AgentStatus::Idle => "Idle",
+        AgentStatus::WaitingForInput => "Waiting for input",
+        AgentStatus::NeedsApproval(_) => "Needs attention",
+        AgentStatus::Done { code: Some(0) } => "Done",
+        AgentStatus::Done { .. } | AgentStatus::Failed(_) => "Failed",
+        AgentStatus::Interrupted => "Interrupted",
+    }
+}
+
+/// Collapse runs of whitespace (incl. newlines) to single spaces so a multi-line
+/// prompt renders as one scannable line.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// Display fields for one expanded sub-row.
 pub struct SubRowView {
@@ -195,17 +259,6 @@ pub fn live_title(row: &RailAgentRow) -> Option<LiveTitle> {
     }
 }
 
-/// Single-line truncation with an ellipsis, counting characters (not bytes)
-/// so multi-byte content never splits a codepoint.
-fn truncate_chars(s: &str, max: usize) -> String {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() <= max {
-        return s;
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
 
 /// One expanded agent sub-row, mirroring the reference cockpit's compact row:
 /// `[status dot] [adapter icon] [activity / verb]  …  [relative age]`. A live
@@ -223,98 +276,79 @@ fn render_agent_sub_row(
     density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
-    let v = sub_row_view(row, theme);
-    // Reference-cockpit "{title} - {subtitle}" compact row:
-    //   title    = the user's prompt, else the agent's name ("Claude Code")
-    //   subtitle = the live tool/message, else the status verb ("Idle")
-    // The title leads in primary text; the subtitle reads muted; the dot color
-    // carries the status. e.g. "Claude Code - Idle", "fix parser - Edit: x.rs".
-    let (title, title_is_prompt) = match live_prompt(row) {
-        Some(p) => (p, true),
-        None => (row.label.to_string(), false),
-    };
-    let subtitle = live_activity(row).unwrap_or_else(|| v.verb.to_string());
-    let descriptor = if subtitle.trim().is_empty() || subtitle == title {
-        title
-    } else {
-        format!("{title} - {subtitle}")
-    };
-    let descriptor_color = if title_is_prompt {
+    let _ = is_active;
+    let status = row.effective_status();
+    // Reference-cockpit compact row: "{primary} - {secondary}", one line.
+    //   primary   = the user's prompt, else the agent's name ("Claude Code")
+    //   secondary = the live tool/message, else the state label ("Idle")
+    // primary leads brighter; secondary trails muted; the state indicator (check
+    // / spinner ring / colored dot) carries the status. The row ALWAYS truncates
+    // to one line — the reference cockpit never wraps an agent row, active or not.
+    let primary_is_prompt = live_prompt(row).is_some();
+    let primary = collapse_ws(&live_prompt(row).unwrap_or_else(|| row.label.to_string()));
+    let secondary = collapse_ws(&live_activity(row).unwrap_or_else(|| agent_state_label(&status).to_string()));
+    let show_secondary = !secondary.is_empty() && secondary != primary;
+    let primary_color = if primary_is_prompt {
         theme.fg_base
     } else {
         theme.fg_muted
     };
-    // Active workspace → wrap the full descriptor; inactive → one ellipsised
-    // line. The dot/icon/age align to the top when wrapping so they sit with
-    // the first line of text.
-    let descriptor_elem = if is_active {
-        div().flex_1().min_w_0().child(
+
+    // One truncating line holding two inline spans: a brighter primary and a
+    // dimmer " - secondary". Both `min_w_0` + `.truncate()` so the longer side
+    // ellipsises rather than wrapping.
+    let descriptor = div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(
             div()
+                .min_w_0()
                 .text_size(px(typography.t_body_sm))
-                .text_color(descriptor_color)
-                .child(descriptor),
+                .text_color(primary_color)
+                .truncate()
+                .child(primary),
         )
-    } else {
-        // Keep the descriptor in a flex-row so a truncating line never collapses
-        // to blank (a known flex-col text pitfall). `.truncate()` clips it to one
-        // line with an ellipsis at the row width.
-        div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .child(
+        .when(show_secondary, |d| {
+            d.child(
                 div()
                     .min_w_0()
                     .text_size(px(typography.t_body_sm))
-                    .text_color(descriptor_color)
+                    .text_color(theme.fg_subtle)
                     .truncate()
-                    .child(truncate_chars(&descriptor, 48)),
+                    .child(format!(" - {secondary}")),
             )
-    };
+        });
+
     // A stable element id makes GPUI track this row's hover hitbox across the
     // rail's frequent re-renders, so the hover fill repaints promptly on
-    // mouse-move (a bare `.hover()` div without an id repaints unreliably —
-    // the cause of the "hover feels laggy" report). Mirrors the workspace card,
-    // which is `.id()`-stateful.
-    let mut base = div()
+    // mouse-move (a bare `.hover()` div without an id repaints unreliably).
+    // Mirrors the `.id()`-stateful workspace card.
+    let base = div()
         .id(SharedString::from(format!("agent-row-{}", row.db_id)))
         .flex()
         .flex_row()
+        .items_center()
         .w_full()
+        .h(px(density.h_row))
         .pl(px(density.pad_panel * 3.0))
         .pr(px(density.pad_panel))
-        .gap(px(density.gap_inline));
-    base = if is_active {
-        base.items_start()
-            .min_h(px(density.h_row))
-            .py(px(density.gap_inline))
-    } else {
-        base.items_center().h(px(density.h_row))
-    };
-    let base = base
-        .child(
-            div()
-                .size(px(SUB_DOT))
-                .rounded_full()
-                .bg(v.dot)
-                .flex_shrink_0()
-                .when(is_active, |d| d.mt(px(5.0))),
-        )
+        .gap(px(density.gap_inline))
+        .child(agent_state_indicator(&status, theme))
         .child(
             svg()
                 .path(adapter_icon_path(&row.adapter_id))
                 .size(px(13.0))
                 .text_color(theme.fg_muted)
-                .flex_shrink_0()
-                .when(is_active, |d| d.mt(px(2.0))),
+                .flex_shrink_0(),
         )
-        .child(descriptor_elem)
+        .child(descriptor)
         .child(
             div()
                 .flex_shrink_0()
-                .text_size(px(typography.t_body_sm))
+                .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
                 .child(row.age_label.clone()),
         );
