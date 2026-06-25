@@ -45,6 +45,7 @@ pub struct StatusMachine {
     ring: VecDeque<u8>,
     current: AgentStatus,
     last_output_at: Option<Instant>,
+    sideband_running: bool,
 }
 
 impl StatusMachine {
@@ -55,6 +56,7 @@ impl StatusMachine {
             ring: VecDeque::with_capacity(SCAN_WINDOW_BYTES),
             current: AgentStatus::Idle,
             last_output_at: None,
+            sideband_running: false,
         }
     }
 
@@ -71,12 +73,17 @@ impl StatusMachine {
             return None;
         }
         self.push_to_ring(bytes);
-        self.last_output_at = Some(now);
+        if !self.sideband_running {
+            self.last_output_at = Some(now);
+        }
 
         // 1. Adapter pattern table — first match wins.
         let haystack = self.ring.make_contiguous();
         for pat in self.patterns.iter() {
             if pat.regex.is_match(haystack) {
+                if !matches!(pat.transition, AgentStatus::Running) {
+                    self.sideband_running = false;
+                }
                 return self.transition_to(pat.transition.clone());
             }
         }
@@ -86,21 +93,25 @@ impl StatusMachine {
         //    (the prompt scrolled out of the ring; user must have replied).
         //    Stays put when already Running (most common case, no work).
         if !matches!(self.current, AgentStatus::Running) {
+            self.sideband_running = false;
             return self.transition_to(AgentStatus::Running);
         }
         None
     }
 
     /// Wall-clock tick — typically driven by the same 500 ms tokio timer
-    /// the UI repaint uses. Decays `Running` → `Idle` after `IDLE_AFTER`.
+    /// the UI repaint uses. Decays output-derived `Running` → `Idle` after
+    /// `IDLE_AFTER`.
     ///
-    /// Note: `feed_sideband` does not touch `last_output_at` (it carries no
-    /// bytes), so a session driven purely by OSC-9999 packets never decays
-    /// here — it stays in the agent-reported state until the next sideband
-    /// packet or the exit event. That is intentional: when the agent says it
-    /// is running we trust it over the output-absence heuristic.
+    /// Sideband-reported `Running` clears `last_output_at`, so OSC-9999 hook
+    /// state does not immediately decay because of an old raw-output timestamp.
+    /// When the agent says it is running we trust that explicit state over the
+    /// output-absence heuristic until the next sideband packet or exit event.
     pub fn tick(&mut self, now: Instant) -> Option<StatusTransition> {
         if !matches!(self.current, AgentStatus::Running) {
+            return None;
+        }
+        if self.sideband_running {
             return None;
         }
         let last = self.last_output_at?;
@@ -117,6 +128,7 @@ impl StatusMachine {
         if self.current.is_terminal() {
             return None;
         }
+        self.sideband_running = false;
         let to = match code {
             Some(0) => AgentStatus::Done { code: Some(0) },
             Some(c) => AgentStatus::Failed(format!("exit {c}")),
@@ -134,6 +146,7 @@ impl StatusMachine {
         if self.current.is_terminal() {
             return None;
         }
+        self.sideband_running = false;
         self.transition_to(AgentStatus::Interrupted)
     }
 
@@ -145,6 +158,7 @@ impl StatusMachine {
         if self.current.is_terminal() {
             return None;
         }
+        self.sideband_running = false;
         self.transition_to(status)
     }
 
@@ -161,7 +175,14 @@ impl StatusMachine {
         tool: Option<String>,
     ) -> Option<StatusTransition> {
         let derived = crate::osc_sideband::map_state_to_status(state, tool);
-        self.force(derived)
+        if self.current.is_terminal() {
+            return None;
+        }
+        self.sideband_running = matches!(derived, AgentStatus::Running);
+        if self.sideband_running {
+            self.last_output_at = None;
+        }
+        self.transition_to(derived)
     }
 
     fn push_to_ring(&mut self, bytes: &[u8]) {
@@ -454,5 +475,35 @@ mod tests {
             sm.feed_sideband(AgentSidebandState::Working, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn feed_sideband_working_clears_stale_output_decay_clock() {
+        use oximux_core::AgentSidebandState;
+        let mut sm = StatusMachine::new(patterns(&[]));
+        let start = t0();
+        sm.feed(b"old output", start);
+        assert_eq!(sm.current(), &AgentStatus::Running);
+
+        // Same visible status, but now explicitly hook-driven. The stale raw
+        // output timestamp must no longer make the agent decay back to Idle.
+        assert!(
+            sm.feed_sideband(AgentSidebandState::Working, None)
+                .is_none()
+        );
+        assert!(sm.tick(start + IDLE_AFTER * 2).is_none());
+        assert_eq!(sm.current(), &AgentStatus::Running);
+    }
+
+    #[test]
+    fn sideband_working_ignores_later_plain_output_decay_clock() {
+        use oximux_core::AgentSidebandState;
+        let mut sm = StatusMachine::new(patterns(&[]));
+        let start = t0();
+        sm.feed_sideband(AgentSidebandState::Working, None);
+        sm.feed(b"plain tool output", start + Duration::from_secs(1));
+
+        assert!(sm.tick(start + IDLE_AFTER * 2).is_none());
+        assert_eq!(sm.current(), &AgentStatus::Running);
     }
 }
