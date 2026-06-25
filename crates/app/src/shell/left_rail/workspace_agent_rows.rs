@@ -11,7 +11,7 @@
 //! disclosure matches the tab badge and dashboard.
 
 use gpui::prelude::*;
-use gpui::{Entity, Hsla, MouseButton, WeakEntity, div, px, svg};
+use gpui::{Entity, Hsla, MouseButton, SharedString, WeakEntity, div, px, svg};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agent_presentation::{adapter_icon_path, agent_verb};
@@ -65,6 +65,9 @@ pub fn render_workspace_agent_disclosure(
     };
 
     let summary = div()
+        // Stable id so GPUI tracks the hover hitbox across re-renders (see the
+        // agent row note below) — a bare `.hover()` repaints unreliably.
+        .id(SharedString::from(format!("agents-disclosure-{workspace_key}")))
         .flex()
         .flex_row()
         .items_center()
@@ -270,7 +273,13 @@ fn render_agent_sub_row(
                     .child(truncate_chars(&descriptor, 48)),
             )
     };
+    // A stable element id makes GPUI track this row's hover hitbox across the
+    // rail's frequent re-renders, so the hover fill repaints promptly on
+    // mouse-move (a bare `.hover()` div without an id repaints unreliably —
+    // the cause of the "hover feels laggy" report). Mirrors the workspace card,
+    // which is `.id()`-stateful.
     let mut base = div()
+        .id(SharedString::from(format!("agent-row-{}", row.db_id)))
         .flex()
         .flex_row()
         .w_full()
