@@ -113,6 +113,18 @@ impl AmbientAgentScan {
         self.last_seen = Some(now);
     }
 
+    /// Re-prime the scan from a persisted reading on restore, so a still-running
+    /// agent in a re-attached terminal is listed immediately instead of waiting
+    /// for its next hook (an agent idle at its prompt emits none). `now` marks
+    /// the reading fresh from here on — wall-clock TTL was already enforced by
+    /// the persistence layer before this is called.
+    pub fn seed(&mut self, status: AgentStatus, detail: SidebandDetail, now: Instant) {
+        self.cached_prompt = detail.prompt.clone();
+        self.status = Some(status);
+        self.detail = detail;
+        self.last_seen = Some(now);
+    }
+
     /// The current hook-derived reading, or `None` when no sideband has ever
     /// arrived or the last one is older than [`SIDEBAND_TTL`].
     pub fn current(&self, now: Instant) -> Option<AmbientSideband> {
@@ -192,6 +204,31 @@ mod tests {
         scan.feed(&osc(r#"{"v":1,"state":"idle"}"#), start);
         assert!(scan.current(start).is_some());
         assert!(scan.current(start + SIDEBAND_TTL + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn seed_primes_status_and_prompt_for_immediate_listing() {
+        let mut scan = AmbientAgentScan::new();
+        let now = Instant::now();
+        // A fresh scan (post-restore) reports nothing until seeded.
+        assert!(scan.current(now).is_none());
+        scan.seed(
+            AgentStatus::Running,
+            SidebandDetail {
+                prompt: Some("hi 2".into()),
+                ..Default::default()
+            },
+            now,
+        );
+        let cur = scan.current(now).expect("seeded reading is visible");
+        assert_eq!(cur.status, AgentStatus::Running);
+        assert_eq!(cur.detail.prompt.as_deref(), Some("hi 2"));
+        // A later tool step with no prompt keeps the seeded title (cached).
+        scan.feed(&osc(r#"{"v":1,"state":"working","tool":"Edit"}"#), now);
+        assert_eq!(
+            scan.current(now).and_then(|c| c.detail.prompt),
+            Some("hi 2".to_string())
+        );
     }
 
     #[test]

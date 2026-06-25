@@ -109,6 +109,11 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
     // threading a Db through every intermediate constructor.
     crate::shell::diff_view::note_repo_handle::init_note_repo(DiffReviewNoteRepo::new(db.clone()));
 
+    // Install the process-wide ambient-agent state handle so a plain terminal
+    // running a hand-typed agent can persist its last hook reading and re-seed
+    // it on a warm re-attach — keeping the agent listed across a restart.
+    crate::shell::ambient_state::init(settings_repo.clone());
+
     // Manual display order for the rail: by `sort_order`, not recency. Opening
     // a project does not reshuffle the list — the order is sticky until a drag
     // rewrites it. The picker reads the same snapshot.
