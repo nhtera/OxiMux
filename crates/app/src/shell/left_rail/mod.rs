@@ -78,7 +78,7 @@ const AUTOSCROLL_TICK: Duration = Duration::from_millis(16);
 /// `None` means no sessions have ever been started for that workspace.
 pub type LatestStatusMap = HashMap<String, Option<AgentStatus>>;
 
-pub use rail_agent_row::{RailAgentRow, WorkspaceAgentList};
+pub use rail_agent_row::{RailAgentRow, RailAgentTarget, WorkspaceAgentList};
 
 /// One project group's held Smart-sort order plus when it was locked. Within
 /// `SMART_SETTLE` of the lock time, the group renders this order instead of a
@@ -711,6 +711,32 @@ impl LeftRail {
                 }
             }
         }
+        // Dirty-check: `WorkspaceRoot::render` pushes this snapshot down every
+        // frame (and re-renders on every pane-output tick while an agent
+        // streams), so notifying unconditionally rebuilds the whole rail
+        // constantly — the hover/scroll jank. Only re-render when the rail's
+        // render inputs actually changed. Every genuine live change already
+        // routes through `mark_rail_dirty` (status edges), `note_agent_sideband`
+        // (tool steps), or the per-frame ambient/diff maps → one of these
+        // compared fields changes, so the rail still updates; we only drop the
+        // redundant repaints. `status_rx` is excluded (not `Eq`); its live status
+        // surfaces via `latest_status`/`agent_sideband`/`ambient_status`, which
+        // ARE compared (ambient rows also carry their prompt in `persisted_title`,
+        // compared by `agents_display_equal`).
+        let changed = self.projects != projects
+            || self.active_project_id != active_project_id
+            || self.active_workspace_id != active_workspace_id
+            || self.workspaces_by_project != workspaces_by_project
+            || self.latest_status != latest_status
+            || self.ambient_status != ambient_status
+            || self.latest_adapter != latest_adapter
+            || self.live_worktrees != live_worktrees
+            || self.diff_counts != diff_counts
+            || self.agent_activity != agent_activity
+            || self.agent_sideband != agent_sideband
+            || self.last_active != last_active
+            || !agents_display_equal(&self.workspace_agents, &workspace_agents);
+
         self.projects = projects;
         self.active_project_id = active_project_id;
         // A locate glow is scoped to the workspace it was triggered on —
@@ -741,7 +767,12 @@ impl LeftRail {
                 tv.refresh(cx);
             }
         });
-        cx.notify();
+        // Only repaint the rail when its inputs changed (see the dirty-check
+        // above). A no-op frame keeps the last render — no churn on hover or
+        // while an agent merely streams output.
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Flip the multi-agent disclosure for one workspace. The caller notifies;
@@ -811,6 +842,32 @@ impl LeftRail {
         }
         cx.notify();
     }
+}
+
+/// Compare two per-workspace agent lists by their RENDER-VISIBLE fields only,
+/// skipping `status_rx` (a `watch::Receiver`, not `Eq`). The live status the
+/// receiver carries surfaces through `latest_status`/`agent_sideband`, which the
+/// caller compares separately; an ambient row's prompt rides `persisted_title`,
+/// compared here — so this projection is enough to decide whether the disclosure
+/// rows would look any different.
+fn agents_display_equal(a: &WorkspaceAgentList, b: &WorkspaceAgentList) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().all(|(key, rows_a)| {
+        b.get(key).is_some_and(|rows_b| {
+            rows_a.len() == rows_b.len()
+                && rows_a.iter().zip(rows_b).all(|(x, y)| {
+                    x.db_id == y.db_id
+                        && x.is_live == y.is_live
+                        && x.db_status == y.db_status
+                        && x.age_label == y.age_label
+                        && x.label == y.label
+                        && x.adapter_id == y.adapter_id
+                        && x.persisted_title == y.persisted_title
+                })
+        })
+    })
 }
 
 impl Render for LeftRail {
@@ -1294,6 +1351,60 @@ mod tests {
         let removed = vec!["x".to_string()];
         assert!(!same_membership(&a, &added));
         assert!(!same_membership(&a, &removed));
+    }
+
+    #[test]
+    fn agents_display_equal_skips_status_rx_catches_visible_fields() {
+        use crate::shell::left_rail::{RailAgentRow, RailAgentTarget};
+        use oximux_core::{AgentSnapshot, AgentStatus};
+        use std::collections::HashMap;
+        use tokio::sync::watch;
+
+        // Each row gets its OWN status receiver instance — the compare must
+        // ignore those and look only at the visible fields.
+        fn row(age: &str, title: Option<&str>) -> RailAgentRow {
+            let (_tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Running));
+            RailAgentRow {
+                db_id: "a".into(),
+                target: RailAgentTarget::AgentSession { db_id: "a".into() },
+                workspace_key: "ws".into(),
+                adapter_id: "claude-code".into(),
+                label: "Claude Code".into(),
+                is_live: true,
+                status_rx: Some(rx),
+                db_status: AgentStatus::Idle,
+                started_at: Some("t".into()),
+                ended_at: None,
+                age_label: age.into(),
+                persisted_title: title.map(str::to_string),
+            }
+        }
+        let list = |rows: Vec<RailAgentRow>| {
+            let mut m: super::WorkspaceAgentList = HashMap::new();
+            m.insert("ws".to_string(), rows);
+            m
+        };
+
+        // Same visible fields, different receiver instances → equal.
+        assert!(super::agents_display_equal(
+            &list(vec![row("now", None)]),
+            &list(vec![row("now", None)])
+        ));
+        // A changed age label → not equal (the row would render differently).
+        assert!(!super::agents_display_equal(
+            &list(vec![row("now", None)]),
+            &list(vec![row("3d", None)])
+        ));
+        // A changed prompt title (e.g. an ambient agent's new prompt) → not equal.
+        assert!(!super::agents_display_equal(
+            &list(vec![row("now", Some("old"))]),
+            &list(vec![row("now", Some("new"))])
+        ));
+        // Different agent count → not equal.
+        assert!(!super::agents_display_equal(
+            &list(vec![row("now", None)]),
+            &list(vec![row("now", None), row("now", None)])
+        ));
     }
 
     #[test]

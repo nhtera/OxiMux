@@ -604,6 +604,12 @@ pub struct TerminalView {
     /// ([`adopt_live_session`](Self::adopt_live_session) /
     /// [`respawn_if_dormant`](Self::respawn_if_dormant)).
     exited: Option<i32>,
+    /// Consumes the OSC-9999 status sideband the global hooks emit into THIS
+    /// terminal's output. A hand-typed `claude`/`codex`/… in a plain terminal
+    /// has no `AgentRuntime` to decode its hook packets; this gives such an
+    /// ambient agent the same stable, hook-driven status as a spawned one. Read
+    /// by [`ambient_agent`](Self::ambient_agent); idle for a plain shell.
+    agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan,
 }
 
 impl TerminalView {
@@ -766,6 +772,7 @@ impl TerminalView {
             pending_attach: false,
             pending_relay_hint: None,
             exited: None,
+            agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
         }
     }
 
@@ -965,6 +972,7 @@ impl TerminalView {
             pending_attach: false,
             pending_relay_hint: None,
             exited: None,
+            agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
         }
     }
 
@@ -2115,9 +2123,16 @@ impl TerminalView {
         let mut pty_replies: Vec<Vec<u8>> = Vec::new();
         for ev in &events {
             match ev {
-                TerminalEvent::Output { .. } => {
+                TerminalEvent::Output { bytes, .. } => {
                     needs_snapshot = true;
                     had_output = true;
+                    // Decode any OSC-9999 status sideband the global hooks
+                    // emitted onto this terminal's stream. Cheap for a plain
+                    // shell (skipped unless a marker is present); gives a
+                    // hand-typed agent the same hook-driven status as a spawned
+                    // one. The relay also leaves these private-OSC bytes for the
+                    // emulator, which ignores them — so nothing is displayed.
+                    self.agent_scan.feed(bytes, std::time::Instant::now());
                 }
                 // The child process died. Record the code so render shows a
                 // "process exited" banner; without it a dead leader (e.g. a
@@ -2307,6 +2322,17 @@ impl TerminalView {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Hook-derived agent status for this terminal, decoded from the OSC-9999
+    /// sideband, or `None` for a plain shell / an agent that has not yet emitted
+    /// a hook. Richer and more stable than the title heuristic; the ambient
+    /// aggregation prefers it when present.
+    pub fn ambient_agent(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<crate::shell::ambient_agent_scan::AmbientSideband> {
+        self.agent_scan.current(now)
     }
 
     /// Latest OSC 9;4 progress `(state, value)` the child reported, if any.

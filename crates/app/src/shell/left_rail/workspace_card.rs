@@ -66,6 +66,7 @@ pub fn render_workspace_card(
     plan: WorkspaceCardPlan,
     row_id: SharedString,
     group_name: SharedString,
+    active_shell: bool,
     show_menu: bool,
     locate_glow_seq: u64,
     drag: Option<WorkspaceDragConfig>,
@@ -208,7 +209,9 @@ pub fn render_workspace_card(
                 .into_any_element()
         }
         // Renamable row at rest → title with double-click-to-rename.
-        Some(RowRenameConfig { rail, workspace, .. }) => div()
+        Some(RowRenameConfig {
+            rail, workspace, ..
+        }) => div()
             .text_size(px(typography.t_body_sm))
             .text_color(plan.row.fg)
             .child(plan.row.name.clone())
@@ -303,24 +306,24 @@ pub fn render_workspace_card(
         .as_ref()
         .filter(|d| d.added > 0 || d.removed > 0)
         .map(|d| {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .text_size(px(typography.t_sub_label))
-                    .text_color(theme.status_added)
-                    .child(format!("+{}", d.added)),
-            )
-            .child(
-                div()
-                    .text_size(px(typography.t_sub_label))
-                    .text_color(theme.status_removed)
-                    .child(format!("−{}", d.removed)),
-            )
-    });
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(typography.t_sub_label))
+                        .text_color(theme.status_added)
+                        .child(format!("+{}", d.added)),
+                )
+                .child(
+                    div()
+                        .text_size(px(typography.t_sub_label))
+                        .text_color(theme.status_removed)
+                        .child(format!("−{}", d.removed)),
+                )
+        });
 
     // When a live title is present it takes the whole line (the prompt is the
     // headline); otherwise fall back to the `name · verb` summary. The diff
@@ -389,12 +392,14 @@ pub fn render_workspace_card(
     // so the card runs flush to the body's right edge and that hit-pad becomes
     // the right gap — keeping the visible left/right gaps symmetric. The flex
     // wrapper means this no longer overflows, so all four corners still round.
-    let shell = if plan.row.is_active {
+    let shell = if plan.row.is_active && active_shell {
         base.ml(px(density.gap_inline))
             .rounded(px(density.r_card))
             .border_1()
             .border_color(theme.border_inactive)
             .bg(plan.row.bg)
+    } else if plan.row.is_active {
+        base.rounded(px(density.r_card))
     } else {
         base.ml(px(density.gap_inline))
             .rounded(px(density.r_card))
@@ -463,14 +468,23 @@ pub fn render_workspace_card(
                     theme.bg_rail,
                 )
             })
-            .on_drop::<WorkspaceDragPayload>(move |payload: &WorkspaceDragPayload, window, cx| {
-                // Reorder-only: reject a drop from a different project group or
-                // onto the source row itself.
-                if payload.project_id != drop_project || payload.workspace_id == this_workspace_id {
-                    return;
-                }
-                on_reorder(payload.workspace_id.clone(), this_workspace_id.clone(), window, cx);
-            })
+            .on_drop::<WorkspaceDragPayload>(
+                move |payload: &WorkspaceDragPayload, window, cx| {
+                    // Reorder-only: reject a drop from a different project group or
+                    // onto the source row itself.
+                    if payload.project_id != drop_project
+                        || payload.workspace_id == this_workspace_id
+                    {
+                        return;
+                    }
+                    on_reorder(
+                        payload.workspace_id.clone(),
+                        this_workspace_id.clone(),
+                        window,
+                        cx,
+                    );
+                },
+            )
         });
 
     // Locate glow: the scroll-to-current affordance replays a one-shot
@@ -479,7 +493,7 @@ pub fn render_workspace_card(
     // a dedicated absolute overlay animates its border alpha to zero and
     // leaves no residue. seq == 0 means never triggered (and reduced
     // motion never bumps the seq).
-    let glow_overlay = (plan.row.is_active && locate_glow_seq > 0).then(|| {
+    let glow_overlay = (plan.row.is_active && active_shell && locate_glow_seq > 0).then(|| {
         let ring = theme.focus_ring;
         div()
             .absolute()
@@ -493,7 +507,12 @@ pub fn render_workspace_card(
                 ElementId::NamedInteger("locate-glow".into(), locate_glow_seq),
                 Animation::new(Duration::from_millis(LOCATE_GLOW_MS))
                     .with_easing(gpui::ease_out_quint()),
-                move |el, delta| el.border_color(Hsla { a: 1.0 - delta, ..ring }),
+                move |el, delta| {
+                    el.border_color(Hsla {
+                        a: 1.0 - delta,
+                        ..ring
+                    })
+                },
             )
     });
 

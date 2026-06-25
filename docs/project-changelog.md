@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-25 — Agents: hook-driven ambient tracking + rail repaint perf
+
+**Touches**: `crates/app/src/shell/ambient_agent_scan.rs` (new), `crates/app/src/shell/terminal_view.rs`, `crates/app/src/shell/session_merge.rs`, `crates/app/src/shell/left_rail/*`, `crates/app/src/shell/pane_group/mod.rs`, `crates/app/src/shell/project_panes/mod.rs`, `crates/app/src/shell/agent_session_persistence.rs`, `crates/app/src/shell/workspace_ops.rs`, `crates/app/src/workspace_root.rs`, `crates/agents/src/{osc_sideband,status_machine}.rs`
+
+Hand-launched agent CLIs in normal terminal tabs now participate in the same per-workspace agent list as spawned agent sessions, with the SAME stable, hook-driven status — not a flaky terminal-title heuristic.
+
+- **Hook-driven ambient detection.** A plain `TerminalView` now consumes the OSC-9999 status sideband the global hooks already emit onto its stream (`AmbientAgentScan`), giving a hand-typed `claude`/`codex` the same rich status (prompt title, live tool step, needs-approval, working/idle) as a spawned agent. The terminal-title heuristic is kept only as an immediate-presence fallback for an agent that has not yet fired a hook. Marker-gated so a plain shell pays one substring scan and no allocation.
+- **Status stability.** Sideband `Working` no longer decays to `Idle` from a stale/later plain-output timestamp (`StatusMachine::sideband_running`).
+- **Ambient rows show their prompt.** The hook prompt becomes each ambient row's title (the reference cockpit's primary per-agent distinguisher); it rides the compared ambient map, so a new prompt repaints the rail through the dirty-check.
+- **Rail repaint perf.** `set_sidebar_data` dirty-checks its render inputs and repaints only on a real change; the per-workspace agent merge (150+ rows) is cached and rebuilt only on a session/live-agent change — killing the per-output-byte whole-rail rebuild that caused hover/scroll jank.
+- **Active styling.** A multi-agent active workspace wraps the card and its agent rows in one container sharing the active surface fill; child hover fills are suppressed while active. Workspace summary label precedence matches status precedence (active tracked sessions stay authoritative).
+
+Gates: `cargo build -p oximux-app`; `cargo clippy -p oximux-app -p oximux-agents` (0 warnings); `cargo test -p oximux-app --lib` (1014 pass); `cargo test -p oximux-agents --lib` (279 pass). Live verify: run `OXIMUX_STATUS_HOOKS=1 RUST_LOG=oximux_app=debug,oximux_agents=debug cargo run -p oximux-app`, type `claude` in a plain terminal, prompt it, and watch for `ambient agent OSC-9999 sideband decoded` + the grouped rail row.
+
+---
+
 ### 2026-06-23 — Agents: fix NeedsApproval status detection (Notification hook)
 
 **Touches**: `crates/app/src/agent_status_hooks.rs`, `crates/app/src/main.rs`

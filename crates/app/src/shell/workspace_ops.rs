@@ -71,6 +71,19 @@ fn push_nav_entry(
     history.len() - 1
 }
 
+fn workspace_path_for_ambient_terminal(
+    terminal_path: &str,
+    workspaces_by_project: &HashMap<String, Vec<Workspace>>,
+) -> Option<String> {
+    let terminal_path = Path::new(terminal_path);
+    workspaces_by_project
+        .values()
+        .flat_map(|workspaces| workspaces.iter())
+        .filter(|workspace| terminal_path.starts_with(Path::new(&workspace.worktree_path)))
+        .max_by_key(|workspace| workspace.worktree_path.len())
+        .map(|workspace| workspace.worktree_path.clone())
+}
+
 /// Walk indices from `cursor` in the chosen direction, returning the first one
 /// for which `live(idx)` holds (skipping stale entries), or `None` at the
 /// boundary. Pure so the skip-stale traversal is unit-testable without GPUI.
@@ -1350,23 +1363,6 @@ impl WorkspaceRoot {
         for panes in self.project_panes_by_project.values() {
             live_worktrees.extend(panes.read(cx).live_worktree_paths(cx));
         }
-        // Ambient agent statuses inferred live from plain-terminal OSC titles
-        // (a hand-launched `claude`/`codex`/… with no tracked session). Keyed
-        // by worktree path; the card resolves these against the DB-backed
-        // status so a live hand-typed agent surfaces over a stale one. Strong-
-        // est reading per path wins when projects overlap on a worktree.
-        let mut ambient_status: HashMap<String, AmbientAgent> = HashMap::new();
-        for panes in self.project_panes_by_project.values() {
-            for (path, agent) in panes.read(cx).ambient_agent_statuses(cx) {
-                let replace = ambient_status.get(&path).is_none_or(|cur| {
-                    crate::shell::agent_presentation::ambient_status_rank(&agent.status)
-                        > crate::shell::agent_presentation::ambient_status_rank(&cur.status)
-                });
-                if replace {
-                    ambient_status.insert(path, agent);
-                }
-            }
-        }
         // Workspace rows + latest agent statuses come from the rail caches
         // (gathered on the background executor by `mark_rail_dirty`) —
         // render never touches SQLite or stats the filesystem.
@@ -1381,6 +1377,28 @@ impl WorkspaceRoot {
                     .unwrap_or_default(),
             );
         }
+        // Ambient agent statuses inferred live from plain-terminal OSC titles
+        // (a hand-launched `claude`/`codex`/… with no tracked session). Raw
+        // terminal cwd is normalized to the owning workspace root, so a shell
+        // that has `cd`'d into a subdirectory still groups under the worktree.
+        let mut ambient_status: HashMap<String, AmbientAgent> = HashMap::new();
+        for panes in self.project_panes_by_project.values() {
+            for (path, agent) in panes.read(cx).ambient_agent_statuses(cx) {
+                let Some(worktree_path) =
+                    workspace_path_for_ambient_terminal(&path, &workspaces_by_project)
+                else {
+                    continue;
+                };
+                let replace = ambient_status.get(&worktree_path).is_none_or(|cur| {
+                    crate::shell::agent_presentation::ambient_status_rank(&agent.status)
+                        > crate::shell::agent_presentation::ambient_status_rank(&cur.status)
+                });
+                if replace {
+                    ambient_status.insert(worktree_path, agent);
+                }
+            }
+        }
+        live_worktrees.extend(ambient_status.keys().cloned());
         let latest_status = self.rail_latest_status.clone();
         let latest_adapter = self.rail_latest_adapter.clone();
         let last_active = self.rail_last_active.clone();
@@ -1395,17 +1413,33 @@ impl WorkspaceRoot {
         // shared UUID; terminal history older than 24h is culled (live rows are
         // always kept). The single-row caches above are untouched, so the
         // collapsed dot is unchanged until the disclosure UI lands.
-        let now = chrono::Utc::now();
-        let history_cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
-        let now_rfc3339 = now.to_rfc3339();
-        let workspace_agents: WorkspaceAgentList =
-            crate::shell::session_merge::build_workspace_agent_lists(
+        // Rebuild the DB+live merge only when a session/live-agent changed; on a
+        // plain output frame reuse the cache so streaming doesn't rebuild 150+
+        // rows. The cheap maps above are still refreshed every frame, so live
+        // worktree/diff changes still surface via the rail dirty-check.
+        if self.rail_agents_dirty {
+            let now = chrono::Utc::now();
+            let history_cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
+            let now_rfc3339 = now.to_rfc3339();
+            self.rail_agents_cache = crate::shell::session_merge::build_workspace_agent_lists(
                 &workspaces_by_project,
                 &self.rail_workspace_sessions,
                 &self.live_agents,
                 Some(&history_cutoff),
                 &now_rfc3339,
             );
+            self.rail_agents_dirty = false;
+        }
+        // Ambient (plain-terminal) agents are cheap to detect and change with
+        // their hook status, so they are appended to a CLONE of the cached merge
+        // every frame; their detail rides the compared `ambient_status` map, so
+        // the rail dirty-check repaints when one changes.
+        let mut workspace_agents: WorkspaceAgentList = self.rail_agents_cache.clone();
+        crate::shell::session_merge::append_ambient_agent_rows(
+            &workspaces_by_project,
+            &ambient_status,
+            &mut workspace_agents,
+        );
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
                 projects,
@@ -1434,6 +1468,9 @@ impl WorkspaceRoot {
     /// and from the periodic diff tick (reconciliation net).
     pub(crate) fn mark_rail_dirty(&mut self, cx: &mut Context<Self>) {
         self.rail_dirty = true;
+        // A rail-dirty signal means a session/live-agent change too, so the
+        // cached agent merge must be rebuilt on the next render.
+        self.rail_agents_dirty = true;
         if self.rail_refresh_inflight {
             return;
         }
@@ -1465,6 +1502,8 @@ impl WorkspaceRoot {
                     this.rail_latest_adapter = adapters;
                     this.rail_last_active = last_active;
                     this.rail_workspace_sessions = sessions;
+                    // Fresh DB sessions landed — rebuild the cached agent merge.
+                    this.rail_agents_dirty = true;
                     cx.notify();
                     if this.rail_dirty {
                         true
@@ -2087,12 +2126,32 @@ impl WorkspaceRoot {
 
 #[cfg(test)]
 mod nav_history_tests {
-    use super::{WorkspaceNavRef, push_nav_entry};
+    use super::{WorkspaceNavRef, push_nav_entry, workspace_path_for_ambient_terminal};
+    use oximux_core::Workspace;
+    use std::collections::HashMap;
 
     fn r(id: &str) -> WorkspaceNavRef {
         WorkspaceNavRef {
             project_id: "p".to_string(),
             workspace_id: id.to_string(),
+        }
+    }
+
+    fn workspace(id: &str, path: &str) -> Workspace {
+        Workspace {
+            id: id.to_string(),
+            project_id: "p".to_string(),
+            name: id.to_string(),
+            slug: id.to_string(),
+            branch: "main".to_string(),
+            worktree_path: path.to_string(),
+            status: "active".to_string(),
+            created_at: "2026-06-24T00:00:00Z".to_string(),
+            archived_at: None,
+            linked_issue: None,
+            tint: None,
+            sort_order: 0.0,
+            pinned: false,
         }
     }
 
@@ -2156,6 +2215,26 @@ mod nav_history_tests {
         // Everything ahead is stale → no live target, no move.
         let none_live = |_: usize| false;
         assert_eq!(next_live_index(3, 2, false, none_live), None);
+    }
+
+    #[test]
+    fn ambient_terminal_path_resolves_to_deepest_workspace_root() {
+        let workspaces = HashMap::from([(
+            "p".to_string(),
+            vec![
+                workspace("main", "/repo"),
+                workspace("feature", "/repo/worktrees/feature"),
+            ],
+        )]);
+
+        assert_eq!(
+            workspace_path_for_ambient_terminal("/repo/worktrees/feature/src", &workspaces),
+            Some("/repo/worktrees/feature".to_string())
+        );
+        assert_eq!(
+            workspace_path_for_ambient_terminal("/outside", &workspaces),
+            None
+        );
     }
 }
 

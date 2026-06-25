@@ -6,16 +6,16 @@
 //! existing single dot on the row itself and render nothing here.
 //!
 //! The collapsed cluster is the headline visual — it renders with no
-//! interaction. Sub-rows are display-only in this slice; per-row focus is a
-//! follow-up. Status colors + verbs reuse `agent_presentation::agent_verb`,
-//! so the disclosure matches the tab badge and dashboard.
+//! interaction. Live sub-rows focus their backing agent or ambient terminal.
+//! Status colors + verbs reuse `agent_presentation::agent_verb`, so the
+//! disclosure matches the tab badge and dashboard.
 
 use gpui::prelude::*;
 use gpui::{Entity, Hsla, MouseButton, WeakEntity, div, px, svg};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agent_presentation::{adapter_icon_path, agent_verb};
-use crate::shell::left_rail::{LeftRail, RailAgentRow};
+use crate::shell::left_rail::{LeftRail, RailAgentRow, RailAgentTarget};
 use crate::workspace_root::WorkspaceRoot;
 
 /// Max status glyphs shown in the collapsed cluster before an "+N" overflow.
@@ -119,7 +119,7 @@ pub fn render_workspace_agent_disclosure(
         .pr(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .cursor_pointer()
-        .hover(|s| s.bg(theme.hover_overlay))
+        .when(!is_active, |s| s.hover(|s| s.bg(theme.hover_overlay)))
         .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
             rail.update(cx, |r, cx| {
                 r.toggle_workspace_expanded(&ws);
@@ -169,12 +169,20 @@ fn live_activity(row: &RailAgentRow) -> Option<String> {
     let snap = row.status_rx.as_ref()?.borrow();
     let detail = snap.detail.as_ref()?;
     let text = if let Some(tool) = detail.tool_name.as_deref().filter(|t| !t.is_empty()) {
-        match detail.tool_input_summary.as_deref().filter(|s| !s.is_empty()) {
+        match detail
+            .tool_input_summary
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             Some(input) => format!("{tool}: {input}"),
             None => tool.to_string(),
         }
     } else {
-        detail.last_message.as_deref().filter(|m| !m.is_empty())?.to_string()
+        detail
+            .last_message
+            .as_deref()
+            .filter(|m| !m.is_empty())?
+            .to_string()
     };
     Some(text)
 }
@@ -250,6 +258,7 @@ fn render_agent_sub_row(
     //   status verb (a row with no live detail at all)
     // The prompt leads and reads as primary text; the dot color carries the
     // status.
+    let is_ambient = matches!(row.target, RailAgentTarget::AmbientTerminal { .. });
     let (descriptor, descriptor_color) = match live_title(row) {
         Some(t) => (
             t.text,
@@ -259,6 +268,7 @@ fn render_agent_sub_row(
                 theme.fg_muted
             },
         ),
+        None if is_ambient => (format!("{} · {}", row.label, v.verb), v.verb_color),
         None => (v.verb.to_string(), v.verb_color),
     };
     // Active workspace → wrap the full descriptor; inactive → one ellipsised
@@ -275,14 +285,20 @@ fn render_agent_sub_row(
         // Keep the descriptor in a flex-row so a truncating line never collapses
         // to blank (a known flex-col text pitfall). `.truncate()` clips it to one
         // line with an ellipsis at the row width.
-        div().flex_1().min_w_0().flex().flex_row().items_center().child(
-            div()
-                .min_w_0()
-                .text_size(px(typography.t_body_sm))
-                .text_color(descriptor_color)
-                .truncate()
-                .child(truncate_chars(&descriptor, 48)),
-        )
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(descriptor_color)
+                    .truncate()
+                    .child(truncate_chars(&descriptor, 48)),
+            )
     };
     let mut base = div()
         .flex()
@@ -323,13 +339,19 @@ fn render_agent_sub_row(
                 .text_color(theme.fg_subtle)
                 .child(row.age_label.clone()),
         );
-    if row.is_live {
-        let db_id = row.db_id.clone();
+    if row.is_focusable() {
+        let target = row.target.clone();
         base.cursor_pointer()
-            .hover(|s| s.bg(theme.hover_overlay))
+            .when(!is_active, |s| s.hover(|s| s.bg(theme.hover_overlay)))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                let _ = weak_root
-                    .update(cx, |root, cx| root.focus_agent_by_db_id(&db_id, window, cx));
+                let _ = weak_root.update(cx, |root, cx| match &target {
+                    RailAgentTarget::AgentSession { db_id } => {
+                        root.focus_agent_by_db_id(db_id, window, cx);
+                    }
+                    RailAgentTarget::AmbientTerminal { worktree_path } => {
+                        root.focus_ambient_agent_terminal(worktree_path, window, cx);
+                    }
+                });
             })
     } else {
         base
@@ -350,6 +372,7 @@ mod tests {
     fn row(is_live: bool, db_status: AgentStatus, rx: Option<AgentStatusStream>) -> RailAgentRow {
         RailAgentRow {
             db_id: "id".into(),
+            target: RailAgentTarget::AgentSession { db_id: "id".into() },
             workspace_key: "ws".into(),
             adapter_id: "claude-code".into(),
             label: "Claude Code".into(),

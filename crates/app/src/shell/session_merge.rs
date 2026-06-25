@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::DateTime;
 use oximux_core::{AgentSession, AgentStatus, Workspace};
 
-use crate::shell::agent_presentation::adapter_display_name;
-use crate::shell::left_rail::{RailAgentRow, WorkspaceAgentList};
+use crate::shell::agent_presentation::{AmbientAgent, adapter_display_name, adapter_id_for_label};
+use crate::shell::left_rail::{RailAgentRow, RailAgentTarget, WorkspaceAgentList};
 use crate::shell::session_live_store::LiveAgentMap;
 
 /// Max agent rows kept per workspace (live + history). Newest win after the
@@ -85,6 +85,80 @@ pub fn build_workspace_agent_lists(
     out
 }
 
+/// Add live rows for agent CLIs detected inside plain terminal tabs. These
+/// rows are intentionally ephemeral: they do not write to `agent_sessions`,
+/// but they make hand-launched Claude/Codex/etc. participate in the same
+/// per-workspace list as spawned agents.
+pub fn append_ambient_agent_rows(
+    workspaces_by_project: &HashMap<String, Vec<Workspace>>,
+    ambient_by_path: &HashMap<String, AmbientAgent>,
+    workspace_agents: &mut WorkspaceAgentList,
+) {
+    for workspaces in workspaces_by_project.values() {
+        for ws in workspaces {
+            let Some(agent) = ambient_by_path.get(&ws.worktree_path) else {
+                continue;
+            };
+            let rows = workspace_agents.entry(ws.id.clone()).or_default();
+            if rows.iter().any(|r| {
+                matches!(
+                    &r.target,
+                    RailAgentTarget::AmbientTerminal { worktree_path }
+                        if worktree_path == &ws.worktree_path
+                )
+            }) {
+                continue;
+            }
+            let label = agent.label.unwrap_or("Agent");
+            // Surface the hook detail (the user's prompt, or the live tool step)
+            // as the row's title — the reference UX's primary per-agent distinguisher. The
+            // detail rides the compared `ambient_status` map, so a change
+            // repaints the rail through the dirty-check even though the row
+            // carries no live receiver.
+            let persisted_title = agent.detail.as_ref().and_then(ambient_title_from_detail);
+            rows.push(RailAgentRow {
+                db_id: format!("ambient:{}", ws.id),
+                target: RailAgentTarget::AmbientTerminal {
+                    worktree_path: ws.worktree_path.clone(),
+                },
+                workspace_key: ws.id.clone(),
+                adapter_id: adapter_id_for_label(label).to_string(),
+                label: label.into(),
+                is_live: true,
+                status_rx: None,
+                db_status: agent.status.clone(),
+                started_at: None,
+                ended_at: None,
+                age_label: "now".to_string(),
+                persisted_title,
+            });
+            sort_and_cap_rows(rows);
+        }
+    }
+}
+
+/// The headline string for an ambient agent row from its hook detail: the
+/// user's prompt when present, otherwise the live tool step (`"Edit: x.rs"`),
+/// otherwise the last free-form message. `None` when the detail is empty.
+fn ambient_title_from_detail(detail: &oximux_core::SidebandDetail) -> Option<String> {
+    if let Some(p) = detail.prompt.as_deref().filter(|p| !p.is_empty()) {
+        return Some(p.to_string());
+    }
+    if let Some(tool) = detail.tool_name.as_deref().filter(|t| !t.is_empty()) {
+        return Some(
+            match detail.tool_input_summary.as_deref().filter(|s| !s.is_empty()) {
+                Some(input) => format!("{tool}: {input}"),
+                None => tool.to_string(),
+            },
+        );
+    }
+    detail
+        .last_message
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
 /// Build the sorted agent list for one workspace.
 ///
 /// `db_sessions` is `list_for_workspace` output (all rows, `started_at`
@@ -116,6 +190,9 @@ pub fn merge_workspace_agents(
         }
         rows.push(RailAgentRow {
             db_id: s.id.clone(),
+            target: RailAgentTarget::AgentSession {
+                db_id: s.id.clone(),
+            },
             workspace_key: workspace_key.to_string(),
             adapter_id: s.adapter_id.clone(),
             label: live
@@ -143,6 +220,7 @@ pub fn merge_workspace_agents(
         if e.workspace_key == workspace_key && !db_ids.contains(id.as_str()) {
             rows.push(RailAgentRow {
                 db_id: id.clone(),
+                target: RailAgentTarget::AgentSession { db_id: id.clone() },
                 workspace_key: workspace_key.to_string(),
                 adapter_id: e.adapter_id.to_string(),
                 label: e.label.clone(),
@@ -160,13 +238,17 @@ pub fn merge_workspace_agents(
     }
 
     // 3. Live first, then most-recent launch first. Cap the tail.
+    sort_and_cap_rows(&mut rows);
+    rows
+}
+
+fn sort_and_cap_rows(rows: &mut Vec<RailAgentRow>) {
     rows.sort_by(|a, b| {
         b.is_live
             .cmp(&a.is_live)
             .then_with(|| b.started_at.cmp(&a.started_at))
     });
     rows.truncate(HISTORY_CAP);
-    rows
 }
 
 #[cfg(test)]
@@ -385,7 +467,10 @@ mod tests {
         let (_tx, rx) = live_rx(AgentStatus::Running);
         let mut live = LiveAgentMap::new();
         // Same UUID but a different workspace key — must not upgrade this row.
-        live.insert("a".into(), entry("primary:other", rx, "2026-06-23T10:00:00Z"));
+        live.insert(
+            "a".into(),
+            entry("primary:other", rx, "2026-06-23T10:00:00Z"),
+        );
 
         let rows = merge_workspace_agents(WS, &sessions, &live, None, NOW);
         assert_eq!(rows.len(), 1);
@@ -394,8 +479,7 @@ mod tests {
 
     #[test]
     fn build_lists_groups_by_workspace_and_omits_empty() {
-        let wbp =
-            HashMap::from([("proj-1".to_string(), vec![ws("ws-a"), ws("ws-empty")])]);
+        let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a"), ws("ws-empty")])]);
         let sessions = HashMap::from([(
             "ws-a".to_string(),
             vec![db(
@@ -410,5 +494,40 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("ws-a").map(Vec::len), Some(1));
         assert!(!out.contains_key("ws-empty"));
+    }
+
+    #[test]
+    fn ambient_terminal_agent_is_added_as_live_workspace_row() {
+        let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a")])]);
+        let mut out =
+            build_workspace_agent_lists(&wbp, &HashMap::new(), &LiveAgentMap::new(), None, NOW);
+        let ambient = HashMap::from([(
+            "/tmp".to_string(),
+            AmbientAgent {
+                status: AgentStatus::Running,
+                label: Some("Claude Code"),
+                detail: Some(oximux_core::SidebandDetail {
+                    prompt: Some("fix the parser".to_string()),
+                    ..Default::default()
+                }),
+            },
+        )]);
+
+        append_ambient_agent_rows(&wbp, &ambient, &mut out);
+
+        let rows = out.get("ws-a").expect("ambient row creates list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].db_id, "ambient:ws-a");
+        assert_eq!(rows[0].adapter_id, "claude-code");
+        // The hook prompt becomes the row's title (the reference UX's distinguisher).
+        assert_eq!(rows[0].persisted_title.as_deref(), Some("fix the parser"));
+        assert_eq!(rows[0].effective_status(), AgentStatus::Running);
+        assert!(rows[0].is_focusable());
+        assert_eq!(
+            rows[0].target,
+            RailAgentTarget::AmbientTerminal {
+                worktree_path: "/tmp".to_string(),
+            }
+        );
     }
 }

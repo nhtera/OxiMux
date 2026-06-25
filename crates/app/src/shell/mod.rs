@@ -6,6 +6,7 @@
 pub mod adapter_picker;
 pub mod agent_presentation;
 pub mod agent_session_persistence;
+pub mod ambient_agent_scan;
 pub mod agents_dashboard;
 pub mod add_project_dialog;
 pub mod agent_status_badge;

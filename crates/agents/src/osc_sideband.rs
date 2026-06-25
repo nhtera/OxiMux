@@ -123,6 +123,13 @@ impl AgentOscScanner {
         }
     }
 
+    /// True while a sideband sequence is mid-parse (a payload split across two
+    /// PTY reads). A caller that gates `feed` on a fresh marker must still feed
+    /// the next chunk while this holds, or it would drop the sequence's tail.
+    pub fn is_active(&self) -> bool {
+        self.state != State::Normal
+    }
+
     /// Feed one PTY output chunk. Returns the OSC-9999-stripped bytes plus
     /// the latest decoded sideband event (if a sequence completed here).
     pub fn feed<'a>(&mut self, bytes: &'a [u8]) -> ScanOutput<'a> {

@@ -681,7 +681,8 @@ impl ProjectPanes {
         let Some(frac) = crate::shell::divider::fraction_along(&active, pos) else {
             return false;
         };
-        let new_weights = render::redistribute_weights(&active.initial_weights, active.divider_idx, frac);
+        let new_weights =
+            render::redistribute_weights(&active.initial_weights, active.divider_idx, frac);
         self.set_split_weights(&active.split_path, new_weights, cx)
     }
 
@@ -810,17 +811,12 @@ impl ProjectPanes {
             // Prefer the last terminal group in DFS order so a freshly-split
             // pane ends up at the bottom (matches the "dock newest terminal"
             // expectation).
-            let existing = self
-                .manager
-                .in_order_groups()
-                .into_iter()
-                .rev()
-                .find(|id| {
-                    self.groups
-                        .get(id)
-                        .map(|g| g.read(cx).tty_count() > 0)
-                        .unwrap_or(false)
-                });
+            let existing = self.manager.in_order_groups().into_iter().rev().find(|id| {
+                self.groups
+                    .get(id)
+                    .map(|g| g.read(cx).tty_count() > 0)
+                    .unwrap_or(false)
+            });
             match existing {
                 Some(id) => Some(id),
                 // No terminal group exists yet — spawn one. `split_active_group`
@@ -966,6 +962,50 @@ impl ProjectPanes {
                 .map(|idx| (*id, idx))
         });
         let Some((id, idx)) = existing else {
+            return false;
+        };
+        self.set_active_group(id, window, cx);
+        if let Some(group) = self.groups.get(&id).cloned() {
+            group.update(cx, |g, cx| g.set_active(idx, window, cx));
+        }
+        true
+    }
+
+    /// Whether any group contains a plain terminal in `worktree_path` whose
+    /// title currently classifies as an agent.
+    pub fn has_ambient_agent_terminal(
+        &self,
+        worktree_path: &std::path::Path,
+        cx: &gpui::App,
+    ) -> bool {
+        self.groups.values().any(|group| {
+            group
+                .read(cx)
+                .ambient_agent_terminal_tab_candidate(worktree_path, cx)
+                .is_some()
+        })
+    }
+
+    /// Activate the best plain terminal tab advertising an agent title in
+    /// `worktree_path`. This is the ambient-terminal counterpart of
+    /// `focus_agent_session`.
+    pub fn focus_ambient_agent_terminal(
+        &mut self,
+        worktree_path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let existing: Option<(PaneGroupId, usize, u8)> = self
+            .groups
+            .iter()
+            .filter_map(|(id, group)| {
+                group
+                    .read(cx)
+                    .ambient_agent_terminal_tab_candidate(worktree_path, cx)
+                    .map(|(idx, rank)| (*id, idx, rank))
+            })
+            .max_by_key(|(_, _, rank)| *rank);
+        let Some((id, idx, _)) = existing else {
             return false;
         };
         self.set_active_group(id, window, cx);
@@ -1377,7 +1417,13 @@ impl ProjectPanes {
                             } else {
                                 (url.clone(), None)
                             };
-                        (None, PersistedTabKind::Browser { url: live, profile_id })
+                        (
+                            None,
+                            PersistedTabKind::Browser {
+                                url: live,
+                                profile_id,
+                            },
+                        )
                     }
                     PaneGroupTabKind::Agent {
                         adapter,
@@ -1395,11 +1441,14 @@ impl ProjectPanes {
                         // still-running CLI instead of respawning it. Paired
                         // with the current relay session id — restore only
                         // re-attaches when both still match.
-                        let relay_external_id = if let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content {
-                            tree.active_view().and_then(|v| v.read(cx).external_id())
-                        } else {
-                            None
-                        };
+                        let relay_external_id =
+                            if let crate::shell::pane_content::PaneContent::Terminal(tree) =
+                                &tab.content
+                            {
+                                tree.active_view().and_then(|v| v.read(cx).external_id())
+                            } else {
+                                None
+                            };
                         let relay_session = relay_external_id.as_ref().and_then(|_| {
                             crate::shell::terminal_view::relay_state_snapshot().session_id
                         });

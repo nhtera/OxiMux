@@ -24,12 +24,12 @@ use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
     Subscription, Task, Window, px,
 };
-use std::rc::Rc;
 use oximux_agents::{
     AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend, agent_label_from_title,
     classify_agent_title,
 };
 use oximux_core::{AgentAdapter, AgentSessionId};
+use std::rc::Rc;
 
 use crate::shell::agent_presentation::AmbientAgent;
 use oximux_pty::TerminalSessionId;
@@ -38,15 +38,16 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::actions::{
     CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewBrowserTab, NewTab, NextTab,
     PrevTab, RequestOpenAdapterPicker, Search, SendTextToActiveAgent, SplitSubPaneDown,
-    SplitSubPaneRight,
-    ToggleZoomSubPane,
+    SplitSubPaneRight, ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
-use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt, ConfirmSecondary};
-use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
+use crate::shell::confirm_dialog::{
+    ConfirmCallback, ConfirmDialog, ConfirmPrompt, ConfirmSecondary,
+};
 use crate::shell::context_env::SurfaceIds;
+use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::{Axis, SplitInsert};
@@ -382,6 +383,15 @@ pub struct MruSwitcher {
     pub cursor: usize,
 }
 
+fn terminal_view_cwd(
+    view: &crate::shell::terminal_view::TerminalView,
+    fallback: &std::path::Path,
+) -> PathBuf {
+    view.cwd_hint()
+        .or_else(|| view.os_pid().and_then(crate::shell::cwd_resolver::cwd_of_pid))
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
 impl PaneGroup {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -545,8 +555,12 @@ impl PaneGroup {
             tab.color = meta.color;
             tab.custom_title = meta.custom_title;
         }
-        self.tab_order
-            .sort_by_key(|&i| self.tabs.get(i).and_then(|t| t.restore_rank).unwrap_or(usize::MAX));
+        self.tab_order.sort_by_key(|&i| {
+            self.tabs
+                .get(i)
+                .and_then(|t| t.restore_rank)
+                .unwrap_or(usize::MAX)
+        });
         debug_assert_eq!(self.tabs.len(), self.tab_order.len());
         cx.notify();
     }
@@ -753,8 +767,8 @@ impl PaneGroup {
     /// Agent statuses inferred live from the OSC titles of *plain* terminal
     /// tabs — a hand-launched agent CLI (typed `claude`/`codex`/… into a
     /// terminal) the spawn machinery never minted a tracked session for.
-    /// Keyed by the group's `cwd` (the path plain terminals run at, matching
-    /// [`live_worktree_paths`]). `Agent`-kind tabs are excluded: their
+    /// Keyed by each terminal view's current cwd when known, falling back to
+    /// the group's `cwd`. `Agent`-kind tabs are excluded: their
     /// `StatusMachine` is authoritative and already feeds the sidebar.
     ///
     /// Multiple views in one tab can each classify; the strongest reading
@@ -763,7 +777,9 @@ impl PaneGroup {
     /// display name when recognizable.
     pub fn ambient_agent_statuses(&self, cx: &gpui::App) -> Vec<(PathBuf, AmbientAgent)> {
         use crate::shell::agent_presentation::ambient_status_rank;
-        let mut best: Option<AmbientAgent> = None;
+        let now = std::time::Instant::now();
+        let mut by_path: std::collections::HashMap<PathBuf, AmbientAgent> =
+            std::collections::HashMap::new();
         for tab in &self.tabs {
             if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
                 continue;
@@ -773,27 +789,50 @@ impl PaneGroup {
             };
             for (_, _, view) in tree.iter_all_views() {
                 let view = view.read(cx);
-                let Some(title) = view.title() else { continue };
-                let Some(status) = classify_agent_title(title) else {
+                let title = view.title();
+                let title_status = title.and_then(classify_agent_title);
+                // Hook sideband (rich + stable) is preferred; the title is the
+                // immediate-presence fallback for an agent that has not yet
+                // emitted a hook. Neither → not an agent.
+                let Some(agent) = (match view.ambient_agent(now) {
+                    Some(sb) => Some(AmbientAgent {
+                        status: sb.status,
+                        // The hook tells us the state, not the CLI; the title
+                        // names it when set, otherwise default to the only CLI
+                        // we install global hooks for.
+                        label: title.and_then(agent_label_from_title).or(Some("Claude Code")),
+                        detail: Some(sb.detail),
+                    }),
+                    None => title_status.map(|status| AmbientAgent {
+                        status,
+                        label: title.and_then(agent_label_from_title),
+                        detail: None,
+                    }),
+                }) else {
                     continue;
                 };
-                let label = agent_label_from_title(title);
-                if best
-                    .as_ref()
-                    .is_none_or(|cur| ambient_status_rank(&status) > ambient_status_rank(&cur.status))
-                {
-                    best = Some(AmbientAgent { status, label });
+                let path = terminal_view_cwd(view, &self.cwd);
+                let better = by_path.get(&path).is_none_or(|cur| {
+                    let rank = ambient_status_rank(&agent.status);
+                    let cur_rank = ambient_status_rank(&cur.status);
+                    // Higher attention wins; on a tie the hook-backed reading
+                    // (has detail) beats a title-only one.
+                    rank > cur_rank
+                        || (rank == cur_rank && agent.detail.is_some() && cur.detail.is_none())
+                });
+                if better {
+                    by_path.insert(path, agent);
                 }
             }
         }
-        best.map(|agent| vec![(self.cwd.clone(), agent)])
-            .unwrap_or_default()
+        by_path.into_iter().collect()
     }
 
     /// Count of plain-terminal tabs running a recognizable agent (any view's
     /// title classifies). Feeds the status-bar "N agents" total alongside
     /// spawned `Agent` tabs, so a hand-launched agent registers there too.
     pub fn ambient_agent_count(&self, cx: &gpui::App) -> usize {
+        let now = std::time::Instant::now();
         self.tabs
             .iter()
             .filter(|tab| matches!(tab.kind, PaneGroupTabKind::Terminal))
@@ -802,10 +841,9 @@ impl PaneGroup {
                     return false;
                 };
                 tree.iter_all_views().any(|(_, _, view)| {
-                    view.read(cx)
-                        .title()
-                        .and_then(classify_agent_title)
-                        .is_some()
+                    let view = view.read(cx);
+                    view.ambient_agent(now).is_some()
+                        || view.title().and_then(classify_agent_title).is_some()
                 })
             })
             .count()
@@ -891,6 +929,48 @@ impl PaneGroup {
         self.tabs.iter().position(|t| {
             matches!(&t.kind, PaneGroupTabKind::Agent { worktree_path, .. } if worktree_path == path)
         })
+    }
+
+    /// Index of a plain terminal tab currently running a recognizable agent
+    /// (hook sideband or title). When several terminal tabs classify, focus the
+    /// most attention-worthy one (approval > running > idle), matching the
+    /// sidebar status aggregation rule.
+    pub fn ambient_agent_terminal_tab_candidate(
+        &self,
+        worktree_path: &std::path::Path,
+        cx: &gpui::App,
+    ) -> Option<(usize, u8)> {
+        use crate::shell::agent_presentation::ambient_status_rank;
+        let now = std::time::Instant::now();
+
+        let mut best: Option<(usize, u8)> = None;
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
+                continue;
+            }
+            let PaneContent::Terminal(tree) = &tab.content else {
+                continue;
+            };
+            let tab_rank = tree
+                .iter_all_views()
+                .filter_map(|(_, _, view)| {
+                    let view = view.read(cx);
+                    if !terminal_view_cwd(view, &self.cwd).starts_with(worktree_path) {
+                        return None;
+                    }
+                    let status = view
+                        .ambient_agent(now)
+                        .map(|sb| sb.status)
+                        .or_else(|| view.title().and_then(classify_agent_title))?;
+                    Some(ambient_status_rank(&status))
+                })
+                .max()
+                .unwrap_or(0);
+            if tab_rank > best.map(|(_, rank)| rank).unwrap_or(0) {
+                best = Some((idx, tab_rank));
+            }
+        }
+        best
     }
 
     /// Index of the agent tab driving `session_id`, if this group holds it.
@@ -1595,9 +1675,11 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        if let Some(idx) = self.tabs.iter().position(|t| {
-            matches!(&t.kind, PaneGroupTabKind::Commit { sha: s } if s == &sha)
-        }) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::Commit { sha: s } if s == &sha))
+        {
             self.set_active(idx, window, cx);
             return idx;
         }
@@ -1622,7 +1704,11 @@ impl PaneGroup {
         // message.
         let label = {
             let subject_trim: String = subject.chars().take(50).collect();
-            let suffix = if subject.chars().count() > 50 { "…" } else { "" };
+            let suffix = if subject.chars().count() > 50 {
+                "…"
+            } else {
+                ""
+            };
             SharedString::from(format!("{short_oid}: {subject_trim}{suffix}"))
         };
         let tab = PaneGroupTab {
@@ -1662,9 +1748,11 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        if let Some(idx) = self.tabs.iter().position(|t| {
-            matches!(&t.kind, PaneGroupTabKind::BranchFile { path: p } if p == &path)
-        }) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::BranchFile { path: p } if p == &path))
+        {
             self.set_active(idx, window, cx);
             return idx;
         }
@@ -2100,18 +2188,17 @@ impl PaneGroup {
 
         // Drop the dialog the moment the user resolves it. Replacing the
         // observer cancels any stale one.
-        self._dirty_close_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |group, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    group.dirty_close_dialog = None;
-                    group._dirty_close_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
+        self._dirty_close_observer =
+            Some(
+                cx.observe_in(&dialog, window, |group, dialog, _window, cx| {
+                    let d = dialog.read(cx);
+                    if d.is_confirmed() || d.is_cancelled() {
+                        group.dirty_close_dialog = None;
+                        group._dirty_close_observer = None;
+                        cx.notify();
+                    }
+                }),
+            );
         self.dirty_close_dialog = Some(dialog);
         cx.notify();
     }
@@ -2522,7 +2609,6 @@ impl PaneGroup {
         cx.notify();
     }
 
-
     pub(crate) fn on_close_tab(
         &mut self,
         _: &CloseTab,
@@ -2722,7 +2808,9 @@ impl PaneGroup {
         let density = self.density;
         let typography = self.typography.clone();
         let composer = cx.new(|cx| {
-            crate::shell::compose_bar::ComposerBar::new(root, theme, density, typography, window, cx)
+            crate::shell::compose_bar::ComposerBar::new(
+                root, theme, density, typography, window, cx,
+            )
         });
         let sub = cx.subscribe_in(
             &composer,

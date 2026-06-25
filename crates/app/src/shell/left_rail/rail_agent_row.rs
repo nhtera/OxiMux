@@ -10,12 +10,24 @@ use gpui::SharedString;
 use oximux_agents::AgentStatusStream;
 use oximux_core::AgentStatus;
 
+/// What a clickable rail row should focus. Tracked agent sessions focus by
+/// their DB UUID → runtime session mapping; ambient terminal agents focus by
+/// the worktree terminal that is currently advertising an agent title.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RailAgentTarget {
+    AgentSession { db_id: String },
+    AmbientTerminal { worktree_path: String },
+}
+
 /// One agent in a workspace's rail list — a live session, a finished
 /// history row, or a live session whose DB insert hasn't landed yet.
 #[derive(Clone)]
 pub struct RailAgentRow {
-    /// `agent_sessions.id` UUID — the unified key across live + history.
+    /// Stable row key. For tracked sessions this is `agent_sessions.id`; for
+    /// ambient terminal agents this is a synthetic `ambient:<workspace>` key.
     pub db_id: String,
+    /// Focus target for live tracked rows and ambient terminal rows.
+    pub target: RailAgentTarget,
     /// Owning workspace key (`workspaces.id` or `primary:<project_id>`).
     pub workspace_key: String,
     /// Adapter slug (`claude-code`, `codex`, …).
@@ -52,6 +64,11 @@ impl RailAgentRow {
             Some(rx) => rx.borrow().status.clone(),
             None => self.db_status.clone(),
         }
+    }
+
+    /// Whether this row currently has a live pane/tab to focus.
+    pub fn is_focusable(&self) -> bool {
+        self.is_live || matches!(self.target, RailAgentTarget::AmbientTerminal { .. })
     }
 }
 

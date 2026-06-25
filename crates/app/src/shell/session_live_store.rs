@@ -81,7 +81,12 @@ impl WorkspaceRoot {
         let owner = self
             .project_panes_by_project
             .iter()
-            .find_map(|(pid, panes)| panes.read(cx).has_agent_session(session_id, cx).then(|| pid.clone()));
+            .find_map(|(pid, panes)| {
+                panes
+                    .read(cx)
+                    .has_agent_session(session_id, cx)
+                    .then(|| pid.clone())
+            });
         let Some(project_id) = owner else {
             return;
         };
@@ -100,6 +105,47 @@ impl WorkspaceRoot {
         if let Some(panes) = self.active_project_panes() {
             panes.update(cx, |p, cx| {
                 p.focus_agent_session(session_id, window, cx);
+            });
+        }
+    }
+
+    /// Focus a hand-launched agent detected from a plain terminal title. The
+    /// row is keyed by worktree path rather than DB session id because no
+    /// tracked `agent_sessions` row exists for ambient terminal agents.
+    pub(crate) fn focus_ambient_agent_terminal(
+        &mut self,
+        worktree_path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let worktree_path = std::path::PathBuf::from(worktree_path);
+        let owner = self
+            .project_panes_by_project
+            .iter()
+            .find_map(|(pid, panes)| {
+                panes
+                    .read(cx)
+                    .has_ambient_agent_terminal(&worktree_path, cx)
+                    .then(|| pid.clone())
+            });
+        let Some(project_id) = owner else {
+            return;
+        };
+        if self.active_project.as_ref().map(|p| p.id.as_str()) != Some(project_id.as_str()) {
+            match self
+                .app_state
+                .recent_projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            {
+                Some(project) => self.set_active_project(project, window, cx),
+                None => return,
+            }
+        }
+        if let Some(panes) = self.active_project_panes() {
+            panes.update(cx, |p, cx| {
+                p.focus_ambient_agent_terminal(&worktree_path, window, cx);
             });
         }
     }
@@ -133,7 +179,10 @@ mod tests {
         // mirrored copy — the contract the Phase 2 rail render relies on.
         tx.send(AgentSnapshot::from_status(AgentStatus::Running))
             .unwrap();
-        assert_eq!(map["uuid-1"].status_rx.borrow().status, AgentStatus::Running);
+        assert_eq!(
+            map["uuid-1"].status_rx.borrow().status,
+            AgentStatus::Running
+        );
 
         // Removal is keyed by the same UUID.
         assert!(map.remove("uuid-1").is_some());

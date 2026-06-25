@@ -402,21 +402,9 @@ fn detect_tab_agent(tab: &PaneGroupTab, cx: &App) -> Option<TabAgent> {
     let label = oximux_agents::agent_label_from_title(title)?;
     Some(TabAgent {
         label,
-        adapter_id: adapter_slug_for_label(label),
+        adapter_id: crate::shell::agent_presentation::adapter_id_for_label(label),
         status,
     })
-}
-
-/// Map an agent display name to its registry adapter slug so the tab chip
-/// renders the right brand glyph. Names without a dedicated icon map to `""`
-/// (terminal-glyph fallback in `agent_icon`).
-fn adapter_slug_for_label(label: &str) -> &'static str {
-    match label {
-        "Claude Code" => "claude-code",
-        "Codex" => "codex",
-        "Aider" => "aider",
-        _ => "",
-    }
 }
 
 fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {

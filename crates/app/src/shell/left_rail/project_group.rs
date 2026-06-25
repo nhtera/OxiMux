@@ -151,22 +151,30 @@ pub fn render_project_group(
         // overrides a stale/absent one (see `resolve_effective_status`).
         let tracked = latest_status_for(&workspace.id);
         let tracked_present = tracked.is_some();
+        let tracked_is_active = matches!(
+            tracked.as_ref(),
+            Some(AgentStatus::Running)
+                | Some(AgentStatus::WaitingForInput)
+                | Some(AgentStatus::NeedsApproval(_))
+        );
         let ambient = ambient_by_path.get(&workspace.worktree_path);
         let latest = crate::shell::agent_presentation::resolve_effective_status(
             tracked,
             ambient.map(|a| a.status.clone()),
         );
-        // Agent display name: a hand-launched agent's name (from its title)
-        // wins; otherwise a tracked session contributes its adapter name.
-        // `None` leaves the card showing only the status verb.
-        let agent_name: Option<SharedString> = ambient
-            .and_then(|a| a.label)
-            .or_else(|| {
+        // Agent display name follows the same precedence as status: an active
+        // tracked session stays authoritative; otherwise an ambient terminal's
+        // title can surface over stale DB history.
+        let agent_name: Option<SharedString> = if tracked_is_active {
+            latest_adapter_for(&workspace.id)
+        } else {
+            ambient.and_then(|a| a.label).or_else(|| {
                 tracked_present
                     .then(|| latest_adapter_for(&workspace.id))
                     .flatten()
             })
-            .map(SharedString::new_static);
+        }
+        .map(SharedString::new_static);
         // Diff counts are looked up from the pushed-down cache; `None` means
         // not yet available — the card renders without the chip.
         let diff = diff_counts.get(&workspace.worktree_path).cloned();
@@ -226,8 +234,9 @@ pub fn render_project_group(
                     return;
                 }
                 let workspace = workspace_for_row.clone();
-                let _ = weak_root_for_row
-                    .update(cx, |root, cx| root.activate_workspace(workspace, window, cx));
+                let _ = weak_root_for_row.update(cx, |root, cx| {
+                    root.activate_workspace(workspace, window, cx)
+                });
             };
 
         // Inline-rename wiring for non-primary rows: carries the rail entity +
@@ -236,7 +245,11 @@ pub fn render_project_group(
         let rename_config = (!is_primary).then(|| RowRenameConfig {
             rail: rail.clone(),
             workspace: workspace.clone(),
-            active_input: if is_renaming { rename_input.clone() } else { None },
+            active_input: if is_renaming {
+                rename_input.clone()
+            } else {
+                None
+            },
         });
 
         // Drag-to-reorder is offered only for non-primary rows while the rail
@@ -251,29 +264,44 @@ pub fn render_project_group(
             && sort_mode == WorkspaceSortMode::Manual
             && !is_renaming)
             .then(|| {
-            let weak_root_for_reorder = weak_root.clone();
-            let project_id_for_reorder = project.id.clone();
-            crate::shell::left_rail::project_drag::WorkspaceDragConfig {
-                workspace_id: workspace.id.clone(),
-                project_id: project.id.clone(),
-                src_index: row_index,
-                accent: theme.selection,
-                ghost_label: workspace.name.clone().into(),
-                on_reorder: std::rc::Rc::new(
-                    move |moved_id: String, target_id: String, window: &mut gpui::Window, cx: &mut gpui::App| {
-                        let project_id = project_id_for_reorder.clone();
-                        let _ = weak_root_for_reorder.update(cx, |root, cx| {
-                            root.reorder_workspace(moved_id, target_id, project_id, window, cx);
-                        });
-                    },
-                ),
-            }
-        });
+                let weak_root_for_reorder = weak_root.clone();
+                let project_id_for_reorder = project.id.clone();
+                crate::shell::left_rail::project_drag::WorkspaceDragConfig {
+                    workspace_id: workspace.id.clone(),
+                    project_id: project.id.clone(),
+                    src_index: row_index,
+                    accent: theme.selection,
+                    ghost_label: workspace.name.clone().into(),
+                    on_reorder: std::rc::Rc::new(
+                        move |moved_id: String,
+                              target_id: String,
+                              window: &mut gpui::Window,
+                              cx: &mut gpui::App| {
+                            let project_id = project_id_for_reorder.clone();
+                            let _ = weak_root_for_reorder.update(cx, |root, cx| {
+                                root.reorder_workspace(moved_id, target_id, project_id, window, cx);
+                            });
+                        },
+                    ),
+                }
+            });
 
-        col = col.child(render_workspace_card(
+        let agent_rows = workspace_agents.get(&workspace.id);
+        let active_agent_wrap = is_active && agent_rows.is_some_and(|rows| rows.len() > 1);
+        // The active surface fill, reused for the wrap container so a
+        // multi-agent active workspace reads as ONE highlighted block (card +
+        // its agent rows) — matching the single-agent active card exactly.
+        let active_surface_bg = card_plan.row.bg;
+
+        let mut workspace_block = div().flex().flex_col();
+        if !active_agent_wrap {
+            workspace_block = workspace_block.w_full();
+        }
+        workspace_block = workspace_block.child(render_workspace_card(
             card_plan,
             row_id,
             row_group,
+            !active_agent_wrap,
             !is_primary,
             locate_glow_seq,
             drag_config,
@@ -287,11 +315,11 @@ pub fn render_project_group(
 
         // Multi-agent disclosure: only when a workspace has more than one
         // agent. A single-agent workspace keeps the row's own status dot.
-        if let Some(rows) = workspace_agents.get(&workspace.id)
+        if let Some(rows) = agent_rows
             && rows.len() > 1
         {
             let is_expanded = expanded_workspaces.contains(&workspace.id);
-            col = col.child(
+            workspace_block = workspace_block.child(
                 crate::shell::left_rail::workspace_agent_rows::render_workspace_agent_disclosure(
                     &workspace.id,
                     rows,
@@ -305,6 +333,17 @@ pub fn render_project_group(
                 ),
             );
         }
+
+        if active_agent_wrap {
+            workspace_block = workspace_block
+                .ml(px(density.gap_inline))
+                .rounded(px(density.r_card))
+                .border_1()
+                .border_color(theme.border_inactive)
+                .bg(active_surface_bg);
+        }
+
+        col = col.child(workspace_block);
     }
 
     col
@@ -533,20 +572,22 @@ fn build_header(
         })
         .on_click(move |_ev, window, cx| {
             let id = project_id_for_toggle.clone();
-            rail_for_toggle
-                .update(cx, |r, cx| r.toggle_collapsed(id, window, cx));
+            rail_for_toggle.update(cx, |r, cx| r.toggle_collapsed(id, window, cx));
         })
-        .on_mouse_down(MouseButton::Right, move |ev: &MouseDownEvent, window, cx| {
-            cx.stop_propagation();
-            let pos = ev.position;
-            on_project_menu_ctx(
-                project_for_ctx.clone(),
-                f32::from(pos.x),
-                f32::from(pos.y),
-                window,
-                cx,
-            );
-        })
+        .on_mouse_down(
+            MouseButton::Right,
+            move |ev: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                let pos = ev.position;
+                on_project_menu_ctx(
+                    project_for_ctx.clone(),
+                    f32::from(pos.x),
+                    f32::from(pos.y),
+                    window,
+                    cx,
+                );
+            },
+        )
         .on_drag(drag_payload, move |_p, _offset, _window, cx| {
             cx.new(|_| SidebarDragPreview::new(ghost_label.clone(), theme))
         })

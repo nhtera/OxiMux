@@ -131,9 +131,13 @@ pub(crate) fn spawn_for_session(
             let snap = status_rx.borrow_and_update();
             (snap.status.clone(), snap.detail.clone())
         };
-        persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
+        let title_changed =
+            persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
         let _ = weak.update(cx, |this, cx| {
             this.note_agent_sideband(&ws_key, &current, detail, cx);
+            if title_changed {
+                this.mark_rail_dirty(cx);
+            }
         });
         if current != last {
             last = current.clone();
@@ -163,12 +167,18 @@ pub(crate) fn spawn_for_session(
                 let snap = status_rx.borrow_and_update();
                 (snap.status.clone(), snap.detail.clone())
             };
-            persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
+            let title_changed =
+                persist_title_if_changed(&agent_repo, &row_id, &detail, &mut last_title, cx).await;
             // The live tool subline can change WITHOUT a status edge (Bash →
             // Edit while still Running), so refresh it every tick — not only
             // when the status itself changes.
             let _ = weak.update(cx, |this, cx| {
                 this.note_agent_sideband(&ws_key, &status, detail, cx);
+                // A new prompt mid-Running has no status edge; nudge the rail so
+                // the title updates even when the status itself stays put.
+                if title_changed {
+                    this.mark_rail_dirty(cx);
+                }
             });
             if status == last {
                 continue;
@@ -194,13 +204,16 @@ pub(crate) fn spawn_for_session(
 /// every snapshot once captured, so this would otherwise write every tick. A
 /// blank/absent prompt is ignored (keeps the prior title). Best-effort: a write
 /// failure is logged, never propagated.
+///
+/// Returns `true` when a new title was written, so the caller can repaint the
+/// rail — a fresh prompt with no status edge would otherwise not refresh it.
 async fn persist_title_if_changed(
     repo: &oximux_storage::AgentSessionRepo,
     row_id: &str,
     detail: &Option<oximux_core::SidebandDetail>,
     last_title: &mut Option<String>,
     cx: &gpui::AsyncApp,
-) {
+) -> bool {
     let Some(title) = detail
         .as_ref()
         .and_then(|d| d.prompt.as_ref())
@@ -208,10 +221,10 @@ async fn persist_title_if_changed(
         .filter(|p| !p.is_empty())
         .map(str::to_string)
     else {
-        return;
+        return false;
     };
     if last_title.as_deref() == Some(title.as_str()) {
-        return;
+        return false;
     }
     *last_title = Some(title.clone());
     let repo = repo.clone();
@@ -223,6 +236,7 @@ async fn persist_title_if_changed(
             }
         })
         .await;
+    true
 }
 
 /// Write one status to the row (+ `ended_at` when terminal) on the

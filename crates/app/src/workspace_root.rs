@@ -383,6 +383,15 @@ pub struct WorkspaceRoot {
     /// Guards against overlapping rail gathers (the gather re-runs itself
     /// while `rail_dirty` keeps getting re-set).
     pub(crate) rail_refresh_inflight: bool,
+    /// Cached per-workspace agent lists. `refresh_left_rail` runs every frame
+    /// (WorkspaceRoot re-renders on every agent-output tick via the panes
+    /// observer), and rebuilding 150+ rows each time is the streaming jank.
+    /// Recomputed only when `rail_agents_dirty` flips — a session or live-agent
+    /// change — not on raw terminal output. The cheap per-frame ambient rows are
+    /// appended to a clone of this after the rebuild gate.
+    pub(crate) rail_agents_cache: crate::shell::left_rail::WorkspaceAgentList,
+    /// Marks `rail_agents_cache` stale (session/live-agent change).
+    pub(crate) rail_agents_dirty: bool,
     /// `true` while the window is active. The periodic diff refresh only runs
     /// when focused so an inactive window does not churn `git` in the
     /// background (mirrors the SCM status poller's pause-on-blur behavior).
@@ -1051,6 +1060,8 @@ impl WorkspaceRoot {
             usage_popover_window: None,
             rail_dirty: false,
             rail_refresh_inflight: false,
+            rail_agents_cache: HashMap::new(),
+            rail_agents_dirty: true,
             diff_refresh_focused: true,
             diff_refresh_in_flight: false,
             _diff_refresh_task: diff_refresh_task,
