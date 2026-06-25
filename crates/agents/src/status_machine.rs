@@ -46,6 +46,16 @@ pub struct StatusMachine {
     current: AgentStatus,
     last_output_at: Option<Instant>,
     sideband_running: bool,
+    /// Set the first time a sideband (hook) event arrives. From then on the
+    /// hooks are the authority for `Running`/`Idle`: raw output no longer flips
+    /// a finished agent back to `Running`, and the silence-decay is disabled —
+    /// only an explicit sideband or exit changes the live/idle state. This is
+    /// the reference cockpit's model (state changes on hook events, not on the
+    /// presence/absence of output), and it removes the "Running flash" an agent
+    /// would otherwise show when it prints a final summary AFTER its `Stop`
+    /// hook reported idle. The regex table still runs, so the immediate
+    /// `NeedsApproval`/`WaitingForInput` body-prompt backstop is preserved.
+    hook_driven: bool,
 }
 
 impl StatusMachine {
@@ -57,6 +67,7 @@ impl StatusMachine {
             current: AgentStatus::Idle,
             last_output_at: None,
             sideband_running: false,
+            hook_driven: false,
         }
     }
 
@@ -92,7 +103,14 @@ impl StatusMachine {
         //    Fires from Idle (burst → Running) AND from blocking states
         //    (the prompt scrolled out of the ring; user must have replied).
         //    Stays put when already Running (most common case, no work).
-        if !matches!(self.current, AgentStatus::Running) {
+        //
+        //    Suppressed once hooks drive this session: under hooks the sideband
+        //    is the authority for live/idle, so a finished agent's trailing
+        //    output (e.g. a summary printed after its `Stop` hook) must NOT
+        //    revive it to `Running` and trigger a decay flash. The next real
+        //    turn re-enters `Running` through its `UserPromptSubmit`/`PreToolUse`
+        //    sideband, not through output.
+        if !self.hook_driven && !matches!(self.current, AgentStatus::Running) {
             self.sideband_running = false;
             return self.transition_to(AgentStatus::Running);
         }
@@ -111,7 +129,9 @@ impl StatusMachine {
         if !matches!(self.current, AgentStatus::Running) {
             return None;
         }
-        if self.sideband_running {
+        // Hooks own the live/idle state once seen — never decay a hook-reported
+        // Running on output silence; only a `Stop` sideband or exit ends it.
+        if self.sideband_running || self.hook_driven {
             return None;
         }
         let last = self.last_output_at?;
@@ -175,6 +195,10 @@ impl StatusMachine {
         tool: Option<String>,
     ) -> Option<StatusTransition> {
         let derived = crate::osc_sideband::map_state_to_status(state, tool);
+        // A hook has spoken: from here the sideband (not raw output) owns the
+        // live/idle state. Marked even if the session is already terminal so the
+        // invariant is recorded for any future logic.
+        self.hook_driven = true;
         if self.current.is_terminal() {
             return None;
         }
@@ -493,6 +517,38 @@ mod tests {
         );
         assert!(sm.tick(start + IDLE_AFTER * 2).is_none());
         assert_eq!(sm.current(), &AgentStatus::Running);
+    }
+
+    #[test]
+    fn hook_driven_idle_is_not_revived_by_trailing_output() {
+        use oximux_core::AgentSidebandState;
+        // The "Running flash" regression: an agent finishes (Stop → Idle via
+        // sideband), then prints a final summary. Under hooks that trailing
+        // output must NOT flip it back to Running (and therefore never decays).
+        let mut sm = StatusMachine::new(patterns(&[]));
+        let start = t0();
+        sm.feed_sideband(AgentSidebandState::Working, None); // → Running
+        sm.feed_sideband(AgentSidebandState::Idle, None); // Stop → Idle
+        assert_eq!(sm.current(), &AgentStatus::Idle);
+
+        // Trailing summary output — must stay Idle, no fallback to Running.
+        assert!(sm.feed(b"Here is what I changed: ...", start).is_none());
+        assert_eq!(sm.current(), &AgentStatus::Idle);
+        // And no decay flap on the following tick.
+        assert!(sm.tick(start + IDLE_AFTER * 2).is_none());
+        assert_eq!(sm.current(), &AgentStatus::Idle);
+    }
+
+    #[test]
+    fn hook_driven_still_matches_blocking_patterns() {
+        use oximux_core::AgentSidebandState;
+        // Suppressing the output→Running fallback under hooks must NOT disable
+        // the regex table — the immediate NeedsApproval body backstop still fires.
+        let pats = patterns(&[(r"Do you want to proceed", AgentStatus::NeedsApproval("x".into()))]);
+        let mut sm = StatusMachine::new(pats);
+        sm.feed_sideband(AgentSidebandState::Working, None); // hook-driven now
+        let t = sm.feed(b"Do you want to proceed? (y/n)", t0()).unwrap();
+        assert!(matches!(t.to, AgentStatus::NeedsApproval(_)));
     }
 
     #[test]

@@ -66,7 +66,8 @@ pub fn process_poll_events(
                 let scan = scanner.feed(&bytes);
                 // Regex path on the OSC-9999-stripped bytes only.
                 if let Some(t) = machine.feed(scan.cleaned.as_ref(), now) {
-                    let _ = status_tx.send(status_snapshot(t.to, last_prompt));
+                    let prev_msg = prev_last_message(status_tx);
+                    let _ = status_tx.send(status_snapshot(t.to, last_prompt, prev_msg));
                 }
                 // Sideband path: force the reported state, then publish the
                 // machine's current status with the structured detail. Skip
@@ -86,6 +87,19 @@ pub fn process_poll_events(
                     // tool-step and idle events that follow keep surfacing it.
                     if sb.detail.prompt.is_some() {
                         *last_prompt = sb.detail.prompt.clone();
+                    }
+                    // Carry the last reply forward when this event brings none:
+                    // only a finished turn (`Stop`) supplies a message; the
+                    // prompt/tool events that follow carry none and must not blank
+                    // it, so a finished-turn agent keeps showing its reply across
+                    // the next turn — matching the reference cockpit, which holds
+                    // the last assistant message until a newer reply replaces it.
+                    if sb.detail.last_message.is_none() {
+                        sb.detail.last_message = status_tx
+                            .borrow()
+                            .detail
+                            .as_ref()
+                            .and_then(|d| d.last_message.clone());
                     }
                     let tool = sb.detail.tool_name.clone();
                     machine.feed_sideband(sb.state, tool);
@@ -110,7 +124,8 @@ pub fn process_poll_events(
                     machine.note_exit(code)
                 };
                 if let Some(t) = transition {
-                    let _ = status_tx.send(status_snapshot(t.to, last_prompt));
+                    let prev_msg = prev_last_message(status_tx);
+                    let _ = status_tx.send(status_snapshot(t.to, last_prompt, prev_msg));
                 }
                 saw_exit = true;
             }
@@ -118,21 +133,40 @@ pub fn process_poll_events(
         }
     }
     if let Some(t) = machine.tick(now) {
-        let _ = status_tx.send(status_snapshot(t.to, last_prompt));
+        let prev_msg = prev_last_message(status_tx);
+        let _ = status_tx.send(status_snapshot(t.to, last_prompt, prev_msg));
     }
     saw_exit
 }
 
+/// The last assistant reply on the currently-published snapshot, if any. Read
+/// before building a detail-less status edge so the message survives the
+/// transition instead of being blanked. The `watch` borrow is dropped before
+/// the caller's `send`, so it never contends with the publish.
+fn prev_last_message(status_tx: &watch::Sender<AgentSnapshot>) -> Option<String> {
+    status_tx
+        .borrow()
+        .detail
+        .as_ref()
+        .and_then(|d| d.last_message.clone())
+}
+
 /// Build a snapshot for a path with no sideband detail of its own (regex
-/// transition, exit, idle decay). The volatile tool fields are dropped, but
-/// the cached prompt (the agent's title) is re-attached so a plain status
-/// edge never blanks the row's label.
-fn status_snapshot(status: AgentStatus, last_prompt: &Option<String>) -> AgentSnapshot {
-    if last_prompt.is_some() {
+/// transition, exit, idle decay). The volatile tool fields are dropped, but the
+/// cached prompt (the agent's title) and the last assistant reply are
+/// re-attached so a plain status edge never blanks the row's label or its
+/// finished-turn message.
+fn status_snapshot(
+    status: AgentStatus,
+    last_prompt: &Option<String>,
+    last_message: Option<String>,
+) -> AgentSnapshot {
+    if last_prompt.is_some() || last_message.is_some() {
         AgentSnapshot {
             status,
             detail: Some(SidebandDetail {
                 prompt: last_prompt.clone(),
+                last_message,
                 ..Default::default()
             }),
         }
@@ -154,6 +188,19 @@ mod tests {
 
     fn empty_machine() -> StatusMachine {
         let patterns: Arc<[StatusPattern]> = Vec::new().into();
+        StatusMachine::new(patterns)
+    }
+
+    /// A machine with one blocking pattern, so the regex path can drive a
+    /// transition even after hooks take over (under hooks the output→Running
+    /// *fallback* is suppressed, but pattern matches still fire — that is the
+    /// immediate NeedsApproval/WaitingForInput backstop).
+    fn approval_pattern_machine() -> StatusMachine {
+        let patterns: Arc<[StatusPattern]> = vec![StatusPattern {
+            regex: regex::bytes::Regex::new(r"Approval needed").unwrap(),
+            transition: AgentStatus::NeedsApproval("x".into()),
+        }]
+        .into();
         StatusMachine::new(patterns)
     }
 
@@ -183,6 +230,95 @@ mod tests {
         );
         let snap = rx.borrow().clone();
         (snap, saw_exit)
+    }
+
+    #[test]
+    fn idle_sideband_carries_the_last_assistant_message() {
+        // The Stop hook reports idle WITH the agent's last reply (`msg`). The
+        // published snapshot must carry it as `last_message` so the rail renders
+        // a finished-turn agent's reply (and the emerald done-check), not "Idle".
+        let bytes = osc(r#"{"v":1,"state":"idle","msg":"All done — tests pass."}"#);
+        let (snap, _) = run(vec![TerminalEvent::Output { id: TERM, bytes }]);
+        assert_eq!(snap.status, AgentStatus::Idle);
+        assert_eq!(
+            snap.detail.expect("detail").last_message.as_deref(),
+            Some("All done — tests pass.")
+        );
+    }
+
+    #[test]
+    fn last_assistant_message_survives_the_next_turn() {
+        // A finished turn brings the reply (idle + msg). The next prompt and its
+        // tool steps carry none — the reply must persist so the row keeps showing
+        // it instead of reverting to a bare status verb (reference-cockpit parity).
+        let mut machine = empty_machine();
+        let mut scanner = AgentOscScanner::new();
+        let mut last_prompt = None;
+        let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
+        let cancel = AtomicBool::new(false);
+
+        let feed = |machine: &mut StatusMachine,
+                    scanner: &mut AgentOscScanner,
+                    last_prompt: &mut Option<String>,
+                    bytes: Vec<u8>| {
+            process_poll_events(
+                vec![TerminalEvent::Output { id: TERM, bytes }],
+                TERM,
+                machine,
+                scanner,
+                &tx,
+                last_prompt,
+                &cancel,
+                Instant::now(),
+            );
+        };
+
+        feed(
+            &mut machine,
+            &mut scanner,
+            &mut last_prompt,
+            osc(r#"{"v":1,"state":"idle","msg":"All done — tests pass."}"#),
+        );
+        assert_eq!(
+            rx.borrow().detail.clone().and_then(|d| d.last_message).as_deref(),
+            Some("All done — tests pass.")
+        );
+
+        // Next prompt — no message; the reply must persist.
+        feed(
+            &mut machine,
+            &mut scanner,
+            &mut last_prompt,
+            osc(r#"{"v":1,"state":"working","prompt":"now refactor"}"#),
+        );
+        assert_eq!(
+            rx.borrow().detail.clone().and_then(|d| d.last_message).as_deref(),
+            Some("All done — tests pass."),
+            "reply persists across the next prompt"
+        );
+
+        // A tool step — still no message; reply persists, tool surfaces fresh.
+        feed(
+            &mut machine,
+            &mut scanner,
+            &mut last_prompt,
+            osc(r#"{"v":1,"state":"working","tool":"Edit","tool_input":"y.rs"}"#),
+        );
+        let d = rx.borrow().detail.clone().expect("detail");
+        assert_eq!(d.last_message.as_deref(), Some("All done — tests pass."));
+        assert_eq!(d.tool_name.as_deref(), Some("Edit"));
+
+        // A newer finished turn replaces the reply.
+        feed(
+            &mut machine,
+            &mut scanner,
+            &mut last_prompt,
+            osc(r#"{"v":1,"state":"idle","msg":"Refactor complete."}"#),
+        );
+        assert_eq!(
+            rx.borrow().detail.clone().and_then(|d| d.last_message).as_deref(),
+            Some("Refactor complete.")
+        );
     }
 
     #[test]
@@ -221,9 +357,10 @@ mod tests {
 
     #[test]
     fn regex_path_clears_stale_sideband_detail() {
-        // First a sideband sets detail; then plain output drives a regex
-        // transition whose snapshot must carry detail: None.
-        let mut machine = empty_machine();
+        // A sideband sets stale tool detail; then a regex pattern match drives a
+        // transition whose snapshot must carry detail: None. The pattern path
+        // still fires under hooks — only the output→Running fallback is gated.
+        let mut machine = approval_pattern_machine();
         let mut scanner = AgentOscScanner::new();
         let mut last_prompt = None;
         let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
@@ -245,12 +382,12 @@ mod tests {
         );
         assert!(rx.borrow().detail.is_some(), "sideband attached detail");
 
-        // Force the machine off Running so plain output produces a transition.
-        machine.force(AgentStatus::Idle);
+        // A blocking-prompt pattern match transitions Working → NeedsApproval;
+        // its snapshot drops the stale tool detail.
         process_poll_events(
             vec![TerminalEvent::Output {
                 id: TERM,
-                bytes: b"plain text".to_vec(),
+                bytes: b"Approval needed: proceed?".to_vec(),
             }],
             TERM,
             &mut machine,
@@ -261,7 +398,7 @@ mod tests {
             Instant::now(),
         );
         let snap = rx.borrow().clone();
-        assert_eq!(snap.status, AgentStatus::Running);
+        assert!(matches!(snap.status, AgentStatus::NeedsApproval(_)));
         // No prompt was ever submitted, so the regex transition carries no
         // detail at all — stale tool info is cleared.
         assert!(snap.detail.is_none(), "regex transition clears tool detail");
@@ -310,15 +447,15 @@ mod tests {
 
     #[test]
     fn cached_prompt_survives_a_regex_transition() {
-        // After a prompt is cached, a plain-output regex transition must keep
-        // the prompt (the title) even though it drops the volatile tool fields.
-        let mut machine = empty_machine();
+        // After a prompt is cached, a regex pattern transition must keep the
+        // prompt (the title) even though it drops the volatile tool fields.
+        let mut machine = approval_pattern_machine();
         let mut scanner = AgentOscScanner::new();
         let mut last_prompt = None;
         let (tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Idle));
         let cancel = AtomicBool::new(false);
 
-        let submit = osc(r#"{"v":1,"state":"idle","prompt":"add tests"}"#);
+        let submit = osc(r#"{"v":1,"state":"working","prompt":"add tests"}"#);
         process_poll_events(
             vec![TerminalEvent::Output { id: TERM, bytes: submit }],
             TERM,
@@ -329,11 +466,12 @@ mod tests {
             &cancel,
             Instant::now(),
         );
-        // Plain output → regex Idle→Running transition (no sideband).
+        // A blocking-prompt pattern match → regex transition (Working →
+        // NeedsApproval); the cached prompt must ride the new snapshot.
         process_poll_events(
             vec![TerminalEvent::Output {
                 id: TERM,
-                bytes: b"some output".to_vec(),
+                bytes: b"Approval needed: proceed?".to_vec(),
             }],
             TERM,
             &mut machine,
@@ -344,7 +482,7 @@ mod tests {
             Instant::now(),
         );
         let snap = rx.borrow().clone();
-        assert_eq!(snap.status, AgentStatus::Running);
+        assert!(matches!(snap.status, AgentStatus::NeedsApproval(_)));
         let d = snap.detail.expect("regex snapshot keeps the cached prompt");
         assert_eq!(d.prompt.as_deref(), Some("add tests"));
         assert!(d.tool_name.is_none(), "tool fields stay cleared");
