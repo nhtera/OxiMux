@@ -287,7 +287,8 @@ pub fn render_project_group(
             });
 
         let agent_rows = workspace_agents.get(&workspace.id);
-        let active_agent_wrap = is_active && agent_rows.is_some_and(|rows| rows.len() > 1);
+        let multi_agent = agent_rows.is_some_and(|rows| rows.len() > 1);
+        let active_agent_wrap = is_active && multi_agent;
         // The active surface fill, reused for the wrap container so a
         // multi-agent active workspace reads as ONE highlighted block (card +
         // its agent rows) — matching the single-agent active card exactly.
@@ -302,6 +303,7 @@ pub fn render_project_group(
             row_id,
             row_group,
             !active_agent_wrap,
+            multi_agent,
             !is_primary,
             locate_glow_seq,
             drag_config,
@@ -335,11 +337,14 @@ pub fn render_project_group(
         }
 
         if active_agent_wrap {
+            // One highlighted container around the card + its agent rows, like
+            // the reference cockpit. `border_active` keeps the box clearly
+            // delineated; the fill matches the single-agent active card.
             workspace_block = workspace_block
                 .ml(px(density.gap_inline))
                 .rounded(px(density.r_card))
                 .border_1()
-                .border_color(theme.border_inactive)
+                .border_color(theme.border_active)
                 .bg(active_surface_bg);
         }
 

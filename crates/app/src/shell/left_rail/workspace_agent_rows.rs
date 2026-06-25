@@ -18,28 +18,7 @@ use crate::shell::agent_presentation::{adapter_icon_path, agent_verb};
 use crate::shell::left_rail::{LeftRail, RailAgentRow, RailAgentTarget};
 use crate::workspace_root::WorkspaceRoot;
 
-/// Max status glyphs shown in the collapsed cluster before an "+N" overflow.
-pub const MAX_GLYPHS: usize = 5;
-
-const GLYPH_DOT: f32 = 6.0;
 const SUB_DOT: f32 = 7.0;
-
-/// Collapsed-cluster dot colors — one per agent, capped at [`MAX_GLYPHS`].
-/// Live agents reflect their current status; history rows use the DB status.
-pub fn glyph_colors(rows: &[RailAgentRow], theme: Theme) -> Vec<Hsla> {
-    rows.iter()
-        .take(MAX_GLYPHS)
-        .map(|r| {
-            let status = r.effective_status();
-            agent_verb(Some(&status), r.is_live, theme).color
-        })
-        .collect()
-}
-
-/// Agents beyond the glyph cap, surfaced as a trailing "+N".
-pub fn glyph_overflow(count: usize) -> usize {
-    count.saturating_sub(MAX_GLYPHS)
-}
 
 /// Display fields for one expanded sub-row.
 pub struct SubRowView {
@@ -76,37 +55,14 @@ pub fn render_workspace_agent_disclosure(
 ) -> impl IntoElement {
     let ws = workspace_key.to_string();
     let count = rows.len();
-    let overflow = glyph_overflow(count);
     let chevron = if is_expanded { "▾" } else { "▸" };
-
-    let mut cluster = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(density.gap_inline))
-        .child(
-            div()
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_muted)
-                .child(format!("{chevron} {count}")),
-        );
-    for color in glyph_colors(rows, theme) {
-        cluster = cluster.child(
-            div()
-                .size(px(GLYPH_DOT))
-                .rounded_full()
-                .bg(color)
-                .flex_shrink_0(),
-        );
-    }
-    if overflow > 0 {
-        cluster = cluster.child(
-            div()
-                .text_size(px(typography.t_body_sm))
-                .text_color(theme.fg_subtle)
-                .child(format!("+{overflow}")),
-        );
-    }
+    // Reference-cockpit header: "N agents" on the left, a disclosure chevron on
+    // the right — no inline status cluster (the per-agent dots live on the rows).
+    let header_label = if count == 1 {
+        "1 agent".to_string()
+    } else {
+        format!("{count} agents")
+    };
 
     let summary = div()
         .flex()
@@ -119,14 +75,28 @@ pub fn render_workspace_agent_disclosure(
         .pr(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .cursor_pointer()
-        .when(!is_active, |s| s.hover(|s| s.bg(theme.hover_overlay)))
+        .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
             rail.update(cx, |r, cx| {
                 r.toggle_workspace_expanded(&ws);
                 cx.notify();
             });
         })
-        .child(cluster);
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(header_label),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_subtle)
+                .child(chevron),
+        );
 
     let mut col = div().flex().flex_col().w_full().child(summary);
     if is_expanded {
@@ -251,25 +221,25 @@ fn render_agent_sub_row(
     typography: &Typography,
 ) -> impl IntoElement {
     let v = sub_row_view(row, theme);
-    // Title precedence, mirroring the reference cockpit's compact row:
-    //   prompt (the agent's title) · live tool/message
-    //   prompt
-    //   live tool/message (no prompt captured yet)
-    //   status verb (a row with no live detail at all)
-    // The prompt leads and reads as primary text; the dot color carries the
-    // status.
-    let is_ambient = matches!(row.target, RailAgentTarget::AmbientTerminal { .. });
-    let (descriptor, descriptor_color) = match live_title(row) {
-        Some(t) => (
-            t.text,
-            if t.leads_with_prompt {
-                theme.fg_base
-            } else {
-                theme.fg_muted
-            },
-        ),
-        None if is_ambient => (format!("{} · {}", row.label, v.verb), v.verb_color),
-        None => (v.verb.to_string(), v.verb_color),
+    // Reference-cockpit "{title} - {subtitle}" compact row:
+    //   title    = the user's prompt, else the agent's name ("Claude Code")
+    //   subtitle = the live tool/message, else the status verb ("Idle")
+    // The title leads in primary text; the subtitle reads muted; the dot color
+    // carries the status. e.g. "Claude Code - Idle", "fix parser - Edit: x.rs".
+    let (title, title_is_prompt) = match live_prompt(row) {
+        Some(p) => (p, true),
+        None => (row.label.to_string(), false),
+    };
+    let subtitle = live_activity(row).unwrap_or_else(|| v.verb.to_string());
+    let descriptor = if subtitle.trim().is_empty() || subtitle == title {
+        title
+    } else {
+        format!("{title} - {subtitle}")
+    };
+    let descriptor_color = if title_is_prompt {
+        theme.fg_base
+    } else {
+        theme.fg_muted
     };
     // Active workspace → wrap the full descriptor; inactive → one ellipsised
     // line. The dot/icon/age align to the top when wrapping so they sit with
@@ -342,7 +312,7 @@ fn render_agent_sub_row(
     if row.is_focusable() {
         let target = row.target.clone();
         base.cursor_pointer()
-            .when(!is_active, |s| s.hover(|s| s.bg(theme.hover_overlay)))
+            .hover(|s| s.bg(theme.hover_overlay))
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 let _ = weak_root.update(cx, |root, cx| match &target {
                     RailAgentTarget::AgentSession { db_id } => {
@@ -384,21 +354,6 @@ mod tests {
             age_label: "3d".into(),
             persisted_title: None,
         }
-    }
-
-    #[test]
-    fn glyph_colors_caps_at_max() {
-        let rows: Vec<RailAgentRow> = (0..8)
-            .map(|_| row(false, AgentStatus::Idle, None))
-            .collect();
-        assert_eq!(glyph_colors(&rows, Theme::default()).len(), MAX_GLYPHS);
-    }
-
-    #[test]
-    fn overflow_math() {
-        assert_eq!(glyph_overflow(8), 3);
-        assert_eq!(glyph_overflow(5), 0);
-        assert_eq!(glyph_overflow(1), 0);
     }
 
     #[test]

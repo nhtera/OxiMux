@@ -67,6 +67,11 @@ pub fn render_workspace_card(
     row_id: SharedString,
     group_name: SharedString,
     active_shell: bool,
+    // When a multi-agent disclosure renders below this card, the per-agent rows
+    // already carry name + status, so the card drops its redundant
+    // `name · verb` line-2 summary (matches the reference cockpit, which shows
+    // the branch then "N agents" rather than repeating an agent summary).
+    suppress_agent_summary: bool,
     show_menu: bool,
     locate_glow_seq: u64,
     drag: Option<WorkspaceDragConfig>,
@@ -336,6 +341,15 @@ pub fn render_workspace_card(
             .w_full()
             .gap(px(density.gap_inline))
             .children(title_elem)
+            .children(diff_elem)
+    } else if suppress_agent_summary {
+        // Multi-agent: the disclosure below lists each agent, so line 2 drops
+        // the `name · verb` summary and carries only the diff chip.
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline))
             .children(diff_elem)
     } else {
         div()
