@@ -102,6 +102,16 @@ fn main() {
         std::process::exit(run_agent_status_cli(&rt));
     }
 
+    // Single-instance guard. A second GUI launched against the same data
+    // directory would clobber the shared per-window layout store and
+    // double-attach the same relay PTYs, so a window saved by one instance
+    // vanishes when the other overwrites the snapshot. If a live instance
+    // already holds the lock, this brings it forward and exits. Held for the
+    // whole process (released implicitly on exit). Placed AFTER the helper-CLI
+    // short-circuits above so `oximux notify` / `agent-status` — which hooks
+    // invoke while the GUI is up — never contend for it.
+    let _single_instance = enforce_single_instance();
+
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
     // without the git column — the rest of the shell still works.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -640,6 +650,50 @@ fn run_file_tree_spike() {
     });
 }
 
+/// Take the single-instance lock before any shared-state boot. When another
+/// live GUI already holds it, bring that instance to the front and exit
+/// cleanly rather than start a second window set that would clobber the shared
+/// layout store and double-attach the same relay PTYs. Returns the guard the
+/// caller must hold for the whole process lifetime. `None` means we degraded to
+/// an unguarded boot — only when the data directory can't be resolved/created
+/// or the lock errored unexpectedly — never because a peer was found (that path
+/// exits).
+fn enforce_single_instance() -> Option<oximux_app::single_instance::SingleInstanceGuard> {
+    use oximux_app::single_instance::{
+        AcquireOutcome, activate_existing_instance, lock_path_in, try_acquire,
+    };
+    let Some(data_dir) = dirs::data_dir() else {
+        tracing::warn!("no data_dir; skipping single-instance guard");
+        return None;
+    };
+    let dir = data_dir.join(APP_DATA_SUBDIR);
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(?err, "cannot create data dir; skipping single-instance guard");
+        return None;
+    }
+    let lock_path = lock_path_in(&dir);
+    match try_acquire(&lock_path) {
+        Ok(AcquireOutcome::Acquired(guard)) => Some(guard),
+        Ok(AcquireOutcome::AlreadyRunning { holder_pid }) => {
+            if let Some(pid) = holder_pid {
+                activate_existing_instance(pid);
+            }
+            let suffix = holder_pid
+                .map(|p| format!(" (pid {p})"))
+                .unwrap_or_default();
+            eprintln!(
+                "oximux: another OxiMux instance is already running{suffix} — \
+                 bringing its window to the front."
+            );
+            std::process::exit(0);
+        }
+        Err(err) => {
+            tracing::warn!(?err, "single-instance lock failed; continuing without guard");
+            None
+        }
+    }
+}
+
 /// Resolve `~/Library/Application Support/dev.nhtera.oximux/oximux.db`,
 /// mkdir-p the parent, and open the SQLite database. Any failure on this
 /// path is fatal — `eprintln` + `exit(1)` rather than panic so the user
@@ -771,11 +825,9 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
         }
     };
     // Read the hook event JSON once when we'll need it — for tool extraction
-    // (working / needs_approval) or the notification filter. `idle` (Stop)
-    // carries nothing relevant, so skip the read.
-    let stdin_json = if state == "idle" {
-        None
-    } else {
+    // (working / needs_approval), the notification filter, OR — for `idle`
+    // (Stop) — the `transcript_path` we read to extract the agent's last reply.
+    let stdin_json = {
         use std::io::Read;
         let mut buf = String::new();
         let _ = std::io::stdin().read_to_string(&mut buf);
@@ -793,6 +845,23 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
     let tool = stdin_json
         .as_deref()
         .and_then(oximux_app::agent_status_hooks::tool_name_from_hook_json);
+    // A `UserPromptSubmit` event carries the user's prompt (no tool); other
+    // working events carry a tool (no prompt). Both are read from the same
+    // stdin JSON — one of them is `None` for any given hook.
+    let prompt = stdin_json
+        .as_deref()
+        .and_then(oximux_app::agent_status_hooks::prompt_from_hook_json);
+    // On `Stop` (idle) read the transcript for the agent's last reply — the
+    // row's secondary text for a finished turn (the reference cockpit's
+    // `lastAssistantMessage`). Only on Stop: it fires once per turn, whereas a
+    // per-tool transcript read would be wasteful.
+    let message = if state == "idle" {
+        stdin_json
+            .as_deref()
+            .and_then(oximux_app::agent_status_hooks::last_assistant_message_from_hook_json)
+    } else {
+        None
+    };
 
     let pty_id = match std::env::var("OXIMUX_PTY_ID") {
         Ok(id) if !id.is_empty() => id,
@@ -802,7 +871,12 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
             return 0;
         }
     };
-    let payload = oximux_app::agent_status_hooks::build_status_payload(&state, tool.as_deref());
+    let payload = oximux_app::agent_status_hooks::build_status_payload(
+        &state,
+        tool.as_deref(),
+        prompt.as_deref(),
+        message.as_deref(),
+    );
 
     let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
         eprintln!("oximux agent-status: cannot resolve application data directory");

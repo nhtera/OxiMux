@@ -88,15 +88,25 @@ pub fn agent_verb(status: Option<&AgentStatus>, is_live: bool, theme: Theme) -> 
     }
 }
 
-/// A live agent detected from a plain terminal's OSC title: its status plus,
-/// when recognizable, the agent's display name. Carried through the rail so a
+/// A live agent detected in a plain terminal: its status plus, when
+/// recognizable, the agent's display name. Carried through the rail so a
 /// hand-launched agent shows up by name on the card, not just by status.
+///
+/// Status comes from one of two sources, in order of preference:
+///  1. the OSC-9999 hook sideband (`detail` is `Some`) — rich and stable,
+///     identical to a spawned agent's status;
+///  2. the OSC title heuristic (`detail` is `None`) — coarse but immediate,
+///     so an agent that launched but hasn't emitted a hook still shows up.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AmbientAgent {
     pub status: AgentStatus,
-    /// Display name (e.g. "Claude Code"), or `None` when the title classifies
+    /// Display name (e.g. "Claude Code"), or `None` when the source classifies
     /// as agent activity but the specific CLI couldn't be named.
     pub label: Option<&'static str>,
+    /// Hook sideband detail (prompt title + live tool step) when the status
+    /// came from a sideband packet; `None` for a title-only reading. Lets the
+    /// rail show a hand-typed agent's prompt as its row title.
+    pub detail: Option<oximux_core::SidebandDetail>,
 }
 
 /// Map a tracked-session adapter id (as stored in the agent-session row) to a
@@ -108,6 +118,19 @@ pub fn adapter_display_name(adapter_id: &str) -> &'static str {
         "aider" => "Aider",
         "gemini" => "Gemini CLI",
         _ => "Agent",
+    }
+}
+
+/// Map an ambient terminal title's display label back to the registry adapter
+/// slug used by icons and agent rows. Labels without dedicated first-class
+/// support fall back to the generic agent slug.
+pub fn adapter_id_for_label(label: &str) -> &'static str {
+    match label {
+        "Claude Code" => "claude-code",
+        "Codex" => "codex",
+        "Aider" => "aider",
+        "Gemini CLI" => "gemini",
+        _ => "agent",
     }
 }
 
@@ -219,6 +242,15 @@ mod tests {
     }
 
     #[test]
+    fn adapter_id_for_label_maps_ambient_labels() {
+        assert_eq!(adapter_id_for_label("Claude Code"), "claude-code");
+        assert_eq!(adapter_id_for_label("Codex"), "codex");
+        assert_eq!(adapter_id_for_label("Aider"), "aider");
+        assert_eq!(adapter_id_for_label("Gemini CLI"), "gemini");
+        assert_eq!(adapter_id_for_label("Unknown"), "agent");
+    }
+
+    #[test]
     fn adapter_icon_path_maps_known_ids_and_falls_back() {
         assert_eq!(adapter_icon_path("claude-code"), "icons/claude-code.svg");
         assert_eq!(adapter_icon_path("codex"), "icons/codex.svg");
@@ -232,7 +264,9 @@ mod tests {
             ambient_status_rank(&AgentStatus::NeedsApproval("x".into()))
                 > ambient_status_rank(&AgentStatus::Running)
         );
-        assert!(ambient_status_rank(&AgentStatus::Running) > ambient_status_rank(&AgentStatus::Idle));
+        assert!(
+            ambient_status_rank(&AgentStatus::Running) > ambient_status_rank(&AgentStatus::Idle)
+        );
     }
 
     // ── dot-color parity: each case must match status_dot_color exactly ──────

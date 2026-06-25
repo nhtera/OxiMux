@@ -658,9 +658,10 @@ fn restore_agent_tab(
                 (session_id, backend, term_id, status_rx)
             }
         };
-        // Restored sessions get a fresh agent_sessions row too (the boot
-        // sweep already marked the pre-restart row Interrupted); without
-        // this, a live re-adopted agent would read "Stopped" on the rail.
+        // Re-adopt the pre-restart agent_sessions row (the boot sweep marked it
+        // Interrupted): `restoring = true` flips that same row back to live and
+        // keeps its persisted title, instead of orphaning it and inserting a
+        // duplicate "Claude Code" row.
         let _ = root.update(cx, |this, cx| {
             crate::shell::agent_session_persistence::spawn_for_session(
                 this,
@@ -668,7 +669,9 @@ fn restore_agent_tab(
                 adapter_id,
                 persisted_clone.model.clone(),
                 persisted_clone.effort.clone(),
+                session_id,
                 status_rx.clone(),
+                true,
                 cx,
             );
         });
@@ -1094,16 +1097,26 @@ pub(crate) fn spawn_attach_reconcile(
             };
             let delivered = entry.view.update(cx, |view, cx| {
                 let adopted = view.adopt_live_session(backend.clone(), session_id, cx);
-                if adopted
-                    && let Some((restore, _)) = &cold
-                    && !restore.bytes.is_empty()
-                {
-                    // Prefill BEFORE the first poll tick drains the fresh
-                    // shell's prompt: recovered history paints first, the
-                    // live prompt then appends below the restored marker.
-                    // A cwd-only restore (no replayable scrollback) skips
-                    // this — blank grid, recovered spawn dir.
-                    view.prefill_grid(&restore.bytes);
+                if adopted {
+                    if let Some((restore, _)) = &cold
+                        && !restore.bytes.is_empty()
+                    {
+                        // Prefill BEFORE the first poll tick drains the fresh
+                        // shell's prompt: recovered history paints first, the
+                        // live prompt then appends below the restored marker.
+                        // A cwd-only restore (no replayable scrollback) skips
+                        // this — blank grid, recovered spawn dir.
+                        view.prefill_grid(&restore.bytes);
+                    }
+                    // A warm re-attach reuses the surviving daemon PTY, so a
+                    // hand-typed agent still running in it can be re-listed from
+                    // its persisted hook reading (the OSC sideband is never in
+                    // the replayed ring). A cold spawn gets a fresh shell with
+                    // no agent, so it skips this — and its stale reading is
+                    // dropped when the dead PTY's checkpoint is consumed below.
+                    if was_attach {
+                        view.seed_ambient_from_persisted();
+                    }
                 }
                 adopted
             });
@@ -1137,6 +1150,10 @@ pub(crate) fn spawn_attach_reconcile(
                         executor
                             .spawn(async move {
                                 crate::relay_cold_restore::consume_checkpoint(&dir, &pty_id);
+                                // The dead PTY can never re-attach, so drop any
+                                // ambient reading persisted under its id — it
+                                // must not be re-seeded onto an unrelated PTY.
+                                crate::shell::ambient_state::forget(&pty_id);
                             })
                             .detach();
                     }

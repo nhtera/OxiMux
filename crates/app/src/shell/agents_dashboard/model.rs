@@ -303,6 +303,7 @@ mod tests {
             tool_input_summary: input.map(str::to_string),
             last_message: msg.map(str::to_string),
             session_id: None,
+            ..Default::default()
         }
     }
 

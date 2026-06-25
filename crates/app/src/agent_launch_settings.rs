@@ -70,6 +70,14 @@ pub fn save(settings: &AgentLaunchSettings) -> std::io::Result<()> {
 }
 
 fn apply(cx: &mut App, settings: AgentLaunchSettings) {
+    // Mirror the toggle into the user's global Claude hooks so a hand-typed
+    // `claude` in any pane reports status too (picker agents already get the
+    // same hooks via `--settings`; the command strings match, so Claude's hook
+    // dedup keeps them firing once). Runs at boot and on every live edit, so
+    // flipping the toggle installs or removes the global hooks without a
+    // restart. The env override force-enables it like the per-spawn path does.
+    let hooks_on = settings.status_hooks_enabled || crate::agent_status_hooks::env_forced();
+    crate::agent_hooks_global::sync_global_status_hooks(hooks_on);
     cx.set_global(settings);
 }
 

@@ -23,9 +23,11 @@ pub mod nav_section;
 pub mod project_drag;
 pub mod project_group;
 pub mod project_menu;
+pub mod rail_agent_row;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
+pub mod workspace_agent_rows;
 pub mod workspace_card;
 pub mod workspace_list_render;
 pub mod workspace_row;
@@ -75,6 +77,8 @@ const AUTOSCROLL_TICK: Duration = Duration::from_millis(16);
 /// Snapshot of the latest agent-session status for a single workspace.
 /// `None` means no sessions have ever been started for that workspace.
 pub type LatestStatusMap = HashMap<String, Option<AgentStatus>>;
+
+pub use rail_agent_row::{RailAgentRow, RailAgentTarget, WorkspaceAgentList};
 
 /// One project group's held Smart-sort order plus when it was locked. Within
 /// `SMART_SETTLE` of the lock time, the group renders this order instead of a
@@ -171,6 +175,19 @@ pub struct LeftRail {
     /// Drives the dashboard's in-tier recency sort. Sourced from SQLite in
     /// `gather_rail_db_data` and pushed down with the rest of the snapshot.
     last_active: HashMap<String, String>,
+    /// Per-workspace agent lists (live runtime sessions merged with DB
+    /// history), keyed by workspace key. Built in `refresh_left_rail` and
+    /// pushed down with the snapshot; the expandable multi-agent disclosure
+    /// reads it at render. Empty until a workspace has agents.
+    workspace_agents: WorkspaceAgentList,
+    /// Workspace keys whose multi-agent disclosure is expanded. Toggled by
+    /// clicking the "N agents" summary line; in-memory only (not persisted),
+    /// and survives rail rebuilds since it lives on the entity.
+    expanded_workspaces: HashSet<String>,
+    /// The agent whose tab is the active pane, so its disclosure sub-row stays
+    /// lit (the reference cockpit's focused-pane row). `None` when the active
+    /// tab is not an agent surface. Pushed down with the snapshot.
+    focused_agent: Option<RailAgentTarget>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -260,6 +277,9 @@ impl LeftRail {
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
             last_active: HashMap::new(),
+            workspace_agents: HashMap::new(),
+            expanded_workspaces: HashSet::new(),
+            focused_agent: None,
             width: px(density.w_left_rail),
             resizing: false,
             settings_repo: None,
@@ -677,6 +697,8 @@ impl LeftRail {
         agent_activity: HashMap<String, String>,
         agent_sideband: HashMap<String, SidebandDetail>,
         last_active: HashMap<String, String>,
+        workspace_agents: WorkspaceAgentList,
+        focused_agent: Option<RailAgentTarget>,
         cx: &mut Context<Self>,
     ) {
         let project_changed = self.active_project_id != active_project_id;
@@ -695,6 +717,33 @@ impl LeftRail {
                 }
             }
         }
+        // Dirty-check: `WorkspaceRoot::render` pushes this snapshot down every
+        // frame (and re-renders on every pane-output tick while an agent
+        // streams), so notifying unconditionally rebuilds the whole rail
+        // constantly — the hover/scroll jank. Only re-render when the rail's
+        // render inputs actually changed. Every genuine live change already
+        // routes through `mark_rail_dirty` (status edges), `note_agent_sideband`
+        // (tool steps), or the per-frame ambient/diff maps → one of these
+        // compared fields changes, so the rail still updates; we only drop the
+        // redundant repaints. `status_rx` is excluded (not `Eq`); its live status
+        // surfaces via `latest_status`/`agent_sideband`/`ambient_status`, which
+        // ARE compared (ambient rows also carry their prompt in `persisted_title`,
+        // compared by `agents_display_equal`).
+        let changed = self.projects != projects
+            || self.active_project_id != active_project_id
+            || self.active_workspace_id != active_workspace_id
+            || self.workspaces_by_project != workspaces_by_project
+            || self.latest_status != latest_status
+            || self.ambient_status != ambient_status
+            || self.latest_adapter != latest_adapter
+            || self.live_worktrees != live_worktrees
+            || self.diff_counts != diff_counts
+            || self.agent_activity != agent_activity
+            || self.agent_sideband != agent_sideband
+            || self.last_active != last_active
+            || self.focused_agent != focused_agent
+            || !agents_display_equal(&self.workspace_agents, &workspace_agents);
+
         self.projects = projects;
         self.active_project_id = active_project_id;
         // A locate glow is scoped to the workspace it was triggered on —
@@ -713,6 +762,8 @@ impl LeftRail {
         self.agent_activity = agent_activity;
         self.agent_sideband = agent_sideband;
         self.last_active = last_active;
+        self.workspace_agents = workspace_agents;
+        self.focused_agent = focused_agent;
 
         // Keep the Tasks page's project in sync; re-fetch only when the active
         // project actually changes while the page is open.
@@ -724,7 +775,20 @@ impl LeftRail {
                 tv.refresh(cx);
             }
         });
-        cx.notify();
+        // Only repaint the rail when its inputs changed (see the dirty-check
+        // above). A no-op frame keeps the last render — no churn on hover or
+        // while an agent merely streams output.
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Flip the multi-agent disclosure for one workspace. The caller notifies;
+    /// this only mutates the in-memory expand set.
+    pub(crate) fn toggle_workspace_expanded(&mut self, workspace_key: &str) {
+        if !self.expanded_workspaces.remove(workspace_key) {
+            self.expanded_workspaces.insert(workspace_key.to_string());
+        }
     }
 
     /// Test-only inspector for the currently-active nav item (`None` = home).
@@ -788,6 +852,33 @@ impl LeftRail {
     }
 }
 
+/// Compare two per-workspace agent lists by their RENDER-VISIBLE fields only,
+/// skipping `status_rx` (a `watch::Receiver`, not `Eq`). The live status the
+/// receiver carries surfaces through `latest_status`/`agent_sideband`, which the
+/// caller compares separately; an ambient row's prompt rides `persisted_title`,
+/// compared here — so this projection is enough to decide whether the disclosure
+/// rows would look any different.
+fn agents_display_equal(a: &WorkspaceAgentList, b: &WorkspaceAgentList) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().all(|(key, rows_a)| {
+        b.get(key).is_some_and(|rows_b| {
+            rows_a.len() == rows_b.len()
+                && rows_a.iter().zip(rows_b).all(|(x, y)| {
+                    x.db_id == y.db_id
+                        && x.is_live == y.is_live
+                        && x.db_status == y.db_status
+                        && x.age_label == y.age_label
+                        && x.label == y.label
+                        && x.adapter_id == y.adapter_id
+                        && x.persisted_title == y.persisted_title
+                        && x.persisted_message == y.persisted_message
+                })
+        })
+    })
+}
+
 impl Render for LeftRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A resize drag is over once no drag is active — releasing the
@@ -848,6 +939,9 @@ impl Render for LeftRail {
                 self.ambient_status.clone(),
                 self.latest_adapter.clone(),
                 self.diff_counts.clone(),
+                self.workspace_agents.clone(),
+                self.expanded_workspaces.clone(),
+                self.focused_agent.clone(),
                 self.weak_root.clone(),
                 self.locate_glow_seq,
                 self.list_scroll.clone(),
@@ -953,6 +1047,9 @@ fn render_workspace_list(
     ambient_status: HashMap<String, AmbientAgent>,
     latest_adapter: HashMap<String, String>,
     diff_counts: HashMap<String, DiffCounts>,
+    workspace_agents: WorkspaceAgentList,
+    expanded_workspaces: HashSet<String>,
+    focused_agent: Option<RailAgentTarget>,
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
     list_scroll: ScrollHandle,
@@ -1077,6 +1174,9 @@ fn render_workspace_list(
             &live_worktrees,
             &ambient_status,
             &diff_counts,
+            &workspace_agents,
+            &expanded_workspaces,
+            focused_agent.as_ref(),
             rail.clone(),
             weak_root.clone(),
             on_row_menu,
@@ -1263,6 +1363,62 @@ mod tests {
         let removed = vec!["x".to_string()];
         assert!(!same_membership(&a, &added));
         assert!(!same_membership(&a, &removed));
+    }
+
+    #[test]
+    fn agents_display_equal_skips_status_rx_catches_visible_fields() {
+        use crate::shell::left_rail::{RailAgentRow, RailAgentTarget};
+        use oximux_core::{AgentSnapshot, AgentStatus};
+        use std::collections::HashMap;
+        use tokio::sync::watch;
+
+        // Each row gets its OWN status receiver instance — the compare must
+        // ignore those and look only at the visible fields.
+        fn row(age: &str, title: Option<&str>) -> RailAgentRow {
+            let (_tx, rx) = watch::channel(AgentSnapshot::from_status(AgentStatus::Running));
+            RailAgentRow {
+                db_id: "a".into(),
+                target: RailAgentTarget::AgentSession { db_id: "a".into() },
+                workspace_key: "ws".into(),
+                adapter_id: "claude-code".into(),
+                label: "Claude Code".into(),
+                is_live: true,
+                status_rx: Some(rx),
+                db_status: AgentStatus::Idle,
+                started_at: Some("t".into()),
+                ended_at: None,
+                age_label: age.into(),
+                persisted_title: title.map(str::to_string),
+                persisted_message: None,
+                ambient_detail: None,
+            }
+        }
+        let list = |rows: Vec<RailAgentRow>| {
+            let mut m: super::WorkspaceAgentList = HashMap::new();
+            m.insert("ws".to_string(), rows);
+            m
+        };
+
+        // Same visible fields, different receiver instances → equal.
+        assert!(super::agents_display_equal(
+            &list(vec![row("now", None)]),
+            &list(vec![row("now", None)])
+        ));
+        // A changed age label → not equal (the row would render differently).
+        assert!(!super::agents_display_equal(
+            &list(vec![row("now", None)]),
+            &list(vec![row("3d", None)])
+        ));
+        // A changed prompt title (e.g. an ambient agent's new prompt) → not equal.
+        assert!(!super::agents_display_equal(
+            &list(vec![row("now", Some("old"))]),
+            &list(vec![row("now", Some("new"))])
+        ));
+        // Different agent count → not equal.
+        assert!(!super::agents_display_equal(
+            &list(vec![row("now", None)]),
+            &list(vec![row("now", None), row("now", None)])
+        ));
     }
 
     #[test]

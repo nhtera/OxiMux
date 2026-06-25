@@ -24,12 +24,12 @@ use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
     Subscription, Task, Window, px,
 };
-use std::rc::Rc;
 use oximux_agents::{
     AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend, agent_label_from_title,
     classify_agent_title,
 };
 use oximux_core::{AgentAdapter, AgentSessionId};
+use std::rc::Rc;
 
 use crate::shell::agent_presentation::AmbientAgent;
 use oximux_pty::TerminalSessionId;
@@ -38,15 +38,16 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::actions::{
     CloseTab, FocusNextSubPane, FocusPrevSubPane, NewAgent, NewBrowserTab, NewTab, NextTab,
     PrevTab, RequestOpenAdapterPicker, Search, SendTextToActiveAgent, SplitSubPaneDown,
-    SplitSubPaneRight,
-    ToggleZoomSubPane,
+    SplitSubPaneRight, ToggleZoomSubPane,
 };
 use crate::notifier::{Notifier, TabId};
-use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt, ConfirmSecondary};
-use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::agent_status_task::spawn_status_task;
 use crate::shell::agent_tab_label;
+use crate::shell::confirm_dialog::{
+    ConfirmCallback, ConfirmDialog, ConfirmPrompt, ConfirmSecondary,
+};
 use crate::shell::context_env::SurfaceIds;
+use crate::shell::divider::{ActiveDivider, DividerBoundsCache};
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
 use crate::shell::pane_tree::{Axis, SplitInsert};
@@ -382,6 +383,38 @@ pub struct MruSwitcher {
     pub cursor: usize,
 }
 
+fn terminal_view_cwd(
+    view: &crate::shell::terminal_view::TerminalView,
+    fallback: &std::path::Path,
+) -> PathBuf {
+    view.cwd_hint()
+        .or_else(|| view.os_pid().and_then(crate::shell::cwd_resolver::cwd_of_pid))
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+/// The agent the user is currently looking at, resolved from the active group's
+/// active tab. Either a tracked agent session (keyed by id) or a focused plain
+/// terminal that is running a hand-launched (ambient) agent (keyed by its PTY
+/// id, the same per-pane identity the rail rows use). `WorkspaceRoot` maps this
+/// to a `RailAgentTarget` so the rail lights the matching disclosure row.
+#[derive(Clone, Debug)]
+pub enum FocusedRailAgent {
+    Session(AgentSessionId),
+    AmbientTerminal { pty_id: String },
+}
+
+/// One hand-launched (ambient) agent detected in a plain terminal, keyed by the
+/// terminal's PTY id so each pane is its own rail row — mirroring the reference
+/// cockpit's per-pane agent identity instead of collapsing every agent in a
+/// worktree to a single row. `cwd` is carried so the rail can group the row
+/// under the owning workspace; `agent` is the status/label/detail reading.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AmbientAgentEntry {
+    pub pty_id: String,
+    pub cwd: PathBuf,
+    pub agent: AmbientAgent,
+}
+
 impl PaneGroup {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -545,8 +578,12 @@ impl PaneGroup {
             tab.color = meta.color;
             tab.custom_title = meta.custom_title;
         }
-        self.tab_order
-            .sort_by_key(|&i| self.tabs.get(i).and_then(|t| t.restore_rank).unwrap_or(usize::MAX));
+        self.tab_order.sort_by_key(|&i| {
+            self.tabs
+                .get(i)
+                .and_then(|t| t.restore_rank)
+                .unwrap_or(usize::MAX)
+        });
         debug_assert_eq!(self.tabs.len(), self.tab_order.len());
         cx.notify();
     }
@@ -704,6 +741,42 @@ impl PaneGroup {
         })
     }
 
+    /// The agent the user is currently looking at in this group's active tab:
+    /// a tracked agent session, or the cwd of a focused plain-terminal running
+    /// a hand-launched (ambient) agent. `None` when the active tab is not an
+    /// agent surface (plain shell, editor, diff, …) — unlike
+    /// `target_agent_session`, this never falls back to a background tab, so
+    /// the rail lights exactly the focused row or nothing.
+    pub fn focused_rail_agent(&self, cx: &gpui::App) -> Option<FocusedRailAgent> {
+        let tab = self.active_tab()?;
+        match &tab.kind {
+            PaneGroupTabKind::Agent { session_id, .. } => {
+                Some(FocusedRailAgent::Session(*session_id))
+            }
+            PaneGroupTabKind::Terminal => {
+                let PaneContent::Terminal(tree) = &tab.content else {
+                    return None;
+                };
+                let view = tree.active_view()?;
+                let now = std::time::Instant::now();
+                let v = view.read(cx);
+                // Only a terminal actually running an agent gets a rail row to
+                // light; a plain shell does not. Hook sideband or an agent title
+                // is the same presence test the rail uses to group it.
+                let is_agent = v.ambient_agent(now).is_some()
+                    || v.title().and_then(classify_agent_title).is_some();
+                // Key the focused row by the terminal's PTY id, the same per-pane
+                // identity the rail rows carry. No PTY id (pending view) → nothing
+                // to light.
+                is_agent
+                    .then(|| v.external_id())
+                    .flatten()
+                    .map(|pty_id| FocusedRailAgent::AmbientTerminal { pty_id })
+            }
+            _ => None,
+        }
+    }
+
     /// Count of TTY-backed tabs (terminals + agents) in this group.
     /// Excludes editor tabs.
     pub fn tty_count(&self) -> usize {
@@ -750,20 +823,17 @@ impl PaneGroup {
         paths
     }
 
-    /// Agent statuses inferred live from the OSC titles of *plain* terminal
-    /// tabs — a hand-launched agent CLI (typed `claude`/`codex`/… into a
-    /// terminal) the spawn machinery never minted a tracked session for.
-    /// Keyed by the group's `cwd` (the path plain terminals run at, matching
-    /// [`live_worktree_paths`]). `Agent`-kind tabs are excluded: their
-    /// `StatusMachine` is authoritative and already feeds the sidebar.
-    ///
-    /// Multiple views in one tab can each classify; the strongest reading
-    /// (most attention-worthy) wins so a working sub-pane is not masked by an
-    /// idle sibling. The winning view's title also resolves the agent's
-    /// display name when recognizable.
-    pub fn ambient_agent_statuses(&self, cx: &gpui::App) -> Vec<(PathBuf, AmbientAgent)> {
-        use crate::shell::agent_presentation::ambient_status_rank;
-        let mut best: Option<AmbientAgent> = None;
+    /// One [`AmbientAgentEntry`] per terminal PTY running a hand-launched agent
+    /// CLI (typed `claude`/`codex`/… into a plain terminal) the spawn machinery
+    /// never minted a tracked session for. Each PTY is its own entry — the
+    /// reference cockpit's per-pane identity — so N agents in one worktree list
+    /// as N rows rather than collapsing to one. `Agent`-kind tabs are excluded:
+    /// their `StatusMachine` is authoritative and already feeds the sidebar. A
+    /// view with no resolvable PTY id is skipped (it can be neither persisted
+    /// nor focused without one — the same key the ambient persistence uses).
+    pub fn ambient_agents(&self, cx: &gpui::App) -> Vec<AmbientAgentEntry> {
+        let now = std::time::Instant::now();
+        let mut out: Vec<AmbientAgentEntry> = Vec::new();
         for tab in &self.tabs {
             if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
                 continue;
@@ -773,27 +843,67 @@ impl PaneGroup {
             };
             for (_, _, view) in tree.iter_all_views() {
                 let view = view.read(cx);
-                let Some(title) = view.title() else { continue };
-                let Some(status) = classify_agent_title(title) else {
+                let title = view.title();
+                let title_status = title.and_then(classify_agent_title);
+                // Hook sideband (rich + stable) is preferred; the title is the
+                // immediate-presence fallback for an agent that has not yet
+                // emitted a hook. Neither → not an agent.
+                let Some(agent) = (match view.ambient_agent(now) {
+                    Some(sb) => Some(AmbientAgent {
+                        status: sb.status,
+                        // The hook tells us the state, not the CLI; the title
+                        // names it when set, otherwise default to the only CLI
+                        // we install global hooks for.
+                        label: title.and_then(agent_label_from_title).or(Some("Claude Code")),
+                        detail: Some(sb.detail),
+                    }),
+                    None => title_status.map(|status| AmbientAgent {
+                        status,
+                        label: title.and_then(agent_label_from_title),
+                        detail: None,
+                    }),
+                }) else {
                     continue;
                 };
-                let label = agent_label_from_title(title);
-                if best
-                    .as_ref()
-                    .is_none_or(|cur| ambient_status_rank(&status) > ambient_status_rank(&cur.status))
-                {
-                    best = Some(AmbientAgent { status, label });
-                }
+                let Some(pty_id) = view.external_id() else {
+                    continue;
+                };
+                out.push(AmbientAgentEntry {
+                    pty_id,
+                    cwd: terminal_view_cwd(view, &self.cwd),
+                    agent,
+                });
             }
         }
-        best.map(|agent| vec![(self.cwd.clone(), agent)])
-            .unwrap_or_default()
+        out
+    }
+
+    /// Index of the terminal tab whose split tree hosts the PTY `pty_id`, if
+    /// this group owns it. Resolves a rail click on an ambient agent row to the
+    /// exact terminal running it (per-pane focus).
+    pub fn terminal_tab_index_for_pty(&self, pty_id: &str, cx: &gpui::App) -> Option<usize> {
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
+                continue;
+            }
+            let PaneContent::Terminal(tree) = &tab.content else {
+                continue;
+            };
+            if tree
+                .iter_all_views()
+                .any(|(_, _, view)| view.read(cx).external_id().as_deref() == Some(pty_id))
+            {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Count of plain-terminal tabs running a recognizable agent (any view's
     /// title classifies). Feeds the status-bar "N agents" total alongside
     /// spawned `Agent` tabs, so a hand-launched agent registers there too.
     pub fn ambient_agent_count(&self, cx: &gpui::App) -> usize {
+        let now = std::time::Instant::now();
         self.tabs
             .iter()
             .filter(|tab| matches!(tab.kind, PaneGroupTabKind::Terminal))
@@ -802,10 +912,9 @@ impl PaneGroup {
                     return false;
                 };
                 tree.iter_all_views().any(|(_, _, view)| {
-                    view.read(cx)
-                        .title()
-                        .and_then(classify_agent_title)
-                        .is_some()
+                    let view = view.read(cx);
+                    view.ambient_agent(now).is_some()
+                        || view.title().and_then(classify_agent_title).is_some()
                 })
             })
             .count()
@@ -891,6 +1000,15 @@ impl PaneGroup {
         self.tabs.iter().position(|t| {
             matches!(&t.kind, PaneGroupTabKind::Agent { worktree_path, .. } if worktree_path == path)
         })
+    }
+
+    /// Index of the agent tab driving `session_id`, if this group holds it.
+    /// Lets the rail focus the exact agent a sub-row was clicked for, rather
+    /// than just the worktree's first agent tab.
+    pub fn agent_tab_index_for_session(&self, session_id: AgentSessionId) -> Option<usize> {
+        self.tabs.iter().position(
+            |t| matches!(&t.kind, PaneGroupTabKind::Agent { session_id: sid, .. } if *sid == session_id),
+        )
     }
 
     /// Retained for the sidebar-width tracking plumbing (`set_chrome_width`
@@ -1586,9 +1704,11 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        if let Some(idx) = self.tabs.iter().position(|t| {
-            matches!(&t.kind, PaneGroupTabKind::Commit { sha: s } if s == &sha)
-        }) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::Commit { sha: s } if s == &sha))
+        {
             self.set_active(idx, window, cx);
             return idx;
         }
@@ -1613,7 +1733,11 @@ impl PaneGroup {
         // message.
         let label = {
             let subject_trim: String = subject.chars().take(50).collect();
-            let suffix = if subject.chars().count() > 50 { "…" } else { "" };
+            let suffix = if subject.chars().count() > 50 {
+                "…"
+            } else {
+                ""
+            };
             SharedString::from(format!("{short_oid}: {subject_trim}{suffix}"))
         };
         let tab = PaneGroupTab {
@@ -1653,9 +1777,11 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        if let Some(idx) = self.tabs.iter().position(|t| {
-            matches!(&t.kind, PaneGroupTabKind::BranchFile { path: p } if p == &path)
-        }) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::BranchFile { path: p } if p == &path))
+        {
             self.set_active(idx, window, cx);
             return idx;
         }
@@ -2091,18 +2217,17 @@ impl PaneGroup {
 
         // Drop the dialog the moment the user resolves it. Replacing the
         // observer cancels any stale one.
-        self._dirty_close_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |group, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    group.dirty_close_dialog = None;
-                    group._dirty_close_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
+        self._dirty_close_observer =
+            Some(
+                cx.observe_in(&dialog, window, |group, dialog, _window, cx| {
+                    let d = dialog.read(cx);
+                    if d.is_confirmed() || d.is_cancelled() {
+                        group.dirty_close_dialog = None;
+                        group._dirty_close_observer = None;
+                        cx.notify();
+                    }
+                }),
+            );
         self.dirty_close_dialog = Some(dialog);
         cx.notify();
     }
@@ -2513,7 +2638,6 @@ impl PaneGroup {
         cx.notify();
     }
 
-
     pub(crate) fn on_close_tab(
         &mut self,
         _: &CloseTab,
@@ -2713,7 +2837,9 @@ impl PaneGroup {
         let density = self.density;
         let typography = self.typography.clone();
         let composer = cx.new(|cx| {
-            crate::shell::compose_bar::ComposerBar::new(root, theme, density, typography, window, cx)
+            crate::shell::compose_bar::ComposerBar::new(
+                root, theme, density, typography, window, cx,
+            )
         });
         let sub = cx.subscribe_in(
             &composer,

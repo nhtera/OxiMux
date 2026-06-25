@@ -53,7 +53,7 @@ pub const DEFAULT_AGENT_ARGS: &[(&str, &str)] = &[
 /// All per-agent launch settings plus the picker's default agent.
 /// `BTreeMap` (not `HashMap`) so TOML serialization is key-sorted and
 /// round-trips deterministically.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentLaunchSettings {
     /// Adapter id surfaced first in the picker (with a "Default" badge).
@@ -64,13 +64,32 @@ pub struct AgentLaunchSettings {
     /// is never re-seeded on the next launch.
     pub yolo_defaults_migrated: bool,
     /// Enable OSC-9999 status hooks for Claude Code launches: inject the
-    /// `--settings` hooks block so each agent reports the tool it is running,
-    /// surfaced on the dashboard agent card. Off by default (no behaviour
-    /// change for a fresh install). The env var `OXIMUX_STATUS_HOOKS=1`
-    /// force-enables regardless of this flag (a debug escape hatch).
+    /// `--settings` hooks block so each agent reports the user's prompt, the
+    /// tool it is running, and its lifecycle — surfaced as the rail agent
+    /// title + status. **On by default**: this is the whole point of the
+    /// agent cockpit (the reference cockpit keeps its status hooks always on);
+    /// without it the rail can only show a generic "Ready" per agent. A user
+    /// can disable it in Settings → Agents. The env var `OXIMUX_STATUS_HOOKS=1`
+    /// force-enables regardless of this flag (a debug escape hatch). A missing
+    /// key in an existing `agent_launch.toml` picks up this `true` default via
+    /// the container-level `#[serde(default)]`, so the feature lights up on
+    /// upgrade without a manual toggle.
     pub status_hooks_enabled: bool,
     /// Per-agent overrides keyed by adapter id.
     pub agents: BTreeMap<String, PerAgentLaunch>,
+}
+
+impl Default for AgentLaunchSettings {
+    fn default() -> Self {
+        Self {
+            default_agent: String::new(),
+            yolo_defaults_migrated: false,
+            // On by default — see the field docs. An explicit `false` in the
+            // TOML still wins (a present value overrides this default).
+            status_hooks_enabled: true,
+            agents: BTreeMap::new(),
+        }
+    }
 }
 
 impl Global for AgentLaunchSettings {}
@@ -230,11 +249,23 @@ model = "opus"
     }
 
     #[test]
-    fn status_hooks_flag_defaults_off_and_round_trips() {
-        // Absent key → off (no behaviour change for a fresh install).
+    fn status_hooks_flag_defaults_on_and_explicit_false_is_preserved() {
+        // Absent key → ON (the cockpit's status sideband, the reference app's
+        // always-on model). An existing toml without the key lights up on
+        // upgrade via the container `#[serde(default)]`.
         let s = AgentLaunchSettings::from_toml_str("").expect("empty parses");
-        assert!(!s.status_hooks_enabled);
-        // Set → round-trips through TOML.
+        assert!(s.status_hooks_enabled, "missing key defaults to on");
+        // A toml that omits the key but sets other fields still defaults on.
+        let partial = AgentLaunchSettings::from_toml_str(
+            "default_agent = \"\"\nyolo_defaults_migrated = true\n",
+        )
+        .expect("partial parses");
+        assert!(partial.status_hooks_enabled, "partial toml defaults on");
+        // An explicit `false` wins over the default (a present value is kept).
+        let off = AgentLaunchSettings::from_toml_str("status_hooks_enabled = false\n")
+            .expect("explicit off parses");
+        assert!(!off.status_hooks_enabled, "explicit false is preserved");
+        // Round-trips through TOML.
         let on = AgentLaunchSettings {
             status_hooks_enabled: true,
             ..Default::default()

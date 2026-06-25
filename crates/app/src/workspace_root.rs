@@ -339,6 +339,12 @@ pub struct WorkspaceRoot {
     /// `ended_at` if finished, else `started_at`) — same lifecycle as
     /// `rail_latest_status`. Drives the dashboard's in-tier recency sort.
     pub(crate) rail_last_active: HashMap<String, String>,
+    /// Every agent session per workspace id (`agent_sessions` rows, newest
+    /// first) — same gather lifecycle as `rail_latest_status`. `refresh_left_rail`
+    /// merges this DB history with the live `live_agents` map into the rail's
+    /// per-workspace agent list. The single-row caches above stay derived from
+    /// the newest session, so existing collapsed-dot behavior is unchanged.
+    pub(crate) rail_workspace_sessions: HashMap<String, Vec<oximux_core::AgentSession>>,
     /// Live tool-activity line per workspace id ("Bash: cargo test…"),
     /// refreshed by `_agent_activity_task` for Running primary-CLI
     /// sessions and pushed to the rail via `refresh_left_rail`.
@@ -350,6 +356,12 @@ pub struct WorkspaceRoot {
     /// the agent is `Running`; takes precedence over `agent_activity` on the
     /// dashboard's Running rows and is pushed to the rail via `refresh_left_rail`.
     pub(crate) agent_sideband: HashMap<String, oximux_core::SidebandDetail>,
+    /// Live agent sessions keyed by `agent_sessions.id` UUID, fed directly
+    /// from each tab's status watch channel by the persistence watcher. Unlike
+    /// `agent_sideband` (one collapsed entry per workspace key), this holds
+    /// EVERY open agent so the rail can list multiple agents per workspace.
+    /// Entries live only while the session is non-terminal (its tab is open).
+    pub(crate) live_agents: crate::shell::session_live_store::LiveAgentMap,
     /// Latest usage-meter state. `None` only before the first sample lands
     /// (then it is always `Available` or `Unavailable`).
     pub(crate) usage_state: Option<oximux_agents::session_log::usage::UsageState>,
@@ -371,6 +383,15 @@ pub struct WorkspaceRoot {
     /// Guards against overlapping rail gathers (the gather re-runs itself
     /// while `rail_dirty` keeps getting re-set).
     pub(crate) rail_refresh_inflight: bool,
+    /// Cached per-workspace agent lists. `refresh_left_rail` runs every frame
+    /// (WorkspaceRoot re-renders on every agent-output tick via the panes
+    /// observer), and rebuilding 150+ rows each time is the streaming jank.
+    /// Recomputed only when `rail_agents_dirty` flips — a session or live-agent
+    /// change — not on raw terminal output. The cheap per-frame ambient rows are
+    /// appended to a clone of this after the rebuild gate.
+    pub(crate) rail_agents_cache: crate::shell::left_rail::WorkspaceAgentList,
+    /// Marks `rail_agents_cache` stale (session/live-agent change).
+    pub(crate) rail_agents_dirty: bool,
     /// `true` while the window is active. The periodic diff refresh only runs
     /// when focused so an inactive window does not churn `git` in the
     /// background (mirrors the SCM status poller's pause-on-blur behavior).
@@ -1029,14 +1050,18 @@ impl WorkspaceRoot {
             rail_latest_status: HashMap::new(),
             rail_latest_adapter: HashMap::new(),
             rail_last_active: HashMap::new(),
+            rail_workspace_sessions: HashMap::new(),
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
+            live_agents: HashMap::new(),
             usage_state: None,
             usage_popover_open: false,
             #[cfg(target_os = "macos")]
             usage_popover_window: None,
             rail_dirty: false,
             rail_refresh_inflight: false,
+            rail_agents_cache: HashMap::new(),
+            rail_agents_dirty: true,
             diff_refresh_focused: true,
             diff_refresh_in_flight: false,
             _diff_refresh_task: diff_refresh_task,
@@ -1899,13 +1924,16 @@ impl WorkspaceRoot {
             (
                 model.or_else(|| defaults.and_then(|d| d.model_for(adapter_id))),
                 defaults.map(|d| d.args_for(adapter_id)).unwrap_or_default(),
-                defaults.map(|d| d.status_hooks_enabled).unwrap_or(false),
+                // On by default (mirrors `AgentLaunchSettings::default`); also
+                // on when the global isn't seeded yet, so a very early launch
+                // still gets status. A user's explicit `false` flows through.
+                defaults.map(|d| d.status_hooks_enabled).unwrap_or(true),
             )
         };
-        // Opt-in OSC-9999 status hooks (Settings → Agents toggle, or the
-        // OXIMUX_STATUS_HOOKS=1 env override): inject the `--settings` hooks
-        // block so Claude Code emits structured status the poll-loop scanner
-        // reads. Claude-only for now; no-op when off.
+        // OSC-9999 status hooks (on by default; Settings → Agents toggle, or
+        // the OXIMUX_STATUS_HOOKS=1 env override): inject the `--settings`
+        // hooks block so Claude Code emits the prompt + tool + lifecycle the
+        // poll-loop scanner reads. Claude-only for now; no-op when disabled.
         if adapter_id == "claude-code" {
             crate::agent_status_hooks::maybe_inject(status_hooks_on, &mut extra_args);
         }
@@ -2001,7 +2029,10 @@ impl WorkspaceRoot {
                     adapter_id,
                     model.clone(),
                     effort.clone(),
+                    session_id,
                     status_rx.clone(),
+                    // Fresh launch — always inserts a new session row.
+                    false,
                     cx,
                 );
             });

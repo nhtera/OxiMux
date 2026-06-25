@@ -604,6 +604,16 @@ pub struct TerminalView {
     /// ([`adopt_live_session`](Self::adopt_live_session) /
     /// [`respawn_if_dormant`](Self::respawn_if_dormant)).
     exited: Option<i32>,
+    /// Consumes the OSC-9999 status sideband the global hooks emit into THIS
+    /// terminal's output. A hand-typed `claude`/`codex`/… in a plain terminal
+    /// has no `AgentRuntime` to decode its hook packets; this gives such an
+    /// ambient agent the same stable, hook-driven status as a spawned one. Read
+    /// by [`ambient_agent`](Self::ambient_agent); idle for a plain shell.
+    agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan,
+    /// Last ambient reading written to the persistent per-PTY store, so an
+    /// unchanged status doesn't re-hit SQLite every output frame. `None` until
+    /// the first agent reading (a plain shell never writes).
+    last_persisted_ambient: Option<crate::shell::ambient_agent_scan::AmbientSideband>,
 }
 
 impl TerminalView {
@@ -766,6 +776,8 @@ impl TerminalView {
             pending_attach: false,
             pending_relay_hint: None,
             exited: None,
+            agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
+            last_persisted_ambient: None,
         }
     }
 
@@ -965,6 +977,8 @@ impl TerminalView {
             pending_attach: false,
             pending_relay_hint: None,
             exited: None,
+            agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
+            last_persisted_ambient: None,
         }
     }
 
@@ -2115,9 +2129,16 @@ impl TerminalView {
         let mut pty_replies: Vec<Vec<u8>> = Vec::new();
         for ev in &events {
             match ev {
-                TerminalEvent::Output { .. } => {
+                TerminalEvent::Output { bytes, .. } => {
                     needs_snapshot = true;
                     had_output = true;
+                    // Decode any OSC-9999 status sideband the global hooks
+                    // emitted onto this terminal's stream. Cheap for a plain
+                    // shell (skipped unless a marker is present); gives a
+                    // hand-typed agent the same hook-driven status as a spawned
+                    // one. The relay also leaves these private-OSC bytes for the
+                    // emulator, which ignores them — so nothing is displayed.
+                    self.agent_scan.feed(bytes, std::time::Instant::now());
                 }
                 // The child process died. Record the code so render shows a
                 // "process exited" banner; without it a dead leader (e.g. a
@@ -2197,6 +2218,25 @@ impl TerminalView {
         }
         if had_output {
             self.cursor_visible = true;
+            // Persist the ambient-agent reading (keyed by this pane's PTY id)
+            // whenever it changes, so a warm re-attach after a quit re-seeds it
+            // and the rail lists the still-running agent immediately. Written
+            // only on change → no SQLite churn on a steady output stream; a
+            // plain shell never produces a reading, so it never writes.
+            let reading = self.agent_scan.current(std::time::Instant::now());
+            if reading != self.last_persisted_ambient {
+                if let Some(sb) = &reading
+                    && let Some(pty) = self.external_id()
+                {
+                    let (status, detail) = (sb.status.clone(), sb.detail.clone());
+                    cx.background_executor()
+                        .spawn(async move {
+                            crate::shell::ambient_state::persist(&pty, &status, &detail);
+                        })
+                        .detach();
+                }
+                self.last_persisted_ambient = reading;
+            }
         }
         if let Some(title) = latest_title {
             self.title = Some(title);
@@ -2307,6 +2347,36 @@ impl TerminalView {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Hook-derived agent status for this terminal, decoded from the OSC-9999
+    /// sideband, or `None` for a plain shell / an agent that has not yet emitted
+    /// a hook. Richer and more stable than the title heuristic; the ambient
+    /// aggregation prefers it when present.
+    pub fn ambient_agent(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<crate::shell::ambient_agent_scan::AmbientSideband> {
+        self.agent_scan.current(now)
+    }
+
+    /// On a warm re-attach, re-prime the ambient scan from the persisted reading
+    /// for this pane's surviving PTY id. The hook sideband is never stored in
+    /// the byte ring, so a still-running agent would otherwise vanish from the
+    /// rail until its next hook fires (an agent idle at its prompt fires none).
+    /// No-op for a plain terminal (nothing persisted) or a stale reading (the
+    /// store enforces the freshness TTL). Call only after the live session is
+    /// adopted so `external_id()` resolves to the re-attached PTY.
+    pub fn seed_ambient_from_persisted(&mut self) {
+        let Some(pty) = self.external_id() else {
+            return;
+        };
+        if let Some((status, detail)) = crate::shell::ambient_state::load(&pty) {
+            self.agent_scan
+                .seed(status, detail, std::time::Instant::now());
+            self.last_persisted_ambient = self.agent_scan.current(std::time::Instant::now());
+            tracing::debug!(pty_id = %pty, "seeded ambient agent from persisted reading");
+        }
     }
 
     /// Latest OSC 9;4 progress `(state, value)` the child reported, if any.

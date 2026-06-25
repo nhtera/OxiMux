@@ -378,6 +378,7 @@ mod tests {
             tool_input_summary: Some("src/lib.rs".to_string()),
             last_message: None,
             session_id: None,
+            ..Default::default()
         };
         sideband.insert("run".to_string(), edit_detail.clone());
         sideband.insert("done".to_string(), edit_detail);

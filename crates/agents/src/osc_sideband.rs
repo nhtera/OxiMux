@@ -47,6 +47,7 @@ const MAX_TOOL: usize = 64;
 const MAX_TOOL_INPUT: usize = 256;
 const MAX_MSG: usize = 512;
 const MAX_SESSION_ID: usize = 64;
+const MAX_PROMPT: usize = 256;
 
 const BEL: u8 = 0x07;
 const ESC: u8 = 0x1B;
@@ -120,6 +121,13 @@ impl AgentOscScanner {
             payload: Vec::new(),
             truncated: false,
         }
+    }
+
+    /// True while a sideband sequence is mid-parse (a payload split across two
+    /// PTY reads). A caller that gates `feed` on a fresh marker must still feed
+    /// the next chunk while this holds, or it would drop the sequence's tail.
+    pub fn is_active(&self) -> bool {
+        self.state != State::Normal
     }
 
     /// Feed one PTY output chunk. Returns the OSC-9999-stripped bytes plus
@@ -285,6 +293,9 @@ struct WireSideband {
     tool_input: Option<String>,
     msg: Option<String>,
     session_id: Option<String>,
+    /// The user's prompt, carried by the prompt-submit hook. Additive: an
+    /// older payload without it deserializes fine (the field defaults `None`).
+    prompt: Option<String>,
 }
 
 /// Parse one OSC-9999 payload. Returns `None` on malformed JSON, an
@@ -301,6 +312,7 @@ fn parse_sideband_json(bytes: &[u8]) -> Option<SidebandEvent> {
         tool_input_summary: wire.tool_input.map(|s| cap_bytes(s, MAX_TOOL_INPUT)),
         last_message: wire.msg.map(|s| cap_bytes(s, MAX_MSG)),
         session_id: wire.session_id.map(|s| cap_bytes(s, MAX_SESSION_ID)),
+        prompt: wire.prompt.map(|s| cap_bytes(s, MAX_PROMPT)),
     };
     Some(SidebandEvent { state, detail })
 }
@@ -482,14 +494,24 @@ mod tests {
         let long_input = "a".repeat(MAX_TOOL_INPUT + 50);
         let long_msg = "b".repeat(MAX_MSG + 50);
         let long_sid = "c".repeat(MAX_SESSION_ID + 50);
+        let long_prompt = "d".repeat(MAX_PROMPT + 50);
         let bytes = osc(&format!(
-            r#"{{"v":1,"state":"working","tool_input":"{long_input}","msg":"{long_msg}","session_id":"{long_sid}"}}"#
+            r#"{{"v":1,"state":"working","tool_input":"{long_input}","msg":"{long_msg}","session_id":"{long_sid}","prompt":"{long_prompt}"}}"#
         ));
         let out = sc.feed(&bytes);
         let d = out.event.expect("event").detail;
         assert_eq!(d.tool_input_summary.unwrap().len(), MAX_TOOL_INPUT);
         assert_eq!(d.last_message.unwrap().len(), MAX_MSG);
         assert_eq!(d.session_id.unwrap().len(), MAX_SESSION_ID);
+        assert_eq!(d.prompt.unwrap().len(), MAX_PROMPT);
+    }
+
+    #[test]
+    fn prompt_field_decodes() {
+        let mut sc = AgentOscScanner::new();
+        let bytes = osc(r#"{"v":1,"state":"working","prompt":"fix the parser bug"}"#);
+        let ev = sc.feed(&bytes).event.expect("event");
+        assert_eq!(ev.detail.prompt.as_deref(), Some("fix the parser bug"));
     }
 
     #[test]

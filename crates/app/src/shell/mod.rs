@@ -6,6 +6,8 @@
 pub mod adapter_picker;
 pub mod agent_presentation;
 pub mod agent_session_persistence;
+pub mod ambient_agent_scan;
+pub mod ambient_state;
 pub mod agents_dashboard;
 pub mod add_project_dialog;
 pub mod agent_status_badge;
@@ -46,6 +48,8 @@ pub mod rename_tab_dialog;
 pub mod right_sidebar;
 pub mod search_panel;
 pub mod session_history;
+pub mod session_live_store;
+pub mod session_merge;
 pub mod settings_modal;
 pub mod source_control;
 pub mod split_direction;

@@ -252,6 +252,18 @@ impl ProjectPanes {
     /// agent (most-direct routing for the common "terminal + agent side
     /// by side" layout); (2) any group's active tab that's an agent; (3)
     /// any agent tab anywhere. Returns `None` when no agent is open.
+    /// The agent whose tab is the active pane, for the rail's focused-row
+    /// highlight. Resolves the active group's active tab only — no fallback to
+    /// background tabs or other groups (unlike `target_agent_session`), so the
+    /// highlight tracks exactly what the user is looking at. `None` when the
+    /// active tab is not an agent surface.
+    pub fn focused_rail_agent(
+        &self,
+        cx: &App,
+    ) -> Option<crate::shell::pane_group::FocusedRailAgent> {
+        self.active_group()?.read(cx).focused_rail_agent(cx)
+    }
+
     pub fn target_agent_session(&self, cx: &App) -> Option<AgentSessionId> {
         if let Some(active) = self.active_group()
             && let Some(id) = active.read(cx).active_agent_session()
@@ -681,7 +693,8 @@ impl ProjectPanes {
         let Some(frac) = crate::shell::divider::fraction_along(&active, pos) else {
             return false;
         };
-        let new_weights = render::redistribute_weights(&active.initial_weights, active.divider_idx, frac);
+        let new_weights =
+            render::redistribute_weights(&active.initial_weights, active.divider_idx, frac);
         self.set_split_weights(&active.split_path, new_weights, cx)
     }
 
@@ -810,17 +823,12 @@ impl ProjectPanes {
             // Prefer the last terminal group in DFS order so a freshly-split
             // pane ends up at the bottom (matches the "dock newest terminal"
             // expectation).
-            let existing = self
-                .manager
-                .in_order_groups()
-                .into_iter()
-                .rev()
-                .find(|id| {
-                    self.groups
-                        .get(id)
-                        .map(|g| g.read(cx).tty_count() > 0)
-                        .unwrap_or(false)
-                });
+            let existing = self.manager.in_order_groups().into_iter().rev().find(|id| {
+                self.groups
+                    .get(id)
+                    .map(|g| g.read(cx).tty_count() > 0)
+                    .unwrap_or(false)
+            });
             match existing {
                 Some(id) => Some(id),
                 // No terminal group exists yet — spawn one. `split_active_group`
@@ -937,6 +945,77 @@ impl ProjectPanes {
         true
     }
 
+    /// Whether any group in these panes holds the agent tab for `session_id`.
+    /// Read-only — used to locate the owning project before switching to it.
+    pub fn has_agent_session(
+        &self,
+        session_id: oximux_core::AgentSessionId,
+        cx: &gpui::App,
+    ) -> bool {
+        self.groups
+            .values()
+            .any(|g| g.read(cx).agent_tab_index_for_session(session_id).is_some())
+    }
+
+    /// Activate the tab driving `session_id` (its group becomes active, then
+    /// the tab within it). Mirror of `focus_workspace_tab` but keyed by the
+    /// runtime session rather than the worktree, so a clicked rail sub-row
+    /// focuses that exact agent. Returns `false` if no group holds it.
+    pub fn focus_agent_session(
+        &mut self,
+        session_id: oximux_core::AgentSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .agent_tab_index_for_session(session_id)
+                .map(|idx| (*id, idx))
+        });
+        let Some((id, idx)) = existing else {
+            return false;
+        };
+        self.set_active_group(id, window, cx);
+        if let Some(group) = self.groups.get(&id).cloned() {
+            group.update(cx, |g, cx| g.set_active(idx, window, cx));
+        }
+        true
+    }
+
+    /// Whether any group hosts the terminal PTY `pty_id` (the per-pane identity
+    /// an ambient agent rail row is keyed by).
+    pub fn has_terminal_pty(&self, pty_id: &str, cx: &gpui::App) -> bool {
+        self.groups
+            .values()
+            .any(|group| group.read(cx).terminal_tab_index_for_pty(pty_id, cx).is_some())
+    }
+
+    /// Activate the terminal tab hosting the PTY `pty_id`. This is the
+    /// ambient-terminal counterpart of `focus_agent_session`, focusing the
+    /// exact pane the user clicked in the rail (per-pane identity).
+    pub fn focus_ambient_agent_terminal(
+        &mut self,
+        pty_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let existing: Option<(PaneGroupId, usize)> = self.groups.iter().find_map(|(id, group)| {
+            group
+                .read(cx)
+                .terminal_tab_index_for_pty(pty_id, cx)
+                .map(|idx| (*id, idx))
+        });
+        let Some((id, idx)) = existing else {
+            return false;
+        };
+        self.set_active_group(id, window, cx);
+        if let Some(group) = self.groups.get(&id).cloned() {
+            group.update(cx, |g, cx| g.set_active(idx, window, cx));
+        }
+        true
+    }
+
     /// Collect the worktree paths kept "live" by open PTY tabs across all
     /// groups (as strings, to match the sidebar's `Workspace.worktree_path`).
     /// Drives the left rail's live/idle status dot: a workspace with an
@@ -951,30 +1030,20 @@ impl ProjectPanes {
         set
     }
 
-    /// Ambient agent statuses inferred from plain-terminal titles across all
-    /// groups, keyed by worktree path string (matching
-    /// `Workspace.worktree_path`). When several groups/terminals key the same
-    /// path, the strongest (most attention-worthy) reading wins. Surfaces a
-    /// hand-launched agent on the sidebar without a tracked session.
-    pub fn ambient_agent_statuses(
+    /// Every hand-launched (ambient) agent across all groups, one entry per
+    /// terminal PTY (the per-pane identity the rail lists as its own row).
+    /// Surfaces hand-launched agents on the sidebar without a tracked session;
+    /// grouping under a workspace + collapsing for the single-agent card dot is
+    /// the caller's job (it resolves each entry's cwd to a worktree root).
+    pub fn ambient_agents(
         &self,
         cx: &gpui::App,
-    ) -> std::collections::HashMap<String, crate::shell::agent_presentation::AmbientAgent> {
-        use crate::shell::agent_presentation::{AmbientAgent, ambient_status_rank};
-        let mut map: std::collections::HashMap<String, AmbientAgent> =
-            std::collections::HashMap::new();
+    ) -> Vec<crate::shell::pane_group::AmbientAgentEntry> {
+        let mut out = Vec::new();
         for group in self.groups.values() {
-            for (path, agent) in group.read(cx).ambient_agent_statuses(cx) {
-                let key = path.display().to_string();
-                let replace = map.get(&key).is_none_or(|cur| {
-                    ambient_status_rank(&agent.status) > ambient_status_rank(&cur.status)
-                });
-                if replace {
-                    map.insert(key, agent);
-                }
-            }
+            out.extend(group.read(cx).ambient_agents(cx));
         }
-        map
+        out
     }
 
     /// Open or activate a diff tab in the active group for `(path, staged)`.
@@ -1339,7 +1408,13 @@ impl ProjectPanes {
                             } else {
                                 (url.clone(), None)
                             };
-                        (None, PersistedTabKind::Browser { url: live, profile_id })
+                        (
+                            None,
+                            PersistedTabKind::Browser {
+                                url: live,
+                                profile_id,
+                            },
+                        )
                     }
                     PaneGroupTabKind::Agent {
                         adapter,
@@ -1357,11 +1432,14 @@ impl ProjectPanes {
                         // still-running CLI instead of respawning it. Paired
                         // with the current relay session id — restore only
                         // re-attaches when both still match.
-                        let relay_external_id = if let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content {
-                            tree.active_view().and_then(|v| v.read(cx).external_id())
-                        } else {
-                            None
-                        };
+                        let relay_external_id =
+                            if let crate::shell::pane_content::PaneContent::Terminal(tree) =
+                                &tab.content
+                            {
+                                tree.active_view().and_then(|v| v.read(cx).external_id())
+                            } else {
+                                None
+                            };
                         let relay_session = relay_external_id.as_ref().and_then(|_| {
                             crate::shell::terminal_view::relay_state_snapshot().session_id
                         });

@@ -1,0 +1,92 @@
+//! Per-agent rail row + the per-workspace list it composes into.
+//!
+//! Today the rail shows one collapsed status per workspace. To list every
+//! agent under a workspace, the merge step (`session_merge`) produces one
+//! `RailAgentRow` per agent — live sessions (from the runtime's
+//! `LiveAgentMap`) unified with DB history rows by their shared
+//! `agent_sessions.id` UUID. Phase 3's render reads `WorkspaceAgentList`.
+
+use gpui::SharedString;
+use oximux_agents::AgentStatusStream;
+use oximux_core::AgentStatus;
+
+/// What a clickable rail row should focus. Tracked agent sessions focus by
+/// their DB UUID → runtime session mapping; ambient terminal agents focus by
+/// the PTY id of the exact terminal running the hand-launched agent — one row
+/// per terminal, like the reference cockpit's per-pane identity (not collapsed
+/// to one row per worktree).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RailAgentTarget {
+    AgentSession { db_id: String },
+    AmbientTerminal { pty_id: String },
+}
+
+/// One agent in a workspace's rail list — a live session, a finished
+/// history row, or a live session whose DB insert hasn't landed yet.
+#[derive(Clone)]
+pub struct RailAgentRow {
+    /// Stable row key. For tracked sessions this is `agent_sessions.id`; for
+    /// ambient terminal agents this is a synthetic `ambient:<pty_id>` key, so
+    /// each hand-launched terminal is its own row.
+    pub db_id: String,
+    /// Focus target for live tracked rows and ambient terminal rows.
+    pub target: RailAgentTarget,
+    /// Owning workspace key (`workspaces.id` or `primary:<project_id>`).
+    pub workspace_key: String,
+    /// Adapter slug (`claude-code`, `codex`, …).
+    pub adapter_id: String,
+    /// Display label (adapter name; Phase 3 may add a per-workspace index).
+    pub label: SharedString,
+    /// `true` when a live `LiveAgentEntry` backs this row.
+    pub is_live: bool,
+    /// Live status receiver — `Some` only when `is_live`. Render reads the
+    /// current status via `status_rx.borrow()`; falls back to `db_status`.
+    pub status_rx: Option<AgentStatusStream>,
+    /// DB-persisted status (the last-known / terminal state for history).
+    pub db_status: AgentStatus,
+    /// Launch timestamp (RFC-3339), for ordering + relative-age rendering.
+    pub started_at: Option<String>,
+    /// Terminal timestamp (RFC-3339), `None` while live/non-terminal.
+    pub ended_at: Option<String>,
+    /// Pre-formatted relative age shown on the right of the row (e.g. "now",
+    /// "3d"). Computed at merge time against a captured `now` so render needs
+    /// no clock. Empty when no timestamp is available.
+    pub age_label: String,
+    /// DB-persisted title (the agent's most recent prompt). The rail title
+    /// falls back to this when the live status channel carries no prompt — so a
+    /// restored or re-adopted session keeps its title across an app restart.
+    /// `None` for a session that never captured a prompt.
+    pub persisted_title: Option<String>,
+    /// DB-persisted last assistant reply for a tracked row. The rail's secondary
+    /// text + done-check fall back to this when the live status channel carries
+    /// no message — so a restored or re-adopted session keeps showing its
+    /// finished-turn reply across an app restart, instead of reverting to the
+    /// bare status verb. `None` for a session that never produced a reply, and
+    /// for ambient rows (which carry their message in `ambient_detail`).
+    pub persisted_message: Option<String>,
+    /// Hook sideband detail for an AMBIENT row (no `status_rx`): the live tool
+    /// step + last assistant message that drive the row's secondary text and the
+    /// "finished a turn" (done check) indicator. `None` for tracked rows, which
+    /// read the same fields live from `status_rx`.
+    pub ambient_detail: Option<oximux_core::SidebandDetail>,
+}
+
+impl RailAgentRow {
+    /// Effective status for render: the live snapshot when present, else the
+    /// DB-persisted status. Live always wins — it is fresher than the row.
+    pub fn effective_status(&self) -> AgentStatus {
+        match &self.status_rx {
+            Some(rx) => rx.borrow().status.clone(),
+            None => self.db_status.clone(),
+        }
+    }
+
+    /// Whether this row currently has a live pane/tab to focus.
+    pub fn is_focusable(&self) -> bool {
+        self.is_live || matches!(self.target, RailAgentTarget::AmbientTerminal { .. })
+    }
+}
+
+/// Per-workspace agent lists keyed by workspace key. Each value is sorted
+/// live-first, then most-recent `started_at` first.
+pub type WorkspaceAgentList = std::collections::HashMap<String, Vec<RailAgentRow>>;

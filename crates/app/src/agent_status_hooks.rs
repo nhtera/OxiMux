@@ -1,11 +1,14 @@
-//! Opt-in agent status hooks for Claude Code.
+//! Agent status hooks for Claude Code (on by default).
 //!
-//! Enabled by the **Settings → Agents** "Status hooks" toggle (persisted as
-//! `status_hooks_enabled` in `agent_launch.toml`), or by the env var
-//! `OXIMUX_STATUS_HOOKS=1` which force-enables regardless (a debug escape
-//! hatch). When on, a Claude Code agent is launched with a `--settings` block
-//! that wires three hooks to the `oximux agent-status` CLI:
+//! On by default (`status_hooks_enabled` in `agent_launch.toml` defaults to
+//! `true`); disabled via the **Settings → Agents** "Status hooks" toggle. The
+//! env var `OXIMUX_STATUS_HOOKS=1` force-enables regardless of the flag (a
+//! debug escape hatch). When on, a Claude Code agent is launched with a
+//! `--settings` block that wires four hooks to the `oximux agent-status` CLI:
 //!
+//! - `UserPromptSubmit` → `--state working` (`{"state":"working","prompt":<text>}`)
+//!   — fires the instant the user submits, carrying the prompt that becomes the
+//!   agent's rail title and flipping the dot to working right away.
 //! - `PreToolUse`   → `--state working` (`{"state":"working","tool":<name>}`)
 //! - `Notification` → `--state needs_approval --filter-notification` — Claude
 //!   fires `Notification` (NOT `PermissionRequest`, which never fires) when it
@@ -14,8 +17,8 @@
 //!   permission prompt, ignoring the benign "waiting for your input" nudge.
 //! - `Stop`         → `--state idle` (`{"state":"idle"}`)
 //!
-//! The CLI reads the hook event JSON on stdin (for the tool name), reads
-//! `OXIMUX_PTY_ID` (injected by the relay at spawn), and asks the relay to
+//! The CLI reads the hook event JSON on stdin (for the tool name / prompt),
+//! reads `OXIMUX_PTY_ID` (injected by the relay at spawn), and asks the relay to
 //! emit an OSC-9999 status packet on that PTY's output stream. OxiMux's scanner
 //! (`oximux-agents` `osc_sideband`) decodes it into structured agent status.
 //!
@@ -30,7 +33,8 @@
 //!   JSON STRING at spawn, never written into the user's `~/.claude` config.
 //!   Because `--settings` replaces (not deep-merges) the `hooks` key, we read
 //!   the user's existing global hooks and merge ours in, so theirs keep firing.
-//! - **Opt-in.** Off unless the Settings toggle is on (or the env override).
+//! - **On by default.** The cockpit's status sideband; the Settings toggle (or
+//!   an explicit `status_hooks_enabled = false`) opts out.
 //! - **`Stop` → `idle`, not `done`.** A finished turn is not a dead process;
 //!   the terminal `Done` state comes from the PTY exit event, not a hook.
 
@@ -43,6 +47,15 @@ const ENABLE_ENV: &str = "OXIMUX_STATUS_HOOKS";
 /// Cap the reported tool name so a pathological hook payload can't bloat the
 /// OSC-9999 packet. The scanner caps again, but trimming at the source is free.
 const MAX_TOOL_LEN: usize = 64;
+
+/// Cap the captured prompt at the source. The scanner caps again (256 bytes);
+/// trimming here keeps the OSC-9999 packet small and bounds a giant paste.
+const MAX_PROMPT_LEN: usize = 200;
+
+/// Cap the captured last-assistant message (the row's secondary text for a
+/// finished turn). The scanner caps again (512 bytes); the rail truncates the
+/// rendered line, so a tight source cap keeps the OSC-9999 packet small.
+const MAX_MSG_LEN: usize = 200;
 
 /// True when the env override forces status hooks on (`OXIMUX_STATUS_HOOKS=1`),
 /// independent of the persisted Settings toggle. A debug escape hatch — the
@@ -67,25 +80,65 @@ fn build_settings_json_with(user_hooks: Option<Value>, binary_path: &Path) -> St
     let mut hooks = user_hooks
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
+    for spec in status_hook_specs(binary_path) {
+        append_hook(&mut hooks, spec.event, spec.matcher, &spec.command);
+    }
+    json!({ "hooks": hooks }).to_string()
+}
+
+/// One status hook: which Claude event drives it, an optional tool matcher, and
+/// the `oximux agent-status` command line it runs.
+pub(crate) struct HookSpec {
+    pub event: &'static str,
+    pub matcher: Option<&'static str>,
+    pub command: String,
+}
+
+/// The four status hooks wiring Claude events to the `oximux agent-status` CLI.
+///
+/// The single source of truth for both the per-spawn `--settings` JSON and the
+/// global `~/.claude/settings.json` install — so the COMMAND STRINGS are
+/// byte-identical and Claude's command-string hook dedup makes a picker-launched
+/// agent (which sees both) fire each hook exactly once.
+pub(crate) fn status_hook_specs(binary_path: &Path) -> Vec<HookSpec> {
     // The command single-quotes the binary path (an installed app bundle path
     // can contain spaces, e.g. "Application Support") then appends the CLI
     // subcommand. Escape any embedded single quote (`'` → `'\''`) so a home dir
     // like `/Users/O'X` can't break out of the quoting into shell injection.
     let quoted = binary_path.display().to_string().replace('\'', "'\\''");
     let cmd = |state: &str| format!("'{quoted}' agent-status --state {state}");
-    append_hook(&mut hooks, "PreToolUse", Some("*"), &cmd("working"));
-    // `Notification` (no matcher — like `Stop`) is the event Claude actually
-    // fires for a tool-permission prompt; `PermissionRequest` is a dead name in
-    // current Claude. `--filter-notification` gates the emit on the payload's
-    // `notification_type` so only a real permission ask reports needs_approval.
-    append_hook(
-        &mut hooks,
-        "Notification",
-        None,
-        &format!("'{quoted}' agent-status --state needs_approval --filter-notification"),
-    );
-    append_hook(&mut hooks, "Stop", None, &cmd("idle"));
-    json!({ "hooks": hooks }).to_string()
+    vec![
+        HookSpec {
+            event: "PreToolUse",
+            matcher: Some("*"),
+            command: cmd("working"),
+        },
+        // `UserPromptSubmit` fires the instant the user submits a prompt —
+        // whether typed into the agent's own TUI or sent from OxiMux. It carries
+        // the prompt text, captured as the agent's rail title, and flips the dot
+        // to working immediately (a text-only reply that calls no tool would
+        // otherwise look idle for its whole turn). No matcher (like `Stop`).
+        HookSpec {
+            event: "UserPromptSubmit",
+            matcher: None,
+            command: cmd("working"),
+        },
+        // `Notification` (no matcher — like `Stop`) is the event Claude actually
+        // fires for a tool-permission prompt; `PermissionRequest` is a dead name
+        // in current Claude. `--filter-notification` gates the emit on the
+        // payload's `notification_type` so only a real permission ask reports
+        // needs_approval.
+        HookSpec {
+            event: "Notification",
+            matcher: None,
+            command: format!("'{quoted}' agent-status --state needs_approval --filter-notification"),
+        },
+        HookSpec {
+            event: "Stop",
+            matcher: None,
+            command: cmd("idle"),
+        },
+    ]
 }
 
 /// Append one `{matcher?, hooks:[{type:command, command, async}]}` entry to the
@@ -206,15 +259,118 @@ pub fn notification_is_permission(stdin_json: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the user's `prompt` from a Claude `UserPromptSubmit` hook event
+/// JSON. Best-effort: a parse failure or missing/empty field yields `None`.
+/// Whitespace-trimmed and capped at [`MAX_PROMPT_LEN`] chars (the scanner caps
+/// again in bytes) so a giant paste can't bloat the OSC-9999 packet.
+pub fn prompt_from_hook_json(stdin_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin_json).ok()?;
+    let prompt = value.get("prompt")?.as_str()?.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(prompt.chars().take(MAX_PROMPT_LEN).collect())
+}
+
+/// Extract the agent's most recent assistant text reply from a `Stop` hook
+/// event. Two sources, in the reference cockpit's order. First, the
+/// `last_assistant_message` field Claude puts directly on the Stop event: it is
+/// populated synchronously with the hook, so it avoids both a file read and the
+/// transcript-flush RACE — the Stop hook can fire before the turn's final
+/// assistant line is written to the JSONL, which left the row blank. Second, as
+/// a fallback (older Claude builds, or an event without the direct field), the
+/// `transcript_path` JSONL tail: the last `type:"assistant"` line whose
+/// `message.content` carries a text part.
+///
+/// Best-effort: any IO/parse failure yields `None`. Whitespace is collapsed to
+/// one line and capped at [`MAX_MSG_LEN`] chars (the scanner caps again in
+/// bytes). This becomes the row's secondary text for a finished turn — the
+/// reference cockpit's `lastAssistantMessage`.
+pub fn last_assistant_message_from_hook_json(stdin_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin_json).ok()?;
+    // 1. The reply handed to us directly — preferred, race-free.
+    if let Some(msg) = value
+        .get("last_assistant_message")
+        .and_then(Value::as_str)
+        .and_then(normalize_message)
+    {
+        return Some(msg);
+    }
+    // 2. Fallback: scan the transcript tail. `str::lines()` is double-ended, so
+    // `.rev()` walks newest-first without allocating a Vec; we stop at the first
+    // assistant line that has text.
+    let path = value.get("transcript_path")?.as_str()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let content = entry.get("message").and_then(|m| m.get("content"));
+        if let Some(msg) = assistant_text_from_content(content) {
+            return Some(msg);
+        }
+    }
+    None
+}
+
+/// Collapse whitespace to a single line and cap at [`MAX_MSG_LEN`] chars.
+/// `None` when nothing is left after trimming.
+fn normalize_message(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(MAX_MSG_LEN).collect())
+}
+
+/// Join the `text` parts of an assistant message's `content` array into one
+/// collapsed, capped line. Assistant turns interleave `text` and `tool_use`
+/// parts; only the text is human-facing. `None` when there is no text part.
+fn assistant_text_from_content(content: Option<&Value>) -> Option<String> {
+    let arr = content?.as_array()?;
+    let mut out = String::new();
+    for part in arr {
+        if part.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(t) = part.get("text").and_then(Value::as_str)
+        {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(t);
+        }
+    }
+    normalize_message(&out)
+}
+
 /// Build the OSC-9999 inner JSON payload (`{"v":1,"state":..,"tool":..}`) the
 /// relay wraps and the scanner decodes. Serialized via `serde_json` so control
-/// characters in `tool` are escaped — the relay treats the result as opaque.
-pub fn build_status_payload(state: &str, tool: Option<&str>) -> String {
+/// characters in `tool`/`prompt`/`msg` are escaped — the relay treats the
+/// result as opaque. `prompt` is present only on `UserPromptSubmit`; `msg` (the
+/// last assistant reply) only on `Stop`.
+pub fn build_status_payload(
+    state: &str,
+    tool: Option<&str>,
+    prompt: Option<&str>,
+    message: Option<&str>,
+) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("v".into(), json!(1));
     obj.insert("state".into(), json!(state));
     if let Some(t) = tool {
         obj.insert("tool".into(), json!(t));
+    }
+    if let Some(p) = prompt {
+        obj.insert("prompt".into(), json!(p));
+    }
+    if let Some(m) = message {
+        obj.insert("msg".into(), json!(m));
     }
     Value::Object(obj).to_string()
 }
@@ -230,13 +386,23 @@ mod tests {
     }
 
     #[test]
-    fn settings_json_wires_three_events_to_agent_status_cli() {
+    fn settings_json_wires_four_events_to_agent_status_cli() {
         let json = build_settings_json_with(None, binary_path());
         let v: Value = serde_json::from_str(&json).unwrap();
         let hooks = &v["hooks"];
         assert!(hooks["PreToolUse"].is_array());
         assert!(hooks["Notification"].is_array());
         assert!(hooks["Stop"].is_array());
+        // UserPromptSubmit (no matcher, like Stop) reports working and carries
+        // the prompt the CLI reads from stdin.
+        assert!(hooks["UserPromptSubmit"].is_array());
+        assert!(hooks["UserPromptSubmit"][0].get("matcher").is_none());
+        assert!(
+            hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" agent-status --state working")
+        );
         // PreToolUse: matcher "*", async true, command single-quotes the binary
         // path and calls `agent-status --state working`.
         let pre = &hooks["PreToolUse"][0];
@@ -357,7 +523,7 @@ mod tests {
     /// what the Phase-1 scanner decodes.
     #[test]
     fn payload_round_trips_through_scanner() {
-        let payload = build_status_payload("working", Some("Bash"));
+        let payload = build_status_payload("working", Some("Bash"), None, None);
         // Relay envelope: ESC ] 9999 ; <payload> BEL.
         let mut bytes = b"\x1b]9999;".to_vec();
         bytes.extend_from_slice(payload.as_bytes());
@@ -371,11 +537,124 @@ mod tests {
         assert!(scan.cleaned.is_empty(), "OSC bytes fully stripped");
     }
 
+    /// End-to-end proof for the prompt path: the payload the CLI builds from a
+    /// `UserPromptSubmit` hook, wrapped in the relay's OSC-9999 envelope, is
+    /// decoded by the scanner with the prompt intact.
+    #[test]
+    fn prompt_payload_round_trips_through_scanner() {
+        let prompt = prompt_from_hook_json(
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"refactor the auth module"}"#,
+        );
+        let payload = build_status_payload("working", None, prompt.as_deref(), None);
+        let mut bytes = b"\x1b]9999;".to_vec();
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.push(0x07);
+
+        let mut scanner = AgentOscScanner::new();
+        let ev = scanner.feed(&bytes).event.expect("scanner decoded event");
+        assert_eq!(ev.state, AgentSidebandState::Working);
+        assert_eq!(ev.detail.prompt.as_deref(), Some("refactor the auth module"));
+    }
+
     #[test]
     fn idle_payload_has_no_tool() {
-        let payload = build_status_payload("idle", None);
+        let payload = build_status_payload("idle", None, None, None);
         let v: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["state"], "idle");
         assert!(v.get("tool").is_none());
+        assert!(v.get("prompt").is_none());
+        assert!(v.get("msg").is_none());
+    }
+
+    #[test]
+    fn prompt_is_extracted_trimmed_and_capped() {
+        let stdin =
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"  fix the parser bug  "}"#;
+        assert_eq!(
+            prompt_from_hook_json(stdin).as_deref(),
+            Some("fix the parser bug")
+        );
+        // Absent / empty / non-JSON → None (the hook still no-ops cleanly).
+        assert_eq!(prompt_from_hook_json(r#"{"prompt":"   "}"#), None);
+        assert_eq!(prompt_from_hook_json(r#"{"hook_event_name":"Stop"}"#), None);
+        assert_eq!(prompt_from_hook_json("not json"), None);
+        // Cap.
+        let long = "x".repeat(MAX_PROMPT_LEN + 50);
+        let payload = format!(r#"{{"prompt":"{long}"}}"#);
+        assert_eq!(
+            prompt_from_hook_json(&payload).unwrap().chars().count(),
+            MAX_PROMPT_LEN
+        );
+    }
+
+    #[test]
+    fn payload_carries_prompt_when_present() {
+        let payload = build_status_payload("working", None, Some("hello there"), None);
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["state"], "working");
+        assert_eq!(v["prompt"], "hello there");
+    }
+
+    #[test]
+    fn stop_payload_carries_last_assistant_message_as_msg() {
+        let payload = build_status_payload("idle", None, None, Some("All set — tests pass."));
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["state"], "idle");
+        assert_eq!(v["msg"], "All set — tests pass.");
+    }
+
+    #[test]
+    fn last_assistant_message_reads_the_transcript_tail() {
+        use std::io::Write;
+        // A JSONL transcript: a user line, an assistant turn with a tool_use
+        // (no text), then the final assistant turn with the text reply. We must
+        // skip the tool-only turn and return the last TEXT reply, collapsed.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("oximux-transcript-test-{}.jsonl", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"content":"hi"}}}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"working on it"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Edit"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"  Done!\nShipped the   fix.  "}}]}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let stdin = format!(r#"{{"hook_event_name":"Stop","transcript_path":"{}"}}"#, path.display());
+        let msg = last_assistant_message_from_hook_json(&stdin);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(msg.as_deref(), Some("Done! Shipped the fix."));
+
+        // No transcript_path / bad JSON → None (hook still no-ops cleanly).
+        assert_eq!(last_assistant_message_from_hook_json(r#"{"hook_event_name":"Stop"}"#), None);
+        assert_eq!(last_assistant_message_from_hook_json("not json"), None);
+    }
+
+    #[test]
+    fn last_assistant_message_prefers_the_direct_stop_field() {
+        // Claude puts the reply directly on the Stop event. We must use it
+        // (collapsed/capped) WITHOUT touching the transcript — it is race-free
+        // (the JSONL may not be flushed yet) and points at a path here that does
+        // not exist, proving the field wins over the file.
+        let stdin = r#"{"hook_event_name":"Stop","transcript_path":"/no/such/file.jsonl","last_assistant_message":"  hello   there  "}"#;
+        assert_eq!(
+            last_assistant_message_from_hook_json(stdin).as_deref(),
+            Some("hello there")
+        );
+
+        // An empty/blank direct field falls back to the transcript path (here
+        // absent → None), never returning a blank string.
+        let blank = r#"{"hook_event_name":"Stop","last_assistant_message":"   "}"#;
+        assert_eq!(last_assistant_message_from_hook_json(blank), None);
     }
 }
