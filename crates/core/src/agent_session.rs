@@ -217,4 +217,8 @@ pub struct AgentSession {
     /// the turn progresses so a restored or re-adopted session keeps its rail
     /// title across an app restart. `None` until a prompt has been captured.
     pub title: Option<String>,
+    /// The agent's last assistant reply, persisted on `Stop` so a restored
+    /// session keeps showing its finished-turn message in the rail instead of
+    /// reverting to the bare status verb. `None` until a turn produced a reply.
+    pub last_message: Option<String>,
 }

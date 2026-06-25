@@ -154,6 +154,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "agent_sessions_title",
         sql: include_str!("../migrations/V017__agent_sessions_title.sql"),
     },
+    Migration {
+        version: 18,
+        name: "agent_sessions_last_message",
+        sql: include_str!("../migrations/V018__agent_sessions_last_message.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

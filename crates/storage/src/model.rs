@@ -123,6 +123,10 @@ pub struct AgentSessionRow {
     /// The agent's persisted title (its most recent prompt). `None` until a
     /// prompt has been captured for the session.
     pub title: Option<String>,
+    /// The agent's last assistant reply, persisted so a restored session keeps
+    /// showing its finished-turn message in the rail. `None` until a turn has
+    /// produced a reply for the session.
+    pub last_message: Option<String>,
 }
 
 impl AgentSessionRow {
@@ -139,6 +143,7 @@ impl AgentSessionRow {
             started_at: row.get("started_at")?,
             ended_at: row.get("ended_at")?,
             title: row.get("title")?,
+            last_message: row.get("last_message")?,
         })
     }
 }
@@ -160,6 +165,7 @@ impl From<AgentSessionRow> for AgentSession {
             started_at: r.started_at,
             ended_at: r.ended_at,
             title: r.title,
+            last_message: r.last_message,
         }
     }
 }
