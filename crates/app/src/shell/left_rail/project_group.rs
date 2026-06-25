@@ -179,15 +179,16 @@ pub fn render_project_group(
         // Diff counts are looked up from the pushed-down cache; `None` means
         // not yet available — the card renders without the chip.
         let diff = diff_counts.get(&workspace.worktree_path).cloned();
-        // A single-agent workspace surfaces its live agent's prompt as the
-        // card's title (the dot still carries status). Multi-agent workspaces
-        // (rows > 1) defer to the disclosure below, so they stay on the
-        // `name · verb` summary. Read live from the one row's status receiver.
+        // A single-agent workspace surfaces the agent's prompt as the card's
+        // title (the dot still carries status). This includes a restored,
+        // non-live agent: its persisted title shows after a restart instead of
+        // decaying to the bare status verb, matching the reference cockpit.
+        // Multi-agent workspaces (rows > 1) defer to the disclosure below, so
+        // they stay on the `name · verb` summary.
         let agent_title = workspace_agents
             .get(&workspace.id)
             .filter(|rows| rows.len() == 1)
             .and_then(|rows| rows.first())
-            .filter(|row| row.is_live)
             .and_then(crate::shell::left_rail::workspace_agent_rows::live_title)
             .map(|t| SharedString::from(t.text));
         let card_plan = build_workspace_card_plan(

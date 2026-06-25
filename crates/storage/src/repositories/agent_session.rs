@@ -129,6 +129,28 @@ impl AgentSessionRepo {
         Ok(())
     }
 
+    /// Mark a session interrupted by a quit/shutdown AND stamp `ended_at` in one
+    /// write, returning the timestamp. The boot sweep loses the live process, so
+    /// `update_status` alone would leave `ended_at` NULL — making the row look
+    /// infinitely old, so the rail's recency cutoff would cull it and lose the
+    /// agent's persisted title. Stamping the shutdown time keeps the session as
+    /// recent "sleeping" history so it (and its title) survive the restart.
+    pub fn mark_interrupted_at_shutdown(&self, id: &str) -> Result<String, StorageError> {
+        let status = AgentStatus::Interrupted;
+        let slug = status.as_str();
+        let exit_code = status.exit_code_for_storage();
+        let detail = status.detail_for_storage();
+        let ts = now();
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_sessions SET status = ?1, exit_code = ?2, status_detail = ?3, ended_at = ?4 WHERE id = ?5",
+                params![slug, exit_code, detail, ts, id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(ts)
+    }
+
     /// Sessions in any NON-TERMINAL status with no `ended_at` — i.e. they
     /// were alive when the app went down. The startup path calls
     /// `update_status(id, AgentStatus::Interrupted)` on each.

@@ -128,19 +128,21 @@ pub fn hydrate(db: Db) -> Result<AppState, StorageError> {
     // crash mid-iteration: next boot's `list_unfinished_at_shutdown`
     // returns only the still-non-terminal rows.
     let running = agent_session_repo.list_unfinished_at_shutdown()?;
-    for session in &running {
-        agent_session_repo.update_status(&session.id, &AgentStatus::Interrupted)?;
-    }
-    // Update the in-memory copies to match the DB rows we just wrote.
-    // Without this, consumers reading `app_state.interrupted_sessions[i]
-    // .status` would see the stale `Running` snapshot.
+    // Mark each alive-at-shutdown session Interrupted AND stamp its `ended_at`
+    // with the shutdown time, mirroring both into the in-memory copy. The
+    // `ended_at` stamp is what lets the rail keep it as recent "sleeping"
+    // history after the restart (so the agent and its persisted title survive
+    // the quit); a status-only mark would leave `ended_at` NULL and the row
+    // would be culled as stale.
     let interrupted_sessions: Vec<AgentSession> = running
         .into_iter()
         .map(|mut s| {
+            let ts = agent_session_repo.mark_interrupted_at_shutdown(&s.id)?;
             s.status = AgentStatus::Interrupted;
-            s
+            s.ended_at = Some(ts);
+            Ok(s)
         })
-        .collect();
+        .collect::<Result<Vec<_>, oximux_storage::StorageError>>()?;
 
     let workspace_total: usize = workspaces.values().map(Vec::len).sum();
     tracing::info!(

@@ -19,12 +19,6 @@ use crate::shell::session_live_store::LiveAgentMap;
 /// live-first sort, so this trims the oldest finished sessions.
 pub const HISTORY_CAP: usize = 20;
 
-/// History scope for a NON-live row: shown only when it is a cleanly-finished
-/// (`Done`) session whose `ended_at` is at or after the recency cutoff (or
-/// unbounded when `cutoff` is `None`). This mirrors the reference cockpit,
-/// which keeps only cleanly-completed agents as recent history — a crash,
-/// a shutdown (`Interrupted`/`Failed`), or a never-closed `idle`/`running`
-/// leftover with no live tab is not "recent work to glance at" and is dropped.
 /// Format a relative age ("now", "5m", "3h", "2d") from an RFC-3339 timestamp
 /// against a captured `now`, mirroring the reference cockpit's thresholds:
 /// `<1m → now`, `<1h → Nm`, `<24h → Nh`, else `Nd`. Empty on unparseable input.
@@ -47,13 +41,26 @@ fn relative_age(ts: &str, now: &str) -> String {
     }
 }
 
-fn is_recent_done(s: &AgentSession, cutoff: Option<&str>) -> bool {
-    if !matches!(s.status, AgentStatus::Done { .. }) {
+/// History scope for a NON-live row: shown when it is a TERMINAL session —
+/// cleanly `Done`, `Interrupted` by a quit/shutdown, or `Failed` — whose
+/// `ended_at` is at or after the recency cutoff (unbounded when `cutoff` is
+/// `None`). This mirrors the reference cockpit's "sleeping agents": the agents
+/// open at the last quit (the boot sweep marks them `Interrupted` and stamps
+/// the shutdown time) reappear with their persisted title after the restart,
+/// alongside recent clean exits. A terminal row with NO `ended_at` stamp is a
+/// stale legacy artifact (not a cleanly-closed session) and is dropped once a
+/// cutoff applies; a never-closed `Idle`/`Running` leftover (not terminal) is
+/// dropped too.
+fn is_recent_history(s: &AgentSession, cutoff: Option<&str>) -> bool {
+    if !s.status.is_terminal() {
         return false;
     }
     match (cutoff, s.ended_at.as_deref()) {
         (Some(cut), Some(ended)) => ended >= cut,
-        _ => true,
+        // A cutoff is set but this terminal row never stamped its end → stale.
+        (Some(_), None) => false,
+        // No cutoff (tests / unbounded) → keep all terminal history.
+        (None, _) => true,
     }
 }
 
@@ -162,11 +169,12 @@ fn ambient_title_from_detail(detail: &oximux_core::SidebandDetail) -> Option<Str
 /// Build the sorted agent list for one workspace.
 ///
 /// `db_sessions` is `list_for_workspace` output (all rows, `started_at`
-/// DESC). The result is the **live + recently-completed** set: every live
-/// session plus only the cleanly-finished (`Done`) history whose `ended_at`
-/// is at or after `history_cutoff` (an RFC-3339 `now - 24h`). Stale
-/// non-terminal leftovers and interrupted/failed sessions are dropped — see
-/// [`is_recent_done`]. Pass `None` to keep all `Done` history (tests).
+/// DESC). The result is the **live + recent-history** set: every live session
+/// plus any TERMINAL history (clean `Done`, quit-`Interrupted`, or `Failed`)
+/// whose end is at or after `history_cutoff` (an RFC-3339 `now - 24h`). This
+/// keeps an agent and its persisted title across a restart — see
+/// [`is_recent_history`]. Never-closed non-terminal leftovers and old history
+/// are dropped. Pass `None` to keep all terminal history (tests).
 pub fn merge_workspace_agents(
     workspace_key: &str,
     db_sessions: &[AgentSession],
@@ -178,14 +186,15 @@ pub fn merge_workspace_agents(
 
     // 1. DB rows. A matching live entry (same UUID + workspace) upgrades the
     //    row to live and attaches its status receiver. A non-live row is kept
-    //    only when it is recent cleanly-finished history (see `is_recent_done`)
-    //    — stale leftovers and crashes are dropped so the list stays the
-    //    live + recently-completed set, not the full session log.
+    //    only when it is recent TERMINAL history (see `is_recent_history`) —
+    //    a quit-interrupted "sleeping" agent or a recent clean exit — so an
+    //    agent and its persisted title survive a restart; older leftovers and
+    //    never-closed rows are dropped so the list stays a recent set.
     for s in db_sessions {
         let live = live_agents
             .get(&s.id)
             .filter(|e| e.workspace_key == workspace_key);
-        if live.is_none() && !is_recent_done(s, history_cutoff) {
+        if live.is_none() && !is_recent_history(s, history_cutoff) {
             continue;
         }
         rows.push(RailAgentRow {
@@ -335,13 +344,13 @@ mod tests {
     }
 
     #[test]
-    fn non_live_keeps_only_recent_done() {
+    fn non_live_keeps_recent_terminal_history() {
         let sessions = vec![
-            // Stale leftover (never closed) — dropped.
+            // Never-closed leftover (no terminal mark) — dropped as stale.
             db("idle", AgentStatus::Idle, "2026-06-23T10:00:00Z", None),
-            // Crash / forced close — dropped.
+            // Quit-interrupted "sleeping" agent — KEPT (survives the restart).
             db(
-                "crash",
+                "interrupted",
                 AgentStatus::Interrupted,
                 "2026-06-23T09:00:00Z",
                 Some("2026-06-23T09:10:00Z"),
@@ -355,8 +364,11 @@ mod tests {
             ),
         ];
         let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None, NOW);
-        let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
-        assert_eq!(ids, vec!["done"]);
+        let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["interrupted", "done"])
+        );
         assert!(rows.iter().all(|r| !r.is_live && r.status_rx.is_none()));
     }
 
@@ -426,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn history_keeps_only_recent_done() {
+    fn history_keeps_recent_terminal_drops_old() {
         let sessions = vec![
             // Clean exit but long before the cutoff → dropped by age.
             db(
@@ -442,18 +454,47 @@ mod tests {
                 "2026-06-23T08:00:00Z",
                 Some("2026-06-23T09:00:00Z"),
             ),
-            // Recent but a crash, not a clean exit → dropped by status.
+            // Recent quit-interrupted agent → now KEPT (was dropped before).
             db(
-                "recent-crash",
+                "recent-interrupted",
                 AgentStatus::Interrupted,
                 "2026-06-23T08:00:00Z",
                 Some("2026-06-23T09:05:00Z"),
             ),
+            // Old interrupted (before the cutoff) → still dropped by age.
+            db(
+                "old-interrupted",
+                AgentStatus::Interrupted,
+                "2026-06-20T08:00:00Z",
+                Some("2026-06-20T09:05:00Z"),
+            ),
         ];
         let cutoff = "2026-06-22T00:00:00Z";
         let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), Some(cutoff), NOW);
-        let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
-        assert_eq!(ids, vec!["recent-done"]);
+        let ids: std::collections::HashSet<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["recent-done", "recent-interrupted"])
+        );
+    }
+
+    #[test]
+    fn history_drops_terminal_without_end_stamp_when_cutoff_applies() {
+        // A legacy interrupted row that never stamped `ended_at` (pre-fix boot
+        // sweep) is stale, so a recency cutoff drops it rather than falling back
+        // to its (possibly recent) start time.
+        let sessions = vec![db(
+            "no-end",
+            AgentStatus::Interrupted,
+            "2026-06-23T23:00:00Z",
+            None,
+        )];
+        let cutoff = "2026-06-22T00:00:00Z";
+        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), Some(cutoff), NOW);
+        assert!(rows.is_empty());
+        // With no cutoff (unbounded), the same row is kept.
+        let rows = merge_workspace_agents(WS, &sessions, &LiveAgentMap::new(), None, NOW);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
