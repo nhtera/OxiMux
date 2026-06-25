@@ -1,9 +1,10 @@
 //! The "N agents" disclosure rendered under a workspace row.
 //!
 //! A workspace with more than one agent gets a compact, clickable summary
-//! line (a chevron, the count, and one status glyph per agent) that expands
-//! into a slim status sub-row per agent. Single-agent workspaces keep the
-//! existing single dot on the row itself and render nothing here.
+//! line — a grouped status cluster (one `[dot] count` chip per indicator
+//! color), the agent count, and a chevron — that expands into a slim status
+//! sub-row per agent. Single-agent workspaces keep the existing single dot on
+//! the row itself and render nothing here.
 //!
 //! The collapsed cluster is the headline visual — it renders with no
 //! interaction. Live sub-rows focus their backing agent or ambient terminal.
@@ -108,6 +109,38 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Collapsed-header status summary: the agents grouped by their indicator color
+/// into severity-ordered `(color, count)` chips, so the collapsed disclosure
+/// shows the state mix at a glance (mirroring the reference cockpit's grouped
+/// status cluster) without expanding. Buckets share the per-row indicator's
+/// color vocabulary — attention-red first, then working/approval-amber, done-
+/// green, idle-grey — and same-color states merge into one chip.
+fn collapsed_state_chips(rows: &[RailAgentRow], theme: Theme) -> Vec<(Hsla, usize)> {
+    // [error, warn, ok, muted] — fixed severity order; counts filled per row.
+    let mut counts = [0usize; 4];
+    for row in rows {
+        let idx = match row.effective_status() {
+            AgentStatus::Done { code: Some(0) } => 2, // ok (done)
+            AgentStatus::Running | AgentStatus::NeedsApproval(_) => 1, // warn (working/approval)
+            AgentStatus::Idle => 3,                    // muted (idle)
+            _ => 0, // error (waiting / interrupted / failed / done-nonzero)
+        };
+        counts[idx] += 1;
+    }
+    let colors = [
+        theme.status_error,
+        theme.status_warn,
+        theme.status_ok,
+        theme.status_muted,
+    ];
+    counts
+        .iter()
+        .zip(colors)
+        .filter(|(n, _)| **n > 0)
+        .map(|(n, c)| (c, *n))
+        .collect()
+}
+
 /// Display fields for one expanded sub-row.
 pub struct SubRowView {
     pub dot: Hsla,
@@ -144,13 +177,49 @@ pub fn render_workspace_agent_disclosure(
     let ws = workspace_key.to_string();
     let count = rows.len();
     let chevron = if is_expanded { "▾" } else { "▸" };
-    // Reference-cockpit header: "N agents" on the left, a disclosure chevron on
-    // the right — no inline status cluster (the per-agent dots live on the rows).
-    let header_label = if count == 1 {
-        "1 agent".to_string()
-    } else {
-        format!("{count} agents")
-    };
+
+    // Collapsed header leads with a grouped status cluster (one `[dot] count`
+    // chip per indicator color) so the state mix reads at a glance without
+    // expanding; the count text trails it. Expanded, the cluster is redundant
+    // with the per-agent rows below, so the header is just the count + chevron.
+    let chips = collapsed_state_chips(rows, theme);
+    let visible_chips = chips.iter().take(3).copied().collect::<Vec<_>>();
+    let hidden_chip_count: usize = chips.iter().skip(3).map(|(_, n)| n).sum();
+    let count_label = format!("{count} agents");
+
+    let mut cluster = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .flex_shrink_0();
+    if !is_expanded {
+        for (color, n) in visible_chips {
+            let mut chip = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .child(div().size(px(STATE_DOT)).rounded_full().bg(color));
+            if n > 1 {
+                chip = chip.child(
+                    div()
+                        .text_size(px(typography.t_sub_label))
+                        .text_color(theme.fg_subtle)
+                        .child(n.to_string()),
+                );
+            }
+            cluster = cluster.child(chip);
+        }
+        if hidden_chip_count > 0 {
+            cluster = cluster.child(
+                div()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_subtle)
+                    .child(format!("+{hidden_chip_count}")),
+            );
+        }
+    }
 
     let summary = div()
         // Stable id so GPUI tracks the hover hitbox across re-renders (see the
@@ -173,13 +242,14 @@ pub fn render_workspace_agent_disclosure(
                 cx.notify();
             });
         })
+        .child(cluster)
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .text_size(px(typography.t_body_sm))
                 .text_color(theme.fg_muted)
-                .child(header_label),
+                .child(count_label),
         )
         .child(
             div()
@@ -426,6 +496,42 @@ mod tests {
             age_label: "3d".into(),
             persisted_title: None,
         }
+    }
+
+    #[test]
+    fn collapsed_chips_group_by_color_and_order_by_severity() {
+        let theme = Theme::default();
+        // Two warn-bucket states (Running + NeedsApproval) must merge into one
+        // amber chip; the chips come back error → warn → ok → muted.
+        let rows = vec![
+            row(false, AgentStatus::Idle, None),
+            row(false, AgentStatus::Running, None),
+            row(false, AgentStatus::NeedsApproval("approve?".into()), None),
+            row(false, AgentStatus::Done { code: Some(0) }, None),
+            row(false, AgentStatus::Failed("boom".into()), None),
+        ];
+        let chips = collapsed_state_chips(&rows, theme);
+        assert_eq!(
+            chips,
+            vec![
+                (theme.status_error, 1), // failed
+                (theme.status_warn, 2),  // running + needs-approval merged
+                (theme.status_ok, 1),    // done
+                (theme.status_muted, 1), // idle
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_chips_skip_empty_buckets() {
+        let theme = Theme::default();
+        // All idle → a single muted chip, no zero-count buckets.
+        let rows = vec![
+            row(false, AgentStatus::Idle, None),
+            row(false, AgentStatus::Idle, None),
+        ];
+        let chips = collapsed_state_chips(&rows, theme);
+        assert_eq!(chips, vec![(theme.status_muted, 2)]);
     }
 
     #[test]
