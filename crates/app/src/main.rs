@@ -825,11 +825,9 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
         }
     };
     // Read the hook event JSON once when we'll need it — for tool extraction
-    // (working / needs_approval) or the notification filter. `idle` (Stop)
-    // carries nothing relevant, so skip the read.
-    let stdin_json = if state == "idle" {
-        None
-    } else {
+    // (working / needs_approval), the notification filter, OR — for `idle`
+    // (Stop) — the `transcript_path` we read to extract the agent's last reply.
+    let stdin_json = {
         use std::io::Read;
         let mut buf = String::new();
         let _ = std::io::stdin().read_to_string(&mut buf);
@@ -853,6 +851,17 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
     let prompt = stdin_json
         .as_deref()
         .and_then(oximux_app::agent_status_hooks::prompt_from_hook_json);
+    // On `Stop` (idle) read the transcript for the agent's last reply — the
+    // row's secondary text for a finished turn (the reference cockpit's
+    // `lastAssistantMessage`). Only on Stop: it fires once per turn, whereas a
+    // per-tool transcript read would be wasteful.
+    let message = if state == "idle" {
+        stdin_json
+            .as_deref()
+            .and_then(oximux_app::agent_status_hooks::last_assistant_message_from_hook_json)
+    } else {
+        None
+    };
 
     let pty_id = match std::env::var("OXIMUX_PTY_ID") {
         Ok(id) if !id.is_empty() => id,
@@ -866,6 +875,7 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
         &state,
         tool.as_deref(),
         prompt.as_deref(),
+        message.as_deref(),
     );
 
     let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {

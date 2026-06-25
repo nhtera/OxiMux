@@ -52,6 +52,11 @@ const MAX_TOOL_LEN: usize = 64;
 /// trimming here keeps the OSC-9999 packet small and bounds a giant paste.
 const MAX_PROMPT_LEN: usize = 200;
 
+/// Cap the captured last-assistant message (the row's secondary text for a
+/// finished turn). The scanner caps again (512 bytes); the rail truncates the
+/// rendered line, so a tight source cap keeps the OSC-9999 packet small.
+const MAX_MSG_LEN: usize = 200;
+
 /// True when the env override forces status hooks on (`OXIMUX_STATUS_HOOKS=1`),
 /// independent of the persisted Settings toggle. A debug escape hatch — the
 /// primary control is the `status_hooks_enabled` setting, OR-combined with this
@@ -267,11 +272,94 @@ pub fn prompt_from_hook_json(stdin_json: &str) -> Option<String> {
     Some(prompt.chars().take(MAX_PROMPT_LEN).collect())
 }
 
+/// Extract the agent's most recent assistant text reply from a `Stop` hook
+/// event. Two sources, in the reference cockpit's order. First, the
+/// `last_assistant_message` field Claude puts directly on the Stop event: it is
+/// populated synchronously with the hook, so it avoids both a file read and the
+/// transcript-flush RACE — the Stop hook can fire before the turn's final
+/// assistant line is written to the JSONL, which left the row blank. Second, as
+/// a fallback (older Claude builds, or an event without the direct field), the
+/// `transcript_path` JSONL tail: the last `type:"assistant"` line whose
+/// `message.content` carries a text part.
+///
+/// Best-effort: any IO/parse failure yields `None`. Whitespace is collapsed to
+/// one line and capped at [`MAX_MSG_LEN`] chars (the scanner caps again in
+/// bytes). This becomes the row's secondary text for a finished turn — the
+/// reference cockpit's `lastAssistantMessage`.
+pub fn last_assistant_message_from_hook_json(stdin_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin_json).ok()?;
+    // 1. The reply handed to us directly — preferred, race-free.
+    if let Some(msg) = value
+        .get("last_assistant_message")
+        .and_then(Value::as_str)
+        .and_then(normalize_message)
+    {
+        return Some(msg);
+    }
+    // 2. Fallback: scan the transcript tail. `str::lines()` is double-ended, so
+    // `.rev()` walks newest-first without allocating a Vec; we stop at the first
+    // assistant line that has text.
+    let path = value.get("transcript_path")?.as_str()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let content = entry.get("message").and_then(|m| m.get("content"));
+        if let Some(msg) = assistant_text_from_content(content) {
+            return Some(msg);
+        }
+    }
+    None
+}
+
+/// Collapse whitespace to a single line and cap at [`MAX_MSG_LEN`] chars.
+/// `None` when nothing is left after trimming.
+fn normalize_message(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(MAX_MSG_LEN).collect())
+}
+
+/// Join the `text` parts of an assistant message's `content` array into one
+/// collapsed, capped line. Assistant turns interleave `text` and `tool_use`
+/// parts; only the text is human-facing. `None` when there is no text part.
+fn assistant_text_from_content(content: Option<&Value>) -> Option<String> {
+    let arr = content?.as_array()?;
+    let mut out = String::new();
+    for part in arr {
+        if part.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(t) = part.get("text").and_then(Value::as_str)
+        {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(t);
+        }
+    }
+    normalize_message(&out)
+}
+
 /// Build the OSC-9999 inner JSON payload (`{"v":1,"state":..,"tool":..}`) the
 /// relay wraps and the scanner decodes. Serialized via `serde_json` so control
-/// characters in `tool`/`prompt` are escaped — the relay treats the result as
-/// opaque. `prompt` is present only on the `UserPromptSubmit` hook.
-pub fn build_status_payload(state: &str, tool: Option<&str>, prompt: Option<&str>) -> String {
+/// characters in `tool`/`prompt`/`msg` are escaped — the relay treats the
+/// result as opaque. `prompt` is present only on `UserPromptSubmit`; `msg` (the
+/// last assistant reply) only on `Stop`.
+pub fn build_status_payload(
+    state: &str,
+    tool: Option<&str>,
+    prompt: Option<&str>,
+    message: Option<&str>,
+) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("v".into(), json!(1));
     obj.insert("state".into(), json!(state));
@@ -280,6 +368,9 @@ pub fn build_status_payload(state: &str, tool: Option<&str>, prompt: Option<&str
     }
     if let Some(p) = prompt {
         obj.insert("prompt".into(), json!(p));
+    }
+    if let Some(m) = message {
+        obj.insert("msg".into(), json!(m));
     }
     Value::Object(obj).to_string()
 }
@@ -432,7 +523,7 @@ mod tests {
     /// what the Phase-1 scanner decodes.
     #[test]
     fn payload_round_trips_through_scanner() {
-        let payload = build_status_payload("working", Some("Bash"), None);
+        let payload = build_status_payload("working", Some("Bash"), None, None);
         // Relay envelope: ESC ] 9999 ; <payload> BEL.
         let mut bytes = b"\x1b]9999;".to_vec();
         bytes.extend_from_slice(payload.as_bytes());
@@ -454,7 +545,7 @@ mod tests {
         let prompt = prompt_from_hook_json(
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"refactor the auth module"}"#,
         );
-        let payload = build_status_payload("working", None, prompt.as_deref());
+        let payload = build_status_payload("working", None, prompt.as_deref(), None);
         let mut bytes = b"\x1b]9999;".to_vec();
         bytes.extend_from_slice(payload.as_bytes());
         bytes.push(0x07);
@@ -467,11 +558,12 @@ mod tests {
 
     #[test]
     fn idle_payload_has_no_tool() {
-        let payload = build_status_payload("idle", None, None);
+        let payload = build_status_payload("idle", None, None, None);
         let v: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["state"], "idle");
         assert!(v.get("tool").is_none());
         assert!(v.get("prompt").is_none());
+        assert!(v.get("msg").is_none());
     }
 
     #[test]
@@ -497,9 +589,72 @@ mod tests {
 
     #[test]
     fn payload_carries_prompt_when_present() {
-        let payload = build_status_payload("working", None, Some("hello there"));
+        let payload = build_status_payload("working", None, Some("hello there"), None);
         let v: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["state"], "working");
         assert_eq!(v["prompt"], "hello there");
+    }
+
+    #[test]
+    fn stop_payload_carries_last_assistant_message_as_msg() {
+        let payload = build_status_payload("idle", None, None, Some("All set — tests pass."));
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["state"], "idle");
+        assert_eq!(v["msg"], "All set — tests pass.");
+    }
+
+    #[test]
+    fn last_assistant_message_reads_the_transcript_tail() {
+        use std::io::Write;
+        // A JSONL transcript: a user line, an assistant turn with a tool_use
+        // (no text), then the final assistant turn with the text reply. We must
+        // skip the tool-only turn and return the last TEXT reply, collapsed.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("oximux-transcript-test-{}.jsonl", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"content":"hi"}}}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"working on it"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Edit"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"  Done!\nShipped the   fix.  "}}]}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let stdin = format!(r#"{{"hook_event_name":"Stop","transcript_path":"{}"}}"#, path.display());
+        let msg = last_assistant_message_from_hook_json(&stdin);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(msg.as_deref(), Some("Done! Shipped the fix."));
+
+        // No transcript_path / bad JSON → None (hook still no-ops cleanly).
+        assert_eq!(last_assistant_message_from_hook_json(r#"{"hook_event_name":"Stop"}"#), None);
+        assert_eq!(last_assistant_message_from_hook_json("not json"), None);
+    }
+
+    #[test]
+    fn last_assistant_message_prefers_the_direct_stop_field() {
+        // Claude puts the reply directly on the Stop event. We must use it
+        // (collapsed/capped) WITHOUT touching the transcript — it is race-free
+        // (the JSONL may not be flushed yet) and points at a path here that does
+        // not exist, proving the field wins over the file.
+        let stdin = r#"{"hook_event_name":"Stop","transcript_path":"/no/such/file.jsonl","last_assistant_message":"  hello   there  "}"#;
+        assert_eq!(
+            last_assistant_message_from_hook_json(stdin).as_deref(),
+            Some("hello there")
+        );
+
+        // An empty/blank direct field falls back to the transcript path (here
+        // absent → None), never returning a blank string.
+        let blank = r#"{"hook_event_name":"Stop","last_assistant_message":"   "}"#;
+        assert_eq!(last_assistant_message_from_hook_json(blank), None);
     }
 }
