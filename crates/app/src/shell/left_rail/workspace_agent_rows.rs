@@ -10,8 +10,14 @@
 //! Status colors + verbs reuse `agent_presentation::agent_verb`, so the
 //! disclosure matches the tab badge and dashboard.
 
+use std::time::Duration;
+
 use gpui::prelude::*;
-use gpui::{AnyElement, Entity, Hsla, MouseButton, SharedString, WeakEntity, div, px, svg};
+use gpui::{
+    AnyElement, Animation, AnimationExt as _, Entity, Hsla, MouseButton, SharedString,
+    Transformation, WeakEntity, div, percentage, px, svg,
+};
+use gpui_component::Icon;
 use oximux_core::AgentStatus;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -19,17 +25,26 @@ use crate::shell::agent_presentation::{adapter_icon_path, agent_verb};
 use crate::shell::left_rail::{LeftRail, RailAgentRow, RailAgentTarget};
 use crate::workspace_root::WorkspaceRoot;
 
-/// Reference-cockpit state-indicator metrics: a 10px box holding a 6px dot, an
-/// 8px spinner-style ring (Working), or a 10px check glyph (Done).
+/// Reference-cockpit state-indicator metrics: a 10px box holding a 6px dot, a
+/// 10px rotating spinner glyph (Working), or an 11px circle-check glyph (Done).
 const STATE_BOX: f32 = 10.0;
 const STATE_DOT: f32 = 6.0;
-const STATE_RING: f32 = 8.0;
+const STATE_SPINNER: f32 = 10.0;
 const STATE_CHECK: f32 = 11.0;
 
+/// Discrete steps per rotation for the Working spinner. Mirrors the reference
+/// cockpit's `steps(12)` cadence: the glyph ticks in 12 mechanical jumps per
+/// second rather than a smooth sweep, which reads as "agent is working" without
+/// the optical buzz of a continuous spin.
+const SPINNER_STEPS: f32 = 12.0;
+
 /// One agent's state indicator, mirroring the reference cockpit's `AgentStateDot`:
-/// Done → a green check, Working → a hollow spinner-style ring, everything else
+/// Done → a green circle-check, Working → a rotating spinner, everything else
 /// → a colored dot (idle grey, needs-approval amber, attention red).
-fn agent_state_indicator(status: &AgentStatus, theme: Theme) -> AnyElement {
+///
+/// `row_key` seeds the spinner's animation id so concurrently-running agents
+/// each keep their own rotation phase instead of sharing one.
+fn agent_state_indicator(status: &AgentStatus, row_key: &str, theme: Theme) -> AnyElement {
     let box_el = || {
         div()
             .flex()
@@ -42,19 +57,28 @@ fn agent_state_indicator(status: &AgentStatus, theme: Theme) -> AnyElement {
     match status {
         AgentStatus::Done { code: Some(0) } => box_el()
             .child(
-                svg()
-                    .path("icons/check.svg")
+                Icon::default()
+                    .path("icons/circle-check.svg")
                     .size(px(STATE_CHECK))
                     .text_color(theme.status_ok),
             )
             .into_any_element(),
         AgentStatus::Running => box_el()
             .child(
-                div()
-                    .size(px(STATE_RING))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(theme.status_warn),
+                Icon::default()
+                    .path("icons/loader-circle.svg")
+                    .size(px(STATE_SPINNER))
+                    .text_color(theme.status_warn)
+                    .with_animation(
+                        SharedString::from(format!("agent-spinner-{row_key}")),
+                        Animation::new(Duration::from_secs(1)).repeat(),
+                        |icon, delta| {
+                            // Quantize to SPINNER_STEPS discrete positions so the
+                            // glyph ticks instead of sweeping.
+                            let stepped = (delta * SPINNER_STEPS).floor() / SPINNER_STEPS;
+                            icon.transform(Transformation::rotate(percentage(stepped)))
+                        },
+                    ),
             )
             .into_any_element(),
         AgentStatus::Idle => box_el().child(dot(theme.status_muted)).into_any_element(),
@@ -294,9 +318,12 @@ fn render_agent_sub_row(
         theme.fg_muted
     };
 
-    // One truncating line holding two inline spans: a brighter primary and a
-    // dimmer " - secondary". Both `min_w_0` + `.truncate()` so the longer side
-    // ellipsises rather than wrapping.
+    // One line holding two inline-styled spans: a brighter primary (the prompt)
+    // and a dimmer " - secondary" (the live tool/state). The prompt is the
+    // identity of the row, so it leads at its natural width; only the trailing
+    // secondary yields and ellipsises first when the row narrows — matching the
+    // reference cockpit, which truncates the concatenation from the end. The
+    // primary still truncates if it alone overflows.
     let descriptor = div()
         .flex_1()
         .min_w_0()
@@ -306,6 +333,7 @@ fn render_agent_sub_row(
         .child(
             div()
                 .min_w_0()
+                .flex_shrink()
                 .text_size(px(typography.t_body_sm))
                 .text_color(primary_color)
                 .truncate()
@@ -314,6 +342,7 @@ fn render_agent_sub_row(
         .when(show_secondary, |d| {
             d.child(
                 div()
+                    .flex_1()
                     .min_w_0()
                     .text_size(px(typography.t_body_sm))
                     .text_color(theme.fg_subtle)
@@ -336,7 +365,7 @@ fn render_agent_sub_row(
         .pl(px(density.pad_panel * 3.0))
         .pr(px(density.pad_panel))
         .gap(px(density.gap_inline))
-        .child(agent_state_indicator(&status, theme))
+        .child(agent_state_indicator(&status, &row.db_id, theme))
         .child(
             svg()
                 .path(adapter_icon_path(&row.adapter_id))
