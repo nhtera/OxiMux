@@ -42,6 +42,9 @@ pub(crate) fn spawn_for_session(
     effort: Option<String>,
     runtime_session_id: AgentSessionId,
     mut status_rx: AgentStatusStream,
+    // `true` when this is a restore re-adopt: try to reuse the prior
+    // interrupted DB row (keeping its title) before inserting a fresh one.
+    restoring: bool,
     cx: &mut Context<WorkspaceRoot>,
 ) {
     let workspace_repo = root.app_state.workspace_repo.clone();
@@ -88,14 +91,31 @@ pub(crate) fn spawn_for_session(
 
         let repo = agent_repo.clone();
         let (m, e) = (model.clone(), effort.clone());
-        let inserted = cx
+        // On restore, re-adopt the prior interrupted session for this
+        // (workspace, adapter) so the tab keeps its DB row + persisted title
+        // instead of orphaning it and inserting a duplicate. A fresh spawn — or
+        // a restore with nothing claimable — inserts a new row.
+        let ws_claim = workspace_key;
+        let resolved = cx
             .background_executor()
-            .spawn(
-                async move { repo.insert(&workspace_key, adapter_id, m.as_deref(), e.as_deref()) },
-            )
+            .spawn(async move {
+                if restoring {
+                    match repo.claim_interrupted_for_restore(&ws_claim, adapter_id) {
+                        Ok(Some((id, started))) => {
+                            return Ok((id, started.unwrap_or_default()));
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(?err, "agent persistence: restore claim failed");
+                        }
+                    }
+                }
+                repo.insert(&ws_claim, adapter_id, m.as_deref(), e.as_deref())
+                    .map(|s| (s.id, s.started_at.unwrap_or_default()))
+            })
             .await;
-        let (row_id, started_at) = match inserted {
-            Ok(session) => (session.id, session.started_at.unwrap_or_default()),
+        let (row_id, started_at) = match resolved {
+            Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!(?err, "agent persistence: session insert failed");
                 return;

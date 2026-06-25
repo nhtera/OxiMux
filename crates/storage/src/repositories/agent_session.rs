@@ -165,6 +165,41 @@ impl AgentSessionRepo {
     /// `agent_status_non_terminal_slugs_match_query` (in
     /// `crates/storage/tests/agent_status_codec.rs`) machine-checks the
     /// link.
+    /// Re-adopt a quit-interrupted session on restore: atomically flip the
+    /// most-recently-ended `interrupted` session for this `(workspace, adapter)`
+    /// back to live (`idle`, no end/exit/detail) and return its id + original
+    /// `started_at`, so the restored tab REUSES that row — keeping its persisted
+    /// title and history — instead of orphaning it and inserting a duplicate.
+    ///
+    /// Ordered by `ended_at` DESC so the agents open at the last quit (freshly
+    /// stamped by the boot sweep) are claimed before older interrupted history.
+    /// The single-statement `UPDATE ... WHERE id = (SELECT ... LIMIT 1)
+    /// RETURNING` is atomic, so concurrent per-tab restores each claim a
+    /// distinct row. Returns `None` when nothing is claimable (first launch, or
+    /// an untracked agent) — the caller then inserts a fresh row.
+    pub fn claim_interrupted_for_restore(
+        &self,
+        workspace_id: &str,
+        adapter_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, StorageError> {
+        let claimed = self.db.with_conn(|c| {
+            c.query_row(
+                "UPDATE agent_sessions \
+                   SET status = 'idle', exit_code = NULL, status_detail = NULL, ended_at = NULL \
+                 WHERE id = ( \
+                   SELECT id FROM agent_sessions \
+                   WHERE workspace_id = ?1 AND adapter_id = ?2 AND status = 'interrupted' \
+                   ORDER BY ended_at DESC, started_at DESC LIMIT 1 \
+                 ) \
+                 RETURNING id, started_at",
+                params![workspace_id, adapter_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+        })?;
+        Ok(claimed)
+    }
+
     pub fn list_unfinished_at_shutdown(&self) -> Result<Vec<AgentSession>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
@@ -178,5 +213,79 @@ impl AgentSessionRepo {
             iter.collect::<rusqlite::Result<Vec<_>>>()
         })?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::open_memory;
+
+    fn repo() -> AgentSessionRepo {
+        AgentSessionRepo::new(open_memory().expect("memory db"))
+    }
+
+    #[test]
+    fn claim_reopens_interrupted_and_preserves_title() {
+        let repo = repo();
+        let s = repo.insert("ws-1", "claude-code", None, None).expect("insert");
+        repo.update_title(&s.id, "fix the parser").expect("title");
+        repo.mark_interrupted_at_shutdown(&s.id).expect("interrupt");
+
+        // Restore claims the SAME row back to live.
+        let (id, _started) = repo
+            .claim_interrupted_for_restore("ws-1", "claude-code")
+            .expect("claim ok")
+            .expect("a row to claim");
+        assert_eq!(id, s.id);
+
+        // It is live again (idle, no end stamp) and KEEPS its persisted title.
+        let row = repo.get_by_id(&s.id).expect("get").expect("row");
+        assert_eq!(row.status, AgentStatus::Idle);
+        assert_eq!(row.ended_at, None);
+        assert_eq!(row.title.as_deref(), Some("fix the parser"));
+
+        // Nothing left to claim → None (so the caller inserts a fresh row).
+        assert!(
+            repo.claim_interrupted_for_restore("ws-1", "claude-code")
+                .expect("claim ok")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claim_only_matches_same_workspace_and_adapter() {
+        let repo = repo();
+        let s = repo.insert("ws-1", "claude-code", None, None).expect("insert");
+        repo.mark_interrupted_at_shutdown(&s.id).expect("interrupt");
+        // A different workspace or adapter never claims it.
+        assert!(
+            repo.claim_interrupted_for_restore("ws-2", "claude-code")
+                .expect("ok")
+                .is_none()
+        );
+        assert!(
+            repo.claim_interrupted_for_restore("ws-1", "codex")
+                .expect("ok")
+                .is_none()
+        );
+        // The matching keys do.
+        assert!(
+            repo.claim_interrupted_for_restore("ws-1", "claude-code")
+                .expect("ok")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn claim_skips_non_interrupted_rows() {
+        let repo = repo();
+        // A live (idle) session is not claimable — only quit-interrupted rows.
+        repo.insert("ws-1", "claude-code", None, None).expect("insert");
+        assert!(
+            repo.claim_interrupted_for_restore("ws-1", "claude-code")
+                .expect("ok")
+                .is_none()
+        );
     }
 }

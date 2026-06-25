@@ -2031,6 +2031,8 @@ impl WorkspaceRoot {
                     effort.clone(),
                     session_id,
                     status_rx.clone(),
+                    // Fresh launch — always inserts a new session row.
+                    false,
                     cx,
                 );
             });

@@ -658,9 +658,10 @@ fn restore_agent_tab(
                 (session_id, backend, term_id, status_rx)
             }
         };
-        // Restored sessions get a fresh agent_sessions row too (the boot
-        // sweep already marked the pre-restart row Interrupted); without
-        // this, a live re-adopted agent would read "Stopped" on the rail.
+        // Re-adopt the pre-restart agent_sessions row (the boot sweep marked it
+        // Interrupted): `restoring = true` flips that same row back to live and
+        // keeps its persisted title, instead of orphaning it and inserting a
+        // duplicate "Claude Code" row.
         let _ = root.update(cx, |this, cx| {
             crate::shell::agent_session_persistence::spawn_for_session(
                 this,
@@ -670,6 +671,7 @@ fn restore_agent_tab(
                 persisted_clone.effort.clone(),
                 session_id,
                 status_rx.clone(),
+                true,
                 cx,
             );
         });
