@@ -102,6 +102,16 @@ fn main() {
         std::process::exit(run_agent_status_cli(&rt));
     }
 
+    // Single-instance guard. A second GUI launched against the same data
+    // directory would clobber the shared per-window layout store and
+    // double-attach the same relay PTYs, so a window saved by one instance
+    // vanishes when the other overwrites the snapshot. If a live instance
+    // already holds the lock, this brings it forward and exits. Held for the
+    // whole process (released implicitly on exit). Placed AFTER the helper-CLI
+    // short-circuits above so `oximux notify` / `agent-status` — which hooks
+    // invoke while the GUI is up — never contend for it.
+    let _single_instance = enforce_single_instance();
+
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
     // without the git column — the rest of the shell still works.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -638,6 +648,50 @@ fn run_file_tree_spike() {
             cx.new(|cx| gpui_component::Root::new(any, window, cx))
         });
     });
+}
+
+/// Take the single-instance lock before any shared-state boot. When another
+/// live GUI already holds it, bring that instance to the front and exit
+/// cleanly rather than start a second window set that would clobber the shared
+/// layout store and double-attach the same relay PTYs. Returns the guard the
+/// caller must hold for the whole process lifetime. `None` means we degraded to
+/// an unguarded boot — only when the data directory can't be resolved/created
+/// or the lock errored unexpectedly — never because a peer was found (that path
+/// exits).
+fn enforce_single_instance() -> Option<oximux_app::single_instance::SingleInstanceGuard> {
+    use oximux_app::single_instance::{
+        AcquireOutcome, activate_existing_instance, lock_path_in, try_acquire,
+    };
+    let Some(data_dir) = dirs::data_dir() else {
+        tracing::warn!("no data_dir; skipping single-instance guard");
+        return None;
+    };
+    let dir = data_dir.join(APP_DATA_SUBDIR);
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(?err, "cannot create data dir; skipping single-instance guard");
+        return None;
+    }
+    let lock_path = lock_path_in(&dir);
+    match try_acquire(&lock_path) {
+        Ok(AcquireOutcome::Acquired(guard)) => Some(guard),
+        Ok(AcquireOutcome::AlreadyRunning { holder_pid }) => {
+            if let Some(pid) = holder_pid {
+                activate_existing_instance(pid);
+            }
+            let suffix = holder_pid
+                .map(|p| format!(" (pid {p})"))
+                .unwrap_or_default();
+            eprintln!(
+                "oximux: another OxiMux instance is already running{suffix} — \
+                 bringing its window to the front."
+            );
+            std::process::exit(0);
+        }
+        Err(err) => {
+            tracing::warn!(?err, "single-instance lock failed; continuing without guard");
+            None
+        }
+    }
 }
 
 /// Resolve `~/Library/Application Support/dev.nhtera.oximux/oximux.db`,

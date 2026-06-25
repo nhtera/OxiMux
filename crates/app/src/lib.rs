@@ -29,6 +29,7 @@ pub mod relay_supervisor;
 pub(crate) mod restore_fallback;
 pub mod scm_layout_settings;
 pub mod shell;
+pub mod single_instance;
 pub mod state;
 pub mod terminal_settings;
 pub mod ui;
