@@ -78,7 +78,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 
 | File / folder | Holds |
 |---|---|
-| `workspace_root.rs` | `WorkspaceRoot` — one per window; owns panes + sidebar |
+| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`) |
 | `project_panes_factory.rs` | manifest save/load, pane-buffer load, attach-reconcile |
 | `actions.rs` / `state.rs` / `left_rail_layout.rs` | GPUI actions, app state, rail layout |
 | `agent_glue/` | app-side agent wiring (bridges `oximux-agents` ↔ views) |
