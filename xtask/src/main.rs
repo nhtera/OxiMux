@@ -1,14 +1,22 @@
 //! xtask — repo-level lint orchestrator. CI calls these subcommands.
 //!
 //! Subcommands:
-//!   xtask file-size-lint   Walk crates/*/src and warn > 500 LOC, fail > 800.
+//!   xtask file-size-lint   Walk crates/*/src and warn > 1500 LOC, fail > 3000.
 //!   xtask ci-check         Run all xtask checks back-to-back.
+//!
+//! Thresholds match GPUI reality (large render/impl files are idiomatic). A
+//! ratchet allowlist (`xtask/file-size-allow.txt`) grandfathers the handful of
+//! files still over the hard cap at their recorded LOC: an allowlisted file may
+//! shrink freely but fails the moment it grows past its recorded size, so the
+//! debt can only go down. Drop a row once the file falls under the cap.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const WARN_LOC: usize = 500;
-const FAIL_LOC: usize = 800;
+const WARN_LOC: usize = 1500;
+const FAIL_LOC: usize = 3000;
+const ALLOW_FILE: &str = "xtask/file-size-allow.txt";
 
 fn main() -> ExitCode {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "help".into());
@@ -47,19 +55,50 @@ fn print_help() {
 fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
     let root = workspace_root()?;
     let crates_dir = root.join("crates");
+    let allow = load_allowlist(&root)?;
+    // Track which allowlist rows we actually saw over-cap, to flag stale rows.
+    let mut seen_over_cap: HashMap<String, bool> = allow.keys().map(|k| (k.clone(), false)).collect();
     let mut warn = 0usize;
     let mut fail = 0usize;
 
     for rs in collect_rs_files(&crates_dir.join(""))? {
         let loc = count_loc(&rs)?;
-        let rel = rs.strip_prefix(&root).unwrap_or(&rs).display();
+        let rel_path = rs.strip_prefix(&root).unwrap_or(&rs);
+        let rel = rel_path.to_string_lossy().replace('\\', "/");
+
         if loc > FAIL_LOC {
-            eprintln!("FAIL  {loc:>4} LOC  {rel}  (> {FAIL_LOC})");
-            fail += 1;
+            match allow.get(&rel) {
+                Some(&budget) => {
+                    seen_over_cap.insert(rel.clone(), true);
+                    if loc > budget {
+                        eprintln!(
+                            "FAIL  {loc:>4} LOC  {rel}  (allowlisted at {budget}, grew past it — ratchet only shrinks)"
+                        );
+                        fail += 1;
+                    } else {
+                        eprintln!("ALLOW {loc:>4} LOC  {rel}  (grandfathered, budget {budget})");
+                    }
+                }
+                None => {
+                    eprintln!("FAIL  {loc:>4} LOC  {rel}  (> {FAIL_LOC}, not allowlisted)");
+                    fail += 1;
+                }
+            }
         } else if loc > WARN_LOC {
             eprintln!("WARN  {loc:>4} LOC  {rel}  (> {WARN_LOC})");
             warn += 1;
         }
+    }
+
+    // Stale allowlist rows: file dropped under the cap (or was deleted/moved).
+    // Not a failure — just nudge to drain the row so the ratchet keeps shrinking.
+    let stale: Vec<&String> = seen_over_cap
+        .iter()
+        .filter(|(_, seen)| !**seen)
+        .map(|(k, _)| k)
+        .collect();
+    for path in &stale {
+        eprintln!("STALE       allowlist row '{path}' no longer over cap — drop it from {ALLOW_FILE}");
     }
 
     if fail > 0 {
@@ -67,8 +106,42 @@ fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
             format!("file-size-lint: {fail} file(s) over hard cap ({FAIL_LOC} LOC)").into(),
         );
     }
-    println!("file-size-lint: ok ({warn} warnings, 0 failures)");
+    println!(
+        "file-size-lint: ok ({warn} warnings, {} allowlisted, {} stale rows)",
+        allow.len() - stale.len(),
+        stale.len()
+    );
     Ok(())
+}
+
+/// Parse `xtask/file-size-allow.txt` into a map of `repo-relative path -> LOC budget`.
+/// Lines are `<path> <loc>`; blank lines and `#` comments are ignored. A missing
+/// file means an empty allowlist (every over-cap file then fails).
+fn load_allowlist(root: &Path) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
+    let path = root.join(ALLOW_FILE);
+    let mut map = HashMap::new();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(map),
+        Err(e) => return Err(e.into()),
+    };
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let file = parts
+            .next()
+            .ok_or_else(|| format!("{ALLOW_FILE}:{}: missing path", n + 1))?;
+        let loc: usize = parts
+            .next()
+            .ok_or_else(|| format!("{ALLOW_FILE}:{}: missing LOC for '{file}'", n + 1))?
+            .parse()
+            .map_err(|_| format!("{ALLOW_FILE}:{}: LOC for '{file}' is not a number", n + 1))?;
+        map.insert(file.replace('\\', "/"), loc);
+    }
+    Ok(map)
 }
 
 fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
