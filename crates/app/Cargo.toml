@@ -22,6 +22,7 @@ oximux-relay-client = { workspace = true }
 oximux-relay-proto = { workspace = true }
 oximux-settings = { workspace = true }
 oximux-storage = { workspace = true }
+oximux-ui = { workspace = true }
 
 gpui = { workspace = true }
 gpui_platform = { workspace = true }

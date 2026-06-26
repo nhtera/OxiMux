@@ -12,8 +12,12 @@ pub mod notifier;
 pub mod project_panes_factory;
 pub mod shell;
 pub mod state;
-pub mod ui;
 pub mod workspace_root;
+
+// Shared widget layer extracted to the `oximux-ui` crate. Re-exported under the
+// historical `crate::ui` path so every `crate::ui::…` call site resolves
+// unchanged (host depends on ui; ui never depends on the host).
+pub use oximux_ui as ui;
 
 // --- Grouped module folders (Tier-1 reorg) ---------------------------------
 // Files are foldered one level deep for traversal; each submodule is
