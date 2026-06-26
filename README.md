@@ -61,12 +61,12 @@ plans/
 - **Diff viewer** — a custom-canvas renderer with per-line geometry, word-diff, combined-diff, and folded hunks.
 - **Navigation** — a command palette (Quick Open + commands, fuzzy match), file explorer, search panel.
 - **Design system** — charcoal dark theme, cockpit density, typography scale (`oximux-settings`; see `docs/design-guidelines.md`).
-- **Guardrails** — `xtask file-size-lint` (warn > 500 LOC / fail > 800), font-kit feature check, migration ladder count check, producer/consumer pre-commit hook.
+- **Guardrails** — `xtask file-size-lint` (warn > 1500 LOC / fail > 3000, with a ratchet allowlist that only shrinks), font-kit feature check, migration ladder count check, producer/consumer pre-commit hook.
 - ADRs 001 (stack), 002 (gpui-component), 003 (dogfood gate), 004 (no ACP in v1), 005 (fresh start).
 
 ## Working agreements
 
-- **No file > 200 LOC** unless there is a documented reason (CI cap is 500 warn / 800 fail; soft cap is 200).
+- **Keep files small** — aim for **< 500 LOC** per file (authoring guideline, not enforced). The lint enforces **warn > 1500 / fail > 3000** non-blank LOC; any file over 3000 must sit on the `xtask/file-size-allow.txt` ratchet allowlist and may only shrink. Split before you hit the warn band. (Where things live: see `docs/system-architecture.md` → "Source map".)
 - **Snake_case** for Rust files; kebab-case for shell scripts.
 - **Edit existing files** in-place. No `*_v2.rs`, `*_new.rs`, or `*_enhanced.rs`.
 - **Dogfood before tag**: see [ADR-003](docs/adr/adr-003-dogfood-gate.md).
