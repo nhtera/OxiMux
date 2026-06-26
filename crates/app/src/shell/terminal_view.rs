@@ -1829,20 +1829,47 @@ impl TerminalView {
             return;
         }
 
-        if let Err(err) = self.with_backend(|be| be.scroll(id, lines)) {
+        self.scroll_viewport(lines, cx);
+    }
+
+    /// Scroll the local viewport by `delta` lines (+ = back into history, - =
+    /// toward the live tail) and repaint this frame. Shared by the wheel,
+    /// scrollbar-drag, and keyboard scroll paths. Re-fetches the snapshot
+    /// because the poll loop (`tick`) only resnapshots on new PTY output — so on
+    /// an idle pane (e.g. after `cat` of a long file finishes draining) the grid
+    /// and the `↑ N lines` chip would otherwise freeze and scrolling look dead.
+    /// A zero/over-scroll delta is a no-op (alacritty clamps to the history).
+    fn scroll_viewport(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if delta == 0 {
+            return;
+        }
+        let id = self.session_id;
+        if let Err(err) = self.with_backend(|be| be.scroll(id, delta)) {
             tracing::warn!(?err, "pty scroll failed");
             return;
         }
-        // Re-fetch the snapshot here so the new viewport offset paints this
-        // frame. The poll loop (`tick`) only resnapshots on new PTY output, so
-        // on an idle pane — e.g. after `cat` of a long file has finished
-        // draining — the grid and the `↑ N lines` indicator would otherwise
-        // freeze at their last-drained values and the wheel would appear dead.
         if let Ok(snapshot) = self.with_backend(|be| be.snapshot(id)) {
             self.snapshot = Arc::new(snapshot);
             self.revalidate_hover();
         }
         cx.notify();
+    }
+
+    /// One page of scrollback in lines, with a single line of overlap kept for
+    /// context across the jump. Floors at 1 so a tiny pane still advances.
+    fn page_lines(&self) -> i32 {
+        (self.snapshot.cells.len() as i32 - 1).max(1)
+    }
+
+    /// Run a keyboard scroll command against the local scrollback. Only reached
+    /// on the main screen (the caller forwards these keys to the app on the
+    /// alt-screen / mouse-reporting modes, where scrollback doesn't apply).
+    fn handle_scroll_command(&mut self, cmd: ScrollCmd, cx: &mut Context<Self>) {
+        match cmd {
+            ScrollCmd::PageUp => self.scroll_viewport(self.page_lines(), cx),
+            ScrollCmd::PageDown => self.scroll_viewport(-self.page_lines(), cx),
+            ScrollCmd::Tail => self.scroll_to_tail(cx),
+        }
     }
 
     /// Snap the viewport back to the live tail and repaint immediately. Wired to
@@ -1880,19 +1907,7 @@ impl TerminalView {
         let dy = f32::from(mouse_y) - drag.start_y;
         let new_offset = drag_to_offset(drag, dy, track_px, history, visible);
         let delta = new_offset as i32 - self.snapshot.display_offset as i32;
-        if delta == 0 {
-            return;
-        }
-        let id = self.session_id;
-        if let Err(err) = self.with_backend(|be| be.scroll(id, delta)) {
-            tracing::warn!(?err, "scrollbar drag scroll failed");
-            return;
-        }
-        if let Ok(snapshot) = self.with_backend(|be| be.snapshot(id)) {
-            self.snapshot = Arc::new(snapshot);
-            self.revalidate_hover();
-        }
-        cx.notify();
+        self.scroll_viewport(delta, cx);
     }
 
     /// Overlay scrollbar on the right edge, present only when there's scrollback
@@ -2034,6 +2049,19 @@ impl TerminalView {
                     return;
                 }
                 _ => {}
+            }
+        }
+
+        // Local scrollback keys (PageUp/Down, Cmd+Up = page up, Cmd+Down = tail).
+        // Only act on the main screen: on the alt-screen or while a mouse-
+        // reporting app is active there is no scrollback, so these fall through
+        // to the byte encoder and the app receives the normal escape sequences
+        // (e.g. PageUp in less/vim) instead of moving a buffer that isn't there.
+        if let Some(cmd) = scroll_key_command(ks) {
+            let mode = self.with_backend(|be| be.mouse_mode(self.session_id));
+            if !mode.alt_screen && !mode.any_reporting() {
+                self.handle_scroll_command(cmd, cx);
+                return;
             }
         }
 
@@ -3413,6 +3441,34 @@ fn build_exit_banner(theme: &Theme, code: i32) -> gpui::Div {
         )
 }
 
+/// A keyboard scrollback command, resolved from a keystroke by
+/// [`scroll_key_command`] and applied by `TerminalView::handle_scroll_command`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScrollCmd {
+    PageUp,
+    PageDown,
+    /// Jump to the live tail (bottom).
+    Tail,
+}
+
+/// Classify a keystroke as a local-scrollback command, or `None` to let it
+/// reach the PTY. Bindings: plain PageUp/PageDown page the viewport; Cmd+Up
+/// pages up (matches mature terminals); Cmd+Down jumps to the tail. Ctrl/Alt
+/// are excluded so app chords (Ctrl+Up word-nav, etc.) pass through untouched.
+fn scroll_key_command(ks: &gpui::Keystroke) -> Option<ScrollCmd> {
+    let m = &ks.modifiers;
+    if m.control || m.alt {
+        return None;
+    }
+    match ks.key.as_str() {
+        "pageup" if !m.platform => Some(ScrollCmd::PageUp),
+        "pagedown" if !m.platform => Some(ScrollCmd::PageDown),
+        "up" if m.platform => Some(ScrollCmd::PageUp),
+        "down" if m.platform => Some(ScrollCmd::Tail),
+        _ => None,
+    }
+}
+
 /// Fold a pixel delta into the sub-line accumulator and return the whole lines
 /// to scroll, keeping the fractional remainder in `*acc`. This carry is what
 /// lets a slow trackpad drag — each event under one line tall — eventually
@@ -3460,6 +3516,40 @@ mod poll_interval_tests {
         assert_eq!(poll_interval_ms(true), POLL_INTERVAL_MS);
         assert_eq!(poll_interval_ms(false), BACKGROUND_POLL_INTERVAL_MS);
         assert!(poll_interval_ms(false) > poll_interval_ms(true));
+    }
+}
+
+#[cfg(test)]
+mod scroll_key_tests {
+    use super::{ScrollCmd, scroll_key_command};
+    use gpui::Keystroke;
+
+    fn cmd(chord: &str) -> Option<ScrollCmd> {
+        scroll_key_command(&Keystroke::parse(chord).expect("valid chord"))
+    }
+
+    #[test]
+    fn plain_page_keys_scroll_pages() {
+        assert_eq!(cmd("pageup"), Some(ScrollCmd::PageUp));
+        assert_eq!(cmd("pagedown"), Some(ScrollCmd::PageDown));
+    }
+
+    #[test]
+    fn cmd_up_pages_up_and_cmd_down_jumps_to_tail() {
+        assert_eq!(cmd("cmd-up"), Some(ScrollCmd::PageUp));
+        assert_eq!(cmd("cmd-down"), Some(ScrollCmd::Tail));
+    }
+
+    #[test]
+    fn plain_arrows_and_app_chords_pass_through() {
+        // Bare arrows belong to the shell/app, not scrollback.
+        assert_eq!(cmd("up"), None);
+        assert_eq!(cmd("down"), None);
+        // Ctrl/Alt arrow combos are app navigation — never intercepted.
+        assert_eq!(cmd("ctrl-up"), None);
+        assert_eq!(cmd("alt-up"), None);
+        // Cmd+PageUp isn't one of ours either (plain PageUp is).
+        assert_eq!(cmd("cmd-pageup"), None);
     }
 }
 
