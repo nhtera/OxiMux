@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     AppContext, Bounds, Context, DragMoveEvent, Entity, Focusable, Hsla, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
     div, point, px, svg,
 };
 use gpui_component::input::{InputEvent, InputState};
@@ -53,6 +53,7 @@ use crate::left_rail_layout;
 use crate::actions::OpenProjectPicker;
 use crate::shell::agent_presentation::AmbientAgent;
 use crate::shell::agents_dashboard::model::{attention_rank, needs_attention};
+use crate::shell::agents_dashboard::filter::StatusFilter;
 use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
 use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
@@ -206,9 +207,17 @@ pub struct LeftRail {
     /// How workspace rows are ordered within each project group. Persisted
     /// so the choice survives restart.
     sort_mode: WorkspaceSortMode,
-    /// Scroll position for the agents dashboard `uniform_list`. Stored on
-    /// `LeftRail` so it survives re-renders while the Agents nav is active.
-    agents_scroll: UniformListScrollHandle,
+    /// Scroll position for the agents dashboard list. Stored on `LeftRail` so
+    /// it survives re-renders while the Agents nav is active.
+    agents_scroll: ScrollHandle,
+    /// Agents-page status filter — the header chip, cycling on click.
+    dashboard_status_filter: StatusFilter,
+    /// Agents-page text filter, mirroring the filter input's current value.
+    dashboard_filter: String,
+    /// Lazily-built filter text input for the Agents page (needs a window).
+    dashboard_filter_input: Option<Entity<InputState>>,
+    /// Held so the filter input's `Change → repaint` subscription stays alive.
+    _dashboard_filter_sub: Option<Subscription>,
     /// Scroll position for the home workspace list (children = project
     /// groups). Drives the scroll-to-current-workspace affordance.
     list_scroll: ScrollHandle,
@@ -285,7 +294,11 @@ impl LeftRail {
             settings_repo: None,
             collapsed: HashSet::new(),
             sort_mode: WorkspaceSortMode::default(),
-            agents_scroll: UniformListScrollHandle::new(),
+            agents_scroll: ScrollHandle::new(),
+            dashboard_status_filter: StatusFilter::default(),
+            dashboard_filter: String::new(),
+            dashboard_filter_input: None,
+            _dashboard_filter_sub: None,
             list_scroll: ScrollHandle::new(),
             locate_glow_seq: 0,
             agents_unread: 0,
@@ -370,6 +383,45 @@ impl LeftRail {
         if self.renaming_workspace.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// Advance the Agents-page status filter to the next bucket (wraps).
+    pub(crate) fn cycle_dashboard_status_filter(&mut self, cx: &mut Context<Self>) {
+        self.dashboard_status_filter = self.dashboard_status_filter.next();
+        cx.notify();
+    }
+
+    /// Clear the Agents-page text filter (the Escape affordance on its input).
+    pub(crate) fn clear_dashboard_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.dashboard_filter_input.clone() {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        if !self.dashboard_filter.is_empty() {
+            self.dashboard_filter.clear();
+            cx.notify();
+        }
+    }
+
+    /// Lazily build the Agents-page filter input (it needs a window) and wire
+    /// its `Change → mirror value + repaint` subscription. Returns a clone for
+    /// the header render.
+    fn ensure_dashboard_filter_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if self.dashboard_filter_input.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter…"));
+            let sub = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.dashboard_filter = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            });
+            self.dashboard_filter_input = Some(input);
+            self._dashboard_filter_sub = Some(sub);
+        }
+        self.dashboard_filter_input.clone().expect("just set")
     }
 
     /// Clear all held Smart-sort orders so the next render re-locks fresh
@@ -896,16 +948,18 @@ impl Render for LeftRail {
         // Agents → agents dashboard; Tasks → issue/PR browser; home (None) and
         // the not-yet-built shells → the workspace list.
         let content_body: gpui::AnyElement = if self.active_nav == Some(NavItem::Agents) {
+            let filter_input = self.ensure_dashboard_filter_input(_window, cx);
+            let status_filter = self.dashboard_status_filter;
+            let filter_text = self.dashboard_filter.clone();
             render_agents_dashboard(
+                &self.workspace_agents,
                 &self.projects,
                 &self.workspaces_by_project,
-                &self.latest_status,
-                &self.live_worktrees,
-                &self.diff_counts,
-                &self.agent_activity,
-                &self.agent_sideband,
-                &self.latest_adapter,
-                &self.last_active,
+                self.focused_agent.as_ref(),
+                status_filter,
+                &filter_text,
+                filter_input,
+                entity.clone(),
                 self.weak_root.clone(),
                 &self.agents_scroll,
                 theme,

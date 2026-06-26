@@ -1,151 +1,188 @@
-//! Single-row painter for the agents dashboard.
+//! Single-card painter for the agents dashboard.
 //!
-//! Each row is a two-line card:
+//! Each card is a per-agent-session row mirroring the reference cockpit's
+//! agent card:
 //!
 //!   ┌──────────────────────────────────────────────────────────┐
-//!   │ (◐)  project · branch            verb-chip      +A −B     │  line 1
-//!   │      Bash: cargo test… / Review →                         │  line 2
+//!   │ (✓) ✳  add tests · Edit: foo.rs              10 hours ago │  line 1
+//!   │        All set — the suite is green.                      │  line 2
+//!   │        [oximux]  main                                     │  line 3
 //!   └──────────────────────────────────────────────────────────┘
 //!
-//! The leading element is a 28px icon ring whose border carries the status
-//! color and whose glyph is the agent's brand mark. Action-required rows
-//! (tier 0: NeedsApproval / WaitingForInput) get floating-card chrome plus a
-//! 2px left accent bar so they read as "come look at me".
+//! The state glyph (emerald check / stepped spinner / colored dot) and the
+//! prompt/activity text reuse the rail's shared helpers so a card reads exactly
+//! like a rail sub-row. Action-required rows (tier 0: NeedsApproval /
+//! WaitingForInput) get floating-card chrome plus a 2px left accent bar so they
+//! read as "come look at me".
 
 use gpui::{Div, InteractiveElement, ParentElement, Styled, div, px, svg};
+use oximux_core::AgentStatus;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::agents_dashboard::model::{AgentRow, attention_rank, sideband_subline};
+use crate::shell::agents_dashboard::model::{AgentRow, attention_rank};
+use crate::shell::agents_dashboard::sections::SectionKind;
+use crate::shell::left_rail::workspace_agent_rows::{agent_state_indicator, agent_state_label};
 use crate::ui::overlay::FloatingSurface;
 
-/// Row height for the `uniform_list` item. Taller than the old single-line
-/// row to fit the two-line card + 28px icon ring with breathing room.
-pub(crate) const ROW_HEIGHT: f32 = 52.0;
+/// Fixed card height — fits the 3-line card (title + secondary + badges) with
+/// breathing room.
+pub(crate) const ROW_HEIGHT: f32 = 64.0;
 
-/// Diameter of the agent icon ring.
-const ICON_RING_SIZE: f32 = 28.0;
-/// Size of the brand glyph inside the ring.
-const ICON_GLYPH_SIZE: f32 = 16.0;
+/// Height of a status-section header row.
+const SECTION_HEADER_HEIGHT: f32 = 26.0;
+
+/// A status-section header — the small-caps section name + a count, like the
+/// reference cockpit's `DONE 4`. Sits above its cards in the scroll column.
+pub(crate) fn render_section_header(
+    kind: SectionKind,
+    count: usize,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .h(px(SECTION_HEADER_HEIGHT))
+        .px(px(density.pad_panel))
+        .pt(px(density.gap_inline))
+        .gap(px(density.gap_inline))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .whitespace_nowrap()
+                .child(kind.label()),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_muted)
+                .child(count.to_string()),
+        )
+}
+
+/// Size of the adapter brand glyph beside the state indicator.
+const ICON_GLYPH_SIZE: f32 = 14.0;
 
 /// Paint one `AgentRow` into a GPUI element. Height is `ROW_HEIGHT` so all
-/// rows have the same fixed height for `uniform_list`.
+/// cards share one height for `uniform_list`.
 pub fn render_agent_row(
     row: &AgentRow,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> Div {
-    let verb_color = row.verb.color;
+    let status = row.status.clone().unwrap_or(AgentStatus::Idle);
     // Tier 0 = the user is being asked something (approval / input).
     let is_attention = attention_rank(row.status.as_ref(), row.is_live) == 0;
 
-    // Icon ring: status-color border around the agent's brand glyph. The
-    // glyph is tinted to the same status color so the ring reads as one mark.
-    let icon_ring = div()
-        .flex_shrink_0()
-        .size(px(ICON_RING_SIZE))
-        .rounded_full()
-        .border_1()
-        .border_color(verb_color)
-        .bg(theme.bg_panel)
+    // ── leading column: state glyph + adapter icon, sat on the title line ──
+    let lead = div()
         .flex()
+        .flex_row()
         .items_center()
-        .justify_center()
+        .flex_shrink_0()
+        .h(px(20.))
+        .gap(px(density.gap_inline))
+        .child(agent_state_indicator(
+            &status,
+            row.completed_turn,
+            &row.db_id,
+            theme,
+        ))
         .child(
             svg()
                 .path(row.icon_path)
                 .size(px(ICON_GLYPH_SIZE))
-                .text_color(verb_color),
+                .text_color(theme.fg_muted)
+                .flex_shrink_0(),
         );
 
-    // ── line 1: "Project · branch" (truncates) + verb chip + diff chip ──
-    let branch_or_slug = if !row.workspace.branch.is_empty() {
-        row.workspace.branch.as_str()
+    // ── line 1: prompt title (else adapter label) + relative age, right ──
+    let primary = row.primary.as_deref().unwrap_or(row.label.as_str());
+    // A captured prompt leads brighter; the adapter-name fallback reads dimmer.
+    let primary_color = if row.primary.is_some() {
+        theme.fg_base
     } else {
-        row.workspace.slug.as_str()
+        theme.fg_muted
     };
-    let loc_label = div()
-        .flex_1()
-        .min_w_0()
-        .text_size(px(typography.t_body_sm))
-        .text_color(theme.fg_base)
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .child(format!("{} · {}", row.project_name, branch_or_slug));
-
-    let verb_chip = div()
-        .flex_shrink_0()
-        .text_size(px(typography.t_sub_label))
-        .text_color(verb_color)
-        .whitespace_nowrap()
-        .child(row.verb.label);
-
-    // Diff chip: "+A −B" — omitted when diff is absent or both counts are zero.
-    let diff_chip = row.diff.as_ref().and_then(|d| {
-        if d.added == 0 && d.removed == 0 {
-            return None;
-        }
-        Some(
-            div()
-                .flex_shrink_0()
-                .ml(px(density.gap_inline))
-                .text_size(px(typography.t_sub_label))
-                .text_color(theme.fg_subtle)
-                .whitespace_nowrap()
-                .child(format!("+{} −{}", d.added, d.removed)),
-        )
-    });
-
     let line1 = div()
         .flex()
         .flex_row()
         .items_center()
         .w_full()
         .gap(px(density.gap_inline))
-        .child(loc_label)
-        .child(verb_chip)
-        .children(diff_chip);
-
-    // ── line 2: review CTA (tier 0) else the live tool subline ──
-    // Action-required rows surface a discoverable "Review →" — clicking the
-    // row jumps to the agent's tab (approval happens in its own TUI). Running
-    // rows show the structured sideband tool step ("Edit · src/lib.rs") when
-    // the agent reports one, falling back to the log-tailed activity line;
-    // everything else leaves line 2 empty (the taller card still reads cleanly).
-    let line2_child = if is_attention {
-        Some(
+        .child(
             div()
+                .flex_1()
                 .min_w_0()
-                .text_size(px(typography.t_sub_label))
-                .text_color(verb_color)
+                .text_size(px(typography.t_body_sm))
+                .text_color(primary_color)
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .child("Review →"),
+                .child(primary.to_string()),
         )
-    } else {
-        let subline = row
-            .sideband_detail
-            .as_ref()
-            .and_then(sideband_subline)
-            .or_else(|| row.activity.clone());
-        subline.map(|text| {
+        .child(
             div()
-                .min_w_0()
+                .flex_shrink_0()
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
-                .overflow_hidden()
                 .whitespace_nowrap()
-                .child(text)
-        })
+                .child(row.age_label.clone()),
+        );
+
+    // ── line 2: the live tool step / reply, else the state label ──
+    let secondary = row
+        .secondary
+        .clone()
+        .unwrap_or_else(|| agent_state_label(&status).to_string());
+    let line2 = (!secondary.is_empty()).then(|| {
+        div()
+            .w_full()
+            .min_w_0()
+            .text_size(px(typography.t_sub_label))
+            .text_color(theme.fg_subtle)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(secondary)
+    });
+
+    // ── line 3: repo pill + branch chip ──
+    let branch_or_slug = if row.workspace.branch.is_empty() {
+        row.workspace.slug.as_str()
+    } else {
+        row.workspace.branch.as_str()
     };
-    let line2 = div()
+    let line3 = div()
         .flex()
         .flex_row()
         .items_center()
-        .w_full()
-        .children(line2_child);
+        .gap(px(density.gap_inline))
+        .child(
+            div()
+                .flex_shrink_0()
+                .px(px(4.))
+                .rounded(px(4.))
+                .bg(theme.hover_overlay)
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_muted)
+                .whitespace_nowrap()
+                .child(row.project_name.clone()),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .whitespace_nowrap()
+                .child(branch_or_slug.to_string()),
+        );
 
-    // Stacked text column next to the icon ring.
     let text_col = div()
         .flex()
         .flex_col()
@@ -153,18 +190,20 @@ pub fn render_agent_row(
         .min_w_0()
         .gap(px(2.))
         .child(line1)
-        .child(line2);
+        .children(line2)
+        .child(line3);
 
     let root = div()
         .flex()
         .flex_row()
-        .items_center()
+        .items_start()
         .w_full()
         .h(px(ROW_HEIGHT))
         .px(px(density.pad_panel))
+        .py(px(density.gap_inline))
         .gap(px(density.gap_inline))
         .cursor_pointer()
-        .child(icon_ring)
+        .child(lead)
         .child(text_col);
 
     if is_attention {

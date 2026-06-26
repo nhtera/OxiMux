@@ -48,7 +48,7 @@ const SPINNER_STEPS: f32 = 12.0;
 /// cockpit's "done") so it renders the emerald check rather than the grey idle
 /// dot a never-run agent shows. `row_key` seeds the spinner's animation id so
 /// concurrently-running agents each keep their own rotation phase.
-fn agent_state_indicator(
+pub fn agent_state_indicator(
     status: &AgentStatus,
     completed_turn: bool,
     row_key: &str,
@@ -105,7 +105,7 @@ fn agent_state_indicator(
 
 /// State label for the row's secondary text, matching the reference cockpit's
 /// vocabulary ("Idle"/"Working"/…) rather than the tab badge's "Ready".
-fn agent_state_label(status: &AgentStatus) -> &'static str {
+pub fn agent_state_label(status: &AgentStatus) -> &'static str {
     match status {
         AgentStatus::Running => "Working",
         AgentStatus::Idle => "Idle",
@@ -119,7 +119,7 @@ fn agent_state_label(status: &AgentStatus) -> &'static str {
 
 /// Collapse runs of whitespace (incl. newlines) to single spaces so a multi-line
 /// prompt renders as one scannable line.
-fn collapse_ws(s: &str) -> String {
+pub fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -393,14 +393,14 @@ fn row_detail(row: &RailAgentRow) -> Option<oximux_core::SidebandDetail> {
 /// it is idle but has produced an assistant reply (captured by the `Stop` hook).
 /// Drives the emerald done-check, distinguishing a completed agent from one that
 /// has never run a turn (which stays a grey idle dot).
-fn is_completed_turn(row: &RailAgentRow) -> bool {
+pub fn is_completed_turn(row: &RailAgentRow) -> bool {
     matches!(row.effective_status(), AgentStatus::Idle)
         && row_detail(row)
             .and_then(|d| d.last_message)
             .is_some_and(|m| !m.trim().is_empty())
 }
 
-fn live_prompt(row: &RailAgentRow) -> Option<String> {
+pub fn live_prompt(row: &RailAgentRow) -> Option<String> {
     let live = row_detail(row).and_then(|d| d.prompt);
     let chosen = live.or_else(|| row.persisted_title.clone())?;
     let trimmed = chosen.trim();
@@ -411,7 +411,7 @@ fn live_prompt(row: &RailAgentRow) -> Option<String> {
 /// the tool it is invoking (`"Edit: foo.rs"`) or its last free-form message.
 /// `None` for history rows or a live agent with no current detail — the row
 /// then falls back to its prompt or status verb. Not truncated here.
-fn live_activity(row: &RailAgentRow) -> Option<String> {
+pub fn live_activity(row: &RailAgentRow) -> Option<String> {
     let detail = row_detail(row)?;
     let text = if let Some(tool) = detail.tool_name.as_deref().filter(|t| !t.is_empty()) {
         match detail

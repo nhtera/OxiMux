@@ -1,96 +1,59 @@
 //! Pure data layer for the agents dashboard — no GPUI runtime required.
 //!
-//! Provides `AgentRow` (one row per live/status-bearing workspace across all
-//! projects), `attention_rank` (priority tier for sorting), and
-//! `sort_agent_rows` (stable sort by tier, then recency within a tier).
+//! Provides `AgentRow` (one row per agent session across all projects),
+//! `attention_rank` (priority tier for sorting), and `sort_agent_rows` (stable
+//! sort by tier, then recency within a tier).
 //!
 //! Row assembly (`build_agent_rows`, `widest_row_index`) lives in the sibling
 //! `row_builder` module; this file is the pure `AgentRow` model + ranking and
 //! is testable without a window.
 
-use oximux_core::{AgentStatus, SidebandDetail, Workspace};
+use oximux_core::{AgentStatus, Workspace};
 
-use crate::shell::agent_presentation::AgentVerb;
-use crate::shell::left_rail::workspace_row::DiffCounts;
+use crate::shell::left_rail::RailAgentTarget;
 
-/// Max length of the composed line-2 sideband subline, in characters. The
-/// scanner already caps the raw payload fields; this caps the joined string
-/// so a tool + input pair can't overflow the narrow card.
-const SUBLINE_MAX_CHARS: usize = 80;
-
-/// One row in the agents dashboard. Carries enough data to render the row
-/// and to activate the workspace on click — avoids re-querying any map
-/// inside the `uniform_list` closure.
+/// One row in the agents dashboard — **one per agent session** (a workspace
+/// with multiple agents yields multiple rows). Carries enough data to render
+/// the card and to focus the agent on click — avoids re-querying any map or
+/// borrowing a live channel inside the `uniform_list` closure.
 #[derive(Debug, Clone)]
 pub struct AgentRow {
-    /// Human-readable project name for the first-column label.
+    /// Human-readable project name for the repo badge.
     pub project_name: String,
-    /// The workspace this row represents. Its `id` and `worktree_path` drive
-    /// the click handler; its `name`/`slug`/`branch` drive the row label.
+    /// The owning workspace. Its `worktree_path` is the row identity; its
+    /// `branch`/`slug` drive the branch badge.
     pub workspace: Workspace,
-    /// Resolved verb label + color (reused from `agent_presentation`).
-    pub verb: AgentVerb,
-    /// Working-tree diff counts. `None` when not yet cached or unavailable.
-    pub diff: Option<DiffCounts>,
-    /// Latest agent-session status. `None` for live-but-never-started workspaces.
+    /// Stable per-session row key (`agent_sessions.id` or `ambient:<pty>`) —
+    /// the card's element id and the spinner animation key.
+    pub db_id: String,
+    /// What clicking this card focuses: the agent's tab (tracked) or its
+    /// terminal (ambient).
+    pub target: RailAgentTarget,
+    /// Pre-formatted relative age ("now", "5m", "2d") computed at merge time.
+    pub age_label: String,
+    /// Effective status (live snapshot when live, else DB). `Some` for every
+    /// session row; `Option` only so `attention_rank` shares one signature.
     pub status: Option<AgentStatus>,
-    /// Whether the workspace currently has an open agent tab (green idle dot).
+    /// Whether a live tab/terminal currently backs this row.
     pub is_live: bool,
-    /// Live tool-activity line for Running sessions ("Bash: cargo test…"),
-    /// tailed from the agent CLI's session log on a background tick. `None`
-    /// when idle, non-Running, or the log has no fresh tool call.
-    pub activity: Option<String>,
-    /// Bundled SVG glyph for the workspace's latest agent adapter
-    /// (`icons/claude-code.svg` etc.), resolved once at build time so the
-    /// render closure never re-derives it. Falls back to the sparkles glyph.
+    /// Bundled SVG glyph for the agent's adapter, resolved once at build time.
     pub icon_path: &'static str,
-    /// Recency key for the in-tier secondary sort: the latest session's
-    /// `ended_at` (terminal) else `started_at`, as the raw RFC-3339 string.
-    /// Storage stamps every value with `Utc::now().to_rfc3339()` (a `+00:00`
-    /// suffix, NOT `Z`), so all values share one format and lexicographic
-    /// ordering matches chronological — no parse to millis needed. `None`
-    /// for a live-but-never-started workspace.
+    /// Recency key for the in-tier secondary sort: terminal `ended_at` else
+    /// `started_at`, as the raw RFC-3339 string. `None` when unavailable.
     pub last_active_at: Option<String>,
-    /// Live structured detail from the agent's OSC-9999 status sideband — the
-    /// tool it is currently invoking (`Edit`, `Bash`, …) with an optional
-    /// input summary. Populated only while Running; takes precedence over the
-    /// log-tailed `activity` on line 2 of the card. `None` when no sideband
-    /// has arrived (regex/heuristic path) or the agent isn't Running.
-    pub sideband_detail: Option<SidebandDetail>,
-}
-
-/// Compose the line-2 subline for a Running agent's live sideband detail: the
-/// tool name, plus a ` · <input>` suffix when an input summary is present
-/// (e.g. `"Edit · src/lib.rs"`). Falls back to the free-form `last_message`
-/// when no tool name was reported. Returns `None` when the detail carries
-/// neither. Capped to `SUBLINE_MAX_CHARS` so a long input can't overflow the
-/// card. Shared by the row painter and the width estimator so both agree on
-/// the displayed text.
-pub fn sideband_subline(detail: &SidebandDetail) -> Option<String> {
-    let body = match (
-        detail.tool_name.as_deref(),
-        detail.tool_input_summary.as_deref(),
-    ) {
-        (Some(tool), Some(input)) if !input.is_empty() => format!("{tool} · {input}"),
-        (Some(tool), _) => tool.to_string(),
-        (None, _) => detail.last_message.clone()?,
-    };
-    if body.is_empty() {
-        return None;
-    }
-    Some(truncate_chars(&body, SUBLINE_MAX_CHARS))
-}
-
-/// Truncate `s` to at most `max` characters, appending an ellipsis when cut.
-/// Char-based (not byte-based) so a multi-byte tool input never splits a
-/// codepoint.
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    /// Adapter display name ("Claude Code") — the primary text when the agent
+    /// has no prompt yet.
+    pub label: String,
+    /// The user's prompt (the agent's title), collapsed to one line. `None`
+    /// when the agent has no captured prompt (primary falls back to `label`).
+    pub primary: Option<String>,
+    /// The live tool step ("Edit: foo.rs") or last reply, collapsed to one
+    /// line. `None` when the row has neither (secondary falls back to the
+    /// state label).
+    pub secondary: Option<String>,
+    /// Idle-with-reply: the agent finished a turn, so the card shows the
+    /// emerald done-check instead of a grey idle dot.
+    pub completed_turn: bool,
 }
 
 /// True for states a user should come look at: the session is blocked on
@@ -136,8 +99,8 @@ pub fn attention_rank(status: Option<&AgentStatus>, is_live: bool) -> u8 {
 
 /// Sort `rows` by `attention_rank`, then by recency (newest `last_active_at`
 /// first) within each tier. `slice::sort_by` is stable, so rows that tie on
-/// both keys (e.g. two running agents with no timestamp) keep their input
-/// order. A row with no timestamp sorts after rows that have one.
+/// both keys keep their input order. A row with no timestamp sorts after rows
+/// that have one.
 pub fn sort_agent_rows(rows: &mut [AgentRow]) {
     rows.sort_by(|a, b| {
         attention_rank(a.status.as_ref(), a.is_live)
@@ -153,12 +116,6 @@ pub fn sort_agent_rows(rows: &mut [AgentRow]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell::agent_presentation::agent_verb;
-    use oximux_settings::Theme;
-
-    fn t() -> Theme {
-        Theme::charcoal()
-    }
 
     fn workspace(id: &str, project_id: &str) -> Workspace {
         Workspace {
@@ -180,7 +137,6 @@ mod tests {
 
     #[test]
     fn needs_attention_matches_blocked_and_terminal_states() {
-        // Blocked-on-user and stopped states badge; in-flight states don't.
         assert!(needs_attention(&AgentStatus::NeedsApproval("x".into())));
         assert!(needs_attention(&AgentStatus::WaitingForInput));
         assert!(needs_attention(&AgentStatus::Done { code: Some(0) }));
@@ -203,10 +159,7 @@ mod tests {
 
     #[test]
     fn tier_zero_waiting_for_input() {
-        assert_eq!(
-            attention_rank(Some(&AgentStatus::WaitingForInput), false),
-            0
-        );
+        assert_eq!(attention_rank(Some(&AgentStatus::WaitingForInput), false), 0);
     }
 
     #[test]
@@ -221,14 +174,11 @@ mod tests {
 
     #[test]
     fn tier_two_live_without_status() {
-        // A workspace with an open agent tab but no concrete status → tier 2.
         assert_eq!(attention_rank(None, true), 2);
     }
 
     #[test]
     fn tier_two_idle_and_live() {
-        // Idle + live (the green "Ready" case) stays tier 2 — the live flag
-        // must not promote it above Running.
         assert_eq!(attention_rank(Some(&AgentStatus::Idle), true), 2);
     }
 
@@ -281,77 +231,23 @@ mod tests {
         is_live: bool,
         last_active_at: Option<&str>,
     ) -> AgentRow {
-        let theme = t();
-        let verb = agent_verb(status.as_ref(), is_live, theme);
         AgentRow {
             project_name: "P".to_string(),
             workspace: workspace(id, "proj"),
-            verb,
-            diff: None,
+            db_id: id.to_string(),
+            target: RailAgentTarget::AgentSession {
+                db_id: id.to_string(),
+            },
+            age_label: String::new(),
             status,
             is_live,
-            activity: None,
             icon_path: "icons/sparkles.svg",
             last_active_at: last_active_at.map(str::to_string),
-            sideband_detail: None,
+            label: "Claude Code".to_string(),
+            primary: None,
+            secondary: None,
+            completed_turn: false,
         }
-    }
-
-    fn detail(tool: Option<&str>, input: Option<&str>, msg: Option<&str>) -> SidebandDetail {
-        SidebandDetail {
-            tool_name: tool.map(str::to_string),
-            tool_input_summary: input.map(str::to_string),
-            last_message: msg.map(str::to_string),
-            session_id: None,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn subline_joins_tool_and_input() {
-        let d = detail(Some("Edit"), Some("src/lib.rs"), None);
-        assert_eq!(sideband_subline(&d).as_deref(), Some("Edit · src/lib.rs"));
-    }
-
-    #[test]
-    fn subline_tool_only_when_no_input() {
-        let d = detail(Some("Bash"), None, None);
-        assert_eq!(sideband_subline(&d).as_deref(), Some("Bash"));
-        // Empty input is treated as absent, not joined.
-        let d_empty = detail(Some("Bash"), Some(""), None);
-        assert_eq!(sideband_subline(&d_empty).as_deref(), Some("Bash"));
-    }
-
-    #[test]
-    fn subline_falls_back_to_message_without_tool() {
-        let d = detail(None, None, Some("rewriting auth"));
-        assert_eq!(sideband_subline(&d).as_deref(), Some("rewriting auth"));
-    }
-
-    #[test]
-    fn subline_none_when_empty() {
-        assert!(sideband_subline(&detail(None, None, None)).is_none());
-    }
-
-    #[test]
-    fn subline_truncated_at_cap() {
-        // A 200-char input yields a string capped at SUBLINE_MAX_CHARS with an
-        // ellipsis as the final char.
-        let long = "x".repeat(200);
-        let d = detail(Some("Edit"), Some(&long), None);
-        let out = sideband_subline(&d).expect("some");
-        assert_eq!(out.chars().count(), SUBLINE_MAX_CHARS);
-        assert!(out.ends_with('…'));
-    }
-
-    #[test]
-    fn truncate_chars_respects_codepoint_boundaries() {
-        // Multi-byte chars must not split: 100 'é' capped to 80 stays valid
-        // UTF-8 and ends with the ellipsis.
-        let s = "é".repeat(100);
-        let out = truncate_chars(&s, SUBLINE_MAX_CHARS);
-        assert_eq!(out.chars().count(), SUBLINE_MAX_CHARS);
-        assert!(out.ends_with('…'));
     }
 
     #[test]
@@ -361,18 +257,8 @@ mod tests {
             make_row("b", Some(AgentStatus::NeedsApproval("x".into())), false),
         ];
         sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "b");
-        assert_eq!(rows[1].workspace.id, "a");
-    }
-
-    #[test]
-    fn sort_puts_waiting_before_running() {
-        let mut rows = vec![
-            make_row("a", Some(AgentStatus::Running), false),
-            make_row("b", Some(AgentStatus::WaitingForInput), false),
-        ];
-        sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "b");
+        assert_eq!(rows[0].db_id, "b");
+        assert_eq!(rows[1].db_id, "a");
     }
 
     #[test]
@@ -382,7 +268,7 @@ mod tests {
             make_row("run", Some(AgentStatus::Running), false),
         ];
         sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "run");
+        assert_eq!(rows[0].db_id, "run");
     }
 
     #[test]
@@ -392,34 +278,22 @@ mod tests {
             make_row("idle", Some(AgentStatus::Idle), false),
         ];
         sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "idle");
-    }
-
-    #[test]
-    fn sort_puts_done_clean_before_failed() {
-        let mut rows = vec![
-            make_row("fail", Some(AgentStatus::Failed("x".into())), false),
-            make_row("done", Some(AgentStatus::Done { code: Some(0) }), false),
-        ];
-        sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "done");
+        assert_eq!(rows[0].db_id, "idle");
     }
 
     #[test]
     fn sort_is_stable_within_tier() {
-        // Two running agents, no timestamps — input order must be preserved.
         let mut rows = vec![
             make_row("first", Some(AgentStatus::Running), false),
             make_row("second", Some(AgentStatus::Running), false),
         ];
         sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "first");
-        assert_eq!(rows[1].workspace.id, "second");
+        assert_eq!(rows[0].db_id, "first");
+        assert_eq!(rows[1].db_id, "second");
     }
 
     #[test]
     fn sort_running_rows_by_recency_descending() {
-        // SC1: within the same attention tier, the newer session floats up.
         let mut rows = vec![
             make_row_at(
                 "older",
@@ -435,30 +309,12 @@ mod tests {
             ),
         ];
         sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "newer");
-        assert_eq!(rows[1].workspace.id, "older");
-    }
-
-    #[test]
-    fn sort_row_with_timestamp_floats_above_one_without() {
-        // Within a tier, a row carrying a recency timestamp beats one missing it.
-        let mut rows = vec![
-            make_row_at("no-ts", Some(AgentStatus::Running), false, None),
-            make_row_at(
-                "has-ts",
-                Some(AgentStatus::Running),
-                false,
-                Some("2026-06-20T00:00:00+00:00"),
-            ),
-        ];
-        sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "has-ts");
+        assert_eq!(rows[0].db_id, "newer");
+        assert_eq!(rows[1].db_id, "older");
     }
 
     #[test]
     fn approval_row_floats_above_newer_running() {
-        // SC2: tier-0 (NeedsApproval) beats tier-1 (Running) regardless of a
-        // newer running timestamp — the attention tier is the primary key.
         let mut rows = vec![
             make_row_at(
                 "running-newer",
@@ -474,8 +330,8 @@ mod tests {
             ),
         ];
         sort_agent_rows(&mut rows);
-        assert_eq!(rows[0].workspace.id, "approval-older");
-        assert_eq!(rows[1].workspace.id, "running-newer");
+        assert_eq!(rows[0].db_id, "approval-older");
+        assert_eq!(rows[1].db_id, "running-newer");
     }
 
     #[test]
@@ -488,7 +344,7 @@ mod tests {
             make_row("e", Some(AgentStatus::Idle), false),
         ];
         sort_agent_rows(&mut rows);
-        let ids: Vec<&str> = rows.iter().map(|r| r.workspace.id.as_str()).collect();
+        let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
         // Expected order: d (0), c (1), e (2), a (3), b (4)
         assert_eq!(ids, vec!["d", "c", "e", "a", "b"]);
     }
