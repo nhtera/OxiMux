@@ -98,8 +98,8 @@ fn batch_touches_settings(result: &DebounceEventResult) -> bool {
 /// Call once from the app's `run` closure alongside the other settings
 /// installers.
 ///
-/// On a fresh profile we back-fill the skip-permissions defaults (the reference UX-style
-/// one-shot migration) and persist them, so the first one-click launch starts
+/// On a fresh profile we back-fill the skip-permissions defaults via a
+/// one-shot migration and persist them, so the first one-click launch starts
 /// the agent in full-autonomy mode and the seeded flags are visible + editable
 /// in the settings pane. The `yolo_defaults_migrated` guard means a user who
 /// later clears a flag is never re-seeded.

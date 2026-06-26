@@ -7,7 +7,7 @@
 //! below the 500-LOC warn budget and gives the click-routing logic a
 //! single file to reason about.
 //!
-//! Click semantics (matching Finder / VSCode list behaviour):
+//! Click semantics (standard multi-select list behaviour):
 //! - **Bare click** → [`select_only`] — replace selection with one path,
 //!   update anchor.
 //! - **Cmd-click** → [`toggle_selection`] — flip one path in/out of

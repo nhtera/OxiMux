@@ -257,7 +257,7 @@ every other kind `→ .outline()`.
 
 A verb menu (the SCM commit split-button dropdown is the canonical case) reads
 top-down as "what can I do right now?". Render the rows to make that scannable
-(modeled on VS Code / the reference UX git menus):
+(modeled on common IDE git menus):
 
 - **Enabled / actionable** rows carry `w_medium` weight and the menu's default
   bright foreground — *no* explicit color, so the hover highlight still recolors

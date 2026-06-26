@@ -456,9 +456,9 @@ fn push_disabled_reason(
 /// Precise "why is Create PR disabled" reason, in severity order. The
 /// `!in_sync` case is split into needs-push (only ahead) vs needs-sync
 /// (behind — pull or force-push first), and detached-HEAD / default-branch
-/// get their own actionable steers. (the reference UX additionally has an
-/// `auth_required` → "Run gh auth login" reason; OxiMux doesn't poll
-/// `gh auth status`, so that case isn't distinguished here.)
+/// get their own actionable steers. (A possible `auth_required` →
+/// "Run gh auth login" reason isn't distinguished here, since OxiMux
+/// doesn't poll `gh auth status`.)
 fn create_pr_disabled_reason(
     p: &PrimaryActionInputs,
     has_upstream: bool,

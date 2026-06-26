@@ -16,7 +16,7 @@ De-bulk the ~93k-LOC `app` crate for navigability — a pure refactor, full suit
 - **File-size lint relaxed to GPUI reality.** Warn 1500 / fail 3000 (was 500/800), plus a ratchet allowlist (`xtask/file-size-allow.txt`) that grandfathers the 3 remaining over-cap files and can only shrink.
 - **Deferred (parked w/ design record):** `oximux-contract` (33-module action floor) + all `*-ui` feature crates — see `docs/adr/006-tier1-reorg-and-oximux-ui.md`.
 
-Gates: `cargo build --workspace` (debug + `--release`), `cargo test --workspace --all-targets` (2382 pass), `cargo clippy --workspace --all-targets` (0 warnings), `cargo run -p xtask -- file-size-lint` (ok). On branch `refactor/crate-reorg-foundation`; per-phase commits; pending GUI smoke + merge to main.
+Gates: `cargo build --workspace` (debug + `--release`), `cargo test --workspace --all-targets` (2382 pass), `cargo clippy --workspace --all-targets` (0 warnings), `cargo run -p xtask -- file-size-lint` (ok). On a refactor branch; per-phase commits; pending GUI smoke + merge to main.
 
 ---
 
@@ -248,7 +248,7 @@ GUI-screenshot verification of the diff-zoom + failed-load states is environment
 **Commits**: _(local, pending)_
 **Touches**: `crates/storage/migrations/V016__workspaces_pinned.sql` (new — `pinned INTEGER DEFAULT 0`, ladder → 16), `crates/storage/src/{migrations.rs,model.rs}`, `crates/storage/src/repositories/workspace.rs` (`set_pinned`, SELECT cols), `crates/core/src/workspace.rs` (`pinned: bool`), `crates/app/src/shell/left_rail/{mod.rs,workspace_list_render.rs,row_menu.rs,workspace_card.rs,workspace_row.rs,project_group.rs,project_drag.rs}`, `crates/app/src/shell/workspace_ops.rs` (`toggle_workspace_pin`, `rename_workspace_now` pub), `crates/app/src/assets.rs` (register `pin.svg`), `crates/app/assets/icons/pin.svg` (new)
 
-Implements all 12 research recommendations plus **workspace pinning** (the reference UX's model). Sort mode stays global; free drag-reorder stays gated to Manual.
+Implements all 12 research recommendations plus **workspace pinning**. Sort mode stays global; free drag-reorder stays gated to Manual.
 
 **Pinning:** migration V016 adds `workspaces.pinned`; a pinned workspace floats to the top of its project group in *every* sort mode (`sort_workspaces` now orders `[primary, pinned…by mode, unpinned…by mode]`). Pin/Unpin sits at the top of the row menu (and right-click), shows a pin glyph, persists across restart, and is excluded from free-drag (it's already anchored). Pinned rows are tracked in the Smart-sort settle entry so a pin re-ranks immediately while attention changes still debounce.
 
@@ -448,7 +448,7 @@ Verified: clean build, 22 browser_view tests green. Live-verify pending on your 
 **Commits**: _(local, pending)_
 **Touches**: `crates/app/src/shell/browser_view/agent_context.rs` (`profile_menu_js` + `switch_profile`/`new_profile` IPC), `crates/app/src/shell/browser_view/mod.rs` (`open_profile_menu` + deferred `ProfileRequest`), `crates/app/src/shell/browser_view/render.rs`
 
-The profile control was a cycle-on-click button (rotate to the next store, current name only in a tooltip) plus a separate "+" button to mint a new profile — two buttons, neither showing the full list. Consolidated into one menu.
+The profile control was a cycle-on-click button (rotate to the next store, current name only in a tooltip) plus a separate "+" button to mint a new profile — two buttons, neither showing the full list. Consolidated into one unified menu.
 
 - **Profile button → opens a Profiles menu** listing every cookie-isolated profile with a green **✓** + a highlighted row on the active one, a divider, then **New Profile…**. Switching is one click to a *named* target (no blind cycling); the standalone "+" button is folded in and removed.
 - The button **tints green** when a non-default profile is active, so an isolated store shows at a glance.
@@ -600,7 +600,7 @@ GUI-verified live: the carded pane renders, default-agent chips select with the 
 A Settings → Agents "Launch defaults" section, so the one-click launcher can apply per-agent defaults — matching the reference cockpit's agent-settings screen. Configurable per agent: extra CLI flags (a one-tap skip-permissions toggle), a default model, and enable/disable; plus a default agent surfaced first in the picker.
 
 - **Settings model** (`agent_launch.rs`): `AgentLaunchSettings { default_agent, yolo_defaults_migrated, agents: { <id>: { args, model, disabled } } }`, persisted to `agent_launch.toml` (TOML + GPUI global + debounced file-watcher, same pattern as the other settings files). A `split_args` helper shell-splits the free-text args (quote-aware) at launch.
-- **Skip-permissions ON by default** (matching the reference cockpit): on a fresh profile, a one-shot migration (`seed_yolo_defaults`, mirroring the reference UX's `migrateAgentYoloDefaults`) back-fills each built-in's skip-permissions flag (`--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox` / `--yes-always`) and persists the file, so the first one-click launch starts the agent in full-autonomy mode. The `yolo_defaults_migrated` guard means a user who later clears a flag is never re-seeded; an agent already configured is left untouched.
+- **Skip-permissions ON by default** (matching the reference cockpit): on a fresh profile, a one-shot migration (`seed_yolo_defaults`) back-fills each built-in's skip-permissions flag (`--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox` / `--yes-always`) and persists the file, so the first one-click launch starts the agent in full-autonomy mode. The `yolo_defaults_migrated` guard means a user who later clears a flag is never re-seeded; an agent already configured is left untouched.
 - **Settings UI** (`pane_agents_launch.rs`): default-agent segmented picker + a row per built-in agent with three live chips — Enabled/Disabled, Skip-perms On/Off (toggles the agent-correct flag: `--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox` / `--yes-always` in/out of the args string, preserving any other hand-edited flags), and a Model cycle. Edits write the TOML immediately; the watcher reloads + swaps the global. Both sections are searchable.
 - **Launch threading**: `AgentSessionConfig` gained `extra_args`; each built-in adapter appends them after its model/effort flags and before the positional prompt. The picker `on_select` fills the model when unset and the extra args from the global; the restore path re-applies args on respawn.
 - **Picker** (`adapter_picker.rs`): hides disabled agents and floats the default agent to the top with a "default" badge (stable order otherwise).
@@ -642,7 +642,7 @@ Verified live: real `cc` typed into a plain terminal flips the graphify-rs card 
 
 Note: OSC title state isn't replayed when the daemon re-attaches a restored terminal (only scrollback is) — a cold-restored agent tab reads its stale tracked status and "Terminal N" until the program re-emits a title.
 
-Scope (v1): a single name + verb per card (not the reference UX's expandable multi-row list); the dashboard/nav badge unchanged.
+Scope (v1): a single name + verb per card (not an expandable multi-row list); the dashboard/nav badge unchanged.
 
 ---
 
@@ -895,9 +895,8 @@ Replaces single-line workspace rows in the left rail with two-line rich cards:
 **Commits**: `3b08487` (P1–P3), `b4e084f` (P4–P6), `c58fca6` (P7), `e7f316f` (P8), `2b11d2f` (P9), `1f6ef9f` (P10), `86acc23` (P11), `8b5ddc7` (P12 slices 1+1.5), pending (P12 slice 2)  
 **Plan**: `plans/260529-2042-terminal-emulator-richness/`
 
-Closes the emulator-quality gap with the three reference GPUI terminals
-(gpui-terminal, crate-reorg, zed-industries/zed) that share OxiMux's
-`alacritty_terminal` + `portable-pty` backend.
+Closes the emulator-quality gap with the reference GPUI terminals that
+share OxiMux's `alacritty_terminal` + `portable-pty` backend.
 
 #### Sprint A — base feels real
 - **P1 SGR text attributes** — bold/italic/underline/strikethrough/dim now propagate from alacritty to the canvas paint via per-cell flags + per-run font weight/style overrides.

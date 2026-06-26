@@ -14,7 +14,7 @@
 //! `overflow_y_scroll` flex column couldn't compute a reliable max scroll
 //! offset over that dynamic tree (so it never reached the last line).
 //!
-//! The fix mirrors how GPUI diff viewers do it (Zed / its mobile fork):
+//! The fix mirrors how GPUI diff viewers do it:
 //!
 //!   1. **Flatten** the nested plan into a single `Vec<PreparedRow>` so the
 //!      body lives in one flat index space.

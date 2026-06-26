@@ -42,7 +42,7 @@ pub enum NodeStatus {
 
 impl NodeStatus {
     /// Severity used for folder rollup. Higher wins. `Deleted` returns
-    /// `None` so it never propagates to parents (matches the reference UX).
+    /// `None` so it never propagates to parents.
     fn rollup_severity(self) -> Option<u8> {
         match self {
             NodeStatus::Conflict => Some(5),
@@ -375,7 +375,7 @@ mod tests {
         for child in dir.children.values() {
             assert_eq!(child.leaf_status, Some(NodeStatus::Deleted));
         }
-        // ...but the parent gets no rollup (matches the reference UX).
+        // ...but the parent gets no rollup.
         assert_eq!(dir.rollup_status, None);
     }
 

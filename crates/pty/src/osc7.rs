@@ -159,7 +159,7 @@ impl OscScanner {
                     on_hit(OscHit::Cwd(path));
                 }
             }
-            // OSC 133 (FinalTerm) / OSC 633 (VS Code) command marks share the
+            // OSC 133 / OSC 633 command marks share the
             // A/B/C/D phase tags; 633's extra E/F/P fields parse to None.
             b"133" | b"633" => {
                 if let Some(hit) = parse_command_mark(rest) {
@@ -180,7 +180,7 @@ impl OscScanner {
 
 /// Parse the payload AFTER the `133;`/`633;` prefix into a command mark.
 /// `A`→PromptStart, `B`→CommandStart, `C`→OutputStart, `D[;exit]`→CommandEnd.
-/// Unknown tags (VS Code's `E`/`F`/`P`) return `None`.
+/// Unknown tags (633's `E`/`F`/`P`) return `None`.
 fn parse_command_mark(rest: &[u8]) -> Option<OscHit> {
     let mut parts = rest.split(|&b| b == b';');
     let kind = match parts.next()? {
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn osc633_shares_command_mark_semantics() {
-        // VS Code uses 633; A/B/C/D map the same, E (command line) is ignored.
+        // 633 adds E/F/P; A/B/C/D map the same, E (command line) is ignored.
         let hits = collect_hits(b"\x1b]633;A\x07\x1b]633;E;ls -la\x07\x1b]633;D;0\x07");
         assert_eq!(
             hits,

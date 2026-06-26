@@ -358,8 +358,8 @@ pub(super) fn row(
         // selection set is bundled into `selection_paths` so the menu
         // pluralises labels and dispatches over the whole set. When
         // the right-clicked row is NOT in the current selection, the
-        // menu opens in Single scope against just this row — matches
-        // VSCode / Finder behaviour where right-clicking an unselected
+        // menu opens in Single scope against just this row — the
+        // standard list behaviour where right-clicking an unselected
         // row implicitly targets that row.
         .on_mouse_down(
             MouseButton::Right,

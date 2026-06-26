@@ -84,7 +84,7 @@ pub struct WorkspaceRowPlan {
     /// (the main worktree is removed by removing the project, not here).
     pub is_primary: bool,
     /// `true` when this row represents a non-git folder project — renders
-    /// a `Folder` badge (instead of `primary`/branch), mirroring the reference UX.
+    /// a `Folder` badge (instead of `primary`/branch).
     pub is_folder: bool,
     /// `true` when this is the selected/active workspace — the row is
     /// painted as an inset rounded card rather than a flat highlight.

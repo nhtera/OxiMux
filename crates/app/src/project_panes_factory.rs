@@ -731,7 +731,7 @@ fn needs_tree_restore(tab: &PersistedTab) -> bool {
     tab.sub_panes.len() > 1 || tab.sub_panes.iter().any(|sp| sp.tabs.len() > 1)
 }
 
-/// One terminal per pane (single-terminal-per-pane model): expand any persisted leaf that held
+/// One terminal per pane: expand any persisted leaf that held
 /// more than one terminal (a legacy per-pane tab strip) into a horizontal
 /// split of single-terminal leaves. Leaves that already hold one terminal
 /// pass through unchanged, so a fully-migrated snapshot round-trips
@@ -849,7 +849,7 @@ fn build_multi_sub_pane_tree(
     cx: &mut Context<WorkspaceRoot>,
 ) -> Option<TerminalSplitTree> {
     type LeafSpec = (Vec<(Entity<TerminalView>, gpui::Subscription)>, usize);
-    // single-terminal-per-pane model: one terminal per pane. Expand any legacy per-pane tab
+    // One terminal per pane. Expand any legacy per-pane tab
     // strip into split leaves before building views, so each pane carries a
     // single terminal. Idempotent for already-single-terminal snapshots.
     let (tree, sub_panes, active_sub_pane) =

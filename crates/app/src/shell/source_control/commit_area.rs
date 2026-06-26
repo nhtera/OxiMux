@@ -861,7 +861,7 @@ fn build_commit_menu(
 
 /// Map one resolved entry into a styled `PopupMenuItem`.
 ///
-/// Hierarchy (modeled on VS Code / the reference UX git menus):
+/// Hierarchy (modeled on common IDE git menus):
 /// - **Enabled** verbs carry a medium weight and the menu's default bright
 ///   foreground (no explicit color, so hover still recolors them) — the
 ///   actionable rows are the visual focus. Counts ride inline in the label

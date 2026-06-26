@@ -25,8 +25,8 @@
 //! Why a relay round-trip and not a `/dev/tty` write: Claude runs hook commands
 //! detached (new session, no controlling terminal), so `/dev/tty` is `ENXIO`.
 //! Routing the status back through the relay — keyed by the env-injected pane
-//! id — is the only path that works for a hook. (the reference UX and the reference cockpit solve the same
-//! constraint the same way: a callback to the app over an IPC channel.)
+//! id — is the only path that works for a hook. (Other agent cockpits solve
+//! the same constraint the same way: a callback to the app over an IPC channel.)
 //!
 //! Design notes:
 //! - **App-owned, non-destructive.** The hooks are passed as a `--settings`

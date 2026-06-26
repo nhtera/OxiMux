@@ -231,7 +231,7 @@ const COMMAND_CENTER_MAX_W: f32 = 520.0;
 /// Glyph size for the command-center search icon and the `⌘P` hint scale.
 const COMMAND_CENTER_ICON: f32 = 12.0;
 
-/// VS Code–style "Command Center": a centered, fixed-max-width field hosted in
+/// IDE-style "Command Center": a centered, fixed-max-width field hosted in
 /// the center chrome zone that opens Quick Open on click.
 ///
 /// Deliberately NOT the reference editor's draggable tab strip in the title

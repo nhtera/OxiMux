@@ -26,7 +26,7 @@ The correct cargo idiom for git deps shared with an unpinned transitive crate is
 |---|---|---|---|
 | `gpui` / `gpui_platform` / `gpui_macros` | `4e06b33eb9f292507c98e4a143438c1c3d8a2b5b` | 2026-05-15 | zed-industries/zed main |
 | `gpui-component` | `ccc1e7689203d09bfc88a0aae29473d1c289fa0c` | 2026-05-15 | longbridge/gpui-component main |
-| Rust toolchain | `1.95.0` | 2026-05-15 | matches `zed-industries/zed/rust-toolchain.toml` upstream |
+| Rust toolchain | `1.95.0` | 2026-05-15 | matches `zed-industries/zed` rust-toolchain.toml upstream |
 
 ## Bump history
 

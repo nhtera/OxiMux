@@ -121,7 +121,7 @@ impl Render for BrowserView {
                 nav_btn("browser-forward", "icons/arrow-right.svg")
                     .on_click(cx.listener(|this, _, _window, _cx| this.go_forward())),
             )
-            // Reload, or stop while a page is loading (swap).
+            // Reload, or stop while a page is loading (in-place swap).
             .child(if self.loading {
                 nav_btn("browser-stop", "icons/x.svg")
                     .tooltip("Stop")

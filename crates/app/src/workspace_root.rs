@@ -2577,7 +2577,7 @@ impl Render for WorkspaceRoot {
         // gives them top/bottom breathing room inside the 36px band.
         let strip_row_height_px = density.h_top_bar;
         let center_column = {
-            // VS Code–style command center in the center chrome zone (the tab
+            // IDE-style command center in the center chrome zone (the tab
             // strip lives in its OWN row below — not here). Resting label is the
             // active project name; click opens Quick Open.
             let command_center = top_bar::command_center(

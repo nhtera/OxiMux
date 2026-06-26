@@ -47,8 +47,7 @@ docs/
 ├── adr/                   architectural decision records (001-005)
 ├── design-guidelines.md   palette, density, typography (the contract)
 ├── gpui-pins.md           GPUI + gpui-component SHA tuple + bump log
-├── brief.md               product vision and PRD
-└── reference.md           competitor inventory
+└── brief.md               product vision and PRD
 plans/
 └── 260515-2012-oximux-v1-build/   nine-phase implementation plan
 ```

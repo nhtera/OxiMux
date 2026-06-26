@@ -377,7 +377,7 @@ fn build_header(
     };
     let is_collapsed = plan.is_collapsed;
 
-    // Leading icon slot — matches the reference UX: the folder icon shows at rest
+    // Leading icon slot: the folder icon shows at rest
     // and is replaced in-place by a disclosure chevron on header hover
     // (no layout shift, folder stays flush-left). The chevron is a pure
     // visual indicator — the collapse toggle lives on the whole header row
@@ -536,7 +536,7 @@ fn build_header(
         });
 
     // Click anywhere on the header (folder / title / count chip / gap) to
-    // activate this project AND toggle its collapse state, matching the reference UX's
+    // activate this project AND toggle its collapse state via a
     // whole-row disclosure. Activate fires on mouse-down (so a drag-reorder
     // still focuses the project); the collapse toggle fires on `on_click`,
     // which GPUI suppresses after a drag — so reordering a header never
