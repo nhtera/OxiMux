@@ -3,7 +3,6 @@
 //! Each child module is one zone of the cockpit. They take a `Theme + Density
 //! + Typography` and return an `impl IntoElement` (RenderOnce). No state.
 
-pub mod adapter_picker;
 pub mod agent_presentation;
 pub mod agent_session_persistence;
 pub mod ambient_agent_scan;
@@ -13,9 +12,7 @@ pub mod add_project_dialog;
 pub mod agent_status_badge;
 pub mod agent_status_task;
 pub mod agent_tab_label;
-pub mod box_drawing;
 pub mod browser_view;
-pub mod cell_metrics;
 pub mod command_palette;
 pub mod commit_dialog;
 pub mod compose_bar;
@@ -26,14 +23,11 @@ pub mod diff_view;
 pub mod divider;
 pub mod file_explorer;
 pub mod forge;
-pub mod floating_terminal;
 pub mod file_tree_context_menu;
 pub mod file_tree_view;
 pub mod git_panel;
-pub mod key_input;
 pub mod left_rail;
 pub mod main_area;
-pub mod mouse_report;
 pub mod openable_text_file;
 pub mod pane_actions;
 pub mod pane_content;
@@ -56,21 +50,10 @@ pub mod split_direction;
 pub mod stash_panel;
 pub mod status_bar;
 pub mod tab_context_menu;
-pub mod floating_terminal_host;
-pub mod floating_terminal_persistence;
 pub mod usage_meter;
 #[cfg(target_os = "macos")]
 pub mod usage_popover;
 pub mod tasks_view;
-pub mod terminal_canvas;
-pub mod terminal_links;
-pub mod terminal_palette;
-pub mod terminal_row;
-pub mod terminal_search;
-pub mod terminal_search_overlay;
-pub mod terminal_scrollbar;
-pub mod terminal_search_state;
-pub mod terminal_view;
 pub mod toast;
 pub mod top_bar;
 pub mod welcome_actions;
@@ -79,3 +62,15 @@ pub mod welcome_view;
 pub mod workspace_dialog;
 pub mod workspace_ops;
 pub mod worktree_panel;
+
+// Terminal surface — clustered into shell/terminal/ for traversal. Re-exported
+// here so existing `crate::shell::<name>::…` paths keep resolving unchanged.
+pub mod terminal;
+
+#[doc(inline)]
+pub use terminal::{
+    adapter_picker, box_drawing, cell_metrics, floating_terminal, floating_terminal_host,
+    floating_terminal_persistence, key_input, mouse_report, terminal_canvas, terminal_links,
+    terminal_palette, terminal_row, terminal_scrollbar, terminal_search, terminal_search_overlay,
+    terminal_search_state, terminal_view,
+};

@@ -7,5 +7,5 @@
 #
 # Format: <repo-relative-path> <loc-budget>
 crates/app/src/workspace_root.rs 3796
-crates/app/src/shell/terminal_view.rs 3642
+crates/app/src/shell/terminal/terminal_view.rs 3642
 crates/app/src/shell/pane_group/mod.rs 3216
