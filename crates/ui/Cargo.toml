@@ -1,0 +1,19 @@
+[package]
+name = "oximux-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Shared, app-agnostic widget layer: overlay/FloatingSurface chrome, button
+# variant wrappers, and generic dialogs. Depends only DOWNWARD — GPUI for the
+# element API, gpui-component for the wrapped widgets (Icon/Input/...), and
+# oximux-settings for design tokens (Theme/Density/Typography/Motion). It must
+# never depend on oximux-app; widgets take their data via params and emit
+# local events so the host wires them.
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+oximux-settings = { workspace = true }

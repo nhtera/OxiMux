@@ -26,8 +26,12 @@ open dist/OxiMux.app
 
 ```
 crates/
-├── app/          GPUI shell: panes/tabs/splits, SCM, diff viewer,
-│                 command palette, agents dashboard, dialogs
+├── app/          GPUI host shell: panes/tabs/splits, SCM, diff viewer,
+│                 command palette, agents dashboard. Modules are foldered
+│                 by concern (app_settings/ agent_glue/ session_restore/
+│                 platform/ loaders/ shell/terminal/)
+├── ui/           shared, app-agnostic widgets (FloatingSurface overlay,
+│                 button variants, confirm dialog) — depends only downward
 ├── core/         domain types (Project, Workspace, Pane, AgentSession)
 ├── pty/          portable-pty + alacritty_terminal backend
 ├── git/          git CLI wrappers, status poller, diff parser, clone

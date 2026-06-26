@@ -7,7 +7,7 @@
 //! timeout; results cache for the app lifetime. Subsequent opens render the
 //! cache instantly + fire a background refresh.
 //!
-//! Pattern mirrors [`super::pane_actions::PaneActionsMenu`] — hand-rolled
+//! Pattern mirrors [`crate::shell::pane_actions::PaneActionsMenu`] — hand-rolled
 //! `Entity<Self>` with full-window overlay for click-outside dismiss; no
 //! `FocusHandle`, no Escape key (parity with the existing popover).
 
@@ -23,7 +23,7 @@ use oximux_agents::{AdapterRegistry, RegistryEntry};
 use oximux_core::AgentAdapter;
 use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
-use super::agent_presentation::adapter_icon_path;
+use crate::shell::agent_presentation::adapter_icon_path;
 use crate::keymap_registry::display_chord_for;
 use crate::ui::FloatingSurface;
 

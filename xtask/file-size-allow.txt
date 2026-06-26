@@ -1,0 +1,11 @@
+# file-size ratchet allowlist
+#
+# Files grandfathered over the 3000-LOC hard cap, recorded at their current
+# non-blank LOC. An allowlisted file may shrink freely but fails the lint the
+# moment it grows past the budget here — so this list can only ratchet down.
+# Drop a row once its file falls under the cap (the lint prints STALE to nudge).
+#
+# Format: <repo-relative-path> <loc-budget>
+crates/app/src/workspace_root.rs 3796
+crates/app/src/shell/terminal/terminal_view.rs 3642
+crates/app/src/shell/pane_group/mod.rs 3216

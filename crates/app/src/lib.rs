@@ -5,35 +5,45 @@
 //! binary at `src/main.rs` imports from this library.
 
 pub mod actions;
-pub mod agent_awake;
-pub mod app_nap;
 pub mod assets;
-pub mod agent_hooks_global;
-pub mod agent_launch_settings;
-pub mod agent_status_hooks;
-pub mod browser_profiles;
-pub mod commit_message_ai_settings;
-pub mod custom_commands_loader;
-pub mod file_http_client;
-pub mod git_state_cache;
-pub mod keybindings_settings;
 pub mod keymap_registry;
 pub mod left_rail_layout;
-pub mod menu;
-pub mod motion_settings;
 pub mod notifier;
-pub mod persisted_terminals;
 pub mod project_panes_factory;
-pub mod project_scripts_loader;
-pub mod relay_cold_restore;
-pub mod relay_supervisor;
-pub(crate) mod restore_fallback;
-pub mod scm_layout_settings;
 pub mod shell;
-pub mod single_instance;
 pub mod state;
-pub mod terminal_settings;
-pub mod ui;
-pub mod window_factory;
-pub mod window_registry;
 pub mod workspace_root;
+
+// Shared widget layer extracted to the `oximux-ui` crate. Re-exported under the
+// historical `crate::ui` path so every `crate::ui::…` call site resolves
+// unchanged (host depends on ui; ui never depends on the host).
+pub use oximux_ui as ui;
+
+// --- Grouped module folders (Tier-1 reorg) ---------------------------------
+// Files are foldered one level deep for traversal; each submodule is
+// re-exported below so existing `crate::<name>::…` / `oximux_app::<name>::…`
+// call sites keep resolving unchanged.
+pub mod agent_glue;
+pub mod app_settings;
+pub mod loaders;
+pub mod platform;
+pub mod session_restore;
+
+#[doc(inline)]
+pub use agent_glue::{agent_awake, agent_hooks_global, agent_status_hooks};
+#[doc(inline)]
+pub use app_settings::{
+    agent_launch_settings, commit_message_ai_settings, keybindings_settings, motion_settings,
+    scm_layout_settings, terminal_settings,
+};
+#[doc(inline)]
+pub use loaders::{
+    browser_profiles, custom_commands_loader, file_http_client, project_scripts_loader,
+};
+#[doc(inline)]
+pub use platform::{app_nap, menu, single_instance, window_factory, window_registry};
+#[doc(inline)]
+pub use session_restore::{
+    git_state_cache, persisted_terminals, relay_cold_restore, relay_supervisor,
+};
+pub(crate) use session_restore::restore_fallback;

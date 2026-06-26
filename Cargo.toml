@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/app",
+    "crates/ui",
     "crates/core",
     "crates/pty",
     "crates/git",
@@ -27,6 +28,7 @@ rust-version = "1.89"
 [workspace.dependencies]
 # Internal crates
 oximux-app      = { path = "crates/app" }
+oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
 oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }
