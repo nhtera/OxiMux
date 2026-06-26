@@ -13,7 +13,11 @@ oximux/
 ├── Cargo.toml              workspace root; all crate deps declared here
 ├── xtask/                  CI helpers: file-size-lint, build checks
 └── crates/
-    ├── app/                GPUI shell — UI composition, action routing, rendering
+    ├── app/                GPUI host shell — UI composition, action routing, rendering
+    │                       (modules foldered by concern: app_settings/ agent_glue/
+    │                       session_restore/ platform/ loaders/ shell/terminal/)
+    ├── ui/                 shared app-agnostic widgets (FloatingSurface, buttons,
+    │                       confirm dialog); depends only downward — never on app
     ├── core/               domain types with zero tokio/GPUI deps
     ├── pty/                portable-pty + alacritty_terminal backend
     ├── git/                git CLI wrappers, poller, diff parser
@@ -209,8 +213,40 @@ src/
         └── list_render.rs  pure label/suggest-path helpers
 ```
 
-Top-level entries in `crates/app/src/` also include:
-- `project_scripts_loader.rs` — reads `.oximux/scripts.toml` per project (`ProjectScripts`); wires left-rail "…" menu items ("Run setup / Run / Run cleanup") → spawns interactive PTY tab at worktree cwd; `auto_setup` hook after worktree create; cleanup awaited (30 s bound, `kill_on_drop`) before worktree delete
+**Tier-1 foldering (2026-06):** the formerly-flat top-level modules are grouped
+one folder deep for traversal (each folder re-exports its submodules at the
+crate root, so `crate::<name>::…` paths are unchanged):
+- `app_settings/` — terminal/motion/scm_layout/keybindings/commit_message_ai/agent_launch settings (host-level; distinct from the `oximux-settings` crate)
+- `agent_glue/` — agent_awake, agent_hooks_global, agent_status_hooks
+- `session_restore/` — relay_cold_restore, relay_supervisor, restore_fallback, persisted_terminals, git_state_cache (several are `impl WorkspaceRoot`, so they stay in `app`)
+- `platform/` — app_nap, single_instance, window_factory, window_registry, menu
+- `loaders/` — custom_commands_loader, `project_scripts_loader` (reads `.oximux/scripts.toml`), browser_profiles, file_http_client
+- `shell/terminal/` — the ~17 terminal-surface modules (terminal_view/canvas/row/links/palette/scrollbar/search*/key_input/mouse_report/cell_metrics/box_drawing/adapter_picker/floating_terminal*)
+
+Stays loose at `crates/app/src/` root: `lib.rs`, `main.rs`, `actions.rs`,
+`state.rs`, `assets.rs`, `workspace_root.rs`, `left_rail_layout.rs`,
+`project_panes_factory.rs`, plus the `keymap_registry/` and `notifier/` folders.
+
+---
+
+## crates/ui — shared widgets (oximux-ui)
+
+App-agnostic widget layer, extracted from `app/src/ui/` in 2026-06. Depends only
+downward (`gpui`, `gpui-component`, `oximux-settings`) and **never** on
+`oximux-app`; the host re-exports it as `crate::ui` (`pub use oximux_ui as ui`).
+
+```
+src/
+├── lib.rs              pub mod buttons/overlay/confirm_dialog; re-exports danger_ghost + FloatingSurface
+├── overlay.rs          FloatingSurface — overlay/surface chrome recipe (.floating_chrome())
+├── buttons.rs          button variant wrappers (danger_ghost, …)
+└── confirm_dialog/     ConfirmDialog modal (prompt + callback; pure is_match in logic.rs)
+```
+
+Generic dialogs that **stay in `app`** because they reach host state: `toast`
+(uses `crate::motion_settings::active`) and `divider` (uses
+`crate::shell::pane_tree::Axis`) — moving either would create a forbidden
+`oximux-ui → oximux-app` edge.
 
 ---
 
@@ -494,7 +530,12 @@ PTY process → watcher thread → `state.advance(&buf)` → `TerminalEvent::Out
 
 | Threshold | Action |
 |---|---|
-| > 500 non-blank LOC | warn |
-| > 800 non-blank LOC | fail |
+| > 1500 non-blank LOC | warn |
+| > 3000 non-blank LOC | fail (unless allowlisted) |
 
-Applies to all `.rs` files in `crates/`. `shell/mod.rs` monolith pattern from v0.9 is blocked by this guard.
+Thresholds were raised to GPUI reality in 2026-06 (large render/impl files are
+idiomatic). A ratchet allowlist (`xtask/file-size-allow.txt`) grandfathers the
+handful of files still over the hard cap at their recorded LOC: an allowlisted
+file may shrink freely but fails the moment it grows past its budget, so the
+debt can only go down (a `STALE` notice nudges dropping a row once its file
+falls under the cap). Applies to all `.rs` files in `crates/`.

@@ -27,6 +27,11 @@
 │    SettingsModal  — Cmd+,  / left-rail cog           │
 │    FloatingTerminal — Cmd+Shift+T (PiP, draggable)  │
 ├─────────────────────────────────────────────────────┤
+│  Shared widget layer  (crates/ui — oximux-ui)       │
+│  FloatingSurface overlay chrome, button variants,   │
+│  ConfirmDialog. App-agnostic; app depends on ui,    │
+│  ui never on app. Host re-exports as crate::ui.     │
+├─────────────────────────────────────────────────────┤
 │  Domain / backend layer                             │
 │  crates/pty    — TerminalBackend + PortablePtyBackend│
 │  crates/git    — Repository, StatusPoller, git ops, │
