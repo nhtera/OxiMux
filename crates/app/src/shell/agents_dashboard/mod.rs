@@ -62,7 +62,15 @@ pub fn render_agents_dashboard(
     let had_any = !all_rows.is_empty();
     let rows = apply_filter(all_rows, filter_text, status_filter);
 
-    let header = render_dashboard_header(filter_input, status_filter, rail, theme, density, typography);
+    let header = render_dashboard_header(
+        filter_input,
+        status_filter,
+        rail,
+        weak_root.clone(),
+        theme,
+        density,
+        typography,
+    );
 
     let body: AnyElement = if rows.is_empty() {
         // Distinguish "nothing running" from "filtered to nothing" so the user
@@ -117,12 +125,13 @@ pub fn render_agents_dashboard(
 }
 
 /// The filter header: a text `Filter…` input (Escape clears it) plus a status
-/// chip that cycles the section filter on click — the reference cockpit's
-/// `Filter` + `Status` controls.
+/// chip that opens a dropdown of the status buckets on click — the reference
+/// cockpit's `Filter` + `Status` controls.
 fn render_dashboard_header(
     filter_input: Entity<InputState>,
     status_filter: StatusFilter,
     rail: Entity<LeftRail>,
+    weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -177,9 +186,19 @@ fn render_dashboard_header(
                 .text_color(theme.fg_muted)
                 .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
                 .child(format!("{chip_label} ▾"))
-                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                    rail.update(cx, |r, cx| r.cycle_dashboard_status_filter(cx));
-                }),
+                // Open the bucket dropdown anchored at the click point. The
+                // menu (mounted at the window root) shows a check on the active
+                // bucket and applies the pick back to the rail.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |ev: &MouseDownEvent, _window, cx| {
+                        let x = f32::from(ev.position.x);
+                        let y = f32::from(ev.position.y);
+                        let _ = weak_root.update(cx, |root, cx| {
+                            root.open_dashboard_status_menu(status_filter, x, y, cx)
+                        });
+                    },
+                ),
         )
 }
 

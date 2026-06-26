@@ -19,6 +19,7 @@
 //! kept on `weak_root` is dispatch upward via callbacks (e.g.
 //! `open_row_menu`), which fire on user events after render completes.
 
+pub mod dashboard_status_menu;
 pub mod nav_section;
 pub mod project_drag;
 pub mod project_group;
@@ -385,10 +386,17 @@ impl LeftRail {
         }
     }
 
-    /// Advance the Agents-page status filter to the next bucket (wraps).
-    pub(crate) fn cycle_dashboard_status_filter(&mut self, cx: &mut Context<Self>) {
-        self.dashboard_status_filter = self.dashboard_status_filter.next();
-        cx.notify();
+    /// Set the Agents-page status filter to `choice` (picked from the header
+    /// dropdown). Repaints only when it actually changes.
+    pub(crate) fn set_dashboard_status_filter(
+        &mut self,
+        choice: StatusFilter,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dashboard_status_filter != choice {
+            self.dashboard_status_filter = choice;
+            cx.notify();
+        }
     }
 
     /// Clear the Agents-page text filter (the Escape affordance on its input).

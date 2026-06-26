@@ -109,6 +109,7 @@ use crate::shell::{
     },
     left_rail::{
         LeftRail,
+        dashboard_status_menu::DashboardStatusFilterMenu,
         project_menu::ProjectRowMenu,
         row_menu::WorkspaceRowMenu,
         workspace_row::{DiffCounts, sum_numstat},
@@ -261,6 +262,9 @@ pub struct WorkspaceRoot {
     /// Sidebar per-project-header action popover (Reveal/Copy/Remove).
     /// Same full-window-backdrop mount contract as `row_menu`.
     pub(crate) project_menu: Entity<ProjectRowMenu>,
+    /// Agents-page status-filter dropdown. Same full-window-backdrop mount
+    /// contract as `row_menu`; applies its pick to `left_rail`.
+    pub(crate) dashboard_status_menu: Entity<DashboardStatusFilterMenu>,
     pub(crate) add_project_dialog: Entity<AddProjectDialog>,
     /// Render root tracks this so action dispatch reaches the workspace
     /// even when no pane is focused (sidebar toggle, command palette).
@@ -774,6 +778,10 @@ impl WorkspaceRoot {
         let project_menu = cx.new(|_| {
             ProjectRowMenu::new(theme, density, typography.clone(), weak_for_project_menu)
         });
+        let weak_left_rail = left_rail.downgrade();
+        let dashboard_status_menu = cx.new(|_| {
+            DashboardStatusFilterMenu::new(theme, density, typography.clone(), weak_left_rail)
+        });
         let pr = app_state.project_repo.clone();
         let add_project_dialog =
             build_add_project_dialog(theme, density, typography.clone(), pr, cx);
@@ -1041,6 +1049,7 @@ impl WorkspaceRoot {
             nav_replaying: false,
             row_menu,
             project_menu,
+            dashboard_status_menu,
             add_project_dialog,
             focus_handle,
             window_id,
@@ -2384,6 +2393,7 @@ impl Render for WorkspaceRoot {
             || self.commit_context_menu.read(cx).is_open()
             || self.row_menu.read(cx).is_open()
             || self.project_menu.read(cx).is_open()
+            || self.dashboard_status_menu.read(cx).is_open()
             || self.floating_terminal_visible
             || self.confirm_dialog.is_some()
             || self.rename_tab_dialog.is_some()
@@ -3789,6 +3799,8 @@ impl Render for WorkspaceRoot {
             .child(self.row_menu.clone())
             // Per-project-header action popover (Reveal / Copy / Remove).
             .child(self.project_menu.clone())
+            // Agents-page status-filter dropdown.
+            .child(self.dashboard_status_menu.clone())
             .child(self.add_project_dialog.clone())
             // Type-to-confirm dialog for destructive workspace ops. Built
             // per-request; `None` when idle. Wrapped in a full-window
