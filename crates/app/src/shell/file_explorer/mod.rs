@@ -7,6 +7,8 @@
 pub mod create_ops;
 pub mod file_icon;
 pub mod file_mutations;
+pub mod file_tree_context_menu;
+pub mod file_tree_view;
 pub mod fs_load;
 pub mod header_render;
 pub mod load_ops;
