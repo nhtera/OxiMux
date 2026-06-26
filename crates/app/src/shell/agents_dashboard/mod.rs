@@ -19,6 +19,7 @@ use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
 };
+use gpui_component::Sizable as _;
 use gpui_component::input::{Escape as InputEscape, Input, InputState};
 use oximux_core::{Project, Workspace};
 use oximux_settings::{Density, Theme, Typography};
@@ -144,28 +145,37 @@ fn render_dashboard_header(
         .px(px(density.pad_panel))
         .py(px(density.gap_inline))
         .child(
-            // Escape is captured before the Input's own handling so it clears
-            // the filter rather than bubbling elsewhere.
+            // A compact (.small() = 30px) input with a clear button, so it
+            // matches the status control's height. Escape is captured before
+            // the Input's own handling so it clears the filter.
             div()
                 .flex_1()
                 .min_w_0()
                 .capture_action(move |_: &InputEscape, window, cx| {
                     rail_for_clear.update(cx, |r, cx| r.clear_dashboard_filter(window, cx));
                 })
-                .child(Input::new(&filter_input)),
+                .child(Input::new(&filter_input).small().cleanable(true)),
         )
         .child(
+            // A bordered control the SAME height as the input, so the two read
+            // as a matched pair (the reference cockpit's filter + status row).
             div()
                 .id("agents-status-filter")
                 .flex_shrink_0()
-                .px(px(6.))
-                .py(px(2.))
-                .rounded(px(4.))
-                .bg(theme.hover_overlay)
+                .h(px(30.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.border_inactive)
+                .bg(theme.bg_panel)
                 .cursor_pointer()
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)
-                .hover(|s| s.text_color(theme.fg_base))
+                .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
                 .child(format!("{chip_label} ▾"))
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                     rail.update(cx, |r, cx| r.cycle_dashboard_status_filter(cx));
