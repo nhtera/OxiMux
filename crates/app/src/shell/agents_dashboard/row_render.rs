@@ -58,8 +58,12 @@ pub(crate) fn render_section_header(
                 .child(kind.label()),
         )
         .child(
+            // Count as a subtle rounded badge, like the reference cockpit.
             div()
                 .flex_shrink_0()
+                .px(px(5.))
+                .rounded(px(6.))
+                .bg(theme.hover_overlay)
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)
                 .child(count.to_string()),

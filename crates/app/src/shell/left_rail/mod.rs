@@ -951,10 +951,13 @@ impl Render for LeftRail {
             let filter_input = self.ensure_dashboard_filter_input(_window, cx);
             let status_filter = self.dashboard_status_filter;
             let filter_text = self.dashboard_filter.clone();
+            // Long-form card ages are relative to this render's clock.
+            let now = chrono::Utc::now().to_rfc3339();
             render_agents_dashboard(
                 &self.workspace_agents,
                 &self.projects,
                 &self.workspaces_by_project,
+                &now,
                 self.focused_agent.as_ref(),
                 status_filter,
                 &filter_text,

@@ -43,6 +43,7 @@ pub fn render_agents_dashboard(
     workspace_agents: &WorkspaceAgentList,
     projects: &[Project],
     workspaces_by_project: &HashMap<String, Vec<Workspace>>,
+    now: &str,
     focused_agent: Option<&RailAgentTarget>,
     status_filter: StatusFilter,
     filter_text: &str,
@@ -56,7 +57,7 @@ pub fn render_agents_dashboard(
 ) -> AnyElement {
     // Build + sort once, narrow by the filter, then group into status sections.
     let all_rows: Vec<AgentRow> =
-        build_agent_rows(workspace_agents, projects, workspaces_by_project);
+        build_agent_rows(workspace_agents, projects, workspaces_by_project, now);
     let had_any = !all_rows.is_empty();
     let rows = apply_filter(all_rows, filter_text, status_filter);
 
@@ -126,6 +127,13 @@ fn render_dashboard_header(
     typography: &Typography,
 ) -> impl IntoElement {
     let rail_for_clear = rail.clone();
+    // At rest the chip reads "Status" (the field, like the reference cockpit);
+    // an active filter shows the chosen bucket so the narrowing is visible.
+    let chip_label = if status_filter == StatusFilter::All {
+        "Status".to_string()
+    } else {
+        status_filter.label().to_string()
+    };
     div()
         .flex()
         .flex_row()
@@ -158,7 +166,7 @@ fn render_dashboard_header(
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)
                 .hover(|s| s.text_color(theme.fg_base))
-                .child(format!("{} ▾", status_filter.label()))
+                .child(format!("{chip_label} ▾"))
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                     rail.update(cx, |r, cx| r.cycle_dashboard_status_filter(cx));
                 }),

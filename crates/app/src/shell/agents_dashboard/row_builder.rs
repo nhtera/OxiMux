@@ -16,6 +16,7 @@ use crate::shell::left_rail::WorkspaceAgentList;
 use crate::shell::left_rail::workspace_agent_rows::{
     collapse_ws, is_completed_turn, live_activity, live_prompt,
 };
+use crate::shell::session_merge::relative_age_long;
 
 /// Build the dashboard row list — **one row per agent session** — from the
 /// per-session `WorkspaceAgentList` the rail already assembles (live + recent
@@ -32,6 +33,7 @@ pub fn build_agent_rows(
     workspace_agents: &WorkspaceAgentList,
     projects: &[Project],
     workspaces_by_project: &HashMap<String, Vec<Workspace>>,
+    now: &str,
 ) -> Vec<AgentRow> {
     // workspace_key → (Workspace, project name). Built once before the loop so
     // each session resolves its badge in O(1) without rescanning projects.
@@ -57,16 +59,24 @@ pub fn build_agent_rows(
             // not in the render closure.
             let primary = live_prompt(rail).map(|p| collapse_ws(&p));
             let secondary = live_activity(rail).map(|s| collapse_ws(&s));
+            // Recency key: terminal `ended_at` else `started_at`.
+            let last_active_at = rail.ended_at.clone().or_else(|| rail.started_at.clone());
+            // Long-form age ("14 hours ago") for the wider dashboard card; the
+            // rail keeps its compact `age_label` for the narrow sub-rows.
+            let age_label = last_active_at
+                .as_deref()
+                .map(|ts| relative_age_long(ts, now))
+                .unwrap_or_default();
             rows.push(AgentRow {
                 project_name: project_name.to_string(),
                 workspace: workspace.clone(),
                 db_id: rail.db_id.clone(),
                 target: rail.target.clone(),
-                age_label: rail.age_label.clone(),
+                age_label,
                 status: Some(rail.effective_status()),
                 is_live: rail.is_live,
                 icon_path: adapter_icon_path(&rail.adapter_id),
-                last_active_at: rail.ended_at.clone().or_else(|| rail.started_at.clone()),
+                last_active_at,
                 label: rail.label.to_string(),
                 primary,
                 secondary,
@@ -85,6 +95,9 @@ mod tests {
     use crate::shell::left_rail::{RailAgentRow, RailAgentTarget};
     use oximux_core::{AgentSnapshot, AgentStatus, SidebandDetail};
     use tokio::sync::watch;
+
+    // Fixed clock: 4 days after every fixture's `started_at` default.
+    const NOW: &str = "2026-06-24T00:00:00+00:00";
 
     fn project(id: &str, name: &str) -> Project {
         Project {
@@ -176,7 +189,7 @@ mod tests {
                 rail("s2", "a", "claude-code", AgentStatus::Idle),
             ],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         assert_eq!(rows.len(), 2);
         let ids: Vec<&str> = rows.iter().map(|r| r.db_id.as_str()).collect();
         assert!(ids.contains(&"s1") && ids.contains(&"s2"));
@@ -188,7 +201,7 @@ mod tests {
         wbp.insert("p1".to_string(), vec![workspace("a", "p1")]);
         let projects = vec![project("p1", "MyProject")];
         let wa = list(vec![("a", vec![rail("s1", "a", "claude-code", AgentStatus::Idle)])]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         assert_eq!(rows[0].project_name, "MyProject");
         assert_eq!(rows[0].workspace.branch, "oximux/a");
         // No prompt captured → primary falls back to the adapter label.
@@ -203,7 +216,7 @@ mod tests {
             "ghost",
             vec![rail("s1", "ghost", "claude-code", AgentStatus::Running)],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         assert!(rows.is_empty());
     }
 
@@ -220,7 +233,7 @@ mod tests {
             "a",
             vec![live_rail("s1", "a", AgentStatus::Running, Some(detail))],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         assert_eq!(rows[0].primary.as_deref(), Some("fix the parser"));
         assert_eq!(rows[0].secondary.as_deref(), Some("Edit: src/lib.rs"));
         assert!(!rows[0].completed_turn);
@@ -238,7 +251,7 @@ mod tests {
             "a",
             vec![live_rail("s1", "a", AgentStatus::Idle, Some(detail))],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         assert!(rows[0].completed_turn);
         assert_eq!(rows[0].primary.as_deref(), Some("hi"));
         assert_eq!(rows[0].secondary.as_deref(), Some("All set — tests pass."));
@@ -254,7 +267,7 @@ mod tests {
                 rail("wait", "a", "claude-code", AgentStatus::WaitingForInput),
             ],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         assert_eq!(rows[0].db_id, "wait");
         assert_eq!(rows[1].db_id, "done");
     }
@@ -269,7 +282,7 @@ mod tests {
                 rail("bare", "a", "", AgentStatus::Running),
             ],
         )]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         let branded = rows.iter().find(|r| r.db_id == "branded").unwrap();
         let bare = rows.iter().find(|r| r.db_id == "bare").unwrap();
         assert_eq!(branded.icon_path, "icons/claude-code.svg");
@@ -283,7 +296,7 @@ mod tests {
         ended.ended_at = Some("2026-06-22T00:00:00+00:00".to_string());
         let started = rail("started", "a", "claude-code", AgentStatus::Running);
         let wa = list(vec![("a", vec![ended, started])]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
         let e = rows.iter().find(|r| r.db_id == "ended").unwrap();
         let s = rows.iter().find(|r| r.db_id == "started").unwrap();
         assert_eq!(e.last_active_at.as_deref(), Some("2026-06-22T00:00:00+00:00"));
@@ -291,13 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn target_and_age_carried_for_click_and_display() {
+    fn target_carried_and_age_is_long_form() {
         let (projects, wbp) = one_project(vec![workspace("a", "p1")]);
-        let mut r = rail("s1", "a", "claude-code", AgentStatus::Idle);
-        r.age_label = "3h".to_string();
+        // rail() defaults started_at to 2026-06-20; NOW is 4 days later.
+        let r = rail("s1", "a", "claude-code", AgentStatus::Idle);
         let wa = list(vec![("a", vec![r])]);
-        let rows = build_agent_rows(&wa, &projects, &wbp);
-        assert_eq!(rows[0].age_label, "3h");
+        let rows = build_agent_rows(&wa, &projects, &wbp, NOW);
+        assert_eq!(rows[0].age_label, "4 days ago");
         assert_eq!(
             rows[0].target,
             RailAgentTarget::AgentSession {

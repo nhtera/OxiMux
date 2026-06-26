@@ -41,6 +41,37 @@ fn relative_age(ts: &str, now: &str) -> String {
     }
 }
 
+/// Long-form relative age ("just now", "5 minutes ago", "14 hours ago",
+/// "6 days ago") from an RFC-3339 timestamp against a captured `now` — the
+/// reference cockpit's AGENTS-PAGE wording. The compact `relative_age` above is
+/// for the narrow rail rows; this is for the wider dashboard cards. Empty on
+/// unparseable input.
+pub fn relative_age_long(ts: &str, now: &str) -> String {
+    let (Ok(t), Ok(n)) = (
+        DateTime::parse_from_rfc3339(ts),
+        DateTime::parse_from_rfc3339(now),
+    ) else {
+        return String::new();
+    };
+    let secs = (n - t).num_seconds().max(0);
+    let ago = |n: i64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{n} {unit}s ago")
+        }
+    };
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        ago(secs / 60, "minute")
+    } else if secs < 86_400 {
+        ago(secs / 3_600, "hour")
+    } else {
+        ago(secs / 86_400, "day")
+    }
+}
+
 /// History scope for a NON-live row: shown ONLY when it is a CLEANLY-COMPLETED
 /// session (`Done { code: 0 }`) whose `ended_at` is at or after the recency
 /// cutoff (unbounded when `cutoff` is `None`). This mirrors the reference
@@ -300,6 +331,17 @@ mod tests {
     const WS: &str = "primary:proj-1";
     // Fixed clock for deterministic tests — later than every fixture timestamp.
     const NOW: &str = "2026-06-24T00:00:00Z";
+
+    #[test]
+    fn relative_age_long_uses_full_words_and_pluralizes() {
+        assert_eq!(relative_age_long("2026-06-23T23:59:30Z", NOW), "just now");
+        assert_eq!(relative_age_long("2026-06-23T23:59:00Z", NOW), "1 minute ago");
+        assert_eq!(relative_age_long("2026-06-23T23:30:00Z", NOW), "30 minutes ago");
+        assert_eq!(relative_age_long("2026-06-23T23:00:00Z", NOW), "1 hour ago");
+        assert_eq!(relative_age_long("2026-06-23T10:00:00Z", NOW), "14 hours ago");
+        assert_eq!(relative_age_long("2026-06-18T00:00:00Z", NOW), "6 days ago");
+        assert_eq!(relative_age_long("not-a-date", NOW), "");
+    }
 
     fn db(id: &str, status: AgentStatus, started: &str, ended: Option<&str>) -> AgentSession {
         AgentSession {
