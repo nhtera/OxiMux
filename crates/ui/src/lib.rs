@@ -8,6 +8,7 @@
 //! on `oximux-app`. The host crate re-exports it as `crate::ui`.
 
 pub mod buttons;
+pub mod confirm_dialog;
 pub mod overlay;
 
 pub use buttons::danger_ghost;

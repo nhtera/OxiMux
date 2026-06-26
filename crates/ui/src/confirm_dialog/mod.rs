@@ -18,7 +18,7 @@
 
 pub mod logic;
 
-use crate::shell::confirm_dialog::logic::is_match;
+use crate::confirm_dialog::logic::is_match;
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, div, px,

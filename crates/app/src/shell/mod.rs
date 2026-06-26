@@ -16,7 +16,6 @@ pub mod browser_view;
 pub mod command_palette;
 pub mod commit_dialog;
 pub mod compose_bar;
-pub mod confirm_dialog;
 pub mod context_env;
 pub mod cwd_resolver;
 pub mod diff_view;
@@ -62,6 +61,10 @@ pub mod welcome_view;
 pub mod workspace_dialog;
 pub mod workspace_ops;
 pub mod worktree_panel;
+
+// `confirm_dialog` is a generic, app-agnostic widget now living in oximux-ui.
+// Re-exported here so existing `crate::shell::confirm_dialog::…` paths resolve.
+pub use oximux_ui::confirm_dialog;
 
 // Terminal surface — clustered into shell/terminal/ for traversal. Re-exported
 // here so existing `crate::shell::<name>::…` paths keep resolving unchanged.
