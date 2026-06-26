@@ -91,11 +91,13 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 
 ### `crates/app/src/shell/<domain>/` — GPUI views
 
-One folder per cockpit zone. Existing domains: `agents_dashboard`, `browser_view`,
-`command_palette`, `commit_dialog`, `compose_bar`, `diff_view`, `file_explorer`,
-`forge`, `git_panel`, `left_rail`, `pane_group`, `pr_dialog`, `project_panes`,
-`right_sidebar`, `search_panel`, `session_history`, `settings_modal`,
-`source_control`, `stash_panel`, `tasks_view`, `terminal`, `worktree_panel`.
+One folder per cockpit zone: `agent_ui`, `agents_dashboard`, `browser_view`,
+`chrome`, `command_palette`, `commit_dialog`, `compose_bar`, `diff_view`,
+`file_explorer`, `forge`, `git_panel`, `left_rail`, `pane_group`, `panes`,
+`pr_dialog`, `project_panes`, `right_sidebar`, `search_panel`, `session_history`,
+`settings_modal`, `source_control`, `stash_panel`, `tasks_view`, `terminal`,
+`usage`, `welcome`, `workspace`, `worktree_panel`. Each re-exports its modules
+so existing `crate::shell::<name>::…` paths resolve regardless of folder.
 A small set of cross-cutting glue files (`context_env.rs`, `openable_text_file.rs`,
 `open_url.rs`, `cwd_resolver.rs`) stays loose at `shell/` root by design.
 

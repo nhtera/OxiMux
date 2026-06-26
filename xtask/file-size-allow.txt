@@ -6,4 +6,4 @@
 # Drop a row once its file falls under the cap (the lint prints STALE to nudge).
 #
 # Format: <repo-relative-path> <loc-budget>
-crates/app/src/shell/pane_group/mod.rs 3216
+# (empty — no files currently grandfathered over the hard cap)
