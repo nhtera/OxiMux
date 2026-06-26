@@ -101,8 +101,10 @@ block2 = "0.6"
 # native window surface via the `raw-window-handle` already in the graph; no
 # `tao`/gtk pulled in on macOS (those are Linux-only optional features).
 # Chosen for future cross-platform (WebView2 / WebKitGTK) over a macOS-only
-# objc2-web-kit binding.
-wry = "0.55"
+# objc2-web-kit binding. `devtools` is enabled explicitly so the inspector
+# methods (open/close/is_devtools_open) exist in release too — wry only turns
+# them on automatically under debug_assertions, which broke release builds.
+wry = { version = "0.55", features = ["devtools"] }
 # Browser agent-context screenshot: `WKWebView.takeSnapshot` returns an
 # `NSImage`; app-kit's `NSBitmapImageRep` re-encodes it to PNG bytes for the
 # clipboard. web-kit's snapshot method is feature-gated on the snapshot

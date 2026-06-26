@@ -27,7 +27,7 @@ use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, InputHandler,
     InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled,
-    Task, UTF16Selection, WeakEntity, Window, canvas, div, point, px, size,
+    Task, TouchPhase, UTF16Selection, WeakEntity, Window, canvas, div, point, px, relative, size,
 };
 use oximux_agents::SharedBackend;
 use oximux_pty::{
@@ -45,6 +45,7 @@ use crate::shell::context_env::SurfaceIds;
 use crate::shell::key_input::{is_ime_text_key, keystroke_to_bytes};
 use crate::shell::mouse_report::{MouseAction, MouseBtn, encode_button, encode_scroll, mod_bits};
 use crate::shell::pane_group::PaneGroup;
+use crate::shell::terminal_scrollbar::{ScrollbarDrag, drag_to_offset, thumb_geometry};
 use crate::shell::terminal_links::{Existence, ExistenceCache, LinkMatch, LinkTarget, detect_at};
 use crate::shell::terminal_canvas::{
     Alphas, PaintParams, grid_dims_for, paint_grid, point_to_cell,
@@ -168,6 +169,9 @@ pub fn set_spawn_scrollback(lines: usize) {
 fn spawn_scrollback() -> usize {
     SPAWN_SCROLLBACK.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Width (px) of the overlay scrollbar gutter on the terminal's right edge.
+const SCROLLBAR_WIDTH: f32 = 10.0;
 
 /// Set true while the app is shutting down (see the quit/window-close/
 /// signal handlers in `main.rs`). `TerminalView::drop` reads it: when
@@ -465,6 +469,15 @@ pub struct TerminalView {
     /// `true` on input + PTY output so the cursor doesn't blink invisible
     /// mid-typing.
     cursor_visible: bool,
+    /// Sub-line wheel accumulator (pixels). Trackpad gestures deliver fractions
+    /// of a line per event; rounding each one to whole lines would drop every
+    /// delta below one line, so a slow scroll would move nothing. We accumulate
+    /// here and emit whole-line scrolls as the carry crosses a line boundary,
+    /// keeping the remainder for the next event.
+    scroll_px: f32,
+    /// `Some` while the overlay scrollbar thumb is being dragged. Holds the drag
+    /// anchor so each mouse-move maps absolute cursor travel to a display offset.
+    scrollbar_drag: Option<ScrollbarDrag>,
     /// Mirrors `focus_handle.is_focused(window)` for the blink task, which
     /// runs in a `Context<Self>`-only closure with no `&Window` access. Kept
     /// in sync via `cx.on_focus` / `cx.on_blur` observers registered in
@@ -747,6 +760,8 @@ impl TerminalView {
             target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
+            scroll_px: 0.0,
+            scrollbar_drag: None,
             // Init to false; the on_focus callback fires for the focus() above
             // and flips this true for whichever pane actually wins focus.
             // Multiple panes constructed in the same effect run will each see
@@ -950,6 +965,8 @@ impl TerminalView {
             target_grid: (DEFAULT_COLS, DEFAULT_ROWS),
             last_resize: (DEFAULT_COLS, DEFAULT_ROWS),
             cursor_visible: true,
+            scroll_px: 0.0,
+            scrollbar_drag: None,
             focused: false,
             visible: true,
             attention: false,
@@ -1774,9 +1791,15 @@ impl TerminalView {
     /// local scrollback (Phase 3).
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
         let metrics = CellMetrics::measure(&self.typography, window);
-        let dy = f32::from(ev.delta.pixel_delta(px(metrics.line_height)).y);
+        let line_height = metrics.line_height;
         let mult = terminal_settings(cx).scroll_multiplier;
-        let lines = (dy / metrics.line_height * mult).round() as i32;
+        // A new gesture starts fresh so a leftover sub-line remainder from the
+        // previous one can't bias its first step.
+        if matches!(ev.touch_phase, TouchPhase::Started) {
+            self.scroll_px = 0.0;
+        }
+        let delta_px = f32::from(ev.delta.pixel_delta(px(line_height)).y) * mult;
+        let lines = accumulate_scroll_lines(&mut self.scroll_px, delta_px, line_height);
         if lines == 0 {
             return;
         }
@@ -1806,10 +1829,141 @@ impl TerminalView {
             return;
         }
 
-        if let Err(err) = self.with_backend(|be| be.scroll(id, lines)) {
+        self.scroll_viewport(lines, cx);
+    }
+
+    /// Scroll the local viewport by `delta` lines (+ = back into history, - =
+    /// toward the live tail) and repaint this frame. Shared by the wheel,
+    /// scrollbar-drag, and keyboard scroll paths. Re-fetches the snapshot
+    /// because the poll loop (`tick`) only resnapshots on new PTY output — so on
+    /// an idle pane (e.g. after `cat` of a long file finishes draining) the grid
+    /// and the `↑ N lines` chip would otherwise freeze and scrolling look dead.
+    /// A zero/over-scroll delta is a no-op (alacritty clamps to the history).
+    fn scroll_viewport(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if delta == 0 {
+            return;
+        }
+        let id = self.session_id;
+        if let Err(err) = self.with_backend(|be| be.scroll(id, delta)) {
             tracing::warn!(?err, "pty scroll failed");
+            return;
+        }
+        if let Ok(snapshot) = self.with_backend(|be| be.snapshot(id)) {
+            self.snapshot = Arc::new(snapshot);
+            self.revalidate_hover();
         }
         cx.notify();
+    }
+
+    /// One page of scrollback in lines, with a single line of overlap kept for
+    /// context across the jump. Floors at 1 so a tiny pane still advances.
+    fn page_lines(&self) -> i32 {
+        (self.snapshot.cells.len() as i32 - 1).max(1)
+    }
+
+    /// Run a keyboard scroll command against the local scrollback. Only reached
+    /// on the main screen (the caller forwards these keys to the app on the
+    /// alt-screen / mouse-reporting modes, where scrollback doesn't apply).
+    fn handle_scroll_command(&mut self, cmd: ScrollCmd, cx: &mut Context<Self>) {
+        match cmd {
+            ScrollCmd::PageUp => self.scroll_viewport(self.page_lines(), cx),
+            ScrollCmd::PageDown => self.scroll_viewport(-self.page_lines(), cx),
+            ScrollCmd::Tail => self.scroll_to_tail(cx),
+        }
+    }
+
+    /// Snap the viewport back to the live tail and repaint immediately. Wired to
+    /// the scrolled-up indicator so a click jumps to the bottom; keyboard input
+    /// reaches the tail for free via `send_bytes` (the echo resnapshots), so it
+    /// doesn't need this. Re-fetches the snapshot for the same reason `on_wheel`
+    /// does — no PTY output is in flight to drive the poll-loop resnapshot.
+    fn scroll_to_tail(&mut self, cx: &mut Context<Self>) {
+        let id = self.session_id;
+        self.scroll_px = 0.0;
+        if let Err(err) = self.with_backend(|be| be.scroll_to_bottom(id)) {
+            tracing::warn!(?err, "pty scroll-to-bottom failed");
+            return;
+        }
+        if let Ok(snapshot) = self.with_backend(|be| be.snapshot(id)) {
+            self.snapshot = Arc::new(snapshot);
+            self.revalidate_hover();
+        }
+        cx.notify();
+    }
+
+    /// Apply an in-progress scrollbar-thumb drag: map the cursor's vertical
+    /// travel to an absolute display offset and scroll there. The track height
+    /// is the viewport in pixels (`visible_rows * line_height`) — the canvas
+    /// derives its row count from that same height, so no element measurement
+    /// is needed. No-op when not dragging or when the offset doesn't change.
+    fn drag_scrollbar(&mut self, mouse_y: Pixels, window: &Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        let history = self.snapshot.history_len;
+        let visible = self.snapshot.cells.len();
+        let line_height = CellMetrics::measure(&self.typography, window).line_height;
+        let track_px = visible as f32 * line_height;
+        let dy = f32::from(mouse_y) - drag.start_y;
+        let new_offset = drag_to_offset(drag, dy, track_px, history, visible);
+        let delta = new_offset as i32 - self.snapshot.display_offset as i32;
+        self.scroll_viewport(delta, cx);
+    }
+
+    /// Overlay scrollbar on the right edge, present only when there's scrollback
+    /// to traverse. The thumb is sized + positioned from history / viewport /
+    /// offset (pure math in `terminal_scrollbar`); its mouse-down captures the
+    /// drag anchor, and the root move/up handlers carry the drag.
+    fn render_scrollbar(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let history = self.snapshot.history_len;
+        if history == 0 {
+            return None;
+        }
+        let (top, height) =
+            thumb_geometry(history, self.snapshot.display_offset, self.snapshot.cells.len());
+        let thumb_color = if self.scrollbar_drag.is_some() {
+            theme.fg_muted
+        } else {
+            theme.border_inactive
+        };
+        Some(
+            div()
+                .id("oximux-terminal-scrollbar")
+                .absolute()
+                .top_0()
+                .right_0()
+                .h_full()
+                .w(px(SCROLLBAR_WIDTH))
+                .child(
+                    div()
+                        .id("oximux-terminal-scrollbar-thumb")
+                        .absolute()
+                        .top(relative(top))
+                        .h(relative(height))
+                        .right(px(1.0))
+                        .w(px(SCROLLBAR_WIDTH - 2.0))
+                        .rounded_full()
+                        .bg(thumb_color)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.fg_muted))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                // Anchor the drag and stop propagation so the
+                                // grid underneath doesn't also start a selection.
+                                this.scrollbar_drag = Some(ScrollbarDrag {
+                                    start_y: f32::from(ev.position.y),
+                                    start_offset: this.snapshot.display_offset,
+                                });
+                                cx.stop_propagation();
+                            }),
+                        ),
+                ),
+        )
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1895,6 +2049,19 @@ impl TerminalView {
                     return;
                 }
                 _ => {}
+            }
+        }
+
+        // Local scrollback keys (PageUp/Down, Cmd+Up = page up, Cmd+Down = tail).
+        // Only act on the main screen: on the alt-screen or while a mouse-
+        // reporting app is active there is no scrollback, so these fall through
+        // to the byte encoder and the app receives the normal escape sequences
+        // (e.g. PageUp in less/vim) instead of moving a buffer that isn't there.
+        if let Some(cmd) = scroll_key_command(ks) {
+            let mode = self.with_backend(|be| be.mouse_mode(self.session_id));
+            if !mode.alt_screen && !mode.any_reporting() {
+                self.handle_scroll_command(cmd, cx);
+                return;
             }
         }
 
@@ -2824,6 +2991,12 @@ impl Render for TerminalView {
                 }),
             )
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
+                // A scrollbar-thumb drag owns the gesture: map travel to offset
+                // and skip hover/selection until the button is released.
+                if this.scrollbar_drag.is_some() {
+                    this.drag_scrollbar(ev.position.y, window, cx);
+                    return;
+                }
                 // Cmd-hover link underline updates regardless of button state.
                 this.update_hover(ev, window, cx);
                 let Some(button) = ev.pressed_button else {
@@ -2850,6 +3023,12 @@ impl Render for TerminalView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseUpEvent, window, cx| {
+                    // End a scrollbar drag without forwarding the release to the
+                    // grid (no mouse-report, no selection finalize).
+                    if this.scrollbar_drag.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
                     if this.report_mouse(
                         ev.button,
                         ev.position,
@@ -2946,7 +3125,20 @@ impl Render for TerminalView {
         // live tail, so the user knows new output is landing below the fold
         // and that any keystroke will snap back down.
         if self.snapshot.display_offset > 0 {
-            root = root.child(build_scroll_indicator(&theme, self.snapshot.display_offset));
+            root = root.child(build_scroll_indicator(&theme, self.snapshot.display_offset).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                    // Click the chip to jump to the live tail. Stop propagation
+                    // so the same click doesn't also start a selection on the
+                    // grid underneath (root owns that mouse-down listener).
+                    this.scroll_to_tail(cx);
+                    cx.stop_propagation();
+                }),
+            ));
+        }
+        // Overlay scrollbar on the right edge (only when scrollback exists).
+        if let Some(bar) = self.render_scrollbar(&theme, cx) {
+            root = root.child(bar);
         }
         // Attention ring: a blue inset stroke when an unfocused pane has
         // signalled (terminal BEL today; agent-waiting / `oximux notify`
@@ -3249,11 +3441,56 @@ fn build_exit_banner(theme: &Theme, code: i32) -> gpui::Div {
         )
 }
 
+/// A keyboard scrollback command, resolved from a keystroke by
+/// [`scroll_key_command`] and applied by `TerminalView::handle_scroll_command`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScrollCmd {
+    PageUp,
+    PageDown,
+    /// Jump to the live tail (bottom).
+    Tail,
+}
+
+/// Classify a keystroke as a local-scrollback command, or `None` to let it
+/// reach the PTY. Bindings: plain PageUp/PageDown page the viewport; Cmd+Up
+/// pages up (matches mature terminals); Cmd+Down jumps to the tail. Ctrl/Alt
+/// are excluded so app chords (Ctrl+Up word-nav, etc.) pass through untouched.
+fn scroll_key_command(ks: &gpui::Keystroke) -> Option<ScrollCmd> {
+    let m = &ks.modifiers;
+    if m.control || m.alt {
+        return None;
+    }
+    match ks.key.as_str() {
+        "pageup" if !m.platform => Some(ScrollCmd::PageUp),
+        "pagedown" if !m.platform => Some(ScrollCmd::PageDown),
+        "up" if m.platform => Some(ScrollCmd::PageUp),
+        "down" if m.platform => Some(ScrollCmd::Tail),
+        _ => None,
+    }
+}
+
+/// Fold a pixel delta into the sub-line accumulator and return the whole lines
+/// to scroll, keeping the fractional remainder in `*acc`. This carry is what
+/// lets a slow trackpad drag — each event under one line tall — eventually
+/// advance the viewport instead of every delta truncating to zero and being
+/// dropped. A non-positive `line_height` is a no-op guard against div-by-zero.
+fn accumulate_scroll_lines(acc: &mut f32, delta_px: f32, line_height: f32) -> i32 {
+    if line_height <= 0.0 {
+        return 0;
+    }
+    *acc += delta_px;
+    let lines = (*acc / line_height).trunc() as i32;
+    *acc -= lines as f32 * line_height;
+    lines
+}
+
 /// Faint top-right chip shown while the viewport is scrolled up off the live
-/// tail (`display_offset > 0`). Informational only — any keystroke snaps the
-/// view back to the bottom (`send_bytes` → `scroll_to_bottom`).
-fn build_scroll_indicator(theme: &Theme, offset: usize) -> gpui::Div {
+/// tail (`display_offset > 0`). Click it to jump back to the bottom; any
+/// keystroke also snaps down (`send_bytes` → `scroll_to_bottom`). The caller
+/// wires the click handler — this only builds the chip + pointer affordance.
+fn build_scroll_indicator(theme: &Theme, offset: usize) -> gpui::Stateful<gpui::Div> {
     div()
+        .id("oximux-scroll-to-tail")
         .absolute()
         .top(px(6.0))
         .right(px(10.0))
@@ -3265,8 +3502,9 @@ fn build_scroll_indicator(theme: &Theme, offset: usize) -> gpui::Div {
         .text_size(px(11.0))
         .border_1()
         .border_color(theme.border_inactive)
-        // `↑` = U+2191 Upwards Arrow.
-        .child(format!("↑ {offset} lines"))
+        .cursor_pointer()
+        // `↑` = U+2191 Upwards Arrow. `⤓` hints the click jumps to the tail.
+        .child(format!("↑ {offset} lines · ⤓"))
 }
 
 #[cfg(test)]
@@ -3278,6 +3516,85 @@ mod poll_interval_tests {
         assert_eq!(poll_interval_ms(true), POLL_INTERVAL_MS);
         assert_eq!(poll_interval_ms(false), BACKGROUND_POLL_INTERVAL_MS);
         assert!(poll_interval_ms(false) > poll_interval_ms(true));
+    }
+}
+
+#[cfg(test)]
+mod scroll_key_tests {
+    use super::{ScrollCmd, scroll_key_command};
+    use gpui::Keystroke;
+
+    fn cmd(chord: &str) -> Option<ScrollCmd> {
+        scroll_key_command(&Keystroke::parse(chord).expect("valid chord"))
+    }
+
+    #[test]
+    fn plain_page_keys_scroll_pages() {
+        assert_eq!(cmd("pageup"), Some(ScrollCmd::PageUp));
+        assert_eq!(cmd("pagedown"), Some(ScrollCmd::PageDown));
+    }
+
+    #[test]
+    fn cmd_up_pages_up_and_cmd_down_jumps_to_tail() {
+        assert_eq!(cmd("cmd-up"), Some(ScrollCmd::PageUp));
+        assert_eq!(cmd("cmd-down"), Some(ScrollCmd::Tail));
+    }
+
+    #[test]
+    fn plain_arrows_and_app_chords_pass_through() {
+        // Bare arrows belong to the shell/app, not scrollback.
+        assert_eq!(cmd("up"), None);
+        assert_eq!(cmd("down"), None);
+        // Ctrl/Alt arrow combos are app navigation — never intercepted.
+        assert_eq!(cmd("ctrl-up"), None);
+        assert_eq!(cmd("alt-up"), None);
+        // Cmd+PageUp isn't one of ours either (plain PageUp is).
+        assert_eq!(cmd("cmd-pageup"), None);
+    }
+}
+
+#[cfg(test)]
+mod scroll_accumulator_tests {
+    use super::accumulate_scroll_lines;
+
+    // A run of sub-line nudges must eventually advance a line — the regression
+    // this guards is "slow trackpad scroll moves nothing" (each delta < 1 line
+    // truncating to zero). Four 6px nudges over a 20px line = 24px → one line,
+    // 4px carried.
+    #[test]
+    fn subline_deltas_carry_into_a_whole_line() {
+        let mut acc = 0.0;
+        let lh = 20.0;
+        assert_eq!(accumulate_scroll_lines(&mut acc, 6.0, lh), 0);
+        assert_eq!(accumulate_scroll_lines(&mut acc, 6.0, lh), 0);
+        assert_eq!(accumulate_scroll_lines(&mut acc, 6.0, lh), 0);
+        assert_eq!(accumulate_scroll_lines(&mut acc, 6.0, lh), 1);
+        assert!((acc - 4.0).abs() < 1e-3, "remainder kept for next event");
+    }
+
+    // A fast flick crosses several lines in one event; the remainder still
+    // carries so cadence stays smooth.
+    #[test]
+    fn large_delta_emits_multiple_lines() {
+        let mut acc = 0.0;
+        assert_eq!(accumulate_scroll_lines(&mut acc, 65.0, 20.0), 3);
+        assert!((acc - 5.0).abs() < 1e-3);
+    }
+
+    // Negative deltas scroll toward the tail and carry symmetrically.
+    #[test]
+    fn negative_deltas_scroll_toward_tail() {
+        let mut acc = 0.0;
+        assert_eq!(accumulate_scroll_lines(&mut acc, -50.0, 20.0), -2);
+        assert!((acc + 10.0).abs() < 1e-3);
+    }
+
+    // Defensive: a zero/garbage line height never divides by zero.
+    #[test]
+    fn nonpositive_line_height_is_a_noop() {
+        let mut acc = 7.0;
+        assert_eq!(accumulate_scroll_lines(&mut acc, 100.0, 0.0), 0);
+        assert_eq!(acc, 7.0);
     }
 }
 
