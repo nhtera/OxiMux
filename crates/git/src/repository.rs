@@ -509,6 +509,31 @@ impl Repository {
         }])
     }
 
+    /// Raw bytes of the git blob at `<rev>:<rel_path>`, or `Ok(None)` when no
+    /// such object exists at that rev (e.g. a freshly added file has no `HEAD`
+    /// blob). Reads via `git cat-file blob` so smudge filters and the pager
+    /// never touch the bytes — the diff view uses it to preview the "before"
+    /// side of an image-binary change.
+    ///
+    /// `<rev>:<path>` treats `<path>` as a literal repo-relative pathname (not
+    /// a pathspec), so glob metacharacters (`[ * ? {`) in the filename stay
+    /// literal — matching the path-correctness discipline of the staging ops.
+    pub async fn read_blob_at(&self, rev: &str, rel_path: &Path) -> Result<Option<Vec<u8>>> {
+        // git uses forward slashes in object specs regardless of platform; on
+        // the macOS/Linux targets here `Path` already separates with `/`.
+        let spec = format!("{rev}:{}", rel_path.to_string_lossy());
+        let out = GitCmd::new(&self.workdir)
+            .timeout(DIFF_TIMEOUT)
+            .arg("cat-file")
+            .arg("blob")
+            .arg(&spec)
+            .run_raw()
+            .await?;
+        // A missing object exits non-zero ("fatal: path … does not exist") —
+        // that's the added/untracked case, not an error to surface.
+        Ok(out.status.success().then_some(out.stdout))
+    }
+
     /// Per-file patch diff for a single commit. `sha` may be any
     /// ref-or-OID `git` accepts (short SHA, full SHA, branch, tag,
     /// `HEAD`, etc.). Returns one `FileDiff` per file the commit
