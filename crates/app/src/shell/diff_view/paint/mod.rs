@@ -58,7 +58,8 @@ use crate::shell::diff_view::word_diff::WordOp;
 // scaled_typography) live in the module root; this child module reaches them
 // by path since the moved `impl Render for DiffView` needs them here.
 use crate::shell::diff_view::{
-    DiffView, DiffViewState, HunkActionSide, body_zoom_factor, current_zoom, scaled_typography,
+    DiffView, DiffViewState, HunkActionSide, PlanCache, body_zoom_factor, current_zoom,
+    scaled_typography,
 };
 use gpui::{
     App, AppContext, ClickEvent, Context, HighlightStyle, Hsla, InteractiveElement, IntoElement,

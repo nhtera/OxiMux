@@ -32,69 +32,89 @@ impl Render for DiffView {
         // Done before borrowing `&self.state` for the body so the heavy
         // plan build doesn't tangle with the element tree below.
         if self.prepared.is_none() {
-            let rows = match &self.state {
-                DiffViewState::Ready {
-                    diffs, expanded, ..
-                }
-                | DiffViewState::CommitReady {
-                    diffs, expanded, ..
-                }
-                | DiffViewState::RangeReady {
-                    diffs, expanded, ..
-                }
-                | DiffViewState::CombinedReady {
-                    diffs, expanded, ..
-                } => {
-                    let plan = build_render_plan(diffs, *expanded);
-                    // Stageable change regions per file — full-file context
-                    // makes one giant hunk, so the renderer docks a chip bar
-                    // per region (git add -p granularity) using these.
-                    let regions: Vec<Vec<oximux_core::ChangeRegion>> =
-                        diffs.iter().map(oximux_core::change_regions).collect();
-                    // Hollow-vs-solid gutter slivers: only the combined view
-                    // carries per-file group tags, so staged files render
-                    // hollow there. Single-file / commit / range views pass an
-                    // empty slice → every sliver solid (uniformly one state).
-                    let staged_per_file: Vec<bool> = match &self.state {
-                        DiffViewState::CombinedReady { groups, .. } => groups
-                            .iter()
-                            .map(|g| matches!(g, FileGroup::Staged))
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    let rctx = RenderCtx {
-                        theme: self.theme,
-                        density: self.density,
-                        typography: &self.typography,
-                    };
-                    let mut body = if self.split {
-                        prepare_split(
-                            &plan,
-                            &regions,
-                            &self.collapsed,
-                            &self.expanded_folds,
-                            &staged_per_file,
-                            &rctx,
-                        )
-                    } else {
-                        prepare(
-                            &plan,
-                            &regions,
-                            &self.collapsed,
-                            &self.expanded_folds,
-                            &staged_per_file,
-                            &rctx,
-                        )
-                    };
-                    // Bake each line's note marker once per rebuild (off the
-                    // per-frame path), parallel to the staged-sliver pass.
-                    let paths: Vec<String> =
-                        diffs.iter().map(|d| d.path.display().to_string()).collect();
-                    mark_notes(&mut body, &paths, &self.notes);
-                    Some(Rc::new(body))
-                }
-                _ => None,
-            };
+            // (1) Rebuild the expensive plan ONLY when it's genuinely stale —
+            //     a fresh diff or a large-file expand (`invalidate_plan`).
+            //     Fold / collapse-all / split / note toggles leave it intact
+            //     (`invalidate_prepared`), so they skip syntect entirely and
+            //     drop straight to the cheap flatten in (2). This is what kept
+            //     Collapse/Expand-all from re-highlighting every line.
+            if self.plan_cache.is_none() {
+                let built = match &self.state {
+                    DiffViewState::Ready {
+                        diffs, expanded, ..
+                    }
+                    | DiffViewState::CommitReady {
+                        diffs, expanded, ..
+                    }
+                    | DiffViewState::RangeReady {
+                        diffs, expanded, ..
+                    }
+                    | DiffViewState::CombinedReady {
+                        diffs, expanded, ..
+                    } => {
+                        let plan = build_render_plan(diffs, *expanded);
+                        // Stageable change regions per file — full-file context
+                        // makes one giant hunk, so the renderer docks a chip bar
+                        // per region (git add -p granularity) using these.
+                        let regions: Vec<Vec<oximux_core::ChangeRegion>> =
+                            diffs.iter().map(oximux_core::change_regions).collect();
+                        // Hollow-vs-solid gutter slivers: only the combined view
+                        // carries per-file group tags, so staged files render
+                        // hollow there. Single-file / commit / range views pass
+                        // an empty slice → every sliver solid (one state).
+                        let staged_per_file: Vec<bool> = match &self.state {
+                            DiffViewState::CombinedReady { groups, .. } => groups
+                                .iter()
+                                .map(|g| matches!(g, FileGroup::Staged))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let paths: Vec<String> =
+                            diffs.iter().map(|d| d.path.display().to_string()).collect();
+                        Some(Rc::new(PlanCache {
+                            plan,
+                            regions,
+                            staged_per_file,
+                            paths,
+                        }))
+                    }
+                    _ => None,
+                };
+                self.plan_cache = built;
+            }
+            // (2) Flatten the cached plan into rows. Cheap — no string or
+            //     highlight work; just walks the plan applying the current
+            //     fold / collapse / split state, then bakes note markers.
+            let rows = self.plan_cache.clone().map(|pc| {
+                let rctx = RenderCtx {
+                    theme: self.theme,
+                    density: self.density,
+                    typography: &self.typography,
+                };
+                let mut body = if self.split {
+                    prepare_split(
+                        &pc.plan,
+                        &pc.regions,
+                        &self.collapsed,
+                        &self.expanded_folds,
+                        &pc.staged_per_file,
+                        &rctx,
+                    )
+                } else {
+                    prepare(
+                        &pc.plan,
+                        &pc.regions,
+                        &self.collapsed,
+                        &self.expanded_folds,
+                        &pc.staged_per_file,
+                        &rctx,
+                    )
+                };
+                // Bake each line's note marker once per rebuild (off the
+                // per-frame path), parallel to the staged-sliver pass.
+                mark_notes(&mut body, &pc.paths, &self.notes);
+                Rc::new(body)
+            });
             self.prepared = rows;
             // Sync the list's per-item height cache to the rebuilt rows. Same
             // row count → identity is stable (a note marker toggled, a hover

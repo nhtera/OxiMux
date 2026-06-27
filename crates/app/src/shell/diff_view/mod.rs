@@ -187,6 +187,24 @@ struct HunkTarget {
     reload: ReloadTarget,
 }
 
+/// Cached output of the expensive plan pass: `build_render_plan` (syntect
+/// highlighting + word-diff pairing for every line) plus the per-file scans
+/// that ride alongside it. Every field here is a pure function of the diff
+/// data and the large-file `expanded` flag — folding a file, collapsing all,
+/// flipping side-by-side, or toggling a review note never changes any of it.
+/// Caching it lets those toggles re-flatten (cheap `prepare`) without paying
+/// the syntect cost again, which is what made Collapse/Expand-all lag.
+pub(crate) struct PlanCache {
+    /// Per-file tokenised render plan — the syntect/word-diff output.
+    plan: Vec<FilePlan>,
+    /// Stageable change regions per file (git add -p granularity).
+    regions: Vec<Vec<oximux_core::ChangeRegion>>,
+    /// Per-file staged flag (combined view only; empty elsewhere → solid).
+    staged_per_file: Vec<bool>,
+    /// File paths in file order, for `mark_notes`.
+    paths: Vec<String>,
+}
+
 pub struct DiffView {
     repo: Repository,
     state: DiffViewState,
@@ -236,6 +254,11 @@ pub struct DiffView {
     /// off the scroll path. `None` means "stale, rebuild on next render";
     /// every state transition that changes the body resets it.
     prepared: Option<Rc<Vec<PreparedRow>>>,
+    /// Cached expensive plan (syntect + word-diff), shared across fold /
+    /// collapse / split toggles. `None` → rebuild on next render. Only a
+    /// fresh diff load or the large-file `expand` clears it (`invalidate_plan`);
+    /// fold/collapse/split go through `invalidate_prepared`, which keeps this.
+    plan_cache: Option<Rc<PlanCache>>,
     /// Side-by-side toggle. `false` → unified/inline body (default); `true`
     /// → original | modified columns. Flipping it rebuilds `prepared` (the
     /// two modes emit different row sets) so it routes through
@@ -358,6 +381,7 @@ impl DiffView {
             body_list_zoom: 1.0,
             body_list_was_populated: false,
             prepared: None,
+            plan_cache: None,
             prepared_widest: 0,
             prepared_widest_chars: 0,
             split_h_offset: 0.0,
@@ -545,6 +569,10 @@ impl DiffView {
     /// diff body (load, commit load, expand, seed).
     fn invalidate_prepared(&mut self) {
         self.prepared = None;
+        // NOTE: deliberately keeps `plan_cache`. Fold / collapse-all / split /
+        // note toggles route here, and none of them change the tokenised plan
+        // (only which rows the flatten emits). Anything that DOES change the
+        // diff data or the large-file `expand` flag calls `invalidate_plan`.
         // Region indices + row indices are only meaningful against the
         // current row set; a rebuild may renumber them, so drop any stale
         // hover (region for slivers + row for the card position).
@@ -553,6 +581,17 @@ impl DiffView {
         // A new body means a new max line length — reset the split scroll so
         // we don't start mid-line on a different file.
         self.split_h_offset = 0.0;
+    }
+
+    /// Invalidate BOTH the tokenised plan and the flattened rows. Use only
+    /// when the underlying diff data changes (a fresh load / seed / post-stage
+    /// reload) or the large-file `expand` flag flips — those are the sole
+    /// inputs to `build_render_plan`. Fold / collapse / split must NOT call
+    /// this (it would re-run syntect for nothing); they call
+    /// `invalidate_prepared` and reuse the cached plan.
+    fn invalidate_plan(&mut self) {
+        self.plan_cache = None;
+        self.invalidate_prepared();
     }
 
     /// Inspect-only accessor used by tests + by `GitPanel` to avoid
@@ -577,7 +616,7 @@ impl DiffView {
         // load, then briefly flash back to the prior file's diff when
         // the stale `_op_task` finishes its reload chain.
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         // A fresh selection always opens fully expanded (no folded files, no
         // pre-expanded context runs from the prior file).
         self.collapsed.clear();
@@ -691,7 +730,7 @@ impl DiffView {
         // from a prior file selection must not flash over the new
         // commit-detail view.
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         self.expanded_folds.clear();
         self.reset_rail_state();
         // Drop the prior scope's notes immediately. `reload_notes` repopulates
@@ -790,7 +829,7 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) {
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         self.expanded_folds.clear();
         self.reset_rail_state();
         // Drop the prior scope's notes immediately. `reload_notes` repopulates
@@ -888,7 +927,7 @@ impl DiffView {
     pub fn load_combined(&mut self, scope: CombinedDiffScope, cx: &mut Context<Self>) {
         // Same drop-on-entry + fresh-selection reset as `load()`.
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         self.collapsed.clear();
         self.expanded_folds.clear();
         self.reset_rail_state();
@@ -979,7 +1018,7 @@ impl DiffView {
         }
         // Expanding a collapsed large diff changes which rows render — drop
         // the cached row list so the next render rebuilds the full body.
-        self.invalidate_prepared();
+        self.invalidate_plan();
     }
 
     fn apply_load_result(
@@ -1054,7 +1093,7 @@ impl DiffView {
             diffs,
             expanded: false,
         };
-        self.invalidate_prepared();
+        self.invalidate_plan();
     }
 
     /// Test-only: stamp the view into `CombinedReady` with pre-fetched diffs
@@ -1072,7 +1111,7 @@ impl DiffView {
             groups,
             expanded: false,
         };
-        self.invalidate_prepared();
+        self.invalidate_plan();
     }
 
     /// Which action side applies to the region in `file_idx` — gating the
