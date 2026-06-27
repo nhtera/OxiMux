@@ -142,16 +142,34 @@ fn hunked_modified_file_renders_lines_in_order() {
 
 #[test]
 fn binary_file_skips_body() {
+    // A non-image binary stays a suppressed-body `Binary` notice.
     let plan = build_render_plan(
-        &[file("logo.png", DiffStatus::Binary, vec![], false)],
+        &[file("data.bin", DiffStatus::Binary, vec![], false)],
         false, true,
     );
     match &plan[0] {
         FilePlan::Binary { path, header } => {
-            assert_eq!(path, "logo.png");
+            assert_eq!(path, "data.bin");
             assert_eq!(header.label, "Binary");
         }
         other => panic!("expected Binary, got {other:?}"),
+    }
+}
+
+#[test]
+fn image_binary_uses_image_variant() {
+    // A binary whose extension is a previewable image routes to `Image` so
+    // the diff view renders a before/after picture instead of a notice.
+    let plan = build_render_plan(
+        &[file("assets/logo.png", DiffStatus::Binary, vec![], false)],
+        false, true,
+    );
+    match &plan[0] {
+        FilePlan::Image { path, header } => {
+            assert_eq!(path, "assets/logo.png");
+            assert_eq!(header.label, "Binary");
+        }
+        other => panic!("expected Image, got {other:?}"),
     }
 }
 
@@ -524,6 +542,7 @@ fn multi_file_plan_preserves_order() {
             FilePlan::Hunked { path, .. } => path.as_str(),
             FilePlan::Collapsed { path, .. } => path.as_str(),
             FilePlan::Binary { path, .. } => path.as_str(),
+            FilePlan::Image { path, .. } => path.as_str(),
             FilePlan::ModeOnly { path, .. } => path.as_str(),
             FilePlan::Oversized { path, .. } => path.as_str(),
         })
@@ -542,7 +561,7 @@ fn split_occupancy(f: &FileDiff) -> Vec<(bool, bool)> {
         density: Density::default(),
         typography: &typography,
     };
-    prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx)
+    prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &Default::default(), &rctx)
         .into_iter()
         .filter_map(|r| match r {
             PreparedRow::SplitLine { left, right, .. } => Some((left.is_some(), right.is_some())),
@@ -644,7 +663,7 @@ fn inline_runs(f: &FileDiff) -> Vec<(f32, f32, RulerMark)> {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx);
+    let rows = prepare(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &Default::default(), &rctx);
     overview_runs(&rows)
         .into_iter()
         .map(|r| (r.start, r.end, r.mark))
@@ -718,7 +737,7 @@ fn overview_split_modify_row_is_mixed() {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx);
+    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &Default::default(), &rctx);
     let runs = overview_runs(&rows);
     assert_eq!(runs.len(), 1, "one change block → one run");
     assert_eq!(runs[0].mark, RulerMark::Mixed);
@@ -751,7 +770,7 @@ fn folded_file_emits_header_only() {
     };
     let mut collapsed = HashSet::new();
     collapsed.insert(0usize);
-    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &[], &rctx);
+    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &[], &Default::default(), &rctx);
     let owner = build_row_owner(&rows);
 
     // File 0 contributes exactly one row — its (folded) header.
@@ -817,7 +836,7 @@ fn split_merged_region_keeps_all_blocks_tagged() {
         density: Density::default(),
         typography: &typography,
     };
-    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &rctx);
+    let rows = prepare_split(&plan, &regions, &HashSet::new(), &HashSet::new(), &[], &Default::default(), &rctx);
 
     let mut tagged = 0;
     let mut anchors = 0;
@@ -855,7 +874,7 @@ fn inline_rows(f: &FileDiff, expanded: &HashSet<(usize, u32)>) -> Vec<PreparedRo
         density: Density::default(),
         typography: &typography,
     };
-    prepare(&plan, &regions, &HashSet::new(), expanded, &[], &rctx)
+    prepare(&plan, &regions, &HashSet::new(), expanded, &[], &Default::default(), &rctx)
 }
 
 /// A long unchanged-context run between two changes folds its middle: 3
@@ -1029,7 +1048,7 @@ fn collect_headers_one_per_file_with_fold_state() {
     };
     let mut collapsed = HashSet::new();
     collapsed.insert(1usize);
-    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &[], &rctx);
+    let rows = prepare(&plan, &regions, &collapsed, &HashSet::new(), &[], &Default::default(), &rctx);
     let headers = collect_headers(&rows);
     assert_eq!(headers.len(), 2, "one header per file");
     assert_eq!(headers[0].file_idx, 0);
@@ -1075,6 +1094,7 @@ fn inline_hollow_by_file(files: &[FileDiff], staged_per_file: &[bool]) -> Vec<(u
         &HashSet::new(),
         &HashSet::new(),
         staged_per_file,
+        &Default::default(),
         &rctx,
     )
     .into_iter()
@@ -1132,6 +1152,7 @@ fn staged_file_group_renders_hollow_sliver_in_split_mode() {
         &HashSet::new(),
         &HashSet::new(),
         &[false, true],
+        &Default::default(),
         &rctx,
     );
     let mut saw_unstaged_solid = false;

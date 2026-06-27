@@ -75,6 +75,12 @@ use gpui_component::{Icon, Sizable as _};
 use oximux_core::{DiffLineKind, FileGroup, NoteSide};
 use oximux_settings::{Density, Theme, Typography};
 
+/// Decoded image previews keyed by file display path — the async-fetched
+/// before/after blobs the image rows display. Threaded into
+/// `prepare`/`prepare_split` so each `FilePlan::Image` bakes in its data.
+pub type ImageStore =
+    std::collections::HashMap<String, Rc<crate::shell::diff_view::image_diff::ImageDiffData>>;
+
 /// Number of unchanged context lines kept on EACH side of a change before a
 /// long run is folded.
 const CONTEXT_KEEP: usize = 3;
@@ -132,6 +138,14 @@ pub enum PreparedRow {
     Collapsed { label: String },
     /// Inline notice body for binary / mode-only files (and "No diff").
     Special { text: String },
+    /// Before/after picture preview for an image-binary file. `data` is the
+    /// decoded blobs (old = HEAD, new = working tree); `None` while the async
+    /// fetch is still in flight, which renders a "Loading preview…" placeholder.
+    Image {
+        file_idx: usize,
+        path: SharedString,
+        data: Option<Rc<crate::shell::diff_view::image_diff::ImageDiffData>>,
+    },
 }
 
 /// One column of a side-by-side row — a single line number + content with
@@ -253,6 +267,9 @@ fn row_width_chars(row: &PreparedRow) -> usize {
         PreparedRow::ContextFold { count, .. } => count_fold_label(*count).chars().count(),
         PreparedRow::Collapsed { label } => label.chars().count(),
         PreparedRow::Special { text } => text.chars().count(),
+        // Image rows are fixed-width panes — they never extend the body's
+        // horizontal scroll range, so they contribute no content width.
+        PreparedRow::Image { .. } => 0,
     }
 }
 
@@ -387,6 +404,7 @@ pub fn prepare(
     collapsed: &std::collections::HashSet<usize>,
     expanded_folds: &std::collections::HashSet<FoldId>,
     staged_per_file: &[bool],
+    images: &ImageStore,
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -514,6 +532,23 @@ pub fn prepare(
                 }
                 rows.push(PreparedRow::Special {
                     text: "Binary file (body suppressed)".to_string(),
+                });
+            }
+            FilePlan::Image { path, header } => {
+                rows.push(PreparedRow::FileHeader {
+                    file_idx,
+                    path: path.clone().into(),
+                    label: header.label.clone(),
+                    stats: None,
+                    folded,
+                });
+                if folded {
+                    continue;
+                }
+                rows.push(PreparedRow::Image {
+                    file_idx,
+                    path: path.clone().into(),
+                    data: images.get(path).cloned(),
                 });
             }
             FilePlan::Oversized {
@@ -742,6 +777,7 @@ pub fn prepare_split(
     collapsed: &std::collections::HashSet<usize>,
     expanded_folds: &std::collections::HashSet<FoldId>,
     staged_per_file: &[bool],
+    images: &ImageStore,
     rctx: &RenderCtx<'_>,
 ) -> Vec<PreparedRow> {
     let gutter_digits = gutter_digits_for(plan);
@@ -903,6 +939,23 @@ pub fn prepare_split(
                 }
                 rows.push(PreparedRow::Special {
                     text: "Binary file (body suppressed)".to_string(),
+                });
+            }
+            FilePlan::Image { path, header } => {
+                rows.push(PreparedRow::FileHeader {
+                    file_idx,
+                    path: path.clone().into(),
+                    label: header.label.clone(),
+                    stats: None,
+                    folded,
+                });
+                if folded {
+                    continue;
+                }
+                rows.push(PreparedRow::Image {
+                    file_idx,
+                    path: path.clone().into(),
+                    data: images.get(path).cloned(),
                 });
             }
             FilePlan::Oversized {

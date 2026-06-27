@@ -52,6 +52,7 @@ fn prepared(files: &[FileDiff]) -> Vec<PreparedRow> {
         &HashSet::new(),
         &HashSet::new(),
         &[],
+        &Default::default(),
         &rctx,
     )
 }
