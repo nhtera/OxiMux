@@ -25,6 +25,41 @@ async fn stage_path_marks_file_as_added_in_index() {
 }
 
 #[tokio::test]
+async fn stage_path_with_glob_chars_matches_literally() {
+    // A file literally named `cache[1].js` must stage exactly that file. A
+    // bare pathspec would treat `[1]` as a character class and match nothing
+    // here (silently staging zero files) — or the wrong file if a sibling
+    // happened to match. The `:(literal)` magic guarantees a verbatim match.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("cache[1].js"), "literal\n");
+    write(&p.join("cache1.js"), "decoy\n");
+
+    let repo = Repository::open(p).await.unwrap();
+    repo.stage_paths(&[Path::new("cache[1].js")]).await.unwrap();
+
+    let st = repo.status().await.unwrap();
+    let staged: Vec<String> = st
+        .files
+        .iter()
+        .filter(|f| f.index == IndexStatus::Added)
+        .map(|f| f.path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        staged,
+        vec!["cache[1].js".to_string()],
+        "only the literally-named file should be staged"
+    );
+    // The decoy stays untracked — proves no glob expansion leaked across.
+    assert!(
+        st.files.iter().any(|f| f.path.to_string_lossy() == "cache1.js"
+            && f.worktree == WorktreeStatus::Untracked),
+        "decoy cache1.js must remain untracked"
+    );
+}
+
+#[tokio::test]
 async fn unstage_path_reverts_index_to_worktree_only() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();

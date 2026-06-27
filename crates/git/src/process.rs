@@ -104,6 +104,14 @@ impl GitCmd {
         };
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.cwd)
+            // Emit non-ASCII paths verbatim (UTF-8) instead of git's default
+            // octal-escaped `"\NNN"` quoting. Without this, a filename with
+            // Vietnamese/CJK/accented characters comes back quoted in `diff`
+            // and `log` output and the path parsers (which strip a bare `a/`
+            // prefix) silently drop the file. This is a `git`-level option, so
+            // it MUST precede the subcommand in `self.args`.
+            .arg("-c")
+            .arg("core.quotePath=false")
             .args(&self.args)
             .env("LANG", "C")
             .env("LC_ALL", "C")

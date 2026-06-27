@@ -12,33 +12,54 @@ use crate::error::{GitError, Result};
 use crate::process::GitCmd;
 use crate::repository::Repository;
 use oximux_core::{DiffLineKind, DiffStatus, FileDiff};
+use std::ffi::OsString;
 use std::path::Path;
 
+/// Max paths handed to a single `git` invocation. Hundreds of paths in one
+/// argv (agent-driven bulk stage/discard) can exceed the OS `ARG_MAX` limit
+/// and fail with E2BIG; chunking fans the op across several invocations.
+const PATH_ARG_CHUNK: usize = 256;
+
+/// Wrap `p` in a `:(literal)` pathspec so git matches it verbatim — no glob,
+/// no wildcard, no pathspec magic. A bare path after `--` still goes through
+/// git's pathspec engine, so a file literally named `cache[1].js` or `a{b}.c`
+/// would be interpreted as a pattern and stage/discard the WRONG files (or
+/// none). Relativity is unchanged: the path stays relative to the command
+/// cwd (the repo workdir), matching the prior bare-argument behaviour.
+fn literal_pathspec(p: &Path) -> OsString {
+    let mut spec = OsString::from(":(literal)");
+    spec.push(p.as_os_str());
+    spec
+}
+
 impl Repository {
-    /// Stage entire files (equivalent to `git add -- <paths>`).
-    pub async fn stage_paths(&self, paths: &[&Path]) -> Result<()> {
+    /// Run a path-scoped op (`add` / `restore` / `clean`) over `paths`,
+    /// chunked under the argv limit with each path wrapped `:(literal)`.
+    /// `leading` is the subcommand plus its `--` terminator, e.g.
+    /// `["restore", "--staged", "--"]`.
+    async fn run_pathspec_op(&self, leading: &[&str], paths: &[&Path]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut cmd = GitCmd::new(self.workdir()).args(["add", "--"]);
-        for p in paths {
-            cmd = cmd.arg(p.as_os_str());
+        for chunk in paths.chunks(PATH_ARG_CHUNK) {
+            let mut cmd = GitCmd::new(self.workdir()).args(leading);
+            for p in chunk {
+                cmd = cmd.arg(literal_pathspec(p));
+            }
+            cmd.run().await?;
         }
-        cmd.run().await?;
         Ok(())
+    }
+
+    /// Stage entire files (equivalent to `git add -- <paths>`).
+    pub async fn stage_paths(&self, paths: &[&Path]) -> Result<()> {
+        self.run_pathspec_op(&["add", "--"], paths).await
     }
 
     /// Unstage entire files (equivalent to `git restore --staged -- <paths>`).
     pub async fn unstage_paths(&self, paths: &[&Path]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let mut cmd = GitCmd::new(self.workdir()).args(["restore", "--staged", "--"]);
-        for p in paths {
-            cmd = cmd.arg(p.as_os_str());
-        }
-        cmd.run().await?;
-        Ok(())
+        self.run_pathspec_op(&["restore", "--staged", "--"], paths)
+            .await
     }
 
     /// Discard worktree changes — DESTRUCTIVE. Equivalent to
@@ -53,15 +74,7 @@ impl Repository {
     ///
     /// [`delete_untracked_paths`]: Self::delete_untracked_paths
     pub async fn discard_paths(&self, paths: &[&Path]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let mut cmd = GitCmd::new(self.workdir()).args(["restore", "--"]);
-        for p in paths {
-            cmd = cmd.arg(p.as_os_str());
-        }
-        cmd.run().await?;
-        Ok(())
+        self.run_pathspec_op(&["restore", "--"], paths).await
     }
 
     /// Permanently delete untracked files from the worktree —
@@ -85,15 +98,7 @@ impl Repository {
     /// `discard_paths` instead since their index entry needs to clear
     /// first.
     pub async fn delete_untracked_paths(&self, paths: &[&Path]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let mut cmd = GitCmd::new(self.workdir()).args(["clean", "-f", "--"]);
-        for p in paths {
-            cmd = cmd.arg(p.as_os_str());
-        }
-        cmd.run().await?;
-        Ok(())
+        self.run_pathspec_op(&["clean", "-f", "--"], paths).await
     }
 
     /// Stage selected hunks from an unstaged diff.
@@ -518,5 +523,13 @@ diff --git a/src/a.rs b/src/a.rs
         let bytes = build_patch(&f, &[0]).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains("@@ -10,1 +10,2 @@ fn second() {\n"), "got: {s}");
+    }
+
+    #[test]
+    fn literal_pathspec_prefixes_without_touching_glob_chars() {
+        // `[`, `*`, `?`, `{` must survive verbatim behind the `:(literal)`
+        // magic — git would otherwise treat them as wildcard pathspec.
+        let spec = literal_pathspec(std::path::Path::new("dir/cache[1]*.js"));
+        assert_eq!(spec, std::ffi::OsString::from(":(literal)dir/cache[1]*.js"));
     }
 }

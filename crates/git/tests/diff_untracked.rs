@@ -23,6 +23,22 @@ async fn fresh_repo() -> (TempDir, Repository) {
 }
 
 #[tokio::test]
+async fn untracked_non_ascii_path_round_trips() {
+    // A filename with non-ASCII (Vietnamese) characters must survive the
+    // `diff --git a/… b/…` header verbatim. Git octal-escapes such paths
+    // unless `core.quotePath=false` is set; the header parser strips a bare
+    // `a/` prefix, so quoted output would silently drop the file.
+    let (dir, repo) = fresh_repo().await;
+    let name = "tài-liệu.md";
+    std::fs::write(dir.path().join(name), "xin chào\n").unwrap();
+
+    let diffs = repo.diff_for_untracked(Path::new(name)).await.unwrap();
+    assert_eq!(diffs.len(), 1, "expected one synthesized diff");
+    assert_eq!(diffs[0].path, std::path::PathBuf::from(name));
+    assert_eq!(diffs[0].status, DiffStatus::Added);
+}
+
+#[tokio::test]
 async fn untracked_text_file_is_all_additions() {
     let (dir, repo) = fresh_repo().await;
     std::fs::write(dir.path().join("hello.rs"), "fn main() {}\n").unwrap();
