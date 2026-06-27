@@ -30,6 +30,8 @@ pub mod dropdown_items;
 pub mod empty_state;
 pub mod filter;
 pub mod graph;
+pub mod graph_gutter;
+pub mod graph_layout;
 pub mod graph_row;
 pub mod picker_wiring;
 pub mod pr_draft;

@@ -4,6 +4,7 @@
 //! 20-row chunks. State machine: `Loading → Ready | Failed`.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use gpui::{
     App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
@@ -22,6 +23,7 @@ use oximux_storage::SettingsRepo;
 use tokio::sync::oneshot;
 
 use crate::scm_layout_settings;
+use crate::shell::source_control::graph_layout::{RowLayout, compute_graph, max_lanes};
 use crate::shell::source_control::graph_row::render_commit_row;
 use crate::shell::source_control::style as sc_style;
 
@@ -99,6 +101,15 @@ pub struct CommitGraph {
     /// wholesale on a refresh / fresh `spawn_load_initial`; extended
     /// in place on `load_more` so prior pages keep their stats.
     stat_cache: HashMap<String, (u32, u32)>,
+    /// Precomputed swimlane drawing model, 1:1 with the loaded commits.
+    /// Recomputed whenever the commit set changes (initial load, refresh,
+    /// load-more) rather than per render, since the layout is a function of
+    /// the whole loaded window. `Rc` so the `uniform_list` row closure can
+    /// hold a cheap clone and index it per visible row.
+    graph_layout: Rc<Vec<RowLayout>>,
+    /// Widest lane count across `graph_layout`, clamped to the lane cap.
+    /// Drives the (fixed) gutter width so commit subjects stay aligned.
+    graph_max_lanes: usize,
 }
 
 impl CommitGraph {
@@ -125,9 +136,25 @@ impl CommitGraph {
             settings_repo,
             focus_handle,
             stat_cache: HashMap::new(),
+            graph_layout: Rc::new(Vec::new()),
+            graph_max_lanes: 1,
         };
         graph.spawn_load_initial(cx);
         graph
+    }
+
+    /// Recompute the swimlane layout from the currently loaded commits.
+    /// Called after any change to the commit set; a no-op (empty layout)
+    /// when the graph isn't in a `Ready` state.
+    fn recompute_layout(&mut self) {
+        if let GraphState::Ready { commits, .. } = &self.state {
+            let layout = compute_graph(commits);
+            self.graph_max_lanes = max_lanes(&layout);
+            self.graph_layout = Rc::new(layout);
+        } else {
+            self.graph_layout = Rc::new(Vec::new());
+            self.graph_max_lanes = 1;
+        }
     }
 
     /// Current body height — exposed so callers (e.g. snapshot tests
@@ -259,6 +286,7 @@ impl CommitGraph {
                                 },
                                 Err(e) => GraphState::Failed(e.to_string()),
                             };
+                            g.recompute_layout();
                         }
                         InitialLoad::Stats(stats) => {
                             // Wholesale replace — a fresh load drops every
@@ -343,6 +371,10 @@ impl CommitGraph {
                         }
                     }
                 }
+                // Re-layout outside the `&mut g.state` borrow above:
+                // appended parents may resolve lanes that previously hung
+                // off the page bottom. No-op when the load failed.
+                g.recompute_layout();
                 cx.notify();
             });
         });
@@ -568,6 +600,11 @@ impl Render for CommitGraph {
                 let theme_cap = theme;
                 let typography_cap = self.typography.clone();
                 let density_cap = self.density;
+                // Precomputed swimlane model (1:1 with `commits`) + the
+                // page's fixed gutter width. Cheap `Rc`/`usize` clones into
+                // the row closure.
+                let layout = self.graph_layout.clone();
+                let max_lanes_cap = self.graph_max_lanes;
                 // Snapshot the stat cache once for the closure so
                 // each row's lookup is a constant-time HashMap hit.
                 // Cloning at most 20–60 (oid → (u32, u32)) entries is
@@ -605,8 +642,16 @@ impl Render for CommitGraph {
                         for ix in range {
                             if let Some(c) = commits.get(ix) {
                                 let stats = stat_cache.get(&c.oid).copied();
+                                // Layout is rebuilt in lockstep with
+                                // `commits`, so `ix` indexes both. The
+                                // `unwrap_or_default` only guards a
+                                // transient frame where a fresh page
+                                // painted before its relayout landed.
+                                let row_layout = layout.get(ix).cloned().unwrap_or_default();
                                 rows.push(render_commit_row(
                                     c,
+                                    &row_layout,
+                                    max_lanes_cap,
                                     theme_cap,
                                     density_cap,
                                     &typography_cap,
