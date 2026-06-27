@@ -49,6 +49,60 @@
 
 ---
 
+## Source map — where things live
+
+Folder-level index (coarse by design — it rots slowly). Logic lives in the
+backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
+`crates/app/src/shell/<domain>/`. To find a feature, grep the domain column.
+
+### Crates (`crates/<dir>/` → package → entry)
+
+| Crate dir | Package | Entry | Purpose |
+|---|---|---|---|
+| `core` | `oximux-core` | `src/lib.rs` | shared domain types, no deps |
+| `pty` | `oximux-pty` | `src/lib.rs` | `TerminalBackend` + `PortablePtyBackend` |
+| `proc-cwd` | `oximux-proc-cwd` | `src/lib.rs` | resolve a process's working dir |
+| `git` | `oximux-git` | `src/lib.rs` | `Repository`, `StatusPoller`, git ops, `GhCmd` |
+| `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine` |
+| `editor` | `oximux-editor` | `src/lib.rs` | gpui-component editor wrapper + LSP glue |
+| `storage` | `oximux-storage` | `src/lib.rs` | SQLite + migration ladder + CI guard |
+| `settings` | `oximux-settings` | `src/lib.rs` | theme tokens, density, typography, TOML config |
+| `relay-proto` | `oximux-relay-proto` | `src/lib.rs` | wire protocol shared by daemon + client |
+| `relay` | `oximux-relay` | `src/lib.rs` + `src/main.rs` | out-of-process PTY relay daemon |
+| `relay-client` | `oximux-relay-client` | `src/lib.rs` | in-app client for the relay daemon |
+| `ui` | `oximux-ui` | `src/lib.rs` | app-agnostic widgets (`FloatingSurface`, buttons, `ConfirmDialog`); re-exported as `crate::ui` |
+| `app` | `oximux-app` | `src/lib.rs` + `src/main.rs` | GPUI cockpit; all views (the 73%-LOC crate) |
+| `xtask/` | `xtask` | `src/main.rs` | repo lint orchestrator (`file-size-lint` etc.) |
+
+### `crates/app/src/` — top-level (non-view)
+
+| File / folder | Holds |
+|---|---|
+| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`) |
+| `project_panes_factory.rs` | manifest save/load, pane-buffer load, attach-reconcile |
+| `actions.rs` / `state.rs` / `left_rail_layout.rs` | GPUI actions, app state, rail layout |
+| `agent_glue/` | app-side agent wiring (bridges `oximux-agents` ↔ views) |
+| `app_settings/` | in-app settings store + persistence |
+| `keymap_registry/` | keybinding registration |
+| `loaders/` | startup data loaders |
+| `notifier/` | OS notifications |
+| `platform/` | macOS-specific glue (App Nap, single-instance) |
+| `session_restore/` | cold/warm session restore orchestration |
+
+### `crates/app/src/shell/<domain>/` — GPUI views
+
+One folder per cockpit zone: `agent_ui`, `agents_dashboard`, `browser_view`,
+`chrome`, `command_palette`, `commit_dialog`, `compose_bar`, `diff_view`,
+`file_explorer`, `forge`, `git_panel`, `left_rail`, `pane_group`, `panes`,
+`pr_dialog`, `project_panes`, `right_sidebar`, `search_panel`, `session_history`,
+`settings_modal`, `source_control`, `stash_panel`, `tasks_view`, `terminal`,
+`usage`, `welcome`, `workspace`, `worktree_panel`. Each re-exports its modules
+so existing `crate::shell::<name>::…` paths resolve regardless of folder.
+A small set of cross-cutting glue files (`context_env.rs`, `openable_text_file.rs`,
+`open_url.rs`, `cwd_resolver.rs`) stays loose at `shell/` root by design.
+
+---
+
 ## WorkspaceRoot + RightSidebar wiring
 
 ```

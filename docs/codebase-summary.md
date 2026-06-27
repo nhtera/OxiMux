@@ -44,7 +44,7 @@ src/
 ├── actions.rs              all GPUI Action structs (SplitHorizontal, Search, NewWindow,
 │                           MoveTabToNewWindow, NewTabInPane, etc.)
 ├── assets.rs              CompositeAssets — local SVGs (git-branch) + gpui-component bundle
-├── workspace_root.rs       WorkspaceRoot entity — top-level layout host
+├── workspace_root/         WorkspaceRoot entity — top-level layout host (mod/ops/render)
 │                           right_sidebar: Option<Entity<RightSidebar>>
 │                           left_rail: Entity<LeftRail>; left_rail_open: bool (Cmd+B)
 │                           palette: Entity<PaletteModal> (Cmd+P / Cmd+Shift+P)
@@ -118,7 +118,7 @@ src/
     │                       pure helpers: tty_label / agent_label / pane_label / metric_color;
     │                       git zone mounts the SCM panel's cached PrimaryAction as a one-click
     │                       smart button (click → SourceControlPanel::trigger_primary_action)
-    ├── terminal_view.rs    TerminalView GPUI entity; poll task; blink; focus;
+    ├── terminal_view/      TerminalView GPUI entity (mod/lifecycle/input/state/render); poll task; blink; focus;
     │                       last_completed_command_output (P8 mark bracket → snapshot
     │                       rows_text band); send-to-agent action handlers dispatch
     │                       SendTextToActiveAgent payload up to WorkspaceRoot
@@ -223,9 +223,10 @@ crate root, so `crate::<name>::…` paths are unchanged):
 - `loaders/` — custom_commands_loader, `project_scripts_loader` (reads `.oximux/scripts.toml`), browser_profiles, file_http_client
 - `shell/terminal/` — the ~17 terminal-surface modules (terminal_view/canvas/row/links/palette/scrollbar/search*/key_input/mouse_report/cell_metrics/box_drawing/adapter_picker/floating_terminal*)
 
-Stays loose at `crates/app/src/` root: `lib.rs`, `main.rs`, `actions.rs`,
-`state.rs`, `assets.rs`, `workspace_root.rs`, `left_rail_layout.rs`,
-`project_panes_factory.rs`, plus the `keymap_registry/` and `notifier/` folders.
+At `crates/app/src/` root: `lib.rs`, `main.rs`, `actions.rs`,
+`state.rs`, `assets.rs`, `workspace_root/` (split into mod/ops/render),
+`left_rail_layout.rs`, `project_panes_factory.rs`, plus the `keymap_registry/`
+and `notifier/` folders.
 
 ---
 
