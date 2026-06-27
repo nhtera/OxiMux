@@ -1,5 +1,12 @@
 use super::*;
 
+/// Diff-body line count at or below which syntax highlighting runs inline on
+/// the render thread. Optimized syntect is ~0.3 ms/line, so this caps the
+/// synchronous cost around a tenth of a second — within the "feels instant"
+/// window and with no uncolored flash. Larger highlightable diffs paint
+/// uncolored immediately and colorize from a background task instead. Tunable.
+const SYNC_HIGHLIGHT_THRESHOLD: usize = 250;
+
 // --- DiffView top-level view (moved out of mod.rs in the Tier-1 slim) -----
 // `impl Render for DiffView` + its loading/failed placeholder helpers. Lives
 // here with the rest of the GPUI element construction; the prepared-row
@@ -19,6 +26,12 @@ impl Render for DiffView {
                 .into_any_element();
         }
 
+        // Editor-global font zoom, resolved once. `zoom` drives the scaled
+        // typography; `zoom_factor` (zoomed code-font px over base) scales the
+        // body row height. Both feed the `list()` height-cache sync below.
+        let zoom = current_zoom(cx);
+        let zoom_factor = body_zoom_factor(self.typography.t_body_sm, zoom);
+
         // Rebuild the cached row list only when stale. This keeps the
         // expensive work — walking every hunk, syntect highlighting each
         // line, word-diff pairing — OFF the per-frame render path; it runs
@@ -26,70 +39,161 @@ impl Render for DiffView {
         // Done before borrowing `&self.state` for the body so the heavy
         // plan build doesn't tangle with the element tree below.
         if self.prepared.is_none() {
-            let rows = match &self.state {
-                DiffViewState::Ready {
-                    diffs, expanded, ..
+            // (1) Rebuild the expensive plan ONLY when it's genuinely stale —
+            //     a fresh diff or a large-file expand (`invalidate_plan`).
+            //     Fold / collapse-all / split / note toggles leave it intact
+            //     (`invalidate_prepared`), so they skip syntect entirely and
+            //     drop straight to the cheap flatten in (2). This is what kept
+            //     Collapse/Expand-all from re-highlighting every line.
+            if self.plan_cache.is_none() {
+                // Small diffs highlight inline (fast, no uncolored flash). Larger
+                // highlightable diffs build UNCOLORED here so the body paints
+                // instantly, then a background pass (spawned below) rebuilds the
+                // colored plan off the UI thread and swaps it in — syntect on a
+                // near-budget diff is ~1 s of work that must never block paint.
+                let mut spawn_async: Option<(Vec<oximux_core::FileDiff>, bool)> = None;
+                let built = match &self.state {
+                    DiffViewState::Ready {
+                        diffs, expanded, ..
+                    }
+                    | DiffViewState::CommitReady {
+                        diffs, expanded, ..
+                    }
+                    | DiffViewState::RangeReady {
+                        diffs, expanded, ..
+                    }
+                    | DiffViewState::CombinedReady {
+                        diffs, expanded, ..
+                    } => {
+                        let lines = diff_body_line_count(diffs);
+                        let highlightable = lines <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
+                        let sync_highlight = highlightable && lines <= SYNC_HIGHLIGHT_THRESHOLD;
+                        let plan = build_render_plan(diffs, *expanded, sync_highlight);
+                        // Stageable change regions per file — full-file context
+                        // makes one giant hunk, so the renderer docks a chip bar
+                        // per region (git add -p granularity) using these.
+                        let regions: Vec<Vec<oximux_core::ChangeRegion>> =
+                            diffs.iter().map(oximux_core::change_regions).collect();
+                        // Hollow-vs-solid gutter slivers: only the combined view
+                        // carries per-file group tags, so staged files render
+                        // hollow there. Single-file / commit / range views pass
+                        // an empty slice → every sliver solid (one state).
+                        let staged_per_file: Vec<bool> = match &self.state {
+                            DiffViewState::CombinedReady { groups, .. } => groups
+                                .iter()
+                                .map(|g| matches!(g, FileGroup::Staged))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let paths: Vec<String> =
+                            diffs.iter().map(|d| d.path.display().to_string()).collect();
+                        // Above the inline threshold but within budget → colorize
+                        // off-thread; clone the inputs the background pass needs.
+                        if highlightable && !sync_highlight {
+                            spawn_async = Some((diffs.clone(), *expanded));
+                        }
+                        Some(Rc::new(PlanCache {
+                            plan,
+                            regions,
+                            staged_per_file,
+                            paths,
+                        }))
+                    }
+                    _ => None,
+                };
+                self.plan_cache = built;
+                // Background syntax-highlight pass for large diffs. Runs the
+                // syntect work on a thread, then swaps the colored plan in on
+                // the foreground — guarded by `plan_gen` so a newer diff load
+                // discards a stale result.
+                if let Some((diffs, expanded)) = spawn_async {
+                    let gen_at_spawn = self.plan_gen;
+                    let executor = cx.background_executor().clone();
+                    self._highlight_task = Some(cx.spawn(async move |this, cx| {
+                        let colored = executor
+                            .spawn(async move { build_render_plan(&diffs, expanded, true) })
+                            .await;
+                        let _ = this.update(cx, |view, cx| {
+                            if view.plan_gen != gen_at_spawn {
+                                return; // superseded by a newer load/expand
+                            }
+                            if let Some(pc) = view.plan_cache.as_ref() {
+                                // Only the per-line tokens changed; reuse the
+                                // collapse-invariant regions/staged/paths.
+                                view.plan_cache = Some(Rc::new(PlanCache {
+                                    plan: colored,
+                                    regions: pc.regions.clone(),
+                                    staged_per_file: pc.staged_per_file.clone(),
+                                    paths: pc.paths.clone(),
+                                }));
+                                // Re-flatten with colors. Same row count → the
+                                // list `remeasure`s, keeping the scroll position.
+                                view.invalidate_prepared();
+                                cx.notify();
+                            }
+                        });
+                    }));
                 }
-                | DiffViewState::CommitReady {
-                    diffs, expanded, ..
-                }
-                | DiffViewState::RangeReady {
-                    diffs, expanded, ..
-                }
-                | DiffViewState::CombinedReady {
-                    diffs, expanded, ..
-                } => {
-                    let plan = build_render_plan(diffs, *expanded);
-                    // Stageable change regions per file — full-file context
-                    // makes one giant hunk, so the renderer docks a chip bar
-                    // per region (git add -p granularity) using these.
-                    let regions: Vec<Vec<oximux_core::ChangeRegion>> =
-                        diffs.iter().map(oximux_core::change_regions).collect();
-                    // Hollow-vs-solid gutter slivers: only the combined view
-                    // carries per-file group tags, so staged files render
-                    // hollow there. Single-file / commit / range views pass an
-                    // empty slice → every sliver solid (uniformly one state).
-                    let staged_per_file: Vec<bool> = match &self.state {
-                        DiffViewState::CombinedReady { groups, .. } => groups
-                            .iter()
-                            .map(|g| matches!(g, FileGroup::Staged))
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    let rctx = RenderCtx {
-                        theme: self.theme,
-                        density: self.density,
-                        typography: &self.typography,
-                    };
-                    let mut body = if self.split {
-                        prepare_split(
-                            &plan,
-                            &regions,
-                            &self.collapsed,
-                            &self.expanded_folds,
-                            &staged_per_file,
-                            &rctx,
-                        )
-                    } else {
-                        prepare(
-                            &plan,
-                            &regions,
-                            &self.collapsed,
-                            &self.expanded_folds,
-                            &staged_per_file,
-                            &rctx,
-                        )
-                    };
-                    // Bake each line's note marker once per rebuild (off the
-                    // per-frame path), parallel to the staged-sliver pass.
-                    let paths: Vec<String> =
-                        diffs.iter().map(|d| d.path.display().to_string()).collect();
-                    mark_notes(&mut body, &paths, &self.notes);
-                    Some(Rc::new(body))
-                }
-                _ => None,
-            };
+            }
+            // (2) Flatten the cached plan into rows. Cheap — no string or
+            //     highlight work; just walks the plan applying the current
+            //     fold / collapse / split state, then bakes note markers.
+            let rows = self.plan_cache.clone().map(|pc| {
+                let rctx = RenderCtx {
+                    theme: self.theme,
+                    density: self.density,
+                    typography: &self.typography,
+                };
+                let mut body = if self.split {
+                    prepare_split(
+                        &pc.plan,
+                        &pc.regions,
+                        &self.collapsed,
+                        &self.expanded_folds,
+                        &pc.staged_per_file,
+                        &rctx,
+                    )
+                } else {
+                    prepare(
+                        &pc.plan,
+                        &pc.regions,
+                        &self.collapsed,
+                        &self.expanded_folds,
+                        &pc.staged_per_file,
+                        &rctx,
+                    )
+                };
+                // Bake each line's note marker once per rebuild (off the
+                // per-frame path), parallel to the staged-sliver pass.
+                mark_notes(&mut body, &pc.paths, &self.notes);
+                Rc::new(body)
+            });
             self.prepared = rows;
+            // Sync the list's per-item height cache to the rebuilt rows. Same
+            // row count → identity is stable (a note marker toggled, a hover
+            // re-render) so `remeasure` keeps the scroll position. A different
+            // count is a structural change → `reset` rebuilds the cache, which
+            // drops the scroll position. For an in-place structural edit (a
+            // fold expand/collapse: the list was already populated last frame,
+            // and the change lands at or below the visible top) restore the
+            // prior scroll so the reader stays put. A fresh diff passed through
+            // an empty Loading frame, so it starts at the top.
+            let new_len = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
+            if self.body_list.item_count() == new_len {
+                self.body_list.remeasure();
+            } else {
+                let prev_scroll = self.body_list.logical_scroll_top();
+                let was_populated = self.body_list_was_populated;
+                self.body_list.reset(new_len);
+                if was_populated && new_len > 0 {
+                    self.body_list.scroll_to(gpui::ListOffset {
+                        item_ix: prev_scroll.item_ix.min(new_len - 1),
+                        offset_in_item: prev_scroll.offset_in_item,
+                    });
+                }
+            }
+            self.body_list_was_populated = new_len > 0;
+            self.body_list_zoom = zoom_factor;
             // Recompute the horizontal-scroll measurement row + its char
             // count alongside the rebuild (off the per-frame path).
             let (widest, chars) = self
@@ -133,8 +237,10 @@ impl Render for DiffView {
             if len > 0
                 && let Some(anchor) = self.pending_scroll_anchor.take()
             {
-                self.scroll_handle
-                    .scroll_to_item(anchor.min(len - 1), ScrollStrategy::Top);
+                self.body_list.scroll_to(ListOffset {
+                    item_ix: anchor.min(len - 1),
+                    offset_in_item: px(0.0),
+                });
             }
         }
 
@@ -146,12 +252,19 @@ impl Render for DiffView {
         // Body-only zoom: the code rows, file headers, sticky overlay, and
         // staging card share the editor's Cmd+/- font size. Scale a body-scoped
         // density (row height) + typography (all sizes) by the same factor so
-        // larger code doesn't clip the fixed-height virtualized rows and every
-        // body pixel computation stays aligned. The toolbar + rail keep base
-        // metrics — only the diff body zooms.
-        let zoom = current_zoom(cx);
+        // larger code reads at the right size and every body pixel computation
+        // stays aligned. The toolbar + rail keep base metrics.
+        //
+        // A zoom change with no rebuild leaves the list's cached row heights
+        // stale (the rows are identical, only their height moved), so remeasure
+        // once when the factor shifts — preserving the proportional scroll
+        // position. A rebuild above already synced the cache at this zoom.
+        if (zoom_factor - self.body_list_zoom).abs() > f32::EPSILON {
+            self.body_list.remeasure();
+            self.body_list_zoom = zoom_factor;
+        }
         let mut body_density = self.density;
-        body_density.h_row *= body_zoom_factor(self.typography.t_body_sm, zoom);
+        body_density.h_row *= zoom_factor;
         let body_typography = scaled_typography(&self.typography, zoom);
         let body_rctx = RenderCtx {
             theme: self.theme,
@@ -178,12 +291,12 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -211,12 +324,12 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -233,12 +346,12 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -256,12 +369,12 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -542,6 +655,13 @@ impl Render for DiffView {
             // `w_full` here — on the horizontal main axis it would fight the
             // rail's fixed width.
             .flex_1()
+            // `min_w(0)` is load-bearing: a flex item defaults to
+            // `min-width: auto`, so the very wide diff body (long lines in the
+            // combined view) would stretch this wrapper past the viewport and
+            // push the right-edge scrollbar + overview ruler off-screen. Pinning
+            // the min width to 0 keeps the wrapper at the available width and
+            // lets the inner `overflow_x_scroll` clip + scroll instead.
+            .min_w(px(0.0))
             .min_h(px(0.0))
             .flex()
             .flex_col()
@@ -595,17 +715,24 @@ impl Render for DiffView {
         if has_body && !self.headers.is_empty() {
             let fv = self.first_visible_row(cx);
             let file_idx = self.row_owner.get(fv).copied().unwrap_or(0);
-            if let Some(header) = self.headers.iter().find(|h| h.file_idx == file_idx) {
-                // No shadow while a file's own header is flush at the top —
-                // the overlay then overlaps that row seamlessly.
-                let stuck = !matches!(
-                    self.prepared.as_ref().and_then(|r| r.get(fv)),
-                    Some(PreparedRow::FileHeader { .. })
-                );
+            // Only pin the overlay once a real header has scrolled ABOVE the
+            // viewport (`stuck`). While the file's own header is still flush at
+            // the top it's already on screen and clickable — stacking an
+            // identical interactive twin over it makes a click fire
+            // `toggle_file_fold` twice (overlay + real row), toggling fold
+            // on then off, which read as "the first file won't expand".
+            let stuck = !matches!(
+                self.prepared.as_ref().and_then(|r| r.get(fv)),
+                Some(PreparedRow::FileHeader { .. })
+            );
+            if stuck
+                && let Some(header) = self.headers.iter().find(|h| h.file_idx == file_idx)
+            {
                 let weak_sticky = cx.entity().downgrade();
                 body_wrap = body_wrap.child(sticky_header_overlay(
                     header,
-                    stuck,
+                    true,
+                    self.recently_copied_file == Some(file_idx),
                     self.theme,
                     body_density,
                     &body_typography,
@@ -613,16 +740,12 @@ impl Render for DiffView {
                 ));
             }
         }
-        // Overview ruler: a thin change-map on the body's right edge (only
-        // when a diff with changes is shown). Stacked last so it paints over
-        // the scrollable body; the body owns scrolling underneath it. Each
-        // run is click-to-jump (maps its start fraction back to a row).
-        if has_body && !self.overview.is_empty() {
-            let total_rows = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
-            let weak_ruler = cx.entity().downgrade();
-            body_wrap =
-                body_wrap.child(overview_ruler(&self.overview, total_rows, &self.theme, weak_ruler));
-        }
+        // The change-map (overview ruler) + draggable scrollbar are NOT
+        // overlaid on the body — they live in a reserved right gutter built
+        // below, so they never sit on top of the diff text or the header's
+        // copy/open icons (the way VS Code / the reference editors reserve a
+        // dedicated scrollbar lane).
+        //
         // Floating Stage/Discard card for the hovered region — pinned to the
         // viewport's right edge at the anchor row's on-screen Y (so it's
         // always visible regardless of the changed line's length or the
@@ -635,12 +758,17 @@ impl Render for DiffView {
             && let Some(row) = self.hovered_row
             && let Some(side) = self.side_for_region(region.0)
         {
-            let h = body_density.h_row;
-            let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
-            // The hovered row's on-screen Y — the card floats right at the
-            // pointer, not at the (possibly far-above) region anchor. Clamp
-            // ≥ 0 defensively; the hovered row is by definition on screen.
-            let top = (row as f32 * h + offset_y).max(0.0);
+            // The hovered row's on-screen Y within the body viewport. `list()`
+            // measures each item, so there's no `row * h_row` shortcut — read
+            // the row's painted window bounds and subtract the viewport's top
+            // (the body wrapper shares the list's top edge). `None` (row not
+            // yet measured) clamps to the top defensively; the hovered row is
+            // by definition on screen.
+            let top = self
+                .body_list
+                .bounds_for_item(row)
+                .map(|b| f32::from(b.origin.y - self.body_list.viewport_bounds().origin.y).max(0.0))
+                .unwrap_or(0.0);
             let weak_card = cx.entity().downgrade();
             if let Some(card) = staging_card_overlay(
                 top,
@@ -655,6 +783,53 @@ impl Render for DiffView {
             ) {
                 body_wrap = body_wrap.child(card);
             }
+        }
+        // Reserved right gutter: a fixed-width lane holding the change-map
+        // (overview ruler) + the draggable scrollbar, so neither overlaps the
+        // diff text or the header's copy/open icons. `body_wrap` (the scrolling
+        // content) yields this width via the `flex_row` below — the same
+        // dedicated-lane layout VS Code / the reference editors use.
+        const BODY_GUTTER_W: f32 = 14.0;
+        let gutter = if has_body {
+            let mut g = div()
+                .relative()
+                .h_full()
+                .flex_shrink_0()
+                .w(px(BODY_GUTTER_W));
+            if !self.overview.is_empty() {
+                let total_rows = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
+                let weak_ruler = cx.entity().downgrade();
+                g = g.child(overview_ruler(
+                    &self.overview,
+                    total_rows,
+                    &self.theme,
+                    weak_ruler,
+                ));
+            }
+            // `list()` owns its scroll internally and paints no native
+            // scrollbar, so bind gpui-component's overlay scrollbar to the same
+            // `ListState`. `Always` keeps the thumb visible at rest.
+            g = g.child(
+                gpui_component::scroll::Scrollbar::vertical(&self.body_list)
+                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+            );
+            Some(g)
+        } else {
+            None
+        };
+        // Compose the scrolling content + the reserved gutter side by side.
+        // `body_wrap` keeps its own `flex_1`/`min_w(0)`, so it fills the width
+        // left after the 14px gutter; the gutter never moves with h-scroll.
+        let mut body_outer = div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .flex()
+            .flex_row()
+            .child(body_wrap);
+        if let Some(g) = gutter {
+            body_outer = body_outer.child(g);
         }
         // When the discard-hunk confirm modal is mounted, stack it as a
         // centered overlay over the diff body. Mirrors `confirm_dialog`
@@ -716,7 +891,7 @@ impl Render for DiffView {
         if let Some(rail) = rail {
             content = content.child(rail);
         }
-        content = content.child(body_wrap);
+        content = content.child(body_outer);
         root = root.child(content);
         if let Some(o) = overlay {
             root = root.child(o);

@@ -12,12 +12,12 @@ use super::*;
 pub fn render_rows(
     rows: Rc<Vec<PreparedRow>>,
     hovered_region: Option<(usize, usize)>,
-    widest_idx: usize,
     split: bool,
     h_offset: f32,
-    scroll: &UniformListScrollHandle,
+    state: ListState,
     rctx: &RenderCtx<'_>,
     weak: WeakEntity<DiffView>,
+    copied_file: Option<usize>,
 ) -> impl IntoElement {
     if rows.is_empty() {
         return placeholder("No diff".to_string(), rctx).into_any_element();
@@ -25,49 +25,45 @@ pub fn render_rows(
     let theme = rctx.theme;
     let density = rctx.density;
     let typography = rctx.typography.clone();
-    let list = uniform_list(
-        "diff-view-rows",
-        rows.len(),
-        move |range, _window, _cx| {
-            range
-                .filter_map(|i| rows.get(i).map(|row| (i, row)))
-                .map(|(i, row)| {
-                    build_prepared_row(
-                        i,
-                        row,
-                        hovered_region,
-                        h_offset,
-                        theme,
-                        density,
-                        &typography,
-                        weak.clone(),
-                    )
-                })
-                .collect()
-        },
-    );
-    // Inline mode: long lines scroll horizontally instead of clipping —
-    // `Unconstrained` lays every row at the widest item's width and turns on
-    // x-overflow scroll; `with_width_from_item` points the measurement at
-    // that widest row so the scroll range is exact. Split mode keeps the two
-    // columns inside the viewport (`FitList`, the default) and clips per half.
-    let list = if split {
-        list
+    // `gpui::list` measures each item's height, so rows may differ in height
+    // (wrapped lines, image previews). The host owns the `ListState`; it calls
+    // `reset(len)` on a prepared-row rebuild and `remeasure()` on a font-zoom /
+    // wrap toggle so the cached heights stay in step with what's painted.
+    let body = list(state, move |i, _window, _cx| {
+        rows.get(i)
+            .map(|row| {
+                build_prepared_row(
+                    i,
+                    row,
+                    hovered_region,
+                    h_offset,
+                    theme,
+                    density,
+                    &typography,
+                    weak.clone(),
+                    copied_file,
+                )
+            })
+            .unwrap_or_else(|| div().into_any_element())
+    });
+    if split {
+        // Side-by-side: columns stay inside the viewport and clip per half (no
+        // per-row horizontal scroll). Default `Auto` sizing fills the body
+        // width; the list owns its own vertical scroll + virtualization.
+        body.size_full().into_any_element()
     } else {
-        list.with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-            .with_width_from_item(Some(widest_idx))
-    };
-    list
-    // `h_full` (NOT `flex_1`) is load-bearing: `uniform_list` implements its
-    // own Element and needs a DEFINITE height to lay rows against + compute
-    // its scroll range. With `flex_1` it infers content height, so its
-    // viewport ≈ content and the scroll max collapses → can't reach the end.
-    // The DiffView root is the `flex_col().h_full()` wrapper that bounds it.
-    // (Same rule as every other uniform_list in the app — see file_explorer.)
-    .track_scroll(scroll)
-    .h_full()
-    .w_full()
-    .into_any_element()
+        // Inline: long lines scroll horizontally. `Infer` lays each row at its
+        // intrinsic (nowrap) width and sizes the list to the widest row, and
+        // the outer `overflow_x_scroll` container scrolls across that width.
+        // The list still virtualizes + owns vertical scroll internally — the
+        // two scroll axes are orthogonal.
+        div()
+            .id("diff-body-hscroll")
+            .size_full()
+            .overflow_x_scroll()
+            .child(body.with_sizing_behavior(ListSizingBehavior::Infer).h_full())
+            .into_any_element()
+    }
 }
 
 /// Build a single visible row. Every branch pins the height to `h_row` so
@@ -82,6 +78,7 @@ fn build_prepared_row(
     density: Density,
     typography: &Typography,
     weak: WeakEntity<DiffView>,
+    copied_file: Option<usize>,
 ) -> gpui::AnyElement {
     match row {
         PreparedRow::FileHeader {
@@ -96,6 +93,7 @@ fn build_prepared_row(
             label.clone(),
             *stats,
             *folded,
+            copied_file == Some(*file_idx),
             false,
             theme,
             density,

@@ -51,20 +51,24 @@ use crate::shell::diff_view::file_header::{
 };
 use crate::shell::diff_view::file_rail::{RAIL_WIDTH, RailContext, file_rail};
 use crate::shell::diff_view::hunk_actions::render_hunk_actions;
-use crate::shell::diff_view::render::{FilePlan, LinePlan, RenderCtx, build_render_plan};
+use crate::shell::diff_view::render::{
+    FilePlan, LinePlan, RenderCtx, SYNTAX_HIGHLIGHT_BUDGET_LINES, build_render_plan,
+    diff_body_line_count,
+};
 use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore};
 use crate::shell::diff_view::word_diff::WordOp;
 // `DiffViewState` + the zoom helpers (current_zoom/body_zoom_factor/
 // scaled_typography) live in the module root; this child module reaches them
 // by path since the moved `impl Render for DiffView` needs them here.
 use crate::shell::diff_view::{
-    DiffView, DiffViewState, HunkActionSide, body_zoom_factor, current_zoom, scaled_typography,
+    DiffView, DiffViewState, HunkActionSide, PlanCache, body_zoom_factor, current_zoom,
+    scaled_typography,
 };
 use gpui::{
     App, AppContext, ClickEvent, Context, HighlightStyle, Hsla, InteractiveElement, IntoElement,
-    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ParentElement, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled, StyledText,
-    UniformListScrollHandle, WeakEntity, Window, div, px, relative, uniform_list,
+    ListOffset, ListSizingBehavior, ListState, MouseButton, MouseDownEvent, ParentElement, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, StyledText, WeakEntity, Window, div,
+    list, px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, Sizable as _};
@@ -512,6 +516,29 @@ pub fn prepare(
                     text: "Binary file (body suppressed)".to_string(),
                 });
             }
+            FilePlan::Oversized {
+                path,
+                header,
+                total_lines,
+                total_bytes,
+            } => {
+                rows.push(PreparedRow::FileHeader {
+                    file_idx,
+                    path: path.clone().into(),
+                    label: header.label.clone(),
+                    stats: None,
+                    folded,
+                });
+                if folded {
+                    continue;
+                }
+                rows.push(PreparedRow::Special {
+                    text: format!(
+                        "Diff too large to render — {total_lines} lines, {:.1} MB (body suppressed)",
+                        *total_bytes as f64 / 1_048_576.0
+                    ),
+                });
+            }
             FilePlan::ModeOnly {
                 path,
                 header,
@@ -876,6 +903,29 @@ pub fn prepare_split(
                 }
                 rows.push(PreparedRow::Special {
                     text: "Binary file (body suppressed)".to_string(),
+                });
+            }
+            FilePlan::Oversized {
+                path,
+                header,
+                total_lines,
+                total_bytes,
+            } => {
+                rows.push(PreparedRow::FileHeader {
+                    file_idx,
+                    path: path.clone().into(),
+                    label: header.label.clone(),
+                    stats: None,
+                    folded,
+                });
+                if folded {
+                    continue;
+                }
+                rows.push(PreparedRow::Special {
+                    text: format!(
+                        "Diff too large to render — {total_lines} lines, {:.1} MB (body suppressed)",
+                        *total_bytes as f64 / 1_048_576.0
+                    ),
                 });
             }
             FilePlan::ModeOnly {

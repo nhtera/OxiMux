@@ -40,8 +40,8 @@ use crate::shell::diff_view::review_note_popover::{
 };
 use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore, format_notes_markdown};
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, ScrollStrategy,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, px,
+    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, ListAlignment,
+    ListOffset, ListState, Subscription, Task, WeakEntity, Window, px,
 };
 use gpui_component::input::InputState;
 use oximux_core::{CombinedDiffScope, FileDiff, FileGroup, NoteSide};
@@ -187,6 +187,24 @@ struct HunkTarget {
     reload: ReloadTarget,
 }
 
+/// Cached output of the expensive plan pass: `build_render_plan` (syntect
+/// highlighting + word-diff pairing for every line) plus the per-file scans
+/// that ride alongside it. Every field here is a pure function of the diff
+/// data and the large-file `expanded` flag — folding a file, collapsing all,
+/// flipping side-by-side, or toggling a review note never changes any of it.
+/// Caching it lets those toggles re-flatten (cheap `prepare`) without paying
+/// the syntect cost again, which is what made Collapse/Expand-all lag.
+pub(crate) struct PlanCache {
+    /// Per-file tokenised render plan — the syntect/word-diff output.
+    plan: Vec<FilePlan>,
+    /// Stageable change regions per file (git add -p granularity).
+    regions: Vec<Vec<oximux_core::ChangeRegion>>,
+    /// Per-file staged flag (combined view only; empty elsewhere → solid).
+    staged_per_file: Vec<bool>,
+    /// File paths in file order, for `mark_notes`.
+    paths: Vec<String>,
+}
+
 pub struct DiffView {
     repo: Repository,
     state: DiffViewState,
@@ -214,15 +232,50 @@ pub struct DiffView {
     /// its dialog. Same lifecycle pattern as
     /// `WorkspaceRoot::_discard_dialog_observer`.
     _confirm_dialog_observer: Option<Subscription>,
-    /// Vertical scroll state for the virtualized diff body. Owned here so
-    /// the `uniform_list` reports an exact content height (`rows × h_row`)
-    /// and scrolling reaches the true end of the diff.
-    scroll_handle: UniformListScrollHandle,
+    /// Vertical scroll + per-item height cache for the variable-height diff
+    /// body (`gpui::list`). Rows can differ in height (wrapped lines, image
+    /// previews), so the list measures each item rather than assuming a
+    /// uniform `h_row`. A prepared-row rebuild calls `reset(len)`; a font
+    /// zoom (rows unchanged, heights changed) calls `remeasure()`.
+    body_list: ListState,
+    /// Body-zoom factor the `body_list` last measured at. When it changes the
+    /// cached row heights are stale, so `remeasure()` runs before the next
+    /// paint — the prepared rows are identical, so no `reset` (which would
+    /// drop the scroll position).
+    body_list_zoom: f32,
+    /// Whether the `body_list` held a non-empty diff on the previous rebuild.
+    /// A structural rebuild (row count changed) that follows a populated frame
+    /// is an in-place edit (a fold expand/collapse) → keep the scroll position;
+    /// one that follows an empty frame is a fresh diff (it passed through a
+    /// Loading frame) → start at the top.
+    body_list_was_populated: bool,
     /// Cached flattened render rows. Built once per (diff, expanded) change
     /// — NOT per frame — so syntax highlighting and word-diff pairing stay
     /// off the scroll path. `None` means "stale, rebuild on next render";
     /// every state transition that changes the body resets it.
     prepared: Option<Rc<Vec<PreparedRow>>>,
+    /// Cached expensive plan (syntect + word-diff), shared across fold /
+    /// collapse / split toggles. `None` → rebuild on next render. Only a
+    /// fresh diff load or the large-file `expand` clears it (`invalidate_plan`);
+    /// fold/collapse/split go through `invalidate_prepared`, which keeps this.
+    plan_cache: Option<Rc<PlanCache>>,
+    /// Monotonic counter bumped by `invalidate_plan` on every fresh diff /
+    /// expand. The background highlight task captures it at spawn; a result
+    /// whose generation no longer matches is stale (a newer diff superseded
+    /// it) and is dropped instead of swapped in.
+    plan_gen: u64,
+    /// In-flight background syntax-highlight pass. Large highlightable diffs
+    /// first paint uncolored (instant), then this task rebuilds the colored
+    /// plan off the UI thread and swaps it in. Dropping it cancels (a new
+    /// load replaces it); the `plan_gen` check guards already-running work.
+    _highlight_task: Option<Task<()>>,
+    /// File index whose path was just copied from its header — drives the
+    /// transient copy → checkmark swap. Cleared after a short delay by
+    /// `_copied_clear_task`. Pure feedback state; never invalidates `prepared`.
+    recently_copied_file: Option<usize>,
+    /// Reverts `recently_copied_file` to `None` a beat after a copy so the
+    /// checkmark flashes briefly then returns to the copy glyph.
+    _copied_clear_task: Option<Task<()>>,
     /// Side-by-side toggle. `false` → unified/inline body (default); `true`
     /// → original | modified columns. Flipping it rebuilds `prepared` (the
     /// two modes emit different row sets) so it routes through
@@ -341,8 +394,15 @@ impl DiffView {
             _op_task: None,
             confirm_dialog: None,
             _confirm_dialog_observer: None,
-            scroll_handle: UniformListScrollHandle::new(),
+            body_list: ListState::new(0, ListAlignment::Top, px(400.0)),
+            body_list_zoom: 1.0,
+            body_list_was_populated: false,
             prepared: None,
+            plan_cache: None,
+            plan_gen: 0,
+            _highlight_task: None,
+            recently_copied_file: None,
+            _copied_clear_task: None,
             prepared_widest: 0,
             prepared_widest_chars: 0,
             split_h_offset: 0.0,
@@ -396,6 +456,25 @@ impl DiffView {
         });
     }
 
+    /// Flash the copy → checkmark confirmation on `file_idx`'s header after its
+    /// path is copied, then revert after a short beat. Pure feedback — the row
+    /// set is unchanged, so it only re-renders (never invalidates `prepared`).
+    fn flash_copied(&mut self, file_idx: usize, cx: &mut Context<Self>) {
+        self.recently_copied_file = Some(file_idx);
+        cx.notify();
+        self._copied_clear_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1400))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.recently_copied_file == Some(file_idx) {
+                    view.recently_copied_file = None;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     /// Fold/unfold a single file's body. Cheap — only the row set changes,
     /// so it routes through `invalidate_prepared` (which drops the cached
     /// rows + stale hover) and re-renders.
@@ -447,34 +526,23 @@ impl DiffView {
         }
     }
 
-    /// First-visible row index, derived from the list's pixel scroll offset
-    /// and the body row height. Every body row is exactly `effective_h_row`
-    /// tall (the base height scaled by the editor zoom), so this is exact.
-    /// Returns 0 when nothing is scrolled or measured.
-    fn first_visible_row(&self, cx: &App) -> usize {
-        let h = self.effective_h_row(cx);
-        if h <= 0.0 {
-            return 0;
-        }
-        let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
-        ((-offset_y) / h).floor().max(0.0) as usize
-    }
-
-    /// Diff-body row height after applying the editor font zoom. The body
-    /// shares the editor's Cmd+/- zoom level; scaling the fixed virtualized
-    /// row height by the same factor keeps larger code from clipping and keeps
-    /// every pixel computation (sticky header, staging card, scroll anchor)
-    /// aligned with what's painted.
-    fn effective_h_row(&self, cx: &App) -> f32 {
-        self.density.h_row * body_zoom_factor(self.typography.t_body_sm, current_zoom(cx))
+    /// First-visible row index — the list's scroll-top item. `list()` owns
+    /// the scroll position in item space, so the sticky header + group-tag
+    /// overlay read it directly (variable row heights mean there's no
+    /// `offset / h_row` shortcut). `0` before the first layout.
+    fn first_visible_row(&self, _cx: &App) -> usize {
+        self.body_list.logical_scroll_top().item_ix
     }
 
     /// Scroll the body so `row` sits at the top of the viewport. Used by the
-    /// overview-ruler click-to-jump. Index-based (`scroll_to_item` resolves the
-    /// pixel offset from the row height the list rendered with), so it stays
-    /// correct across a font-zoom change without recomputation.
+    /// overview-ruler + file-rail click-to-jump. `list()` resolves the pixel
+    /// offset from each item's measured height, so it stays correct across a
+    /// font-zoom or wrap-toggle change without recomputation.
     pub fn scroll_to_row(&self, row: usize) {
-        self.scroll_handle.scroll_to_item(row, ScrollStrategy::Top);
+        self.body_list.scroll_to(ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.0),
+        });
     }
 
     /// Scroll the body so `file_idx`'s header sits at the top. Used by the
@@ -541,6 +609,10 @@ impl DiffView {
     /// diff body (load, commit load, expand, seed).
     fn invalidate_prepared(&mut self) {
         self.prepared = None;
+        // NOTE: deliberately keeps `plan_cache`. Fold / collapse-all / split /
+        // note toggles route here, and none of them change the tokenised plan
+        // (only which rows the flatten emits). Anything that DOES change the
+        // diff data or the large-file `expand` flag calls `invalidate_plan`.
         // Region indices + row indices are only meaningful against the
         // current row set; a rebuild may renumber them, so drop any stale
         // hover (region for slivers + row for the card position).
@@ -549,6 +621,22 @@ impl DiffView {
         // A new body means a new max line length — reset the split scroll so
         // we don't start mid-line on a different file.
         self.split_h_offset = 0.0;
+    }
+
+    /// Invalidate BOTH the tokenised plan and the flattened rows. Use only
+    /// when the underlying diff data changes (a fresh load / seed / post-stage
+    /// reload) or the large-file `expand` flag flips — those are the sole
+    /// inputs to `build_render_plan`. Fold / collapse / split must NOT call
+    /// this (it would re-run syntect for nothing); they call
+    /// `invalidate_prepared` and reuse the cached plan.
+    fn invalidate_plan(&mut self) {
+        self.plan_cache = None;
+        // Supersede any in-flight background highlight: bump the generation so
+        // a result that's already computing is discarded on arrival, and drop
+        // the task handle so a not-yet-started one is cancelled outright.
+        self.plan_gen = self.plan_gen.wrapping_add(1);
+        self._highlight_task = None;
+        self.invalidate_prepared();
     }
 
     /// Inspect-only accessor used by tests + by `GitPanel` to avoid
@@ -573,7 +661,7 @@ impl DiffView {
         // load, then briefly flash back to the prior file's diff when
         // the stale `_op_task` finishes its reload chain.
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         // A fresh selection always opens fully expanded (no folded files, no
         // pre-expanded context runs from the prior file).
         self.collapsed.clear();
@@ -687,7 +775,7 @@ impl DiffView {
         // from a prior file selection must not flash over the new
         // commit-detail view.
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         self.expanded_folds.clear();
         self.reset_rail_state();
         // Drop the prior scope's notes immediately. `reload_notes` repopulates
@@ -786,7 +874,7 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) {
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         self.expanded_folds.clear();
         self.reset_rail_state();
         // Drop the prior scope's notes immediately. `reload_notes` repopulates
@@ -884,7 +972,7 @@ impl DiffView {
     pub fn load_combined(&mut self, scope: CombinedDiffScope, cx: &mut Context<Self>) {
         // Same drop-on-entry + fresh-selection reset as `load()`.
         self._op_task = None;
-        self.invalidate_prepared();
+        self.invalidate_plan();
         self.collapsed.clear();
         self.expanded_folds.clear();
         self.reset_rail_state();
@@ -975,7 +1063,7 @@ impl DiffView {
         }
         // Expanding a collapsed large diff changes which rows render — drop
         // the cached row list so the next render rebuilds the full body.
-        self.invalidate_prepared();
+        self.invalidate_plan();
     }
 
     fn apply_load_result(
@@ -1050,7 +1138,7 @@ impl DiffView {
             diffs,
             expanded: false,
         };
-        self.invalidate_prepared();
+        self.invalidate_plan();
     }
 
     /// Test-only: stamp the view into `CombinedReady` with pre-fetched diffs
@@ -1068,7 +1156,7 @@ impl DiffView {
             groups,
             expanded: false,
         };
-        self.invalidate_prepared();
+        self.invalidate_plan();
     }
 
     /// Which action side applies to the region in `file_idx` — gating the
@@ -1553,7 +1641,8 @@ impl DiffView {
             | DiffViewState::CombinedReady { diffs, .. } => diffs,
             _ => return map,
         };
-        for fp in build_render_plan(diffs, true) {
+        // Note-anchor mapping only reads line numbers — skip the syntect pass.
+        for fp in build_render_plan(diffs, true, false) {
             let FilePlan::Hunked { path, hunks, .. } = fp else {
                 continue;
             };

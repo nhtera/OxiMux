@@ -38,7 +38,7 @@ fn one_change_file(path: &str) -> FileDiff {
 }
 
 fn prepared(files: &[FileDiff]) -> Vec<PreparedRow> {
-    let plan = build_render_plan(files, false);
+    let plan = build_render_plan(files, false, true);
     let regions: Vec<_> = files.iter().map(oximux_core::change_regions).collect();
     let typography = Typography::default();
     let rctx = RenderCtx {

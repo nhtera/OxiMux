@@ -100,6 +100,7 @@ pub fn file_header_row(
     label: String,
     stats: Option<(u32, u32)>,
     folded: bool,
+    copied: bool,
     sticky: bool,
     theme: Theme,
     density: Density,
@@ -112,9 +113,10 @@ pub fn file_header_row(
     let open_id = gpui::ElementId::Name(format!("diff-header-open-{kind}-{file_idx}").into());
     let copy_path = path.clone();
     let open_path = path.clone();
-    // Second weak handle for the open-in-editor click (the row-fold click
-    // below consumes the original).
+    // Extra weak handles for the open-in-editor and copy clicks (the row-fold
+    // click below consumes the original).
     let weak_open = weak.clone();
+    let weak_copy = weak.clone();
     let hover_bg = theme.hover_overlay;
     let chevron = if folded {
         "icons/chevron-right.svg"
@@ -162,7 +164,11 @@ pub fn file_header_row(
     if let Some((added, removed)) = stats {
         row = row.child(stats_chips(added, removed, theme, typography));
     }
-    let copy_tooltip: SharedString = "Click to copy path".into();
+    let copy_tooltip: SharedString = if copied {
+        "Copied!".into()
+    } else {
+        "Click to copy path".into()
+    };
     let open_tooltip: SharedString = "Open in editor".into();
     row.child(div().flex_1())
         .child(
@@ -195,13 +201,25 @@ pub fn file_header_row(
             .tooltip(move |window, cx| Tooltip::new(copy_tooltip.clone()).build(window, cx))
             .on_click(move |_: &ClickEvent, _window, cx: &mut App| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy_path.to_string()));
+                // Flash the copy → checkmark confirmation on this file's header.
+                let _ = weak_copy.update(cx, |view, cx| view.flash_copied(file_idx, cx));
                 cx.stop_propagation();
             })
             .child(
+                // Swap to a green check for a beat after copying as inline
+                // confirmation, then `flash_copied`'s timer reverts it.
                 Icon::default()
-                    .path("icons/copy.svg")
+                    .path(if copied {
+                        "icons/check.svg"
+                    } else {
+                        "icons/copy.svg"
+                    })
                     .xsmall()
-                    .text_color(theme.fg_subtle),
+                    .text_color(if copied {
+                        theme.status_ok
+                    } else {
+                        theme.fg_subtle
+                    }),
             ),
     )
 }
@@ -240,9 +258,11 @@ pub(crate) fn stats_chips(
 /// Gains a shadow only when `stuck` (a real header has scrolled above the
 /// viewport); when the file's own header is flush at the top the overlay
 /// overlaps it seamlessly with no shadow.
+#[allow(clippy::too_many_arguments)]
 pub fn sticky_header_overlay(
     header: &StickyHeader,
     stuck: bool,
+    copied: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -254,6 +274,7 @@ pub fn sticky_header_overlay(
         header.label.clone(),
         header.stats,
         header.folded,
+        copied,
         true,
         theme,
         density,
