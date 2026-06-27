@@ -1,4 +1,6 @@
 use super::*;
+use crate::shell::diff_view::image_diff::{ImageDiffData, ImageSide};
+use gpui::{ObjectFit, StyledImage, img};
 
 /// Render the prepared rows into the virtualized body. Called from
 /// `DiffView::render` with the cached `Rc<Vec<PreparedRow>>`.
@@ -36,6 +38,7 @@ pub fn render_rows(
                     i,
                     row,
                     hovered_region,
+                    split,
                     h_offset,
                     theme,
                     density,
@@ -73,6 +76,7 @@ fn build_prepared_row(
     row_index: usize,
     row: &PreparedRow,
     hovered_region: Option<(usize, usize)>,
+    split: bool,
     h_offset: f32,
     theme: Theme,
     density: Density,
@@ -141,7 +145,142 @@ fn build_prepared_row(
         PreparedRow::Special { text } => {
             special_row(text.clone(), theme, density, typography).into_any_element()
         }
+        PreparedRow::Image { data, .. } => {
+            image_diff_row(data.as_deref(), split, theme, density, typography).into_any_element()
+        }
     }
+}
+
+/// Maximum painted height of an image preview pane. The picture scales to fit
+/// (contain) within this so a tall image stays bounded and the body row never
+/// balloons the variable-height list.
+const IMAGE_PREVIEW_H: f32 = 320.0;
+
+/// Render an image-binary file body as a before/after picture preview:
+/// `Original` (the HEAD blob) and `Modified` (the working tree). A side with
+/// no blob shows a "No preview" placeholder, which is how an addition (no
+/// original) or a deletion (no modified) reads at a glance. While the async
+/// fetch is still in flight (`data == None`) a single "Loading preview…"
+/// notice stands in until the blobs arrive.
+///
+/// Layout follows the diff viewer's Inline ↔ Side-by-side toggle, matching the
+/// reference editors: `split` stacks the two panes into columns; inline stacks
+/// them vertically (Original above Modified).
+fn image_diff_row(
+    data: Option<&ImageDiffData>,
+    split: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    let Some(data) = data else {
+        return div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w_full()
+            .h(px(80.0))
+            .px(px(density.pad_panel))
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.fg_subtle)
+            .child("Loading preview…")
+            .into_any_element();
+    };
+    let mut container = div()
+        .flex()
+        .w_full()
+        .min_w_full()
+        .gap(px(12.0))
+        .p(px(density.pad_panel));
+    container = if split {
+        // Side-by-side: two equal columns, Original | Modified.
+        container.flex_row().items_start()
+    } else {
+        // Inline: Original stacked above Modified, each full-width.
+        container.flex_col()
+    };
+    container
+        .child(image_pane(
+            "Original",
+            data.old.as_ref(),
+            split,
+            theme,
+            density,
+            typography,
+        ))
+        .child(image_pane(
+            "Modified",
+            data.new.as_ref(),
+            split,
+            theme,
+            density,
+            typography,
+        ))
+        .into_any_element()
+}
+
+/// One labelled pane of the image diff. In split mode the pane is a flex
+/// column (`min_w_0` lets it shrink to the available half instead of forcing
+/// the image's intrinsic — often large — width into the row's measured width);
+/// in inline mode it spans the full width so the stacked panes read top-down.
+fn image_pane(
+    label: &'static str,
+    side: Option<&ImageSide>,
+    split: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    let caption_row = side.map(|s| {
+        div()
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.fg_muted)
+            .child(s.caption())
+    });
+    // The picture box: a fixed-height, full-width frame with the image
+    // contained inside it, or a muted "No preview" stand-in for the absent
+    // side. `overflow_hidden` clips the rounded corners.
+    let frame = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w_full()
+        .h(px(IMAGE_PREVIEW_H))
+        .rounded(px(density.r_xs))
+        .border_1()
+        .border_color(theme.border_inactive)
+        .bg(theme.bg_panel)
+        .overflow_hidden();
+    let frame = match side {
+        Some(s) => frame.child(
+            img(s.image.clone())
+                .object_fit(ObjectFit::Contain)
+                .size_full(),
+        ),
+        None => frame.child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_subtle)
+                .child("No preview"),
+        ),
+    };
+    let mut pane = div().flex().flex_col().gap(px(6.0));
+    pane = if split {
+        // Column: clamp to the available half (see `min_w_0` note above).
+        pane.flex_1().min_w(px(0.0))
+    } else {
+        // Stacked: each pane spans the full width.
+        pane.w_full()
+    };
+    pane.child(
+        div()
+            .text_size(px(typography.t_label_caps))
+            .font_weight(typography.w_semibold)
+            .text_color(theme.fg_muted)
+            .child(label),
+    )
+    .child(frame)
+    .children(caption_row)
 }
 
 /// One diff body line: strip cell + dual gutter + a SINGLE `StyledText`

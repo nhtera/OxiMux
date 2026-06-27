@@ -61,6 +61,11 @@ pub enum FilePlan {
     },
     /// Binary file body: no patch text.
     Binary { path: String, header: FileHeader },
+    /// Image-binary file: rendered as a before/after picture preview instead
+    /// of a suppressed-body notice. The plan only marks the file as an image
+    /// (a pure function of its extension); the actual pixels are fetched
+    /// asynchronously by `DiffView` and baked into the prepared row.
+    Image { path: String, header: FileHeader },
     /// Mode-only change (no hunks). When mode change *and* content both
     /// changed, the parser yields `ModeChanged` *with* hunks; that case
     /// renders as `Hunked` with the mode line in the header.
@@ -168,6 +173,9 @@ fn build_file_plan(d: &FileDiff, expanded: bool, highlight: bool) -> FilePlan {
         label: format_status_label(&d.status),
     };
     match &d.status {
+        DiffStatus::Binary if crate::shell::diff_view::image_diff::is_image_path(d.path.as_path()) => {
+            FilePlan::Image { path, header }
+        }
         DiffStatus::Binary => FilePlan::Binary { path, header },
         DiffStatus::ModeChanged {
             old_mode, new_mode, ..

@@ -21,6 +21,7 @@
 pub mod file_header;
 pub mod file_rail;
 pub mod hunk_actions;
+pub mod image_diff;
 pub mod note_repo_handle;
 pub mod paint;
 pub mod render;
@@ -269,6 +270,19 @@ pub struct DiffView {
     /// plan off the UI thread and swaps it in. Dropping it cancels (a new
     /// load replaces it); the `plan_gen` check guards already-running work.
     _highlight_task: Option<Task<()>>,
+    /// Decoded image blobs for image-binary files in the current diff, keyed
+    /// by the file's display path. Populated asynchronously after a load by
+    /// `fetch_image_blobs`; the `prepare` flatten bakes the matching entry into
+    /// each `PreparedRow::Image`. A path with no entry (still fetching / fetch
+    /// failed) renders a "Loading…" placeholder. Cleared on every fresh load.
+    images: HashMap<String, Rc<image_diff::ImageDiffData>>,
+    /// In-flight image-blob fetch. Dropping aborts; replaced on every load.
+    /// The `image_gen` check discards a result that a newer load superseded.
+    _image_task: Option<Task<()>>,
+    /// Monotonic counter bumped on each fresh image fetch. The async task
+    /// captures it at spawn; a result whose generation no longer matches is
+    /// stale (a newer load started) and is dropped instead of applied.
+    image_gen: u64,
     /// File index whose path was just copied from its header — drives the
     /// transient copy → checkmark swap. Cleared after a short delay by
     /// `_copied_clear_task`. Pure feedback state; never invalidates `prepared`.
@@ -401,6 +415,9 @@ impl DiffView {
             plan_cache: None,
             plan_gen: 0,
             _highlight_task: None,
+            images: HashMap::new(),
+            _image_task: None,
+            image_gen: 0,
             recently_copied_file: None,
             _copied_clear_task: None,
             prepared_widest: 0,
@@ -639,6 +656,109 @@ impl DiffView {
         self.invalidate_prepared();
     }
 
+    /// The diffs of whichever `*Ready` state is active, or `&[]` otherwise.
+    /// Lets the image fetch enumerate files without re-matching every state.
+    fn current_diffs(&self) -> &[FileDiff] {
+        match &self.state {
+            DiffViewState::Ready { diffs, .. }
+            | DiffViewState::CommitReady { diffs, .. }
+            | DiffViewState::RangeReady { diffs, .. }
+            | DiffViewState::CombinedReady { diffs, .. } => diffs,
+            _ => &[],
+        }
+    }
+
+    /// Kick off the async fetch of image-binary previews for the current diff.
+    /// Each image file's "before" side comes from the `HEAD` blob and its
+    /// "after" side from the working-tree file on disk — the working-tree-vs-
+    /// HEAD pairing the SCM panel shows. Added/untracked files have no HEAD
+    /// blob (no `old`); deleted files have no working-tree file (no `new`).
+    /// On completion the decoded blobs land in `self.images` and a cheap
+    /// re-flatten (`invalidate_prepared`) bakes them into the image rows.
+    ///
+    /// Called after every successful load; a no-op when the diff carries no
+    /// image binaries. `image_gen` guards against a stale result from a load
+    /// the user has already navigated away from.
+    fn fetch_image_blobs(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .current_diffs()
+            .iter()
+            .filter(|d| {
+                matches!(d.status, oximux_core::DiffStatus::Binary)
+                    && image_diff::is_image_path(d.path.as_path())
+            })
+            .map(|d| d.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.image_gen = self.image_gen.wrapping_add(1);
+        let gen_id = self.image_gen;
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<Vec<(String, image_diff::ImageDiffData)>>();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                target: "oximux_app::diff_view",
+                "no tokio runtime entered; image preview fetch skipped"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            let mut out: Vec<(String, image_diff::ImageDiffData)> = Vec::with_capacity(paths.len());
+            for p in paths {
+                let Some(format) = image_diff::gpui_format_for(p.as_path()) else {
+                    continue;
+                };
+                // After = working-tree file (absent for a deletion).
+                let abs = repo.workdir().join(&p);
+                let new_side = tokio::fs::read(&abs)
+                    .await
+                    .ok()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| image_diff::ImageSide::from_bytes(format, b));
+                // Before = HEAD blob (absent for an addition / untracked file).
+                let old_side = repo
+                    .read_blob_at("HEAD", p.as_path())
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| image_diff::ImageSide::from_bytes(format, b));
+                if old_side.is_some() || new_side.is_some() {
+                    out.push((
+                        p.display().to_string(),
+                        image_diff::ImageDiffData {
+                            old: old_side,
+                            new: new_side,
+                        },
+                    ));
+                }
+            }
+            let _ = tx.send(out);
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(results) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                if view.image_gen != gen_id {
+                    return; // a newer load superseded this fetch
+                }
+                if results.is_empty() {
+                    return;
+                }
+                for (key, data) in results {
+                    view.images.insert(key, Rc::new(data));
+                }
+                // Plan is unchanged (image-ness is already in it) — only the
+                // baked-in pixels are new, so re-flatten without re-highlight.
+                view.invalidate_prepared();
+                cx.notify();
+            });
+        });
+        self._image_task = Some(task);
+    }
+
     /// Inspect-only accessor used by tests + by `GitPanel` to avoid
     /// double-loading when the user re-clicks the same row.
     pub fn state(&self) -> &DiffViewState {
@@ -671,6 +791,9 @@ impl DiffView {
         // on the next `*Ready`; clearing here keeps `notes` empty during the
         // Loading window so nothing reads stale anchors.
         self.notes.clear();
+        // Drop the prior file's image previews so a fast switch never flashes
+        // a stale picture; `fetch_image_blobs` repopulates after the load.
+        self.images.clear();
         self.state = DiffViewState::Loading {
             path: path.clone(),
             staged,
@@ -709,6 +832,7 @@ impl DiffView {
             let _ = this.update(cx, |view, cx| {
                 view.apply_load_result(path, staged, untracked, result);
                 view.reload_notes();
+                view.fetch_image_blobs(cx);
                 cx.notify();
             });
         });
@@ -782,6 +906,7 @@ impl DiffView {
         // on the next `*Ready`; clearing here keeps `notes` empty during the
         // Loading window so nothing reads stale anchors.
         self.notes.clear();
+        self.images.clear();
         self.state = DiffViewState::CommitLoading {
             sha: sha.clone(),
             short_oid: short_oid.clone(),
@@ -815,6 +940,7 @@ impl DiffView {
             let _ = this.update(cx, |view, cx| {
                 view.apply_commit_load_result(sha, short_oid, subject, result);
                 view.reload_notes();
+                view.fetch_image_blobs(cx);
                 cx.notify();
             });
         });
@@ -881,6 +1007,7 @@ impl DiffView {
         // on the next `*Ready`; clearing here keeps `notes` empty during the
         // Loading window so nothing reads stale anchors.
         self.notes.clear();
+        self.images.clear();
         self.state = DiffViewState::RangeLoading {
             base: base.clone(),
             head: head.clone(),
@@ -915,6 +1042,7 @@ impl DiffView {
             let _ = this.update(cx, |view, cx| {
                 view.apply_range_load_result(base, head, path, title, result);
                 view.reload_notes();
+                view.fetch_image_blobs(cx);
                 cx.notify();
             });
         });
@@ -980,6 +1108,7 @@ impl DiffView {
         // on the next `*Ready`; clearing here keeps `notes` empty during the
         // Loading window so nothing reads stale anchors.
         self.notes.clear();
+        self.images.clear();
         self.state = DiffViewState::CombinedLoading {
             scope: scope.clone(),
         };
@@ -1011,6 +1140,7 @@ impl DiffView {
             let _ = this.update(cx, |view, cx| {
                 view.apply_combined_result(scope, result);
                 view.reload_notes();
+                view.fetch_image_blobs(cx);
                 cx.notify();
             });
         });

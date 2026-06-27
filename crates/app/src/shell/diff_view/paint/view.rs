@@ -151,6 +151,7 @@ impl Render for DiffView {
                         &self.collapsed,
                         &self.expanded_folds,
                         &pc.staged_per_file,
+                        &self.images,
                         &rctx,
                     )
                 } else {
@@ -160,6 +161,7 @@ impl Render for DiffView {
                         &self.collapsed,
                         &self.expanded_folds,
                         &pc.staged_per_file,
+                        &self.images,
                         &rctx,
                     )
                 };
