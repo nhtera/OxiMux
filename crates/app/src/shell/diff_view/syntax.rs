@@ -9,13 +9,22 @@
 //!
 //! - One crate, one API. Tree-sitter would mean a parser crate per language
 //!   plus `tree-sitter-highlight` plus per-language `highlights.scm`.
-//! - The bundled Sublime Text 2 grammars cover the languages we care about
-//!   (Rust, TypeScript, JavaScript, Markdown, TOML, JSON) and ship inside
-//!   the syntect crate — no extra grammar crates, no `build.rs` C compiles.
-//! - `default-fancy` selects the pure-Rust `fancy-regex` engine instead of
-//!   the C `onig` binding. No `.a` link on macOS, ~300 KB smaller binary.
+//! - The grammar set comes from `two-face` (the `bat` Sublime collection,
+//!   ~250 languages) — Rust, Python, Go, TypeScript, TOML, JavaScript,
+//!   C/C++, Java, Ruby, PHP, shell, YAML, JSON, HTML, CSS, SQL, Swift,
+//!   Kotlin, … — so no per-language grammar crate and no `build.rs` C compiles.
+//! - `syntect-fancy` selects the pure-Rust `fancy-regex` engine instead of
+//!   the C `onig` binding. No `.a` link on macOS.
 //! - Per-line restart is built in via `HighlightLines` — easy to feed one
 //!   diff row at a time without re-parsing the file.
+//!
+//! Detection is delegated to syntect's own extension lookup rather than a
+//! hand-maintained language enum, so every grammar in the set lights up
+//! automatically.
+//!
+//! NOTE: `two-face` bundles Sublime grammars under their own licenses;
+//! `two_face::acknowledgement` exposes the attribution listing if an
+//! about/licenses screen ever needs it.
 //!
 //! ### Threading + caching
 //!
@@ -34,9 +43,11 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
-/// Lazy holders. `SyntaxSet::load_defaults_nonewlines()` is the heavy call
-/// (~30 ms cold start, ~550 KB embedded grammars). Read-only after init.
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_nonewlines);
+/// Lazy holder. `two_face::syntax::extra_no_newlines()` deserializes the
+/// embedded `bat` grammar set (~250 languages) on first use. Read-only after
+/// init; `Send + Sync` so the GPUI thread can read it. The `no_newlines`
+/// variant matches the per-line feeding in `highlight_line`.
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_no_newlines);
 
 /// The diff syntax theme — a conventional dark-editor token palette
 /// (keyword-blue / string-orange / comment-green) bundled as a TextMate
@@ -54,37 +65,51 @@ fn active_theme() -> &'static Theme {
     &SYNTAX_DARK
 }
 
-/// Coarse language buckets — keyed on file extension. Mirrors the
-/// languages we ship grammars for; everything else degrades to `Unknown`
-/// and skips highlighting entirely.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Language {
-    Rust,
-    TypeScript,
-    JavaScript,
-    Markdown,
-    Toml,
-    Json,
-    Unknown,
+/// A resolved grammar handle for one file. Wraps the syntect
+/// [`SyntaxReference`] matched from the bundled set, or `None` when nothing
+/// fits (unknown extension, plain `.log`, …). Carrying the reference instead
+/// of a fixed language enum means every grammar syntect ships highlights
+/// with no per-language match arm. `Copy` so the renderer can thread it
+/// through `tokens_for_row` per line for free.
+#[derive(Debug, Copy, Clone)]
+pub struct Language(Option<&'static SyntaxReference>);
+
+impl Language {
+    /// True when no grammar matched — the renderer reads this as "paint the
+    /// row in the muted base color, no per-token syntax color".
+    pub fn is_plain(&self) -> bool {
+        self.0.is_none()
+    }
 }
 
-/// Map a file path to its language bucket. Extension-only lookup — no
-/// shebang sniffing, no content heuristics. Extension-less files (e.g.
-/// `Dockerfile`, `Makefile`) fall through to `Unknown`.
+/// Map a file path to a bundled grammar. Extension lookup first (covers the
+/// vast majority of source files), then a short filename map for the
+/// extension-less cases syntect ships a grammar for (`Makefile`). No shebang
+/// sniffing or content heuristics — anything unmatched renders plain.
 pub fn detect_language(path: &Path) -> Language {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("rs") => Language::Rust,
-        Some("ts") | Some("tsx") => Language::TypeScript,
-        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Language::JavaScript,
-        Some("md") | Some("markdown") => Language::Markdown,
-        Some("toml") => Language::Toml,
-        Some("json") | Some("jsonc") => Language::Json,
-        _ => Language::Unknown,
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        let ext = ext.to_ascii_lowercase();
+        if let Some(syntax) = SYNTAX_SET.find_syntax_by_extension(&ext) {
+            return Language(Some(syntax));
+        }
     }
+    if let Some(name) = path.file_name().and_then(|s| s.to_str())
+        && let Some(syntax) = syntax_for_filename(name)
+    {
+        return Language(Some(syntax));
+    }
+    Language(None)
+}
+
+/// Resolve a grammar for the handful of extension-less filenames syntect
+/// bundles a grammar for. Kept deliberately short — anything missing just
+/// renders plain, which is the safe default.
+fn syntax_for_filename(name: &str) -> Option<&'static SyntaxReference> {
+    let grammar = match name {
+        "Makefile" | "makefile" | "GNUmakefile" => "Makefile",
+        _ => return None,
+    };
+    SYNTAX_SET.find_syntax_by_name(grammar)
 }
 
 /// One byte-range slice of a line plus the sRGB foreground color syntect
@@ -110,12 +135,12 @@ pub struct HiToken {
 /// color", which keeps the renderer simple and prevents a bad grammar
 /// match from blanking out the row.
 pub fn highlight_line(line: &str, lang: Language) -> Vec<HiToken> {
-    if line.is_empty() || matches!(lang, Language::Unknown) {
-        return Vec::new();
-    }
-    let Some(syntax) = syntax_for(lang) else {
+    let Some(syntax) = lang.0 else {
         return Vec::new();
     };
+    if line.is_empty() {
+        return Vec::new();
+    }
     let mut hl = HighlightLines::new(syntax, active_theme());
     // syntect expects each call to receive lines *with* their trailing `\n`
     // — that's how it knows the line ended. Diff rows don't carry the
@@ -156,25 +181,6 @@ pub fn highlight_line(line: &str, lang: Language) -> Vec<HiToken> {
     out
 }
 
-/// Look up the syntect syntax reference for our language bucket. Falls
-/// back to plain-text when the bundled set doesn't carry the language —
-/// in practice every variant above is covered, but the fallback keeps
-/// the function total.
-fn syntax_for(lang: Language) -> Option<&'static SyntaxReference> {
-    let token = match lang {
-        Language::Rust => "rs",
-        Language::TypeScript => "ts",
-        Language::JavaScript => "js",
-        Language::Markdown => "md",
-        Language::Toml => "toml",
-        Language::Json => "json",
-        Language::Unknown => return None,
-    };
-    SYNTAX_SET
-        .find_syntax_by_extension(token)
-        .or_else(|| Some(SYNTAX_SET.find_syntax_plain_text()))
-}
-
 /// Pre-warm the static sets. Called from a background task at app boot
 /// (`main.rs`) so the ~30 ms cold-start never lands on the first diff
 /// paint. Safe to call any number of times; first call to
@@ -196,58 +202,78 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn detect_language_known_extensions() {
-        assert_eq!(
-            detect_language(&PathBuf::from("src/main.rs")),
-            Language::Rust
-        );
-        assert_eq!(
-            detect_language(&PathBuf::from("App.tsx")),
-            Language::TypeScript
-        );
-        assert_eq!(
-            detect_language(&PathBuf::from("README.md")),
-            Language::Markdown
-        );
-        assert_eq!(
-            detect_language(&PathBuf::from("Cargo.toml")),
-            Language::Toml
-        );
-        assert_eq!(
-            detect_language(&PathBuf::from("package.json")),
-            Language::Json
-        );
+    fn detect_language_resolves_bundled_extensions() {
+        // Every grammar syntect bundles by extension must resolve (no plain
+        // fallback) — far beyond the original 6-language list. This is the
+        // broad-coverage contract.
+        for f in [
+            "src/main.rs",
+            "app.py",
+            "server.go",
+            "index.js",
+            "App.tsx",
+            "config.yaml",
+            "Cargo.toml",
+            "deploy.sh",
+            "main.c",
+            "engine.cpp",
+            "Service.java",
+            "model.rb",
+            "index.php",
+            "styles.css",
+            "page.html",
+            "query.sql",
+            "init.lua",
+            "View.swift",
+            "Main.kt",
+            "README.md",
+            "package.json",
+        ] {
+            assert!(
+                !detect_language(&PathBuf::from(f)).is_plain(),
+                "{f} should resolve to a bundled grammar"
+            );
+        }
     }
 
     #[test]
     fn detect_language_case_insensitive() {
-        assert_eq!(
-            detect_language(&PathBuf::from("README.MD")),
-            Language::Markdown
-        );
-        assert_eq!(detect_language(&PathBuf::from("Foo.RS")), Language::Rust);
+        assert!(!detect_language(&PathBuf::from("README.MD")).is_plain());
+        assert!(!detect_language(&PathBuf::from("Foo.RS")).is_plain());
+        assert!(!detect_language(&PathBuf::from("App.PY")).is_plain());
     }
 
     #[test]
-    fn detect_language_unknown_for_extensionless() {
-        assert_eq!(
-            detect_language(&PathBuf::from("Dockerfile")),
-            Language::Unknown
-        );
-        assert_eq!(
-            detect_language(&PathBuf::from("Makefile")),
-            Language::Unknown
-        );
+    fn detect_language_filename_and_plain_fallback() {
+        // Makefile's grammar is reachable only by filename (no extension).
+        assert!(!detect_language(&PathBuf::from("Makefile")).is_plain());
+        // No grammar for these — must render plain (the safe default).
+        assert!(detect_language(&PathBuf::from("notes.unknownext")).is_plain());
+        assert!(detect_language(&PathBuf::from("file.zzzznope")).is_plain());
     }
 
     #[test]
     fn highlight_empty_line_yields_no_tokens() {
-        assert!(highlight_line("", Language::Rust).is_empty());
+        assert!(highlight_line("", detect_language(&PathBuf::from("x.rs"))).is_empty());
     }
 
     #[test]
-    fn highlight_unknown_language_yields_no_tokens() {
-        assert!(highlight_line("anything goes", Language::Unknown).is_empty());
+    fn highlight_plain_language_yields_no_tokens() {
+        let plain = detect_language(&PathBuf::from("notes.unknownext"));
+        assert!(plain.is_plain());
+        assert!(highlight_line("anything goes", plain).is_empty());
+    }
+
+    #[test]
+    fn highlight_python_produces_tokens() {
+        // Python was absent from the original 6-language list; the
+        // extension-based resolver must now tokenize it.
+        let lang = detect_language(&PathBuf::from("app.py"));
+        assert!(!lang.is_plain(), "python should resolve");
+        assert!(
+            !highlight_line("def main():", lang).is_empty(),
+            "python keyword line should produce tokens"
+        );
     }
 
     #[test]
@@ -255,7 +281,7 @@ mod tests {
         // `let` (keyword) and `"hello"` (string) should land on different
         // foreground colors under any sane theme. The exact values are
         // theme-dependent so we assert on inequality only.
-        let toks = highlight_line(r#"let x = "hello";"#, Language::Rust);
+        let toks = highlight_line(r#"let x = "hello";"#, detect_language(&PathBuf::from("x.rs")));
         assert!(!toks.is_empty(), "rust line should produce tokens");
         // Find a token covering `let` and one covering the string body.
         let let_tok = toks.iter().find(|t| t.start == 0).expect("token at start");
@@ -274,7 +300,7 @@ mod tests {
         // Lock the dark-editor hues: keyword #569CD6 (blue), string body
         // #CE9178 (orange). Guards against an accidental theme swap silently
         // regressing the syntax palette.
-        let toks = highlight_line(r#"let x = "hello";"#, Language::Rust);
+        let toks = highlight_line(r#"let x = "hello";"#, detect_language(&PathBuf::from("x.rs")));
         let kw = toks.iter().find(|t| t.start == 0).expect("keyword token");
         assert_eq!((kw.r, kw.g, kw.b), (0x56, 0x9C, 0xD6), "keyword should be blue");
         // The string body sits inside the quotes (bytes 8..=15).
@@ -292,7 +318,7 @@ mod tests {
         // the last token's end should be <= line.len(), and the first
         // should start at 0.
         let line = "let x = 1;";
-        let toks = highlight_line(line, Language::Rust);
+        let toks = highlight_line(line, detect_language(&PathBuf::from("x.rs")));
         assert!(toks.first().is_some_and(|t| t.start == 0));
         assert!(toks.last().is_some_and(|t| t.end == line.len()));
         // No gaps and no overlaps.

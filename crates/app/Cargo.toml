@@ -60,6 +60,7 @@ cbc = "0.1"
 pbkdf2 = { version = "0.12", default-features = false }
 sha1 = "0.10"
 hmac = "0.12"
+two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 
 # Relay supervisor's `pre_exec` calls libc::umask so the bundled
 # socket/token files come out 0600. libc is already in the transitive
