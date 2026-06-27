@@ -1,5 +1,12 @@
 use super::*;
 
+/// Diff-body line count at or below which syntax highlighting runs inline on
+/// the render thread. Optimized syntect is ~0.3 ms/line, so this caps the
+/// synchronous cost around a tenth of a second — within the "feels instant"
+/// window and with no uncolored flash. Larger highlightable diffs paint
+/// uncolored immediately and colorize from a background task instead. Tunable.
+const SYNC_HIGHLIGHT_THRESHOLD: usize = 250;
+
 // --- DiffView top-level view (moved out of mod.rs in the Tier-1 slim) -----
 // `impl Render for DiffView` + its loading/failed placeholder helpers. Lives
 // here with the rest of the GPUI element construction; the prepared-row
@@ -39,6 +46,12 @@ impl Render for DiffView {
             //     drop straight to the cheap flatten in (2). This is what kept
             //     Collapse/Expand-all from re-highlighting every line.
             if self.plan_cache.is_none() {
+                // Small diffs highlight inline (fast, no uncolored flash). Larger
+                // highlightable diffs build UNCOLORED here so the body paints
+                // instantly, then a background pass (spawned below) rebuilds the
+                // colored plan off the UI thread and swaps it in — syntect on a
+                // near-budget diff is ~1 s of work that must never block paint.
+                let mut spawn_async: Option<(Vec<oximux_core::FileDiff>, bool)> = None;
                 let built = match &self.state {
                     DiffViewState::Ready {
                         diffs, expanded, ..
@@ -52,7 +65,10 @@ impl Render for DiffView {
                     | DiffViewState::CombinedReady {
                         diffs, expanded, ..
                     } => {
-                        let plan = build_render_plan(diffs, *expanded);
+                        let lines = diff_body_line_count(diffs);
+                        let highlightable = lines <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
+                        let sync_highlight = highlightable && lines <= SYNC_HIGHLIGHT_THRESHOLD;
+                        let plan = build_render_plan(diffs, *expanded, sync_highlight);
                         // Stageable change regions per file — full-file context
                         // makes one giant hunk, so the renderer docks a chip bar
                         // per region (git add -p granularity) using these.
@@ -71,6 +87,11 @@ impl Render for DiffView {
                         };
                         let paths: Vec<String> =
                             diffs.iter().map(|d| d.path.display().to_string()).collect();
+                        // Above the inline threshold but within budget → colorize
+                        // off-thread; clone the inputs the background pass needs.
+                        if highlightable && !sync_highlight {
+                            spawn_async = Some((diffs.clone(), *expanded));
+                        }
                         Some(Rc::new(PlanCache {
                             plan,
                             regions,
@@ -81,6 +102,38 @@ impl Render for DiffView {
                     _ => None,
                 };
                 self.plan_cache = built;
+                // Background syntax-highlight pass for large diffs. Runs the
+                // syntect work on a thread, then swaps the colored plan in on
+                // the foreground — guarded by `plan_gen` so a newer diff load
+                // discards a stale result.
+                if let Some((diffs, expanded)) = spawn_async {
+                    let gen_at_spawn = self.plan_gen;
+                    let executor = cx.background_executor().clone();
+                    self._highlight_task = Some(cx.spawn(async move |this, cx| {
+                        let colored = executor
+                            .spawn(async move { build_render_plan(&diffs, expanded, true) })
+                            .await;
+                        let _ = this.update(cx, |view, cx| {
+                            if view.plan_gen != gen_at_spawn {
+                                return; // superseded by a newer load/expand
+                            }
+                            if let Some(pc) = view.plan_cache.as_ref() {
+                                // Only the per-line tokens changed; reuse the
+                                // collapse-invariant regions/staged/paths.
+                                view.plan_cache = Some(Rc::new(PlanCache {
+                                    plan: colored,
+                                    regions: pc.regions.clone(),
+                                    staged_per_file: pc.staged_per_file.clone(),
+                                    paths: pc.paths.clone(),
+                                }));
+                                // Re-flatten with colors. Same row count → the
+                                // list `remeasure`s, keeping the scroll position.
+                                view.invalidate_prepared();
+                                cx.notify();
+                            }
+                        });
+                    }));
+                }
             }
             // (2) Flatten the cached plan into rows. Cheap — no string or
             //     highlight work; just walks the plan applying the current

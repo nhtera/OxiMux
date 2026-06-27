@@ -136,16 +136,25 @@ pub const MAX_RENDERED_DIFF_LINES: usize = 50_000;
 /// base64 blob) can exhaust memory without tripping the line cap.
 pub const MAX_RENDERED_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
-/// Build the pure render plan. Highlighting is gated on the total body size:
-/// a very large multi-file diff renders without syntax color to stay
-/// responsive (see [`SYNTAX_HIGHLIGHT_BUDGET_LINES`]).
-pub fn build_render_plan(diffs: &[FileDiff], expanded: bool) -> Vec<FilePlan> {
-    let total_lines: usize = diffs
+/// Total diff-body line count across all files — the figure the highlight
+/// budget and the sync/async highlight split are keyed on.
+pub fn diff_body_line_count(diffs: &[FileDiff]) -> usize {
+    diffs
         .iter()
         .flat_map(|d| d.hunks.iter())
         .map(|h| h.lines.len())
-        .sum();
-    let highlight = total_lines <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
+        .sum()
+}
+
+/// Build the pure render plan. `allow_highlight` lets the caller suppress
+/// syntect tokenization (the dominant per-line cost): the diff view paints an
+/// instant uncolored plan first, then a background pass rebuilds the colored
+/// one (see `DiffView`'s highlight task); note-anchor mapping likewise only
+/// needs line numbers. Highlighting stays gated on the size budget even when
+/// allowed, so an over-budget diff never tokenizes
+/// (see [`SYNTAX_HIGHLIGHT_BUDGET_LINES`]).
+pub fn build_render_plan(diffs: &[FileDiff], expanded: bool, allow_highlight: bool) -> Vec<FilePlan> {
+    let highlight = allow_highlight && diff_body_line_count(diffs) <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
     diffs
         .iter()
         .map(|d| build_file_plan(d, expanded, highlight))

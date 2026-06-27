@@ -52,7 +52,7 @@ fn file(path: &str, status: DiffStatus, hunks: Vec<DiffHunk>, large: bool) -> Fi
 
 #[test]
 fn empty_diff_vec_gives_empty_plan() {
-    let plan = build_render_plan(&[], false);
+    let plan = build_render_plan(&[], false, true);
     assert!(plan.is_empty());
 }
 
@@ -65,7 +65,7 @@ fn oversized_by_line_count_suppresses_body_even_when_expanded() {
     let h = hunk((0, 0), (1, n as u32), "", lines);
     let f = file("generated.rs", DiffStatus::Added, vec![h], true);
     // expanded = true must NOT override the hard cap.
-    let plan = build_render_plan(&[f], true);
+    let plan = build_render_plan(&[f], true, true);
     assert_eq!(plan.len(), 1);
     match &plan[0] {
         FilePlan::Oversized { total_lines, .. } => assert_eq!(*total_lines, n),
@@ -81,7 +81,7 @@ fn oversized_by_bytes_with_few_long_lines() {
     let lines: Vec<DiffLine> = (0..5).map(|_| line(DiffLineKind::Added, &big)).collect();
     let h = hunk((0, 0), (1, 5), "", lines);
     let f = file("bundle.min.js", DiffStatus::Added, vec![h], false);
-    let plan = build_render_plan(&[f], true);
+    let plan = build_render_plan(&[f], true, true);
     assert!(
         matches!(plan[0], FilePlan::Oversized { .. }),
         "few long lines should trip the byte cap"
@@ -92,7 +92,7 @@ fn oversized_by_bytes_with_few_long_lines() {
 fn normal_small_file_is_not_oversized() {
     let h = hunk((1, 1), (1, 1), "", vec![line(DiffLineKind::Added, "small")]);
     let f = file("a.rs", DiffStatus::Added, vec![h], false);
-    let plan = build_render_plan(&[f], false);
+    let plan = build_render_plan(&[f], false, true);
     assert!(!matches!(plan[0], FilePlan::Oversized { .. }));
 }
 
@@ -111,7 +111,7 @@ fn hunked_modified_file_renders_lines_in_order() {
     );
     let plan = build_render_plan(
         &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
-        false,
+        false, true,
     );
     assert_eq!(plan.len(), 1);
     match &plan[0] {
@@ -144,7 +144,7 @@ fn hunked_modified_file_renders_lines_in_order() {
 fn binary_file_skips_body() {
     let plan = build_render_plan(
         &[file("logo.png", DiffStatus::Binary, vec![], false)],
-        false,
+        false, true,
     );
     match &plan[0] {
         FilePlan::Binary { path, header } => {
@@ -167,7 +167,7 @@ fn mode_only_change_uses_mode_only_variant() {
             vec![],
             false,
         )],
-        false,
+        false, true,
     );
     match &plan[0] {
         FilePlan::ModeOnly {
@@ -197,7 +197,7 @@ fn mode_change_with_content_renders_as_hunked() {
             vec![h],
             false,
         )],
-        false,
+        false, true,
     );
     assert!(matches!(plan[0], FilePlan::Hunked { .. }));
 }
@@ -214,7 +214,7 @@ fn renamed_header_includes_from_path_and_similarity() {
             vec![],
             false,
         )],
-        false,
+        false, true,
     );
     match &plan[0] {
         FilePlan::Hunked { header, .. } => {
@@ -237,7 +237,7 @@ fn large_diff_collapsed_when_expanded_false() {
             vec![hunk((1, 1500), (1, 1500), "", big_lines)],
             true,
         )],
-        false,
+        false, true,
     );
     match &plan[0] {
         FilePlan::Collapsed {
@@ -264,7 +264,7 @@ fn large_diff_expanded_renders_full_body() {
             vec![hunk((1, 1500), (1, 1500), "", big_lines)],
             true,
         )],
-        true,
+        true, true,
     );
     match &plan[0] {
         FilePlan::Hunked { hunks, .. } => {
@@ -277,7 +277,7 @@ fn large_diff_expanded_renders_full_body() {
 #[test]
 fn hunk_header_omits_suffix_separator_when_suffix_empty() {
     let h = hunk((10, 1), (10, 1), "", vec![line(DiffLineKind::Context, "x")]);
-    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false);
+    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false, true);
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
     };
@@ -298,7 +298,7 @@ fn no_newline_hint_after_removal_is_stripped() {
             line(DiffLineKind::NoNewlineHint, " No newline at end of file"),
         ],
     );
-    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false);
+    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false, true);
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
     };
@@ -326,7 +326,7 @@ fn collapse_no_newline_only_flip_becomes_context() {
             line(DiffLineKind::NoNewlineHint, " No newline at end of file"),
         ],
     );
-    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false);
+    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false, true);
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
     };
@@ -358,7 +358,7 @@ fn collapse_does_not_swallow_real_content_changes() {
             line(DiffLineKind::NoNewlineHint, " No newline at end of file"),
         ],
     );
-    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false);
+    let plan = build_render_plan(&[file("a", DiffStatus::Modified, vec![h], false)], false, true);
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
     };
@@ -387,7 +387,7 @@ fn paired_modified_lines_get_word_spans() {
     );
     let plan = build_render_plan(
         &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
-        false,
+        false, true,
     );
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
@@ -415,7 +415,7 @@ fn rust_file_rows_carry_syntax_tokens() {
     );
     let plan = build_render_plan(
         &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
-        false,
+        false, true,
     );
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
@@ -446,7 +446,7 @@ fn oversize_diff_skips_syntax_highlighting() {
     let big = hunk((1, 1), (1, lines.len() as u32), "", lines);
     let plan = build_render_plan(
         &[file("src/main.rs", DiffStatus::Modified, vec![big], false)],
-        false,
+        false, true,
     );
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
@@ -469,7 +469,7 @@ fn unknown_extension_rows_have_no_syntax_tokens() {
     );
     let plan = build_render_plan(
         &[file("LICENSE", DiffStatus::Modified, vec![h], false)],
-        false,
+        false, true,
     );
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
@@ -497,7 +497,7 @@ fn unpaired_lines_have_no_word_spans() {
     );
     let plan = build_render_plan(
         &[file("src/main.rs", DiffStatus::Modified, vec![h], false)],
-        false,
+        false, true,
     );
     let FilePlan::Hunked { hunks, .. } = &plan[0] else {
         panic!("expected hunked");
@@ -515,7 +515,7 @@ fn multi_file_plan_preserves_order() {
             file("b.rs", DiffStatus::Deleted, vec![], false),
             file("c.rs", DiffStatus::Modified, vec![], false),
         ],
-        false,
+        false, true,
     );
     assert_eq!(plan.len(), 3);
     let labels: Vec<&str> = plan
@@ -534,7 +534,7 @@ fn multi_file_plan_preserves_order() {
 /// Helper: build the side-by-side rows for one file and return each
 /// `SplitLine`'s `(has_left, has_right)` occupancy, in order.
 fn split_occupancy(f: &FileDiff) -> Vec<(bool, bool)> {
-    let plan = build_render_plan(std::slice::from_ref(f), false);
+    let plan = build_render_plan(std::slice::from_ref(f), false, true);
     let regions = vec![change_regions(f)];
     let typography = Typography::default();
     let rctx = RenderCtx {
@@ -636,7 +636,7 @@ fn split_pure_addition_has_left_fillers() {
 /// Helper: overview-ruler runs for one file's INLINE body, as
 /// `(start, end, mark)` tuples in order.
 fn inline_runs(f: &FileDiff) -> Vec<(f32, f32, RulerMark)> {
-    let plan = build_render_plan(std::slice::from_ref(f), false);
+    let plan = build_render_plan(std::slice::from_ref(f), false, true);
     let regions = vec![change_regions(f)];
     let typography = Typography::default();
     let rctx = RenderCtx {
@@ -710,7 +710,7 @@ fn overview_split_modify_row_is_mixed() {
         )],
         false,
     );
-    let plan = build_render_plan(std::slice::from_ref(&f), false);
+    let plan = build_render_plan(std::slice::from_ref(&f), false, true);
     let regions = vec![change_regions(&f)];
     let typography = Typography::default();
     let rctx = RenderCtx {
@@ -741,7 +741,7 @@ fn folded_file_emits_header_only() {
     };
     let f0 = file("a.rs", DiffStatus::Modified, vec![mk()], false);
     let f1 = file("b.rs", DiffStatus::Modified, vec![mk()], false);
-    let plan = build_render_plan(&[f0.clone(), f1.clone()], false);
+    let plan = build_render_plan(&[f0.clone(), f1.clone()], false, true);
     let regions = vec![change_regions(&f0), change_regions(&f1)];
     let typography = Typography::default();
     let rctx = RenderCtx {
@@ -809,7 +809,7 @@ fn split_merged_region_keeps_all_blocks_tagged() {
     );
     assert_eq!(change_regions(&f).len(), 1, "two close edits merge to 1 region");
 
-    let plan = build_render_plan(std::slice::from_ref(&f), false);
+    let plan = build_render_plan(std::slice::from_ref(&f), false, true);
     let regions = vec![change_regions(&f)];
     let typography = Typography::default();
     let rctx = RenderCtx {
@@ -847,7 +847,7 @@ fn split_merged_region_keeps_all_blocks_tagged() {
 
 /// Helper: build inline rows for one file with the given expanded folds.
 fn inline_rows(f: &FileDiff, expanded: &HashSet<(usize, u32)>) -> Vec<PreparedRow> {
-    let plan = build_render_plan(std::slice::from_ref(f), false);
+    let plan = build_render_plan(std::slice::from_ref(f), false, true);
     let regions = vec![change_regions(f)];
     let typography = Typography::default();
     let rctx = RenderCtx {
@@ -1019,7 +1019,7 @@ fn collect_headers_one_per_file_with_fold_state() {
     };
     let f0 = file("a.rs", DiffStatus::Modified, vec![mk()], false);
     let f1 = file("b.rs", DiffStatus::Modified, vec![mk()], false);
-    let plan = build_render_plan(&[f0.clone(), f1.clone()], false);
+    let plan = build_render_plan(&[f0.clone(), f1.clone()], false, true);
     let regions = vec![change_regions(&f0), change_regions(&f1)];
     let typography = Typography::default();
     let rctx = RenderCtx {
@@ -1065,7 +1065,7 @@ fn one_change_file(path: &str, content: &str) -> FileDiff {
 /// `(file_idx, hollow)` for every changed inline `Line` row (those that carry
 /// a sliver), given a multi-file plan + per-file staged tags.
 fn inline_hollow_by_file(files: &[FileDiff], staged_per_file: &[bool]) -> Vec<(usize, bool)> {
-    let plan = build_render_plan(files, false);
+    let plan = build_render_plan(files, false, true);
     let regions: Vec<_> = files.iter().map(change_regions).collect();
     let typography = Typography::default();
     let rctx = render_ctx_for(&typography);
@@ -1122,7 +1122,7 @@ fn staged_file_group_renders_hollow_sliver_in_split_mode() {
         one_change_file("u.rs", "x"),
         one_change_file("s.rs", "y"),
     ];
-    let plan = build_render_plan(&files, false);
+    let plan = build_render_plan(&files, false, true);
     let regions: Vec<_> = files.iter().map(change_regions).collect();
     let typography = Typography::default();
     let rctx = render_ctx_for(&typography);

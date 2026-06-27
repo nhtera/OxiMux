@@ -259,6 +259,16 @@ pub struct DiffView {
     /// fresh diff load or the large-file `expand` clears it (`invalidate_plan`);
     /// fold/collapse/split go through `invalidate_prepared`, which keeps this.
     plan_cache: Option<Rc<PlanCache>>,
+    /// Monotonic counter bumped by `invalidate_plan` on every fresh diff /
+    /// expand. The background highlight task captures it at spawn; a result
+    /// whose generation no longer matches is stale (a newer diff superseded
+    /// it) and is dropped instead of swapped in.
+    plan_gen: u64,
+    /// In-flight background syntax-highlight pass. Large highlightable diffs
+    /// first paint uncolored (instant), then this task rebuilds the colored
+    /// plan off the UI thread and swaps it in. Dropping it cancels (a new
+    /// load replaces it); the `plan_gen` check guards already-running work.
+    _highlight_task: Option<Task<()>>,
     /// Side-by-side toggle. `false` → unified/inline body (default); `true`
     /// → original | modified columns. Flipping it rebuilds `prepared` (the
     /// two modes emit different row sets) so it routes through
@@ -382,6 +392,8 @@ impl DiffView {
             body_list_was_populated: false,
             prepared: None,
             plan_cache: None,
+            plan_gen: 0,
+            _highlight_task: None,
             prepared_widest: 0,
             prepared_widest_chars: 0,
             split_h_offset: 0.0,
@@ -591,6 +603,11 @@ impl DiffView {
     /// `invalidate_prepared` and reuse the cached plan.
     fn invalidate_plan(&mut self) {
         self.plan_cache = None;
+        // Supersede any in-flight background highlight: bump the generation so
+        // a result that's already computing is discarded on arrival, and drop
+        // the task handle so a not-yet-started one is cancelled outright.
+        self.plan_gen = self.plan_gen.wrapping_add(1);
+        self._highlight_task = None;
         self.invalidate_prepared();
     }
 
@@ -1596,7 +1613,8 @@ impl DiffView {
             | DiffViewState::CombinedReady { diffs, .. } => diffs,
             _ => return map,
         };
-        for fp in build_render_plan(diffs, true) {
+        // Note-anchor mapping only reads line numbers — skip the syntect pass.
+        for fp in build_render_plan(diffs, true, false) {
             let FilePlan::Hunked { path, hunks, .. } = fp else {
                 continue;
             };
