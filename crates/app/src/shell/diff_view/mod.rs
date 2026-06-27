@@ -40,8 +40,8 @@ use crate::shell::diff_view::review_note_popover::{
 };
 use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore, format_notes_markdown};
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, ScrollStrategy,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, px,
+    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, ListAlignment,
+    ListOffset, ListState, Subscription, Task, WeakEntity, Window, px,
 };
 use gpui_component::input::InputState;
 use oximux_core::{CombinedDiffScope, FileDiff, FileGroup, NoteSide};
@@ -214,10 +214,23 @@ pub struct DiffView {
     /// its dialog. Same lifecycle pattern as
     /// `WorkspaceRoot::_discard_dialog_observer`.
     _confirm_dialog_observer: Option<Subscription>,
-    /// Vertical scroll state for the virtualized diff body. Owned here so
-    /// the `uniform_list` reports an exact content height (`rows × h_row`)
-    /// and scrolling reaches the true end of the diff.
-    scroll_handle: UniformListScrollHandle,
+    /// Vertical scroll + per-item height cache for the variable-height diff
+    /// body (`gpui::list`). Rows can differ in height (wrapped lines, image
+    /// previews), so the list measures each item rather than assuming a
+    /// uniform `h_row`. A prepared-row rebuild calls `reset(len)`; a font
+    /// zoom (rows unchanged, heights changed) calls `remeasure()`.
+    body_list: ListState,
+    /// Body-zoom factor the `body_list` last measured at. When it changes the
+    /// cached row heights are stale, so `remeasure()` runs before the next
+    /// paint — the prepared rows are identical, so no `reset` (which would
+    /// drop the scroll position).
+    body_list_zoom: f32,
+    /// Whether the `body_list` held a non-empty diff on the previous rebuild.
+    /// A structural rebuild (row count changed) that follows a populated frame
+    /// is an in-place edit (a fold expand/collapse) → keep the scroll position;
+    /// one that follows an empty frame is a fresh diff (it passed through a
+    /// Loading frame) → start at the top.
+    body_list_was_populated: bool,
     /// Cached flattened render rows. Built once per (diff, expanded) change
     /// — NOT per frame — so syntax highlighting and word-diff pairing stay
     /// off the scroll path. `None` means "stale, rebuild on next render";
@@ -341,7 +354,9 @@ impl DiffView {
             _op_task: None,
             confirm_dialog: None,
             _confirm_dialog_observer: None,
-            scroll_handle: UniformListScrollHandle::new(),
+            body_list: ListState::new(0, ListAlignment::Top, px(400.0)),
+            body_list_zoom: 1.0,
+            body_list_was_populated: false,
             prepared: None,
             prepared_widest: 0,
             prepared_widest_chars: 0,
@@ -447,34 +462,23 @@ impl DiffView {
         }
     }
 
-    /// First-visible row index, derived from the list's pixel scroll offset
-    /// and the body row height. Every body row is exactly `effective_h_row`
-    /// tall (the base height scaled by the editor zoom), so this is exact.
-    /// Returns 0 when nothing is scrolled or measured.
-    fn first_visible_row(&self, cx: &App) -> usize {
-        let h = self.effective_h_row(cx);
-        if h <= 0.0 {
-            return 0;
-        }
-        let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
-        ((-offset_y) / h).floor().max(0.0) as usize
-    }
-
-    /// Diff-body row height after applying the editor font zoom. The body
-    /// shares the editor's Cmd+/- zoom level; scaling the fixed virtualized
-    /// row height by the same factor keeps larger code from clipping and keeps
-    /// every pixel computation (sticky header, staging card, scroll anchor)
-    /// aligned with what's painted.
-    fn effective_h_row(&self, cx: &App) -> f32 {
-        self.density.h_row * body_zoom_factor(self.typography.t_body_sm, current_zoom(cx))
+    /// First-visible row index — the list's scroll-top item. `list()` owns
+    /// the scroll position in item space, so the sticky header + group-tag
+    /// overlay read it directly (variable row heights mean there's no
+    /// `offset / h_row` shortcut). `0` before the first layout.
+    fn first_visible_row(&self, _cx: &App) -> usize {
+        self.body_list.logical_scroll_top().item_ix
     }
 
     /// Scroll the body so `row` sits at the top of the viewport. Used by the
-    /// overview-ruler click-to-jump. Index-based (`scroll_to_item` resolves the
-    /// pixel offset from the row height the list rendered with), so it stays
-    /// correct across a font-zoom change without recomputation.
+    /// overview-ruler + file-rail click-to-jump. `list()` resolves the pixel
+    /// offset from each item's measured height, so it stays correct across a
+    /// font-zoom or wrap-toggle change without recomputation.
     pub fn scroll_to_row(&self, row: usize) {
-        self.scroll_handle.scroll_to_item(row, ScrollStrategy::Top);
+        self.body_list.scroll_to(ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.0),
+        });
     }
 
     /// Scroll the body so `file_idx`'s header sits at the top. Used by the

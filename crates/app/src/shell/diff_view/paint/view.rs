@@ -19,6 +19,12 @@ impl Render for DiffView {
                 .into_any_element();
         }
 
+        // Editor-global font zoom, resolved once. `zoom` drives the scaled
+        // typography; `zoom_factor` (zoomed code-font px over base) scales the
+        // body row height. Both feed the `list()` height-cache sync below.
+        let zoom = current_zoom(cx);
+        let zoom_factor = body_zoom_factor(self.typography.t_body_sm, zoom);
+
         // Rebuild the cached row list only when stale. This keeps the
         // expensive work — walking every hunk, syntect highlighting each
         // line, word-diff pairing — OFF the per-frame render path; it runs
@@ -90,6 +96,31 @@ impl Render for DiffView {
                 _ => None,
             };
             self.prepared = rows;
+            // Sync the list's per-item height cache to the rebuilt rows. Same
+            // row count → identity is stable (a note marker toggled, a hover
+            // re-render) so `remeasure` keeps the scroll position. A different
+            // count is a structural change → `reset` rebuilds the cache, which
+            // drops the scroll position. For an in-place structural edit (a
+            // fold expand/collapse: the list was already populated last frame,
+            // and the change lands at or below the visible top) restore the
+            // prior scroll so the reader stays put. A fresh diff passed through
+            // an empty Loading frame, so it starts at the top.
+            let new_len = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
+            if self.body_list.item_count() == new_len {
+                self.body_list.remeasure();
+            } else {
+                let prev_scroll = self.body_list.logical_scroll_top();
+                let was_populated = self.body_list_was_populated;
+                self.body_list.reset(new_len);
+                if was_populated && new_len > 0 {
+                    self.body_list.scroll_to(gpui::ListOffset {
+                        item_ix: prev_scroll.item_ix.min(new_len - 1),
+                        offset_in_item: prev_scroll.offset_in_item,
+                    });
+                }
+            }
+            self.body_list_was_populated = new_len > 0;
+            self.body_list_zoom = zoom_factor;
             // Recompute the horizontal-scroll measurement row + its char
             // count alongside the rebuild (off the per-frame path).
             let (widest, chars) = self
@@ -133,8 +164,10 @@ impl Render for DiffView {
             if len > 0
                 && let Some(anchor) = self.pending_scroll_anchor.take()
             {
-                self.scroll_handle
-                    .scroll_to_item(anchor.min(len - 1), ScrollStrategy::Top);
+                self.body_list.scroll_to(ListOffset {
+                    item_ix: anchor.min(len - 1),
+                    offset_in_item: px(0.0),
+                });
             }
         }
 
@@ -146,12 +179,19 @@ impl Render for DiffView {
         // Body-only zoom: the code rows, file headers, sticky overlay, and
         // staging card share the editor's Cmd+/- font size. Scale a body-scoped
         // density (row height) + typography (all sizes) by the same factor so
-        // larger code doesn't clip the fixed-height virtualized rows and every
-        // body pixel computation stays aligned. The toolbar + rail keep base
-        // metrics — only the diff body zooms.
-        let zoom = current_zoom(cx);
+        // larger code reads at the right size and every body pixel computation
+        // stays aligned. The toolbar + rail keep base metrics.
+        //
+        // A zoom change with no rebuild leaves the list's cached row heights
+        // stale (the rows are identical, only their height moved), so remeasure
+        // once when the factor shifts — preserving the proportional scroll
+        // position. A rebuild above already synced the cache at this zoom.
+        if (zoom_factor - self.body_list_zoom).abs() > f32::EPSILON {
+            self.body_list.remeasure();
+            self.body_list_zoom = zoom_factor;
+        }
         let mut body_density = self.density;
-        body_density.h_row *= body_zoom_factor(self.typography.t_body_sm, zoom);
+        body_density.h_row *= zoom_factor;
         let body_typography = scaled_typography(&self.typography, zoom);
         let body_rctx = RenderCtx {
             theme: self.theme,
@@ -178,10 +218,9 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
                 )
@@ -211,10 +250,9 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
                 )
@@ -233,10 +271,9 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
                 )
@@ -256,10 +293,9 @@ impl Render for DiffView {
                 render_rows(
                     rows,
                     hovered_region,
-                    self.prepared_widest,
                     split,
                     split_h_offset,
-                    &self.scroll_handle,
+                    self.body_list.clone(),
                     &body_rctx,
                     weak,
                 )
@@ -542,6 +578,13 @@ impl Render for DiffView {
             // `w_full` here — on the horizontal main axis it would fight the
             // rail's fixed width.
             .flex_1()
+            // `min_w(0)` is load-bearing: a flex item defaults to
+            // `min-width: auto`, so the very wide diff body (long lines in the
+            // combined view) would stretch this wrapper past the viewport and
+            // push the right-edge scrollbar + overview ruler off-screen. Pinning
+            // the min width to 0 keeps the wrapper at the available width and
+            // lets the inner `overflow_x_scroll` clip + scroll instead.
+            .min_w(px(0.0))
             .min_h(px(0.0))
             .flex()
             .flex_col()
@@ -623,6 +666,20 @@ impl Render for DiffView {
             body_wrap =
                 body_wrap.child(overview_ruler(&self.overview, total_rows, &self.theme, weak_ruler));
         }
+        // Draggable vertical scrollbar. `list()` owns its scroll internally and
+        // paints no native scrollbar, so bind gpui-component's overlay
+        // scrollbar to the same `ListState`. Stacked last so the thumb sits on
+        // the body's right edge above the overview-ruler change-map (Monaco
+        // style: the position indicator and the change-map share the lane).
+        if has_body {
+            body_wrap = body_wrap.child(
+                gpui_component::scroll::Scrollbar::vertical(&self.body_list)
+                    // Keep the thumb visible at rest (not just while scrolling)
+                    // so the diff has a persistent position indicator like the
+                    // reference editors.
+                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+            );
+        }
         // Floating Stage/Discard card for the hovered region — pinned to the
         // viewport's right edge at the anchor row's on-screen Y (so it's
         // always visible regardless of the changed line's length or the
@@ -635,12 +692,17 @@ impl Render for DiffView {
             && let Some(row) = self.hovered_row
             && let Some(side) = self.side_for_region(region.0)
         {
-            let h = body_density.h_row;
-            let offset_y = f32::from(self.scroll_handle.0.borrow().base_handle.offset().y);
-            // The hovered row's on-screen Y — the card floats right at the
-            // pointer, not at the (possibly far-above) region anchor. Clamp
-            // ≥ 0 defensively; the hovered row is by definition on screen.
-            let top = (row as f32 * h + offset_y).max(0.0);
+            // The hovered row's on-screen Y within the body viewport. `list()`
+            // measures each item, so there's no `row * h_row` shortcut — read
+            // the row's painted window bounds and subtract the viewport's top
+            // (the body wrapper shares the list's top edge). `None` (row not
+            // yet measured) clamps to the top defensively; the hovered row is
+            // by definition on screen.
+            let top = self
+                .body_list
+                .bounds_for_item(row)
+                .map(|b| f32::from(b.origin.y - self.body_list.viewport_bounds().origin.y).max(0.0))
+                .unwrap_or(0.0);
             let weak_card = cx.entity().downgrade();
             if let Some(card) = staging_card_overlay(
                 top,

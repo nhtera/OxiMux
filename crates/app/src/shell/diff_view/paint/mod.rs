@@ -62,9 +62,9 @@ use crate::shell::diff_view::{
 };
 use gpui::{
     App, AppContext, ClickEvent, Context, HighlightStyle, Hsla, InteractiveElement, IntoElement,
-    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ParentElement, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled, StyledText,
-    UniformListScrollHandle, WeakEntity, Window, div, px, relative, uniform_list,
+    ListOffset, ListSizingBehavior, ListState, MouseButton, MouseDownEvent, ParentElement, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, StyledText, WeakEntity, Window, div,
+    list, px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, Sizable as _};
