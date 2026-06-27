@@ -656,30 +656,12 @@ impl Render for DiffView {
                 ));
             }
         }
-        // Overview ruler: a thin change-map on the body's right edge (only
-        // when a diff with changes is shown). Stacked last so it paints over
-        // the scrollable body; the body owns scrolling underneath it. Each
-        // run is click-to-jump (maps its start fraction back to a row).
-        if has_body && !self.overview.is_empty() {
-            let total_rows = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
-            let weak_ruler = cx.entity().downgrade();
-            body_wrap =
-                body_wrap.child(overview_ruler(&self.overview, total_rows, &self.theme, weak_ruler));
-        }
-        // Draggable vertical scrollbar. `list()` owns its scroll internally and
-        // paints no native scrollbar, so bind gpui-component's overlay
-        // scrollbar to the same `ListState`. Stacked last so the thumb sits on
-        // the body's right edge above the overview-ruler change-map (Monaco
-        // style: the position indicator and the change-map share the lane).
-        if has_body {
-            body_wrap = body_wrap.child(
-                gpui_component::scroll::Scrollbar::vertical(&self.body_list)
-                    // Keep the thumb visible at rest (not just while scrolling)
-                    // so the diff has a persistent position indicator like the
-                    // reference editors.
-                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
-            );
-        }
+        // The change-map (overview ruler) + draggable scrollbar are NOT
+        // overlaid on the body — they live in a reserved right gutter built
+        // below, so they never sit on top of the diff text or the header's
+        // copy/open icons (the way VS Code / the reference editors reserve a
+        // dedicated scrollbar lane).
+        //
         // Floating Stage/Discard card for the hovered region — pinned to the
         // viewport's right edge at the anchor row's on-screen Y (so it's
         // always visible regardless of the changed line's length or the
@@ -717,6 +699,53 @@ impl Render for DiffView {
             ) {
                 body_wrap = body_wrap.child(card);
             }
+        }
+        // Reserved right gutter: a fixed-width lane holding the change-map
+        // (overview ruler) + the draggable scrollbar, so neither overlaps the
+        // diff text or the header's copy/open icons. `body_wrap` (the scrolling
+        // content) yields this width via the `flex_row` below — the same
+        // dedicated-lane layout VS Code / the reference editors use.
+        const BODY_GUTTER_W: f32 = 14.0;
+        let gutter = if has_body {
+            let mut g = div()
+                .relative()
+                .h_full()
+                .flex_shrink_0()
+                .w(px(BODY_GUTTER_W));
+            if !self.overview.is_empty() {
+                let total_rows = self.prepared.as_ref().map(|r| r.len()).unwrap_or(0);
+                let weak_ruler = cx.entity().downgrade();
+                g = g.child(overview_ruler(
+                    &self.overview,
+                    total_rows,
+                    &self.theme,
+                    weak_ruler,
+                ));
+            }
+            // `list()` owns its scroll internally and paints no native
+            // scrollbar, so bind gpui-component's overlay scrollbar to the same
+            // `ListState`. `Always` keeps the thumb visible at rest.
+            g = g.child(
+                gpui_component::scroll::Scrollbar::vertical(&self.body_list)
+                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+            );
+            Some(g)
+        } else {
+            None
+        };
+        // Compose the scrolling content + the reserved gutter side by side.
+        // `body_wrap` keeps its own `flex_1`/`min_w(0)`, so it fills the width
+        // left after the 14px gutter; the gutter never moves with h-scroll.
+        let mut body_outer = div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .flex()
+            .flex_row()
+            .child(body_wrap);
+        if let Some(g) = gutter {
+            body_outer = body_outer.child(g);
         }
         // When the discard-hunk confirm modal is mounted, stack it as a
         // centered overlay over the diff body. Mirrors `confirm_dialog`
@@ -778,7 +807,7 @@ impl Render for DiffView {
         if let Some(rail) = rail {
             content = content.child(rail);
         }
-        content = content.child(body_wrap);
+        content = content.child(body_outer);
         root = root.child(content);
         if let Some(o) = overlay {
             root = root.child(o);
