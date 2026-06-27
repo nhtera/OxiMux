@@ -154,6 +154,22 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 opt-level = 0
 debug = 1
 
+# Syntax highlighting runs syntect on a `fancy-regex` (pure-Rust) backend.
+# Unoptimized, its regex engine is ~10 ms per source line — a debug-build
+# diff of a few hundred lines stalls the UI for ~1 s while it highlights.
+# Compile just these hot crates optimized even in dev builds so highlighting
+# runs at release speed; the app itself stays opt-level 0 (debuggable, fast
+# incremental rebuilds). These crates rarely change, so the one-time
+# optimized compile stays cached.
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"

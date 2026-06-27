@@ -27,12 +27,10 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use syntect::easy::HighlightLines;
 #[cfg(test)]
 use syntect::highlighting::Style;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::LinesWithEndings;
+use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter, Theme, ThemeSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 /// Lazy holders. `SyntaxSet::load_defaults_nonewlines()` is the heavy call
 /// (~30 ms cold start, ~550 KB embedded grammars). Read-only after init.
@@ -53,6 +51,16 @@ static SYNTAX_DARK: LazyLock<Theme> = LazyLock::new(|| {
 fn active_theme() -> &'static Theme {
     &SYNTAX_DARK
 }
+
+/// The syntect highlighter, derived once from the bundled theme. Building it
+/// walks every scope selector in the theme to build its match caches, so it
+/// must NOT be reconstructed per line. The original code created a fresh
+/// `HighlightLines` (which rebuilds this) on every `highlight_line` call —
+/// ~6 ms/line in a debug build, i.e. a ~1 s stall to highlight a 170-line
+/// diff. Shared here so each line pays only a cheap `ParseState` +
+/// `HighlightState` setup.
+static HIGHLIGHTER: LazyLock<Highlighter<'static>> =
+    LazyLock::new(|| Highlighter::new(active_theme()));
 
 /// Coarse language buckets — keyed on file extension. Mirrors the
 /// languages we ship grammars for; everything else degrades to `Unknown`
@@ -116,42 +124,43 @@ pub fn highlight_line(line: &str, lang: Language) -> Vec<HiToken> {
     let Some(syntax) = syntax_for(lang) else {
         return Vec::new();
     };
-    let mut hl = HighlightLines::new(syntax, active_theme());
-    // syntect expects each call to receive lines *with* their trailing `\n`
-    // — that's how it knows the line ended. Diff rows don't carry the
-    // newline (`parse_hunk_body_line` strips it), so we feed
-    // `LinesWithEndings::from(...)` over a `String` containing the line
-    // plus a fresh `\n`. Cheap allocation, single line each time.
+    // Each diff row is highlighted standalone — a fresh parse + highlight
+    // state per line — preserving the prior per-line behaviour (added/removed
+    // rows must not leak multi-line string/comment state across the +/-
+    // boundary). Only the heavy `Highlighter` (theme scope cache) is shared.
+    let highlighter = &*HIGHLIGHTER;
+    let mut parse_state = ParseState::new(syntax);
+    let mut highlight_state = HighlightState::new(highlighter, ScopeStack::new());
+    // syntect expects the trailing `\n` so it knows the line ended. Diff rows
+    // don't carry it (`parse_hunk_body_line` strips it), so re-add it on a
+    // cheap single-line allocation.
     let mut padded = String::with_capacity(line.len() + 1);
     padded.push_str(line);
     padded.push('\n');
+    let Ok(ops) = parse_state.parse_line(&padded, &SYNTAX_SET) else {
+        return Vec::new();
+    };
+    // Translate syntect's (Style, &str) pairs into our HiToken with explicit
+    // byte offsets relative to the *original* line content. The offset tracks
+    // cumulative chunk len — syntect guarantees the chunks concatenate back to
+    // the input, in order, including the trailing newline char.
     let mut out = Vec::new();
-    for ln in LinesWithEndings::from(&padded) {
-        let Ok(ranges) = hl.highlight_line(ln, &SYNTAX_SET) else {
-            return Vec::new();
-        };
-        // Translate syntect's (Style, &str) pairs into our HiToken with
-        // explicit byte offsets relative to the *original* line content.
-        // We compute the offset by tracking cumulative len of the &str
-        // chunks — syntect guarantees the chunks concatenate back to
-        // the input line, in order, including any trailing newline char.
-        let mut offset = 0usize;
-        for (style, chunk) in ranges {
-            let len = chunk.len();
-            // Drop the trailing-newline token — it lives outside the
-            // diff-row's content slice.
-            let end = (offset + len).min(line.len());
-            if offset < line.len() {
-                out.push(HiToken {
-                    start: offset,
-                    end,
-                    r: style.foreground.r,
-                    g: style.foreground.g,
-                    b: style.foreground.b,
-                });
-            }
-            offset += len;
+    let mut offset = 0usize;
+    for (style, chunk) in HighlightIterator::new(&mut highlight_state, &ops, &padded, highlighter) {
+        let len = chunk.len();
+        // Drop the trailing-newline token — it lives outside the diff-row's
+        // content slice.
+        let end = (offset + len).min(line.len());
+        if offset < line.len() {
+            out.push(HiToken {
+                start: offset,
+                end,
+                r: style.foreground.r,
+                g: style.foreground.g,
+                b: style.foreground.b,
+            });
         }
+        offset += len;
     }
     out
 }
