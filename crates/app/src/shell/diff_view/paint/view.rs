@@ -658,17 +658,23 @@ impl Render for DiffView {
         if has_body && !self.headers.is_empty() {
             let fv = self.first_visible_row(cx);
             let file_idx = self.row_owner.get(fv).copied().unwrap_or(0);
-            if let Some(header) = self.headers.iter().find(|h| h.file_idx == file_idx) {
-                // No shadow while a file's own header is flush at the top —
-                // the overlay then overlaps that row seamlessly.
-                let stuck = !matches!(
-                    self.prepared.as_ref().and_then(|r| r.get(fv)),
-                    Some(PreparedRow::FileHeader { .. })
-                );
+            // Only pin the overlay once a real header has scrolled ABOVE the
+            // viewport (`stuck`). While the file's own header is still flush at
+            // the top it's already on screen and clickable — stacking an
+            // identical interactive twin over it makes a click fire
+            // `toggle_file_fold` twice (overlay + real row), toggling fold
+            // on then off, which read as "the first file won't expand".
+            let stuck = !matches!(
+                self.prepared.as_ref().and_then(|r| r.get(fv)),
+                Some(PreparedRow::FileHeader { .. })
+            );
+            if stuck
+                && let Some(header) = self.headers.iter().find(|h| h.file_idx == file_idx)
+            {
                 let weak_sticky = cx.entity().downgrade();
                 body_wrap = body_wrap.child(sticky_header_overlay(
                     header,
-                    stuck,
+                    true,
                     self.theme,
                     body_density,
                     &body_typography,
