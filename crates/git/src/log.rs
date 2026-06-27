@@ -25,7 +25,13 @@ const LOG_TIMEOUT: Duration = Duration::from_secs(15);
 /// separated when multiple refs decorate one commit. Empty for commits
 /// with no decorations — the parser's empty-string check yields an empty
 /// `Vec<RefLabel>` for those.
-const LOG_FORMAT: &str = "%H%x1f%h%x1f%s%x1f%an%x1f%ad%x1f%D%x1f%b";
+///
+/// `%P` is the space-separated list of full parent SHAs (empty for a root
+/// commit, two-or-more on a merge). It feeds the commit-graph lane layout,
+/// which joins these against later rows' `%H`. Placed before `%b` because
+/// `%b` is the only field that can contain the `\x1f` separator or stray
+/// newlines; parent hashes never do, so the split stays unambiguous.
+const LOG_FORMAT: &str = "%H%x1f%h%x1f%s%x1f%an%x1f%ad%x1f%D%x1f%P%x1f%b";
 
 /// Compact author-date format ("May 20") that drops the year for the recent
 /// view. Paired with `LOG_FORMAT`'s `%ad` so the date column stays narrow.
@@ -33,7 +39,7 @@ const LOG_DATE_FORMAT: &str = "--date=format-local:%b %d";
 
 /// Field count produced by `LOG_FORMAT` — guards the parser against silent
 /// drift if someone tweaks the format string without updating the splitter.
-const LOG_FIELD_COUNT: usize = 7;
+const LOG_FIELD_COUNT: usize = 8;
 
 impl Repository {
     /// Last `max` commits on HEAD. Returns an empty vec on an initial repo
@@ -94,6 +100,16 @@ pub fn parse_log_record(record: &str) -> Option<CommitInfo> {
     // a separate optionality check.
     let decorate = parts.next().unwrap_or("");
     let refs = parse_decorate(decorate);
+    // Parents (`%P`) — full SHAs, space-separated. Empty for a root
+    // commit; the `filter` drops the empty token that `split_whitespace`
+    // already avoids but guards a stray double-space defensively. Feeds
+    // the commit-graph lane layout (joins against later rows' `oid`).
+    let parents = parts
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
     // Body is optional. `%b` may emit a trailing newline pair that we trim
     // so the tooltip doesn't render dead whitespace.
     let body = parts.next().unwrap_or("").trim_end().to_string();
@@ -108,6 +124,7 @@ pub fn parse_log_record(record: &str) -> Option<CommitInfo> {
         short_date,
         body,
         refs,
+        parents,
     })
 }
 
@@ -204,8 +221,9 @@ mod tests {
             "docs: hello world",
             "Alice",
             "May 20",
-            "", // decorate
-            "", // body
+            "",                                          // decorate
+            "abc0000000000000000000000000000000000000",  // parents
+            "",                                          // body
         ]);
         let info = parse_log_record(&r).unwrap();
         assert_eq!(info.oid, "c62d24a1234567890abcdef1234567890abcdef0");
@@ -215,6 +233,7 @@ mod tests {
         assert_eq!(info.short_date, "May 20");
         assert_eq!(info.body, "");
         assert!(info.refs.is_empty());
+        assert_eq!(info.parents, vec!["abc0000000000000000000000000000000000000"]);
     }
 
     #[test]
@@ -226,6 +245,7 @@ mod tests {
             "Bob",
             "May 19",
             "",
+            "", // parents
             "Adds the thing.\n\n- bullet one\n- bullet two\n",
         ]);
         let info = parse_log_record(&r).unwrap();
@@ -242,6 +262,7 @@ mod tests {
             "Bob",
             "May 19",
             "",
+            "", // parents
             "",
         ]);
         let info = parse_log_record(&r).unwrap();
@@ -257,7 +278,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_oid() {
-        let r = record(&["", "", "subject", "author", "date", "", ""]);
+        let r = record(&["", "", "subject", "author", "date", "", "", ""]);
         assert!(parse_log_record(&r).is_none());
     }
 
@@ -270,6 +291,7 @@ mod tests {
             "Alice",
             "May 18",
             "",
+            "", // parents
             "",
         ]);
         let info = parse_log_record(&r).unwrap();
@@ -285,6 +307,7 @@ mod tests {
             "Alice",
             "May 20",
             "",
+            "", // parents
             "body one",
         ]);
         let r2 = record(&[
@@ -294,6 +317,7 @@ mod tests {
             "Bob",
             "May 19",
             "",
+            "", // parents
             "",
         ]);
         let out = format!("{r1}\0{r2}");
@@ -303,6 +327,47 @@ mod tests {
         assert_eq!(parsed[0].body, "body one");
         assert_eq!(parsed[1].subject, "subj two");
         assert_eq!(parsed[1].body, "");
+    }
+
+    #[test]
+    fn parses_merge_commit_with_two_parents() {
+        // A merge record carries two space-separated SHAs in the `%P`
+        // field — the lane layout joins these against later rows to draw
+        // the two incoming branch lines that converge on the merge node.
+        let r = record(&[
+            "deadbeef00000000000000000000000000000000",
+            "deadbee",
+            "Merge branch 'feat/x'",
+            "Carol",
+            "May 21",
+            "",
+            "1111111111111111111111111111111111111111 2222222222222222222222222222222222222222",
+            "",
+        ]);
+        let info = parse_log_record(&r).unwrap();
+        assert_eq!(
+            info.parents,
+            vec![
+                "1111111111111111111111111111111111111111".to_string(),
+                "2222222222222222222222222222222222222222".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_commit_has_no_parents() {
+        let r = record(&[
+            "f00d000000000000000000000000000000000000",
+            "f00d000",
+            "initial commit",
+            "Dave",
+            "May 01",
+            "",
+            "", // parents — root commit
+            "",
+        ]);
+        let info = parse_log_record(&r).unwrap();
+        assert!(info.parents.is_empty());
     }
 
     // ---------- decorate parsing ----------
