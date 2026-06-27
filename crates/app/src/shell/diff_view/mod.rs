@@ -269,6 +269,13 @@ pub struct DiffView {
     /// plan off the UI thread and swaps it in. Dropping it cancels (a new
     /// load replaces it); the `plan_gen` check guards already-running work.
     _highlight_task: Option<Task<()>>,
+    /// File index whose path was just copied from its header — drives the
+    /// transient copy → checkmark swap. Cleared after a short delay by
+    /// `_copied_clear_task`. Pure feedback state; never invalidates `prepared`.
+    recently_copied_file: Option<usize>,
+    /// Reverts `recently_copied_file` to `None` a beat after a copy so the
+    /// checkmark flashes briefly then returns to the copy glyph.
+    _copied_clear_task: Option<Task<()>>,
     /// Side-by-side toggle. `false` → unified/inline body (default); `true`
     /// → original | modified columns. Flipping it rebuilds `prepared` (the
     /// two modes emit different row sets) so it routes through
@@ -394,6 +401,8 @@ impl DiffView {
             plan_cache: None,
             plan_gen: 0,
             _highlight_task: None,
+            recently_copied_file: None,
+            _copied_clear_task: None,
             prepared_widest: 0,
             prepared_widest_chars: 0,
             split_h_offset: 0.0,
@@ -445,6 +454,25 @@ impl DiffView {
         let _ = opener.update(cx, |group, cx| {
             group.open_or_activate_editor_tab(abs, window, cx);
         });
+    }
+
+    /// Flash the copy → checkmark confirmation on `file_idx`'s header after its
+    /// path is copied, then revert after a short beat. Pure feedback — the row
+    /// set is unchanged, so it only re-renders (never invalidates `prepared`).
+    fn flash_copied(&mut self, file_idx: usize, cx: &mut Context<Self>) {
+        self.recently_copied_file = Some(file_idx);
+        cx.notify();
+        self._copied_clear_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1400))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.recently_copied_file == Some(file_idx) {
+                    view.recently_copied_file = None;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     /// Fold/unfold a single file's body. Cheap — only the row set changes,

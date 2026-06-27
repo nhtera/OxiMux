@@ -296,6 +296,7 @@ impl Render for DiffView {
                     self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -328,6 +329,7 @@ impl Render for DiffView {
                     self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -349,6 +351,7 @@ impl Render for DiffView {
                     self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -371,6 +374,7 @@ impl Render for DiffView {
                     self.body_list.clone(),
                     &body_rctx,
                     weak,
+                    self.recently_copied_file,
                 )
                 .into_any_element()
             }
@@ -728,6 +732,7 @@ impl Render for DiffView {
                 body_wrap = body_wrap.child(sticky_header_overlay(
                     header,
                     true,
+                    self.recently_copied_file == Some(file_idx),
                     self.theme,
                     body_density,
                     &body_typography,
