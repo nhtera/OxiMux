@@ -14,7 +14,9 @@ use oximux_app::shell::diff_view::file_header::{build_row_owner, collect_headers
 use oximux_app::shell::diff_view::paint::{
     PreparedRow, RulerMark, overview_runs, prepare, prepare_split, region_anchor_rows,
 };
-use oximux_app::shell::diff_view::render::{FilePlan, RenderCtx, build_render_plan};
+use oximux_app::shell::diff_view::render::{
+    FilePlan, MAX_RENDERED_DIFF_BYTES, MAX_RENDERED_DIFF_LINES, RenderCtx, build_render_plan,
+};
 use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff, change_regions};
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
@@ -52,6 +54,46 @@ fn file(path: &str, status: DiffStatus, hunks: Vec<DiffHunk>, large: bool) -> Fi
 fn empty_diff_vec_gives_empty_plan() {
     let plan = build_render_plan(&[], false);
     assert!(plan.is_empty());
+}
+
+#[test]
+fn oversized_by_line_count_suppresses_body_even_when_expanded() {
+    // Past the hard line ceiling the file becomes `Oversized` regardless of
+    // the expand flag — building one row per line is exactly what we avoid.
+    let n = MAX_RENDERED_DIFF_LINES + 10;
+    let lines: Vec<DiffLine> = (0..n).map(|_| line(DiffLineKind::Added, "x")).collect();
+    let h = hunk((0, 0), (1, n as u32), "", lines);
+    let f = file("generated.rs", DiffStatus::Added, vec![h], true);
+    // expanded = true must NOT override the hard cap.
+    let plan = build_render_plan(&[f], true);
+    assert_eq!(plan.len(), 1);
+    match &plan[0] {
+        FilePlan::Oversized { total_lines, .. } => assert_eq!(*total_lines, n),
+        other => panic!("expected Oversized, got {other:?}"),
+    }
+}
+
+#[test]
+fn oversized_by_bytes_with_few_long_lines() {
+    // A handful of very long lines (a minified bundle, a base64 blob) trips
+    // the byte ceiling without coming near the line ceiling.
+    let big = "a".repeat(MAX_RENDERED_DIFF_BYTES / 4 + 1);
+    let lines: Vec<DiffLine> = (0..5).map(|_| line(DiffLineKind::Added, &big)).collect();
+    let h = hunk((0, 0), (1, 5), "", lines);
+    let f = file("bundle.min.js", DiffStatus::Added, vec![h], false);
+    let plan = build_render_plan(&[f], true);
+    assert!(
+        matches!(plan[0], FilePlan::Oversized { .. }),
+        "few long lines should trip the byte cap"
+    );
+}
+
+#[test]
+fn normal_small_file_is_not_oversized() {
+    let h = hunk((1, 1), (1, 1), "", vec![line(DiffLineKind::Added, "small")]);
+    let f = file("a.rs", DiffStatus::Added, vec![h], false);
+    let plan = build_render_plan(&[f], false);
+    assert!(!matches!(plan[0], FilePlan::Oversized { .. }));
 }
 
 #[test]
@@ -483,6 +525,7 @@ fn multi_file_plan_preserves_order() {
             FilePlan::Collapsed { path, .. } => path.as_str(),
             FilePlan::Binary { path, .. } => path.as_str(),
             FilePlan::ModeOnly { path, .. } => path.as_str(),
+            FilePlan::Oversized { path, .. } => path.as_str(),
         })
         .collect();
     assert_eq!(labels, ["a.rs", "b.rs", "c.rs"]);

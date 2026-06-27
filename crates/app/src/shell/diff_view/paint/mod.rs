@@ -512,6 +512,29 @@ pub fn prepare(
                     text: "Binary file (body suppressed)".to_string(),
                 });
             }
+            FilePlan::Oversized {
+                path,
+                header,
+                total_lines,
+                total_bytes,
+            } => {
+                rows.push(PreparedRow::FileHeader {
+                    file_idx,
+                    path: path.clone().into(),
+                    label: header.label.clone(),
+                    stats: None,
+                    folded,
+                });
+                if folded {
+                    continue;
+                }
+                rows.push(PreparedRow::Special {
+                    text: format!(
+                        "Diff too large to render — {total_lines} lines, {:.1} MB (body suppressed)",
+                        *total_bytes as f64 / 1_048_576.0
+                    ),
+                });
+            }
             FilePlan::ModeOnly {
                 path,
                 header,
@@ -876,6 +899,29 @@ pub fn prepare_split(
                 }
                 rows.push(PreparedRow::Special {
                     text: "Binary file (body suppressed)".to_string(),
+                });
+            }
+            FilePlan::Oversized {
+                path,
+                header,
+                total_lines,
+                total_bytes,
+            } => {
+                rows.push(PreparedRow::FileHeader {
+                    file_idx,
+                    path: path.clone().into(),
+                    label: header.label.clone(),
+                    stats: None,
+                    folded,
+                });
+                if folded {
+                    continue;
+                }
+                rows.push(PreparedRow::Special {
+                    text: format!(
+                        "Diff too large to render — {total_lines} lines, {:.1} MB (body suppressed)",
+                        *total_bytes as f64 / 1_048_576.0
+                    ),
                 });
             }
             FilePlan::ModeOnly {

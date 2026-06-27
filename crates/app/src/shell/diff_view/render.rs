@@ -49,6 +49,16 @@ pub enum FilePlan {
         total_lines: usize,
         hunk_count: usize,
     },
+    /// Past the hard render ceiling ([`MAX_RENDERED_DIFF_LINES`] /
+    /// [`MAX_RENDERED_DIFF_BYTES`]): body suppressed unconditionally, a notice
+    /// shown instead. Distinct from `Collapsed` — there is no expand affordance
+    /// because building the per-line plan is exactly what we're avoiding.
+    Oversized {
+        path: String,
+        header: FileHeader,
+        total_lines: usize,
+        total_bytes: usize,
+    },
     /// Binary file body: no patch text.
     Binary { path: String, header: FileHeader },
     /// Mode-only change (no hunks). When mode change *and* content both
@@ -112,6 +122,20 @@ pub struct LinePlan {
 /// gutter slivers, and word-diff — only per-token syntax color drops.
 pub const SYNTAX_HIGHLIGHT_BUDGET_LINES: usize = 4000;
 
+/// Hard ceiling past which a single file's diff body is not built at all — a
+/// fallback notice is shown instead. Unlike `large`/`Collapsed` (a soft,
+/// expandable collapse at 1000 lines), this is an absolute backstop: even an
+/// explicit expand won't build a per-line plan for a pathological diff
+/// (generated code, minified bundle, accidental binary-as-text). `uniform_list`
+/// virtualizes *painting*, but the plan itself allocates one row per line, so
+/// without this cap a multi-million-line diff balloons memory and stalls the
+/// build.
+pub const MAX_RENDERED_DIFF_LINES: usize = 50_000;
+
+/// Companion byte ceiling — a handful of very long lines (minified JS, a
+/// base64 blob) can exhaust memory without tripping the line cap.
+pub const MAX_RENDERED_DIFF_BYTES: usize = 8 * 1024 * 1024;
+
 /// Build the pure render plan. Highlighting is gated on the total body size:
 /// a very large multi-file diff renders without syntax color to stay
 /// responsive (see [`SYNTAX_HIGHLIGHT_BUDGET_LINES`]).
@@ -145,8 +169,24 @@ fn build_file_plan(d: &FileDiff, expanded: bool, highlight: bool) -> FilePlan {
             new_mode: *new_mode,
         },
         _ => {
+            let total_lines: usize = d.hunks.iter().map(|h| h.lines.len()).sum();
+            let total_bytes: usize = d
+                .hunks
+                .iter()
+                .flat_map(|h| h.lines.iter())
+                .map(|l| l.content.len())
+                .sum();
+            // Absolute backstop — applies even when `expanded`, so a user
+            // can't force a pathological diff to build its full per-line plan.
+            if total_lines > MAX_RENDERED_DIFF_LINES || total_bytes > MAX_RENDERED_DIFF_BYTES {
+                return FilePlan::Oversized {
+                    path,
+                    header,
+                    total_lines,
+                    total_bytes,
+                };
+            }
             if d.large && !expanded {
-                let total_lines: usize = d.hunks.iter().map(|h| h.lines.len()).sum();
                 FilePlan::Collapsed {
                     path,
                     header,
