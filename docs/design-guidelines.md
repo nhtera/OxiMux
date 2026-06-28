@@ -225,6 +225,7 @@ anchor; only the worktree tail reorders.
 | `left_rail::row_menu::ROW_MENU_ITEM_H` | 28 (vs `h_overlay_item` 30) | Narrow rail context reads tighter at 28px |
 | `project_picker::ROW_HEIGHT` | 40 + `ROW_PAD_X` 16 | Modal-scale picker, not floating overlay |
 | `workspace_card::CARD_HEIGHT_MULT` | 2.2 × `h_row` | Two-line rich card (name + agent verb/diff); same local-exception pattern as `ROW_HEIGHT_MULT = 1.6` |
+| `workspace_card` compact mode | `h_row` (single line) | Opt-in compact card density: drops the second line (agent verb / diff) for users with many workspaces; toggled from the Projects header and persisted |
 | `stash_panel::STASH_ACTION_REST_OPACITY` | cluster ghosted to 0.45 at rest (vs fully hidden) | No context-menu fallback for stash rows, so Apply/Pop/Drop must never fully hide — ghost-at-rest keeps every verb reachable while still calming the row |
 
 ## Button Variants × Sizes

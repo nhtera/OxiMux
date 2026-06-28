@@ -76,6 +76,9 @@ pub fn render_workspace_card(
     locate_glow_seq: u64,
     drag: Option<WorkspaceDragConfig>,
     rename: Option<RowRenameConfig>,
+    // Single-line compact layout: drops the second line (agent verb / diff)
+    // and shrinks the card to one row height. Detailed (two-line) when false.
+    compact: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -375,7 +378,11 @@ pub fn render_workspace_card(
         .flex()
         .flex_row()
         .items_center()
-        .h(px(density.h_row * CARD_HEIGHT_MULT))
+        .h(px(if compact {
+            density.h_row
+        } else {
+            density.h_row * CARD_HEIGHT_MULT
+        }))
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .cursor_pointer();
@@ -439,7 +446,9 @@ pub fn render_workspace_card(
                 .flex_col()
                 .gap(px(2.0))
                 .child(line1)
-                .child(line2),
+                // Compact mode shows only the title line; the second line
+                // (agent verb / diff) is dropped to fit a single row height.
+                .when(!compact, |c| c.child(line2)),
         )
         .children(trailing_btn)
         .on_mouse_down(MouseButton::Left, on_row_click)
