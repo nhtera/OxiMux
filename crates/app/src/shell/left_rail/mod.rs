@@ -238,9 +238,13 @@ pub struct LeftRail {
     /// Smart rows don't reshuffle under the cursor right after a status
     /// change). Keyed by project id. Not persisted.
     smart_settle: HashMap<String, SettleEntry>,
-    /// `true` while a settle-expiry re-render timer is pending, so render
-    /// arms at most one.
+    /// `true` while a settle-expiry re-render timer is pending, so the refresh
+    /// path arms at most one.
     settle_timer_armed: bool,
+    /// Cached Smart-sort settle overrides (project id → held workspace-id
+    /// order), recomputed off the render path so `render` only reads it.
+    /// Refreshed on data change, sort-mode change, and settle-timer expiry.
+    settle_override_cache: HashMap<String, Vec<String>>,
     /// Active drag auto-scroll step: `+` scrolls toward the top of the list,
     /// `-` toward the bottom, `0` = no auto-scroll. Set from the cursor's
     /// position relative to the list bounds during a drag.
@@ -306,6 +310,7 @@ impl LeftRail {
             tasks_view,
             smart_settle: HashMap::new(),
             settle_timer_armed: false,
+            settle_override_cache: HashMap::new(),
             autoscroll: 0.0,
             autoscroll_armed: false,
             renaming_workspace: None,
@@ -418,18 +423,19 @@ impl LeftRail {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
-        if self.dashboard_filter_input.is_none() {
-            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter…"));
-            let sub = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.dashboard_filter = input.read(cx).value().to_string();
-                    cx.notify();
-                }
-            });
-            self.dashboard_filter_input = Some(input);
-            self._dashboard_filter_sub = Some(sub);
+        if let Some(input) = &self.dashboard_filter_input {
+            return input.clone();
         }
-        self.dashboard_filter_input.clone().expect("just set")
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter…"));
+        let sub = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.dashboard_filter = input.read(cx).value().to_string();
+                cx.notify();
+            }
+        });
+        self.dashboard_filter_input = Some(input.clone());
+        self._dashboard_filter_sub = Some(sub);
+        input
     }
 
     /// Clear all held Smart-sort orders so the next render re-locks fresh
@@ -437,22 +443,28 @@ impl LeftRail {
     /// immediately rather than waiting out the settle window.
     pub(crate) fn clear_sort_settle(&mut self) {
         self.smart_settle.clear();
+        // Drop any held order immediately so the next render re-sorts fresh
+        // rather than waiting for the next data push to refresh the cache.
+        self.settle_override_cache.clear();
     }
 
-    /// Reconcile the per-project Smart-sort settle and return id-order
-    /// overrides to apply this render. For each project, compares the
-    /// freshly-computed Smart order against the held one: within the settle
-    /// window and with unchanged membership, the held order wins (and a single
-    /// expiry timer is armed); otherwise a fresh order is locked. Returns an
-    /// empty map outside Smart mode.
-    fn compute_settle_overrides(&mut self, cx: &mut Context<Self>) -> HashMap<String, Vec<String>> {
+    /// Recompute the per-project Smart-sort settle overrides and store them in
+    /// `settle_override_cache` for the next render to read. For each project,
+    /// compares the freshly-computed Smart order against the held one: within
+    /// the settle window and with unchanged membership, the held order wins
+    /// (and a single expiry timer is armed); otherwise a fresh order is locked.
+    /// Caches an empty map outside Smart mode. Call this off the render path —
+    /// on data change, sort-mode change, or settle-timer expiry — so render
+    /// never mutates state or arms a timer.
+    fn refresh_settle_cache(&mut self, cx: &mut Context<Self>) {
         let mut overrides = HashMap::new();
         // Settle applies to Smart only — Recent/Manual orders don't move when an
         // agent status changes. Leaving Smart drops stale state so a later
         // return to Smart re-locks fresh.
         if self.sort_mode != WorkspaceSortMode::Smart {
             self.smart_settle.clear();
-            return overrides;
+            self.settle_override_cache = overrides;
+            return;
         }
         // Snapshot the freshly-sorted id order + pinned set per project under
         // an immutable borrow, then reconcile against the cache (mutable) in a
@@ -512,7 +524,7 @@ impl LeftRail {
         if within_window {
             self.arm_settle_timer(cx);
         }
-        overrides
+        self.settle_override_cache = overrides;
     }
 
     /// Arm a single timer that fires at the end of the settle window to drop
@@ -527,7 +539,9 @@ impl LeftRail {
             cx.background_executor().timer(SMART_SETTLE).await;
             let _ = this.update(cx, |this, cx| {
                 this.settle_timer_armed = false;
-                this.smart_settle.retain(|_, e| e.at.elapsed() < SMART_SETTLE);
+                // Recompute off the render path: expired holds fall away and a
+                // fresh order locks, refreshing the cache render will read.
+                this.refresh_settle_cache(cx);
                 cx.notify();
             });
         })
@@ -646,6 +660,7 @@ impl LeftRail {
         if let Some(repo) = &self.settings_repo {
             left_rail_layout::save_sort_mode(repo, self.sort_mode);
         }
+        self.refresh_settle_cache(cx);
         cx.notify();
     }
 
@@ -839,6 +854,11 @@ impl LeftRail {
         // above). A no-op frame keeps the last render — no churn on hover or
         // while an agent merely streams output.
         if changed {
+            // Refresh the settle cache off the render path so render only reads
+            // it. Gated on `changed` for the same reason as notify — settle
+            // inputs (order, pinned, status) only move when the snapshot does;
+            // the expiry timer handles the time-only case.
+            self.refresh_settle_cache(cx);
             cx.notify();
         }
     }
@@ -986,9 +1006,10 @@ impl Render for LeftRail {
                 .child(self.tasks_view.clone())
                 .into_any_element()
         } else {
-            // Reconcile the Smart-sort settle before building rows so held
-            // orders override the freshly-computed ones for this render.
-            let settle_overrides = self.compute_settle_overrides(cx);
+            // Read the pre-computed Smart-sort settle overrides (refreshed off
+            // the render path, never mutated here) so held orders override the
+            // freshly-computed ones for this render.
+            let settle_overrides = self.settle_override_cache.clone();
             let renaming_id = self.renaming_workspace_id().map(str::to_string);
             let rename_input = self.rename_input.clone();
             let workspace_list = render_workspace_list(

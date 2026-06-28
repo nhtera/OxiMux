@@ -407,10 +407,13 @@ pub fn render_workspace_card(
     // the right gap — keeping the visible left/right gaps symmetric. The flex
     // wrapper means this no longer overflows, so all four corners still round.
     let shell = if plan.row.is_active && active_shell {
+        // Single-agent active card uses the same solid active border as the
+        // multi-agent wrapper so the selection reads consistently regardless
+        // of how many agents are running on the workspace.
         base.ml(px(density.gap_inline))
             .rounded(px(density.r_card))
             .border_1()
-            .border_color(theme.border_inactive)
+            .border_color(theme.border_active)
             .bg(plan.row.bg)
     } else if plan.row.is_active {
         base.rounded(px(density.r_card))
