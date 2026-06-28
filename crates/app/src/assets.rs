@@ -43,6 +43,16 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/list-collapse.svg",
         include_bytes!("../assets/icons/list-collapse.svg"),
     ),
+    // Add-project glyph for the left rail's Projects header.
+    (
+        "icons/folder-plus.svg",
+        include_bytes!("../assets/icons/folder-plus.svg"),
+    ),
+    // Compact/detailed card-density toggle in the left rail's Projects header.
+    (
+        "icons/rows-2.svg",
+        include_bytes!("../assets/icons/rows-2.svg"),
+    ),
     (
         "icons/refresh-cw.svg",
         include_bytes!("../assets/icons/refresh-cw.svg"),

@@ -1,4 +1,4 @@
-//! Nav rows at the top of the left rail — Tasks / Automations / Agents / Search.
+//! Nav rows at the top of the left rail — Tasks / Agents / Search.
 //!
 //! Shells only in Phase 02 — clicking a row sets `active_nav` but the bodies
 //! show placeholder text until v1-build Phase 07 wires the real entities.
@@ -15,30 +15,19 @@ use crate::shell::left_rail::LeftRail;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavItem {
     Tasks,
-    Automations,
     Agents,
     Search,
 }
 
 const NAV_ICON_SIZE: f32 = 16.0;
 
-/// Feature gate for the Automations nav row. The page behind it is not
-/// built yet; flip to `true` when the build-out lands.
-const SHOW_AUTOMATIONS: bool = false;
-
 impl NavItem {
-    pub const ALL: [NavItem; 4] = [
-        NavItem::Tasks,
-        NavItem::Automations,
-        NavItem::Agents,
-        NavItem::Search,
-    ];
+    pub const ALL: [NavItem; 3] = [NavItem::Tasks, NavItem::Agents, NavItem::Search];
 
     /// Asset path for the row's leading icon. Resolved by `CompositeAssets`.
     pub fn icon_path(self) -> &'static str {
         match self {
             NavItem::Tasks => "icons/inbox.svg",
-            NavItem::Automations => "icons/bell.svg",
             NavItem::Agents => "icons/bot.svg",
             NavItem::Search => "icons/search.svg",
         }
@@ -48,7 +37,6 @@ impl NavItem {
     pub fn label(self) -> &'static str {
         match self {
             NavItem::Tasks => "Tasks",
-            NavItem::Automations => "Automations",
             NavItem::Agents => "Agents",
             NavItem::Search => "Search",
         }
@@ -99,11 +87,6 @@ pub fn render_nav_section(
 ) -> impl IntoElement {
     let mut col = div().flex().flex_col().w_full();
     for item in NavItem::ALL {
-        // Hidden until the feature ships — a nav row that opens an empty
-        // stub is a dead click target, worse than no row.
-        if item == NavItem::Automations && !SHOW_AUTOMATIONS {
-            continue;
-        }
         let badge = if item == NavItem::Agents {
             agents_unread
         } else {
@@ -214,15 +197,6 @@ mod tests {
     }
 
     #[test]
-    fn active_automations_returns_bg_overlay() {
-        let t = Theme::charcoal();
-        assert_eq!(
-            nav_row_bg(NavItem::Automations, Some(NavItem::Automations), t),
-            t.bg_overlay
-        );
-    }
-
-    #[test]
     fn active_agents_returns_bg_overlay() {
         let t = Theme::charcoal();
         assert_eq!(
@@ -285,6 +259,6 @@ mod tests {
 
     #[test]
     fn all_nav_items_covered() {
-        assert_eq!(NavItem::ALL.len(), 4);
+        assert_eq!(NavItem::ALL.len(), 3);
     }
 }

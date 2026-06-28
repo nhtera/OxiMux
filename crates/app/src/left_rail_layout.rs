@@ -111,6 +111,27 @@ pub fn save_sort_mode(repo: &SettingsRepo, mode: WorkspaceSortMode) {
     }
 }
 
+/// Settings key holding the compact-card display preference for the left rail.
+pub const KEY_LEFT_RAIL_COMPACT_CARDS: &str = "left_rail_compact_cards";
+
+/// Load the persisted compact-card preference. Missing / unparsable / error →
+/// `false` (detailed two-line cards).
+pub fn load_compact_cards(repo: &SettingsRepo) -> bool {
+    matches!(repo.get(KEY_LEFT_RAIL_COMPACT_CARDS), Ok(Some(s)) if s.trim() == "true")
+}
+
+/// Persist the compact-card preference. Error is logged and swallowed — a
+/// layout preference shouldn't take down the app.
+pub fn save_compact_cards(repo: &SettingsRepo, compact: bool) {
+    let encoded = if compact { "true" } else { "false" };
+    if let Err(err) = repo.set(KEY_LEFT_RAIL_COMPACT_CARDS, encoded) {
+        tracing::warn!(
+            target: "oximux_app::left_rail_layout",
+            "failed to persist left_rail_compact_cards: {err}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

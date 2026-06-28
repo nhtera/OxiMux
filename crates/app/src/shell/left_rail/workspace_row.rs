@@ -39,25 +39,6 @@ pub struct DiffCounts {
     pub removed: u32,
 }
 
-/// Reserved placeholder for a future PR-state chip. The field is wired into
-/// the card plan so the painter can pattern-match on it, but it is never
-/// populated in this implementation (remote-host integration is out of scope).
-/// `allow(dead_code)` keeps the reserved shape without a warning until then.
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PrChip {
-    pub number: u32,
-    pub state: PrState,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PrState {
-    Open,
-    Merged,
-    Closed,
-}
-
 /// Sum a numstat `path → (added, removed)` map into a single `DiffCounts`
 /// total. Pure + testable; used by the background diff-count refresh to
 /// collapse a per-file numstat result into the worktree-level chip value.
@@ -120,9 +101,6 @@ pub struct WorkspaceCardPlan {
     /// Working-tree diff counts. `None` when not yet fetched or unavailable;
     /// card omits the `+A −B` chip gracefully.
     pub diff: Option<DiffCounts>,
-    /// Reserved for a future PR-state chip. Always `None` in this
-    /// implementation — GitHub integration is out of scope.
-    pub pr: Option<PrChip>,
     /// GitHub issue/PR reference (e.g. `"#42"`) this workspace was created
     /// from, shown as a small badge. `None` for manually-created workspaces.
     pub linked_issue: Option<String>,
@@ -232,7 +210,6 @@ pub fn build_workspace_card_plan(
         agent_name,
         agent_title,
         diff,
-        pr: None, // GitHub integration is out of scope
         linked_issue: workspace.linked_issue.clone(),
         tint: workspace.tint.as_deref().and_then(TabColor::from_slug),
         pinned: workspace.pinned,
@@ -735,15 +712,6 @@ mod tests {
         let w = ws("X", "x");
         let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
         assert!(plan.diff.is_none());
-    }
-
-    #[test]
-    fn card_plan_pr_always_none() {
-        // GitHub integration is out of scope — field is reserved, never populated.
-        let t = Theme::charcoal();
-        let w = ws("X", "x");
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
-        assert!(plan.pr.is_none());
     }
 
     #[test]

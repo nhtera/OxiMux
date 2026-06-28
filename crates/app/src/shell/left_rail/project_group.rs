@@ -31,16 +31,17 @@ const CHEVRON_ICON_SIZE: f32 = 12.0;
 const IDENTITY_DOT_SIZE: f32 = 6.0;
 
 /// Deterministic low-saturation identity hue for a project, derived from its
-/// id so the same project always shows the same accent across restarts (the
-/// hash is stable within a given build; a future toolchain could in principle
-/// re-seed `DefaultHasher` and reshuffle the palette, which is purely
-/// cosmetic). Low saturation + mid lightness keeps the accent calm and legible
-/// on the dark rail without competing with the workspace status dots.
+/// id so the same project always shows the same accent across restarts AND
+/// across Rust toolchain upgrades. Uses a fixed FNV-1a fold over the id bytes
+/// rather than `DefaultHasher` (whose SipHash key is process/toolchain-seeded
+/// and would reshuffle the palette on a `rustc` upgrade). Low saturation + mid
+/// lightness keeps the accent calm and legible on the dark rail without
+/// competing with the workspace status dots.
 fn project_identity_hue(project_id: &str) -> gpui::Hsla {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    project_id.hash(&mut hasher);
-    let hue = (hasher.finish() % 360) as f32 / 360.0;
+    let hash = project_id
+        .bytes()
+        .fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
+    let hue = (hash % 360) as f32 / 360.0;
     gpui::hsla(hue, 0.45, 0.62, 1.0)
 }
 
@@ -110,6 +111,7 @@ pub fn render_project_group(
     locate_glow_seq: u64,
     renaming_id: Option<&str>,
     rename_input: Option<Entity<InputState>>,
+    compact: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -310,6 +312,7 @@ pub fn render_project_group(
             locate_glow_seq,
             drag_config,
             rename_config,
+            compact,
             theme,
             density,
             typography,
@@ -328,7 +331,6 @@ pub fn render_project_group(
                     &workspace.id,
                     rows,
                     is_expanded,
-                    is_active,
                     focused_agent,
                     rail.clone(),
                     weak_root.clone(),
@@ -704,5 +706,34 @@ mod tests {
         let expanded = build_project_group_plan(&p, &[], false, false);
         assert!(collapsed.is_collapsed);
         assert!(!expanded.is_collapsed);
+    }
+
+    #[test]
+    fn project_identity_hue_uses_fixed_fnv1a() {
+        // The dot colour must be a pure function of the id bytes — identical
+        // across Rust toolchains. Recompute FNV-1a (32-bit) independently here
+        // so a regression to a process/toolchain-seeded hasher (the old
+        // `DefaultHasher` behaviour) is caught: this test IS the algorithm spec.
+        fn fnv1a_hue(id: &str) -> f32 {
+            let h = id
+                .bytes()
+                .fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
+            (h % 360) as f32 / 360.0
+        }
+        for id in ["oximux", "graphify-rs", "abc-123", ""] {
+            let c = project_identity_hue(id);
+            assert!(
+                (c.h - fnv1a_hue(id)).abs() < f32::EPSILON,
+                "hue must match fixed FNV-1a for {id:?}"
+            );
+            // Saturation/lightness are fixed so the dots stay calm; only hue varies.
+            assert_eq!(c.s, 0.45);
+            assert_eq!(c.l, 0.62);
+        }
+        // Same id always yields the same colour across calls.
+        assert_eq!(
+            project_identity_hue("oximux"),
+            project_identity_hue("oximux")
+        );
     }
 }

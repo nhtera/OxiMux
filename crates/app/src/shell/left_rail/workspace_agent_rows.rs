@@ -204,7 +204,6 @@ pub fn render_workspace_agent_disclosure(
     workspace_key: &str,
     rows: &[RailAgentRow],
     is_expanded: bool,
-    is_active: bool,
     focused_agent: Option<&RailAgentTarget>,
     rail: Entity<LeftRail>,
     weak_root: WeakEntity<WorkspaceRoot>,
@@ -345,7 +344,6 @@ pub fn render_workspace_agent_disclosure(
             let is_focused = focused_agent == Some(&row.target);
             col = col.child(render_agent_sub_row(
                 row,
-                is_active,
                 is_focused,
                 weak_root.clone(),
                 theme,
@@ -471,21 +469,16 @@ pub fn live_title(row: &RailAgentRow) -> Option<LiveTitle> {
 /// One expanded agent sub-row, mirroring the reference cockpit's compact row:
 /// `[status dot] [adapter icon] [activity / verb]  …  [relative age]`. A live
 /// row is clickable to focus its tab; a history-only row is display-only.
-///
-/// `is_active` (the workspace is the selected one) expands the row: the
-/// descriptor WRAPS to its full text on multiple lines and the row grows,
-/// instead of clipping to a single ellipsised line. Inactive workspaces keep
-/// the compact one-line rows so the rail stays scannable.
+/// The row always truncates to a single line regardless of selection, so the
+/// rail stays scannable; a hover tooltip restores the full text on overflow.
 fn render_agent_sub_row(
     row: &RailAgentRow,
-    is_active: bool,
     is_focused: bool,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
-    let _ = is_active;
     let status = row.effective_status();
     // Reference-cockpit compact row: "{primary} - {secondary}", one line.
     //   primary   = the user's prompt, else the agent's name ("Claude Code")
