@@ -65,6 +65,10 @@ struct Session {
     // `Resize`/`Detach` so the daemon updates the right attachment's
     // requested size in its "smallest screen wins" `min` computation.
     attachment_id: u64,
+    // This session's handle in the client's per-PTY subscriber fan-out.
+    // Unique per attachment so teardown removes only OUR output stream and
+    // never a sibling session that shares the same daemon PTY.
+    sub_id: u64,
     state: Arc<Mutex<TerminalState>>,
     cols: u16,
     rows: u16,
@@ -223,13 +227,14 @@ impl RelayBackend {
 
         let id = self.mint_id();
         let generation = Arc::new(AtomicU64::new(1));
-        let notif_rx = self.client.subscribe_pty(relay_pty_id);
+        let (sub_id, notif_rx) = self.client.subscribe_pty(relay_pty_id);
         let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
         lock_recover(&self.sessions, "sessions").insert(
             id,
             Session {
                 relay_pty_id: relay_pty_id.to_owned(),
                 attachment_id,
+                sub_id,
                 state,
                 cols,
                 rows,
@@ -417,13 +422,14 @@ impl TerminalBackend for RelayBackend {
                 .or_default();
         }
         let generation = Arc::new(AtomicU64::new(1));
-        let notif_rx = self.client.subscribe_pty(&relay_pty_id);
+        let (sub_id, notif_rx) = self.client.subscribe_pty(&relay_pty_id);
         let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
         lock_recover(&self.sessions, "sessions").insert(
             id,
             Session {
                 relay_pty_id,
                 attachment_id,
+                sub_id,
                 state,
                 cols: cfg.cols,
                 rows: cfg.rows,
@@ -712,7 +718,7 @@ impl TerminalBackend for RelayBackend {
         queues.renderer.remove(&id);
         drop(queues);
         lock_recover(&self.output_wakers, "output wakers").remove(&id);
-        self.client.unsubscribe_pty(&session.relay_pty_id);
+        self.client.unsubscribe_pty(&session.relay_pty_id, session.sub_id);
         // Defer the synchronous relay Close round-trip to a detached
         // tokio task so the outer `Arc<Mutex<Box<dyn TerminalBackend>>>`
         // lock (held by `TerminalView::drop`'s spawned thread while
@@ -777,7 +783,7 @@ impl TerminalBackend for RelayBackend {
         queues.renderer.remove(&id);
         drop(queues);
         lock_recover(&self.output_wakers, "output wakers").remove(&id);
-        self.client.unsubscribe_pty(&session.relay_pty_id);
+        self.client.unsubscribe_pty(&session.relay_pty_id, session.sub_id);
         // Release this attachment in the daemon. Detach (not Close) keeps the
         // PTY alive; it also drops this attachment from the daemon's
         // smallest-screen-wins `min`, so the surviving / destination window
