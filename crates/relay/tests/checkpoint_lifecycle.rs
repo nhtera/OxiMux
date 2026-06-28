@@ -210,3 +210,44 @@ async fn attach_after_exit_replays_exit_to_new_subscriber() {
     .expect("reconnecting subscriber is replayed Exit");
     assert_eq!(code_b, Some(0), "replayed Exit carries the real status");
 }
+
+#[tokio::test]
+async fn exited_pty_is_excluded_from_list() {
+    // `list()` backs the restore liveness gate (`live_external_ids`). A PTY
+    // whose child has exited is retained for replay/cold-restore, but it must
+    // NOT be reported as live — otherwise restore warm-re-attaches to the
+    // corpse, shows its frozen scrollback, and silently swallows every
+    // keystroke (writes land on a PTY with no reader). A dead session must
+    // fall through to a fresh respawn instead.
+    let registry = PtyRegistry::with_checkpoints(None);
+    let pty_id = registry.spawn(spawn_args()).expect("spawn");
+
+    // While the child is alive, the session is a valid re-attach target.
+    assert!(
+        registry.list().iter().any(|d| d.pty_id == pty_id),
+        "a live PTY must be listed"
+    );
+
+    // Drive the shell to a clean exit and wait until the registry observes it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(64);
+    registry.attach(&pty_id, tx).expect("attach");
+    registry.write(&pty_id, b"exit\n").expect("write exit");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(Notification::Exit { .. }) => break,
+                Some(_) => continue,
+                None => panic!("channel closed before Exit"),
+            }
+        }
+    })
+    .await
+    .expect("shell exits");
+
+    // The corpse is gone from the live list, so a restore gate keyed on it
+    // respawns rather than attaching a dead, input-less pane.
+    assert!(
+        !registry.list().iter().any(|d| d.pty_id == pty_id),
+        "an exited PTY must be excluded from list()"
+    );
+}

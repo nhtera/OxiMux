@@ -507,9 +507,17 @@ impl PtyRegistry {
         }
     }
 
+    /// PTYs available for warm re-attach. A PTY whose child has already
+    /// exited is kept in the registry (its ring + checkpoint back replay and
+    /// cold-restore), but it is NOT live: re-attaching to it shows the
+    /// replayed scrollback while every keystroke writes to a PTY with no
+    /// reader, so the pane looks alive yet silently swallows input. Excluding
+    /// exited entries here makes the restore liveness gate honest, so a dead
+    /// session falls through to a fresh respawn instead of attaching a corpse.
     pub fn list(&self) -> Vec<PtyDescriptor> {
         self.entries
             .iter()
+            .filter(|kv| !kv.value().child_exited.load(Ordering::Acquire))
             .map(|kv| {
                 let e = kv.value();
                 PtyDescriptor {
