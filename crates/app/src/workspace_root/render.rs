@@ -343,6 +343,40 @@ impl Render for WorkspaceRoot {
                     },
                 ),
             )
+            // Route commit-graph height-resize drag ticks. The handle lives
+            // at the graph section's top edge inside the SCM panel; like the
+            // sidebar/rail handles its move listener has to sit on this
+            // full-size row so the cursor stays inside the listener's bounds
+            // for the whole drag (and so it keeps firing while the cursor
+            // travels over the graph's own commit rows — a listener nested
+            // inside the SCM panel stops firing over child entities). The
+            // window height for the clamp ceiling comes off this row's live
+            // bounds. Reaches the graph through right_sidebar → source_control.
+            .on_drag_move::<crate::shell::source_control::graph::GraphResizePayload>(
+                cx.listener(
+                    |this,
+                     ev: &DragMoveEvent<
+                        crate::shell::source_control::graph::GraphResizePayload,
+                    >,
+                     _window,
+                     cx| {
+                        let cursor_y = f32::from(ev.event.position.y);
+                        let window_height = f32::from(ev.bounds.size.height);
+                        let Some(sidebar) = this.right_sidebar.clone() else {
+                            return;
+                        };
+                        sidebar.update(cx, |s, cx| {
+                            if let Some(panel) = s.source_control.clone() {
+                                panel.update(cx, |p, cx| {
+                                    p.commit_graph.update(cx, |g, cx| {
+                                        g.apply_graph_drag(cursor_y, window_height, cx);
+                                    });
+                                });
+                            }
+                        });
+                    },
+                ),
+            )
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
