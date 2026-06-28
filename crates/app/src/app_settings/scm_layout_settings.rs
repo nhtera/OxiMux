@@ -50,9 +50,12 @@ pub const DEFAULT_GRAPH_HEIGHT: f32 = 240.0;
 pub const MIN_GRAPH_HEIGHT: f32 = 96.0;
 
 /// Maximum graph height expressed as a ratio of the window height.
-/// 33vh keeps the file list + diff view above it from getting squeezed
-/// off-screen on a small laptop display.
-pub const MAX_GRAPH_HEIGHT_VH_RATIO: f32 = 0.33;
+/// 70vh lets the user pull the graph up to fill most of the panel (the
+/// VS Code gesture) while still leaving the file list a usable strip; the
+/// `MIN_GRAPH_HEIGHT` floor on the *other* sections is implicit — the
+/// commit area + filter row never collapse because they sit above the
+/// `flex_1` file list that absorbs the squeeze first.
+pub const MAX_GRAPH_HEIGHT_VH_RATIO: f32 = 0.7;
 
 // ---------------------------------------------------------------------------
 // Clamps
@@ -222,9 +225,9 @@ mod tests {
 
     #[test]
     fn clamp_graph_height_over_max_snaps_to_vh_ceiling() {
-        // window 900 → ceiling = 900 * 0.33 = 297
+        // window 900 → ceiling = 900 * MAX_GRAPH_HEIGHT_VH_RATIO
         let h = clamp_graph_height(5000.0, 900.0);
-        assert!((h - 297.0).abs() < 0.001);
+        assert!((h - 900.0 * MAX_GRAPH_HEIGHT_VH_RATIO).abs() < 0.001);
     }
 
     #[test]
@@ -291,7 +294,7 @@ mod tests {
         let r = repo();
         r.set(KEY_SCM_GRAPH_HEIGHT, "5000").unwrap();
         let h = load_graph_height(&r, 900.0);
-        assert!((h - 297.0).abs() < 0.001);
+        assert!((h - 900.0 * MAX_GRAPH_HEIGHT_VH_RATIO).abs() < 0.001);
     }
 
     #[test]
@@ -336,7 +339,7 @@ mod tests {
         // clamp_graph_height stays the single source of truth on
         // bounds. Caller is expected to clamp.
         let candidate = next_graph_height(200.0, "end", false, 900.0).unwrap();
-        assert!((candidate - 297.0).abs() < 0.001);
+        assert!((candidate - 900.0 * MAX_GRAPH_HEIGHT_VH_RATIO).abs() < 0.001);
     }
 
     #[test]

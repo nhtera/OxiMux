@@ -4,12 +4,13 @@
 //! 20-row chunks. State machine: `Loading → Ready | Failed`.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use gpui::{
-    App, ClickEvent, Context, ElementId, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Render, SharedString, Styled, Task, UniformListScrollHandle, Window, div,
-    prelude::FluentBuilder as _, px, uniform_list,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled, Task,
+    UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
@@ -22,6 +23,7 @@ use oximux_storage::SettingsRepo;
 use tokio::sync::oneshot;
 
 use crate::scm_layout_settings;
+use crate::shell::source_control::graph_layout::{RowLayout, compute_graph, max_lanes};
 use crate::shell::source_control::graph_row::render_commit_row;
 use crate::shell::source_control::style as sc_style;
 
@@ -40,6 +42,25 @@ pub struct ShowCommitRequested {
     /// Single-line subject for the tab title; truncated by the tab
     /// strip if too long.
     pub subject: String,
+}
+
+/// Drag payload tagging a graph-height resize. Empty — the new height is
+/// derived per-tick from the cursor position against the anchor captured
+/// in `CommitGraph` at drag start. Exists only so the matching
+/// `on_drag_move` listener on the Source Control panel can type-select
+/// these ticks apart from other drags (sidebar/rail width resizes).
+#[derive(Debug, Clone)]
+pub struct GraphResizePayload;
+
+/// Zero-size drag preview. GPUI's `on_drag` must return an entity to render
+/// the floating cursor preview; an edge resize-handle has none (the section
+/// reflows live each tick), so this renders nothing.
+pub struct GraphResizeGhost;
+
+impl Render for GraphResizeGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(0.0)).h(px(0.0))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +120,24 @@ pub struct CommitGraph {
     /// wholesale on a refresh / fresh `spawn_load_initial`; extended
     /// in place on `load_more` so prior pages keep their stats.
     stat_cache: HashMap<String, (u32, u32)>,
+    /// Precomputed swimlane drawing model, 1:1 with the loaded commits.
+    /// Recomputed whenever the commit set changes (initial load, refresh,
+    /// load-more) rather than per render, since the layout is a function of
+    /// the whole loaded window. `Rc` so the `uniform_list` row closure can
+    /// hold a cheap clone and index it per visible row.
+    graph_layout: Rc<Vec<RowLayout>>,
+    /// Widest lane count across `graph_layout`, clamped to the lane cap.
+    /// Drives the (fixed) gutter width so commit subjects stay aligned.
+    graph_max_lanes: usize,
+    /// `true` while a mouse drag-resize is in flight — keeps the top
+    /// handle's highlight lit (hover styles are suppressed mid-drag) and is
+    /// cleared on the first render after the drag ends.
+    resizing: bool,
+    /// Drag-resize anchor: `(height_at_drag_start, cursor_y_at_first_tick)`.
+    /// The cursor-y is captured lazily on the first move tick (drag-start
+    /// can't read the pointer), after which each tick maps the cursor delta
+    /// to a height delta so the handle stays glued to the pointer.
+    drag_anchor: Option<(f32, Option<f32>)>,
 }
 
 impl CommitGraph {
@@ -125,9 +164,27 @@ impl CommitGraph {
             settings_repo,
             focus_handle,
             stat_cache: HashMap::new(),
+            graph_layout: Rc::new(Vec::new()),
+            graph_max_lanes: 1,
+            resizing: false,
+            drag_anchor: None,
         };
         graph.spawn_load_initial(cx);
         graph
+    }
+
+    /// Recompute the swimlane layout from the currently loaded commits.
+    /// Called after any change to the commit set; a no-op (empty layout)
+    /// when the graph isn't in a `Ready` state.
+    fn recompute_layout(&mut self) {
+        if let GraphState::Ready { commits, .. } = &self.state {
+            let layout = compute_graph(commits);
+            self.graph_max_lanes = max_lanes(&layout);
+            self.graph_layout = Rc::new(layout);
+        } else {
+            self.graph_layout = Rc::new(Vec::new());
+            self.graph_max_lanes = 1;
+        }
     }
 
     /// Current body height — exposed so callers (e.g. snapshot tests
@@ -148,6 +205,41 @@ impl CommitGraph {
         cx: &mut Context<Self>,
     ) {
         let window_height = f32::from(window.bounds().size.height);
+        let clamped = scm_layout_settings::clamp_graph_height(candidate, window_height);
+        let new_height = px(clamped);
+        if self.graph_height == new_height {
+            return;
+        }
+        self.graph_height = new_height;
+        if let Some(repo) = &self.settings_repo {
+            scm_layout_settings::save_graph_height(repo, clamped);
+        }
+        cx.notify();
+    }
+
+    /// Apply one mouse drag-resize tick. `cursor_y` is the pointer's
+    /// window-space Y and `window_height` the live window height (both from
+    /// the workspace-root `on_drag_move` listener — it reads the window
+    /// height off the listener-div bounds, so this never threads a `Window`
+    /// through the nested entity updates). The first tick of a drag latches
+    /// the anchor cursor-y; thereafter the height tracks the cursor delta —
+    /// dragging the handle UP (smaller `cursor_y`) grows the section, DOWN
+    /// shrinks it — clamped and persisted. No-op when no drag is armed.
+    pub fn apply_graph_drag(&mut self, cursor_y: f32, window_height: f32, cx: &mut Context<Self>) {
+        let Some((start_height, start_y)) = self.drag_anchor else {
+            return;
+        };
+        self.resizing = true;
+        let start_y = match start_y {
+            Some(y) => y,
+            None => {
+                // First move tick — latch the pointer origin and wait for
+                // real movement before changing the height.
+                self.drag_anchor = Some((start_height, Some(cursor_y)));
+                return;
+            }
+        };
+        let candidate = start_height + (start_y - cursor_y);
         let clamped = scm_layout_settings::clamp_graph_height(candidate, window_height);
         let new_height = px(clamped);
         if self.graph_height == new_height {
@@ -259,6 +351,7 @@ impl CommitGraph {
                                 },
                                 Err(e) => GraphState::Failed(e.to_string()),
                             };
+                            g.recompute_layout();
                         }
                         InitialLoad::Stats(stats) => {
                             // Wholesale replace — a fresh load drops every
@@ -343,6 +436,10 @@ impl CommitGraph {
                         }
                     }
                 }
+                // Re-layout outside the `&mut g.state` borrow above:
+                // appended parents may resolve lanes that previously hung
+                // off the page bottom. No-op when the load failed.
+                g.recompute_layout();
                 cx.notify();
             });
         });
@@ -420,6 +517,13 @@ impl Focusable for CommitGraph {
 
 impl Render for CommitGraph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A drag-resize is over once no drag is active: releasing the mouse
+        // produces no further drag-move ticks, so the flag (and the latched
+        // anchor) are cleared here on the next render instead.
+        if self.resizing && !cx.has_active_drag() {
+            self.resizing = false;
+            self.drag_anchor = None;
+        }
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
@@ -568,6 +672,11 @@ impl Render for CommitGraph {
                 let theme_cap = theme;
                 let typography_cap = self.typography.clone();
                 let density_cap = self.density;
+                // Precomputed swimlane model (1:1 with `commits`) + the
+                // page's fixed gutter width. Cheap `Rc`/`usize` clones into
+                // the row closure.
+                let layout = self.graph_layout.clone();
+                let max_lanes_cap = self.graph_max_lanes;
                 // Snapshot the stat cache once for the closure so
                 // each row's lookup is a constant-time HashMap hit.
                 // Cloning at most 20–60 (oid → (u32, u32)) entries is
@@ -605,8 +714,16 @@ impl Render for CommitGraph {
                         for ix in range {
                             if let Some(c) = commits.get(ix) {
                                 let stats = stat_cache.get(&c.oid).copied();
+                                // Layout is rebuilt in lockstep with
+                                // `commits`, so `ix` indexes both. The
+                                // `unwrap_or_default` only guards a
+                                // transient frame where a fresh page
+                                // painted before its relayout landed.
+                                let row_layout = layout.get(ix).cloned().unwrap_or_default();
                                 rows.push(render_commit_row(
                                     c,
+                                    &row_layout,
+                                    max_lanes_cap,
                                     theme_cap,
                                     density_cap,
                                     &typography_cap,
@@ -676,8 +793,14 @@ impl Render for CommitGraph {
             .flex_col()
             .flex_shrink_0()
             .w_full()
-            .bg(theme.bg_panel)
-            .child(header);
+            .bg(theme.bg_panel);
+        // Mouse drag-resize handle at the section's top edge (only when
+        // expanded — there's nothing to resize when collapsed). The matching
+        // `on_drag_move` listener lives on the Source Control panel root.
+        if !self.collapsed {
+            col = col.child(self.render_drag_handle(cx));
+        }
+        col = col.child(header);
         if !self.collapsed {
             col = col.child(body);
             if let Some(lm) = load_more {
@@ -694,7 +817,59 @@ impl Render for CommitGraph {
     }
 }
 
+/// Total mouse hit-height of the top drag handle. A touch taller than the
+/// visible line so the grab zone is forgiving (the line is centred in it).
+const GRAPH_RESIZE_HIT_PX: f32 = 9.0;
+/// Height of the hover/drag highlight bar painted over the hairline.
+const GRAPH_RESIZE_BAR_PX: f32 = 3.0;
+
 impl CommitGraph {
+    /// Build the mouse drag-resize handle at the TOP edge of the graph
+    /// section (the boundary it shares with the content above). Dragging it
+    /// up grows the graph, down shrinks it — the VS Code gesture. A hairline
+    /// at rest; a wider `border_active` bar lights on hover and stays lit for
+    /// the whole drag via `resizing`. The matching `on_drag_move` listener
+    /// lives on the Source Control panel root so the cursor stays inside its
+    /// bounds even as it travels up out of this section.
+    fn render_drag_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let resizing = self.resizing;
+        let weak = cx.entity().downgrade();
+        // Visible hairline centred in the hit zone; a wider bar lights over
+        // it on hover / during a drag. Centring the line gives a few px of
+        // grab tolerance on either side.
+        let hover_bar = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px((GRAPH_RESIZE_HIT_PX - GRAPH_RESIZE_BAR_PX) / 2.0))
+            .h(px(GRAPH_RESIZE_BAR_PX))
+            .bg(theme.border_inactive)
+            .group_hover("graph-resize", move |s| s.bg(theme.border_active))
+            .when(resizing, |b| b.bg(theme.border_active));
+        div()
+            .id(ElementId::Name(SharedString::from("graph-resize-handle")))
+            .group("graph-resize")
+            .relative()
+            .w_full()
+            .h(px(GRAPH_RESIZE_HIT_PX))
+            .flex_shrink_0()
+            .cursor_row_resize()
+            .occlude()
+            .child(hover_bar)
+            .on_drag(GraphResizePayload, move |_payload, _offset, _window, cx| {
+                // Latch the height at drag start; the cursor origin is
+                // captured on the first move tick (drag-start can't read the
+                // pointer position).
+                let _ = weak.update(cx, |g, _| {
+                    g.drag_anchor = Some((f32::from(g.graph_height), None));
+                    g.resizing = true;
+                });
+                cx.new(|_| GraphResizeGhost)
+            })
+            .into_any_element()
+    }
+
     /// Build the focusable keyboard-resize rail rendered at the bottom
     /// of the graph section. 3px tall; subtle by default, accent stripe
     /// on focus + hover. cursor `row_resize` for parity with mouse

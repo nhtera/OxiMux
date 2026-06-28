@@ -22,6 +22,8 @@ use oximux_core::{CommitInfo, RefLabel};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::source_control::graph::{CommitGraph, ShowCommitRequested};
+use crate::shell::source_control::graph_gutter::graph_gutter;
+use crate::shell::source_control::graph_layout::RowLayout;
 use crate::shell::source_control::style as sc_style;
 
 /// Max ref chips rendered inline per commit row before the overflow
@@ -35,8 +37,11 @@ const REF_CHIPS_VISIBLE: usize = 2;
 /// name). `stats` is `Some((added, removed))` once the per-commit
 /// numstat backend has populated the cache; until then the tooltip
 /// renders without the stats line.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_commit_row(
     c: &CommitInfo,
+    layout: &RowLayout,
+    max_lanes: usize,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -44,28 +49,18 @@ pub(super) fn render_commit_row(
     show_author: bool,
     stats: Option<(u32, u32)>,
 ) -> AnyElement {
-    // Single-line row: dot + subject (truncates) + author + date + short sha.
-    // Reference layout collapses the v1 two-line "subject / author • date"
-    // into one tight row so 20+ commits stay scannable inside the sidebar.
+    // Single-line row: graph gutter + subject (truncates) + author + date +
+    // short sha. Reference layout collapses the v1 two-line "subject /
+    // author • date" into one tight row so 20+ commits stay scannable
+    // inside the sidebar.
     //
-    // The timeline column stacks a connector line above the dot and another
-    // below it, so consecutive rows draw an unbroken vertical line through
-    // the dot centers (the canonical commit-graph spine).
-    let timeline = div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .w(px(14.0))
-        .h_full()
-        .child(div().w(px(1.0)).flex_1().bg(theme.border_inactive))
-        .child(
-            div()
-                .w(px(8.0))
-                .h(px(8.0))
-                .rounded_full()
-                .bg(theme.focus_ring),
-        )
-        .child(div().w(px(1.0)).flex_1().bg(theme.border_inactive));
+    // The gutter draws the branch/merge DAG for this row: the node circle
+    // sits at the commit's lane, with the lane lines (pass-through, fold-in,
+    // fan-out) painted around it. Lane layout is precomputed in
+    // `graph_layout`; the gutter only paints. `is_head` accents the current
+    // checkout's node.
+    let is_head = c.refs.iter().any(|r| matches!(r, RefLabel::Head));
+    let gutter = graph_gutter(layout, max_lanes, sc_style::COMMIT_ROW_H, is_head, theme);
 
     // Subject flex-grows but truncates. `w_full` on the outer row gives the
     // `flex_1` child a definite width to shrink against; without it taffy
@@ -169,7 +164,7 @@ pub(super) fn render_commit_row(
         .overflow_hidden()
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover_overlay))
-        .child(timeline.self_stretch())
+        .child(gutter)
         .child(subject)
         .when_some(chips, |row, chips| row.child(chips))
         .when(show_author, |row| row.child(author))

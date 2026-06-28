@@ -188,6 +188,15 @@ pub struct CommitInfo {
     /// HEAD chip.
     #[serde(default)]
     pub refs: Vec<RefLabel>,
+    /// Full 40-char SHAs of this commit's parents, in git's emission
+    /// order (`%P`). Empty for a root commit; one entry for a normal
+    /// commit; two-or-more for a merge. The commit-graph layout matches
+    /// these against the `oid` of later rows to draw the branch/merge
+    /// lanes, so they're full hashes (not the 7-char short form) for an
+    /// unambiguous join. `serde(default)` keeps older persisted commit
+    /// records (written before the field existed) decodable.
+    #[serde(default)]
+    pub parents: Vec<String>,
 }
 
 /// One ref pointing at a commit. Modeled to mirror the decorate
