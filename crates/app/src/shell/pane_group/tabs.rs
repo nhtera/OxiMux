@@ -1311,12 +1311,16 @@ impl PaneGroup {
         self.bump_mru(idx);
         let changed = idx != self.active;
         self.active = idx;
-        // Always land keyboard focus on the active tab's content, even when it
-        // was already active. Activating a tab — including re-selecting the
-        // current one from the sidebar rail or a notification — means "type
-        // here now", so the terminal is ready for input without a second click.
-        // Only the repaint is conditional; the focus change drives its own.
-        self.focus_active(window, cx);
+        // Land keyboard focus on the active tab's content so it's ready for
+        // input — even when re-selecting the already-active tab. The focus is
+        // DEFERRED to the next frame: focusing synchronously here is clobbered
+        // by GPUI's post-click focus dispatch when activation comes from a
+        // tab-bar or sidebar-rail click, which would otherwise leave the
+        // terminal unfocused (a second click was needed before typing).
+        let group = cx.entity();
+        window.defer(cx, move |window, app| {
+            group.update(app, |g, cx| g.focus_active(window, cx));
+        });
         if changed {
             cx.notify();
         }
