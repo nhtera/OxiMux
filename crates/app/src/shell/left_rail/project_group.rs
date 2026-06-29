@@ -411,12 +411,26 @@ pub(crate) fn render_workspace_block(
             // One highlighted container around the card + its agent rows, like
             // the reference cockpit. `border_active` keeps the box clearly
             // delineated; the fill matches the single-agent active card.
+            // `relative` hosts the locate glow so a multi-agent workspace pulses
+            // on scroll-to-current exactly like a single-agent card — the card's
+            // own glow is suppressed here because its active border moved to this
+            // wrapper. No left inset on the ring: the wrapper already carries it.
+            let wrap_glow = (locate_glow_seq > 0).then(|| {
+                crate::shell::left_rail::workspace_card::locate_glow_overlay(
+                    locate_glow_seq,
+                    px(density.r_card),
+                    px(0.0),
+                    theme.focus_ring,
+                )
+            });
             workspace_block = workspace_block
+                .relative()
                 .ml(px(density.gap_inline))
                 .rounded(px(density.r_card))
                 .border_1()
                 .border_color(theme.border_active)
-                .bg(active_surface_bg);
+                .bg(active_surface_bg)
+                .children(wrap_glow);
         }
 
         workspace_block

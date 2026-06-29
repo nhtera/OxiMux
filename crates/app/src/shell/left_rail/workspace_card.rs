@@ -519,27 +519,15 @@ pub fn render_workspace_card(
     // a dedicated absolute overlay animates its border alpha to zero and
     // leaves no residue. seq == 0 means never triggered (and reduced
     // motion never bumps the seq).
+    // Match the active card's left inset + radius so the ring traces the card
+    // edge, not the full-width wrapper.
     let glow_overlay = (plan.row.is_active && active_shell && locate_glow_seq > 0).then(|| {
-        let ring = theme.focus_ring;
-        div()
-            .absolute()
-            .inset_0()
-            // Match the active card's left inset + radius so the ring traces
-            // the card edge, not the full-width wrapper.
-            .ml(px(density.gap_inline))
-            .rounded(px(density.r_card))
-            .border_1()
-            .with_animation(
-                ElementId::NamedInteger("locate-glow".into(), locate_glow_seq),
-                Animation::new(Duration::from_millis(LOCATE_GLOW_MS))
-                    .with_easing(gpui::ease_out_quint()),
-                move |el, delta| {
-                    el.border_color(Hsla {
-                        a: 1.0 - delta,
-                        ..ring
-                    })
-                },
-            )
+        locate_glow_overlay(
+            locate_glow_seq,
+            px(density.r_card),
+            px(density.gap_inline),
+            theme.focus_ring,
+        )
     });
 
     // Outer wrapper carries the tint accent so it sits at a consistent
@@ -554,4 +542,32 @@ pub fn render_workspace_card(
         .children(tint_bar)
         .child(card)
         .children(glow_overlay)
+}
+
+/// One-shot locate "blink": an absolute ring overlay whose border alpha fades
+/// to zero, keyed on `locate_glow_seq` so it runs exactly once per trigger.
+/// Same recipe as the pane rim-flash. Shared by the single-agent active card
+/// and the multi-agent active wrapper so both pulse identically when the
+/// scroll-to-current affordance fires. The host element must be positioned
+/// (`relative`); `left_margin` insets the ring to trace a card edge inside a
+/// full-width wrapper — pass `px(0.)` when the host already carries that inset
+/// (the multi-agent wrapper does, via its own `ml`).
+pub(crate) fn locate_glow_overlay(
+    locate_glow_seq: u64,
+    radius: gpui::Pixels,
+    left_margin: gpui::Pixels,
+    ring: Hsla,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .inset_0()
+        .ml(left_margin)
+        .rounded(radius)
+        .border_1()
+        .with_animation(
+            ElementId::NamedInteger("locate-glow".into(), locate_glow_seq),
+            Animation::new(Duration::from_millis(LOCATE_GLOW_MS))
+                .with_easing(gpui::ease_out_quint()),
+            move |el, delta| el.border_color(Hsla { a: 1.0 - delta, ..ring }),
+        )
 }
