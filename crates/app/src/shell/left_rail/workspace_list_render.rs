@@ -26,15 +26,24 @@ pub enum WorkspaceSortMode {
     Recent,
     /// Insertion order as stored — no reordering.
     Manual,
+    /// Alphabetical by workspace display name (case-insensitive).
+    Name,
+    /// Ordered by owning project name, then workspace name. Within a single
+    /// project group every row shares one project, so this falls back to the
+    /// name ordering; the distinction only matters in the flat (ungrouped)
+    /// list where rows from different projects intermingle.
+    Project,
 }
 
 impl WorkspaceSortMode {
-    /// Short label shown on the header toggle chip.
+    /// Short human label shown in the display-options menu.
     pub fn label(self) -> &'static str {
         match self {
             WorkspaceSortMode::Smart => "Smart",
             WorkspaceSortMode::Recent => "Recent",
             WorkspaceSortMode::Manual => "Manual",
+            WorkspaceSortMode::Name => "Name",
+            WorkspaceSortMode::Project => "Project",
         }
     }
 
@@ -44,6 +53,8 @@ impl WorkspaceSortMode {
             WorkspaceSortMode::Smart => "smart",
             WorkspaceSortMode::Recent => "recent",
             WorkspaceSortMode::Manual => "manual",
+            WorkspaceSortMode::Name => "name",
+            WorkspaceSortMode::Project => "project",
         }
     }
 
@@ -52,16 +63,54 @@ impl WorkspaceSortMode {
         match raw.trim() {
             "recent" => WorkspaceSortMode::Recent,
             "manual" => WorkspaceSortMode::Manual,
+            "name" => WorkspaceSortMode::Name,
+            "project" => WorkspaceSortMode::Project,
             _ => WorkspaceSortMode::Smart,
         }
     }
 
-    /// Next mode in the cycle: Smart → Recent → Manual → Smart.
-    pub fn next(self) -> WorkspaceSortMode {
+    /// All modes in menu-display order.
+    pub const ALL: [WorkspaceSortMode; 5] = [
+        WorkspaceSortMode::Name,
+        WorkspaceSortMode::Smart,
+        WorkspaceSortMode::Recent,
+        WorkspaceSortMode::Project,
+        WorkspaceSortMode::Manual,
+    ];
+}
+
+/// Whether workspace rows are grouped under project headers or shown flat.
+///
+/// `Project` (default) nests rows under their owning project's collapsible
+/// header — the current behaviour. `None` shows every workspace in a single
+/// flat list ordered purely by the active `WorkspaceSortMode`, with no project
+/// headers and no collapse affordance. The choice is persisted across restarts.
+/// Named `Flat` (not `None`) so a future `use WorkspaceGroupMode::*` can't
+/// shadow `Option::None`. The dropdown still labels it "None" for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceGroupMode {
+    /// Rows nested under their owning project group header.
+    #[default]
+    Project,
+    /// All rows shown as one flat list; no project headers.
+    Flat,
+}
+
+impl WorkspaceGroupMode {
+    /// Stable persistence key.
+    pub fn as_key(self) -> &'static str {
         match self {
-            WorkspaceSortMode::Smart => WorkspaceSortMode::Recent,
-            WorkspaceSortMode::Recent => WorkspaceSortMode::Manual,
-            WorkspaceSortMode::Manual => WorkspaceSortMode::Smart,
+            WorkspaceGroupMode::Project => "project",
+            WorkspaceGroupMode::Flat => "flat",
+        }
+    }
+
+    /// Parse a persisted key; unknown / missing values fall back to default.
+    /// Accepts the legacy `"none"` spelling as well as `"flat"`.
+    pub fn from_key(raw: &str) -> WorkspaceGroupMode {
+        match raw.trim() {
+            "flat" | "none" => WorkspaceGroupMode::Flat,
+            _ => WorkspaceGroupMode::Project,
         }
     }
 }
@@ -106,6 +155,11 @@ pub fn sort_workspaces(
         // if a rank is ever NaN (it never should be). Equal ranks keep input
         // order (stable sort).
         WorkspaceSortMode::Manual => list.sort_by(|a, b| a.sort_order.total_cmp(&b.sort_order)),
+        // Case-insensitive alphabetical by display name. `Project` collapses to
+        // the same within-group order because every row here shares one project.
+        WorkspaceSortMode::Name | WorkspaceSortMode::Project => {
+            list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }
     };
     order_group(&mut pinned);
     order_group(&mut unpinned);
@@ -355,13 +409,18 @@ mod tests {
         }
     }
 
+    /// Like `ws` but with an explicit display name distinct from the id, for
+    /// exercising name-based ordering.
+    fn ws_named(id: &str, worktree_path: &str, name: &str, created_at: &str) -> Workspace {
+        Workspace {
+            name: name.to_string(),
+            ..ws(id, worktree_path, created_at)
+        }
+    }
+
     #[test]
     fn sort_mode_round_trips_through_key() {
-        for mode in [
-            WorkspaceSortMode::Smart,
-            WorkspaceSortMode::Recent,
-            WorkspaceSortMode::Manual,
-        ] {
+        for mode in WorkspaceSortMode::ALL {
             assert_eq!(WorkspaceSortMode::from_key(mode.as_key()), mode);
         }
     }
@@ -373,10 +432,36 @@ mod tests {
     }
 
     #[test]
-    fn sort_mode_cycle_wraps() {
-        assert_eq!(WorkspaceSortMode::Smart.next(), WorkspaceSortMode::Recent);
-        assert_eq!(WorkspaceSortMode::Recent.next(), WorkspaceSortMode::Manual);
-        assert_eq!(WorkspaceSortMode::Manual.next(), WorkspaceSortMode::Smart);
+    fn group_mode_round_trips_through_key() {
+        assert_eq!(
+            WorkspaceGroupMode::from_key(WorkspaceGroupMode::Project.as_key()),
+            WorkspaceGroupMode::Project
+        );
+        assert_eq!(
+            WorkspaceGroupMode::from_key(WorkspaceGroupMode::Flat.as_key()),
+            WorkspaceGroupMode::Flat
+        );
+        // Legacy "none" spelling still parses to Flat.
+        assert_eq!(WorkspaceGroupMode::from_key("none"), WorkspaceGroupMode::Flat);
+        assert_eq!(
+            WorkspaceGroupMode::from_key("bogus"),
+            WorkspaceGroupMode::Project
+        );
+    }
+
+    #[test]
+    fn name_sort_is_case_insensitive_alphabetical_primary_pinned() {
+        // Primary anchors first regardless of name; the rest sort
+        // alphabetically without case sensitivity.
+        let root = "/tmp/p1";
+        let list = vec![
+            ws_named("primary", root, "zzz", "2026-01-01T00:00:00+00:00"),
+            ws_named("w1", "/tmp/p1/w1", "Beta", "2026-02-01T00:00:00+00:00"),
+            ws_named("w2", "/tmp/p1/w2", "alpha", "2026-03-01T00:00:00+00:00"),
+        ];
+        let out = sort_workspaces(&list, root, WorkspaceSortMode::Name, |_| 0);
+        let ids: Vec<&str> = out.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["primary", "w2", "w1"]);
     }
 
     #[test]

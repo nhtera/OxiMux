@@ -199,20 +199,34 @@ out.
   fallback, ghost the cluster to a low resting opacity instead of hiding it
   outright, so every verb stays reachable — see the stash-panel exception below.
 
-### Left-rail workspace ordering
+### Left-rail workspace ordering & display options
 
-Workspace rows within a project group obey a persisted sort mode, cycled from a
-text chip in the "Projects" header (`r_xs` radius, `t_sub_label`, `fg_subtle` →
-`fg_base` on hover — no new tokens):
+The "Projects" header carries exactly three actions — a display-options icon
+(`settings-2`), add-project (`folder-plus`), and new-workspace (`plus`) — keeping
+the header calm. Sort, grouping, card layout, and collapse-all live behind the
+options icon in a single anchored dropdown (same occluding-backdrop popover
+contract as `row_menu` / `dashboard_status_menu`). The scroll-to-active
+crosshair lives in the bottom toolbar, not the header.
 
-- **Smart** (default): rows needing action (approval / waiting) and running
-  agents float to the top, reusing the same attention tiers as the agents
-  dashboard so both surfaces agree on priority. Stable within a tier.
-- **Recent**: newest workspace first.
-- **Manual**: stored insertion order, unchanged.
+Persisted display state:
 
-The primary (repo-root) row is pinned first in every mode — it is the project's
-anchor; only the worktree tail reorders.
+- **Sort** (`left_rail_sort_mode`): **Name** (case-insensitive alphabetical) ·
+  **Smart** (default; rows needing action and running agents float up, reusing
+  the agents-dashboard attention tiers, stable within a tier) · **Recent**
+  (newest first) · **Project** (by owning project, then name — only distinct in
+  the flat list) · **Manual** (stored order; the only mode where worktree rows
+  are drag-reorderable).
+- **Group by** (`left_rail_group_mode`): **Project** (default; rows nested under
+  collapsible project headers) · **None** (one flat globally-sorted list, no
+  headers, drag-reorder disabled since cross-project order is undefined).
+- **Card layout**: Detailed / Compact (see the `compact_cards` exception below).
+
+In grouped mode the primary (repo-root) row is pinned first within each group —
+it is the project's anchor; only the worktree tail reorders. The flat list has
+no *primary* anchoring (rows from different projects intermingle), but explicitly
+**pinned** rows still float to the top regardless of mode. Manual mode in the
+flat list has no drag affordance, so it degrades to pinned-first then stable
+insertion order.
 
 ### Approved exceptions (documented locally; do not refactor without paired UX call)
 
@@ -225,7 +239,7 @@ anchor; only the worktree tail reorders.
 | `left_rail::row_menu::ROW_MENU_ITEM_H` | 28 (vs `h_overlay_item` 30) | Narrow rail context reads tighter at 28px |
 | `project_picker::ROW_HEIGHT` | 40 + `ROW_PAD_X` 16 | Modal-scale picker, not floating overlay |
 | `workspace_card::CARD_HEIGHT_MULT` | 2.2 × `h_row` | Two-line rich card (name + agent verb/diff); same local-exception pattern as `ROW_HEIGHT_MULT = 1.6` |
-| `workspace_card` compact mode | `h_row` (single line) | Opt-in compact card density: drops the second line (agent verb / diff) for users with many workspaces; toggled from the Projects header and persisted |
+| `workspace_card` compact mode | `h_row` (single line) | Opt-in compact card density: drops the second line (agent verb / diff) for users with many workspaces; toggled from the display-options dropdown and persisted |
 | `stash_panel::STASH_ACTION_REST_OPACITY` | cluster ghosted to 0.45 at rest (vs fully hidden) | No context-menu fallback for stash rows, so Apply/Pop/Drop must never fully hide — ghost-at-rest keeps every verb reachable while still calming the row |
 
 ## Button Variants × Sizes

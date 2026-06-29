@@ -10,7 +10,7 @@
 
 use oximux_storage::SettingsRepo;
 
-use crate::shell::left_rail::workspace_list_render::WorkspaceSortMode;
+use crate::shell::left_rail::workspace_list_render::{WorkspaceGroupMode, WorkspaceSortMode};
 
 /// Settings key holding the left-rail width in pixels.
 pub const KEY_LEFT_RAIL_WIDTH: &str = "left_rail_width";
@@ -128,6 +128,29 @@ pub fn save_compact_cards(repo: &SettingsRepo, compact: bool) {
         tracing::warn!(
             target: "oximux_app::left_rail_layout",
             "failed to persist left_rail_compact_cards: {err}"
+        );
+    }
+}
+
+/// Settings key holding the project grouping mode for the left rail.
+pub const KEY_LEFT_RAIL_GROUP_MODE: &str = "left_rail_group_mode";
+
+/// Load the persisted grouping mode. Missing / unknown / error →
+/// `WorkspaceGroupMode::default()` (grouped by project).
+pub fn load_group_mode(repo: &SettingsRepo) -> WorkspaceGroupMode {
+    match repo.get(KEY_LEFT_RAIL_GROUP_MODE) {
+        Ok(Some(s)) => WorkspaceGroupMode::from_key(&s),
+        _ => WorkspaceGroupMode::default(),
+    }
+}
+
+/// Persist the grouping mode. Error is logged and swallowed — a layout
+/// preference shouldn't take down the app.
+pub fn save_group_mode(repo: &SettingsRepo, mode: WorkspaceGroupMode) {
+    if let Err(err) = repo.set(KEY_LEFT_RAIL_GROUP_MODE, mode.as_key()) {
+        tracing::warn!(
+            target: "oximux_app::left_rail_layout",
+            "failed to persist left_rail_group_mode: {err}"
         );
     }
 }

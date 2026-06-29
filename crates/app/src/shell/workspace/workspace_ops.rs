@@ -1269,6 +1269,7 @@ impl WorkspaceRoot {
         self.row_menu.update(cx, |m, cx| m.close(cx));
         self.project_menu.update(cx, |m, cx| m.close(cx));
         self.dashboard_status_menu.update(cx, |m, cx| m.close(cx));
+        self.options_menu.update(cx, |m, cx| m.close(cx));
         self.add_project_dialog.update(cx, |d, cx| d.close(cx));
         self.session_history.update(cx, |m, cx| m.close(cx));
     }
@@ -1360,6 +1361,23 @@ impl WorkspaceRoot {
         self.close_modal_overlays(cx);
         self.dashboard_status_menu
             .update(cx, |m, cx| m.open(active, x, y, cx));
+    }
+
+    /// Open the Projects-header display-options dropdown at the given screen
+    /// coordinates, seeded with the rail's current sort / group / card-layout
+    /// state. Closes any other overlays first so backdrops don't compete.
+    pub(crate) fn open_options_menu(
+        &mut self,
+        sort_mode: crate::shell::left_rail::workspace_list_render::WorkspaceSortMode,
+        group_mode: crate::shell::left_rail::workspace_list_render::WorkspaceGroupMode,
+        compact: bool,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_modal_overlays(cx);
+        self.options_menu
+            .update(cx, |m, cx| m.open(sort_mode, group_mode, compact, x, y, cx));
     }
 
     /// Snapshot the sidebar data (all recent projects, their workspaces,

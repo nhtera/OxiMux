@@ -23,6 +23,7 @@ impl Render for WorkspaceRoot {
             || self.row_menu.read(cx).is_open()
             || self.project_menu.read(cx).is_open()
             || self.dashboard_status_menu.read(cx).is_open()
+            || self.options_menu.read(cx).is_open()
             || self.floating_terminal_visible
             || self.confirm_dialog.is_some()
             || self.rename_tab_dialog.is_some()
@@ -1464,6 +1465,8 @@ impl Render for WorkspaceRoot {
             .child(self.project_menu.clone())
             // Agents-page status-filter dropdown.
             .child(self.dashboard_status_menu.clone())
+            // Projects-header display-options dropdown.
+            .child(self.options_menu.clone())
             .child(self.add_project_dialog.clone())
             // Type-to-confirm dialog for destructive workspace ops. Built
             // per-request; `None` when idle. Wrapped in a full-window
