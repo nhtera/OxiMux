@@ -106,6 +106,10 @@ impl WorkspaceRoot {
             panes.update(cx, |p, cx| {
                 p.focus_agent_session(session_id, window, cx);
             });
+            // Deferred focus: a synchronous focus inside the rail-row mouse-down
+            // is clobbered by GPUI's post-click focus dispatch. Re-assert it on
+            // the next frame so the agent's terminal is ready for input.
+            crate::shell::workspace::workspace_ops::defer_focus_active(window, cx, panes);
         }
     }
 
@@ -142,6 +146,10 @@ impl WorkspaceRoot {
             panes.update(cx, |p, cx| {
                 p.focus_ambient_agent_terminal(pty_id, window, cx);
             });
+            // Deferred focus: a synchronous focus inside the rail-row mouse-down
+            // is clobbered by GPUI's post-click focus dispatch. Re-assert it on
+            // the next frame so the terminal is ready for input.
+            crate::shell::workspace::workspace_ops::defer_focus_active(window, cx, panes);
         }
     }
 }

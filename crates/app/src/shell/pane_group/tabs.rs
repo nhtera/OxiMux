@@ -1306,15 +1306,20 @@ impl PaneGroup {
             return;
         }
         // Bump MRU first so the switcher overlay reflects the new
-        // ordering even when set_active early-returns (e.g., clicking
-        // the already-active tab still confirms it as most-recent).
+        // ordering even when the tab is already active (re-selecting it
+        // still confirms it as most-recent).
         self.bump_mru(idx);
-        if idx == self.active {
-            return;
-        }
+        let changed = idx != self.active;
         self.active = idx;
+        // Always land keyboard focus on the active tab's content, even when it
+        // was already active. Activating a tab — including re-selecting the
+        // current one from the sidebar rail or a notification — means "type
+        // here now", so the terminal is ready for input without a second click.
+        // Only the repaint is conditional; the focus change drives its own.
         self.focus_active(window, cx);
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Move `idx` to the front of the MRU queue (deduped). Called from
