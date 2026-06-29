@@ -870,6 +870,20 @@ impl ProjectPanes {
             .any(|group| group.read(cx).terminal_tab_index_for_pty(pty_id, cx).is_some())
     }
 
+    /// The cwd of the pane group hosting the terminal PTY `pty_id`, if any
+    /// group in this project does. The ambient rail-row click router uses it to
+    /// resolve which rail workspace owns the clicked terminal (matched by
+    /// worktree path) so the active-row highlight follows the click. Read-only
+    /// counterpart of `group_cwd_for_terminal_session`, keyed by PTY id.
+    pub fn group_cwd_for_pty(&self, pty_id: &str, cx: &gpui::App) -> Option<std::path::PathBuf> {
+        self.groups.values().find_map(|g| {
+            let group = g.read(cx);
+            group
+                .terminal_tab_index_for_pty(pty_id, cx)
+                .map(|_| group.cwd().clone())
+        })
+    }
+
     /// Activate the terminal tab hosting the PTY `pty_id`. This is the
     /// ambient-terminal counterpart of `focus_agent_session`, focusing the
     /// exact pane the user clicked in the rail (per-pane identity).

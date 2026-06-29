@@ -1207,6 +1207,20 @@ impl WorkspaceRoot {
             push_nav_entry(&mut self.nav_history, self.nav_cursor, entry, MAX_NAV_HISTORY);
     }
 
+    /// Mark `workspace_key` as the selected rail workspace and push it onto
+    /// the nav history. The rail's active-row highlight is driven entirely by
+    /// `active_workspace_id`, so every path that lands focus on a workspace's
+    /// tab must call this — otherwise the highlight stays on the previously
+    /// selected workspace while the panes show another. `workspace_key` is the
+    /// rail row id: a real workspace UUID, or `primary:<project_id>` for a
+    /// repo-root row (the same key carried by a live agent's `workspace_key`).
+    /// Mirrors the selection writes in `activate_workspace`; the caller issues
+    /// `cx.notify()` so the next render re-reads the field into the rail.
+    pub(crate) fn select_rail_workspace(&mut self, project_id: &str, workspace_key: &str) {
+        self.active_workspace_id = Some(workspace_key.to_string());
+        self.record_nav(project_id, workspace_key);
+    }
+
     /// Step back one entry in the workspace-activation history. No-op at the
     /// oldest entry. If the target entry is stale (workspace deleted), the
     /// cursor is reverted so it stays anchored to the displayed workspace.
