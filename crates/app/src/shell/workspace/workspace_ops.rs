@@ -373,7 +373,7 @@ fn agent_adapter_id(kind: AgentAdapter) -> &'static str {
 /// left-rail row, the dialog button, etc.), not the freshly-mounted
 /// pane. The same two-step race is documented in upstream desktop UIs
 /// that use a double-`requestAnimationFrame` pattern for the same fix.
-fn defer_focus_active(
+pub(crate) fn defer_focus_active(
     window: &mut Window,
     cx: &mut Context<crate::workspace_root::WorkspaceRoot>,
     panes: Entity<crate::shell::project_panes::ProjectPanes>,
@@ -967,6 +967,11 @@ impl WorkspaceRoot {
                     "activate_workspace: no agent tab for this worktree; selection set, spawn deferred"
                 );
             }
+            // Re-assert focus on the next frame: focusing synchronously inside a
+            // sidebar-row mouse-down handler gets clobbered by GPUI's post-click
+            // focus dispatch, leaving the terminal unfocused. The deferred pass
+            // lands keyboard focus on the tab so it's ready for input.
+            defer_focus_active(window, cx, panes);
         }
         cx.notify();
     }
