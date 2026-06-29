@@ -110,6 +110,7 @@ use crate::shell::{
     left_rail::{
         LeftRail,
         dashboard_status_menu::DashboardStatusFilterMenu,
+        options_menu::WorkspaceOptionsMenu,
         project_menu::ProjectRowMenu,
         row_menu::WorkspaceRowMenu,
         workspace_row::{DiffCounts, sum_numstat},
@@ -265,6 +266,9 @@ pub struct WorkspaceRoot {
     /// Agents-page status-filter dropdown. Same full-window-backdrop mount
     /// contract as `row_menu`; applies its pick to `left_rail`.
     pub(crate) dashboard_status_menu: Entity<DashboardStatusFilterMenu>,
+    /// Projects-header display-options dropdown (group-by / sort / card layout
+    /// / collapse-all). Same backdrop mount contract; applies to `left_rail`.
+    pub(crate) options_menu: Entity<WorkspaceOptionsMenu>,
     pub(crate) add_project_dialog: Entity<AddProjectDialog>,
     /// Render root tracks this so action dispatch reaches the workspace
     /// even when no pane is focused (sidebar toggle, command palette).
@@ -782,6 +786,10 @@ impl WorkspaceRoot {
         let dashboard_status_menu = cx.new(|_| {
             DashboardStatusFilterMenu::new(theme, density, typography.clone(), weak_left_rail)
         });
+        let weak_left_rail_for_options = left_rail.downgrade();
+        let options_menu = cx.new(|_| {
+            WorkspaceOptionsMenu::new(theme, density, typography.clone(), weak_left_rail_for_options)
+        });
         let pr = app_state.project_repo.clone();
         let add_project_dialog =
             build_add_project_dialog(theme, density, typography.clone(), pr, cx);
@@ -1050,6 +1058,7 @@ impl WorkspaceRoot {
             row_menu,
             project_menu,
             dashboard_status_menu,
+            options_menu,
             add_project_dialog,
             focus_handle,
             window_id,

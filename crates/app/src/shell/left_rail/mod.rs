@@ -21,6 +21,7 @@
 
 pub mod dashboard_status_menu;
 pub mod nav_section;
+pub mod options_menu;
 pub mod project_drag;
 pub mod project_group;
 pub mod project_menu;
@@ -57,9 +58,13 @@ use crate::shell::agents_dashboard::model::{attention_rank, needs_attention};
 use crate::shell::agents_dashboard::filter::StatusFilter;
 use crate::shell::agents_dashboard::render_agents_dashboard;
 use crate::shell::left_rail::nav_section::{NavItem, render_nav_section};
-use crate::shell::left_rail::project_group::{build_project_group_plan, render_project_group};
+use crate::shell::left_rail::project_group::{
+    build_project_group_plan, render_project_group, render_workspace_block,
+};
 use crate::shell::left_rail::toolbar::render_toolbar;
-use crate::shell::left_rail::workspace_list_render::{WorkspaceSortMode, sort_workspaces};
+use crate::shell::left_rail::workspace_list_render::{
+    WorkspaceGroupMode, WorkspaceSortMode, sort_workspaces,
+};
 use crate::shell::tasks_view::TasksView;
 use crate::workspace_root::WorkspaceRoot;
 
@@ -211,6 +216,9 @@ pub struct LeftRail {
     /// `true` renders single-line compact workspace cards; `false` (default)
     /// renders the two-line detailed cards. Persisted across restart.
     compact_cards: bool,
+    /// Whether workspace rows are grouped under project headers (`Project`,
+    /// default) or shown as one flat list (`None`). Persisted across restart.
+    group_mode: WorkspaceGroupMode,
     /// Scroll position for the agents dashboard list. Stored on `LeftRail` so
     /// it survives re-renders while the Agents nav is active.
     agents_scroll: ScrollHandle,
@@ -303,6 +311,7 @@ impl LeftRail {
             collapsed: HashSet::new(),
             sort_mode: WorkspaceSortMode::default(),
             compact_cards: false,
+            group_mode: WorkspaceGroupMode::default(),
             agents_scroll: ScrollHandle::new(),
             dashboard_status_filter: StatusFilter::default(),
             dashboard_filter: String::new(),
@@ -649,24 +658,43 @@ impl LeftRail {
             .collect();
         self.sort_mode = left_rail_layout::load_sort_mode(&settings_repo);
         self.compact_cards = left_rail_layout::load_compact_cards(&settings_repo);
+        self.group_mode = left_rail_layout::load_group_mode(&settings_repo);
         self.settings_repo = Some(settings_repo);
     }
 
-    /// Current workspace sort mode. Test-only inspector.
-    #[doc(hidden)]
+    /// Current workspace sort mode.
     pub fn sort_mode(&self) -> WorkspaceSortMode {
         self.sort_mode
     }
 
-    /// Advance to the next sort mode (Smart → Recent → Manual → Smart),
-    /// persist it, and re-render.
-    pub(crate) fn cycle_sort_mode(&mut self, cx: &mut Context<Self>) {
-        self.sort_mode = self.sort_mode.next();
+    /// Current project grouping mode.
+    pub fn group_mode(&self) -> WorkspaceGroupMode {
+        self.group_mode
+    }
+
+    /// Set the project grouping mode, persist it, and re-render.
+    pub(crate) fn set_group_mode(&mut self, mode: WorkspaceGroupMode, cx: &mut Context<Self>) {
+        self.group_mode = mode;
         if let Some(repo) = &self.settings_repo {
-            left_rail_layout::save_sort_mode(repo, self.sort_mode);
+            left_rail_layout::save_group_mode(repo, mode);
+        }
+        cx.notify();
+    }
+
+    /// Set the workspace sort mode directly (from the display-options menu),
+    /// persist it, and re-render.
+    pub(crate) fn set_sort_mode(&mut self, mode: WorkspaceSortMode, cx: &mut Context<Self>) {
+        self.sort_mode = mode;
+        if let Some(repo) = &self.settings_repo {
+            left_rail_layout::save_sort_mode(repo, mode);
         }
         self.refresh_settle_cache(cx);
         cx.notify();
+    }
+
+    /// Whether compact single-line cards are active.
+    pub fn compact_cards(&self) -> bool {
+        self.compact_cards
     }
 
     /// Collapse all groups, or expand all if every group is already
@@ -1034,6 +1062,7 @@ impl Render for LeftRail {
                 self.active_workspace_id.clone(),
                 self.collapsed.clone(),
                 self.sort_mode,
+                self.group_mode,
                 entity.clone(),
                 self.workspaces_by_project.clone(),
                 self.latest_status.clone(),
@@ -1062,9 +1091,8 @@ impl Render for LeftRail {
                 .w_full()
                 .child(workspace_header(
                     &entity,
-                    self.sort_mode,
+                    &self.weak_root,
                     self.active_project_id.is_some(),
-                    self.compact_cards,
                     theme,
                     density,
                     &typography,
@@ -1098,7 +1126,12 @@ impl Render for LeftRail {
             ))
             .child(divider(theme))
             .child(div().flex_1().w_full().child(content_body))
-            .child(render_toolbar(theme, density, &typography));
+            .child(render_toolbar(
+                entity.downgrade(),
+                theme,
+                density,
+                &typography,
+            ));
 
         let weak_root_for_drop = self.weak_root.clone();
         div()
@@ -1145,6 +1178,7 @@ fn render_workspace_list(
     active_workspace_id: Option<String>,
     collapsed: HashSet<String>,
     sort_mode: WorkspaceSortMode,
+    group_mode: WorkspaceGroupMode,
     rail: gpui::Entity<LeftRail>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
@@ -1212,6 +1246,99 @@ fn render_workspace_list(
                     .update(cx, |r, cx| r.note_autoscroll_cursor(cursor_y, bounds, cx));
             },
         );
+
+    // Flat (ungrouped) list: every workspace across all projects in one
+    // globally-sorted column with no project headers. Drag-reorder is disabled
+    // here because ordering across project boundaries is undefined.
+    if group_mode == WorkspaceGroupMode::Flat {
+        let status_for_flat = latest_status.clone();
+        let latest_status_for =
+            move |workspace_id: &str| status_for_flat.get(workspace_id).cloned().flatten();
+        let adapter_for_flat = latest_adapter.clone();
+        let latest_adapter_for = move |workspace_id: &str| -> Option<&'static str> {
+            adapter_for_flat
+                .get(workspace_id)
+                .map(|id| crate::shell::agent_presentation::adapter_display_name(id))
+        };
+        let weak_root_for_menu = weak_root.clone();
+        let on_row_menu = move |workspace: Workspace,
+                                x: f32,
+                                y: f32,
+                                _window: &mut gpui::Window,
+                                cx: &mut gpui::App| {
+            let _ =
+                weak_root_for_menu.update(cx, |root, cx| root.open_row_menu(workspace, x, y, cx));
+        };
+
+        // Pair each workspace with its owning project, then order the whole
+        // list by the active sort mode.
+        let mut flat: Vec<(Project, Workspace)> = Vec::new();
+        for project in projects.iter() {
+            if let Some(ws) = workspaces_by_project.get(&project.id) {
+                for w in ws {
+                    flat.push((project.clone(), w.clone()));
+                }
+            }
+        }
+        match sort_mode {
+            WorkspaceSortMode::Name => {
+                flat.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()));
+            }
+            WorkspaceSortMode::Project => flat.sort_by(|a, b| {
+                a.0.name
+                    .to_lowercase()
+                    .cmp(&b.0.name.to_lowercase())
+                    .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+            }),
+            WorkspaceSortMode::Recent => {
+                flat.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
+            }
+            WorkspaceSortMode::Manual => {
+                flat.sort_by(|a, b| a.1.sort_order.total_cmp(&b.1.sort_order));
+            }
+            WorkspaceSortMode::Smart => flat.sort_by_key(|(_, w)| {
+                let status = latest_status.get(&w.id).cloned().flatten();
+                attention_rank(status.as_ref(), live_worktrees.contains(&w.worktree_path))
+            }),
+        }
+
+        // Pinned rows float to the top regardless of mode. The sort is stable,
+        // so the active mode's order is preserved within the pinned and
+        // unpinned partitions — mirroring the grouped path's pinned-above
+        // contract (`false` < `true`, so `!pinned` lifts pinned rows first).
+        flat.sort_by_key(|(_, w)| !w.pinned);
+
+        for (row_index, (project, workspace)) in flat.into_iter().enumerate() {
+            col = col.child(render_workspace_block(
+                workspace,
+                row_index,
+                &project,
+                sort_mode,
+                &latest_status_for,
+                &latest_adapter_for,
+                active_workspace_id.as_deref(),
+                &live_worktrees,
+                &ambient_status,
+                &diff_counts,
+                &workspace_agents,
+                &expanded_workspaces,
+                focused_agent.as_ref(),
+                &rail,
+                &weak_root,
+                &on_row_menu,
+                false,
+                locate_glow_seq,
+                renaming_id.as_deref(),
+                &rename_input,
+                compact,
+                theme,
+                density,
+                typography,
+            ));
+        }
+        return col.into_any_element();
+    }
+
     for (project_index, project) in projects.into_iter().enumerate() {
         let workspaces = workspaces_by_project
             .get(&project.id)
@@ -1334,9 +1461,8 @@ fn divider(theme: Theme) -> impl IntoElement {
 
 fn workspace_header(
     rail: &gpui::Entity<LeftRail>,
-    sort_mode: WorkspaceSortMode,
+    weak_root: &WeakEntity<WorkspaceRoot>,
     has_active_project: bool,
-    compact: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -1358,81 +1484,40 @@ fn workspace_header(
                 .text_color(theme.fg_muted)
                 .child("Projects"),
         )
-        .child(locate_active_icon(rail.clone(), theme))
-        .child(sort_mode_chip(rail.clone(), sort_mode, theme, density, typography))
-        .child(compact_toggle_icon(rail.clone(), compact, theme))
+        .child(options_icon(rail.clone(), weak_root.clone(), theme))
         .child(add_project_icon(theme))
         .child(new_workspace_icon(has_active_project, theme))
-        .child(collapse_all_icon(rail.clone(), theme))
 }
 
-/// Scroll-to-current affordance: jumps the list to the active project's
-/// group and replays the locate glow on the active workspace card.
-fn locate_active_icon(rail: gpui::Entity<LeftRail>, theme: Theme) -> impl IntoElement {
-    div()
-        .id("workspaces-header-locate")
-        .cursor_pointer()
-        .text_color(theme.fg_muted)
-        .hover(|s| s.text_color(theme.fg_base))
-        .tooltip(|window, cx| {
-            gpui_component::tooltip::Tooltip::new("Scroll to current workspace").build(window, cx)
-        })
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
-            rail.update(cx, |r, cx| r.scroll_to_active(cx));
-        })
-        .child(
-            svg()
-                .path("icons/crosshair.svg")
-                .size(px(HEADER_ICON_SIZE))
-                .text_color(theme.fg_muted),
-        )
-}
-
-/// Sort-order toggle. A compact text chip showing the active mode; clicking
-/// cycles Smart → Recent → Manual and persists the choice.
-fn sort_mode_chip(
+/// Display-options trigger: opens the dropdown holding group-by, sort, card
+/// layout, and collapse-all. Reads the rail's current display state on click so
+/// the menu opens with the live selections checked.
+fn options_icon(
     rail: gpui::Entity<LeftRail>,
-    sort_mode: WorkspaceSortMode,
+    weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
-    density: Density,
-    typography: &Typography,
 ) -> impl IntoElement {
     div()
-        .id("workspaces-header-sort")
-        .px(px(6.0))
-        .py(px(1.0))
-        .rounded(px(density.r_xs))
-        .cursor_pointer()
-        .text_size(px(typography.t_sub_label))
-        .text_color(theme.fg_subtle)
-        .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
-        .tooltip(|window, cx| {
-            gpui_component::tooltip::Tooltip::new("Sort: Smart → Recent → Manual")
-                .build(window, cx)
-        })
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
-            rail.update(cx, |r, cx| r.cycle_sort_mode(cx));
-        })
-        .child(sort_mode.label())
-}
-
-/// Collapse/expand-all toggle: one click collapses every project group, or
-/// expands all when they are already collapsed.
-fn collapse_all_icon(rail: gpui::Entity<LeftRail>, theme: Theme) -> impl IntoElement {
-    div()
-        .id("workspaces-header-collapse")
+        .id("workspaces-header-options")
         .cursor_pointer()
         .text_color(theme.fg_muted)
         .hover(|s| s.text_color(theme.fg_base))
         .tooltip(|window, cx| {
-            gpui_component::tooltip::Tooltip::new("Collapse / expand all").build(window, cx)
+            gpui_component::tooltip::Tooltip::new("Display options").build(window, cx)
         })
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
-            rail.update(cx, |r, cx| r.toggle_collapse_all(cx));
+        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _window, cx| {
+            let x = f32::from(ev.position.x);
+            let y = f32::from(ev.position.y);
+            let sort = rail.read(cx).sort_mode();
+            let group = rail.read(cx).group_mode();
+            let compact = rail.read(cx).compact_cards();
+            let _ = weak_root.update(cx, |root, cx| {
+                root.open_options_menu(sort, group, compact, x, y, cx);
+            });
         })
         .child(
             svg()
-                .path("icons/list-collapse.svg")
+                .path("icons/settings-2.svg")
                 .size(px(HEADER_ICON_SIZE))
                 .text_color(theme.fg_muted),
         )
@@ -1496,39 +1581,6 @@ fn new_workspace_icon(has_active_project: bool, theme: Theme) -> impl IntoElemen
             .size(px(HEADER_ICON_SIZE))
             .text_color(icon_color),
     )
-}
-
-/// Compact/detailed card-density toggle in the Projects header. Flips between
-/// two-line detailed cards and single-line compact cards, persisting the
-/// choice. The glyph brightens to `fg_base` when compact mode is active.
-fn compact_toggle_icon(
-    rail: gpui::Entity<LeftRail>,
-    compact: bool,
-    theme: Theme,
-) -> impl IntoElement {
-    let color = if compact { theme.fg_base } else { theme.fg_muted };
-    div()
-        .id("workspaces-header-compact")
-        .cursor_pointer()
-        .text_color(color)
-        .hover(|s| s.text_color(theme.fg_base))
-        .tooltip(move |window, cx| {
-            let label = if compact {
-                "Compact cards: on"
-            } else {
-                "Compact cards: off"
-            };
-            gpui_component::tooltip::Tooltip::new(label).build(window, cx)
-        })
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
-            rail.update(cx, |r, cx| r.toggle_compact_cards(cx));
-        })
-        .child(
-            svg()
-                .path("icons/rows-2.svg")
-                .size(px(HEADER_ICON_SIZE))
-                .text_color(color),
-        )
 }
 
 #[cfg(test)]

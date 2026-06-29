@@ -1,20 +1,28 @@
-//! Bottom toolbar of the left rail — "Add Project" button + settings icon.
+//! Bottom toolbar of the left rail — "Add Project" button, locate-active
+//! affordance, and settings icon.
 //!
 //! The settings cog dispatches `OpenSettings`, opening the settings modal.
+//! The crosshair scrolls the list to the active workspace.
 
 use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    StatefulInteractiveElement, Styled, div, px, svg,
+    StatefulInteractiveElement, Styled, WeakEntity, div, px, svg,
 };
 use gpui_component::tooltip::Tooltip;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{OpenAddProjectDialog, OpenSettings};
+use crate::shell::left_rail::LeftRail;
 
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const ICON_SIZE: f32 = 14.0;
 
-pub fn render_toolbar(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
+pub fn render_toolbar(
+    rail: WeakEntity<LeftRail>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
@@ -28,7 +36,28 @@ pub fn render_toolbar(theme: Theme, density: Density, typography: &Typography) -
         .bg(theme.bg_rail)
         .child(add_project_button(theme, density, typography))
         .child(div().flex_1())
+        .child(locate_active_icon(rail, theme))
         .child(settings_icon(theme))
+}
+
+/// Scroll-to-current affordance: jumps the list to the active workspace and
+/// replays the locate glow on its card.
+fn locate_active_icon(rail: WeakEntity<LeftRail>, theme: Theme) -> impl IntoElement {
+    div()
+        .id("left-rail-locate")
+        .cursor_pointer()
+        .text_color(theme.fg_muted)
+        .hover(|s| s.text_color(theme.fg_base))
+        .tooltip(|window, cx| Tooltip::new("Scroll to current workspace").build(window, cx))
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
+            let _ = rail.update(cx, |r, cx| r.scroll_to_active(cx));
+        })
+        .child(
+            svg()
+                .path("icons/crosshair.svg")
+                .size(px(ICON_SIZE))
+                .text_color(theme.fg_muted),
+        )
 }
 
 fn add_project_button(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {

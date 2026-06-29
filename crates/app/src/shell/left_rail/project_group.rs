@@ -140,6 +140,71 @@ pub fn render_project_group(
     }
 
     for (row_index, workspace) in workspaces.into_iter().enumerate() {
+        col = col.child(render_workspace_block(
+            workspace,
+            row_index,
+            &project,
+            sort_mode,
+            &latest_status_for,
+            &latest_adapter_for,
+            active_workspace_id,
+            live_worktrees,
+            ambient_by_path,
+            diff_counts,
+            workspace_agents,
+            expanded_workspaces,
+            focused_agent,
+            &rail,
+            &weak_root,
+            &on_row_menu,
+            true,
+            locate_glow_seq,
+            renaming_id,
+            &rename_input,
+            compact,
+            theme,
+            density,
+            typography,
+        ));
+    }
+
+    col
+}
+
+/// Render one workspace's block: the card plus, for multi-agent workspaces,
+/// the agent disclosure, optionally wrapped in the active-selection container.
+///
+/// Extracted so the grouped list and the flat (ungrouped) list render identical
+/// rows. `allow_drag` is `false` in flat mode, where cross-project reordering
+/// has no meaning.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_workspace_block(
+    workspace: Workspace,
+    row_index: usize,
+    project: &Project,
+    sort_mode: WorkspaceSortMode,
+    latest_status_for: &impl Fn(&str) -> Option<AgentStatus>,
+    latest_adapter_for: &impl Fn(&str) -> Option<&'static str>,
+    active_workspace_id: Option<&str>,
+    live_worktrees: &std::collections::HashSet<String>,
+    ambient_by_path: &std::collections::HashMap<String, AmbientAgent>,
+    diff_counts: &std::collections::HashMap<String, DiffCounts>,
+    workspace_agents: &crate::shell::left_rail::WorkspaceAgentList,
+    expanded_workspaces: &std::collections::HashSet<String>,
+    focused_agent: Option<&crate::shell::left_rail::RailAgentTarget>,
+    rail: &Entity<LeftRail>,
+    weak_root: &WeakEntity<WorkspaceRoot>,
+    on_row_menu: &(impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static),
+    allow_drag: bool,
+    locate_glow_seq: u64,
+    renaming_id: Option<&str>,
+    rename_input: &Option<Entity<InputState>>,
+    compact: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    {
         let row_group: SharedString = format!("ws-row-{}", workspace.id).into();
         let is_active = active_workspace_id == Some(workspace.id.as_str());
         // The main worktree lives at the project root; that row is the
@@ -263,7 +328,8 @@ pub fn render_project_group(
         // draggable. Pinned rows are excluded too: they float to the top of
         // their group regardless of rank, so a free-drag would silently no-op
         // on the display.
-        let drag_config = (!is_primary
+        let drag_config = (allow_drag
+            && !is_primary
             && !workspace.pinned
             && sort_mode == WorkspaceSortMode::Manual
             && !is_renaming)
@@ -353,10 +419,8 @@ pub fn render_project_group(
                 .bg(active_surface_bg);
         }
 
-        col = col.child(workspace_block);
+        workspace_block
     }
-
-    col
 }
 
 #[allow(clippy::too_many_arguments)]
