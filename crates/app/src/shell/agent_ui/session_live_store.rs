@@ -73,7 +73,11 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.live_agents.get(db_id).map(|e| e.session_id) else {
+        let Some((session_id, workspace_key)) = self
+            .live_agents
+            .get(db_id)
+            .map(|e| (e.session_id, e.workspace_key.clone()))
+        else {
             return;
         };
         // The session lives in exactly one project's panes; find its owner so
@@ -111,6 +115,14 @@ impl WorkspaceRoot {
             // the next frame so the agent's terminal is ready for input.
             crate::shell::workspace::workspace_ops::defer_focus_active(window, cx, panes);
         }
+        // Move the rail's active-row highlight onto the workspace that owns this
+        // agent. Without it the highlight stays on the previously selected
+        // workspace (the agent's `workspace_key` is the rail row id), and a
+        // notify forces the next render to re-read it into the rail — the
+        // owning project may already be active, so no `set_active_project`
+        // repaint would otherwise occur.
+        self.select_rail_workspace(&project_id, &workspace_key);
+        cx.notify();
     }
 
     /// Focus a hand-launched (ambient) agent the user clicked in the rail. The
@@ -151,6 +163,26 @@ impl WorkspaceRoot {
             // the next frame so the terminal is ready for input.
             crate::shell::workspace::workspace_ops::defer_focus_active(window, cx, panes);
         }
+        // Move the rail's active-row highlight onto the workspace owning the
+        // clicked terminal. An ambient terminal carries no DB workspace key, so
+        // resolve it from the hosting pane group's cwd matched against the rail
+        // rows by worktree path (the same best-effort mapping the bell-banner
+        // click uses). A notify re-reads the selection into the rail.
+        let cwd = self
+            .active_project_panes()
+            .and_then(|panes| panes.read(cx).group_cwd_for_pty(pty_id, cx));
+        if let Some(cwd) = cwd {
+            let cwd_str = cwd.to_string_lossy().into_owned();
+            if let Some(w) = self
+                .rail_workspaces_by_project
+                .get(&project_id)
+                .and_then(|rows| rows.iter().find(|w| w.worktree_path == cwd_str))
+                .cloned()
+            {
+                self.select_rail_workspace(&w.project_id, &w.id);
+            }
+        }
+        cx.notify();
     }
 }
 
