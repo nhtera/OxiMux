@@ -807,6 +807,9 @@ impl WorkspaceRoot {
             cached.read(cx).set_polling_focused(true);
             self.right_sidebar = Some(cached);
             self.rewire_scm_subscriptions(window, cx);
+            // RT-3: forward the new project to any open Tasks tab so the list
+            // updates without requiring a manual Refresh.
+            self.refresh_tasks_tab_for_active_project(Some(project), cx);
             refocus_active_pane(self, window, cx);
             cx.notify();
             return;
@@ -897,6 +900,9 @@ impl WorkspaceRoot {
                 // "View all" / commit / branch / discard / stash actions
                 // would silently stop firing after a project switch.
                 this.rewire_scm_subscriptions(window, cx);
+                // RT-3: forward the new project to any open Tasks tab.
+                let active_proj = this.active_project.clone();
+                this.refresh_tasks_tab_for_active_project(active_proj, cx);
                 // Re-focus the active pane after the right_sidebar
                 // rebuild — the rebuild's `cx.notify` triggers a
                 // repaint that can land focus on a freshly-mounted
@@ -1762,6 +1768,16 @@ impl WorkspaceRoot {
                         if activate_after {
                             this.activate_workspace(workspace.clone(), window, cx);
                             this.left_rail.update(cx, |rail, cx| rail.go_home(cx));
+                            // The Tasks tab launched this create; close it so the
+                            // foreground leaves the issue browser (the pane-tab
+                            // equivalent of returning the rail to its home view).
+                            // Foreground falls back to the group's prior tab; the
+                            // freshly-selected workspace spawns its tab on demand.
+                            if let Some(panes) = this.active_project_panes() {
+                                panes.update(cx, |p, cx| {
+                                    p.close_tasks_tab_in_active_group(window, cx)
+                                });
+                            }
                         }
                         if let Some(kind) = agent {
                             // Auto-spawn from the create dialog launches the

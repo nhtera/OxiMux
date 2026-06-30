@@ -11,8 +11,9 @@ pub mod row;
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    Styled, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
+    AnyElement, App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, Styled, UniformListScrollHandle, WeakEntity, Window,
+    div, px, uniform_list,
 };
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
@@ -34,6 +35,10 @@ type FetchKey = (String, TaskKind, ForgeState, bool);
 
 pub struct TasksView {
     weak_root: WeakEntity<WorkspaceRoot>,
+    /// Focus handle so `PaneContent::Tasks` can satisfy `Focusable` and
+    /// forward focus correctly. The Tasks view is read-only (no text input),
+    /// so this handle is held but focus is not actively routed to it.
+    focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -58,6 +63,7 @@ impl TasksView {
     ) -> Self {
         Self {
             weak_root,
+            focus_handle: _cx.focus_handle(),
             theme,
             density,
             typography,
@@ -311,6 +317,12 @@ impl TasksView {
             .text_color(self.theme.fg_subtle)
             .child(text.to_string())
             .into_any_element()
+    }
+}
+
+impl Focusable for TasksView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 

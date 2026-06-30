@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, SharedString, Subscription, Window,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, SharedString, Subscription,
+    WeakEntity, Window,
 };
 use oximux_agents::CliRuntime;
 use oximux_settings::{Density, Theme, Typography};

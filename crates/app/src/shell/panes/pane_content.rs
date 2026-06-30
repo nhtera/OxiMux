@@ -15,6 +15,7 @@ use oximux_editor::EditorView;
 use crate::shell::browser_view::BrowserView;
 use crate::shell::diff_view::DiffView;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
+use crate::shell::tasks_view::TasksView;
 use crate::shell::terminal_view::TerminalView;
 
 pub enum PaneContent {
@@ -32,6 +33,11 @@ pub enum PaneContent {
     /// In-process embedded browser leaf. Owns a native webview layered over
     /// the GPU canvas; persists only its URL. No PTY, no relay.
     Browser(Entity<BrowserView>),
+    /// GitHub issue / PR browser for the active project. Singleton per
+    /// workspace: the nav rail opens one instance and re-activates it on
+    /// subsequent clicks. Not persisted across restarts — the nav re-opens
+    /// it from scratch after a session restore.
+    Tasks(Entity<TasksView>),
 }
 
 impl PaneContent {
@@ -46,6 +52,7 @@ impl PaneContent {
             Self::Editor(view) => view.read(cx).focus_handle(cx),
             Self::Diff(view) => view.read(cx).focus_handle(cx),
             Self::Browser(view) => view.read(cx).focus_handle(cx),
+            Self::Tasks(view) => view.read(cx).focus_handle(cx),
         }
     }
 
@@ -64,6 +71,8 @@ impl PaneContent {
             // into the page; GPUI's per-leaf focus bookkeeping doesn't route
             // input to it, so report `false` like the diff view.
             Self::Browser(_) => false,
+            // Tasks is read-only (no text input); report `false` like Diff.
+            Self::Tasks(_) => false,
         }
     }
 
@@ -73,7 +82,7 @@ impl PaneContent {
 
     pub fn editor_path<'a>(&'a self, cx: &'a App) -> Option<&'a Path> {
         match self {
-            Self::Terminal(_) | Self::Diff(_) | Self::Browser(_) => None,
+            Self::Terminal(_) | Self::Diff(_) | Self::Browser(_) | Self::Tasks(_) => None,
             Self::Editor(view) => Some(view.read(cx).file_path()),
         }
     }
@@ -85,7 +94,7 @@ impl PaneContent {
     pub fn terminal_active_view(&self) -> Option<&Entity<TerminalView>> {
         match self {
             Self::Terminal(tree) => tree.active_view(),
-            Self::Editor(_) | Self::Diff(_) | Self::Browser(_) => None,
+            Self::Editor(_) | Self::Diff(_) | Self::Browser(_) | Self::Tasks(_) => None,
         }
     }
 }

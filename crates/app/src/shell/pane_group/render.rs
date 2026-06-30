@@ -142,6 +142,9 @@ impl Render for PaneGroup {
             // Browser tabs render the BrowserView entity directly — its
             // toolbar + anchor canvas; the native webview floats over it.
             PaneContent::Browser(view) => view.clone().into_any_element(),
+            // Tasks tab renders the TasksView entity directly — same pattern
+            // as Diff/Browser: the view owns its own scroll and layout.
+            PaneContent::Tasks(view) => view.clone().into_any_element(),
         });
 
         // Empty-pane placeholder: when the user closes the last tab of
@@ -452,6 +455,9 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         | PaneGroupTabKind::BranchFile { .. }
         | PaneGroupTabKind::CombinedDiff { .. } => PaneTabKindMarker::Diff,
         PaneGroupTabKind::Browser { .. } => PaneTabKindMarker::Browser,
+        // Tasks shares the Browser marker — same "non-editable content page"
+        // semantics and no diff/terminal chrome needed.
+        PaneGroupTabKind::Tasks => PaneTabKindMarker::Browser,
     }
 }
 
@@ -1651,6 +1657,8 @@ fn render_mru_hud(
             | PaneGroupTabKind::CombinedDiff { .. } => "icons/file.svg",
             PaneGroupTabKind::Terminal => "icons/square-terminal.svg",
             PaneGroupTabKind::Browser { .. } => "icons/globe.svg",
+            // Tasks uses the list-tree glyph for the Ctrl+Tab switcher row.
+            PaneGroupTabKind::Tasks => "icons/list-tree.svg",
             // Match the tab chip: brand the agent by its adapter glyph so
             // the Ctrl+Tab switcher reads the same as the strip.
             PaneGroupTabKind::Agent { adapter_id, .. } => agent_icon(adapter_id),

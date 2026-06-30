@@ -65,7 +65,6 @@ use crate::shell::left_rail::toolbar::render_toolbar;
 use crate::shell::left_rail::workspace_list_render::{
     WorkspaceGroupMode, WorkspaceSortMode, sort_workspaces,
 };
-use crate::shell::tasks_view::TasksView;
 use crate::workspace_root::WorkspaceRoot;
 
 const HEADER_ICON_SIZE: f32 = 14.0;
@@ -242,9 +241,6 @@ pub struct LeftRail {
     /// zeroed when the page is opened. Lives here (not on the dashboard
     /// view) because the rail entity survives project switches.
     agents_unread: u32,
-    /// Tasks page entity (GitHub issue/PR browser), mounted when the Tasks nav
-    /// is active. Owns its own async fetch + filter state.
-    tasks_view: Entity<TasksView>,
     /// Per-project held Smart-sort order during the settle window (item:
     /// Smart rows don't reshuffle under the cursor right after a status
     /// change). Keyed by project id. Not persisted.
@@ -277,13 +273,10 @@ pub struct LeftRail {
 impl LeftRail {
     /// Default-construct theme/density/typography. WorkspaceRoot uses the
     /// same constants in its own `new`, so the rail and root always agree.
-    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, cx: &mut Context<Self>) -> Self {
+    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, _cx: &mut Context<Self>) -> Self {
         let density = Density::cockpit();
         let theme = Theme::charcoal();
         let typography = Typography::cockpit();
-        let tasks_view = cx.new(|cx| {
-            TasksView::new(weak_root.clone(), theme, density, typography.clone(), cx)
-        });
         Self {
             active_nav: None,
             weak_root,
@@ -320,7 +313,6 @@ impl LeftRail {
             list_scroll: ScrollHandle::new(),
             locate_glow_seq: 0,
             agents_unread: 0,
-            tasks_view,
             smart_settle: HashMap::new(),
             settle_timer_armed: false,
             settle_override_cache: HashMap::new(),
@@ -820,7 +812,6 @@ impl LeftRail {
         focused_agent: Option<RailAgentTarget>,
         cx: &mut Context<Self>,
     ) {
-        let project_changed = self.active_project_id != active_project_id;
         // Unread accounting BEFORE the snapshot swap: any workspace whose
         // status TRANSITIONED into an attention/terminal state while the
         // Agents page is closed bumps the nav badge. Comparing against the
@@ -884,16 +875,6 @@ impl LeftRail {
         self.workspace_agents = workspace_agents;
         self.focused_agent = focused_agent;
 
-        // Keep the Tasks page's project in sync; re-fetch only when the active
-        // project actually changes while the page is open.
-        let active = self.active_project();
-        let tasks_open = self.active_nav == Some(NavItem::Tasks);
-        self.tasks_view.update(cx, |tv, cx| {
-            tv.set_project(active, cx);
-            if project_changed && tasks_open {
-                tv.refresh(cx);
-            }
-        });
         // Only repaint the rail when its inputs changed (see the dirty-check
         // above). A no-op frame keeps the last render — no churn on hover or
         // while an agent merely streams output.
@@ -919,12 +900,6 @@ impl LeftRail {
     #[doc(hidden)]
     pub fn active_nav(&self) -> Option<NavItem> {
         self.active_nav
-    }
-
-    /// Resolve the active `Project` from the current snapshot, if any.
-    fn active_project(&self) -> Option<oximux_core::Project> {
-        let id = self.active_project_id.as_ref()?;
-        self.projects.iter().find(|p| &p.id == id).cloned()
     }
 
     /// Resolve the active workspace's tint swatch from the current snapshot.
@@ -954,9 +929,16 @@ impl LeftRail {
     }
 
     /// Toggle a nav page. Clicking the active page returns to the home view
-    /// (workspace list). Opening the Tasks page seeds it with the active
-    /// project and triggers a fetch (cheap if already loaded).
+    /// (workspace list, no nav row highlighted).
+    ///
+    /// Tasks is no longer a rail body — it lives in the pane group. Callers
+    /// that have a `&mut Window` should use `select_nav_in` so Tasks gets the
+    /// window context required to open the pane tab.
     pub fn select_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
+        // Tasks moved to pane; skip the rail-body toggle path.
+        if item == NavItem::Tasks {
+            return;
+        }
         self.active_nav = if self.active_nav == Some(item) {
             None
         } else {
@@ -965,14 +947,26 @@ impl LeftRail {
         if self.active_nav == Some(NavItem::Agents) {
             self.agents_unread = 0;
         }
-        if self.active_nav == Some(NavItem::Tasks) {
-            let active = self.active_project();
-            self.tasks_view.update(cx, |tv, cx| {
-                tv.set_project(active, cx);
-                tv.activate(cx);
-            });
-        }
         cx.notify();
+    }
+
+    /// Version of `select_nav` that carries `&mut Window`, required when
+    /// opening the Tasks pane tab (RT-1). For Tasks dispatches up through
+    /// `weak_root` to open the singleton Tasks tab in the active project's
+    /// pane group. For all other items delegates to `select_nav`.
+    pub fn select_nav_in(
+        &mut self,
+        item: NavItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if item == NavItem::Tasks {
+            let _ = self.weak_root.update(cx, |root, cx| {
+                root.open_tasks_tab(window, cx);
+            });
+            return;
+        }
+        self.select_nav(item, cx);
     }
 }
 
@@ -1041,14 +1035,6 @@ impl Render for LeftRail {
                 density,
                 &typography,
             )
-        } else if self.active_nav == Some(NavItem::Tasks) {
-            div()
-                .flex()
-                .flex_col()
-                .h_full()
-                .w_full()
-                .child(self.tasks_view.clone())
-                .into_any_element()
         } else {
             // Read the pre-computed Smart-sort settle overrides (refreshed off
             // the render path, never mutated here) so held orders override the

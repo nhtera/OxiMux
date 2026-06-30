@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, Point, ScrollHandle, SharedString,
-    Subscription, Task, Window, px,
+    Subscription, Task, WeakEntity, Window, px,
 };
 use oximux_agents::{
     AgentRuntime, AgentStatusStream, CliRuntime, SharedBackend, agent_label_from_title,
@@ -107,6 +107,10 @@ pub enum PaneGroupTabKind {
     Browser {
         url: String,
     },
+    /// GitHub issue / PR browser. Singleton: the nav rail opens exactly one
+    /// Tasks tab per workspace session; a second click re-activates it.
+    /// Not persisted — the nav re-opens it after a session restore.
+    Tasks,
 }
 
 pub struct PaneGroupTab {
