@@ -1977,7 +1977,6 @@ impl WorkspaceRoot {
         let force = self.force_delete_offer.as_deref() == Some(workspace.id.as_str());
         self.force_delete_offer = None;
         let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
-        let slug = workspace.slug.clone();
         let workspace_for_cb = workspace.clone();
         let project_root = PathBuf::from(&project.root_path);
         let workspace_repo = self.app_state.workspace_repo.clone();
@@ -2090,7 +2089,10 @@ impl WorkspaceRoot {
                     workspace.worktree_path, workspace.branch
                 )
                 .into(),
-                expected: slug.into(),
+                // Force delete `-D`'s the branch (real data loss), so keep a
+                // deliberate type-gate — but a short fixed word, not the slug,
+                // which can be sentence-length for an issue-derived workspace.
+                expected: "delete".into(),
                 on_confirm,
                 confirm_label: Some("Force Delete".into()),
                 on_cancel: None,
@@ -2104,7 +2106,12 @@ impl WorkspaceRoot {
                     workspace.worktree_path, workspace.branch
                 )
                 .into(),
-                expected: slug.into(),
+                // Plain confirm (no type-to-confirm): a normal delete only
+                // removes the branch when git considers it safe (merged) — it
+                // refuses an unmerged branch without force — so a danger-styled
+                // button + the warning above is proportionate, and it spares the
+                // user typing an issue-derived slug that can be sentence-length.
+                expected: "".into(),
                 on_confirm,
                 confirm_label: None,
                 on_cancel: None,
