@@ -984,6 +984,26 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
+    /// Open an existing workspace from a create/start action: activate it
+    /// (focusing its agent tab), return the rail to its home list, and close
+    /// the Tasks tab that may have launched the action. Shared by the
+    /// create-success path and the "workspace already exists" short-circuit so
+    /// both land identically. `go_home` runs AFTER `activate_workspace` (which
+    /// switches project but never touches `active_nav`) so the rail reliably
+    /// ends on the home view.
+    pub(crate) fn open_existing_workspace(
+        &mut self,
+        workspace: Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_workspace(workspace, window, cx);
+        self.left_rail.update(cx, |rail, cx| rail.go_home(cx));
+        if let Some(panes) = self.active_project_panes() {
+            panes.update(cx, |p, cx| p.close_tasks_tab_in_active_group(window, cx));
+        }
+    }
+
     /// Land a notification click on its agent tab: activate the owning
     /// project (cross-project included), select + locate the owning
     /// workspace in the rail, focus the exact tab, and raise the window.
@@ -1703,7 +1723,7 @@ impl WorkspaceRoot {
         agent_prompt: Option<String>,
         linked_issue: Option<String>,
         activate_after: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let slug = derive_slug(name.trim());
@@ -1724,6 +1744,28 @@ impl WorkspaceRoot {
             tracing::warn!("workspace create: cannot resolve data dir");
             return;
         };
+        // Detect an existing workspace for this slug and OPEN it instead of
+        // erroring on a duplicate worktree. The worktree path is deterministic
+        // from (project, slug), so a re-create from the same issue resolves to
+        // the same stored row — clicking "+ Workspace" twice should land on the
+        // existing workspace's agent, not fail with `add_worktree` "already
+        // exists".
+        let worktree_path_str = worktree_path.to_string_lossy().to_string();
+        if let Ok(Some(existing)) = self
+            .app_state
+            .workspace_repo
+            .get_by_worktree_path(&worktree_path_str)
+        {
+            tracing::info!(
+                workspace_id = %existing.id,
+                slug = %slug,
+                "workspace already exists; opening it instead of recreating"
+            );
+            if activate_after {
+                self.open_existing_workspace(existing, window, cx);
+            }
+            return;
+        }
         let workspace_repo = self.app_state.workspace_repo.clone();
         let project_root = PathBuf::from(&project.root_path);
         let project_id = project.id.clone();
@@ -1763,25 +1805,14 @@ impl WorkspaceRoot {
                         cx.notify();
                         // Land on the new workspace (e.g. created from a task):
                         // select it and return the rail to the home list so it's
-                        // visible. Manual dialog creates pass `false` to keep the
-                        // prior behavior. `go_home` runs AFTER activate_workspace
-                        // (which switches project but never touches `active_nav`),
-                        // so the rail reliably ends on the home view. The Tasks
-                        // path always passes its currently-active project, so
+                        // Land on the new workspace (e.g. created from a task):
+                        // select it, return the rail home, and close the Tasks
+                        // tab that launched the create. Manual dialog creates
+                        // pass `false` to keep the prior behavior. The Tasks path
+                        // always passes its currently-active project, so
                         // activate_workspace's recent-projects lookup resolves.
                         if activate_after {
-                            this.activate_workspace(workspace.clone(), window, cx);
-                            this.left_rail.update(cx, |rail, cx| rail.go_home(cx));
-                            // The Tasks tab launched this create; close it so the
-                            // foreground leaves the issue browser (the pane-tab
-                            // equivalent of returning the rail to its home view).
-                            // Foreground falls back to the group's prior tab; the
-                            // freshly-selected workspace spawns its tab on demand.
-                            if let Some(panes) = this.active_project_panes() {
-                                panes.update(cx, |p, cx| {
-                                    p.close_tasks_tab_in_active_group(window, cx)
-                                });
-                            }
+                            this.open_existing_workspace(workspace.clone(), window, cx);
                         }
                         if let Some(kind) = agent {
                             // Auto-spawn from the create dialog launches the
