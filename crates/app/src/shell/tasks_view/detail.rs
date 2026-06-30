@@ -34,9 +34,10 @@ use crate::shell::tasks_view::{TaskKind, TasksView};
 /// Render the detail view for `view.selected`. No-op element when nothing is
 /// selected (the caller only invokes this when `selected.is_some()`).
 pub(super) fn render_detail(view: &TasksView, cx: &mut Context<TasksView>) -> AnyElement {
-    let Some(item) = view.selected.as_ref() else {
+    let Some(row) = view.selected.as_ref() else {
         return div().into_any_element();
     };
+    let item = &row.item;
     let theme = view.theme;
     let density = view.density;
     let typo = &view.typography;
@@ -83,18 +84,16 @@ pub(super) fn render_detail(view: &TasksView, cx: &mut Context<TasksView>) -> An
         );
     breadcrumb = breadcrumb
         .child(div().flex_1())
-        .child(open_action(item.url.clone(), theme, density, typo));
-    if let Some(project) = view.project.clone() {
-        breadcrumb = breadcrumb.child(create_action(
+        .child(open_action(item.url.clone(), theme, density, typo))
+        .child(create_action(
             workspace_name_for(view.kind, item),
             format!("#{}", item.number),
             view.weak_root.clone(),
-            project,
+            row.project.clone(),
             theme,
             density,
             typo,
         ));
-    }
 
     // ----- Row 2: title (the number lives in the breadcrumb above) -----
     let title = div()

@@ -11,22 +11,27 @@ use gpui::{
 };
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputState};
+use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::forge::{ForgeListFilter, ForgeState};
 use crate::shell::tasks_view::row::{
     COL_ACTIONS_W, COL_ASSIGNEES_W, COL_ID_W, COL_STATUS_W, COL_UPDATED_W,
 };
-use crate::shell::tasks_view::{TaskKind, TasksView};
+use crate::shell::tasks_view::scope_picker::render_scope_picker;
+use crate::shell::tasks_view::{TaskKind, TaskScope, TasksView};
 
-/// Single-row toolbar: `Issues|PRs` · query box · `Open|Closed|All|Mine` ·
-/// `Refresh`. The query box flexes to fill the gap (its `--search` passthrough
-/// is what gives the chips composability with GitHub qualifiers). Chip colors
-/// are re-leveled for the content canvas (`bg_panel`) surface.
+/// Single-row toolbar: `Issues|PRs` · scope picker · query box ·
+/// `Open|Closed|All|Mine` · `Refresh`. The query box flexes to fill the gap
+/// (its `--search` passthrough is what gives the chips composability with
+/// GitHub qualifiers). The scope picker selects which project(s) the listing
+/// spans. Chip colors are re-leveled for the content canvas (`bg_panel`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_toolbar(
     kind: TaskKind,
     filter: &ForgeListFilter,
+    scope: &TaskScope,
+    projects: &[Project],
     query_input: &Entity<InputState>,
     has_query: bool,
     theme: Theme,
@@ -58,6 +63,7 @@ pub(super) fn render_toolbar(
         .child(ctrl_chip("PRs", kind == TaskKind::Prs, theme, density, typography, cx, |tv, cx| {
             tv.set_kind(TaskKind::Prs, cx)
         }))
+        .child(render_scope_picker(scope, projects, cx))
         .child(query_box);
     // The clear control only appears while there's text to clear.
     if has_query {

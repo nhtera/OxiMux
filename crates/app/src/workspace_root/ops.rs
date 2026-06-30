@@ -164,11 +164,13 @@ impl WorkspaceRoot {
             return;
         };
         let weak_root: WeakEntity<WorkspaceRoot> = cx.weak_entity();
-        let active_project = self.active_project.clone();
+        // The page spans every known project (aggregate scope by default), so
+        // it's seeded with the full project list, not just the active one.
+        let projects = self.app_state.recent_projects.clone();
         panes.update(cx, |p, cx| {
             p.open_or_activate_tasks_tab_in_active_group(
                 weak_root,
-                active_project,
+                projects,
                 window,
                 cx,
             );
@@ -1332,17 +1334,21 @@ impl WorkspaceRoot {
     }
 
     /// Scan every group in the active project's pane layout for an open Tasks
-    /// tab and forward the new `project` to it. Called on project switch (RT-3)
-    /// so an already-open Tasks tab shows the incoming repo without requiring a
-    /// manual Refresh.
+    /// tab and refresh its known-project set. Called on project switch / create
+    /// so an already-open Tasks tab reflects the current project list without a
+    /// manual Refresh. The aggregate scope keeps showing every project; a scope
+    /// pinned to one project is preserved and only refetches if the set
+    /// actually changed. The `_project` arg is retained for the call sites but
+    /// no longer pins the tab — the page is scope-driven, not active-driven.
     pub(crate) fn refresh_tasks_tab_for_active_project(
         &self,
-        project: Option<oximux_core::Project>,
+        _project: Option<oximux_core::Project>,
         cx: &mut Context<Self>,
     ) {
         let Some(panes) = self.active_project_panes() else {
             return;
         };
+        let projects = self.app_state.recent_projects.clone();
         // Collect views first (immutable borrow) then update (mutable borrow)
         // to satisfy the borrow checker.
         let mut found_views: Vec<gpui::Entity<crate::shell::tasks_view::TasksView>> = Vec::new();
@@ -1360,9 +1366,11 @@ impl WorkspaceRoot {
             }
         }
         for view in found_views {
+            let projects = projects.clone();
             view.update(cx, |tv, cx| {
-                tv.set_project(project.clone(), cx);
-                tv.refresh(cx);
+                // Updates the list and refetches only when the set changed.
+                tv.set_projects(projects, cx);
+                tv.activate(cx);
             });
         }
     }

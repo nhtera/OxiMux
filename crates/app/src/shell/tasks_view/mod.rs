@@ -1,23 +1,29 @@
 //! Tasks page — rendered when the Tasks pane tab is active.
 //!
-//! A GitHub issue/PR browser for the active project's repo. Owns its own async
-//! fetch + filter state (kind, state, assigned-to-me) so the list survives
-//! re-renders; data is fetched through the [`ForgeProvider`] seam (never `gh`
-//! directly). Mounted by the pane system as an `Entity<TasksView>`; row actions
-//! (create workspace, open in browser) dispatch up via `weak_root`.
+//! A GitHub/GitLab issue/PR browser. Lists across a chosen **scope** — every
+//! known project at once ([`TaskScope::All`], the default) or a single one —
+//! so it works like a global inbox rather than being pinned to the active
+//! project. Owns its own async fetch + filter state (scope, kind, state,
+//! assigned-to-me, query) so the list survives re-renders; data is fetched
+//! through the [`ForgeProvider`] seam (never `gh` directly), one concurrent
+//! call per in-scope project. Mounted by the pane system as an
+//! `Entity<TasksView>`; row actions (create workspace, open in browser)
+//! dispatch up via `weak_root`.
 //!
 //! Layout (top → bottom):
-//!   1. Toolbar    — `table::render_toolbar`
+//!   1. Toolbar    — `table::render_toolbar` (scope picker + kind/state/query)
 //!   2. Col-header — `table::render_col_header`
 //!   3. Body       — virtualized `uniform_list` of `row::render_task_row`
 
 mod detail;
 pub mod row;
+mod scope_picker;
 mod table;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::future::join_all;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement,
     ParentElement, Render, Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
@@ -46,20 +52,40 @@ pub enum TaskKind {
     Prs,
 }
 
+/// Which projects the listing spans. [`TaskScope::All`] fans the query out over
+/// every known project (the default — a global issue/PR inbox); [`TaskScope::One`]
+/// narrows to a single project by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TaskScope {
+    All,
+    One(String),
+}
+
+/// One listed issue/PR paired with the project it belongs to. The pairing is
+/// essential under [`TaskScope::All`]: each row's `+ Workspace` / detail action
+/// must run against *its own* project's working tree, not a single active one.
+#[derive(Clone)]
+pub(super) struct TaskRow {
+    pub(super) project: Project,
+    pub(super) item: ForgeItem,
+}
+
 /// Identifies what a given `items` snapshot was fetched for, so re-activating
-/// the page with the same project + filter doesn't re-hit the network. The
-/// query string is part of the key so a nav toggle never replays stale rows
-/// from a different search.
+/// the page with the same scope + filter doesn't re-hit the network. The scope
+/// key (`"*all*"` or a project id) and the query string are part of the key so
+/// a nav toggle never replays stale rows from a different scope/search. A
+/// change to the project *set* is handled separately (it nulls `loaded_key`).
 type FetchKey = (String, TaskKind, ForgeState, bool, Option<String>);
 
 /// One fetch's result: the rows plus the context needed to pick the right
 /// empty-state copy (was a forge even detected, and is its CLI authenticated).
 #[derive(Default)]
 struct FetchOutcome {
-    items: Vec<ForgeItem>,
-    /// Whether `origin` resolved to a supported forge (GitHub/GitLab) at all.
+    items: Vec<TaskRow>,
+    /// Whether any in-scope project's `origin` resolved to a supported forge.
     forge_detected: bool,
-    /// Auth state of that forge's CLI (always `Ok` when no forge was detected).
+    /// Auth state of the forge CLI. Only probed (and meaningful) for a
+    /// single-project scope; `Ok` for the aggregate view.
     auth: AuthState,
 }
 
@@ -72,26 +98,29 @@ pub struct TasksView {
     theme: Theme,
     density: Density,
     typography: Typography,
-    /// Active project the list is scoped to. `None` until a project is opened.
-    project: Option<Project>,
+    /// Every known project, so the scope picker can offer them and
+    /// [`TaskScope::All`] can fan out. Refreshed via [`TasksView::set_projects`].
+    projects: Vec<Project>,
+    /// Which project(s) the listing spans. Defaults to [`TaskScope::All`].
+    scope: TaskScope,
     kind: TaskKind,
     filter: ForgeListFilter,
     /// GitHub-search query box. Its `Change`/`Enter` events drive
     /// [`TasksView::set_search`] (debounced) and refine the listing.
     query_input: Entity<InputState>,
-    items: Vec<ForgeItem>,
-    /// Whether the last fetch found a supported forge for this project's repo.
+    items: Vec<TaskRow>,
+    /// Whether the last fetch found a supported forge for the scope's repo(s).
     /// Drives the "no GitHub/GitLab remote" hint vs the authenticated states.
     forge_detected: bool,
-    /// Auth state from the last fetch's `gh auth status` probe (cached here so
-    /// the hint branches without re-probing per render; re-checked on Refresh).
+    /// Auth state from the last single-project fetch's `gh auth status` probe
+    /// (cached here so the hint branches without re-probing per render).
     auth: AuthState,
     loading: bool,
     loaded_key: Option<FetchKey>,
     /// Issue/PR currently shown in the in-pane detail view, or `None` for the
-    /// list. Holds the row's [`ForgeItem`] (title/state/labels/assignees) so the
-    /// detail renders its metadata immediately while the body loads.
-    selected: Option<ForgeItem>,
+    /// list. Holds the row (project + [`ForgeItem`]) so the detail renders its
+    /// metadata immediately while the body loads and acts on the right project.
+    selected: Option<TaskRow>,
     /// Lazily-fetched body + author for [`Self::selected`].
     detail: Option<ItemDetail>,
     detail_loading: bool,
@@ -134,7 +163,8 @@ impl TasksView {
             theme,
             density,
             typography,
-            project: None,
+            projects: Vec::new(),
+            scope: TaskScope::All,
             kind: TaskKind::Issues,
             filter: ForgeListFilter::default(),
             query_input,
@@ -156,20 +186,33 @@ impl TasksView {
         }
     }
 
-    /// Push the active project. Stores it without fetching — the pane system
-    /// calls [`TasksView::activate`]/[`TasksView::refresh`] to drive the network.
-    pub fn set_project(&mut self, project: Option<Project>, cx: &mut Context<Self>) {
-        let changed = self.project.as_ref().map(|p| &p.id) != project.as_ref().map(|p| &p.id);
-        self.project = project;
+    /// Push the known-project set. Stores it without fetching — the pane system
+    /// calls [`TasksView::activate`]/[`TasksView::refresh`] to drive the
+    /// network. A changed set invalidates the cache (a newly-added project
+    /// should appear in the `All` view) and drops a scope pinned to a project
+    /// that no longer exists back to `All`.
+    pub fn set_projects(&mut self, projects: Vec<Project>, cx: &mut Context<Self>) {
+        let changed = self
+            .projects
+            .iter()
+            .map(|p| &p.id)
+            .ne(projects.iter().map(|p| &p.id));
+        self.projects = projects;
+        if let TaskScope::One(id) = &self.scope {
+            if !self.projects.iter().any(|p| &p.id == id) {
+                self.scope = TaskScope::All;
+            }
+        }
         if changed {
+            self.loaded_key = None;
             cx.notify();
         }
     }
 
     /// Called when the page becomes visible. Fetches only when the current
-    /// project + filter hasn't already been loaded (cheap nav toggling).
+    /// scope + filter hasn't already been loaded (cheap nav toggling).
     pub fn activate(&mut self, cx: &mut Context<Self>) {
-        if self.loaded_key.is_some() && self.loaded_key == self.current_key() {
+        if self.loaded_key.is_some() && self.loaded_key.as_ref() == Some(&self.current_key()) {
             return;
         }
         self.fetch(cx);
@@ -181,16 +224,47 @@ impl TasksView {
         self.fetch(cx);
     }
 
-    fn current_key(&self) -> Option<FetchKey> {
-        self.project.as_ref().map(|p| {
-            (
-                p.id.clone(),
-                self.kind,
-                self.filter.state,
-                self.filter.mine,
-                self.filter.search.clone(),
-            )
-        })
+    fn current_key(&self) -> FetchKey {
+        (
+            self.scope_key(),
+            self.kind,
+            self.filter.state,
+            self.filter.mine,
+            self.filter.search.clone(),
+        )
+    }
+
+    /// Stable string for the active scope — `"*all*"` for the aggregate view
+    /// (a sentinel no project id can collide with) or the project id.
+    fn scope_key(&self) -> String {
+        match &self.scope {
+            TaskScope::All => "*all*".to_string(),
+            TaskScope::One(id) => id.clone(),
+        }
+    }
+
+    /// Switch the listing scope (picker selection). Returns to the list view and
+    /// refetches.
+    pub(super) fn set_scope(&mut self, scope: TaskScope, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        // Leaving the detail view: a selected row may belong to a project the
+        // new scope no longer shows.
+        self.selected = None;
+        self.detail = None;
+        self.detail_loading = false;
+        self.detail_gen = self.detail_gen.wrapping_add(1);
+        self.fetch(cx);
+    }
+
+    pub(super) fn scope(&self) -> &TaskScope {
+        &self.scope
+    }
+
+    pub(super) fn projects(&self) -> &[Project] {
+        &self.projects
     }
 
     pub(super) fn set_kind(&mut self, kind: TaskKind, cx: &mut Context<Self>) {
@@ -277,13 +351,12 @@ impl TasksView {
     }
 
     /// Open the in-pane detail view for one row, fetching its body + author
-    /// lazily. The row's metadata renders immediately; the body streams in.
-    pub(super) fn open_detail(&mut self, item: ForgeItem, cx: &mut Context<Self>) {
-        let Some(project) = self.project.clone() else {
-            return;
-        };
-        let number = item.number;
-        self.selected = Some(item);
+    /// lazily against the row's own project. The row's metadata renders
+    /// immediately; the body streams in.
+    pub(super) fn open_detail(&mut self, row: TaskRow, cx: &mut Context<Self>) {
+        let project = row.project.clone();
+        let number = row.item.number;
+        self.selected = Some(row);
         self.detail = None;
         self.detail_loading = true;
         self.detail_gen = self.detail_gen.wrapping_add(1);
@@ -345,16 +418,30 @@ impl TasksView {
         // (or Enter) can't leave an orphaned timer that refires a redundant
         // fetch ~300ms later (and flashes the loading state).
         self.debounce_task = None;
-        let Some(project) = self.project.clone() else {
+
+        // Resolve the scope to the concrete projects to query.
+        let targets: Vec<Project> = match &self.scope {
+            TaskScope::All => self.projects.clone(),
+            TaskScope::One(id) => self
+                .projects
+                .iter()
+                .filter(|p| &p.id == id)
+                .cloned()
+                .collect(),
+        };
+        if targets.is_empty() {
             self.items.clear();
             self.loading = false;
             self.loaded_key = None;
+            self.forge_detected = false;
+            self.auth = AuthState::Ok;
             cx.notify();
             return;
-        };
-        self.loaded_key = self.current_key();
+        }
+
+        self.loaded_key = Some(self.current_key());
         self.loading = true;
-        // Drop the previous result so a kind/state/Mine switch shows the
+        // Drop the previous result so a scope/kind/state/Mine switch shows the
         // loading state instead of stale rows from the old query.
         self.items.clear();
         cx.notify();
@@ -364,37 +451,74 @@ impl TasksView {
         self.fetch_gen = self.fetch_gen.wrapping_add(1);
         let my_gen = self.fetch_gen;
 
-        let cwd = PathBuf::from(&project.root_path);
         let kind = self.kind;
         let filter = self.filter.clone();
+        // The per-project auth probe is only meaningful (and surfaced) when the
+        // scope is a single project — the aggregate view skips it.
+        let probe_auth = matches!(self.scope, TaskScope::One(_));
         let (tx, rx) = tokio::sync::oneshot::channel::<FetchOutcome>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    // Unsupported remote (neither GitHub nor GitLab) → empty
-                    // list without firing a forge CLI against a foreign host.
-                    // A detected forge also gets a cheap auth probe so the empty
-                    // state can tell "not signed in" apart from "no open items".
-                    let outcome = match Forge::detect(&cwd).await {
-                        Some(forge) => {
-                            // The auth probe and the listing are independent
-                            // reads, so run them concurrently — a slow/degraded
-                            // auth check then doesn't stack its timeout on top
-                            // of the list call's.
-                            let (auth, items) = tokio::join!(
-                                forge.auth_state(&cwd),
-                                async {
-                                    match kind {
-                                        TaskKind::Issues => forge.list_issues(&cwd, filter).await,
-                                        TaskKind::Prs => forge.list_prs(&cwd, filter).await,
-                                    }
-                                },
-                            );
-                            FetchOutcome { items, forge_detected: true, auth }
+                    // One concurrent forge call per in-scope project. A project
+                    // whose `origin` isn't a supported forge (or that has no
+                    // remote at all) contributes nothing and is skipped — the
+                    // aggregate degrades gracefully exactly like the rest of the
+                    // page does on a forge-CLI failure.
+                    let per_project = targets.into_iter().map(|project| {
+                        let filter = filter.clone();
+                        async move {
+                            let cwd = PathBuf::from(&project.root_path);
+                            match Forge::detect(&cwd).await {
+                                Some(forge) => {
+                                    let list = async {
+                                        match kind {
+                                            TaskKind::Issues => {
+                                                forge.list_issues(&cwd, filter).await
+                                            }
+                                            TaskKind::Prs => forge.list_prs(&cwd, filter).await,
+                                        }
+                                    };
+                                    // For a single-project scope the auth probe
+                                    // and the listing are independent reads, so
+                                    // run them concurrently (no stacked timeout).
+                                    let (auth, items) = if probe_auth {
+                                        tokio::join!(forge.auth_state(&cwd), list)
+                                    } else {
+                                        (AuthState::Ok, list.await)
+                                    };
+                                    (true, auth, project, items)
+                                }
+                                None => (false, AuthState::Ok, project, Vec::new()),
+                            }
                         }
-                        None => FetchOutcome::default(),
-                    };
-                    let _ = tx.send(outcome);
+                    });
+                    let results = join_all(per_project).await;
+
+                    let mut rows: Vec<TaskRow> = Vec::new();
+                    let mut any_detected = false;
+                    let mut probed_auth = AuthState::Ok;
+                    for (detected, auth, project, items) in results {
+                        any_detected |= detected;
+                        if probe_auth {
+                            probed_auth = auth;
+                        }
+                        for item in items {
+                            rows.push(TaskRow {
+                                project: project.clone(),
+                                item,
+                            });
+                        }
+                    }
+                    // Newest-first. RFC-3339 timestamps sort chronologically as
+                    // plain strings; a missing/empty stamp sinks to the bottom.
+                    rows.sort_by(|a, b| b.item.updated_at.cmp(&a.item.updated_at));
+
+                    let _ = tx.send(FetchOutcome {
+                        items: rows,
+                        forge_detected: any_detected,
+                        auth: probed_auth,
+                    });
                 });
             }
             Err(_) => {
@@ -423,9 +547,9 @@ impl TasksView {
 
     fn render_body(&self, weak_tasks: WeakEntity<TasksView>) -> AnyElement {
         let theme = self.theme;
-        let Some(project) = self.project.clone() else {
+        if self.projects.is_empty() {
             return self.hint("Open a project to browse its issues.");
-        };
+        }
         if self.loading && self.items.is_empty() {
             return self.hint("Loading\u{2026}");
         }
@@ -438,6 +562,8 @@ impl TasksView {
         let typography = self.typography.clone();
         let kind = self.kind;
         let weak_root = self.weak_root.clone();
+        // Under the aggregate scope each row tags which project it came from.
+        let show_project = matches!(self.scope, TaskScope::All);
         // One clock read per render (not per row) for the relative `Updated`
         // column; moved into the list closure and borrowed by each row.
         let now = chrono::Utc::now().to_rfc3339();
@@ -448,13 +574,14 @@ impl TasksView {
             move |range: std::ops::Range<usize>, _window, _cx| {
                 range
                     .filter_map(|i| items.get(i).cloned())
-                    .map(|item| {
+                    .map(|row| {
                         render_task_row(
-                            &item,
+                            &row.item,
                             kind,
                             weak_tasks.clone(),
                             weak_root.clone(),
-                            project.clone(),
+                            row.project.clone(),
+                            show_project,
                             &now,
                             theme,
                             density,
@@ -469,15 +596,26 @@ impl TasksView {
         div().flex_1().w_full().child(list).into_any_element()
     }
 
-    /// Copy for the empty list, disambiguating the three failure modes the old
-    /// single string conflated: no supported remote, an unauthenticated CLI, or
-    /// a genuinely empty (but reachable) repo. Filter-aware so "No open issues"
-    /// doesn't lie when the Closed/All filter is active.
+    /// Copy for the empty list. For a single-project scope it disambiguates the
+    /// failure modes the old single string conflated (no supported remote, an
+    /// unauthenticated CLI, or a genuinely empty repo). For the aggregate scope
+    /// the per-project auth nuance doesn't apply, so it stays generic.
     fn empty_hint(&self) -> String {
         let what = match self.kind {
             TaskKind::Issues => "issues",
             TaskKind::Prs => "pull requests",
         };
+        let scope = if self.filter.state == ForgeState::Open {
+            "open "
+        } else {
+            ""
+        };
+        if matches!(self.scope, TaskScope::All) {
+            if !self.forge_detected {
+                return "No GitHub or GitLab remotes across your projects.".to_string();
+            }
+            return format!("No {scope}{what} across your projects.");
+        }
         if !self.forge_detected {
             return "No GitHub or GitLab remote for this repo.".to_string();
         }
@@ -487,14 +625,7 @@ impl TasksView {
             // first — collapsing them would point the user at the wrong step.
             AuthState::NotAuthed => format!("Sign in with `gh auth login` to see {what}."),
             AuthState::GhMissing => format!("Install the `gh` CLI and sign in to see {what}."),
-            AuthState::Ok => {
-                let scope = if self.filter.state == ForgeState::Open {
-                    "open "
-                } else {
-                    ""
-                };
-                format!("No {scope}{what}.")
-            }
+            AuthState::Ok => format!("No {scope}{what}."),
         }
     }
 
@@ -536,6 +667,8 @@ impl Render for TasksView {
         let toolbar = render_toolbar(
             self.kind,
             &self.filter,
+            self.scope(),
+            self.projects(),
             &self.query_input,
             has_query,
             self.theme,

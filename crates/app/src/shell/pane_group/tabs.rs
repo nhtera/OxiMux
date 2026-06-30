@@ -660,7 +660,7 @@ impl PaneGroup {
     pub fn open_or_activate_tasks_tab(
         &mut self,
         weak_root: WeakEntity<crate::workspace_root::WorkspaceRoot>,
-        active_project: Option<oximux_core::Project>,
+        projects: Vec<oximux_core::Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -668,11 +668,11 @@ impl PaneGroup {
         if let Some(idx) = self.tabs.iter().position(|t| {
             matches!(&t.kind, PaneGroupTabKind::Tasks)
         }) {
-            // If the project changed since we last opened the tab, update it.
+            // Keep the known-project set current; the page's scope is preserved.
             if let PaneContent::Tasks(view) = &self.tabs[idx].content {
                 let view = view.clone();
                 view.update(cx, |tv, cx| {
-                    tv.set_project(active_project, cx);
+                    tv.set_projects(projects, cx);
                     tv.activate(cx);
                 });
             }
@@ -683,7 +683,7 @@ impl PaneGroup {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
-        let active_project_for_view = active_project;
+        let projects_for_view = projects;
         let view = cx.new(|cx| {
             let mut v = crate::shell::tasks_view::TasksView::new(
                 weak_root,
@@ -693,7 +693,7 @@ impl PaneGroup {
                 window,
                 cx,
             );
-            v.set_project(active_project_for_view, cx);
+            v.set_projects(projects_for_view, cx);
             v.activate(cx);
             v
         });

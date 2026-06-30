@@ -50,7 +50,7 @@ impl ProjectPanes {
     pub fn open_or_activate_tasks_tab_in_active_group(
         &mut self,
         weak_root: WeakEntity<crate::workspace_root::WorkspaceRoot>,
-        active_project: Option<oximux_core::Project>,
+        projects: Vec<oximux_core::Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -65,7 +65,7 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         if let Some(target) = self.groups.get(&target_id).cloned() {
             target.update(cx, |g, cx| {
-                g.open_or_activate_tasks_tab(weak_root, active_project, window, cx);
+                g.open_or_activate_tasks_tab(weak_root, projects, window, cx);
             });
         }
     }

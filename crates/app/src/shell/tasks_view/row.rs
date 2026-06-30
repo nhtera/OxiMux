@@ -24,7 +24,7 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::shell::forge::ForgeItem;
 use crate::shell::open_url::open_url;
 use crate::shell::session_merge::relative_age_compact;
-use crate::shell::tasks_view::{TaskKind, TasksView};
+use crate::shell::tasks_view::{TaskKind, TaskRow, TasksView};
 use crate::workspace_root::WorkspaceRoot;
 
 // ---------------------------------------------------------------------------
@@ -112,17 +112,28 @@ fn chip(text: String, fg: Hsla, bg: Hsla, density: Density, typography: &Typogra
 /// behind a hover-visible opacity trick (always rendered, zero-opacity at rest).
 /// Clicking the row (outside the action cluster, which stops propagation) opens
 /// the issue/PR in the in-pane detail view via `weak_tasks`.
+///
+/// `project` is the issue/PR's *own* project (each row may belong to a
+/// different one under the aggregate scope); `show_project` adds a small
+/// project tag to the context sub-line so the source is legible when the list
+/// spans projects.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_task_row(
     item: &ForgeItem,
     kind: TaskKind,
     weak_tasks: WeakEntity<TasksView>,
     weak_root: WeakEntity<WorkspaceRoot>,
     project: Project,
+    show_project: bool,
     now: &str,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> AnyElement {
+    // The row dispatches to its own project; capture before the action cluster
+    // moves `project`.
+    let click_project = project.clone();
+    let project_name = project.name.clone();
     // Column: #ID
     let col_id = div()
         .flex_none()
@@ -144,13 +155,24 @@ pub(super) fn render_task_row(
         .text_color(theme.fg_base)
         .child(item.title.clone());
 
-    // Sub-line: up to 2 label chips, clipped to the column width
+    // Sub-line: optional project tag (aggregate scope) + up to 2 label chips,
+    // clipped to the column width. The project tag leads so the source reads
+    // first when the list spans projects.
     let mut sub_row = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(density.gap_inline))
         .overflow_hidden();
+    if show_project {
+        sub_row = sub_row.child(chip(
+            project_name,
+            theme.fg_subtle,
+            theme.bg_panel_alt,
+            density,
+            typography,
+        ));
+    }
     for label in item.labels.iter().take(2) {
         sub_row = sub_row.child(chip(
             label.name.clone(),
@@ -275,8 +297,11 @@ pub(super) fn render_task_row(
         .gap(px(density.gap_inline))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _w, cx: &mut App| {
-            let item = click_item.clone();
-            let _ = weak_tasks.update(cx, |tv, cx| tv.open_detail(item, cx));
+            let row = TaskRow {
+                project: click_project.clone(),
+                item: click_item.clone(),
+            };
+            let _ = weak_tasks.update(cx, |tv, cx| tv.open_detail(row, cx));
         })
         .child(col_id)
         .child(col_title)
