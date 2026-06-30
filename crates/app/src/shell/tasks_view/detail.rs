@@ -28,7 +28,7 @@ use gpui_component::text::{TextView, TextViewStyle};
 
 use crate::shell::forge::ref_parse::parse_forge_ref;
 use crate::shell::session_merge::relative_age_long;
-use crate::shell::tasks_view::row::{create_action, open_action, state_color, workspace_name_for};
+use crate::shell::tasks_view::row::{create_action, open_action, state_pill, workspace_name_for};
 use crate::shell::tasks_view::{TaskKind, TasksView};
 
 /// Render the detail view for `view.selected`. No-op element when nothing is
@@ -108,14 +108,7 @@ pub(super) fn render_detail(view: &TasksView, cx: &mut Context<TasksView>) -> An
         TaskKind::Issues => "issue",
         TaskKind::Prs => "pull request",
     };
-    let state_chip = div()
-        .flex_none()
-        .px(px(6.0))
-        .rounded(px(density.r_chip))
-        .bg(theme.bg_overlay)
-        .text_size(px(typo.t_label_xs))
-        .text_color(state_color(&item.state, theme))
-        .child(format!("\u{25cf} {}", titlecase(&item.state)));
+    let state_chip = state_pill(&item.state, theme, density, typo);
 
     let mut meta = div()
         .flex()
@@ -267,30 +260,9 @@ fn repo_breadcrumb(url: &str) -> Option<String> {
     Some(repo.replace('/', " / "))
 }
 
-/// Title-case a forge state word (`OPEN` / `open` → `Open`) for the state chip.
-/// ASCII-only input (the forge states), so byte-wise capitalization is safe.
-fn titlecase(state: &str) -> String {
-    let mut chars = state.chars();
-    match chars.next() {
-        Some(first) => {
-            let rest = chars.as_str().to_ascii_lowercase();
-            format!("{}{rest}", first.to_ascii_uppercase())
-        }
-        None => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{repo_breadcrumb, titlecase};
-
-    #[test]
-    fn titlecase_normalizes_forge_states() {
-        assert_eq!(titlecase("OPEN"), "Open");
-        assert_eq!(titlecase("closed"), "Closed");
-        assert_eq!(titlecase("Merged"), "Merged");
-        assert_eq!(titlecase(""), "");
-    }
+    use super::repo_breadcrumb;
 
     #[test]
     fn repo_breadcrumb_parses_owner_repo() {

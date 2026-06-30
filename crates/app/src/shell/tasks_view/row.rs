@@ -57,6 +57,40 @@ pub(super) fn state_color(state: &str, theme: Theme) -> Hsla {
     }
 }
 
+/// Title-case a forge state word (`OPEN` / `open` → `Open`). ASCII-only input
+/// (the forge states), so byte-wise capitalization is safe.
+pub(super) fn titlecase_state(state: &str) -> String {
+    let mut chars = state.chars();
+    match chars.next() {
+        Some(first) => {
+            let rest = chars.as_str().to_ascii_lowercase();
+            format!("{}{rest}", first.to_ascii_uppercase())
+        }
+        None => String::new(),
+    }
+}
+
+/// The status pill (`● Open` / `● Closed` / `● Merged`) — a dotted, title-cased
+/// chip tinted by [`state_color`]. Shared by the list's STATUS column and the
+/// detail header so the two read identically.
+pub(super) fn state_pill(
+    state: &str,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(6.0))
+        .rounded(px(density.r_chip))
+        .bg(theme.bg_overlay)
+        .text_size(px(typography.t_label_xs))
+        .text_color(state_color(state, theme))
+        .whitespace_nowrap()
+        .child(format!("\u{25cf} {}", titlecase_state(state)))
+        .into_any_element()
+}
+
 /// The workspace name seeded from an issue/PR. `create_workspace_async` derives
 /// the slug + `oximux/<slug>` branch from this, so it carries the number for a
 /// recognizable branch like `oximux/issue-42-fix-crash`. The title is trimmed
@@ -150,6 +184,7 @@ pub(super) fn render_task_row(
         .w_full()
         .overflow_hidden()
         .whitespace_nowrap()
+        .text_ellipsis()
         .text_size(px(typography.t_body_sm))
         .font_weight(typography.w_semibold)
         .text_color(theme.fg_base)
@@ -220,25 +255,29 @@ pub(super) fn render_task_row(
                 .child(format!("@{}", assignee.login)),
         );
     }
+    // Em dash placeholder when nobody's assigned, so the column never reads as
+    // an accidentally-blank cell.
+    if item.assignees.is_empty() {
+        assignees_row = assignees_row.child(
+            div()
+                .flex_none()
+                .text_size(px(typography.t_label_xs))
+                .text_color(theme.fg_subtle)
+                .child("\u{2014}".to_string()),
+        );
+    }
     let col_assignees = div()
         .flex_none()
         .w(px(COL_ASSIGNEES_W))
         .overflow_hidden()
         .child(assignees_row);
 
-    // Column: STATUS — state chip (open/closed/merged)
-    let state_chip = chip(
-        item.state.to_ascii_lowercase(),
-        state_color(&item.state, theme),
-        theme.bg_overlay,
-        density,
-        typography,
-    );
+    // Column: STATUS — dotted state pill (open/closed/merged)
     let col_status = div()
         .flex_none()
         .w(px(COL_STATUS_W))
         .overflow_hidden()
-        .child(state_chip);
+        .child(state_pill(&item.state, theme, density, typography));
 
     // Column: UPDATED — relative age ("3d", "2h", "now"). Falls back to a dash
     // when the source reported no timestamp (a forge listing that omits it) or
@@ -296,6 +335,9 @@ pub(super) fn render_task_row(
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
         .cursor_pointer()
+        // Subtle row highlight on hover — interactive feedback that the whole
+        // row opens the issue/PR.
+        .hover(|s| s.bg(theme.bg_panel_alt))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _w, cx: &mut App| {
             let row = TaskRow {
                 project: click_project.clone(),
@@ -382,7 +424,15 @@ pub(super) fn create_action(
 
 #[cfg(test)]
 mod tests {
-    use super::short_issue_title;
+    use super::{short_issue_title, titlecase_state};
+
+    #[test]
+    fn titlecase_state_normalizes_forge_states() {
+        assert_eq!(titlecase_state("OPEN"), "Open");
+        assert_eq!(titlecase_state("closed"), "Closed");
+        assert_eq!(titlecase_state("Merged"), "Merged");
+        assert_eq!(titlecase_state(""), "");
+    }
 
     #[test]
     fn short_issue_title_keeps_short_titles_whole() {
