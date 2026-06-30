@@ -4,6 +4,19 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-06-30 — Fix: Send-to-Agent routes to the agent you last used
+
+**Touches**: `crates/app/src/shell/pane_group/state.rs`, `crates/app/src/shell/project_panes/state.rs`
+
+With more than one agent open, "Send Selection / Last Output to Agent" could land in an unintended agent. When the action fires from a focused *terminal*, the active tab isn't an agent, so `target_agent_session` fell straight through to `first_agent_session()` — an arbitrary tab-order pick that ignores which agent the user was actually working with.
+
+- New `PaneGroup::mru_agent_session()` resolves the most-recently-active agent from the group's existing MRU queue (front = most recent), so it's naturally validated and close/reorder-safe.
+- `target_agent_session` now prefers, most-specific first: active-tab agent → active-group MRU agent → any-group active agent → any-group MRU agent → first agent. The common "run a command in a terminal, send its output to the agent I was just in" flow now lands deterministically.
+
+GUI-verified: with two agents, activating one then sending from a terminal lands in that agent; activating the other switches the target cleanly. This also explained an earlier red herring — a "restored agent isn't receiving sends" symptom was really this mis-routing (the send was going to a different agent); once correctly targeted, restored agents receive normally. `cargo test --workspace --no-fail-fast` green (2433 pass / 0 fail).
+
+---
+
 ### 2026-06-30 — Terminal: OSC 133 shell-integration bootstrap on spawn
 
 **Touches**: `crates/app/src/shell/terminal/shell_integration.rs` (new), `crates/app/src/shell/terminal/mod.rs`, `crates/app/src/shell/terminal/terminal_view/{mod,lifecycle,input}.rs`, `crates/app/src/app_settings/terminal_settings.rs`, `crates/settings/src/terminal.rs`

@@ -315,6 +315,20 @@ impl PaneGroup {
         }
     }
 
+    /// The agent the user most recently had active in this group, in MRU
+    /// order (most-recent first). Lets "send to agent" target the agent you
+    /// were just working with even after focusing a terminal tab — instead of
+    /// an arbitrary tab-order pick that ignores which agent you last looked at.
+    /// `None` when no agent tab has ever been active. Naturally validated and
+    /// reorder/close-safe: the MRU stores live tab indices maintained by
+    /// `bump_mru`/`forget_mru`.
+    pub fn mru_agent_session(&self) -> Option<AgentSessionId> {
+        self.mru.iter().find_map(|&idx| match &self.tabs.get(idx)?.kind {
+            PaneGroupTabKind::Agent { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+    }
+
     /// First agent session id found anywhere in this group's tab list,
     /// regardless of active state. Fallback target when no active agent
     /// tab is available (e.g. terminal in active tab, agent in a
