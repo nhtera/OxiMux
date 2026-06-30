@@ -108,7 +108,7 @@ src/
     │                       debounce-persisted to settings repo as JSON; NOT a second OS window
     ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)
     ├── main_pane.rs        pane binary-tree; split/close/focus actions; each leaf holds
-    │                       PaneContent enum (Terminal | Editor); open_editor_in_focused_pane
+    │                       PaneContent enum (Terminal | Editor | Diff | Browser | Tasks); open_editor_in_focused_pane
     │                       replaces focused leaf content; same-path short-circuit
     ├── pane_tree.rs        pure PaneTree data structure (weight-aware)
     ├── pane_layout.rs      layout helpers

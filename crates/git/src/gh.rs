@@ -95,12 +95,21 @@ pub enum AuthState {
 /// round-trip (8s cap). Never panics — a "can't tell" result (no binary,
 /// spawn/timeout failure) maps to [`AuthState::GhMissing`].
 pub async fn auth_state(cwd: impl AsRef<Path>) -> AuthState {
-    match GhCmd::new(cwd)
-        .args(["auth", "status"])
-        .timeout(Duration::from_secs(8))
-        .run_raw()
-        .await
-    {
+    classify_auth_status(
+        GhCmd::new(cwd)
+            .args(["auth", "status"])
+            .timeout(Duration::from_secs(8))
+            .run_raw()
+            .await,
+    )
+}
+
+/// Map a `gh auth status` invocation result onto an [`AuthState`]. Pure (no
+/// I/O) so the exit-code → state mapping is unit-testable without a live `gh`:
+/// exit 0 → `Ok`; ran-but-non-zero (not logged in) → `NotAuthed`; couldn't run
+/// at all (binary absent, spawn/timeout) → `GhMissing`.
+fn classify_auth_status(result: Result<(bool, String, String)>) -> AuthState {
+    match result {
         Ok((true, ..)) => AuthState::Ok,
         Ok((false, ..)) => AuthState::NotAuthed,
         Err(_) => AuthState::GhMissing,
@@ -693,6 +702,25 @@ mod tests {
         assert_eq!(items[0].number, 3);
         assert!(items[0].url.is_empty());
         assert!(items[0].labels.is_empty());
+    }
+
+    #[test]
+    fn classify_auth_status_maps_outcomes() {
+        // Exit 0 → authenticated.
+        assert_eq!(
+            classify_auth_status(Ok((true, String::new(), String::new()))),
+            AuthState::Ok
+        );
+        // Ran but exited non-zero (typically "not logged in") → NotAuthed.
+        assert_eq!(
+            classify_auth_status(Ok((false, String::new(), "not logged in".to_string()))),
+            AuthState::NotAuthed
+        );
+        // Couldn't run at all (binary absent / spawn / timeout) → GhMissing.
+        assert_eq!(
+            classify_auth_status(Err(GitError::Timeout { secs: 8 })),
+            AuthState::GhMissing
+        );
     }
 
     #[test]

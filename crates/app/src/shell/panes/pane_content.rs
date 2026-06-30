@@ -71,7 +71,9 @@ impl PaneContent {
             // into the page; GPUI's per-leaf focus bookkeeping doesn't route
             // input to it, so report `false` like the diff view.
             Self::Browser(_) => false,
-            // Tasks is read-only (no text input); report `false` like Diff.
+            // The Tasks pane's query box owns its own focus (its `InputState`
+            // handle); the pane anchor itself is never a focus target, so the
+            // per-leaf bookkeeping reports `false` like the diff view.
             Self::Tasks(_) => false,
         }
     }

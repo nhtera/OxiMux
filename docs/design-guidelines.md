@@ -415,30 +415,50 @@ The left rail's nav rows are body-replacing **pages**, not just shells. The
 workspace list is the **home** view: `active_nav` is `Option<NavItem>` where
 `None` = home (nothing highlighted), so the app cold-starts on the workspace
 list. Clicking a nav opens its page; clicking the active nav again toggles back
-home. Agents (dashboard) and Tasks are the implemented pages.
+home. Agents (dashboard) renders in the rail body; **Tasks opens in the main
+panel** as a pane tab (see below).
 
-- **Tasks body** (`tasks_view`) — a GitHub issue/PR browser for the active
-  project's repo, fetched through the `ForgeProvider` seam. A two-row header of
-  text chips (mirroring the sort-mode chip: `r_xs`, active = `bg_panel_alt` +
-  `fg_base`, inactive = `bg_panel` + `fg_muted`): `Issues`/`PRs`, then
-  `Open`/`Closed`/`All` + `Mine` + `Refresh`. The body is a virtualized
-  `uniform_list` (constrained sizing → rows fit-and-truncate the rail width, not
-  horizontal-scroll). Loading / empty / no-project states render a centered
-  `fg_subtle` hint; the empty state names the gh-auth requirement rather than
-  implying a bug.
-- **Task row** — two lines: `#<n> <title>` (title `overflow_hidden` +
-  `whitespace_nowrap`) + a state chip (`status_ok` open / `status_info` merged /
-  `fg_muted` closed); second line is a truncating cluster (label chips +
-  `@assignee`) plus a fixed right-side actions cluster that always stays visible:
-  `↗` (open in browser) and `+ Workspace`.
+- **Tasks pane** (`tasks_view`, `PaneContent::Tasks`) — a GitHub/GitLab issue/PR
+  browser for the active project's repo, fetched through the `ForgeProvider`
+  seam. Unlike the rail-body pages, Tasks mounts as a **main-panel pane tab**: a
+  wide 5-column table on the content canvas (`bg_panel`, **not** the rail
+  surface). It is a **singleton** tab — the rail Tasks nav opens-or-activates the
+  one tab (deduped like the Diff pane) rather than stacking duplicates — and is
+  non-persisted (re-opened from the nav after a restart). A project switch
+  refreshes it; opening it with no project shows a hint, not silence.
+- **Toolbar** — one wide row of text chips (`r_xs`, active = `bg_overlay` +
+  `fg_base`, inactive = `bg_panel_alt` + `fg_muted`): `Issues`/`PRs`, a flexing query
+  box, `Open`/`Closed`/`All` + `Mine`, and `Refresh`. The **query box** passes
+  its text straight to the forge search (`gh ... --search`), so qualifier syntax
+  (`is:open`, `assignee:@me`, `label:bug`, free text) works without a local
+  parser. Because the GitHub Search API ignores `--state`/`--assignee`, the state
+  + `Mine` chips are **folded into the query string** while a search is active so
+  chips and query compose instead of dropping each other; input is debounced
+  (~300ms) with a generation guard that discards stale results. GitLab keeps the
+  chips as flags and rides the query alongside as free text.
+- **Columns** — `ID` (`#n`) · `TITLE / CONTEXT` (flexes: title + up to two label
+  chips) · `ASSIGNEES` (`@login`) · `STATUS` (state chip: `status_ok` open /
+  `status_info` merged / `fg_muted` closed) · `UPDATED` (compact relative age —
+  `3d` / `2h` / `now`; a dash when the source omits the timestamp). A shared
+  `COL_*` width source keeps the column header and the virtualized rows
+  (`uniform_list`) aligned; columns fit-and-truncate (no horizontal scroll). A
+  right-edge action cluster — `↗` (open in browser) + `+ Workspace` — is revealed
+  on row hover.
+- **Empty / unauthenticated states** — the body distinguishes three failure modes
+  instead of one conflated string: no supported remote, an unauthenticated CLI
+  (names `gh auth login`) or an absent one (names install), and a reachable but
+  empty repo.
 - **Create workspace from a task** — reuses `create_workspace_async`; the branch
   is `oximux/<slug>` derived from `"{issue|pr} {n} {title}"` so the number is
   legible. The workspace persists a `linked_issue` (`#<n>`, V011 column) shown as
   a `status_info`-tinted badge on its card after the branch chip, and the rail
-  auto-activates it (selects + returns home). Manually-created workspaces have no
-  linked issue and don't auto-activate.
+  auto-activates it (selects + returns home, which also leaves the Tasks tab in
+  the foreground). Manually-created workspaces have no linked issue and don't
+  auto-activate.
 
-Open-in-browser uses the shared `shell/open_url` helper (`open <url>`).
+Open-in-browser uses the shared `shell/open_url` helper, which forwards only
+`https://` URLs — a crafted issue URL can't trigger another scheme through
+`open`.
 
 ## Per-workspace tint
 
