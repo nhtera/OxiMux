@@ -2121,13 +2121,26 @@ impl WorkspaceRoot {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
-        // Drop any per-mount observer the SCM discard path installed
-        // before reusing the confirm_dialog slot. Without this, a stale
-        // observer would keep watching the workspace-delete dialog and
-        // race with the workspace-ops teardown path.
+        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+        // Drop any per-mount observer the SCM discard path installed before
+        // reusing the confirm_dialog slot, then watch THIS dialog so both
+        // confirm AND cancel free the slot. The on-confirm callback drops the
+        // dialog on its own path, but Cancel only flips the dialog's `cancelled`
+        // flag — without this observer nothing would remove it from the overlay.
         self._discard_dialog_observer = None;
-        self.confirm_dialog =
-            Some(cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx)));
+        self._discard_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.confirm_dialog = None;
+                    root._discard_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.confirm_dialog = Some(dialog);
         cx.notify();
     }
 
