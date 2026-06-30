@@ -143,14 +143,32 @@ impl ProjectPanes {
         self.active_group()?.read(cx).focused_rail_agent(cx)
     }
 
+    /// Resolve which agent a "send to agent" action targets. Preference order,
+    /// most-specific first, so the send lands on the agent the user is actually
+    /// working with rather than an arbitrary one when several exist:
+    ///   1. agent in the active tab (terminal + agent side by side),
+    ///   2. most-recently-active agent in the active group (you were just in it
+    ///      before focusing a terminal — the common "run a command, send its
+    ///      output to the agent" flow),
+    ///   3. then the same two, widened to any group,
+    ///   4. finally any agent at all (last resort).
     pub fn target_agent_session(&self, cx: &App) -> Option<AgentSessionId> {
-        if let Some(active) = self.active_group()
-            && let Some(id) = active.read(cx).active_agent_session()
-        {
-            return Some(id);
+        if let Some(active) = self.active_group() {
+            let group = active.read(cx);
+            if let Some(id) = group.active_agent_session() {
+                return Some(id);
+            }
+            if let Some(id) = group.mru_agent_session() {
+                return Some(id);
+            }
         }
         for group in self.groups.values() {
             if let Some(id) = group.read(cx).active_agent_session() {
+                return Some(id);
+            }
+        }
+        for group in self.groups.values() {
+            if let Some(id) = group.read(cx).mru_agent_session() {
                 return Some(id);
             }
         }
