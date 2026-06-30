@@ -130,8 +130,10 @@ fn render_nav_row(
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
-            move |_: &MouseDownEvent, _window: &mut Window, cx: &mut App| {
-                rail.update(cx, |r, cx| r.select_nav(item, cx));
+            move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                // Pass `window` explicitly so Tasks can call the pane opener,
+                // which requires a Window context (RT-1).
+                rail.update(cx, |r, cx| r.select_nav_in(item, window, cx));
             },
         )
         .child(

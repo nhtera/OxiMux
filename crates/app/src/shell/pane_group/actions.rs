@@ -22,7 +22,8 @@ impl PaneGroup {
             | PaneGroupTabKind::Commit { .. }
             | PaneGroupTabKind::BranchFile { .. }
             | PaneGroupTabKind::CombinedDiff { .. }
-            | PaneGroupTabKind::Browser { .. } => false,
+            | PaneGroupTabKind::Browser { .. }
+            | PaneGroupTabKind::Tasks => false,
         }) else {
             return false;
         };
@@ -69,9 +70,12 @@ impl PaneGroup {
         let tab = self.tabs.get(self.active)?;
         match &tab.content {
             PaneContent::Editor(view) => Some(view.read(cx).file_path().to_path_buf()),
-            // Diff/Browser tabs aren't editors and don't surface a file path
-            // the host's editor-tracking flows treat as an editable target.
-            PaneContent::Terminal(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => None,
+            // Diff/Browser/Tasks tabs aren't editors and don't surface a file
+            // path the host's editor-tracking flows treat as an editable target.
+            PaneContent::Terminal(_)
+            | PaneContent::Diff(_)
+            | PaneContent::Browser(_)
+            | PaneContent::Tasks(_) => None,
         }
     }
 
@@ -93,10 +97,13 @@ impl PaneGroup {
                         .unwrap_or_default();
                     out.push(bytes);
                 }
-                // Editor / Diff / Browser tabs have no PTY scrollback, but we
-                // still push an empty slot so the index alignment with `tabs`
-                // is preserved for the duration of this collection call.
-                PaneContent::Editor(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => {
+                // Editor / Diff / Browser / Tasks tabs have no PTY scrollback,
+                // but we still push an empty slot so the index alignment with
+                // `tabs` is preserved for the duration of this collection call.
+                PaneContent::Editor(_)
+                | PaneContent::Diff(_)
+                | PaneContent::Browser(_)
+                | PaneContent::Tasks(_) => {
                     out.push(Vec::new())
                 }
             }
@@ -111,7 +118,10 @@ impl PaneGroup {
                 PaneContent::Terminal(tree) => {
                     out.push(tree.active_view().and_then(|v| v.read(cx).external_id()));
                 }
-                PaneContent::Editor(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => {
+                PaneContent::Editor(_)
+                | PaneContent::Diff(_)
+                | PaneContent::Browser(_)
+                | PaneContent::Tasks(_) => {
                     out.push(None)
                 }
             }

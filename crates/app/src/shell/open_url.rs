@@ -5,8 +5,15 @@
 //! and the caller has no better recovery than retry.
 
 /// Launch `url` in the default browser. No-op on an empty string.
+/// Only `https://` URLs are forwarded — `file://`, `applescript://`, and
+/// other schemes are silently ignored to prevent a crafted issue URL from
+/// executing arbitrary local actions through `open(1)`.
 pub(crate) fn open_url(url: &str) {
     if url.is_empty() {
+        return;
+    }
+    if !url.starts_with("https://") {
+        tracing::warn!(target: "oximux_app", url, "open_url: blocked non-https scheme");
         return;
     }
     if let Err(err) = std::process::Command::new("open").arg(url).spawn() {

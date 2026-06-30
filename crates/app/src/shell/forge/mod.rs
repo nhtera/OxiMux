@@ -34,6 +34,14 @@ pub use oximux_git::gh::MergeMethod;
 /// layer, not the CLI wrapper.
 pub use oximux_git::gh::{ForgeAssignee, ForgeItem, ForgeLabel, ForgeListFilter, ForgeState};
 
+/// Forge-CLI auth classification, for the Tasks page's empty-vs-unauthenticated
+/// hint. Re-exported so the page stays off the raw CLI wrapper.
+pub use oximux_git::gh::AuthState;
+
+/// Lazily-fetched issue/PR body + author for the Tasks detail view. Re-exported
+/// so the page depends on the forge layer, not the CLI wrapper.
+pub use oximux_git::gh::ItemDetail;
+
 pub use github_gh::GithubForge;
 pub use gitlab_glab::GitlabForge;
 
@@ -131,6 +139,18 @@ impl Forge {
         }
     }
 
+    /// Auth state of the backing forge's CLI, for the Tasks page's
+    /// empty-vs-unauthenticated hint. Only GitHub is probed (`gh auth status`,
+    /// see [`oximux_git::gh::auth_state`]); GitLab has no equally-cheap probe
+    /// wired here, so it reports [`AuthState::Ok`] and relies on its list call
+    /// degrading gracefully to empty when unauthenticated.
+    pub async fn auth_state(&self, cwd: &Path) -> AuthState {
+        match self {
+            Forge::Github(_) => oximux_git::gh::auth_state(cwd).await,
+            Forge::Gitlab(_) => AuthState::Ok,
+        }
+    }
+
     /// Pick the provider for the repo at `cwd` from its `origin` URL, or
     /// `None` when `origin` is neither a GitHub nor a GitLab host (or absent).
     ///
@@ -166,6 +186,21 @@ pub async fn fetch_ref_title(
     match forge {
         Forge::Github(_) => oximux_git::gh::item_title(cwd, kind, number, repo).await,
         Forge::Gitlab(_) => oximux_git::glab::item_title(cwd, kind, number, repo).await,
+    }
+}
+
+/// Body + author of an issue/PR through whichever forge backs the repo. The
+/// lazy companion to the list query, for the Tasks detail view. `None` when the
+/// forge CLI can't supply it (absent, no network, item gone).
+pub async fn fetch_item_detail(
+    forge: Forge,
+    cwd: &Path,
+    kind: oximux_core::ForgeRefKind,
+    number: u64,
+) -> Option<ItemDetail> {
+    match forge {
+        Forge::Github(_) => oximux_git::gh::item_detail(cwd, kind, number, None).await,
+        Forge::Gitlab(_) => oximux_git::glab::item_detail(cwd, kind, number, None).await,
     }
 }
 

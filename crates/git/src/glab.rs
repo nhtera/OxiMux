@@ -15,7 +15,10 @@
 //! MR, parse failure) resolves to a benign default, never an error.
 
 use crate::error::{GitError, Result};
-use crate::gh::{CreatePrOptions, ForgeAssignee, ForgeItem, ForgeLabel, ForgeListFilter, MergeMethod};
+use crate::gh::{
+    CreatePrOptions, ForgeAssignee, ForgeAuthor, ForgeItem, ForgeLabel, ForgeListFilter, ItemDetail,
+    MergeMethod,
+};
 use oximux_core::PrState;
 use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
@@ -240,6 +243,55 @@ pub async fn mr_merge(cwd: impl AsRef<Path>, method: MergeMethod) -> Result<()> 
     Ok(())
 }
 
+/// Body + author of one issue/MR — `glab issue|mr view N -F json`. GitLab
+/// spells the body `description` and the author `author.username`, mapped onto
+/// the shared [`ItemDetail`]. Same lazy-on-open + graceful-`None` contract as
+/// [`crate::gh::item_detail`].
+pub async fn item_detail(
+    cwd: impl AsRef<Path>,
+    kind: oximux_core::ForgeRefKind,
+    number: u64,
+    repo: Option<&str>,
+) -> Option<ItemDetail> {
+    let subcommand = match kind {
+        oximux_core::ForgeRefKind::Issue => "issue",
+        oximux_core::ForgeRefKind::Pull => "mr",
+    };
+    let mut cmd = GlabCmd::new(cwd).args([subcommand, "view", &number.to_string(), "-F", "json"]);
+    if let Some(slug) = repo {
+        cmd = cmd.args(["-R", slug]);
+    }
+    let (ok, stdout, _) = cmd.run_raw().await.ok()?;
+    if !ok {
+        return None;
+    }
+    let gl: GitlabDetail = serde_json::from_str(stdout.trim()).ok()?;
+    Some(ItemDetail {
+        body: gl.description,
+        author: ForgeAuthor {
+            login: gl.author.username,
+        },
+    })
+}
+
+/// GitLab's issue/MR detail shape: `description` (not `body`) and an `author`
+/// keyed `username` (not `login`). Mapped onto the shared [`ItemDetail`].
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GitlabDetail {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    author: GitlabAuthor,
+}
+
+/// GitLab spells the author's handle `username` (not GitHub's `login`); shared
+/// by the detail and list shapes.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GitlabAuthor {
+    #[serde(default)]
+    username: String,
+}
+
 /// One issue/MR row as GitLab's `glab ... list -F json` reports it. GitLab's
 /// shape diverges from GitHub's: `iid` (not `number`), `web_url` (not `url`),
 /// labels as bare strings, assignees keyed `username`. Mapped onto the shared
@@ -258,6 +310,14 @@ struct GitlabItem {
     labels: Vec<String>,
     #[serde(default)]
     assignees: Vec<GitlabAssignee>,
+    /// Issue/MR author — `Option` because GitLab can report a null author for
+    /// system-generated items.
+    #[serde(default)]
+    author: Option<GitlabAuthor>,
+    // GitLab already spells this snake_case, so it maps onto the shared
+    // `ForgeItem.updated_at` without a rename.
+    #[serde(default)]
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -300,6 +360,10 @@ impl GitlabItem {
                 .into_iter()
                 .map(|a| ForgeAssignee { login: a.username })
                 .collect(),
+            author: ForgeAuthor {
+                login: self.author.map(|a| a.username).unwrap_or_default(),
+            },
+            updated_at: self.updated_at,
         }
     }
 }
@@ -346,6 +410,17 @@ async fn forge_list(cwd: impl AsRef<Path>, kind: &str, filter: ForgeListFilter) 
         args.push("--assignee".into());
         args.push("@me".into());
     }
+    // GitLab's API combines free-text `--search` with the state/assignee flags
+    // (unlike GitHub's Search API, which ignores them), so the chips stay as
+    // flags above and the query rides alongside as plain text. GitHub-style
+    // qualifiers (`is:open`, `label:bug`) are not GitLab search syntax — they
+    // match as literal text here. This is intentional: the query box is
+    // GitHub-oriented, and translating qualifiers to GitLab filters is left out
+    // deliberately rather than guessed at.
+    if let Some(query) = filter.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        args.push("--search".into());
+        args.push(query.into());
+    }
     let Ok((_ok, stdout, _stderr)) = GlabCmd::new(cwd)
         .args(args)
         .timeout(Duration::from_secs(15))
@@ -385,7 +460,8 @@ mod tests {
     fn gitlab_item_maps_onto_forge_item() {
         let json = r#"[
             {"iid":42,"title":"Fix crash","state":"opened","web_url":"https://gl/42",
-             "labels":["bug","p1"],"assignees":[{"username":"alice"}]},
+             "labels":["bug","p1"],"assignees":[{"username":"alice"}],
+             "author":{"username":"bob"},"updated_at":"2026-06-30T10:00:00Z"},
             {"iid":7,"title":"Docs","state":"merged","web_url":"https://gl/7",
              "labels":[],"assignees":[]}
         ]"#;
@@ -404,9 +480,17 @@ mod tests {
         assert_eq!(items[0].labels.len(), 2);
         assert_eq!(items[0].labels[1].name, "p1");
         assert_eq!(items[0].assignees[0].login, "alice");
+        // GitLab's `author.username` maps onto the shared `author.login`.
+        assert_eq!(items[0].author.login, "bob");
+        // GitLab's snake_case `updated_at` maps through with no rename.
+        assert_eq!(items[0].updated_at, "2026-06-30T10:00:00Z");
         assert_eq!(items[1].number, 7);
         assert_eq!(items[1].state, "MERGED");
         assert!(items[1].assignees.is_empty());
+        // A null/absent author maps to an empty login (no panic).
+        assert!(items[1].author.login.is_empty());
+        // Missing `updated_at` defaults to empty (column renders a dash).
+        assert!(items[1].updated_at.is_empty());
     }
 
     #[test]

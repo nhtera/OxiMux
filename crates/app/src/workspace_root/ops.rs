@@ -148,6 +148,35 @@ impl WorkspaceRoot {
         panes.update(cx, |p, cx| p.open_terminal_tab_in_active_group(window, cx));
     }
 
+    /// Open (or re-activate) the singleton Tasks tab in the active project's
+    /// active pane group. Called from the nav rail's Tasks row mouse handler.
+    ///
+    /// When no project is active (welcome state), surfaces a brief toast so
+    /// the click is never a silent no-op (RT-4).
+    pub(crate) fn open_tasks_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panes) = self.active_project_panes() else {
+            // RT-4: no project open → inform the user instead of silently failing.
+            self.push_toast(
+                ToastKind::Info,
+                "Open a project to browse tasks.",
+                cx,
+            );
+            return;
+        };
+        let weak_root: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        // The page spans every known project (aggregate scope by default), so
+        // it's seeded with the full project list, not just the active one.
+        let projects = self.app_state.recent_projects.clone();
+        panes.update(cx, |p, cx| {
+            p.open_or_activate_tasks_tab_in_active_group(
+                weak_root,
+                projects,
+                window,
+                cx,
+            );
+        });
+    }
+
     // `toggle_floating_terminal` and the rest of the floating-terminal host
     // logic (restore, new-tab spawn, expand-to-pane, rename) live in
     // `crate::shell::floating_terminal_host` — same split-impl pattern as
@@ -863,6 +892,7 @@ impl WorkspaceRoot {
         cwd: std::path::PathBuf,
         model: Option<String>,
         effort: Option<String>,
+        prompt: Option<String>,
         resumption: oximux_core::SessionResumption,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -903,7 +933,7 @@ impl WorkspaceRoot {
             let cfg = AgentSessionConfig {
                 adapter,
                 worktree_path: cwd,
-                prompt: None,
+                prompt,
                 model: model.clone(),
                 effort: effort.clone(),
                 extra_args,
@@ -1302,6 +1332,48 @@ impl WorkspaceRoot {
         panes.update(cx, |p, cx| {
             let _ = p.close_active_group(window, cx);
         });
+    }
+
+    /// Scan every group in the active project's pane layout for an open Tasks
+    /// tab and refresh its known-project set. Called on project switch / create
+    /// so an already-open Tasks tab reflects the current project list without a
+    /// manual Refresh. The aggregate scope keeps showing every project; a scope
+    /// pinned to one project is preserved and only refetches if the set
+    /// actually changed. The `_project` arg is retained for the call sites but
+    /// no longer pins the tab — the page is scope-driven, not active-driven.
+    pub(crate) fn refresh_tasks_tab_for_active_project(
+        &self,
+        _project: Option<oximux_core::Project>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        let projects = self.app_state.recent_projects.clone();
+        // Collect views first (immutable borrow) then update (mutable borrow)
+        // to satisfy the borrow checker.
+        let mut found_views: Vec<gpui::Entity<crate::shell::tasks_view::TasksView>> = Vec::new();
+        {
+            let panes_ref = panes.read(cx);
+            for group_id in panes_ref.manager().in_order_groups() {
+                let Some(group) = panes_ref.group(group_id) else {
+                    continue;
+                };
+                for tab in group.read(cx).tabs() {
+                    if let crate::shell::pane_content::PaneContent::Tasks(v) = &tab.content {
+                        found_views.push(v.clone());
+                    }
+                }
+            }
+        }
+        for view in found_views {
+            let projects = projects.clone();
+            view.update(cx, |tv, cx| {
+                // Updates the list and refetches only when the set changed.
+                tv.set_projects(projects, cx);
+                tv.activate(cx);
+            });
+        }
     }
 
     /// Surface a quiet transient toast (bottom-right). The one entry point for

@@ -77,19 +77,50 @@ impl GhCmd {
     }
 }
 
-/// True when the GitHub CLI is installed and authenticated. A single
-/// `gh auth status` round-trip; any failure (missing binary, not logged in)
-/// resolves to `false` so the caller can show install/auth guidance instead
-/// of a broken button.
-pub async fn available(cwd: impl AsRef<Path>) -> bool {
-    matches!(
+/// Classification of `gh`'s auth status, so callers (the Tasks page) can show
+/// the right guidance instead of conflating "not logged in" with "gh missing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthState {
+    /// `gh auth status` exited zero — the CLI is installed and logged in.
+    #[default]
+    Ok,
+    /// `gh` ran but reported a non-authenticated status (typically "not logged
+    /// in to any GitHub hosts").
+    NotAuthed,
+    /// `gh` couldn't run at all — binary absent, spawn failure, or timeout.
+    GhMissing,
+}
+
+/// Classify the GitHub CLI's auth status via a single `gh auth status`
+/// round-trip (8s cap). Never panics — a "can't tell" result (no binary,
+/// spawn/timeout failure) maps to [`AuthState::GhMissing`].
+pub async fn auth_state(cwd: impl AsRef<Path>) -> AuthState {
+    classify_auth_status(
         GhCmd::new(cwd)
             .args(["auth", "status"])
             .timeout(Duration::from_secs(8))
             .run_raw()
             .await,
-        Ok((true, ..))
     )
+}
+
+/// Map a `gh auth status` invocation result onto an [`AuthState`]. Pure (no
+/// I/O) so the exit-code → state mapping is unit-testable without a live `gh`:
+/// exit 0 → `Ok`; ran-but-non-zero (not logged in) → `NotAuthed`; couldn't run
+/// at all (binary absent, spawn/timeout) → `GhMissing`.
+fn classify_auth_status(result: Result<(bool, String, String)>) -> AuthState {
+    match result {
+        Ok((true, ..)) => AuthState::Ok,
+        Ok((false, ..)) => AuthState::NotAuthed,
+        Err(_) => AuthState::GhMissing,
+    }
+}
+
+/// True when the GitHub CLI is installed and authenticated — the thin bool view
+/// of [`auth_state`] for call sites that only gate a button on "usable or not"
+/// (Create-PR, etc.) and don't need the missing-vs-unauthed distinction.
+pub async fn available(cwd: impl AsRef<Path>) -> bool {
+    matches!(auth_state(cwd).await, AuthState::Ok)
 }
 
 /// True when `origin` points at github.com. `gh` only supports GitHub, so the
@@ -166,6 +197,37 @@ pub async fn item_title(
     }
     match cmd.run_raw().await {
         Ok((true, stdout, _)) => parse_title_json(&stdout),
+        _ => None,
+    }
+}
+
+/// Body + author of one issue/PR by number — `gh issue|pr view N --json
+/// body,author`. Fetched lazily when the Tasks detail view opens (kept out of
+/// the list query, which stays lean). Any failure (gh absent, bad number, no
+/// network) resolves to `None`; the detail view then shows the metadata it
+/// already has from the list, without a body.
+pub async fn item_detail(
+    cwd: impl AsRef<Path>,
+    kind: oximux_core::ForgeRefKind,
+    number: u64,
+    repo: Option<&str>,
+) -> Option<ItemDetail> {
+    let subcommand = match kind {
+        oximux_core::ForgeRefKind::Issue => "issue",
+        oximux_core::ForgeRefKind::Pull => "pr",
+    };
+    let mut cmd = GhCmd::new(cwd).args([
+        subcommand,
+        "view",
+        &number.to_string(),
+        "--json",
+        "body,author",
+    ]);
+    if let Some(slug) = repo {
+        cmd = cmd.args(["-R", slug]);
+    }
+    match cmd.run_raw().await {
+        Ok((true, stdout, _)) => serde_json::from_str(stdout.trim()).ok(),
         _ => None,
     }
 }
@@ -389,6 +451,24 @@ pub struct ForgeAssignee {
     pub login: String,
 }
 
+/// Author of an issue/PR, from `gh ... view --json author`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ForgeAuthor {
+    #[serde(default)]
+    pub login: String,
+}
+
+/// Fields fetched on demand when an issue/PR is opened in the Tasks detail
+/// view — the list query stays lean, so the body (GitHub-flavored markdown)
+/// and author are pulled lazily only when needed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ItemDetail {
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub author: ForgeAuthor,
+}
+
 /// One issue or pull request row from `gh issue list` / `gh pr list`. The
 /// queried JSON fields are shared between the two, so a single struct covers
 /// both kinds; `state` is `OPEN` / `CLOSED` (PRs also report `MERGED`). Every
@@ -407,6 +487,16 @@ pub struct ForgeItem {
     pub labels: Vec<ForgeLabel>,
     #[serde(default)]
     pub assignees: Vec<ForgeAssignee>,
+    /// Who opened the issue/PR, from the list query. Shown in the row's context
+    /// sub-line. Empty when the source omits it (e.g. a deleted account).
+    #[serde(default)]
+    pub author: ForgeAuthor,
+    /// RFC-3339 last-update timestamp, rendered as a relative age in the Tasks
+    /// table. `gh` emits this as camelCase `updatedAt` (hence the rename); the
+    /// GitLab mapper fills it directly. Empty when the source didn't report it
+    /// (older `gh`, or a forge whose listing omits it) — the column shows a dash.
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: String,
 }
 
 /// Which state to list. Maps to `gh --state <open|closed|all>`.
@@ -428,16 +518,25 @@ impl ForgeState {
     }
 }
 
-/// Filter for an issue/PR listing. `mine` adds `--assignee @me`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Filter for an issue/PR listing.
+///
+/// When `search` is `None` the chips map to flags (`--state`, `--assignee @me`).
+/// When `search` is `Some`, the listing routes through GitHub's Search API
+/// (`gh ... --search`), which **ignores** `--state`/`--assignee`/`--label` — so
+/// the state + `mine` chips are folded INTO the query string instead (see
+/// [`compose_search_query`]). Carries a `String`, so this is `Clone` not `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForgeListFilter {
     pub state: ForgeState,
     pub mine: bool,
+    /// Raw GitHub-search query (qualifiers + free text), or `None` for the
+    /// unfiltered flag path.
+    pub search: Option<String>,
 }
 
 /// JSON fields requested for both listings — kept in one place so the two
 /// queries stay in lockstep with [`ForgeItem`]'s fields.
-const FORGE_LIST_FIELDS: &str = "number,title,state,url,labels,assignees";
+const FORGE_LIST_FIELDS: &str = "number,title,state,url,labels,assignees,author,updatedAt";
 
 /// Cap on rows fetched per listing: a generous single page that keeps the JSON
 /// small and the list responsive without paginating.
@@ -457,21 +556,47 @@ pub async fn pr_list(cwd: impl AsRef<Path>, filter: ForgeListFilter) -> Vec<Forg
     forge_list(cwd, "pr", filter).await
 }
 
+/// Fold the state + `mine` chips into a GitHub-search query string. `gh ...
+/// --search` routes through the Search API, which ignores `--state`/`--assignee`
+/// — so when a search is active those filters must ride inside the query
+/// (`is:open`, `assignee:@me`) rather than as flags. The kind (`is:issue` /
+/// `is:pr`) is already implied by the `issue` / `pr` subcommand, so it is not
+/// added. Order is qualifiers first, then the user's free text.
+fn compose_search_query(query: &str, state: ForgeState, mine: bool) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    match state {
+        ForgeState::Open => parts.push("is:open"),
+        ForgeState::Closed => parts.push("is:closed"),
+        ForgeState::All => {}
+    }
+    if mine {
+        parts.push("assignee:@me");
+    }
+    let qualifiers = parts.join(" ");
+    match (qualifiers.is_empty(), query.is_empty()) {
+        (true, _) => query.to_string(),
+        (false, true) => qualifiers,
+        (false, false) => format!("{qualifiers} {query}"),
+    }
+}
+
 async fn forge_list(cwd: impl AsRef<Path>, kind: &str, filter: ForgeListFilter) -> Vec<ForgeItem> {
     let mut cmd = GhCmd::new(cwd)
-        .args([
-            kind,
-            "list",
-            "--json",
-            FORGE_LIST_FIELDS,
-            "--state",
-            filter.state.flag(),
-            "--limit",
-            FORGE_LIST_LIMIT,
-        ])
+        .args([kind, "list", "--json", FORGE_LIST_FIELDS, "--limit", FORGE_LIST_LIMIT])
         .timeout(Duration::from_secs(15));
-    if filter.mine {
-        cmd = cmd.args(["--assignee", "@me"]);
+    // A present, non-blank query takes the Search-API path (chips folded into
+    // the query); otherwise the plain flag path keeps `--state`/`--assignee`.
+    match filter.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        Some(query) => {
+            let composed = compose_search_query(query, filter.state, filter.mine);
+            cmd = cmd.args(["--search", &composed]);
+        }
+        None => {
+            cmd = cmd.args(["--state", filter.state.flag()]);
+            if filter.mine {
+                cmd = cmd.args(["--assignee", "@me"]);
+            }
+        }
     }
     let Ok((_ok, stdout, _stderr)) = cmd.run_raw().await else {
         return Vec::new();
@@ -602,7 +727,8 @@ mod tests {
     fn parses_forge_items_json() {
         let json = r#"[
             {"number":42,"title":"Fix crash","state":"OPEN","url":"https://x/42",
-             "labels":[{"name":"bug"},{"name":"p1"}],"assignees":[{"login":"alice"}]},
+             "labels":[{"name":"bug"},{"name":"p1"}],"assignees":[{"login":"alice"}],
+             "author":{"login":"bob"},"updatedAt":"2026-06-30T12:00:00Z"},
             {"number":7,"title":"Docs","state":"CLOSED","url":"https://x/7",
              "labels":[],"assignees":[]}
         ]"#;
@@ -614,7 +740,14 @@ mod tests {
         assert_eq!(items[0].labels.len(), 2);
         assert_eq!(items[0].labels[1].name, "p1");
         assert_eq!(items[0].assignees[0].login, "alice");
+        assert_eq!(items[0].author.login, "bob");
+        // `gh`'s camelCase `updatedAt` maps onto the snake_case field.
+        assert_eq!(items[0].updated_at, "2026-06-30T12:00:00Z");
         assert!(items[1].assignees.is_empty());
+        // A list item without an author still parses (default empty).
+        assert!(items[1].author.login.is_empty());
+        // Missing `updatedAt` defaults to empty (column renders a dash).
+        assert!(items[1].updated_at.is_empty());
     }
 
     #[test]
@@ -625,6 +758,63 @@ mod tests {
         assert_eq!(items[0].number, 3);
         assert!(items[0].url.is_empty());
         assert!(items[0].labels.is_empty());
+    }
+
+    #[test]
+    fn parses_item_detail_json() {
+        // gh `view --json body,author` shape: body + nested author.login.
+        let json = r#"{"body":"Summary: fix the crash","author":{"login":"alice"}}"#;
+        let d: ItemDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(d.body, "Summary: fix the crash");
+        assert_eq!(d.author.login, "alice");
+        // Missing fields default to empty (no panic) — e.g. a deleted author.
+        let bare: ItemDetail = serde_json::from_str(r#"{"body":"x"}"#).unwrap();
+        assert_eq!(bare.body, "x");
+        assert!(bare.author.login.is_empty());
+    }
+
+    #[test]
+    fn classify_auth_status_maps_outcomes() {
+        // Exit 0 → authenticated.
+        assert_eq!(
+            classify_auth_status(Ok((true, String::new(), String::new()))),
+            AuthState::Ok
+        );
+        // Ran but exited non-zero (typically "not logged in") → NotAuthed.
+        assert_eq!(
+            classify_auth_status(Ok((false, String::new(), "not logged in".to_string()))),
+            AuthState::NotAuthed
+        );
+        // Couldn't run at all (binary absent / spawn / timeout) → GhMissing.
+        assert_eq!(
+            classify_auth_status(Err(GitError::Timeout { secs: 8 })),
+            AuthState::GhMissing
+        );
+    }
+
+    #[test]
+    fn compose_search_folds_chips_into_query() {
+        // Open + mine prepend their qualifiers before the free text.
+        assert_eq!(
+            compose_search_query("label:bug crash", ForgeState::Open, true),
+            "is:open assignee:@me label:bug crash"
+        );
+        // Closed maps to is:closed; All omits a state qualifier entirely.
+        assert_eq!(
+            compose_search_query("foo", ForgeState::Closed, false),
+            "is:closed foo"
+        );
+        assert_eq!(
+            compose_search_query("foo", ForgeState::All, false),
+            "foo"
+        );
+        // No free text → bare qualifiers (no trailing space).
+        assert_eq!(
+            compose_search_query("", ForgeState::Open, true),
+            "is:open assignee:@me"
+        );
+        // No qualifiers and no text → empty (GitHub treats as "match all").
+        assert_eq!(compose_search_query("", ForgeState::All, false), "");
     }
 
     #[test]

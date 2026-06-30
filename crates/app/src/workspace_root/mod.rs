@@ -667,6 +667,7 @@ impl WorkspaceRoot {
                         cwd,
                         None,
                         None,
+                        None,
                         oximux_core::SessionResumption::None,
                         window,
                         cx,

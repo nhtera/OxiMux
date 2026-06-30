@@ -44,6 +44,55 @@ impl ProjectPanes {
         }))
     }
 
+    /// Open or activate the singleton Tasks tab in the active group.
+    /// Routes to `PaneGroup::open_or_activate_tasks_tab` which deduplicates
+    /// by `PaneGroupTabKind::Tasks` (only one Tasks tab per group session).
+    pub fn open_or_activate_tasks_tab_in_active_group(
+        &mut self,
+        weak_root: WeakEntity<crate::workspace_root::WorkspaceRoot>,
+        projects: Vec<oximux_core::Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied());
+        let Some(target_id) = target_id else {
+            return;
+        };
+        self.set_active_group(target_id, window, cx);
+        if let Some(target) = self.groups.get(&target_id).cloned() {
+            target.update(cx, |g, cx| {
+                g.open_or_activate_tasks_tab(weak_root, projects, window, cx);
+            });
+        }
+    }
+
+    /// Close the Tasks tab in the active group, if present. Used after a
+    /// workspace is created from the Tasks page so the foreground leaves the
+    /// issue browser and falls back to the group's prior tab.
+    pub fn close_tasks_tab_in_active_group(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied());
+        let Some(target_id) = target_id else {
+            return;
+        };
+        if let Some(target) = self.groups.get(&target_id).cloned() {
+            target.update(cx, |g, cx| {
+                g.close_tasks_tab(window, cx);
+            });
+        }
+    }
+
     /// Open or activate a commit-detail tab in the active group.
     /// Mirrors `open_or_activate_diff_tab` but routes through
     /// `PaneGroup::open_or_activate_commit_tab` which dedups by SHA
@@ -358,15 +407,15 @@ impl ProjectPanes {
                             path: path.display().to_string(),
                         },
                     ),
-                    // Diff and commit-detail tabs are intentionally NOT
-                    // persisted — they regenerate from current `git`
-                    // state when the user re-clicks the source row.
-                    // Skip the slot so the persisted tab list stays
-                    // compact.
+                    // Diff, commit-detail, and Tasks tabs are intentionally NOT
+                    // persisted. Diff/commit regenerate from current git state;
+                    // Tasks reopens from the nav rail after restore.
+                    // Skip the slot so the persisted tab list stays compact.
                     PaneGroupTabKind::Diff { .. }
                     | PaneGroupTabKind::Commit { .. }
                     | PaneGroupTabKind::BranchFile { .. }
-                    | PaneGroupTabKind::CombinedDiff { .. } => continue,
+                    | PaneGroupTabKind::CombinedDiff { .. }
+                    | PaneGroupTabKind::Tasks => continue,
                     // Browser tabs persist their LIVE url (read from the
                     // BrowserView) so a restored tab reopens where the user
                     // left off, including link-click navigations.

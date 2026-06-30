@@ -20,9 +20,11 @@ use crate::shell::session_live_store::LiveAgentMap;
 pub const HISTORY_CAP: usize = 20;
 
 /// Format a relative age ("now", "5m", "3h", "2d") from an RFC-3339 timestamp
-/// against a captured `now`, mirroring the reference cockpit's thresholds:
-/// `<1m → now`, `<1h → Nm`, `<24h → Nh`, else `Nd`. Empty on unparseable input.
-fn relative_age(ts: &str, now: &str) -> String {
+/// against a captured `now`, with thresholds `<1m → now`, `<1h → Nm`,
+/// `<24h → Nh`, else `Nd`. Empty on unparseable input. Shared by the rail's
+/// agent rows and the Tasks page's `Updated` column (both want the narrow form;
+/// the wider dashboard cards use [`relative_age_long`]).
+pub(crate) fn relative_age_compact(ts: &str, now: &str) -> String {
     let (Ok(t), Ok(n)) = (
         DateTime::parse_from_rfc3339(ts),
         DateTime::parse_from_rfc3339(now),
@@ -43,9 +45,9 @@ fn relative_age(ts: &str, now: &str) -> String {
 
 /// Long-form relative age ("just now", "5 minutes ago", "14 hours ago",
 /// "6 days ago") from an RFC-3339 timestamp against a captured `now` — the
-/// reference cockpit's AGENTS-PAGE wording. The compact `relative_age` above is
-/// for the narrow rail rows; this is for the wider dashboard cards. Empty on
-/// unparseable input.
+/// reference cockpit's AGENTS-PAGE wording. The compact `relative_age_compact`
+/// above is for the narrow rail rows; this is for the wider dashboard cards.
+/// Empty on unparseable input.
 pub fn relative_age_long(ts: &str, now: &str) -> String {
     let (Ok(t), Ok(n)) = (
         DateTime::parse_from_rfc3339(ts),
@@ -269,7 +271,7 @@ pub fn merge_workspace_agents(
                 .ended_at
                 .as_deref()
                 .or(s.started_at.as_deref())
-                .map(|t| relative_age(t, now))
+                .map(|t| relative_age_compact(t, now))
                 .unwrap_or_default(),
             persisted_title: s.title.clone(),
             // Falls back to this when the live channel has no message — a
@@ -296,7 +298,7 @@ pub fn merge_workspace_agents(
                 db_status: AgentStatus::Idle,
                 started_at: Some(e.started_at.clone()),
                 ended_at: None,
-                age_label: relative_age(&e.started_at, now),
+                age_label: relative_age_compact(&e.started_at, now),
                 // No DB row yet → no persisted title/message; the live channel
                 // supplies the prompt + reply once they arrive.
                 persisted_title: None,
@@ -411,12 +413,12 @@ mod tests {
     #[test]
     fn relative_age_thresholds() {
         let now = "2026-06-24T00:00:00Z";
-        assert_eq!(relative_age("2026-06-24T00:00:00Z", now), "now"); // 0s
-        assert_eq!(relative_age("2026-06-23T23:59:30Z", now), "now"); // 30s
-        assert_eq!(relative_age("2026-06-23T23:45:00Z", now), "15m");
-        assert_eq!(relative_age("2026-06-23T20:00:00Z", now), "4h");
-        assert_eq!(relative_age("2026-06-21T00:00:00Z", now), "3d");
-        assert_eq!(relative_age("garbage", now), ""); // unparseable
+        assert_eq!(relative_age_compact("2026-06-24T00:00:00Z", now), "now"); // 0s
+        assert_eq!(relative_age_compact("2026-06-23T23:59:30Z", now), "now"); // 30s
+        assert_eq!(relative_age_compact("2026-06-23T23:45:00Z", now), "15m");
+        assert_eq!(relative_age_compact("2026-06-23T20:00:00Z", now), "4h");
+        assert_eq!(relative_age_compact("2026-06-21T00:00:00Z", now), "3d");
+        assert_eq!(relative_age_compact("garbage", now), ""); // unparseable
     }
 
     #[test]

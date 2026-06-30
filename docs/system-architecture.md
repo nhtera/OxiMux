@@ -14,7 +14,7 @@
 │  WorkspaceRoot → MainPane (grid of pane leaves)     │
 │                   each leaf: LeafTabs (per-pane tabs)│
 │                     each tab: PaneContent::Terminal  │
-│                             | PaneContent::Editor    │
+│                     | Editor | Diff | Browser | Tasks│
 │                → RightSidebar (tab-switched panel)  │
 │                   Explorer tab: FileExplorer         │
 │                   Files tab:    FileTreeView         │
@@ -108,7 +108,7 @@ A small set of cross-cutting glue files (`context_env.rs`, `openable_text_file.r
 ```
 WorkspaceRoot (GPUI entity)
 ├── fields
-│   ├── main_pane: Entity<MainPane>        ← grid of pane leaves (Terminal | Editor)
+│   ├── main_pane: Entity<MainPane>        ← grid of pane leaves (Terminal | Editor | Diff | Browser | Tasks)
 │   ├── right_sidebar: Option<Entity<RightSidebar>>   ← None when no git repo
 │   │     open_file_in_active_pane(path, window, cx)
 │   │       → MainPane::open_editor_in_focused_pane(path, window, cx)
@@ -486,8 +486,11 @@ dir click → tree.expand(id)           oximux-editor entity
 `MainPane` workspace grid is no longer terminal-only. Each leaf now holds a `PaneContent` enum.
 
 ```
-PaneContent::Terminal(Entity<TerminalView>)
+PaneContent::Terminal(TerminalSplitTree)
 PaneContent::Editor(Entity<EditorView>)
+PaneContent::Diff(Entity<DiffView>)        // read-only patch view
+PaneContent::Browser(Entity<BrowserView>)  // inline webview
+PaneContent::Tasks(Entity<TasksView>)      // main-panel issue/PR table, singleton tab
 
 MainPane::open_editor_in_focused_pane(path, window, cx)
   same-path short-circuit → no-op if focused leaf already shows that file

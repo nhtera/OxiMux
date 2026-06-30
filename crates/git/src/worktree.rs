@@ -152,10 +152,28 @@ pub fn derive_slug(name: &str) -> String {
     }
     let trimmed = out.trim_matches('-');
     if trimmed.is_empty() {
-        FALLBACK.to_string()
-    } else {
-        trimmed.to_string()
+        return FALLBACK.to_string();
     }
+    cap_slug_len(trimmed)
+}
+
+/// Maximum derived-slug length. A slug becomes a branch component, a worktree
+/// directory name, AND the string the user types to confirm deletion — so an
+/// unbounded slug from a long issue title makes all three unwieldy. Cut to this
+/// many bytes at a word (`-`) boundary.
+const MAX_SLUG_LEN: usize = 48;
+
+/// Trim a normalized slug to [`MAX_SLUG_LEN`], breaking on the last `-` within
+/// the budget so it ends on a whole word. The input is already `[a-z0-9-]`
+/// (ASCII), so byte slicing is char-boundary-safe. Falls back to a hard cut
+/// when there is no dash to break on (one very long word).
+fn cap_slug_len(slug: &str) -> String {
+    if slug.len() <= MAX_SLUG_LEN {
+        return slug.to_string();
+    }
+    let head = &slug[..MAX_SLUG_LEN];
+    let cut = head.rfind('-').unwrap_or(MAX_SLUG_LEN);
+    slug[..cut].trim_end_matches('-').to_string()
 }
 
 /// Parse `git worktree list --porcelain` output. Blocks are delimited by
@@ -323,6 +341,27 @@ mod tests {
     #[test]
     fn derive_slug_run_collapse() {
         assert_eq!(derive_slug("foo---bar"), "foo-bar");
+    }
+
+    #[test]
+    fn derive_slug_caps_long_names_at_word_boundary() {
+        // A sentence-length issue title must not produce a 100+ char slug.
+        let long = "issue 1556 iOS Objective-C/Swift mixed-language: many expected edges missing self imports";
+        let slug = derive_slug(long);
+        assert!(slug.len() <= 48, "slug too long: {} ({})", slug, slug.len());
+        // Ends on a whole word (no trailing dash, no mid-word cut).
+        assert!(!slug.ends_with('-'));
+        assert!(slug.starts_with("issue-1556-ios-objective-c-swift"));
+        // A name already within budget is returned unchanged.
+        assert_eq!(derive_slug("short feature"), "short-feature");
+    }
+
+    #[test]
+    fn derive_slug_caps_single_long_word_hard() {
+        // No dash to break on within the budget → hard cut, still valid.
+        let slug = derive_slug(&"a".repeat(80));
+        assert_eq!(slug.len(), 48);
+        assert!(validate_slug(&slug).is_ok());
     }
 
     #[test]

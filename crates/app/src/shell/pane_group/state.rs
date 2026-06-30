@@ -552,7 +552,10 @@ impl PaneGroup {
             PaneContent::Terminal(tree) => tree
                 .iter_all_views()
                 .any(|(_, _, v)| v.read(cx).session_id() == session),
-            PaneContent::Editor(_) | PaneContent::Diff(_) | PaneContent::Browser(_) => false,
+            PaneContent::Editor(_)
+            | PaneContent::Diff(_)
+            | PaneContent::Browser(_)
+            | PaneContent::Tasks(_) => false,
         })
     }
 

@@ -807,6 +807,9 @@ impl WorkspaceRoot {
             cached.read(cx).set_polling_focused(true);
             self.right_sidebar = Some(cached);
             self.rewire_scm_subscriptions(window, cx);
+            // RT-3: forward the new project to any open Tasks tab so the list
+            // updates without requiring a manual Refresh.
+            self.refresh_tasks_tab_for_active_project(Some(project), cx);
             refocus_active_pane(self, window, cx);
             cx.notify();
             return;
@@ -897,6 +900,9 @@ impl WorkspaceRoot {
                 // "View all" / commit / branch / discard / stash actions
                 // would silently stop firing after a project switch.
                 this.rewire_scm_subscriptions(window, cx);
+                // RT-3: forward the new project to any open Tasks tab.
+                let active_proj = this.active_project.clone();
+                this.refresh_tasks_tab_for_active_project(active_proj, cx);
                 // Re-focus the active pane after the right_sidebar
                 // rebuild — the rebuild's `cx.notify` triggers a
                 // repaint that can land focus on a freshly-mounted
@@ -976,6 +982,26 @@ impl WorkspaceRoot {
             defer_focus_active(window, cx, panes);
         }
         cx.notify();
+    }
+
+    /// Open an existing workspace from a create/start action: activate it
+    /// (focusing its agent tab), return the rail to its home list, and close
+    /// the Tasks tab that may have launched the action. Shared by the
+    /// create-success path and the "workspace already exists" short-circuit so
+    /// both land identically. `go_home` runs AFTER `activate_workspace` (which
+    /// switches project but never touches `active_nav`) so the rail reliably
+    /// ends on the home view.
+    pub(crate) fn open_existing_workspace(
+        &mut self,
+        workspace: Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_workspace(workspace, window, cx);
+        self.left_rail.update(cx, |rail, cx| rail.go_home(cx));
+        if let Some(panes) = self.active_project_panes() {
+            panes.update(cx, |p, cx| p.close_tasks_tab_in_active_group(window, cx));
+        }
     }
 
     /// Land a notification click on its agent tab: activate the owning
@@ -1670,6 +1696,9 @@ impl WorkspaceRoot {
                     project,
                     submit.name,
                     submit.agent,
+                    // The manual dialog doesn't carry the issue URL, so no
+                    // prompt prefill (the linked-issue badge still records it).
+                    None,
                     submit.linked_issue,
                     false,
                     window,
@@ -1691,9 +1720,10 @@ impl WorkspaceRoot {
         project: Project,
         name: String,
         agent: Option<AgentAdapter>,
+        agent_prompt: Option<String>,
         linked_issue: Option<String>,
         activate_after: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let slug = derive_slug(name.trim());
@@ -1714,6 +1744,28 @@ impl WorkspaceRoot {
             tracing::warn!("workspace create: cannot resolve data dir");
             return;
         };
+        // Detect an existing workspace for this slug and OPEN it instead of
+        // erroring on a duplicate worktree. The worktree path is deterministic
+        // from (project, slug), so a re-create from the same issue resolves to
+        // the same stored row — clicking "+ Workspace" twice should land on the
+        // existing workspace's agent, not fail with `add_worktree` "already
+        // exists".
+        let worktree_path_str = worktree_path.to_string_lossy().to_string();
+        if let Ok(Some(existing)) = self
+            .app_state
+            .workspace_repo
+            .get_by_worktree_path(&worktree_path_str)
+        {
+            tracing::info!(
+                workspace_id = %existing.id,
+                slug = %slug,
+                "workspace already exists; opening it instead of recreating"
+            );
+            if activate_after {
+                self.open_existing_workspace(existing, window, cx);
+            }
+            return;
+        }
         let workspace_repo = self.app_state.workspace_repo.clone();
         let project_root = PathBuf::from(&project.root_path);
         let project_id = project.id.clone();
@@ -1753,15 +1805,14 @@ impl WorkspaceRoot {
                         cx.notify();
                         // Land on the new workspace (e.g. created from a task):
                         // select it and return the rail to the home list so it's
-                        // visible. Manual dialog creates pass `false` to keep the
-                        // prior behavior. `go_home` runs AFTER activate_workspace
-                        // (which switches project but never touches `active_nav`),
-                        // so the rail reliably ends on the home view. The Tasks
-                        // path always passes its currently-active project, so
+                        // Land on the new workspace (e.g. created from a task):
+                        // select it, return the rail home, and close the Tasks
+                        // tab that launched the create. Manual dialog creates
+                        // pass `false` to keep the prior behavior. The Tasks path
+                        // always passes its currently-active project, so
                         // activate_workspace's recent-projects lookup resolves.
                         if activate_after {
-                            this.activate_workspace(workspace.clone(), window, cx);
-                            this.left_rail.update(cx, |rail, cx| rail.go_home(cx));
+                            this.open_existing_workspace(workspace.clone(), window, cx);
                         }
                         if let Some(kind) = agent {
                             // Auto-spawn from the create dialog launches the
@@ -1774,6 +1825,7 @@ impl WorkspaceRoot {
                                 cwd.clone(),
                                 None,
                                 None,
+                                agent_prompt.clone(),
                                 oximux_core::SessionResumption::None,
                                 window,
                                 cx,
@@ -1961,7 +2013,6 @@ impl WorkspaceRoot {
         let force = self.force_delete_offer.as_deref() == Some(workspace.id.as_str());
         self.force_delete_offer = None;
         let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
-        let slug = workspace.slug.clone();
         let workspace_for_cb = workspace.clone();
         let project_root = PathBuf::from(&project.root_path);
         let workspace_repo = self.app_state.workspace_repo.clone();
@@ -2074,7 +2125,10 @@ impl WorkspaceRoot {
                     workspace.worktree_path, workspace.branch
                 )
                 .into(),
-                expected: slug.into(),
+                // Force delete `-D`'s the branch (real data loss), so keep a
+                // deliberate type-gate — but a short fixed word, not the slug,
+                // which can be sentence-length for an issue-derived workspace.
+                expected: "delete".into(),
                 on_confirm,
                 confirm_label: Some("Force Delete".into()),
                 on_cancel: None,
@@ -2088,7 +2142,12 @@ impl WorkspaceRoot {
                     workspace.worktree_path, workspace.branch
                 )
                 .into(),
-                expected: slug.into(),
+                // Plain confirm (no type-to-confirm): a normal delete only
+                // removes the branch when git considers it safe (merged) — it
+                // refuses an unmerged branch without force — so a danger-styled
+                // button + the warning above is proportionate, and it spares the
+                // user typing an issue-derived slug that can be sentence-length.
+                expected: "".into(),
                 on_confirm,
                 confirm_label: None,
                 on_cancel: None,
@@ -2098,13 +2157,26 @@ impl WorkspaceRoot {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
-        // Drop any per-mount observer the SCM discard path installed
-        // before reusing the confirm_dialog slot. Without this, a stale
-        // observer would keep watching the workspace-delete dialog and
-        // race with the workspace-ops teardown path.
+        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+        // Drop any per-mount observer the SCM discard path installed before
+        // reusing the confirm_dialog slot, then watch THIS dialog so both
+        // confirm AND cancel free the slot. The on-confirm callback drops the
+        // dialog on its own path, but Cancel only flips the dialog's `cancelled`
+        // flag — without this observer nothing would remove it from the overlay.
         self._discard_dialog_observer = None;
-        self.confirm_dialog =
-            Some(cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx)));
+        self._discard_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.confirm_dialog = None;
+                    root._discard_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.confirm_dialog = Some(dialog);
         cx.notify();
     }
 

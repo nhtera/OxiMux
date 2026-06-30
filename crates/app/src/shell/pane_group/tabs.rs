@@ -634,6 +634,94 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open or activate the singleton Tasks tab (GitHub issue / PR browser).
+    ///
+    /// If a Tasks tab already exists in this group it is activated rather than
+    /// duplicated (singleton dedup — same pattern as diff tabs). Otherwise a
+    /// fresh `TasksView` is constructed with `active_project`, the tab is
+    /// appended and made active.
+    /// Close the singleton Tasks tab if this group has one. Returns whether a
+    /// tab was closed. Used when a workspace is created from the Tasks page —
+    /// the browser has served its purpose, so the foreground returns to the
+    /// group's prior tab (the pane-tab equivalent of returning the rail home).
+    pub fn close_tasks_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::Tasks))
+        {
+            self.close_tab(idx, window, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn open_or_activate_tasks_tab(
+        &mut self,
+        weak_root: WeakEntity<crate::workspace_root::WorkspaceRoot>,
+        projects: Vec<oximux_core::Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        // Singleton dedup: re-activate existing tab if one is already open.
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::Tasks)
+        }) {
+            // Keep the known-project set current; the page's scope is preserved.
+            if let PaneContent::Tasks(view) = &self.tabs[idx].content {
+                let view = view.clone();
+                view.update(cx, |tv, cx| {
+                    tv.set_projects(projects, cx);
+                    tv.activate(cx);
+                });
+            }
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        // Construct a fresh TasksView for this pane group.
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let projects_for_view = projects;
+        let view = cx.new(|cx| {
+            let mut v = crate::shell::tasks_view::TasksView::new(
+                weak_root,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            );
+            v.set_projects(projects_for_view, cx);
+            v.activate(cx);
+            v
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let tab = PaneGroupTab {
+            label: SharedString::from("Tasks"),
+            content: PaneContent::Tasks(view),
+            kind: PaneGroupTabKind::Tasks,
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     /// Open or activate a commit-detail tab. Dedup key is the full
     /// SHA — clicking the same commit row twice activates the
     /// existing tab. `short_oid` and `subject` are display-only and
@@ -981,6 +1069,8 @@ impl PaneGroup {
             PaneContent::Diff(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
             // Browser tabs notify the host on title/URL/loading changes.
             PaneContent::Browser(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
+            // Tasks tabs notify the host on list data / loading changes.
+            PaneContent::Tasks(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
         };
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
