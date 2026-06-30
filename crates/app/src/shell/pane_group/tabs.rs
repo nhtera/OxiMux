@@ -690,6 +690,7 @@ impl PaneGroup {
                 theme,
                 density,
                 typography,
+                window,
                 cx,
             );
             v.set_project(active_project_for_view, cx);

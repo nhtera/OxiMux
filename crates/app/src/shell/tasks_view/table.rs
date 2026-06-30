@@ -5,7 +5,12 @@
 //! The column-header row uses the same `COL_*` constants as `row.rs` so the
 //! two always align without any runtime coordination.
 
-use gpui::{AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, div, px};
+use gpui::{
+    AnyElement, Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Styled, div, px,
+};
+use gpui_component::Sizable as _;
+use gpui_component::input::{Input, InputState};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::forge::{ForgeListFilter, ForgeState};
@@ -14,11 +19,16 @@ use crate::shell::tasks_view::row::{
 };
 use crate::shell::tasks_view::{TaskKind, TasksView};
 
-/// Single-row toolbar: `Issues|PRs` · spacer · `Open|Closed|All|Mine` · `Refresh`.
-/// Chip colors are re-leveled for the content canvas (`bg_panel`) surface.
+/// Single-row toolbar: `Issues|PRs` · query box · `Open|Closed|All|Mine` ·
+/// `Refresh`. The query box flexes to fill the gap (its `--search` passthrough
+/// is what gives the chips composability with GitHub qualifiers). Chip colors
+/// are re-leveled for the content canvas (`bg_panel`) surface.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_toolbar(
     kind: TaskKind,
     filter: &ForgeListFilter,
+    query_input: &Entity<InputState>,
+    has_query: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -26,7 +36,13 @@ pub(super) fn render_toolbar(
 ) -> AnyElement {
     let state = filter.state;
     let mine = filter.mine;
-    div()
+    let query_box = div().flex_1().min_w_0().child(
+        Input::new(query_input)
+            .small()
+            .shadow_none()
+            .text_size(px(typography.t_body_sm)),
+    );
+    let mut row = div()
         .flex()
         .flex_row()
         .items_center()
@@ -42,23 +58,53 @@ pub(super) fn render_toolbar(
         .child(ctrl_chip("PRs", kind == TaskKind::Prs, theme, density, typography, cx, |tv, cx| {
             tv.set_kind(TaskKind::Prs, cx)
         }))
-        .child(div().flex_1())
-        .child(ctrl_chip("Open", state == ForgeState::Open, theme, density, typography, cx, |tv, cx| {
-            tv.set_state(ForgeState::Open, cx)
-        }))
-        .child(ctrl_chip("Closed", state == ForgeState::Closed, theme, density, typography, cx, |tv, cx| {
-            tv.set_state(ForgeState::Closed, cx)
-        }))
-        .child(ctrl_chip("All", state == ForgeState::All, theme, density, typography, cx, |tv, cx| {
-            tv.set_state(ForgeState::All, cx)
-        }))
-        .child(ctrl_chip("Mine", mine, theme, density, typography, cx, |tv, cx| {
-            tv.toggle_mine(cx)
-        }))
-        .child(div().w(px(density.gap_inline as f32 * 2.0)))
-        .child(ctrl_chip("Refresh", false, theme, density, typography, cx, |tv, cx| {
-            tv.refresh(cx)
-        }))
+        .child(query_box);
+    // The clear control only appears while there's text to clear.
+    if has_query {
+        row = row.child(clear_chip(theme, density, typography, cx));
+    }
+    row.child(ctrl_chip("Open", state == ForgeState::Open, theme, density, typography, cx, |tv, cx| {
+        tv.set_state(ForgeState::Open, cx)
+    }))
+    .child(ctrl_chip("Closed", state == ForgeState::Closed, theme, density, typography, cx, |tv, cx| {
+        tv.set_state(ForgeState::Closed, cx)
+    }))
+    .child(ctrl_chip("All", state == ForgeState::All, theme, density, typography, cx, |tv, cx| {
+        tv.set_state(ForgeState::All, cx)
+    }))
+    .child(ctrl_chip("Mine", mine, theme, density, typography, cx, |tv, cx| {
+        tv.toggle_mine(cx)
+    }))
+    .child(div().w(px(density.gap_inline as f32 * 2.0)))
+    .child(ctrl_chip("Refresh", false, theme, density, typography, cx, |tv, cx| {
+        tv.refresh(cx)
+    }))
+    .into_any_element()
+}
+
+/// The query-box clear (`×`) control. A dedicated builder (not [`ctrl_chip`])
+/// because clearing needs `&mut Window` to reset + refocus the input, which the
+/// chip handler signature doesn't carry.
+fn clear_chip(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut Context<TasksView>,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(density.r_xs))
+        .bg(theme.bg_panel_alt)
+        .text_size(px(typography.t_label_xs))
+        .text_color(theme.fg_muted)
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|tv, _ev, window, cx| tv.clear_search(window, cx)),
+        )
+        .child("Clear".to_string())
         .into_any_element()
 }
 

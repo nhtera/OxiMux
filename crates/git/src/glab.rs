@@ -351,6 +351,17 @@ async fn forge_list(cwd: impl AsRef<Path>, kind: &str, filter: ForgeListFilter) 
         args.push("--assignee".into());
         args.push("@me".into());
     }
+    // GitLab's API combines free-text `--search` with the state/assignee flags
+    // (unlike GitHub's Search API, which ignores them), so the chips stay as
+    // flags above and the query rides alongside as plain text. GitHub-style
+    // qualifiers (`is:open`, `label:bug`) are not GitLab search syntax — they
+    // match as literal text here. This is intentional: the query box is
+    // GitHub-oriented, and translating qualifiers to GitLab filters is left out
+    // deliberately rather than guessed at.
+    if let Some(query) = filter.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        args.push("--search".into());
+        args.push(query.into());
+    }
     let Ok((_ok, stdout, _stderr)) = GlabCmd::new(cwd)
         .args(args)
         .timeout(Duration::from_secs(15))

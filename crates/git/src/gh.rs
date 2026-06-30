@@ -456,11 +456,20 @@ impl ForgeState {
     }
 }
 
-/// Filter for an issue/PR listing. `mine` adds `--assignee @me`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Filter for an issue/PR listing.
+///
+/// When `search` is `None` the chips map to flags (`--state`, `--assignee @me`).
+/// When `search` is `Some`, the listing routes through GitHub's Search API
+/// (`gh ... --search`), which **ignores** `--state`/`--assignee`/`--label` — so
+/// the state + `mine` chips are folded INTO the query string instead (see
+/// [`compose_search_query`]). Carries a `String`, so this is `Clone` not `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForgeListFilter {
     pub state: ForgeState,
     pub mine: bool,
+    /// Raw GitHub-search query (qualifiers + free text), or `None` for the
+    /// unfiltered flag path.
+    pub search: Option<String>,
 }
 
 /// JSON fields requested for both listings — kept in one place so the two
@@ -485,21 +494,47 @@ pub async fn pr_list(cwd: impl AsRef<Path>, filter: ForgeListFilter) -> Vec<Forg
     forge_list(cwd, "pr", filter).await
 }
 
+/// Fold the state + `mine` chips into a GitHub-search query string. `gh ...
+/// --search` routes through the Search API, which ignores `--state`/`--assignee`
+/// — so when a search is active those filters must ride inside the query
+/// (`is:open`, `assignee:@me`) rather than as flags. The kind (`is:issue` /
+/// `is:pr`) is already implied by the `issue` / `pr` subcommand, so it is not
+/// added. Order is qualifiers first, then the user's free text.
+fn compose_search_query(query: &str, state: ForgeState, mine: bool) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    match state {
+        ForgeState::Open => parts.push("is:open"),
+        ForgeState::Closed => parts.push("is:closed"),
+        ForgeState::All => {}
+    }
+    if mine {
+        parts.push("assignee:@me");
+    }
+    let qualifiers = parts.join(" ");
+    match (qualifiers.is_empty(), query.is_empty()) {
+        (true, _) => query.to_string(),
+        (false, true) => qualifiers,
+        (false, false) => format!("{qualifiers} {query}"),
+    }
+}
+
 async fn forge_list(cwd: impl AsRef<Path>, kind: &str, filter: ForgeListFilter) -> Vec<ForgeItem> {
     let mut cmd = GhCmd::new(cwd)
-        .args([
-            kind,
-            "list",
-            "--json",
-            FORGE_LIST_FIELDS,
-            "--state",
-            filter.state.flag(),
-            "--limit",
-            FORGE_LIST_LIMIT,
-        ])
+        .args([kind, "list", "--json", FORGE_LIST_FIELDS, "--limit", FORGE_LIST_LIMIT])
         .timeout(Duration::from_secs(15));
-    if filter.mine {
-        cmd = cmd.args(["--assignee", "@me"]);
+    // A present, non-blank query takes the Search-API path (chips folded into
+    // the query); otherwise the plain flag path keeps `--state`/`--assignee`.
+    match filter.search.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        Some(query) => {
+            let composed = compose_search_query(query, filter.state, filter.mine);
+            cmd = cmd.args(["--search", &composed]);
+        }
+        None => {
+            cmd = cmd.args(["--state", filter.state.flag()]);
+            if filter.mine {
+                cmd = cmd.args(["--assignee", "@me"]);
+            }
+        }
     }
     let Ok((_ok, stdout, _stderr)) = cmd.run_raw().await else {
         return Vec::new();
@@ -658,6 +693,31 @@ mod tests {
         assert_eq!(items[0].number, 3);
         assert!(items[0].url.is_empty());
         assert!(items[0].labels.is_empty());
+    }
+
+    #[test]
+    fn compose_search_folds_chips_into_query() {
+        // Open + mine prepend their qualifiers before the free text.
+        assert_eq!(
+            compose_search_query("label:bug crash", ForgeState::Open, true),
+            "is:open assignee:@me label:bug crash"
+        );
+        // Closed maps to is:closed; All omits a state qualifier entirely.
+        assert_eq!(
+            compose_search_query("foo", ForgeState::Closed, false),
+            "is:closed foo"
+        );
+        assert_eq!(
+            compose_search_query("foo", ForgeState::All, false),
+            "foo"
+        );
+        // No free text → bare qualifiers (no trailing space).
+        assert_eq!(
+            compose_search_query("", ForgeState::Open, true),
+            "is:open assignee:@me"
+        );
+        // No qualifiers and no text → empty (GitHub treats as "match all").
+        assert_eq!(compose_search_query("", ForgeState::All, false), "");
     }
 
     #[test]

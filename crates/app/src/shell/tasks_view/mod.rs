@@ -15,12 +15,14 @@ pub mod row;
 mod table;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, Styled, UniformListScrollHandle, WeakEntity, Window,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement,
+    ParentElement, Render, Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
     div, px, uniform_list,
 };
+use gpui_component::input::{InputEvent, InputState};
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -28,6 +30,10 @@ use crate::shell::forge::{AuthState, Forge, ForgeItem, ForgeListFilter, ForgePro
 use crate::shell::tasks_view::row::render_task_row;
 use crate::shell::tasks_view::table::{render_col_header, render_toolbar};
 use crate::workspace_root::WorkspaceRoot;
+
+/// Debounce window for the query box — a key per ~300ms instead of per
+/// keystroke, matching the repo's search-panel idiom.
+const QUERY_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Whether the page is listing issues or pull requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +43,10 @@ pub enum TaskKind {
 }
 
 /// Identifies what a given `items` snapshot was fetched for, so re-activating
-/// the page with the same project + filter doesn't re-hit the network.
-type FetchKey = (String, TaskKind, ForgeState, bool);
+/// the page with the same project + filter doesn't re-hit the network. The
+/// query string is part of the key so a nav toggle never replays stale rows
+/// from a different search.
+type FetchKey = (String, TaskKind, ForgeState, bool, Option<String>);
 
 /// One fetch's result: the rows plus the context needed to pick the right
 /// empty-state copy (was a forge even detected, and is its CLI authenticated).
@@ -53,9 +61,9 @@ struct FetchOutcome {
 
 pub struct TasksView {
     weak_root: WeakEntity<WorkspaceRoot>,
-    /// Focus handle so `PaneContent::Tasks` can satisfy `Focusable` and
-    /// forward focus correctly. The Tasks view is read-only (no text input),
-    /// so this handle is held but focus is not actively routed to it.
+    /// Focus handle so `PaneContent::Tasks` can satisfy `Focusable` and forward
+    /// focus correctly. The page's only text input (the query box) carries its
+    /// own focus; this handle anchors the pane itself.
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -64,6 +72,9 @@ pub struct TasksView {
     project: Option<Project>,
     kind: TaskKind,
     filter: ForgeListFilter,
+    /// GitHub-search query box. Its `Change`/`Enter` events drive
+    /// [`TasksView::set_search`] (debounced) and refine the listing.
+    query_input: Entity<InputState>,
     items: Vec<ForgeItem>,
     /// Whether the last fetch found a supported forge for this project's repo.
     /// Drives the "no GitHub/GitLab remote" hint vs the authenticated states.
@@ -73,8 +84,16 @@ pub struct TasksView {
     auth: AuthState,
     loading: bool,
     loaded_key: Option<FetchKey>,
+    /// Monotonic fetch id. Each fetch captures the current value; a result only
+    /// applies if it still matches, so a slow query that resolves after a newer
+    /// one is discarded instead of clobbering fresher rows.
+    fetch_gen: u64,
     scroll: UniformListScrollHandle,
-    _fetch_task: Option<gpui::Task<()>>,
+    /// Pending debounce timer for the query box (dropped — and thus cancelled —
+    /// when a newer keystroke schedules another).
+    debounce_task: Option<Task<()>>,
+    _fetch_task: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl TasksView {
@@ -83,24 +102,37 @@ impl TasksView {
         theme: Theme,
         density: Density,
         typography: Typography,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Self {
+        let query_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Filter, e.g. is:open label:bug")
+        });
+        let subs = vec![cx.subscribe_in(
+            &query_input,
+            window,
+            |me, _, ev: &InputEvent, window, cx| me.on_query_event(ev, window, cx),
+        )];
         Self {
             weak_root,
-            focus_handle: _cx.focus_handle(),
+            focus_handle: cx.focus_handle(),
             theme,
             density,
             typography,
             project: None,
             kind: TaskKind::Issues,
             filter: ForgeListFilter::default(),
+            query_input,
             items: Vec::new(),
             forge_detected: false,
             auth: AuthState::Ok,
             loading: false,
             loaded_key: None,
+            fetch_gen: 0,
             scroll: UniformListScrollHandle::new(),
+            debounce_task: None,
             _fetch_task: None,
+            _subscriptions: subs,
         }
     }
 
@@ -130,9 +162,15 @@ impl TasksView {
     }
 
     fn current_key(&self) -> Option<FetchKey> {
-        self.project
-            .as_ref()
-            .map(|p| (p.id.clone(), self.kind, self.filter.state, self.filter.mine))
+        self.project.as_ref().map(|p| {
+            (
+                p.id.clone(),
+                self.kind,
+                self.filter.state,
+                self.filter.mine,
+                self.filter.search.clone(),
+            )
+        })
     }
 
     pub(super) fn set_kind(&mut self, kind: TaskKind, cx: &mut Context<Self>) {
@@ -154,7 +192,75 @@ impl TasksView {
         self.fetch(cx);
     }
 
+    /// True when a non-blank query is committed — drives the clear (×)
+    /// affordance. Reads the committed filter (kept in lockstep with the input
+    /// by `commit_query`) rather than re-reading the input entity per frame.
+    pub(super) fn has_query(&self) -> bool {
+        self.filter.search.is_some()
+    }
+
+    /// Query-box event hook. `Change` debounces a refetch; `Enter` fetches
+    /// immediately (no wait).
+    fn on_query_event(&mut self, ev: &InputEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            InputEvent::Change => {
+                self.set_search(window, cx);
+                // Re-render so the typed text and the clear (×) affordance
+                // reflect the new value (the input is a child of our element).
+                cx.notify();
+            }
+            InputEvent::PressEnter { .. } => {
+                // Fetch now; `fetch` drops the pending debounce so it can't
+                // refire.
+                self.commit_query(cx);
+                self.fetch(cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Pull the live input value into `filter.search` (`None` when blank so the
+    /// fetch takes the plain flag path), returning whether it actually changed.
+    fn commit_query(&mut self, cx: &mut Context<Self>) -> bool {
+        let raw = self.query_input.read(cx).value().trim().to_string();
+        let next = (!raw.is_empty()).then_some(raw);
+        if self.filter.search == next {
+            return false;
+        }
+        self.filter.search = next;
+        true
+    }
+
+    /// Debounced refetch from a query keystroke: commit the text, then schedule
+    /// a fetch ~300ms out. A newer keystroke drops this pending task, so only
+    /// the last pause in typing actually hits the network.
+    fn set_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.commit_query(cx) {
+            return;
+        }
+        self.debounce_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(QUERY_DEBOUNCE).await;
+            let _ = this.update(cx, |tv, cx| tv.fetch(cx));
+        }));
+    }
+
+    /// Clear the query box (× button) and refetch the unfiltered listing.
+    pub(super) fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.query_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        self.debounce_task = None;
+        if self.commit_query(cx) {
+            self.fetch(cx);
+        }
+    }
+
     fn fetch(&mut self, cx: &mut Context<Self>) {
+        // This fetch supersedes any pending debounce — drop it so a chip click
+        // (or Enter) can't leave an orphaned timer that refires a redundant
+        // fetch ~300ms later (and flashes the loading state).
+        self.debounce_task = None;
         let Some(project) = self.project.clone() else {
             self.items.clear();
             self.loading = false;
@@ -169,9 +275,14 @@ impl TasksView {
         self.items.clear();
         cx.notify();
 
+        // Bump the generation so a slower in-flight fetch (e.g. an earlier
+        // query keystroke) can't apply its result over this newer one.
+        self.fetch_gen = self.fetch_gen.wrapping_add(1);
+        let my_gen = self.fetch_gen;
+
         let cwd = PathBuf::from(&project.root_path);
         let kind = self.kind;
-        let filter = self.filter;
+        let filter = self.filter.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<FetchOutcome>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -213,6 +324,10 @@ impl TasksView {
         self._fetch_task = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_default();
             let _ = this.update(cx, |tv, cx| {
+                // Discard a result that a newer fetch has already superseded.
+                if tv.fetch_gen != my_gen {
+                    return;
+                }
                 tv.items = outcome.items;
                 tv.forge_detected = outcome.forge_detected;
                 tv.auth = outcome.auth;
@@ -321,7 +436,17 @@ impl Focusable for TasksView {
 
 impl Render for TasksView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let toolbar = render_toolbar(self.kind, &self.filter, self.theme, self.density, &self.typography, cx);
+        let has_query = self.has_query();
+        let toolbar = render_toolbar(
+            self.kind,
+            &self.filter,
+            &self.query_input,
+            has_query,
+            self.theme,
+            self.density,
+            &self.typography,
+            cx,
+        );
         let col_header = render_col_header(self.theme, self.density, &self.typography);
         let body = self.render_body();
         // Tasks sits on the content canvas (`bg_panel`), not the rail surface.
