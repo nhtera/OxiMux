@@ -258,6 +258,10 @@ struct GitlabItem {
     labels: Vec<String>,
     #[serde(default)]
     assignees: Vec<GitlabAssignee>,
+    // GitLab already spells this snake_case, so it maps onto the shared
+    // `ForgeItem.updated_at` without a rename.
+    #[serde(default)]
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -300,6 +304,7 @@ impl GitlabItem {
                 .into_iter()
                 .map(|a| ForgeAssignee { login: a.username })
                 .collect(),
+            updated_at: self.updated_at,
         }
     }
 }
@@ -385,7 +390,8 @@ mod tests {
     fn gitlab_item_maps_onto_forge_item() {
         let json = r#"[
             {"iid":42,"title":"Fix crash","state":"opened","web_url":"https://gl/42",
-             "labels":["bug","p1"],"assignees":[{"username":"alice"}]},
+             "labels":["bug","p1"],"assignees":[{"username":"alice"}],
+             "updated_at":"2026-06-30T10:00:00Z"},
             {"iid":7,"title":"Docs","state":"merged","web_url":"https://gl/7",
              "labels":[],"assignees":[]}
         ]"#;
@@ -404,9 +410,13 @@ mod tests {
         assert_eq!(items[0].labels.len(), 2);
         assert_eq!(items[0].labels[1].name, "p1");
         assert_eq!(items[0].assignees[0].login, "alice");
+        // GitLab's snake_case `updated_at` maps through with no rename.
+        assert_eq!(items[0].updated_at, "2026-06-30T10:00:00Z");
         assert_eq!(items[1].number, 7);
         assert_eq!(items[1].state, "MERGED");
         assert!(items[1].assignees.is_empty());
+        // Missing `updated_at` defaults to empty (column renders a dash).
+        assert!(items[1].updated_at.is_empty());
     }
 
     #[test]

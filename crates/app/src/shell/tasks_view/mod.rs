@@ -24,7 +24,7 @@ use gpui::{
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::forge::{Forge, ForgeItem, ForgeListFilter, ForgeProvider, ForgeState};
+use crate::shell::forge::{AuthState, Forge, ForgeItem, ForgeListFilter, ForgeProvider, ForgeState};
 use crate::shell::tasks_view::row::render_task_row;
 use crate::shell::tasks_view::table::{render_col_header, render_toolbar};
 use crate::workspace_root::WorkspaceRoot;
@@ -40,6 +40,17 @@ pub enum TaskKind {
 /// the page with the same project + filter doesn't re-hit the network.
 type FetchKey = (String, TaskKind, ForgeState, bool);
 
+/// One fetch's result: the rows plus the context needed to pick the right
+/// empty-state copy (was a forge even detected, and is its CLI authenticated).
+#[derive(Default)]
+struct FetchOutcome {
+    items: Vec<ForgeItem>,
+    /// Whether `origin` resolved to a supported forge (GitHub/GitLab) at all.
+    forge_detected: bool,
+    /// Auth state of that forge's CLI (always `Ok` when no forge was detected).
+    auth: AuthState,
+}
+
 pub struct TasksView {
     weak_root: WeakEntity<WorkspaceRoot>,
     /// Focus handle so `PaneContent::Tasks` can satisfy `Focusable` and
@@ -54,6 +65,12 @@ pub struct TasksView {
     kind: TaskKind,
     filter: ForgeListFilter,
     items: Vec<ForgeItem>,
+    /// Whether the last fetch found a supported forge for this project's repo.
+    /// Drives the "no GitHub/GitLab remote" hint vs the authenticated states.
+    forge_detected: bool,
+    /// Auth state from the last fetch's `gh auth status` probe (cached here so
+    /// the hint branches without re-probing per render; re-checked on Refresh).
+    auth: AuthState,
     loading: bool,
     loaded_key: Option<FetchKey>,
     scroll: UniformListScrollHandle,
@@ -78,6 +95,8 @@ impl TasksView {
             kind: TaskKind::Issues,
             filter: ForgeListFilter::default(),
             items: Vec::new(),
+            forge_detected: false,
+            auth: AuthState::Ok,
             loading: false,
             loaded_key: None,
             scroll: UniformListScrollHandle::new(),
@@ -153,20 +172,34 @@ impl TasksView {
         let cwd = PathBuf::from(&project.root_path);
         let kind = self.kind;
         let filter = self.filter;
-        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<ForgeItem>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<FetchOutcome>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     // Unsupported remote (neither GitHub nor GitLab) → empty
                     // list without firing a forge CLI against a foreign host.
-                    let items = match Forge::detect(&cwd).await {
-                        Some(forge) => match kind {
-                            TaskKind::Issues => forge.list_issues(&cwd, filter).await,
-                            TaskKind::Prs => forge.list_prs(&cwd, filter).await,
-                        },
-                        None => Vec::new(),
+                    // A detected forge also gets a cheap auth probe so the empty
+                    // state can tell "not signed in" apart from "no open items".
+                    let outcome = match Forge::detect(&cwd).await {
+                        Some(forge) => {
+                            // The auth probe and the listing are independent
+                            // reads, so run them concurrently — a slow/degraded
+                            // auth check then doesn't stack its timeout on top
+                            // of the list call's.
+                            let (auth, items) = tokio::join!(
+                                forge.auth_state(&cwd),
+                                async {
+                                    match kind {
+                                        TaskKind::Issues => forge.list_issues(&cwd, filter).await,
+                                        TaskKind::Prs => forge.list_prs(&cwd, filter).await,
+                                    }
+                                },
+                            );
+                            FetchOutcome { items, forge_detected: true, auth }
+                        }
+                        None => FetchOutcome::default(),
                     };
-                    let _ = tx.send(items);
+                    let _ = tx.send(outcome);
                 });
             }
             Err(_) => {
@@ -178,9 +211,11 @@ impl TasksView {
             }
         }
         self._fetch_task = Some(cx.spawn(async move |this, cx| {
-            let items = rx.await.unwrap_or_default();
+            let outcome = rx.await.unwrap_or_default();
             let _ = this.update(cx, |tv, cx| {
-                tv.items = items;
+                tv.items = outcome.items;
+                tv.forge_detected = outcome.forge_detected;
+                tv.auth = outcome.auth;
                 tv.loading = false;
                 cx.notify();
             });
@@ -196,13 +231,7 @@ impl TasksView {
             return self.hint("Loading\u{2026}");
         }
         if self.items.is_empty() {
-            let what = match self.kind {
-                TaskKind::Issues => "issues",
-                TaskKind::Prs => "pull requests",
-            };
-            return self.hint(&format!(
-                "No {what}. Requires the gh CLI authenticated for a GitHub repo."
-            ));
+            return self.hint(&self.empty_hint());
         }
 
         let items = self.items.clone();
@@ -210,6 +239,9 @@ impl TasksView {
         let typography = self.typography.clone();
         let kind = self.kind;
         let weak_root = self.weak_root.clone();
+        // One clock read per render (not per row) for the relative `Updated`
+        // column; moved into the list closure and borrowed by each row.
+        let now = chrono::Utc::now().to_rfc3339();
         let row_count = items.len();
         let list = uniform_list(
             "tasks-rows",
@@ -223,6 +255,7 @@ impl TasksView {
                             kind,
                             weak_root.clone(),
                             project.clone(),
+                            &now,
                             theme,
                             density,
                             &typography,
@@ -234,6 +267,35 @@ impl TasksView {
         .track_scroll(&self.scroll)
         .h_full();
         div().flex_1().w_full().child(list).into_any_element()
+    }
+
+    /// Copy for the empty list, disambiguating the three failure modes the old
+    /// single string conflated: no supported remote, an unauthenticated CLI, or
+    /// a genuinely empty (but reachable) repo. Filter-aware so "No open issues"
+    /// doesn't lie when the Closed/All filter is active.
+    fn empty_hint(&self) -> String {
+        let what = match self.kind {
+            TaskKind::Issues => "issues",
+            TaskKind::Prs => "pull requests",
+        };
+        if !self.forge_detected {
+            return "No GitHub or GitLab remote for this repo.".to_string();
+        }
+        match self.auth {
+            // Distinct remedies: an unauthenticated CLI needs a login; an
+            // absent binary can't run `gh auth login` at all and needs install
+            // first — collapsing them would point the user at the wrong step.
+            AuthState::NotAuthed => format!("Sign in with `gh auth login` to see {what}."),
+            AuthState::GhMissing => format!("Install the `gh` CLI and sign in to see {what}."),
+            AuthState::Ok => {
+                let scope = if self.filter.state == ForgeState::Open {
+                    "open "
+                } else {
+                    ""
+                };
+                format!("No {scope}{what}.")
+            }
+        }
     }
 
     fn hint(&self, text: &str) -> AnyElement {

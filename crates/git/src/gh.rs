@@ -77,19 +77,41 @@ impl GhCmd {
     }
 }
 
-/// True when the GitHub CLI is installed and authenticated. A single
-/// `gh auth status` round-trip; any failure (missing binary, not logged in)
-/// resolves to `false` so the caller can show install/auth guidance instead
-/// of a broken button.
+/// Classification of `gh`'s auth status, so callers (the Tasks page) can show
+/// the right guidance instead of conflating "not logged in" with "gh missing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthState {
+    /// `gh auth status` exited zero — the CLI is installed and logged in.
+    #[default]
+    Ok,
+    /// `gh` ran but reported a non-authenticated status (typically "not logged
+    /// in to any GitHub hosts").
+    NotAuthed,
+    /// `gh` couldn't run at all — binary absent, spawn failure, or timeout.
+    GhMissing,
+}
+
+/// Classify the GitHub CLI's auth status via a single `gh auth status`
+/// round-trip (8s cap). Never panics — a "can't tell" result (no binary,
+/// spawn/timeout failure) maps to [`AuthState::GhMissing`].
+pub async fn auth_state(cwd: impl AsRef<Path>) -> AuthState {
+    match GhCmd::new(cwd)
+        .args(["auth", "status"])
+        .timeout(Duration::from_secs(8))
+        .run_raw()
+        .await
+    {
+        Ok((true, ..)) => AuthState::Ok,
+        Ok((false, ..)) => AuthState::NotAuthed,
+        Err(_) => AuthState::GhMissing,
+    }
+}
+
+/// True when the GitHub CLI is installed and authenticated — the thin bool view
+/// of [`auth_state`] for call sites that only gate a button on "usable or not"
+/// (Create-PR, etc.) and don't need the missing-vs-unauthed distinction.
 pub async fn available(cwd: impl AsRef<Path>) -> bool {
-    matches!(
-        GhCmd::new(cwd)
-            .args(["auth", "status"])
-            .timeout(Duration::from_secs(8))
-            .run_raw()
-            .await,
-        Ok((true, ..))
-    )
+    matches!(auth_state(cwd).await, AuthState::Ok)
 }
 
 /// True when `origin` points at github.com. `gh` only supports GitHub, so the
@@ -407,6 +429,12 @@ pub struct ForgeItem {
     pub labels: Vec<ForgeLabel>,
     #[serde(default)]
     pub assignees: Vec<ForgeAssignee>,
+    /// RFC-3339 last-update timestamp, rendered as a relative age in the Tasks
+    /// table. `gh` emits this as camelCase `updatedAt` (hence the rename); the
+    /// GitLab mapper fills it directly. Empty when the source didn't report it
+    /// (older `gh`, or a forge whose listing omits it) — the column shows a dash.
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: String,
 }
 
 /// Which state to list. Maps to `gh --state <open|closed|all>`.
@@ -437,7 +465,7 @@ pub struct ForgeListFilter {
 
 /// JSON fields requested for both listings — kept in one place so the two
 /// queries stay in lockstep with [`ForgeItem`]'s fields.
-const FORGE_LIST_FIELDS: &str = "number,title,state,url,labels,assignees";
+const FORGE_LIST_FIELDS: &str = "number,title,state,url,labels,assignees,updatedAt";
 
 /// Cap on rows fetched per listing: a generous single page that keeps the JSON
 /// small and the list responsive without paginating.
@@ -602,7 +630,8 @@ mod tests {
     fn parses_forge_items_json() {
         let json = r#"[
             {"number":42,"title":"Fix crash","state":"OPEN","url":"https://x/42",
-             "labels":[{"name":"bug"},{"name":"p1"}],"assignees":[{"login":"alice"}]},
+             "labels":[{"name":"bug"},{"name":"p1"}],"assignees":[{"login":"alice"}],
+             "updatedAt":"2026-06-30T12:00:00Z"},
             {"number":7,"title":"Docs","state":"CLOSED","url":"https://x/7",
              "labels":[],"assignees":[]}
         ]"#;
@@ -614,7 +643,11 @@ mod tests {
         assert_eq!(items[0].labels.len(), 2);
         assert_eq!(items[0].labels[1].name, "p1");
         assert_eq!(items[0].assignees[0].login, "alice");
+        // `gh`'s camelCase `updatedAt` maps onto the snake_case field.
+        assert_eq!(items[0].updated_at, "2026-06-30T12:00:00Z");
         assert!(items[1].assignees.is_empty());
+        // Missing `updatedAt` defaults to empty (column renders a dash).
+        assert!(items[1].updated_at.is_empty());
     }
 
     #[test]

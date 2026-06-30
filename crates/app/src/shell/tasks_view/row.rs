@@ -23,6 +23,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::forge::ForgeItem;
 use crate::shell::open_url::open_url;
+use crate::shell::session_merge::relative_age_compact;
 use crate::shell::tasks_view::TaskKind;
 use crate::workspace_root::WorkspaceRoot;
 
@@ -37,7 +38,7 @@ pub(super) const COL_ID_W: f32 = 56.0;
 pub(super) const COL_ASSIGNEES_W: f32 = 120.0;
 /// Fixed width for the `STATUS` column (state chip).
 pub(super) const COL_STATUS_W: f32 = 80.0;
-/// Fixed width for the `UPDATED` column (placeholder this phase).
+/// Fixed width for the `UPDATED` column (relative age, e.g. `3d`).
 pub(super) const COL_UPDATED_W: f32 = 90.0;
 /// Fixed-width right-edge action cluster revealed on row hover.
 pub(super) const COL_ACTIONS_W: f32 = 100.0;
@@ -91,6 +92,7 @@ pub(super) fn render_task_row(
     kind: TaskKind,
     weak_root: WeakEntity<WorkspaceRoot>,
     project: Project,
+    now: &str,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -190,13 +192,25 @@ pub(super) fn render_task_row(
         .overflow_hidden()
         .child(state_chip);
 
-    // Column: UPDATED — placeholder this phase, real data wired in Phase 3
+    // Column: UPDATED — relative age ("3d", "2h", "now"). Falls back to a dash
+    // when the source reported no timestamp (a forge listing that omits it) or
+    // it's unparseable, so the column never renders an empty cell.
+    let updated_label = {
+        let rel = relative_age_compact(&item.updated_at, now);
+        if rel.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            rel
+        }
+    };
     let col_updated = div()
         .flex_none()
         .w(px(COL_UPDATED_W))
+        .overflow_hidden()
+        .whitespace_nowrap()
         .text_size(px(typography.t_body_sm))
         .text_color(theme.fg_subtle)
-        .child("—".to_string());
+        .child(updated_label);
 
     // Right-edge action cluster — always laid out (reserves its column), but
     // transparent at rest and faded in on row hover via the row's `.group("")`.
