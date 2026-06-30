@@ -412,9 +412,12 @@ impl ProjectPanes {
                             } else {
                                 None
                             };
-                        let relay_session = relay_external_id.as_ref().and_then(|_| {
-                            crate::shell::terminal_view::relay_state_snapshot().session_id
-                        });
+                        // Cached session id only — no daemon round-trip on the
+                        // capture path (the full `relay_state_snapshot` ListPtys
+                        // RPC isn't needed here; we never read live ids).
+                        let relay_session = relay_external_id
+                            .as_ref()
+                            .and_then(|_| crate::shell::terminal_view::relay_session_id_cached());
                         (
                             Some(PersistedAgentTab {
                                 adapter: *adapter,

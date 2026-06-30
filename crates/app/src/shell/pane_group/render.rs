@@ -291,9 +291,14 @@ pub fn build_tab_strip_for(
                     if let PaneContent::Browser(view) = &t.content {
                         view.read(cx).chrome_label()
                     } else {
+                        // Label precedence: recognized agent chip > the
+                        // program's OSC 2 window title > the static slug.
+                        // (A user-set `custom_title` already won above and
+                        // pins the name against further OSC-2 overrides.)
                         ambient
                             .as_ref()
                             .map(|a| a.label.into())
+                            .or_else(|| terminal_osc2_title(t, cx))
                             .unwrap_or_else(|| t.label.clone())
                     }
                 }),
@@ -405,6 +410,33 @@ fn detect_tab_agent(tab: &PaneGroupTab, cx: &App) -> Option<TabAgent> {
         adapter_id: crate::shell::agent_presentation::adapter_id_for_label(label),
         status,
     })
+}
+
+/// The active terminal view's OSC 2 window title for a *plain* terminal tab,
+/// trimmed and non-empty, used as the chip label when the user hasn't set a
+/// custom title and the title doesn't classify as agent activity (e.g. `vim`
+/// or `ssh` setting the window title). `None` for non-terminal tabs or when no
+/// title has been emitted. Pull-read at render time, so it tracks live without
+/// any push plumbing; `custom_title` (manual rename) still wins above this.
+fn terminal_osc2_title(tab: &PaneGroupTab, cx: &App) -> Option<SharedString> {
+    if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
+        return None;
+    }
+    let PaneContent::Terminal(tree) = &tab.content else {
+        return None;
+    };
+    let view = tree.active_view()?;
+    let title = view.read(cx).title()?;
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    // Cap pathological titles (a shell that sets its title to the full cwd) so
+    // the chip layout never has to lay out a multi-hundred-char string; the
+    // chip truncates visually too, but this bounds the work up front.
+    const MAX_TITLE_CHARS: usize = 80;
+    let capped: String = title.chars().take(MAX_TITLE_CHARS).collect();
+    Some(SharedString::from(capped))
 }
 
 fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {

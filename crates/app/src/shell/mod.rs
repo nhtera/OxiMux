@@ -70,7 +70,7 @@ pub mod terminal;
 #[doc(inline)]
 pub use terminal::{
     adapter_picker, box_drawing, cell_metrics, floating_terminal, floating_terminal_host,
-    floating_terminal_persistence, key_input, mouse_report, terminal_canvas, terminal_links,
-    terminal_palette, terminal_row, terminal_scrollbar, terminal_search, terminal_search_overlay,
-    terminal_search_state, terminal_view,
+    floating_terminal_persistence, key_input, mouse_report, terminal_canvas, terminal_context_menu,
+    terminal_links, terminal_palette, terminal_row, terminal_scrollbar, terminal_search,
+    terminal_search_overlay, terminal_search_state, terminal_view,
 };

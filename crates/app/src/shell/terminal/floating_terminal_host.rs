@@ -65,6 +65,13 @@ impl WorkspaceRoot {
         if blob.tabs.is_empty() {
             return Vec::new();
         }
+        // FIXME(relay-mainthread): this is the last `relay_state_snapshot`
+        // (ListPtys daemon RPC) still on a main-thread path. It genuinely needs
+        // live external ids (not just the cached session id), and runs during
+        // the user-triggered floating-terminal toggle. A wedged daemon could
+        // stall the GUI up to the 10s `REQUEST_TIMEOUT` here. Deferred: push
+        // this restore off the main thread (mirror the post-paint reconcile's
+        // background_executor pattern). One-shot + infrequent, so low priority.
         let snap = crate::shell::terminal_view::relay_state_snapshot();
         let session_ok = matches!(
             (&blob.relay_session, &snap.session_id),

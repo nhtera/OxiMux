@@ -227,6 +227,41 @@ impl Default for CliRuntime {
     }
 }
 
+impl CliRuntime {
+    /// Inject `text` into an agent session's input the way a paste should land,
+    /// not the way raw typing does: when the agent has DECSET 2004 (bracketed
+    /// paste) on AND this is a review-style send (no trailing newline), wrap
+    /// the bytes in `\e[200~ … \e[201~` so a MULTI-LINE selection / command
+    /// output is inserted as ONE block the user can review — instead of the
+    /// agent's readline executing each embedded newline as a separate line.
+    ///
+    /// A `text` ending in `\n` is an explicit auto-submit (the custom-command
+    /// path) and is sent RAW so the newline still submits; an agent without
+    /// bracketed paste also falls back to a raw write. See
+    /// [`agent_paste_bytes`] for the (pure, tested) byte decision.
+    pub async fn send_agent_paste(&self, id: AgentSessionId, text: &str) -> Result<()> {
+        let (backend, term_id) = {
+            let inner = lock_recover(&self.inner, "CliRuntime sessions");
+            let entry = inner
+                .sessions
+                .get(&id)
+                .ok_or_else(|| anyhow!("unknown session {:?}", id))?;
+            (entry.backend.clone(), entry.term_id)
+        };
+        let text = text.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut be = lock_recover(&backend, "terminal backend");
+            // Read the AGENT's bracketed-paste state (the send target governs,
+            // not the source terminal).
+            let bracketed = be.bracketed_paste(term_id).unwrap_or(false);
+            let bytes = agent_paste_bytes(&text, bracketed);
+            be.write(term_id, &bytes)
+        })
+        .await??;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl AgentRuntime for CliRuntime {
     async fn start_session(&self, cfg: AgentSessionConfig) -> Result<AgentSessionId> {
@@ -543,6 +578,29 @@ async fn poll_loop(
     }
     let mut be = lock_recover(&backend, "terminal backend");
     be.unsubscribe_status_events(term_id);
+}
+
+/// Decide the bytes to inject for a "send to agent" action (pure, so the
+/// wrapping rules are unit-testable without a live PTY). See
+/// [`CliRuntime::send_agent_paste`] for the live path.
+///
+/// - `bracketed` (agent has DECSET 2004) + review send (no trailing `\n`)
+///   → wrap in `\e[200~ … \e[201~` so a multi-line payload lands as one block.
+///   ESC bytes in the body are stripped first so they can't prematurely close
+///   the paste envelope (the same injection guard the clipboard paste uses).
+/// - trailing `\n` (auto-submit custom command) OR no bracketed support
+///   → raw bytes, unchanged (the newline must still submit).
+fn agent_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let auto_submit = text.ends_with('\n');
+    if !bracketed || auto_submit {
+        return text.as_bytes().to_vec();
+    }
+    let body: Vec<u8> = text.bytes().filter(|b| *b != 0x1b).collect();
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(&body);
+    out.extend_from_slice(b"\x1b[201~");
+    out
 }
 
 /// Lock a mutex, recovering from poison instead of propagating the

@@ -375,6 +375,20 @@ impl TerminalState {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    /// Wipe the visible grid AND the scrollback history, then snap the
+    /// viewport to the tail — the standard terminal "Clear" affordance. This
+    /// feeds the same escape sequence the `clear(1)` utility emits (home,
+    /// erase-display, erase-saved-lines) through the parser, so alacritty's
+    /// grid + history + cursor all stay coherent: `ESC[3J` drops the saved
+    /// scrollback, `ESC[2J` erases the screen, `ESC[H` homes the cursor.
+    /// Goes through `advance` (not `advance_collecting`), so it raises no
+    /// title/clipboard/bell side effects. The shell's own prompt redraws on
+    /// the next keystroke / Enter, leaving a usable terminal immediately.
+    pub fn clear(&mut self) {
+        self.advance(b"\x1b[H\x1b[2J\x1b[3J");
+        self.scroll_to_bottom();
+    }
+
     /// Populate `snap` with the currently *displayed* grid + cursor, honoring
     /// the scrollback offset. Allocates one `Vec<Cell>` per row; cheap at
     /// 24-200 rows.
@@ -748,6 +762,38 @@ mod tests {
         state.advance(b"\x1b[30;1HY");
         let snap = fresh_snapshot(&state);
         assert_eq!(snap.cursor, (29, 1));
+    }
+
+    #[test]
+    fn clear_wipes_grid_and_scrollback() {
+        // 3 visible rows; print 6 lines so several scroll into history.
+        let mut state = TerminalState::new(20, 3, 100);
+        state.advance(b"L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6");
+        let before = fresh_snapshot(&state);
+        assert!(before.history_len > 0, "precondition: lines scrolled to history");
+        assert!(
+            before.cells.iter().any(|r| r.iter().any(|c| c.ch != ' ')),
+            "precondition: visible grid has content"
+        );
+
+        state.clear();
+
+        let after = fresh_snapshot(&state);
+        // Visible grid is blank.
+        for row in &after.cells {
+            for cell in row {
+                assert_eq!(cell.ch, ' ', "every visible cell blank after clear");
+            }
+        }
+        // Scrollback history wiped + viewport snapped to the tail.
+        assert_eq!(after.history_len, 0, "scrollback cleared");
+        assert_eq!(after.display_offset, 0, "viewport at the live tail");
+        // The terminal is usable immediately: fresh output lands at the top.
+        state.advance(b"hi");
+        assert!(
+            row_text(&fresh_snapshot(&state), 0).starts_with("hi"),
+            "fresh output usable right after clear"
+        );
     }
 
     #[test]

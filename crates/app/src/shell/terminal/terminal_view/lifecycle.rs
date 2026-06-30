@@ -142,6 +142,7 @@ impl TerminalView {
             attention: false,
             search: SearchState::new(),
             search_debounce_gen: 0,
+            search_scan_gen: 0,
             title: None,
             dormant_cwd: None,
             _poll_task: Some(poll_task),
@@ -157,6 +158,7 @@ impl TerminalView {
             hovered_link: None,
             last_bell_banner: None,
             link_exists: ExistenceCache::new(),
+            link_stat_inflight: 0,
             command_marks: Vec::new(),
             progress: None,
             pending_attach: false,
@@ -231,6 +233,13 @@ impl TerminalView {
         // exit banner so a swap (e.g. post-attach reconcile) never leaves the
         // "process exited" marker over a now-running shell.
         self.exited = None;
+        // Drop any interaction state that belonged to the placeholder grid:
+        // a selection / hover / in-flight scrollbar drag painted over the old
+        // content would otherwise leak onto the unrelated live session.
+        self.selection = None;
+        self.selecting = None;
+        self.hovered_link = None;
+        self.scrollbar_drag = None;
         let old_backend = std::mem::replace(&mut self.backend, backend);
         let old_id = std::mem::replace(&mut self.session_id, session_id);
         // The placeholder owns no child process, but close it anyway so the
@@ -343,6 +352,7 @@ impl TerminalView {
             attention: false,
             search: SearchState::new(),
             search_debounce_gen: 0,
+            search_scan_gen: 0,
             title: None,
             dormant_cwd: Some(cwd),
             _poll_task: None,
@@ -360,6 +370,7 @@ impl TerminalView {
             hovered_link: None,
             last_bell_banner: None,
             link_exists: ExistenceCache::new(),
+            link_stat_inflight: 0,
             command_marks: Vec::new(),
             progress: None,
             pending_attach: false,
@@ -385,8 +396,11 @@ impl TerminalView {
         let Some(cwd) = self.dormant_cwd.take() else {
             return;
         };
-        let cfg = SpawnConfig {
-            cwd,
+        let mut cfg = SpawnConfig {
+            // Clone so the cwd can be restored into `dormant_cwd` if the
+            // promote fails (the pane stays dormant + retryable rather than
+            // wedged in a no-shell / no-poll-task limbo).
+            cwd: cwd.clone(),
             // Re-inject the SAME context ids so a respawned shell keeps
             // its OXIMUX_SURFACE_ID / TAB_ID across the dormant cycle.
             env: self.ids.env(),
@@ -395,6 +409,7 @@ impl TerminalView {
             scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
+        crate::shell::terminal::shell_integration::augment_spawn_config(&mut cfg);
         let session_id = self.session_id;
         let promote_result = self
             .backend
@@ -403,8 +418,10 @@ impl TerminalView {
             .promote_to_live(session_id, cfg);
         if let Err(err) = promote_result {
             tracing::warn!(?err, "respawn promote_to_live failed; staying dormant");
-            // Leaving dormant_cwd unset; user will see no shell. They
-            // can still scroll through the prefilled grid.
+            // Restore the dormant cwd so the next focus-in / keystroke retries
+            // the wake instead of leaving the pane in limbo. The user can still
+            // scroll through the prefilled grid in the meantime.
+            self.dormant_cwd = Some(cwd);
             return;
         }
         // The shell is alive again at the dormant cwd — clear any exit marker.

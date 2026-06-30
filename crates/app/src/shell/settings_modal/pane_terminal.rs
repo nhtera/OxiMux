@@ -156,6 +156,17 @@ pub(super) fn entries(
         cx,
     );
 
+    let copy_on_select = toggle_switch(
+        "term-copyonselect",
+        t.copy_on_select,
+        theme,
+        |this, _w, cx| {
+            this.terminal.copy_on_select = !this.terminal.copy_on_select;
+            this.persist_terminal(cx);
+        },
+        cx,
+    );
+
     vec![
         entry(
             "Scrollback",
@@ -187,6 +198,11 @@ pub(super) fn entries(
             "Option as Meta",
             "Send the macOS Option key as Meta/Alt to the shell.",
             option_meta,
+        ),
+        entry(
+            "Copy on select",
+            "Copy text to the clipboard as soon as a selection is made.",
+            copy_on_select,
         ),
     ]
 }

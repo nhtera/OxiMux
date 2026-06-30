@@ -661,8 +661,10 @@ impl WorkspaceRoot {
                 crate::project_panes_factory::PANE_BUFFER_MAX_BYTES,
                 cx,
             );
-            let snap = crate::shell::terminal_view::relay_state_snapshot();
-            if let Some(session_id) = snap.session_id {
+            // Cached session id only — capturing relay ids needs the session
+            // id, not the live PTY list, so skip the ListPtys daemon RPC on
+            // this main-thread project-switch path.
+            if let Some(session_id) = crate::shell::terminal_view::relay_session_id_cached() {
                 let relay_repo = self.app_state.pane_relay_id_repo.clone();
                 panes.read(cx).capture_pane_relay_ids(
                     &relay_repo,

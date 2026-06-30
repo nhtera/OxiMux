@@ -401,3 +401,28 @@ async fn backend_for_after_cancel_returns_unknown_session() {
         Err(e) => assert!(e.to_string().contains("unknown session")),
     }
 }
+
+// A multi-line "send to agent" payload must be bracketed-paste-wrapped so the
+// agent's readline inserts it as ONE block (embedded newlines not executed),
+// but only when the agent supports it and the send is review-style (no
+// trailing newline). The auto-submit (custom-command) path stays raw.
+#[test]
+fn agent_paste_bytes_wraps_multiline_for_bracketed_review_sends() {
+    // Bracketed + multi-line, review (no trailing \n) → wrapped block.
+    let out = agent_paste_bytes("line one\nline two", true);
+    assert_eq!(out, b"\x1b[200~line one\nline two\x1b[201~");
+
+    // Bracketed + single line, review → still wrapped (harmless, consistent).
+    assert_eq!(agent_paste_bytes("hi", true), b"\x1b[200~hi\x1b[201~");
+
+    // Trailing newline = explicit auto-submit (custom command) → RAW so the
+    // newline still submits, even when bracketed paste is on.
+    assert_eq!(agent_paste_bytes("run this\n", true), b"run this\n");
+
+    // Agent without bracketed paste → raw fallback.
+    assert_eq!(agent_paste_bytes("a\nb", false), b"a\nb");
+
+    // ESC bytes in the body are stripped so they can't close the envelope early.
+    let out = agent_paste_bytes("ok\x1b[201~evil", true);
+    assert_eq!(out, b"\x1b[200~ok[201~evil\x1b[201~");
+}

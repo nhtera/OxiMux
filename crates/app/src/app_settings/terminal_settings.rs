@@ -21,7 +21,7 @@ use notify_debouncer_full::{
 use oximux_settings::TerminalSettings;
 use tokio::sync::mpsc;
 
-use crate::shell::terminal_view::set_spawn_scrollback;
+use crate::shell::terminal_view::{set_shell_integration_enabled, set_spawn_scrollback};
 
 /// Mirror of `main.rs::APP_DATA_SUBDIR` — kept in lockstep so settings land
 /// next to `oximux.db`.
@@ -91,6 +91,7 @@ fn seed_default_if_absent() {
 
 fn apply(cx: &mut App, settings: TerminalSettings) {
     set_spawn_scrollback(settings.scrollback_lines);
+    set_shell_integration_enabled(settings.shell_integration);
     cx.set_global(settings);
 }
 

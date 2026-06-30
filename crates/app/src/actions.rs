@@ -55,6 +55,26 @@ pub struct OpenTabContextMenuAt {
     pub tab_idx: u32,
 }
 
+/// Payload action fired by a right-click inside the terminal GRID (not the
+/// tab chip). Carries the cursor coords, the right-clicked session id (so
+/// `WorkspaceRoot` can resolve the exact `TerminalView` even across splits),
+/// whether a selection is active at click time (drives the Copy / Send-to-
+/// Agent enabled state), and the link token under the cursor if any (drives
+/// the Open Link / Copy Link rows).
+///
+/// `link` is a `String` because `PathBuf`/enums aren't `Action`-compatible;
+/// the receiver re-classifies it as URL vs `path:line:col` when opening.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+#[derive(Default)]
+pub struct OpenTerminalContextMenuAt {
+    pub x: f32,
+    pub y: f32,
+    pub session_id: u64,
+    pub has_selection: bool,
+    pub link: Option<String>,
+}
+
 /// Payload action fired by a workspace-strip chip's left-click. Carries
 /// (group_id, tab_idx) so `WorkspaceRoot` can switch the active pane group
 /// AND activate the right tab within it.
