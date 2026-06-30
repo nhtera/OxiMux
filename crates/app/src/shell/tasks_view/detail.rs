@@ -88,6 +88,7 @@ pub(super) fn render_detail(view: &TasksView, cx: &mut Context<TasksView>) -> An
         .child(create_action(
             workspace_name_for(view.kind, item),
             format!("#{}", item.number),
+            item.url.clone(),
             view.weak_root.clone(),
             row.project.clone(),
             theme,

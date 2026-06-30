@@ -892,6 +892,7 @@ impl WorkspaceRoot {
         cwd: std::path::PathBuf,
         model: Option<String>,
         effort: Option<String>,
+        prompt: Option<String>,
         resumption: oximux_core::SessionResumption,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -932,7 +933,7 @@ impl WorkspaceRoot {
             let cfg = AgentSessionConfig {
                 adapter,
                 worktree_path: cwd,
-                prompt: None,
+                prompt,
                 model: model.clone(),
                 effort: effort.clone(),
                 extra_args,

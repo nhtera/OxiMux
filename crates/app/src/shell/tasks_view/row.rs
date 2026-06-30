@@ -18,7 +18,7 @@ use gpui::{
     AnyElement, App, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Styled, WeakEntity, Window, div, px,
 };
-use oximux_core::Project;
+use oximux_core::{AgentAdapter, Project};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::forge::ForgeItem;
@@ -324,6 +324,7 @@ pub(super) fn render_task_row(
         .child(create_action(
             workspace_name_for(kind, item),
             format!("#{}", item.number),
+            item.url.clone(),
             weak_root,
             project,
             theme,
@@ -389,13 +390,16 @@ pub(super) fn open_action(
         .into_any_element()
 }
 
-/// "Create workspace from this" action chip → `create_workspace_async`, seeded
-/// with the issue/PR reference (e.g. `"#42"`) and activating the new workspace.
-/// `pub(super)` so the detail view reuses the same chip; stops propagation so
-/// the row's open-detail click doesn't also fire.
+/// "Create workspace from this" action chip → `create_workspace_async`. Seeds
+/// the new workspace with the issue/PR reference (e.g. `"#42"`) and launches
+/// Claude Code with the issue URL pre-filled as its prompt (the agent lands
+/// with the URL drafted for review, ready to work the issue — the Tasks
+/// equivalent of "start"). `pub(super)` so the detail view reuses the same
+/// chip; stops propagation so the row's open-detail click doesn't also fire.
 pub(super) fn create_action(
     name: String,
     linked_issue: String,
+    issue_url: String,
     weak_root: WeakEntity<WorkspaceRoot>,
     project: Project,
     theme: Theme,
@@ -418,7 +422,8 @@ pub(super) fn create_action(
                     root.create_workspace_async(
                         project.clone(),
                         name.clone(),
-                        None,
+                        Some(AgentAdapter::ClaudeCode),
+                        Some(issue_url.clone()),
                         Some(linked_issue.clone()),
                         true,
                         window,

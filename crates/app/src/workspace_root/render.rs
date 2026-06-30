@@ -499,6 +499,7 @@ impl Render for WorkspaceRoot {
                     cwd,
                     None,
                     None,
+                    None,
                     resumption,
                     window,
                     cx,

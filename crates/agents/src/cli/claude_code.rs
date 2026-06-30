@@ -124,10 +124,15 @@ impl CliAgentAdapter for ClaudeCodeAdapter {
         }
 
         // User-configured launch flags (e.g. a skip-permissions default)
-        // go after model/effort and before the positional prompt.
+        // go after model/effort and before the prompt flag.
         args.extend(cfg.extra_args.iter().cloned());
 
+        // `--prefill <text>` lands the TUI with the prompt pre-typed but NOT
+        // submitted — the user reviews and presses Enter. Used to seed a
+        // workspace launched from an issue/PR with its URL. A bare positional
+        // would auto-submit instead, which isn't the "review first" intent.
         if let Some(prompt) = cfg.prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+            args.push("--prefill".to_string());
             args.push(prompt.to_string());
         }
 
@@ -223,11 +228,13 @@ mod tests {
     }
 
     #[test]
-    fn build_command_includes_prompt_as_positional() {
+    fn build_command_includes_prompt_as_prefill_flag() {
         let mut c = cfg();
         c.prompt = Some("hello world".into());
         let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
-        assert_eq!(spec.args, vec!["hello world".to_string()]);
+        // `--prefill <text>` drafts the prompt for review rather than
+        // auto-submitting it as a positional would.
+        assert_eq!(spec.args, vec!["--prefill".to_string(), "hello world".into()]);
     }
 
     #[test]
@@ -270,17 +277,17 @@ mod tests {
                 "claude-opus-4-7".into(),
                 "--effort".into(),
                 "high".into(),
+                "--prefill".into(),
                 "refactor this".into(),
             ],
-            "expected model, effort, then prompt as trailing positional"
+            "expected model, effort, then the prompt behind --prefill"
         );
     }
 
     #[test]
     fn build_command_appends_extra_args_before_prompt() {
-        // Launch-config flags land after model/effort and before the
-        // positional prompt, so claude parses them as flags not as the
-        // prompt text.
+        // Launch-config flags land after model/effort and before the prompt
+        // flag — matching `claude --dangerously-skip-permissions --prefill <url>`.
         let mut c = cfg();
         c.model = Some("opus".into());
         c.extra_args = vec!["--dangerously-skip-permissions".into()];
@@ -292,6 +299,7 @@ mod tests {
                 "--model".to_string(),
                 "opus".into(),
                 "--dangerously-skip-permissions".into(),
+                "--prefill".into(),
                 "do it".into(),
             ]
         );

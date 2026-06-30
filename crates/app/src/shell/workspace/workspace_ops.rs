@@ -1676,6 +1676,9 @@ impl WorkspaceRoot {
                     project,
                     submit.name,
                     submit.agent,
+                    // The manual dialog doesn't carry the issue URL, so no
+                    // prompt prefill (the linked-issue badge still records it).
+                    None,
                     submit.linked_issue,
                     false,
                     window,
@@ -1697,6 +1700,7 @@ impl WorkspaceRoot {
         project: Project,
         name: String,
         agent: Option<AgentAdapter>,
+        agent_prompt: Option<String>,
         linked_issue: Option<String>,
         activate_after: bool,
         _window: &mut Window,
@@ -1790,6 +1794,7 @@ impl WorkspaceRoot {
                                 cwd.clone(),
                                 None,
                                 None,
+                                agent_prompt.clone(),
                                 oximux_core::SessionResumption::None,
                                 window,
                                 cx,
