@@ -381,6 +381,8 @@ enum PaneTabKindMarker {
     Diff,
     /// Browser tabs — globe glyph, no agent status badge.
     Browser,
+    /// Tasks tab — list-tree glyph, no agent status badge.
+    Tasks,
 }
 
 /// A recognized agent running inside a plain terminal tab, detected live from
@@ -455,9 +457,7 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         | PaneGroupTabKind::BranchFile { .. }
         | PaneGroupTabKind::CombinedDiff { .. } => PaneTabKindMarker::Diff,
         PaneGroupTabKind::Browser { .. } => PaneTabKindMarker::Browser,
-        // Tasks shares the Browser marker — same "non-editable content page"
-        // semantics and no diff/terminal chrome needed.
-        PaneGroupTabKind::Tasks => PaneTabKindMarker::Browser,
+        PaneGroupTabKind::Tasks => PaneTabKindMarker::Tasks,
     }
 }
 
@@ -1087,6 +1087,7 @@ fn render_tab_chip(
         PaneTabKindMarker::Editor | PaneTabKindMarker::Diff => "icons/file.svg",
         PaneTabKindMarker::Terminal => "icons/square-terminal.svg",
         PaneTabKindMarker::Browser => "icons/globe.svg",
+        PaneTabKindMarker::Tasks => "icons/list-tree.svg",
         PaneTabKindMarker::Agent(adapter_id) => agent_icon(adapter_id),
     };
     let icon_color = if is_active {
