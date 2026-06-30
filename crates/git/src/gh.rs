@@ -487,6 +487,10 @@ pub struct ForgeItem {
     pub labels: Vec<ForgeLabel>,
     #[serde(default)]
     pub assignees: Vec<ForgeAssignee>,
+    /// Who opened the issue/PR, from the list query. Shown in the row's context
+    /// sub-line. Empty when the source omits it (e.g. a deleted account).
+    #[serde(default)]
+    pub author: ForgeAuthor,
     /// RFC-3339 last-update timestamp, rendered as a relative age in the Tasks
     /// table. `gh` emits this as camelCase `updatedAt` (hence the rename); the
     /// GitLab mapper fills it directly. Empty when the source didn't report it
@@ -532,7 +536,7 @@ pub struct ForgeListFilter {
 
 /// JSON fields requested for both listings — kept in one place so the two
 /// queries stay in lockstep with [`ForgeItem`]'s fields.
-const FORGE_LIST_FIELDS: &str = "number,title,state,url,labels,assignees,updatedAt";
+const FORGE_LIST_FIELDS: &str = "number,title,state,url,labels,assignees,author,updatedAt";
 
 /// Cap on rows fetched per listing: a generous single page that keeps the JSON
 /// small and the list responsive without paginating.
@@ -724,7 +728,7 @@ mod tests {
         let json = r#"[
             {"number":42,"title":"Fix crash","state":"OPEN","url":"https://x/42",
              "labels":[{"name":"bug"},{"name":"p1"}],"assignees":[{"login":"alice"}],
-             "updatedAt":"2026-06-30T12:00:00Z"},
+             "author":{"login":"bob"},"updatedAt":"2026-06-30T12:00:00Z"},
             {"number":7,"title":"Docs","state":"CLOSED","url":"https://x/7",
              "labels":[],"assignees":[]}
         ]"#;
@@ -736,9 +740,12 @@ mod tests {
         assert_eq!(items[0].labels.len(), 2);
         assert_eq!(items[0].labels[1].name, "p1");
         assert_eq!(items[0].assignees[0].login, "alice");
+        assert_eq!(items[0].author.login, "bob");
         // `gh`'s camelCase `updatedAt` maps onto the snake_case field.
         assert_eq!(items[0].updated_at, "2026-06-30T12:00:00Z");
         assert!(items[1].assignees.is_empty());
+        // A list item without an author still parses (default empty).
+        assert!(items[1].author.login.is_empty());
         // Missing `updatedAt` defaults to empty (column renders a dash).
         assert!(items[1].updated_at.is_empty());
     }

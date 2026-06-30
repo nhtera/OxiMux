@@ -281,11 +281,13 @@ struct GitlabDetail {
     #[serde(default)]
     description: String,
     #[serde(default)]
-    author: GitlabDetailAuthor,
+    author: GitlabAuthor,
 }
 
+/// GitLab spells the author's handle `username` (not GitHub's `login`); shared
+/// by the detail and list shapes.
 #[derive(Debug, Clone, Default, Deserialize)]
-struct GitlabDetailAuthor {
+struct GitlabAuthor {
     #[serde(default)]
     username: String,
 }
@@ -308,6 +310,10 @@ struct GitlabItem {
     labels: Vec<String>,
     #[serde(default)]
     assignees: Vec<GitlabAssignee>,
+    /// Issue/MR author — `Option` because GitLab can report a null author for
+    /// system-generated items.
+    #[serde(default)]
+    author: Option<GitlabAuthor>,
     // GitLab already spells this snake_case, so it maps onto the shared
     // `ForgeItem.updated_at` without a rename.
     #[serde(default)]
@@ -354,6 +360,9 @@ impl GitlabItem {
                 .into_iter()
                 .map(|a| ForgeAssignee { login: a.username })
                 .collect(),
+            author: ForgeAuthor {
+                login: self.author.map(|a| a.username).unwrap_or_default(),
+            },
             updated_at: self.updated_at,
         }
     }
@@ -452,7 +461,7 @@ mod tests {
         let json = r#"[
             {"iid":42,"title":"Fix crash","state":"opened","web_url":"https://gl/42",
              "labels":["bug","p1"],"assignees":[{"username":"alice"}],
-             "updated_at":"2026-06-30T10:00:00Z"},
+             "author":{"username":"bob"},"updated_at":"2026-06-30T10:00:00Z"},
             {"iid":7,"title":"Docs","state":"merged","web_url":"https://gl/7",
              "labels":[],"assignees":[]}
         ]"#;
@@ -471,11 +480,15 @@ mod tests {
         assert_eq!(items[0].labels.len(), 2);
         assert_eq!(items[0].labels[1].name, "p1");
         assert_eq!(items[0].assignees[0].login, "alice");
+        // GitLab's `author.username` maps onto the shared `author.login`.
+        assert_eq!(items[0].author.login, "bob");
         // GitLab's snake_case `updated_at` maps through with no rename.
         assert_eq!(items[0].updated_at, "2026-06-30T10:00:00Z");
         assert_eq!(items[1].number, 7);
         assert_eq!(items[1].state, "MERGED");
         assert!(items[1].assignees.is_empty());
+        // A null/absent author maps to an empty login (no panic).
+        assert!(items[1].author.login.is_empty());
         // Missing `updated_at` defaults to empty (column renders a dash).
         assert!(items[1].updated_at.is_empty());
     }

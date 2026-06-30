@@ -122,13 +122,17 @@ pub(super) fn render_detail(view: &TasksView, cx: &mut Context<TasksView>) -> An
         .child(state_chip);
 
     // `@author` (bold) followed by the muted "opened this … · updated <ago>"
-    // phrase. The author streams in with the body, so it's omitted until known.
-    if let Some(login) = view
-        .detail
-        .as_ref()
-        .map(|d| d.author.login.clone())
+    // phrase. The list query already carries the author, so it renders
+    // immediately; the lazy detail fetch is only a fallback for older data.
+    let author = Some(item.author.login.clone())
         .filter(|l| !l.is_empty())
-    {
+        .or_else(|| {
+            view.detail
+                .as_ref()
+                .map(|d| d.author.login.clone())
+                .filter(|l| !l.is_empty())
+        });
+    if let Some(login) = author {
         meta = meta.child(
             div()
                 .flex_none()

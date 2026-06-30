@@ -190,15 +190,24 @@ pub(super) fn render_task_row(
         .text_color(theme.fg_base)
         .child(item.title.clone());
 
-    // Sub-line: optional project tag (aggregate scope) + up to 2 label chips,
-    // clipped to the column width. The project tag leads so the source reads
-    // first when the list spans projects.
+    // Sub-line: author · optional project tag (aggregate scope) · up to 2 label
+    // chips, clipped to the column width.
     let mut sub_row = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(density.gap_inline))
         .overflow_hidden();
+    if !item.author.login.is_empty() {
+        sub_row = sub_row.child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_size(px(typography.t_label_xs))
+                .text_color(theme.fg_subtle)
+                .child(item.author.login.clone()),
+        );
+    }
     if show_project {
         sub_row = sub_row.child(chip(
             project_name,
