@@ -369,6 +369,17 @@ impl TerminalBackend for PortablePtyBackend {
         Ok(())
     }
 
+    fn clear(&mut self, id: TerminalSessionId) -> Result<()> {
+        let session = self
+            .sessions
+            .get(&id)
+            .with_context(|| format!("unknown session {id:?}"))?;
+        if let Ok(mut state) = session.state.lock() {
+            state.clear();
+        }
+        Ok(())
+    }
+
     fn snapshot(&self, id: TerminalSessionId) -> Result<TerminalSnapshot> {
         let session = self
             .sessions

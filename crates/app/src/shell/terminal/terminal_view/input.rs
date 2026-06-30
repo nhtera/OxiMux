@@ -2,9 +2,7 @@ use super::*;
 
 impl TerminalView {
     pub(crate) fn on_search(&mut self, _: &Search, _window: &mut Window, cx: &mut Context<Self>) {
-        self.search.open();
-        self.rerun_search();
-        cx.notify();
+        self.open_search(cx);
     }
 
     /// Cmd-Shift-I: extract the active selection's text and dispatch a
@@ -52,13 +50,15 @@ impl TerminalView {
     /// Plain text of the most-recently COMPLETED command's output,
     /// bracketed by the last two `PromptStart` marks. Returns `None`
     /// when fewer than two marks are present (e.g. shell-integration
-    /// not wired) or when both marks lie above the visible viewport.
+    /// not wired).
     ///
-    /// The output band is `[prev_prompt.line + 1, last_prompt.line - 1]`
-    /// in absolute history coords; both ends clamp into the snapshot's
-    /// visible rows via `abs_line_to_screen_row`. Output that scrolled
-    /// off the top is silently truncated to what's still on screen — a
-    /// known limitation of the v1 viewport-only extractor.
+    /// The output band is `[prev_prompt.line + 1, last_prompt.line - 1]` in
+    /// absolute history-line coords. The full backend grid (history + visible)
+    /// is row-indexed by that same absolute line while scrollback hasn't
+    /// capped, so the band extracts directly from it — capturing output that
+    /// scrolled OFF the visible viewport. Only when the grid is unavailable or
+    /// the band falls outside it do we fall back to the viewport-clamped
+    /// extraction, warning that the result may be partial.
     fn last_completed_command_output(&self) -> Option<String> {
         let n = self.command_marks.len();
         if n < 2 {
@@ -67,13 +67,26 @@ impl TerminalView {
         let prev = &self.command_marks[n - 2];
         let last = &self.command_marks[n - 1];
         // Output band is exclusive of both prompt lines themselves.
-        let band_start = prev.line.saturating_add(1);
-        let band_end = last.line.saturating_sub(1);
+        let band_start = prev.line.saturating_add(1) as usize;
+        let band_end = last.line.saturating_sub(1) as usize;
         if band_end < band_start {
             return None;
         }
-        // Clamp the band into the visible viewport. If the band is
-        // entirely above or below the viewport, nothing to extract.
+        // Preferred path: extract from the full history+visible grid, where
+        // row index == absolute mark line (stable until the scrollback caps +
+        // evicts, which only touches OLD commands — never the last one).
+        let id = self.session_id;
+        let grid = self.with_backend(|be| be.search_grid(id));
+        if !grid.is_empty() && band_end < grid.len() {
+            // Full-width band: end_col `MAX` clamps to each row's real width.
+            return Some(extract_selection_text_cells(
+                &grid,
+                (band_start, 0, band_end, usize::MAX),
+            ));
+        }
+
+        // Fallback: clamp the band into the visible viewport. If it sits
+        // entirely off-screen there's nothing to extract.
         let rows = self.snapshot.cells.len();
         if rows == 0 {
             return None;
@@ -86,17 +99,48 @@ impl TerminalView {
         }
         let screen_start = raw_start.max(0) as usize;
         let screen_end = raw_end.min((rows - 1) as i64) as usize;
+        if raw_start < 0 {
+            tracing::warn!(
+                "send-last-output: command output scrolled above the retained grid; sending the visible portion only"
+            );
+        }
         Some(self.snapshot.rows_text(screen_start, screen_end))
     }
 
-    pub(super) fn rerun_search(&mut self) {
+    pub(super) fn rerun_search(&mut self, cx: &mut Context<Self>) {
+        // Clone the full history+visible grid OFF the main thread: the copy of
+        // a large scrollback under the backend mutex would otherwise block the
+        // GPUI run loop AND the relay reader (which needs the same lock to
+        // drain output). Bump a generation so a slower clone landing out of
+        // order can't apply stale matches over a newer scan.
+        self.search_scan_gen = self.search_scan_gen.wrapping_add(1);
+        let my_gen = self.search_scan_gen;
         let session_id = self.session_id;
-        let grid = self.with_backend(|be| be.search_grid(session_id));
-        let visible = self.snapshot.cells.len();
-        self.search.rerun(&grid, visible);
-        // Find-as-you-type lands on the first hit; jump the viewport to it
-        // the same way cycling does.
-        self.follow_current_match();
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let grid = cx
+                .background_executor()
+                .spawn(async move {
+                    backend
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .search_grid(session_id)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                // A newer rerun superseded this clone — drop the stale result.
+                if view.search_scan_gen != my_gen {
+                    return;
+                }
+                let visible = view.snapshot.cells.len();
+                view.search.rerun(&grid, visible);
+                // Find-as-you-type lands on the first hit; jump the viewport to
+                // it the same way cycling does.
+                view.follow_current_match();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Scroll the viewport so the cycled match is visible, then refresh the
@@ -168,7 +212,7 @@ impl TerminalView {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             let _ = this.update(cx, |view, cx| {
                 if view.search_debounce_gen == my_gen && view.search.active {
-                    view.rerun_search();
+                    view.rerun_search(cx);
                     cx.notify();
                 }
             });
@@ -260,8 +304,10 @@ impl TerminalView {
 
     /// End an in-flight selection. Returns whether a repaint is needed. A
     /// char drag that never left its origin cell leaves no highlight (so a
-    /// plain click does not paint a one-cell selection).
-    pub(super) fn finish_select(&mut self) -> bool {
+    /// plain click does not paint a one-cell selection). When `copy_on_select`
+    /// is enabled, a non-empty finished selection is auto-copied to the
+    /// clipboard (the selection itself stays painted — no Cmd+C needed).
+    pub(super) fn finish_select(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(drag) = self.selecting.take() else {
             return false;
         };
@@ -271,6 +317,14 @@ impl TerminalView {
             && c0 == c1
         {
             self.selection = None;
+        }
+        if let Some(sel) = self.selection
+            && terminal_settings(cx).copy_on_select
+        {
+            let text = extract_selection_text(&self.snapshot, sel);
+            if !text.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
         }
         true
     }
@@ -288,6 +342,14 @@ impl TerminalView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Latch the gesture: once a LOCAL selection drag is in flight, never
+        // forward its continuation (drag/release) to a mouse-reporting app —
+        // even if Shift (the local-selection escape hatch) was released
+        // mid-drag. Without this, releasing Shift while selecting starts
+        // leaking spurious drag/release reports into the app.
+        if self.selecting.is_some() && matches!(action, MouseAction::Drag | MouseAction::Release) {
+            return false;
+        }
         if modifiers.shift {
             return false;
         }
@@ -334,6 +396,29 @@ impl TerminalView {
         detect_at(&chars, col)
     }
 
+    /// The link token under `(row, col)` as a string the context-menu open
+    /// action can carry: URLs verbatim, paths formatted as `path[:line[:col]]`.
+    /// `None` when no link sits there. Re-classified on the open side via
+    /// [`crate::shell::terminal_links::classify_link`].
+    pub(super) fn link_string_at(&self, row: usize, col: usize) -> Option<String> {
+        let hit = self.link_at(row, col)?;
+        Some(match hit.target {
+            LinkTarget::Url(u) => u,
+            LinkTarget::Path { path, line, col } => {
+                let mut s = path.to_string_lossy().into_owned();
+                if let Some(l) = line {
+                    s.push(':');
+                    s.push_str(&l.to_string());
+                    if let Some(c) = col {
+                        s.push(':');
+                        s.push_str(&c.to_string());
+                    }
+                }
+                s
+            }
+        })
+    }
+
     /// Resolve a possibly-relative link path against the session's OSC 7 cwd,
     /// falling back to the path as-is when no cwd is known. A leading `~`
     /// component expands to the home directory (common in `ls`/`fd` output).
@@ -372,8 +457,15 @@ impl TerminalView {
             Some(Existence::Exists) => true,
             Some(Existence::Pending | Existence::Missing) => false,
             None => {
+                // Bound concurrent stat tasks: at the cap, leave the entry
+                // UNRECORDED so a later hover retries it instead of pinning a
+                // permanent `Pending` (which would suppress the underline).
+                if self.link_stat_inflight >= MAX_INFLIGHT_LINK_STATS {
+                    return false;
+                }
                 self.link_exists
                     .record(resolved.clone(), Existence::Pending, now);
+                self.link_stat_inflight += 1;
                 cx.spawn(async move |this, cx| {
                     let stat_path = resolved.clone();
                     let exists = cx
@@ -386,6 +478,7 @@ impl TerminalView {
                         Existence::Missing
                     };
                     let _ = this.update(cx, |view, cx| {
+                        view.link_stat_inflight = view.link_stat_inflight.saturating_sub(1);
                         view.link_exists
                             .record(resolved, state, std::time::Instant::now());
                         if exists {
@@ -726,36 +819,17 @@ impl TerminalView {
                     return;
                 }
                 "c" => {
-                    if let Some(sel) = self.selection.take() {
-                        let text = extract_selection_text(&self.snapshot, sel);
-                        if !text.is_empty() {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                        }
-                        cx.notify();
+                    // Copy the selection if any; otherwise fall through to
+                    // SIGINT (^C) — the common terminal behavior with no
+                    // selection set.
+                    if self.copy_selection(cx) {
                         return;
                     }
                     self.send_bytes(b"\x03", cx);
                     return;
                 }
                 "a" => {
-                    // Select every visible cell. End col is the widest
-                    // populated row's last col — saturating at 0 so an
-                    // empty snapshot doesn't underflow.
-                    let rows = self.snapshot.cells.len();
-                    if rows == 0 {
-                        return;
-                    }
-                    let end_row = rows - 1;
-                    let end_col = self
-                        .snapshot
-                        .cells
-                        .iter()
-                        .map(|r| r.len())
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_sub(1);
-                    self.selection = Some((0, 0, end_row, end_col));
-                    cx.notify();
+                    self.select_all(cx);
                     return;
                 }
                 _ => {}
@@ -909,8 +983,10 @@ impl TerminalView {
         let Some(cwd) = self.dormant_cwd.take() else {
             return;
         };
-        let cfg = SpawnConfig {
-            cwd,
+        let mut cfg = SpawnConfig {
+            // Clone so the cwd survives a failed promote (see
+            // `respawn_if_dormant`): the pane stays dormant + retryable.
+            cwd: cwd.clone(),
             // Re-inject the SAME context ids on the inline wake path too.
             env: self.ids.env(),
             cols: self.target_grid.0.max(DEFAULT_COLS),
@@ -918,6 +994,7 @@ impl TerminalView {
             scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
+        crate::shell::terminal::shell_integration::augment_spawn_config(&mut cfg);
         let session_id = self.session_id;
         let promote_result = self
             .backend
@@ -926,12 +1003,30 @@ impl TerminalView {
             .promote_to_live(session_id, cfg);
         if let Err(err) = promote_result {
             tracing::warn!(?err, "wake_dormant promote_to_live failed");
+            // Stay dormant + retryable rather than dropping into limbo.
+            self.dormant_cwd = Some(cwd);
             return;
         }
         self._poll_task = Some(Self::start_poll_task(cx));
     }
 
-    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        // Auto-wrap with bracketed-paste markers when the shell asked for them.
+        self.paste_clipboard(false, cx);
+    }
+
+    /// Paste the clipboard WITHOUT bracketed-paste wrapping, even when the
+    /// shell has DECSET 2004 on. Surfaced as the context menu's "Paste Text"
+    /// row for programs that mis-handle the `\e[200~`/`\e[201~` envelope or
+    /// when the user wants the raw bytes inserted verbatim. ESC stripping still
+    /// applies (the same clipboard-injection guard as the normal paste path).
+    pub(crate) fn paste_text(&mut self, cx: &mut Context<Self>) {
+        self.paste_clipboard(true, cx);
+    }
+
+    /// Shared clipboard paste. `force_plain` skips the bracketed-paste wrap
+    /// regardless of the shell's DECSET 2004 state (the "Paste Text" path).
+    fn paste_clipboard(&mut self, force_plain: bool, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
@@ -964,10 +1059,12 @@ impl TerminalView {
         // chunk as a single insertion (no per-line execution, no autocomplete
         // expansion). Plain `cat` etc. leave it off — we'd just leak the
         // escape bytes as literal text, so passthrough is correct there.
+        // `force_plain` (the "Paste Text" row) always skips the wrap.
         let session_id = self.session_id;
-        let wrap = self
-            .with_backend(|be| be.bracketed_paste(session_id))
-            .unwrap_or(false);
+        let wrap = !force_plain
+            && self
+                .with_backend(|be| be.bracketed_paste(session_id))
+                .unwrap_or(false);
         let mut out = Vec::with_capacity(sanitized.len() + if wrap { 12 } else { 0 });
         if wrap {
             out.extend_from_slice(b"\x1b[200~");
@@ -979,4 +1076,156 @@ impl TerminalView {
         self.send_bytes(&out, cx);
     }
 
+    /// Copy the active selection to the system clipboard and clear it.
+    /// Returns whether there WAS a selection to consume — Cmd+C uses this to
+    /// decide between copy and its SIGINT fallback (no selection → ^C), and
+    /// the context menu's Copy row drives the same path. An empty-text
+    /// selection still counts as consumed (no SIGINT), matching the prior
+    /// inline behavior.
+    pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(sel) = self.selection.take() else {
+            return false;
+        };
+        // A selection whose end row runs past the viewport came from Select
+        // All over the full scrollback — re-extract from the backend grid so
+        // Copy yields the scrolled-off content, not just the visible rows.
+        let visible_rows = self.snapshot.cells.len();
+        let text = if sel.2 >= visible_rows {
+            let id = self.session_id;
+            let grid = self.with_backend(|be| be.search_grid(id));
+            if grid.is_empty() {
+                extract_selection_text(&self.snapshot, sel)
+            } else {
+                extract_selection_text_cells(&grid, sel)
+            }
+        } else {
+            extract_selection_text(&self.snapshot, sel)
+        };
+        if !text.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+        cx.notify();
+        true
+    }
+
+    /// Select the FULL scrollback (history + visible), so a follow-up Copy
+    /// yields everything the pane retains — not just the on-screen rows.
+    /// Driven by Cmd+A and the context menu's Select All row. The selection
+    /// coords live in the full-grid space; [`copy_selection`](Self::copy_selection)
+    /// detects an end row past the viewport and re-extracts from the backend
+    /// grid. Grid-less / empty backends fall back to the visible extent.
+    pub(crate) fn select_all(&mut self, cx: &mut Context<Self>) {
+        let id = self.session_id;
+        let grid = self.with_backend(|be| be.search_grid(id));
+        let (end_row, end_col) = if grid.is_empty() {
+            let rows = self.snapshot.cells.len();
+            if rows == 0 {
+                return;
+            }
+            let ec = self
+                .snapshot
+                .cells
+                .iter()
+                .map(|r| r.len())
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1);
+            (rows - 1, ec)
+        } else {
+            let ec = grid
+                .iter()
+                .map(|r| r.len())
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1);
+            (grid.len() - 1, ec)
+        };
+        self.selection = Some((0, 0, end_row, end_col));
+        cx.notify();
+    }
+
+    /// Set the selection to the word under `(row, col)`. Used by the terminal
+    /// grid right-click so Copy / Send-to-Agent act on a token even when the
+    /// user hasn't dragged a selection. Blank / whitespace cells are skipped —
+    /// there's no meaningful word to grab there.
+    pub(super) fn select_word_at(&mut self, row: usize, col: usize) {
+        let ch = self
+            .snapshot
+            .cells
+            .get(row)
+            .and_then(|r| r.get(col))
+            .map(|c| c.ch)
+            .unwrap_or('\0');
+        if ch == '\0' || ch.is_whitespace() {
+            return;
+        }
+        let ((sr, sc), (er, ec)) = self.word_span((row, col));
+        self.selection = Some((sr, sc, er, ec));
+    }
+
+    /// Clear the visible grid AND scrollback (the standard terminal "Clear"
+    /// affordance), drop any stale selection/hover, and repaint. The shell's
+    /// prompt redraws on the next keystroke, so the terminal stays usable.
+    pub(crate) fn clear_terminal(&mut self, cx: &mut Context<Self>) {
+        let id = self.session_id;
+        if let Err(err) = self.with_backend(|be| be.clear(id)) {
+            tracing::warn!(?err, "terminal clear failed");
+            return;
+        }
+        self.selection = None;
+        self.hovered_link = None;
+        self.scroll_px = 0.0;
+        if let Ok(snapshot) = self.with_backend(|be| be.snapshot(id)) {
+            self.snapshot = Arc::new(snapshot);
+        }
+        // If search is open, re-scan the now-empty grid so stale match
+        // highlights don't linger over the cleared terminal.
+        if self.search.active {
+            self.rerun_search(cx);
+        }
+        cx.notify();
+    }
+
+    /// Open the scrollback search overlay. Shared by the `Search` action and
+    /// the context menu's Search row.
+    pub(crate) fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.search.open();
+        self.rerun_search(cx);
+        cx.notify();
+    }
+
+    /// Send the active selection to the active agent (context menu row).
+    /// Mirrors the Cmd+Shift+I action handler.
+    pub(crate) fn send_selection_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let text = extract_selection_text(&self.snapshot, sel);
+        if text.is_empty() {
+            return;
+        }
+        window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+    }
+
+    /// Send the last completed command's output to the active agent (context
+    /// menu row). Mirrors the Cmd+Shift+O action handler.
+    pub(crate) fn send_last_output_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.last_completed_command_output() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
+    }
+
+    /// Resolve the link the right-click captured (URL or `path:line:col`) and
+    /// open it: URLs via the system handler, paths in the in-app editor —
+    /// the same destinations as a Cmd-click. No-op when the token doesn't
+    /// classify as a link.
+    pub(crate) fn open_link_string(&mut self, s: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(target) = crate::shell::terminal_links::classify_link(s) {
+            self.open_link(target, window, cx);
+        }
+    }
 }

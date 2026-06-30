@@ -79,7 +79,7 @@ use crate::actions::{
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
     NewBrowserTab, NewTab, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory, OpenSettings,
-    OpenTabContextMenuAt, ResumeAgentSession,
+    OpenTabContextMenuAt, OpenTerminalContextMenuAt, ResumeAgentSession,
     OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, Search, SelectExplorerTab,
     SelectFilesTab,
     SelectSearchTab,
@@ -127,6 +127,7 @@ use crate::shell::{
     },
     status_bar,
     tab_context_menu::TabContextMenu,
+    terminal_context_menu::TerminalContextMenu,
     toast::{ToastKind, ToastLayer},
     terminal_view::{DEFAULT_COLS, DEFAULT_ROWS},
     top_bar,
@@ -188,6 +189,12 @@ pub struct WorkspaceRoot {
     /// Cherry-pick / Revert dispatches route through the existing
     /// single-flight `in_flight` flag.
     pub(crate) commit_context_menu: Entity<CommitContextMenu>,
+    /// Right-click context menu for the terminal GRID (Copy / Paste / Select
+    /// All / Clear / link / send-to-agent / split / tab ops). Same shared-
+    /// entity z-band + click-outside dismiss as the other context menus; holds
+    /// a weak handle to the right-clicked `TerminalView` so grid ops act on it
+    /// directly across splits.
+    pub(crate) terminal_context_menu: Entity<TerminalContextMenu>,
     /// Inline adapter-picker popover anchored to the workspace-tabs `+` button.
     pub(crate) adapter_picker: Entity<AdapterPicker>,
     /// PTY backend + status streams for every agent session. Held behind Arc
@@ -624,6 +631,8 @@ impl WorkspaceRoot {
             cx.new(|_| GitRowContextMenu::new(theme, density, typography.clone()));
         let commit_context_menu =
             cx.new(|_| CommitContextMenu::new(theme, density, typography.clone()));
+        let terminal_context_menu =
+            cx.new(|_| TerminalContextMenu::new(theme, density, typography.clone()));
         let on_select: OnSelect = Box::new(move |selection, window, cx| {
             let weak = weak_self.clone();
             let _ = weak.update(cx, |this, cx| match selection {
@@ -1018,6 +1027,7 @@ impl WorkspaceRoot {
             file_tree_context_menu,
             git_row_context_menu,
             commit_context_menu,
+            terminal_context_menu,
             adapter_picker,
             cli_runtime,
             adapter_registry,

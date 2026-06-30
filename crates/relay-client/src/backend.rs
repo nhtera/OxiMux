@@ -553,6 +553,21 @@ impl TerminalBackend for RelayBackend {
         Ok(())
     }
 
+    fn clear(&mut self, id: TerminalSessionId) -> Result<()> {
+        // Render-side wipe of the LOCAL grid mirror only — the daemon PTY is
+        // never told, so a cold-restore could replay the daemon's retained
+        // scrollback. Acceptable for v1: Clear is a "tidy my screen now"
+        // affordance, not a remote-history purge.
+        let sessions = lock_recover(&self.sessions, "sessions");
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session {id:?}"))?;
+        if let Ok(mut state) = session.state.lock() {
+            state.clear();
+        }
+        Ok(())
+    }
+
     fn bracketed_paste(&self, id: TerminalSessionId) -> Result<bool> {
         let sessions = lock_recover(&self.sessions, "sessions");
         let session = sessions

@@ -88,6 +88,18 @@ pub fn detect_at(row: &[char], col: usize) -> Option<LinkMatch> {
     })
 }
 
+/// Classify a whole link token (as captured by a right-click) into a
+/// [`LinkTarget`]: a known URL scheme wins, otherwise a `path[:line[:col]]`
+/// is attempted. Returns `None` when the token is neither. Used by the
+/// terminal context menu's "Open Link" row to re-derive the target from the
+/// string carried in the open action (actions can't ferry enums/`PathBuf`).
+pub fn classify_link(token: &str) -> Option<LinkTarget> {
+    if let Some(url) = classify_url(token) {
+        return Some(LinkTarget::Url(url));
+    }
+    classify_path(token)
+}
+
 fn scheme_len(s: &str) -> usize {
     SCHEMES
         .iter()
@@ -110,7 +122,12 @@ fn classify_path(token: &str) -> Option<LinkTarget> {
     // Peel up to two trailing all-digit segments (col then line).
     let mut nums: Vec<u32> = Vec::new();
     while parts.len() > 1 && nums.len() < 2 {
-        let last = *parts.last().unwrap();
+        // The `len() > 1` guard makes `last()` infallible, but match it
+        // defensively rather than unwrap so a future refactor of the loop
+        // bounds can't turn this into a panic.
+        let Some(&last) = parts.last() else {
+            break;
+        };
         if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) {
             nums.push(last.parse().ok()?);
             parts.pop();
@@ -286,6 +303,25 @@ mod tests {
     fn boundary_and_out_of_range_yield_none() {
         assert_eq!(target_at("a b", 1), None); // the space
         assert_eq!(target_at("abc", 9), None); // past end
+    }
+
+    #[test]
+    fn classify_link_handles_urls_and_paths() {
+        // The context menu's "Open Link" re-classifies the captured token.
+        assert_eq!(
+            classify_link("https://example.com/x"),
+            Some(LinkTarget::Url("https://example.com/x".into()))
+        );
+        assert_eq!(
+            classify_link("src/foo.rs:42:7"),
+            Some(LinkTarget::Path {
+                path: PathBuf::from("src/foo.rs"),
+                line: Some(42),
+                col: Some(7),
+            })
+        );
+        // A bare word is neither.
+        assert_eq!(classify_link("hello"), None);
     }
 
     #[test]

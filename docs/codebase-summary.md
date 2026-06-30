@@ -131,6 +131,9 @@ src/
     ├── terminal_search.rs  find_matches / visible_match_ranges (pure)
     ├── terminal_search_state.rs SearchState struct
     ├── terminal_search_overlay.rs overlay render
+    ├── terminal_context_menu.rs grid right-click menu (Copy/Paste/Select All/Clear/
+    │                       link/send-to-agent/split/tab ops); WorkspaceRoot-owned entity
+    │                       holding WeakEntity<TerminalView>, opened via OpenTerminalContextMenuAt
     ├── box_drawing/        U+2500–U+257F vector rendering (segments lookup +
     │                       PathBuilder stroke paint); replaces the font face for
     │                       continuous TUI borders, gap-free at cell joins;
@@ -221,7 +224,7 @@ crate root, so `crate::<name>::…` paths are unchanged):
 - `session_restore/` — relay_cold_restore, relay_supervisor, restore_fallback, persisted_terminals, git_state_cache (several are `impl WorkspaceRoot`, so they stay in `app`)
 - `platform/` — app_nap, single_instance, window_factory, window_registry, menu
 - `loaders/` — custom_commands_loader, `project_scripts_loader` (reads `.oximux/scripts.toml`), browser_profiles, file_http_client
-- `shell/terminal/` — the ~17 terminal-surface modules (terminal_view/canvas/row/links/palette/scrollbar/search*/key_input/mouse_report/cell_metrics/box_drawing/adapter_picker/floating_terminal*)
+- `shell/terminal/` — the ~18 terminal-surface modules (terminal_view/canvas/row/links/palette/scrollbar/search*/context_menu/key_input/mouse_report/cell_metrics/box_drawing/adapter_picker/floating_terminal*)
 
 At `crates/app/src/` root: `lib.rs`, `main.rs`, `actions.rs`,
 `state.rs`, `assets.rs`, `workspace_root/` (split into mod/ops/render),

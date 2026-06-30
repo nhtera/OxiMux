@@ -163,6 +163,40 @@ impl WorkspaceRoot {
         self.project_panes_by_project.get(id).cloned()
     }
 
+    /// Resolve the right-clicked terminal grid's view plus its
+    /// `(group_id, tab_idx)` from the session id carried in
+    /// `OpenTerminalContextMenuAt`. Walks the active project's groups → tabs →
+    /// split-tree leaves. `None` when no live view matches (e.g. the pane was
+    /// torn down between right-click and action dispatch).
+    pub(crate) fn resolve_terminal_view_by_session(
+        &self,
+        session_id: u64,
+        cx: &gpui::App,
+    ) -> Option<(
+        gpui::WeakEntity<crate::shell::terminal_view::TerminalView>,
+        u64,
+        u32,
+    )> {
+        let panes = self.active_project_panes()?;
+        let panes_ref = panes.read(cx);
+        for group_id in panes_ref.manager().in_order_groups() {
+            let Some(group) = panes_ref.group(group_id) else {
+                continue;
+            };
+            let group_ref = group.read(cx);
+            for (tab_idx, tab) in group_ref.tabs().iter().enumerate() {
+                if let crate::shell::pane_content::PaneContent::Terminal(tree) = &tab.content {
+                    for (_, _, view) in tree.iter_all_views() {
+                        if view.read(cx).session_id().0 == session_id {
+                            return Some((view.downgrade(), group_id.0, tab_idx as u32));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// (Re)wire every source-control-panel event subscription against the
     /// CURRENT `right_sidebar` entities. Called from `new` AND after every
     /// `set_active_project` sidebar rebuild: that rebuild mints fresh
@@ -777,8 +811,9 @@ impl WorkspaceRoot {
     /// hooks as `capture_all_pane_buffers` so the two tables stay in
     /// sync. No-op when there's no relay session (in-process backend).
     pub fn capture_all_pane_relay_ids(&self, cx: &gpui::App) {
-        let snap = crate::shell::terminal_view::relay_state_snapshot();
-        let Some(session_id) = snap.session_id else {
+        // Cached session id — no ListPtys daemon round-trip on this
+        // autosave/capture path (it only needs the session id, not live ids).
+        let Some(session_id) = crate::shell::terminal_view::relay_session_id_cached() else {
             return;
         };
         self.capture_all_pane_relay_ids_with_session(&session_id, cx);

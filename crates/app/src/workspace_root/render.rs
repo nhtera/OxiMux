@@ -20,6 +20,7 @@ impl Render for WorkspaceRoot {
             || self.file_tree_context_menu.read(cx).is_open()
             || self.git_row_context_menu.read(cx).is_open()
             || self.commit_context_menu.read(cx).is_open()
+            || self.terminal_context_menu.read(cx).is_open()
             || self.row_menu.read(cx).is_open()
             || self.project_menu.read(cx).is_open()
             || self.dashboard_status_menu.read(cx).is_open()
@@ -397,7 +398,7 @@ impl Render for WorkspaceRoot {
                     };
                     let runtime = this.cli_runtime.clone();
                     let text = action.text.clone();
-                    // `send_message` offloads the PTY write via
+                    // `send_agent_paste` offloads the PTY write via
                     // `tokio::spawn_blocking`, which needs a live Tokio reactor.
                     // GPUI's background executor has none, so run on the app
                     // runtime (entered on the main thread for the app's life;
@@ -409,7 +410,10 @@ impl Render for WorkspaceRoot {
                         return;
                     };
                     handle.spawn(async move {
-                        if let Err(err) = runtime.send_message(session_id, &text).await {
+                        // Bracketed-paste-wrap so a MULTI-LINE selection /
+                        // command output lands as one reviewable block instead
+                        // of the agent's readline executing each line.
+                        if let Err(err) = runtime.send_agent_paste(session_id, &text).await {
                             tracing::warn!(?session_id, %err, "send-to-agent failed");
                         }
                     });
@@ -749,6 +753,33 @@ impl Render for WorkspaceRoot {
                             can_tear_off,
                             cx,
                         )
+                    });
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &OpenTerminalContextMenuAt, _window, cx| {
+                    // Terminal GRID right-click. Resolve the exact view (by
+                    // session id, so splits target the right pane) + its tab
+                    // location, then open the shared menu. Bail silently when
+                    // the view vanished between right-click and dispatch.
+                    let Some((view, group_id, tab_idx)) =
+                        this.resolve_terminal_view_by_session(action.session_id, cx)
+                    else {
+                        return;
+                    };
+                    let x = action.x;
+                    let y = action.y;
+                    let has_selection = action.has_selection;
+                    let link = action.link.clone();
+                    // Close peer overlays so two context menus never co-exist.
+                    this.pane_actions.update(cx, |p, cx| p.close(cx));
+                    this.adapter_picker.update(cx, |p, cx| p.close(cx));
+                    this.tab_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+                    this.terminal_context_menu.update(cx, |m, cx| {
+                        m.open(x, y, view, group_id, tab_idx, has_selection, link, cx)
                     });
                 }),
             )
@@ -1263,6 +1294,7 @@ impl Render for WorkspaceRoot {
                     || this.file_tree_context_menu.read(cx).is_open()
                     || this.git_row_context_menu.read(cx).is_open()
                     || this.commit_context_menu.read(cx).is_open()
+                    || this.terminal_context_menu.read(cx).is_open()
                     || this.adapter_picker.read(cx).is_open()
                     || this.row_menu.read(cx).is_open()
                     || this.project_menu.read(cx).is_open()
@@ -1277,6 +1309,7 @@ impl Render for WorkspaceRoot {
                 this.file_tree_context_menu.update(cx, |m, cx| m.close(cx));
                 this.git_row_context_menu.update(cx, |m, cx| m.close(cx));
                 this.commit_context_menu.update(cx, |m, cx| m.close(cx));
+                this.terminal_context_menu.update(cx, |m, cx| m.close(cx));
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.row_menu.update(cx, |m, cx| m.close(cx));
                 this.project_menu.update(cx, |m, cx| m.close(cx));
@@ -1450,6 +1483,10 @@ impl Render for WorkspaceRoot {
             // peer context menus; mutually exclusive via close-on-open
             // in OpenCommitContextMenuAt.
             .child(self.commit_context_menu.clone())
+            // Terminal grid right-click menu — same z-band as the peer
+            // context menus; mutually exclusive via close-on-open in
+            // OpenTerminalContextMenuAt.
+            .child(self.terminal_context_menu.clone())
             // Adapter picker — same z-band as pane_actions; only one of
             // them can be open at a time so order between them is moot.
             .child(self.adapter_picker.clone())

@@ -13,6 +13,8 @@
 pub mod adapter_picker;
 pub mod box_drawing;
 pub mod cell_metrics;
+pub mod shell_integration;
+pub mod terminal_context_menu;
 pub mod floating_terminal;
 pub mod floating_terminal_host;
 pub mod floating_terminal_persistence;

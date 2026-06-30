@@ -54,6 +54,15 @@ pub struct TerminalSettings {
     /// Treat the macOS Option key as Meta (ESC-prefix). When false, Option
     /// composes the platform character (e.g. `å`) instead of ESC-prefixing.
     pub option_as_meta: bool,
+    /// Auto-copy a finished selection to the clipboard (no explicit Cmd+C).
+    /// Off by default — matches macOS Terminal/iTerm out-of-box behavior.
+    pub copy_on_select: bool,
+    /// Inject an OSC 133 shell-integration bootstrap when spawning a plain
+    /// shell so the host can locate prompts/output bands and command exit
+    /// codes (drives "send last output to agent" + exit-code gutter badges).
+    /// On by default; turn off if your own prompt already emits OSC 133 and
+    /// you see doubled marks.
+    pub shell_integration: bool,
     /// How a bell is surfaced.
     pub bell: BellStyle,
 }
@@ -75,6 +84,8 @@ impl Default for TerminalSettings {
             unfocused_cursor_alpha: 0.3,
             osc52_clipboard: true,
             option_as_meta: true,
+            copy_on_select: false,
+            shell_integration: true,
             bell: BellStyle::Visual,
         }
     }
@@ -133,7 +144,17 @@ mod tests {
         // Untouched keys keep the defaults.
         assert_eq!(s.blink_interval_ms, 530);
         assert!(s.osc52_clipboard);
+        assert!(s.shell_integration);
         assert_eq!(s.scroll_multiplier, 1.0);
+    }
+
+    #[test]
+    fn shell_integration_defaults_on_and_can_be_disabled() {
+        assert!(TerminalSettings::default().shell_integration);
+        let off = TerminalSettings::from_toml_str("shell_integration = false\n").expect("parse");
+        assert!(!off.shell_integration);
+        // Untouched keys keep their defaults.
+        assert_eq!(off.scrollback_lines, 5000);
     }
 
     #[test]

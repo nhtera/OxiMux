@@ -148,6 +148,12 @@ impl TerminalView {
             // overwrite your clipboard (injection surface on the next paste).
             // The `osc52_clipboard` setting is the allow-list gate; there is no
             // separate remote-vs-local distinction yet.
+            //
+            // FIXME(osc52-remote-local): gate remote/SSH-backed sessions
+            // separately from local ones so a remote process can't write the
+            // clipboard even when local OSC 52 is allowed. Deferred — low
+            // likelihood, lowest-priority research item; tracked here so the
+            // split isn't lost.
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         }
         for bytes in pty_replies {

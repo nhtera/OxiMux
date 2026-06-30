@@ -37,7 +37,7 @@ use oximux_pty::{
 use oximux_settings::{BellStyle, Density, TerminalSettings, Theme, Typography};
 
 use crate::actions::{
-    FindNextMatch, FindPrevMatch, Search, SendLastCommandOutputToAgent,
+    FindNextMatch, FindPrevMatch, OpenTerminalContextMenuAt, Search, SendLastCommandOutputToAgent,
     SendTerminalSelectionToAgent, SendTextToActiveAgent,
 };
 use crate::shell::cell_metrics::CellMetrics;
@@ -170,6 +170,23 @@ fn spawn_scrollback() -> usize {
     SPAWN_SCROLLBACK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide mirror of `TerminalSettings::shell_integration`. Read by the
+/// `cx`-less PTY spawn helpers (and the dormant-promote paths) to decide
+/// whether to inject the OSC 133 shell-integration bootstrap. Kept in sync by
+/// the settings loader + live-reload watcher (both `cx`-holding).
+static SHELL_INTEGRATION_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Update the shell-integration mirror from settings. Called once at startup
+/// and on every settings reload.
+pub fn set_shell_integration_enabled(enabled: bool) {
+    SHELL_INTEGRATION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn shell_integration_enabled() -> bool {
+    SHELL_INTEGRATION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Width (px) of the overlay scrollbar gutter on the terminal's right edge.
 const SCROLLBAR_WIDTH: f32 = 10.0;
 
@@ -233,7 +250,7 @@ pub fn relay_state_snapshot() -> RelayStateSnapshot {
     // main thread). Hold off App Nap so the system can't wedge the calling
     // thread while it's in flight.
     let _nap = crate::app_nap::prevent("relay list ptys");
-    let guard = shared.lock().expect("shared backend poisoned");
+    let guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     RelayStateSnapshot {
         live_external_ids: guard.list_external_ids().into_iter().collect(),
         session_id: guard.external_session_id(),
@@ -249,7 +266,7 @@ pub fn attach_pty_existing(external_id: &str) -> Option<(SharedBackend, Terminal
     // (background executor from the restore reconcile; main thread from
     // tear-off). Hold off App Nap for its duration.
     let _nap = crate::app_nap::prevent("relay attach");
-    let mut guard = shared.lock().expect("shared backend poisoned");
+    let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match guard.attach_existing(external_id) {
         Ok(session_id) => {
             drop(guard);
@@ -300,7 +317,7 @@ pub fn spawn_local_pty_sized(
     let (cols, rows) = dims.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
     // Relay-backed path: one shared backend across the whole app.
     if let Some(shared) = SHARED_BACKEND.get() {
-        let cfg = SpawnConfig {
+        let mut cfg = SpawnConfig {
             cwd: cwd.clone(),
             env: env.clone(),
             cols,
@@ -308,12 +325,13 @@ pub fn spawn_local_pty_sized(
             scrollback: spawn_scrollback(),
             ..SpawnConfig::default()
         };
+        super::shell_integration::augment_spawn_config(&mut cfg);
         // Spawn is a synchronous daemon round-trip on the calling thread
         // (background executor from the restore reconcile; main thread for
         // interactive new-tab/split spawns). Hold off App Nap so it can't
         // wedge mid-request.
         let _nap = crate::app_nap::prevent("relay spawn");
-        let mut guard = shared.lock().expect("shared backend poisoned");
+        let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.spawn(cfg) {
             Ok(session_id) => {
                 drop(guard);
@@ -335,7 +353,7 @@ fn spawn_fallback_portable(
     (cols, rows): (u16, u16),
 ) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
-    let cfg = SpawnConfig {
+    let mut cfg = SpawnConfig {
         cwd,
         env,
         cols,
@@ -343,6 +361,7 @@ fn spawn_fallback_portable(
         scrollback: spawn_scrollback(),
         ..SpawnConfig::default()
     };
+    super::shell_integration::augment_spawn_config(&mut cfg);
     let session_id = match backend.spawn(cfg) {
         Ok(id) => id,
         Err(err) => {
@@ -361,7 +380,7 @@ fn spawn_fallback_portable(
 /// relay-then-fallback pattern.
 pub fn spawn_local_pty_dormant(cols: u16, rows: u16) -> Option<(SharedBackend, TerminalSessionId)> {
     if let Some(shared) = SHARED_BACKEND.get() {
-        let mut guard = shared.lock().expect("shared backend poisoned");
+        let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.spawn_dormant(cols, rows) {
             Ok(session_id) => {
                 drop(guard);
@@ -425,6 +444,13 @@ struct SelectDrag {
 /// Cap on retained shell-integration command marks — only recent prompts get
 /// a gutter badge, and the oldest age out of the scrollback anyway.
 const MAX_COMMAND_MARKS: usize = 256;
+
+/// Cap on concurrent in-flight filesystem-stat tasks for link existence
+/// checks. A fast Cmd-hover sweep across a row full of distinct `path:line`
+/// tokens could otherwise fan out an unbounded burst of `exists()` probes; at
+/// the cap, further misses are simply left un-recorded and retried on the next
+/// hover (the per-path cache already collapses repeats).
+const MAX_INFLIGHT_LINK_STATS: usize = 8;
 
 /// A shell-integration command mark anchored to an absolute history line.
 /// `exit` is `None` while the command runs and `Some(code)` once it finishes.
@@ -506,6 +532,13 @@ pub struct TerminalView {
     /// generation is still current rescans, so fast typing never clones
     /// the full scrollback grid per keystroke.
     search_debounce_gen: u64,
+    /// Monotonic generation for the OFF-THREAD search-grid clone. Each
+    /// `rerun_search` bumps it; a clone that finishes out of order (a slower
+    /// large-grid fetch landing after a newer one) is dropped instead of
+    /// applying stale matches. Decouples the lock-held grid copy from the
+    /// GPUI main thread so a big scrollback search never stalls the relay
+    /// reader.
+    search_scan_gen: u64,
     /// Latest OSC 2 title from the PTY (`TerminalEvent::TitleChange`). `None`
     /// until the shell emits one. Reserved for future use by the workspace
     /// tab strip — current labels are static `"Terminal N"` slugs.
@@ -584,6 +617,11 @@ pub struct TerminalView {
     /// confirmed `Exists`, which is what keeps version-string-shaped false
     /// positives from ever lighting up.
     link_exists: ExistenceCache,
+    /// Count of filesystem-stat tasks currently in flight for link existence
+    /// checks. Bounded by [`MAX_INFLIGHT_LINK_STATS`] so a fast hover sweep
+    /// can't spawn an unbounded burst; incremented before each spawn,
+    /// decremented when it lands.
+    link_stat_inflight: usize,
     /// Shell-integration command marks (OSC 133/633), newest last. Each holds
     /// the absolute history line of its prompt and the exit code once the
     /// command finishes — the canvas paints a gutter badge (red on non-zero).
@@ -755,9 +793,19 @@ fn word_range_at(row: &[oximux_pty::Cell], col: usize) -> (usize, usize) {
 /// padding" convention. Out-of-range coordinates clamp silently to grid.
 fn extract_selection_text(
     snapshot: &TerminalSnapshot,
+    sel: (usize, usize, usize, usize),
+) -> String {
+    extract_selection_text_cells(&snapshot.cells, sel)
+}
+
+/// Like [`extract_selection_text`] but over a bare row-major cell grid — used
+/// to copy a full-scrollback selection (Cmd+A / "Select All") and to extract
+/// the last command's output from the history grid, neither of which fits in
+/// the visible snapshot.
+fn extract_selection_text_cells(
+    rows: &[Vec<oximux_pty::Cell>],
     (start_row, start_col, end_row, end_col): (usize, usize, usize, usize),
 ) -> String {
-    let rows = &snapshot.cells;
     if rows.is_empty() {
         return String::new();
     }
@@ -1226,6 +1274,43 @@ mod restore_lifecycle_tests {
         });
     }
 
+    // A selection / hover painted over the pending placeholder grid must NOT
+    // survive the swap to the live session — otherwise stale interaction state
+    // leaks onto unrelated content. `adopt_live_session` clears it.
+    #[gpui::test]
+    async fn adopt_clears_stale_selection_and_hover(cx: &mut TestAppContext) {
+        let window = mount_pending_view(cx);
+        cx.run_until_parked();
+
+        // Paint placeholder-pane interaction state.
+        window
+            .update(cx, |view, _win, _cx| {
+                view.selection = Some((0, 0, 1, 1));
+                view.selecting = Some(SelectDrag {
+                    anchor: (0, 0),
+                    kind: SelectKind::Char,
+                });
+                view.hovered_link = Some((0, 0, 3));
+            })
+            .expect("window update");
+
+        let (live_backend, live_sid) = dormant();
+        let adopted = window
+            .update(cx, |view, _win, cx| {
+                view.adopt_live_session(live_backend, live_sid, cx)
+            })
+            .expect("window update");
+        assert!(adopted, "adopt must succeed on a pending view");
+
+        cx.run_until_parked();
+        cx.read(|app| {
+            let v = window.read(app).expect("view alive");
+            assert!(v.selection.is_none(), "adopt clears the stale selection");
+            assert!(v.selecting.is_none(), "adopt clears the in-flight drag");
+            assert!(v.hovered_link.is_none(), "adopt clears the stale hover");
+        });
+    }
+
     // Visibility flips drive the PTY-drain cadence: an on-screen restored tab
     // drains at the foreground rate (low echo latency); a backgrounded one
     // throttles. This is the invariant that keeps typing into the focused
@@ -1304,6 +1389,31 @@ mod selection_tests {
     }
 
     #[test]
+    fn word_range_selects_unicode_words() {
+        // `char::is_alphanumeric()` already spans the full Unicode set, so a
+        // double-click word selection grabs CJK and accented tokens whole —
+        // not just ASCII. Guards against a regression to an ASCII-only
+        // predicate (and documents that the boundary is already Unicode-aware).
+        //
+        // NB: this `snap()` helper lays one cell per char, so each CJK glyph
+        // occupies a single cell. In the real grid a wide glyph spans two cells
+        // (the second is a `\0` wide-spacer that correctly stops the run); this
+        // test pins the predicate's Unicode-awareness, not double-width layout.
+        let s = snap(&["café 你好 δοκιμή"]);
+        let row = &s.cells[0];
+        // "café" = cols 0..=3 (precomposed é is a word char).
+        assert_eq!(word_range_at(row, 0), (0, 3));
+        assert_eq!(word_range_at(row, 3), (0, 3));
+        // space at col 4 → single cell.
+        assert_eq!(word_range_at(row, 4), (4, 4));
+        // "你好" = cols 5..=6 (CJK ideographs).
+        assert_eq!(word_range_at(row, 5), (5, 6));
+        // Greek "δοκιμή" = cols 8..=13.
+        assert_eq!(word_range_at(row, 8), (8, 13));
+        assert_eq!(word_range_at(row, 13), (8, 13));
+    }
+
+    #[test]
     fn order_points_normalizes_reading_order() {
         assert_eq!(order_points((1, 2), (3, 4)), (1, 2, 3, 4));
         assert_eq!(order_points((3, 4), (1, 2)), (1, 2, 3, 4));
@@ -1377,5 +1487,48 @@ mod selection_tests {
         // full width, last row clips end col.
         let txt = extract_selection_text(&s, (0, 1, 2, 0));
         assert_eq!(txt, "a\nbbbb\nc");
+    }
+
+    #[test]
+    fn extract_cells_over_full_grid_band() {
+        // The bare-grid extractor (used by full-scrollback Select All and the
+        // send-last-output band) pulls a multi-row window with `usize::MAX`
+        // clamping to each row's real width — capturing rows that live in the
+        // history grid, outside the visible snapshot.
+        let cells: Vec<Vec<Cell>> = ["old prompt", "output one", "output two", "new prompt"]
+            .iter()
+            .map(|r| r.chars().map(cell).collect::<Vec<_>>())
+            .collect();
+        // Band = the two output rows, full width.
+        let txt = extract_selection_text_cells(&cells, (1, 0, 2, usize::MAX));
+        assert_eq!(txt, "output one\noutput two");
+        // Whole grid.
+        let all = extract_selection_text_cells(&cells, (0, 0, 3, usize::MAX));
+        assert_eq!(all, "old prompt\noutput one\noutput two\nnew prompt");
+    }
+}
+
+#[cfg(test)]
+mod poison_recovery_tests {
+    use std::sync::{Arc, Mutex};
+
+    // The terminal view's backend-lock sites recover a poisoned mutex via
+    // `unwrap_or_else(|p| p.into_inner())` instead of `expect`, so a panic
+    // while another holder had the lock can never cascade into a second panic
+    // (which inside a spawn/Drop would abort the process). This pins the idiom.
+    #[test]
+    fn poisoned_mutex_recovers_via_into_inner() {
+        let m = Arc::new(Mutex::new(42u32));
+        let m2 = Arc::clone(&m);
+        // Poison the mutex by panicking while it's held.
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(m.lock().is_err(), "mutex is poisoned after the panicking holder");
+        // The recovery pattern must yield the guarded value, never panic.
+        let v = *m.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(v, 42, "into_inner recovers the value past poison");
     }
 }

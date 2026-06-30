@@ -205,6 +205,15 @@ pub trait TerminalBackend: Send + 'static {
         Ok(())
     }
 
+    /// Wipe the session's visible grid AND scrollback history (the standard
+    /// terminal "Clear" affordance), leaving a blank, immediately-usable
+    /// terminal. Render-side only — the PTY child is untouched, so the shell
+    /// redraws its prompt on the next keystroke. Default impl is a no-op for
+    /// grid-less backends (fixture / replay).
+    fn clear(&mut self, _id: TerminalSessionId) -> Result<()> {
+        Ok(())
+    }
+
     /// A renderable snapshot of the session's current state. Step 1-2 ships
     /// an empty snapshot — step 3 wires `alacritty_terminal` to produce
     /// real rows and a cursor position.

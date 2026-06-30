@@ -107,17 +107,17 @@ impl Render for TerminalView {
             // (we have `&mut Self` + `&mut Context` here).
             let on_toggle_case = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
                 this.search.toggle_case_sensitive();
-                this.rerun_search();
+                this.rerun_search(cx);
                 cx.notify();
             })) as terminal_search_overlay::ToggleHandler;
             let on_toggle_word = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
                 this.search.toggle_whole_word();
-                this.rerun_search();
+                this.rerun_search(cx);
                 cx.notify();
             })) as terminal_search_overlay::ToggleHandler;
             let on_toggle_regex = Box::new(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
                 this.search.toggle_regex();
-                this.rerun_search();
+                this.rerun_search(cx);
                 cx.notify();
             })) as terminal_search_overlay::ToggleHandler;
             let on_prev = Box::new(cx.listener(|this, _, _, cx| {
@@ -358,26 +358,51 @@ impl Render for TerminalView {
                     ) {
                         return;
                     }
-                    if this.finish_select() {
+                    if this.finish_select(cx) {
                         cx.notify();
                     }
                 }),
             )
-            // Middle / right buttons only matter for mouse-reporting apps
-            // (right-click menus in vim/tmux, middle-click paste). There is no
-            // local-selection fallback for them, so they just forward when the
-            // app is reporting and are otherwise ignored.
+            // Right button: forward to a mouse-reporting app (vim/tmux own
+            // their own right-click menus); otherwise open the local terminal
+            // context menu at the cursor. Middle-click forwards when reporting
+            // and otherwise has no local fallback.
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                    this.report_mouse(
+                    // Focus the pane being acted on (matches left-click).
+                    this.focus_handle.focus(window, cx);
+                    // A mouse-reporting app consumes the press — never shadow
+                    // its own right-click handling with a local menu.
+                    if this.report_mouse(
                         ev.button,
                         ev.position,
                         &ev.modifiers,
                         MouseAction::Press,
                         window,
                         cx,
+                    ) {
+                        return;
+                    }
+                    let (row, col) = this.cell_at(ev.position, window);
+                    // Auto-select the word under the cursor when nothing is
+                    // selected so Copy / Send-to-Agent are meaningful.
+                    if this.selection.is_none() {
+                        this.select_word_at(row, col);
+                    }
+                    let link = this.link_string_at(row, col);
+                    let has_selection = this.selection.is_some();
+                    window.dispatch_action(
+                        Box::new(OpenTerminalContextMenuAt {
+                            x: f32::from(ev.position.x),
+                            y: f32::from(ev.position.y),
+                            session_id: this.session_id.0,
+                            has_selection,
+                            link,
+                        }),
+                        cx,
                     );
+                    cx.notify();
                 }),
             )
             .on_mouse_up(
@@ -409,14 +434,22 @@ impl Render for TerminalView {
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(move |this, ev: &MouseUpEvent, window, cx| {
-                    this.report_mouse(
+                    // A mouse-reporting app consumes the release; otherwise
+                    // middle-click pastes the clipboard (macOS has no separate
+                    // X11 primary selection, so the system clipboard stands in
+                    // — paired with `copy_on_select` this mirrors the classic
+                    // select-then-middle-click-paste workflow).
+                    if this.report_mouse(
                         ev.button,
                         ev.position,
                         &ev.modifiers,
                         MouseAction::Release,
                         window,
                         cx,
-                    );
+                    ) {
+                        return;
+                    }
+                    this.paste_from_clipboard(cx);
                 }),
             )
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
