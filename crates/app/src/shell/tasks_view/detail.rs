@@ -1,9 +1,9 @@
 //! Issue/PR detail view — shown in the Tasks pane when a row is opened.
 //!
 //! Replaces the table for a single issue/PR. Top-to-bottom:
-//!   1. Breadcrumb row — back link · `owner / repo` · the `↗` / `+ Workspace`
-//!      actions.
-//!   2. Title         — the issue/PR title with a muted `#number` suffix.
+//!   1. Breadcrumb row — back link · `owner / repo · #number` · the `↗` /
+//!      `+ Workspace` actions.
+//!   2. Title         — the issue/PR title.
 //!   3. Status line   — state chip (`● Open`), `@author opened this … · updated
 //!      <ago>`, assignees, and label chips (wraps when narrow).
 //!   4. Body          — the markdown-rendered description, framed in a card.
@@ -60,25 +60,27 @@ pub(super) fn render_detail(view: &TasksView, cx: &mut Context<TasksView>) -> An
         )
         .child("\u{2190} Back".to_string());
 
+    // `owner / repo · #number` — the repo half is parsed from the item URL
+    // (the same parser the prefill uses) and dropped for an unrecognized URL,
+    // so the number always anchors the breadcrumb.
+    let context = match repo_breadcrumb(&item.url) {
+        Some(repo) => format!("{repo} \u{00b7} #{}", item.number),
+        None => format!("#{}", item.number),
+    };
     let mut breadcrumb = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(density.gap_inline))
         .w_full()
-        .child(back);
-    // `owner / repo`, parsed from the item URL (the same parser the prefill
-    // uses). Absent for an unrecognized URL — the back link still anchors the
-    // row.
-    if let Some(repo) = repo_breadcrumb(&item.url) {
-        breadcrumb = breadcrumb.child(
+        .child(back)
+        .child(
             div()
                 .flex_none()
                 .text_size(px(typo.t_label_xs))
                 .text_color(theme.fg_subtle)
-                .child(repo),
+                .child(context),
         );
-    }
     breadcrumb = breadcrumb
         .child(div().flex_1())
         .child(open_action(item.url.clone(), theme, density, typo));
@@ -94,29 +96,13 @@ pub(super) fn render_detail(view: &TasksView, cx: &mut Context<TasksView>) -> An
         ));
     }
 
-    // ----- Row 2: title with a muted `#number` suffix -----
+    // ----- Row 2: title (the number lives in the breadcrumb above) -----
     let title = div()
-        .flex()
-        .flex_row()
-        .items_baseline()
-        .gap(px(density.gap_inline))
         .w_full()
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(typo.t_body_lg))
-                .font_weight(typo.w_semibold)
-                .text_color(theme.fg_base)
-                .child(item.title.clone()),
-        )
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(typo.t_body_sm))
-                .text_color(theme.fg_subtle)
-                .child(format!("#{}", item.number)),
-        );
+        .text_size(px(typo.t_body_lg))
+        .font_weight(typo.w_semibold)
+        .text_color(theme.fg_base)
+        .child(item.title.clone());
 
     // ----- Row 3: status line (state · author/updated · assignees · labels) --
     let noun = match view.kind {
