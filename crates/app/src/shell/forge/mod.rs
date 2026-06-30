@@ -38,6 +38,10 @@ pub use oximux_git::gh::{ForgeAssignee, ForgeItem, ForgeLabel, ForgeListFilter, 
 /// hint. Re-exported so the page stays off the raw CLI wrapper.
 pub use oximux_git::gh::AuthState;
 
+/// Lazily-fetched issue/PR body + author for the Tasks detail view. Re-exported
+/// so the page depends on the forge layer, not the CLI wrapper.
+pub use oximux_git::gh::ItemDetail;
+
 pub use github_gh::GithubForge;
 pub use gitlab_glab::GitlabForge;
 
@@ -182,6 +186,21 @@ pub async fn fetch_ref_title(
     match forge {
         Forge::Github(_) => oximux_git::gh::item_title(cwd, kind, number, repo).await,
         Forge::Gitlab(_) => oximux_git::glab::item_title(cwd, kind, number, repo).await,
+    }
+}
+
+/// Body + author of an issue/PR through whichever forge backs the repo. The
+/// lazy companion to the list query, for the Tasks detail view. `None` when the
+/// forge CLI can't supply it (absent, no network, item gone).
+pub async fn fetch_item_detail(
+    forge: Forge,
+    cwd: &Path,
+    kind: oximux_core::ForgeRefKind,
+    number: u64,
+) -> Option<ItemDetail> {
+    match forge {
+        Forge::Github(_) => oximux_git::gh::item_detail(cwd, kind, number, None).await,
+        Forge::Gitlab(_) => oximux_git::glab::item_detail(cwd, kind, number, None).await,
     }
 }
 

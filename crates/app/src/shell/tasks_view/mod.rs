@@ -11,6 +11,7 @@
 //!   2. Col-header — `table::render_col_header`
 //!   3. Body       — virtualized `uniform_list` of `row::render_task_row`
 
+mod detail;
 pub mod row;
 mod table;
 
@@ -26,7 +27,10 @@ use gpui_component::input::{InputEvent, InputState};
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::shell::forge::{AuthState, Forge, ForgeItem, ForgeListFilter, ForgeProvider, ForgeState};
+use crate::shell::forge::{
+    AuthState, Forge, ForgeItem, ForgeListFilter, ForgeProvider, ForgeState, ItemDetail,
+    fetch_item_detail,
+};
 use crate::shell::tasks_view::row::render_task_row;
 use crate::shell::tasks_view::table::{render_col_header, render_toolbar};
 use crate::workspace_root::WorkspaceRoot;
@@ -84,6 +88,17 @@ pub struct TasksView {
     auth: AuthState,
     loading: bool,
     loaded_key: Option<FetchKey>,
+    /// Issue/PR currently shown in the in-pane detail view, or `None` for the
+    /// list. Holds the row's [`ForgeItem`] (title/state/labels/assignees) so the
+    /// detail renders its metadata immediately while the body loads.
+    selected: Option<ForgeItem>,
+    /// Lazily-fetched body + author for [`Self::selected`].
+    detail: Option<ItemDetail>,
+    detail_loading: bool,
+    /// Generation guard for the detail fetch (same role as `fetch_gen`): a slow
+    /// body that resolves after the user opened a different row is discarded.
+    detail_gen: u64,
+    _detail_task: Option<Task<()>>,
     /// Monotonic fetch id. Each fetch captures the current value; a result only
     /// applies if it still matches, so a slow query that resolves after a newer
     /// one is discarded instead of clobbering fresher rows.
@@ -128,6 +143,11 @@ impl TasksView {
             auth: AuthState::Ok,
             loading: false,
             loaded_key: None,
+            selected: None,
+            detail: None,
+            detail_loading: false,
+            detail_gen: 0,
+            _detail_task: None,
             fetch_gen: 0,
             scroll: UniformListScrollHandle::new(),
             debounce_task: None,
@@ -256,6 +276,70 @@ impl TasksView {
         }
     }
 
+    /// Open the in-pane detail view for one row, fetching its body + author
+    /// lazily. The row's metadata renders immediately; the body streams in.
+    pub(super) fn open_detail(&mut self, item: ForgeItem, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let number = item.number;
+        self.selected = Some(item);
+        self.detail = None;
+        self.detail_loading = true;
+        self.detail_gen = self.detail_gen.wrapping_add(1);
+        let my_gen = self.detail_gen;
+        cx.notify();
+
+        let cwd = PathBuf::from(&project.root_path);
+        let kind = match self.kind {
+            TaskKind::Issues => oximux_core::ForgeRefKind::Issue,
+            TaskKind::Prs => oximux_core::ForgeRefKind::Pull,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<ItemDetail>>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let detail = match Forge::detect(&cwd).await {
+                        Some(forge) => fetch_item_detail(forge, &cwd, kind, number).await,
+                        None => None,
+                    };
+                    let _ = tx.send(detail);
+                });
+            }
+            Err(_) => {
+                self.detail_loading = false;
+                cx.notify();
+                return;
+            }
+        }
+        self._detail_task = Some(cx.spawn(async move |this, cx| {
+            let detail = rx.await.unwrap_or(None);
+            let _ = this.update(cx, |tv, cx| {
+                // Discard a body the user already navigated away from.
+                if tv.detail_gen != my_gen {
+                    return;
+                }
+                tv.detail = detail;
+                tv.detail_loading = false;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Return from the detail view to the list.
+    pub(super) fn close_detail(&mut self, cx: &mut Context<Self>) {
+        if self.selected.is_none() {
+            return;
+        }
+        self.selected = None;
+        self.detail = None;
+        self.detail_loading = false;
+        // Invalidate any in-flight body fetch so it can't ghost-write `detail`
+        // (and fire a spurious notify) after we've returned to the list.
+        self.detail_gen = self.detail_gen.wrapping_add(1);
+        cx.notify();
+    }
+
     fn fetch(&mut self, cx: &mut Context<Self>) {
         // This fetch supersedes any pending debounce — drop it so a chip click
         // (or Enter) can't leave an orphaned timer that refires a redundant
@@ -337,7 +421,7 @@ impl TasksView {
         }));
     }
 
-    fn render_body(&self) -> AnyElement {
+    fn render_body(&self, weak_tasks: WeakEntity<TasksView>) -> AnyElement {
         let theme = self.theme;
         let Some(project) = self.project.clone() else {
             return self.hint("Open a project to browse its issues.");
@@ -368,6 +452,7 @@ impl TasksView {
                         render_task_row(
                             &item,
                             kind,
+                            weak_tasks.clone(),
                             weak_root.clone(),
                             project.clone(),
                             &now,
@@ -436,6 +521,17 @@ impl Focusable for TasksView {
 
 impl Render for TasksView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Tasks sits on the content canvas (`bg_panel`), not the rail surface.
+        let root = div()
+            .flex()
+            .flex_col()
+            .h_full()
+            .w_full()
+            .bg(self.theme.bg_panel);
+        // A selected row swaps the whole pane for the issue/PR detail view.
+        if self.selected.is_some() {
+            return root.child(detail::render_detail(self, cx));
+        }
         let has_query = self.has_query();
         let toolbar = render_toolbar(
             self.kind,
@@ -448,16 +544,8 @@ impl Render for TasksView {
             cx,
         );
         let col_header = render_col_header(self.theme, self.density, &self.typography);
-        let body = self.render_body();
-        // Tasks sits on the content canvas (`bg_panel`), not the rail surface.
-        div()
-            .flex()
-            .flex_col()
-            .h_full()
-            .w_full()
-            .bg(self.theme.bg_panel)
-            .child(toolbar)
-            .child(col_header)
-            .child(body)
+        let weak_tasks = cx.entity().downgrade();
+        let body = self.render_body(weak_tasks);
+        root.child(toolbar).child(col_header).child(body)
     }
 }

@@ -24,7 +24,7 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::shell::forge::ForgeItem;
 use crate::shell::open_url::open_url;
 use crate::shell::session_merge::relative_age_compact;
-use crate::shell::tasks_view::TaskKind;
+use crate::shell::tasks_view::{TaskKind, TasksView};
 use crate::workspace_root::WorkspaceRoot;
 
 // ---------------------------------------------------------------------------
@@ -59,13 +59,36 @@ pub(super) fn state_color(state: &str, theme: Theme) -> Hsla {
 
 /// The workspace name seeded from an issue/PR. `create_workspace_async` derives
 /// the slug + `oximux/<slug>` branch from this, so it carries the number for a
-/// recognizable branch like `oximux/issue-42-fix-crash`.
+/// recognizable branch like `oximux/issue-42-fix-crash`. The title is trimmed
+/// to a short lead (see [`short_issue_title`]) so a sentence-length issue title
+/// doesn't yield an unwieldy branch + delete-confirm slug.
 pub(super) fn workspace_name_for(kind: TaskKind, item: &ForgeItem) -> String {
     let prefix = match kind {
         TaskKind::Issues => "issue",
         TaskKind::Prs => "pr",
     };
-    format!("{prefix} {} {}", item.number, item.title)
+    format!("{prefix} {} {}", item.number, short_issue_title(&item.title))
+}
+
+/// Keep only a short lead of an issue/PR title for the workspace name. A full
+/// title can run to a sentence; the derived slug also gets a hard cap, but
+/// trimming here keeps the human-readable name itself tidy. Breaks on a word
+/// boundary within a small budget.
+fn short_issue_title(title: &str) -> String {
+    const MAX: usize = 28;
+    let t = title.trim();
+    if t.len() <= MAX {
+        return t.to_string();
+    }
+    let mut end = MAX;
+    while end > 0 && !t.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &t[..end];
+    match head.rfind(char::is_whitespace) {
+        Some(sp) if sp >= 8 => head[..sp].to_string(),
+        _ => head.to_string(),
+    }
 }
 
 /// A small static rounded pill (status or label chip).
@@ -87,9 +110,12 @@ fn chip(text: String, fg: Hsla, bg: Hsla, density: Density, typography: &Typogra
 ///   `#ID` | `TITLE` (flex) | `ASSIGNEES` | `STATUS` | `UPDATED`
 /// A right-edge action cluster (`↗`, `+ Workspace`) is appended and hidden
 /// behind a hover-visible opacity trick (always rendered, zero-opacity at rest).
+/// Clicking the row (outside the action cluster, which stops propagation) opens
+/// the issue/PR in the in-pane detail view via `weak_tasks`.
 pub(super) fn render_task_row(
     item: &ForgeItem,
     kind: TaskKind,
+    weak_tasks: WeakEntity<TasksView>,
     weak_root: WeakEntity<WorkspaceRoot>,
     project: Project,
     now: &str,
@@ -235,6 +261,9 @@ pub(super) fn render_task_row(
             typography,
         ));
 
+    // Clicking anywhere on the row (the action cluster stops propagation) opens
+    // the issue/PR in the in-pane detail view.
+    let click_item = item.clone();
     div()
         .group("")
         .flex()
@@ -244,6 +273,11 @@ pub(super) fn render_task_row(
         .w_full()
         .px(px(density.pad_panel))
         .gap(px(density.gap_inline))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _w, cx: &mut App| {
+            let item = click_item.clone();
+            let _ = weak_tasks.update(cx, |tv, cx| tv.open_detail(item, cx));
+        })
         .child(col_id)
         .child(col_title)
         .child(col_assignees)
@@ -254,8 +288,15 @@ pub(super) fn render_task_row(
 }
 
 /// "Open in browser" action chip. Only `https://` URLs are forwarded
-/// (the scheme guard lives in `open_url`).
-fn open_action(url: String, theme: Theme, density: Density, typography: &Typography) -> AnyElement {
+/// (the scheme guard lives in `open_url`). `pub(super)` so the detail view
+/// reuses the same chip. Stops propagation so the row's open-detail click
+/// doesn't also fire.
+pub(super) fn open_action(
+    url: String,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> AnyElement {
     div()
         .flex_none()
         .px(px(5.0))
@@ -264,7 +305,8 @@ fn open_action(url: String, theme: Theme, density: Density, typography: &Typogra
         .text_size(px(typography.t_label_xs))
         .text_color(theme.fg_muted)
         .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _w, _cx: &mut App| {
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _w, cx: &mut App| {
+            cx.stop_propagation();
             open_url(&url);
         })
         .child("↗".to_string())
@@ -273,7 +315,9 @@ fn open_action(url: String, theme: Theme, density: Density, typography: &Typogra
 
 /// "Create workspace from this" action chip → `create_workspace_async`, seeded
 /// with the issue/PR reference (e.g. `"#42"`) and activating the new workspace.
-fn create_action(
+/// `pub(super)` so the detail view reuses the same chip; stops propagation so
+/// the row's open-detail click doesn't also fire.
+pub(super) fn create_action(
     name: String,
     linked_issue: String,
     weak_root: WeakEntity<WorkspaceRoot>,
@@ -293,6 +337,7 @@ fn create_action(
         .on_mouse_down(
             MouseButton::Left,
             move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
                 let _ = weak_root.update(cx, |root, cx| {
                     root.create_workspace_async(
                         project.clone(),
@@ -308,4 +353,33 @@ fn create_action(
         )
         .child("+ Workspace".to_string())
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_issue_title;
+
+    #[test]
+    fn short_issue_title_keeps_short_titles_whole() {
+        assert_eq!(short_issue_title("Fix crash"), "Fix crash");
+        assert_eq!(short_issue_title("  trimmed  "), "trimmed");
+    }
+
+    #[test]
+    fn short_issue_title_breaks_on_word_boundary() {
+        // Long title → cut to the last word boundary within the 28-char budget.
+        assert_eq!(
+            short_issue_title("fix crash in parser that is triggered at startup"),
+            "fix crash in parser that is"
+        );
+    }
+
+    #[test]
+    fn short_issue_title_hard_cut_when_first_space_is_too_early() {
+        // Only whitespace is near the start (< 8) → hard cut at the budget;
+        // derive_slug later turns the interior space into a dash.
+        let out = short_issue_title("ab fix-crash-in-parser-that-happens-at-startup");
+        assert!(out.len() <= 28);
+        assert!(out.starts_with("ab fix-crash"));
+    }
 }

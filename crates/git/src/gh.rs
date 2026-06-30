@@ -201,6 +201,37 @@ pub async fn item_title(
     }
 }
 
+/// Body + author of one issue/PR by number — `gh issue|pr view N --json
+/// body,author`. Fetched lazily when the Tasks detail view opens (kept out of
+/// the list query, which stays lean). Any failure (gh absent, bad number, no
+/// network) resolves to `None`; the detail view then shows the metadata it
+/// already has from the list, without a body.
+pub async fn item_detail(
+    cwd: impl AsRef<Path>,
+    kind: oximux_core::ForgeRefKind,
+    number: u64,
+    repo: Option<&str>,
+) -> Option<ItemDetail> {
+    let subcommand = match kind {
+        oximux_core::ForgeRefKind::Issue => "issue",
+        oximux_core::ForgeRefKind::Pull => "pr",
+    };
+    let mut cmd = GhCmd::new(cwd).args([
+        subcommand,
+        "view",
+        &number.to_string(),
+        "--json",
+        "body,author",
+    ]);
+    if let Some(slug) = repo {
+        cmd = cmd.args(["-R", slug]);
+    }
+    match cmd.run_raw().await {
+        Ok((true, stdout, _)) => serde_json::from_str(stdout.trim()).ok(),
+        _ => None,
+    }
+}
+
 /// Pull the `title` field out of a `--json title` / `-F json` response.
 /// Serde (not substring-scanning) so a title that happens to contain
 /// `"title"` can't confuse the parse. Shared by the gh and glab fetchers.
@@ -418,6 +449,24 @@ pub struct ForgeLabel {
 pub struct ForgeAssignee {
     #[serde(default)]
     pub login: String,
+}
+
+/// Author of an issue/PR, from `gh ... view --json author`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ForgeAuthor {
+    #[serde(default)]
+    pub login: String,
+}
+
+/// Fields fetched on demand when an issue/PR is opened in the Tasks detail
+/// view — the list query stays lean, so the body (GitHub-flavored markdown)
+/// and author are pulled lazily only when needed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ItemDetail {
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub author: ForgeAuthor,
 }
 
 /// One issue or pull request row from `gh issue list` / `gh pr list`. The
@@ -702,6 +751,19 @@ mod tests {
         assert_eq!(items[0].number, 3);
         assert!(items[0].url.is_empty());
         assert!(items[0].labels.is_empty());
+    }
+
+    #[test]
+    fn parses_item_detail_json() {
+        // gh `view --json body,author` shape: body + nested author.login.
+        let json = r#"{"body":"Summary: fix the crash","author":{"login":"alice"}}"#;
+        let d: ItemDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(d.body, "Summary: fix the crash");
+        assert_eq!(d.author.login, "alice");
+        // Missing fields default to empty (no panic) — e.g. a deleted author.
+        let bare: ItemDetail = serde_json::from_str(r#"{"body":"x"}"#).unwrap();
+        assert_eq!(bare.body, "x");
+        assert!(bare.author.login.is_empty());
     }
 
     #[test]

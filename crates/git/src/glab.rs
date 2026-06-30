@@ -15,7 +15,10 @@
 //! MR, parse failure) resolves to a benign default, never an error.
 
 use crate::error::{GitError, Result};
-use crate::gh::{CreatePrOptions, ForgeAssignee, ForgeItem, ForgeLabel, ForgeListFilter, MergeMethod};
+use crate::gh::{
+    CreatePrOptions, ForgeAssignee, ForgeAuthor, ForgeItem, ForgeLabel, ForgeListFilter, ItemDetail,
+    MergeMethod,
+};
 use oximux_core::PrState;
 use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
@@ -238,6 +241,53 @@ pub async fn mr_merge(cwd: impl AsRef<Path>, method: MergeMethod) -> Result<()> 
         });
     }
     Ok(())
+}
+
+/// Body + author of one issue/MR — `glab issue|mr view N -F json`. GitLab
+/// spells the body `description` and the author `author.username`, mapped onto
+/// the shared [`ItemDetail`]. Same lazy-on-open + graceful-`None` contract as
+/// [`crate::gh::item_detail`].
+pub async fn item_detail(
+    cwd: impl AsRef<Path>,
+    kind: oximux_core::ForgeRefKind,
+    number: u64,
+    repo: Option<&str>,
+) -> Option<ItemDetail> {
+    let subcommand = match kind {
+        oximux_core::ForgeRefKind::Issue => "issue",
+        oximux_core::ForgeRefKind::Pull => "mr",
+    };
+    let mut cmd = GlabCmd::new(cwd).args([subcommand, "view", &number.to_string(), "-F", "json"]);
+    if let Some(slug) = repo {
+        cmd = cmd.args(["-R", slug]);
+    }
+    let (ok, stdout, _) = cmd.run_raw().await.ok()?;
+    if !ok {
+        return None;
+    }
+    let gl: GitlabDetail = serde_json::from_str(stdout.trim()).ok()?;
+    Some(ItemDetail {
+        body: gl.description,
+        author: ForgeAuthor {
+            login: gl.author.username,
+        },
+    })
+}
+
+/// GitLab's issue/MR detail shape: `description` (not `body`) and an `author`
+/// keyed `username` (not `login`). Mapped onto the shared [`ItemDetail`].
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GitlabDetail {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    author: GitlabDetailAuthor,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GitlabDetailAuthor {
+    #[serde(default)]
+    username: String,
 }
 
 /// One issue/MR row as GitLab's `glab ... list -F json` reports it. GitLab's
