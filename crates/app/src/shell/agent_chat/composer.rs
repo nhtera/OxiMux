@@ -1,5 +1,5 @@
-//! The bottom composer row of the agent chat — a status line, the multi-line
-//! input, and a Send button — isolated into its OWN entity/view.
+//! The bottom composer row of the agent chat — a single-line input and a Send
+//! button — isolated into its OWN entity/view.
 //!
 //! Why a separate entity: a text input only repaints its typed characters when
 //! the view that OWNS it calls `cx.notify()` on each `Change` (gpui-component's
@@ -47,14 +47,17 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
-            // Multi-line field (so Enter is captured for send and long drafts
-            // wrap) but pinned to a fixed height at the render site — see the
-            // pill in `render`. `auto_grow`'s `max_rows > 1` keeps it multi-line
-            // without the fixed `multi_line`'s reserved 2-row scroll space (which
-            // shows a scrollbar even when empty).
-            InputState::new(window, cx)
-                .auto_grow(1, 8)
-                .placeholder("Message Claude…  (↵ to send)")
+            // SINGLE-LINE field: it self-sizes to one centered row at a stable
+            // height, so the pill never resizes when a message is sent. A
+            // multi-line / `auto_grow` field lays its element out at height:100%
+            // of the parent (a circular height in this custom pill) and
+            // top-aligns its content — after Enter clears the draft the caret
+            // drops to the bottom and the pill stretches into dead space. Enter
+            // still submits: the parent root `capture_action(InputEnter)`
+            // intercepts the field's Enter action (see `AgentChatView::render`).
+            // Long drafts scroll horizontally; multi-line-grow is future work and
+            // must first solve the circular-height embedding.
+            InputState::new(window, cx).placeholder("Message Claude…  (↵ to send)")
         });
         let sub = cx.subscribe(&input, |_this, _input, ev: &InputEvent, cx| {
             // Repaint ONLY the composer on edits — the transcript is untouched.
@@ -147,13 +150,11 @@ impl Render for ComposerView {
             .child(SharedString::from("↑"));
 
         // The pill: a rounded, focus-reactive frame holding the borderless input
-        // and, inline on the right, the send button. The input is given an
-        // EXPLICIT fixed height — the multi-line input element lays out at
-        // height:100% of its parent, so without a concrete height it stretches
-        // into dead space (auto-grow's content-height is circular in this
-        // embedding). A fixed height keeps the composer a stable, compact pill
-        // that never resizes when a message is sent; long drafts scroll inside
-        // it. `appearance(false)` drops the input's own box so it doesn't nest.
+        // and, inline on the right, the send button. The single-line input
+        // self-sizes to one centered row, so the row is vertically centered
+        // (`items_center`) and the pill keeps a stable, compact height that never
+        // resizes when a message is sent. `appearance(false)` drops the input's
+        // own box so it doesn't nest a second frame inside the pill.
         let pill = div()
             .flex()
             .flex_row()
@@ -170,7 +171,6 @@ impl Render for ComposerView {
                 div().flex_1().child(
                     Input::new(&self.input)
                         .appearance(false)
-                        .h(px(24.0))
                         .text_size(px(typo.t_body_md)),
                 ),
             )
