@@ -12,6 +12,7 @@ use std::path::Path;
 use gpui::{App, Entity, FocusHandle, Focusable};
 use oximux_editor::EditorView;
 
+use crate::shell::agent_chat::AgentChatView;
 use crate::shell::browser_view::BrowserView;
 use crate::shell::diff_view::DiffView;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
@@ -38,6 +39,11 @@ pub enum PaneContent {
     /// subsequent clicks. Not persisted across restarts — the nav re-opens
     /// it from scratch after a session restore.
     Tasks(Entity<TasksView>),
+    /// Structured Agent Chat leaf: a Claude Code session rendered as a chat
+    /// thread (bubbles / streaming / tool-call lines) over the `stream-json`
+    /// transport, distinct from the raw-PTY `Agent` terminal kind. Owns its own
+    /// headless subprocess (separate PID). No PTY, no relay.
+    AgentChat(Entity<AgentChatView>),
 }
 
 impl PaneContent {
@@ -53,6 +59,8 @@ impl PaneContent {
             Self::Diff(view) => view.read(cx).focus_handle(cx),
             Self::Browser(view) => view.read(cx).focus_handle(cx),
             Self::Tasks(view) => view.read(cx).focus_handle(cx),
+            // Focus the composer so keystrokes land in the draft immediately.
+            Self::AgentChat(view) => view.read(cx).composer_focus_handle(cx),
         }
     }
 
@@ -75,6 +83,9 @@ impl PaneContent {
             // handle); the pane anchor itself is never a focus target, so the
             // per-leaf bookkeeping reports `false` like the diff view.
             Self::Tasks(_) => false,
+            // The composer Input owns its own focus; the per-leaf bookkeeping
+            // reports `false` like the diff/tasks views.
+            Self::AgentChat(_) => false,
         }
     }
 
@@ -84,7 +95,11 @@ impl PaneContent {
 
     pub fn editor_path<'a>(&'a self, cx: &'a App) -> Option<&'a Path> {
         match self {
-            Self::Terminal(_) | Self::Diff(_) | Self::Browser(_) | Self::Tasks(_) => None,
+            Self::Terminal(_)
+            | Self::Diff(_)
+            | Self::Browser(_)
+            | Self::Tasks(_)
+            | Self::AgentChat(_) => None,
             Self::Editor(view) => Some(view.read(cx).file_path()),
         }
     }
@@ -96,7 +111,11 @@ impl PaneContent {
     pub fn terminal_active_view(&self) -> Option<&Entity<TerminalView>> {
         match self {
             Self::Terminal(tree) => tree.active_view(),
-            Self::Editor(_) | Self::Diff(_) | Self::Browser(_) | Self::Tasks(_) => None,
+            Self::Editor(_)
+            | Self::Diff(_)
+            | Self::Browser(_)
+            | Self::Tasks(_)
+            | Self::AgentChat(_) => None,
         }
     }
 }

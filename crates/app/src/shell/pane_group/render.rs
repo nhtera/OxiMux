@@ -145,6 +145,8 @@ impl Render for PaneGroup {
             // Tasks tab renders the TasksView entity directly — same pattern
             // as Diff/Browser: the view owns its own scroll and layout.
             PaneContent::Tasks(view) => view.clone().into_any_element(),
+            // Agent Chat renders its own transcript + composer, same pattern.
+            PaneContent::AgentChat(view) => view.clone().into_any_element(),
         });
 
         // Empty-pane placeholder: when the user closes the last tab of
@@ -214,6 +216,7 @@ impl Render for PaneGroup {
             .on_action(cx.listener(PaneGroup::on_mru_next))
             .on_action(cx.listener(PaneGroup::on_mru_prev))
             .on_action(cx.listener(PaneGroup::on_new_agent))
+            .on_action(cx.listener(PaneGroup::on_new_agent_chat))
             .on_action(cx.listener(PaneGroup::on_open_composer_bar))
             .on_action(cx.listener(PaneGroup::on_split_sub_pane_right))
             .on_action(cx.listener(PaneGroup::on_split_sub_pane_down))
@@ -383,6 +386,9 @@ enum PaneTabKindMarker {
     Browser,
     /// Tasks tab — list-tree glyph, no agent status badge.
     Tasks,
+    /// Agent Chat tab — message glyph, no agent status badge (status is shown
+    /// inline in the transcript, not on the chip).
+    AgentChat,
 }
 
 /// A recognized agent running inside a plain terminal tab, detected live from
@@ -458,6 +464,7 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         | PaneGroupTabKind::CombinedDiff { .. } => PaneTabKindMarker::Diff,
         PaneGroupTabKind::Browser { .. } => PaneTabKindMarker::Browser,
         PaneGroupTabKind::Tasks => PaneTabKindMarker::Tasks,
+        PaneGroupTabKind::AgentChat { .. } => PaneTabKindMarker::AgentChat,
     }
 }
 
@@ -1088,6 +1095,7 @@ fn render_tab_chip(
         PaneTabKindMarker::Terminal => "icons/square-terminal.svg",
         PaneTabKindMarker::Browser => "icons/globe.svg",
         PaneTabKindMarker::Tasks => "icons/list-tree.svg",
+        PaneTabKindMarker::AgentChat => "icons/sparkles.svg",
         PaneTabKindMarker::Agent(adapter_id) => agent_icon(adapter_id),
     };
     let icon_color = if is_active {
@@ -1660,6 +1668,9 @@ fn render_mru_hud(
             PaneGroupTabKind::Browser { .. } => "icons/globe.svg",
             // Tasks uses the list-tree glyph for the Ctrl+Tab switcher row.
             PaneGroupTabKind::Tasks => "icons/list-tree.svg",
+            // Agent Chat uses the sparkles glyph (AI convention), matching its
+            // tab chip in the Ctrl+Tab switcher.
+            PaneGroupTabKind::AgentChat { .. } => "icons/sparkles.svg",
             // Match the tab chip: brand the agent by its adapter glyph so
             // the Ctrl+Tab switcher reads the same as the strip.
             PaneGroupTabKind::Agent { adapter_id, .. } => agent_icon(adapter_id),

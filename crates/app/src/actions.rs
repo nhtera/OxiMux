@@ -470,6 +470,11 @@ actions!(
         /// paths converge on the same surface. A second dispatch while the
         /// popover is open closes it (toggle).
         NewAgent,
+        /// Open a new structured Agent Chat tab (Claude `stream-json`) in the
+        /// active pane group. Distinct from `NewAgent` (a raw-PTY terminal
+        /// agent): this renders the session as a chat thread. Bound to
+        /// Cmd+Shift+C.
+        NewAgentChat,
         /// Open the project picker modal (Cmd+O). Shows recent projects +
         /// "Open Folder…" affordance backed by a native NSOpenPanel.
         OpenProjectPicker,

@@ -411,11 +411,14 @@ impl ProjectPanes {
                     // persisted. Diff/commit regenerate from current git state;
                     // Tasks reopens from the nav rail after restore.
                     // Skip the slot so the persisted tab list stays compact.
+                    // AgentChat transcript persistence + `--resume` is a
+                    // follow-up; until then a chat tab is not restored.
                     PaneGroupTabKind::Diff { .. }
                     | PaneGroupTabKind::Commit { .. }
                     | PaneGroupTabKind::BranchFile { .. }
                     | PaneGroupTabKind::CombinedDiff { .. }
-                    | PaneGroupTabKind::Tasks => continue,
+                    | PaneGroupTabKind::Tasks
+                    | PaneGroupTabKind::AgentChat { .. } => continue,
                     // Browser tabs persist their LIVE url (read from the
                     // BrowserView) so a restored tab reopens where the user
                     // left off, including link-click navigations.

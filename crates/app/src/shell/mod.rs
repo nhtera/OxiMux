@@ -4,6 +4,7 @@
 //! + Typography` and return an `impl IntoElement` (RenderOnce). No state.
 
 // Concern folders — one folder per cockpit domain (views + their helpers).
+pub mod agent_chat;
 pub mod agent_ui;
 pub mod agents_dashboard;
 pub mod browser_view;

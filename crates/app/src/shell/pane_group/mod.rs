@@ -111,6 +111,13 @@ pub enum PaneGroupTabKind {
     /// Tasks tab per workspace session; a second click re-activates it.
     /// Not persisted — the nav re-opens it after a session restore.
     Tasks,
+    /// Structured Agent Chat session (Claude `stream-json`). Backed by its own
+    /// headless subprocess; `cwd`/`model` are the launch context (retained for a
+    /// future `--resume`). Sibling of `Agent` but rendered as chat, not a PTY.
+    AgentChat {
+        cwd: PathBuf,
+        model: Option<String>,
+    },
 }
 
 pub struct PaneGroupTab {

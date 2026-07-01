@@ -14,7 +14,7 @@ use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseGroup, CloseTab,
     DismissOverlay, FindNextMatch, FindPrevMatch, FocusNextPane, FocusNextSubPane, FocusPrevPane,
     FocusPrevSubPane, MruNext, MruPrev, NavWorkspaceBack, NavWorkspaceForward, NewAgent,
-    NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
+    NewAgentChat, NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
     OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
     ReloadCustomCommands, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
@@ -53,6 +53,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     entry!("open_project_picker", "Open project", Global, "cmd-o", OpenProjectPicker),
     entry!("open_workspace_create", "New workspace", Global, "cmd-shift-n", OpenWorkspaceCreate),
     entry!("new_agent", "New agent", Global, "cmd-shift-a", NewAgent),
+    entry!("new_agent_chat", "New agent chat", Global, "cmd-shift-c", NewAgentChat),
     entry!(
         "toggle_floating_terminal",
         "Toggle floating terminal",

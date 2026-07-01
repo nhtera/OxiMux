@@ -23,7 +23,8 @@ impl PaneGroup {
             | PaneGroupTabKind::BranchFile { .. }
             | PaneGroupTabKind::CombinedDiff { .. }
             | PaneGroupTabKind::Browser { .. }
-            | PaneGroupTabKind::Tasks => false,
+            | PaneGroupTabKind::Tasks
+            | PaneGroupTabKind::AgentChat { .. } => false,
         }) else {
             return false;
         };
@@ -75,7 +76,8 @@ impl PaneGroup {
             PaneContent::Terminal(_)
             | PaneContent::Diff(_)
             | PaneContent::Browser(_)
-            | PaneContent::Tasks(_) => None,
+            | PaneContent::Tasks(_)
+            | PaneContent::AgentChat(_) => None,
         }
     }
 
@@ -103,7 +105,8 @@ impl PaneGroup {
                 PaneContent::Editor(_)
                 | PaneContent::Diff(_)
                 | PaneContent::Browser(_)
-                | PaneContent::Tasks(_) => {
+                | PaneContent::Tasks(_)
+                | PaneContent::AgentChat(_) => {
                     out.push(Vec::new())
                 }
             }
@@ -121,7 +124,8 @@ impl PaneGroup {
                 PaneContent::Editor(_)
                 | PaneContent::Diff(_)
                 | PaneContent::Browser(_)
-                | PaneContent::Tasks(_) => {
+                | PaneContent::Tasks(_)
+                | PaneContent::AgentChat(_) => {
                     out.push(None)
                 }
             }
@@ -428,6 +432,19 @@ impl PaneGroup {
         // Keyboard path — no cursor x available. `x: None` tells
         // `WorkspaceRoot` to use the post-rail fallback anchor.
         window.dispatch_action(Box::new(RequestOpenAdapterPicker { x: None }), cx);
+    }
+
+    /// Open a structured Agent Chat tab in this group, rooted at the group's
+    /// cwd with the default model. The chat spawns its own headless `claude`
+    /// (separate PID) — the raw-PTY agent path is untouched.
+    pub(crate) fn on_new_agent_chat(
+        &mut self,
+        _: &crate::actions::NewAgentChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self.cwd.clone();
+        self.open_agent_chat_tab(cwd, None, window, cx);
     }
 
     /// Toggle the prompt composer over the active agent tab. A second press

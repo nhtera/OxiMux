@@ -555,7 +555,8 @@ impl PaneGroup {
             PaneContent::Editor(_)
             | PaneContent::Diff(_)
             | PaneContent::Browser(_)
-            | PaneContent::Tasks(_) => false,
+            | PaneContent::Tasks(_)
+            | PaneContent::AgentChat(_) => false,
         })
     }
 

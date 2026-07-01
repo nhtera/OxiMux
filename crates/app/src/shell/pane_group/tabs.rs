@@ -722,6 +722,64 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open a new Agent Chat tab in this group, backed by its own headless
+    /// `claude` subprocess (separate PID). Not a singleton — each chat is its
+    /// own session, so a second call opens a second chat. The label is a
+    /// running `Chat N` count over the group's existing chat tabs.
+    pub fn open_agent_chat_tab(
+        &mut self,
+        cwd: PathBuf,
+        model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cwd_for_view = cwd.clone();
+        let model_for_view = model.clone();
+        let view = cx.new(|cx| {
+            crate::shell::agent_chat::AgentChatView::new(
+                cwd_for_view,
+                model_for_view,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let n = self
+            .tabs
+            .iter()
+            .filter(|t| matches!(t.kind, PaneGroupTabKind::AgentChat { .. }))
+            .count()
+            + 1;
+        let tab = PaneGroupTab {
+            label: SharedString::from(format!("Chat {n}")),
+            content: PaneContent::AgentChat(view),
+            kind: PaneGroupTabKind::AgentChat { cwd, model },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     /// Open or activate a commit-detail tab. Dedup key is the full
     /// SHA — clicking the same commit row twice activates the
     /// existing tab. `short_oid` and `subject` are display-only and
@@ -1071,6 +1129,8 @@ impl PaneGroup {
             PaneContent::Browser(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
             // Tasks tabs notify the host on list data / loading changes.
             PaneContent::Tasks(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
+            // Agent Chat tabs notify the host on transcript/streaming changes.
+            PaneContent::AgentChat(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
         };
         self.tabs.push(tab);
         self.tab_order.push(self.tabs.len() - 1);
