@@ -70,6 +70,33 @@ impl ProjectPanes {
         }
     }
 
+    /// Open a new Agent Chat tab in the active group (or the first group if the
+    /// active id is stale). Not a singleton — each call opens a fresh chat
+    /// session with its own headless subprocess. Routed to by the launch picker
+    /// when `default_open_mode` is `Chat` and the picked adapter is Claude.
+    pub fn open_agent_chat_tab_in_active_group(
+        &mut self,
+        cwd: PathBuf,
+        model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied());
+        let Some(target_id) = target_id else {
+            return;
+        };
+        self.set_active_group(target_id, window, cx);
+        if let Some(target) = self.groups.get(&target_id).cloned() {
+            target.update(cx, |g, cx| {
+                g.open_agent_chat_tab(cwd, model, window, cx);
+            });
+        }
+    }
+
     /// Close the Tasks tab in the active group, if present. Used after a
     /// workspace is created from the Tasks page so the foreground leaves the
     /// issue browser and falls back to the group's prior tab.

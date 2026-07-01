@@ -660,18 +660,35 @@ impl WorkspaceRoot {
                             std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
-                    // One-click launch: always the agent's default settings.
-                    this.spawn_agent_tab(
-                        kind,
-                        id,
-                        cwd,
-                        None,
-                        None,
-                        None,
-                        oximux_core::SessionResumption::None,
-                        window,
-                        cx,
-                    )
+                    // When the user set "open new agents as Chat" and picked
+                    // Claude, route to the structured chat view instead of the
+                    // raw-PTY agent. Every other adapter (and Terminal mode)
+                    // takes the classic path unchanged.
+                    let open_chat = id == "claude-code"
+                        && cx
+                            .try_global::<oximux_settings::AgentLaunchSettings>()
+                            .map(|s| s.default_open_mode == oximux_settings::OpenMode::Chat)
+                            .unwrap_or(false);
+                    if open_chat {
+                        if let Some(panes) = this.active_project_panes() {
+                            panes.update(cx, |p, cx| {
+                                p.open_agent_chat_tab_in_active_group(cwd, None, window, cx);
+                            });
+                        }
+                    } else {
+                        // One-click launch: always the agent's default settings.
+                        this.spawn_agent_tab(
+                            kind,
+                            id,
+                            cwd,
+                            None,
+                            None,
+                            None,
+                            oximux_core::SessionResumption::None,
+                            window,
+                            cx,
+                        )
+                    }
                 }
             });
         });

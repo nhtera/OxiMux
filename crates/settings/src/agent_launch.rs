@@ -40,6 +40,17 @@ pub struct PerAgentLaunch {
     pub disabled: bool,
 }
 
+/// How a new agent launch opens by default. `Terminal` = the classic raw-PTY
+/// agent; `Chat` opens Claude as a structured chat thread (stream-json). Chat
+/// currently applies to Claude only — other adapters always open as terminals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenMode {
+    #[default]
+    Terminal,
+    Chat,
+}
+
 /// The skip-permissions ("YOLO") flag seeded for each built-in agent on a
 /// fresh install, so a one-click launch starts the agent in full-autonomy
 /// mode out of the box (matching the reference cockpit's default). The user
@@ -75,6 +86,11 @@ pub struct AgentLaunchSettings {
     /// the container-level `#[serde(default)]`, so the feature lights up on
     /// upgrade without a manual toggle.
     pub status_hooks_enabled: bool,
+    /// Default surface a new agent launch opens as (`Terminal` or `Chat`).
+    /// `Chat` reroutes a Claude launch to the structured chat view; every other
+    /// adapter is unaffected. Serde-default `Terminal`, so existing configs and
+    /// the classic new-agent flow are unchanged on upgrade.
+    pub default_open_mode: OpenMode,
     /// Per-agent overrides keyed by adapter id.
     pub agents: BTreeMap<String, PerAgentLaunch>,
 }
@@ -87,6 +103,7 @@ impl Default for AgentLaunchSettings {
             // On by default — see the field docs. An explicit `false` in the
             // TOML still wins (a present value overrides this default).
             status_hooks_enabled: true,
+            default_open_mode: OpenMode::Terminal,
             agents: BTreeMap::new(),
         }
     }
@@ -273,6 +290,20 @@ model = "opus"
         let parsed =
             AgentLaunchSettings::from_toml_str(&on.to_toml_string()).expect("round-trip");
         assert!(parsed.status_hooks_enabled);
+    }
+
+    #[test]
+    fn default_open_mode_defaults_terminal_and_round_trips() {
+        // Absent key → Terminal (the classic new-agent flow is unchanged).
+        let s = AgentLaunchSettings::from_toml_str("").expect("empty parses");
+        assert_eq!(s.default_open_mode, OpenMode::Terminal, "missing key → Terminal");
+        // Explicit chat is parsed (lowercase per serde rename) and preserved.
+        let chat = AgentLaunchSettings::from_toml_str("default_open_mode = \"chat\"\n")
+            .expect("explicit chat parses");
+        assert_eq!(chat.default_open_mode, OpenMode::Chat);
+        // Round-trips through TOML.
+        let parsed = AgentLaunchSettings::from_toml_str(&chat.to_toml_string()).expect("round-trip");
+        assert_eq!(parsed.default_open_mode, OpenMode::Chat);
     }
 
     #[test]

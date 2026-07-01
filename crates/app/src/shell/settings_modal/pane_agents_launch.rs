@@ -8,7 +8,7 @@ use gpui::{
     AnyElement, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     Styled, Window, div, prelude::FluentBuilder, px, svg,
 };
-use oximux_settings::{Density, Theme, Typography, split_args};
+use oximux_settings::{Density, OpenMode, Theme, Typography, split_args};
 
 use super::SettingsModal;
 use super::controls::{toggle_chip, toggle_switch, value_chip};
@@ -100,6 +100,11 @@ pub(super) fn entries(
         status_hooks_toggle(modal, theme, cx),
     ));
     out.push(entry(
+        "Open new agents as chat",
+        "Open Claude launches as a structured chat thread instead of a terminal.",
+        default_open_mode_toggle(modal, theme, cx),
+    ));
+    out.push(entry(
         "Default agent",
         "Surfaced first in the launcher.",
         default_agent_control(modal, theme, density, typography, cx),
@@ -131,6 +136,13 @@ pub(super) fn render_launch_card(
         "Status hooks",
         "Show each Claude Code agent's prompt, live tool, and status on the rail and dashboard. On by default.",
         status_hooks_toggle(modal, theme, cx),
+        theme,
+        typography,
+    ));
+    rows.push(setting_row_desc(
+        "Open new agents as chat",
+        "Open a new Claude launch as a structured chat thread instead of a raw terminal. Other agents always open as terminals.",
+        default_open_mode_toggle(modal, theme, cx),
         theme,
         typography,
     ));
@@ -208,6 +220,29 @@ fn status_hooks_toggle(
         theme,
         |this, _w, cx| {
             this.agent_launch.status_hooks_enabled = !this.agent_launch.status_hooks_enabled;
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    )
+}
+
+/// The default-open-mode toggle: when on, a new Claude launch opens as a
+/// structured chat thread instead of a raw-PTY terminal. Global and Claude-only
+/// (other adapters always open as terminals).
+fn default_open_mode_toggle(
+    modal: &SettingsModal,
+    theme: Theme,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    toggle_switch(
+        "launch-open-mode-chat",
+        modal.agent_launch.default_open_mode == OpenMode::Chat,
+        theme,
+        |this, _w, cx| {
+            this.agent_launch.default_open_mode = match this.agent_launch.default_open_mode {
+                OpenMode::Chat => OpenMode::Terminal,
+                OpenMode::Terminal => OpenMode::Chat,
+            };
             this.persist_agent_launch(cx);
         },
         cx,
