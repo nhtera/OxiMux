@@ -12,7 +12,7 @@
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Subscription, Window,
-    div, px,
+    div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use oximux_settings::{Density, Theme, Typography};
@@ -47,17 +47,20 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
-            // Auto-grow (not fixed multi-line): starts as a single row and grows
-            // with the draft up to 8 rows before scrolling. Fixed `multi_line`
-            // reserves 2 rows of scroll space, which shows a scrollbar even on an
-            // empty/one-line prompt. `max_rows > 1` keeps it a multi-line field.
+            // Multi-line field (so Enter is captured for send and long drafts
+            // wrap) but pinned to a fixed height at the render site — see the
+            // pill in `render`. `auto_grow`'s `max_rows > 1` keeps it multi-line
+            // without the fixed `multi_line`'s reserved 2-row scroll space (which
+            // shows a scrollbar even when empty).
             InputState::new(window, cx)
                 .auto_grow(1, 8)
                 .placeholder("Message Claude…  (↵ to send)")
         });
         let sub = cx.subscribe(&input, |_this, _input, ev: &InputEvent, cx| {
             // Repaint ONLY the composer on edits — the transcript is untouched.
-            if matches!(ev, InputEvent::Change) {
+            // Focus/Blur repaint too so the pill's border can track focus (a
+            // brighter ring while typing), like a native chat field.
+            if matches!(ev, InputEvent::Change | InputEvent::Focus | InputEvent::Blur) {
                 cx.notify();
             }
         });
@@ -102,26 +105,22 @@ impl ComposerView {
 }
 
 impl Render for ComposerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let density = self.density;
         let typo = &self.typography;
         let can_send = !self.disconnected;
-        let status = if self.disconnected {
-            "Disconnected — the agent process exited."
-        } else if self.turn_active {
-            "Claude is working…"
-        } else {
-            "Press ↵ to send · or click Send"
-        };
-        let status_color = if self.disconnected {
-            theme.status_error
-        } else {
-            theme.fg_subtle
-        };
-        // Filled, unmissable Send button. Keyboard send (↵) can be swallowed by
-        // some input methods (e.g. Vietnamese Telex eats Enter before the app
-        // sees it), so a reliable mouse target is the primary send affordance.
+        let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+
+        // No status line here: the composer keeps a FIXED footprint so sending
+        // (turn start/end) never resizes it. Live turn/disconnect state is shown
+        // in the transcript instead — the way a native chat surfaces it —
+        // leaving the composer a calm, stable pill.
+
+        // Circular ↑ send button pinned to the bottom-right of the pill. A
+        // mouse target is the primary send affordance because keyboard ↵ can be
+        // swallowed by some input methods (e.g. Vietnamese Telex eats Enter
+        // before the app sees it).
         let (send_bg, send_fg) = if can_send {
             (theme.status_info, theme.bg_base)
         } else {
@@ -129,49 +128,71 @@ impl Render for ComposerView {
         };
         let send_button = div()
             .id("agent-chat-send")
+            .size(px(28.0))
+            .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .px(px(18.0))
-            .py(px(8.0))
-            .rounded(px(density.r_chip))
+            .rounded_full()
             .bg(send_bg)
             .text_color(send_fg)
-            .text_size(px(typo.t_body_sm))
-            .cursor_pointer()
+            .text_size(px(typo.t_body_md))
+            .when(can_send, |s| {
+                s.cursor_pointer().hover(|s| s.opacity(0.85))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _e, window, cx| this.submit(window, cx)),
             )
-            .child(SharedString::from("Send"));
+            .child(SharedString::from("↑"));
+
+        // The pill: a rounded, focus-reactive frame holding the borderless input
+        // and, inline on the right, the send button. The input is given an
+        // EXPLICIT fixed height — the multi-line input element lays out at
+        // height:100% of its parent, so without a concrete height it stretches
+        // into dead space (auto-grow's content-height is circular in this
+        // embedding). A fixed height keeps the composer a stable, compact pill
+        // that never resizes when a message is sent; long drafts scroll inside
+        // it. `appearance(false)` drops the input's own box so it doesn't nest.
+        let pill = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline))
+            .w_full()
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(if focused { theme.focus_ring } else { theme.border_input })
+            .bg(theme.bg_panel_alt)
+            .px(px(density.pad_panel))
+            .py(px(density.pad_row))
+            .child(
+                div().flex_1().child(
+                    Input::new(&self.input)
+                        .appearance(false)
+                        .h(px(24.0))
+                        .text_size(px(typo.t_body_md)),
+                ),
+            )
+            .child(send_button);
 
         div()
             .flex()
             .flex_col()
+            .items_center()
             .w_full()
             .border_t_1()
             .border_color(theme.border_inactive)
             .p(px(density.pad_panel))
-            .gap(px(density.gap_inline))
             .child(
-                div()
-                    .text_size(px(typo.t_label_xs))
-                    .text_color(status_color)
-                    .child(SharedString::from(status.to_string())),
-            )
-            .child(
+                // Match the transcript's centered reading column so the pill
+                // lines up with the messages above it on wide windows.
                 div()
                     .flex()
-                    .flex_row()
-                    .items_end()
-                    .gap(px(density.gap_inline))
+                    .flex_col()
                     .w_full()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&self.input).text_size(px(typo.t_body_md))),
-                    )
-                    .child(send_button),
+                    .max_w(px(super::CONTENT_MAX_W))
+                    .child(pill),
             )
     }
 }

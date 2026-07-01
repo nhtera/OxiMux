@@ -20,9 +20,15 @@ pub(super) fn role_caption(label: &str, color: Hsla, typo: &Typography) -> impl 
         .child(SharedString::from(label.to_string()))
 }
 
-/// The user's prompt: plain wrapped text in a subtly elevated card. No
-/// `nowrap`/`truncate` (which render blank directly inside a flex column) — the
-/// bubble is width-bounded so the text wraps naturally.
+/// Max width of a user bubble — a prompt longer than this wraps into a column
+/// rather than stretching the full measure, keeping the right-aligned shape.
+const USER_BUBBLE_MAX_W: f32 = 520.0;
+
+/// The user's prompt as a right-aligned, filled bubble (Claude-Desktop style):
+/// visually distinct from the assistant's plain left-aligned text, so the thread
+/// reads as an asymmetric back-and-forth. `bg_overlay` (the lightest surface)
+/// reads as "my message" lifted off the panel. No `nowrap`/`truncate` (which
+/// render blank in a flex column) — the width cap lets the text wrap naturally.
 pub(super) fn user_body(
     text: &str,
     theme: Theme,
@@ -30,16 +36,21 @@ pub(super) fn user_body(
     typo: &Typography,
 ) -> AnyElement {
     div()
+        .flex()
+        .flex_row()
+        .justify_end()
         .w_full()
-        .rounded(px(density.r_card))
-        .border_1()
-        .border_color(theme.border_inactive)
-        .bg(theme.bg_panel_alt)
-        .px(px(density.pad_panel))
-        .py(px(6.0))
-        .text_size(px(typo.t_body_md))
-        .text_color(theme.fg_base)
-        .child(SharedString::from(text.to_string()))
+        .child(
+            div()
+                .max_w(px(USER_BUBBLE_MAX_W))
+                .rounded(px(density.r_card))
+                .bg(theme.bg_overlay)
+                .px(px(density.pad_panel))
+                .py(px(6.0))
+                .text_size(px(typo.t_body_md))
+                .text_color(theme.fg_base)
+                .child(SharedString::from(text.to_string())),
+        )
         .into_any_element()
 }
 

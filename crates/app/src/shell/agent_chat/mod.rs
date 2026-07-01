@@ -18,14 +18,22 @@ mod tool_card;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, WeakEntity, Window, div, px,
+    Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Transformation,
+    WeakEntity, Window, div, percentage, px,
 };
+use gpui_component::Icon;
 use gpui_component::input::Enter as InputEnter;
+
+/// Max width of the reading column (transcript + composer). Wider windows keep
+/// the conversation centered in a comfortable measure rather than stretching
+/// text edge-to-edge — the calm, focused feel of a dedicated chat surface.
+pub(super) const CONTENT_MAX_W: f32 = 720.0;
 
 use composer::{ComposerEvent, ComposerView};
 use oximux_agents::thread::{
@@ -314,50 +322,55 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// The scrollable transcript column.
+    /// The scrollable transcript column. Entries stack in a centered reading
+    /// column ([`CONTENT_MAX_W`]) so wide windows don't stretch text edge-to-
+    /// edge; the outer element only scrolls and centers.
     fn render_transcript(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let density = self.density;
         let typo = self.typography.clone();
-        let mut list = div()
+        let scroll = div()
             .id("agent-chat-list")
             .flex()
             .flex_col()
+            .items_center()
             .w_full()
             .flex_1()
-            .gap(px(density.gap_inline * 1.5))
             .px(px(density.pad_panel))
             .py(px(density.pad_panel))
             .overflow_y_scroll()
             .track_scroll(&self.list_scroll);
 
         if self.thread.entries.is_empty() {
-            return list.child(self.render_empty_hint(&theme, &typo)).into_any_element();
+            return scroll.child(self.render_empty_hint(&theme, &typo)).into_any_element();
         }
+
+        // Turns breathe a little more than inline content — a chat rhythm.
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .max_w(px(CONTENT_MAX_W))
+            .gap(px(density.pad_panel * 2.0));
 
         for (idx, entry) in self.thread.entries.iter().enumerate() {
             match entry {
                 ThreadEntry::User(text) => {
-                    list = list.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .w_full()
-                            .child(bubble::role_caption("You", theme.fg_subtle, &typo))
-                            .child(bubble::user_body(text, theme, density, &typo)),
-                    );
+                    // No "You" caption — the right-aligned bubble is the signal.
+                    content = content.child(bubble::user_body(text, theme, density, &typo));
                 }
                 ThreadEntry::Assistant(msg) => {
                     if msg.is_empty() {
                         continue;
                     }
+                    let group = SharedString::from(format!("chat-asst-{idx}"));
                     let mut block = div()
+                        .group(group.clone())
                         .flex()
                         .flex_col()
                         .gap(px(4.0))
                         .w_full()
-                        .child(bubble::role_caption("Claude", theme.fg_muted, &typo));
+                        .child(assistant_header(group, &msg.text, theme, &typo, cx));
                     if !msg.thinking.is_empty() {
                         let expanded = self.expanded_thinking.contains(&idx);
                         block = block.child(thinking_block(
@@ -367,34 +380,68 @@ impl AgentChatView {
                     if !msg.text.is_empty() {
                         block = block.child(bubble::assistant_body(idx, &msg.text, &typo));
                     }
-                    list = list.child(block);
+                    content = content.child(block);
                 }
                 ThreadEntry::ToolCall(tc) => {
                     let expanded = self.expanded_tool_calls.contains(&tc.id);
-                    list = list.child(tool_card::render_tool_card(
+                    content = content.child(tool_card::render_tool_card(
                         tc, expanded, theme, density, &typo, cx,
                     ));
                 }
             }
         }
-        list.into_any_element()
+        // Live turn / disconnect state lives at the tail of the transcript (like
+        // a native chat), NOT above the composer — so it never resizes the input.
+        if self.disconnected {
+            content = content.child(
+                div()
+                    .w_full()
+                    .text_size(px(typo.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child(SharedString::from("Agent process exited.")),
+            );
+        } else if self.thread.turn_active {
+            content = content.child(working_indicator(theme, &typo));
+        }
+        scroll.child(content).into_any_element()
     }
 
     fn render_empty_hint(&self, theme: &Theme, typo: &Typography) -> AnyElement {
-        let msg = if self.disconnected {
-            self.thread.last_error.as_deref().unwrap_or("Agent unavailable.")
+        // Disconnected → surface the error plainly. Otherwise a calm, centered
+        // greeting (title + hint) rather than a lone sentence.
+        let (title, subtitle, title_color) = if self.disconnected {
+            (
+                "Agent unavailable",
+                self.thread.last_error.as_deref().unwrap_or("The agent process exited."),
+                theme.status_error,
+            )
         } else {
-            "Send a message to start the conversation."
+            (
+                "Start a conversation",
+                "Ask Claude to explain code, make edits, or run commands.",
+                theme.fg_muted,
+            )
         };
         div()
             .flex()
+            .flex_col()
             .flex_1()
             .items_center()
             .justify_center()
+            .gap(px(4.0))
             .w_full()
-            .text_size(px(typo.t_body_sm))
-            .text_color(theme.fg_subtle)
-            .child(SharedString::from(msg.to_string()))
+            .child(
+                div()
+                    .text_size(px(typo.t_body_lg))
+                    .text_color(title_color)
+                    .child(SharedString::from(title)),
+            )
+            .child(
+                div()
+                    .text_size(px(typo.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child(SharedString::from(subtitle.to_string())),
+            )
             .into_any_element()
     }
 
@@ -453,6 +500,80 @@ impl Render for AgentChatView {
             .child(transcript)
             .child(self.composer.clone())
     }
+}
+
+/// A live "Claude is working…" row shown at the tail of the transcript while a
+/// turn streams — a stepped rotating spinner (the reused rail cadence: 12
+/// mechanical ticks/sec) plus muted text. Keeping it here rather than above the
+/// composer means the input never resizes when a turn starts or ends.
+fn working_indicator(theme: Theme, typo: &Typography) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .w_full()
+        .child(
+            Icon::default()
+                .path("icons/loader-circle.svg")
+                .size(px(13.0))
+                .text_color(theme.fg_muted)
+                .with_animation(
+                    SharedString::from("chat-working-spinner"),
+                    Animation::new(Duration::from_secs(1)).repeat(),
+                    |icon, delta| {
+                        let stepped = (delta * 12.0).floor() / 12.0;
+                        icon.transform(Transformation::rotate(percentage(stepped)))
+                    },
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(SharedString::from("Claude is working…")),
+        )
+        .into_any_element()
+}
+
+/// The assistant caption row: the "Claude" label on the left and a Copy
+/// affordance on the right that's revealed while the message block is hovered
+/// (`group`) — the copy-on-hover pattern of a native chat. Clicking copies the
+/// reply's raw markdown to the clipboard. Built here (not `bubble`) because the
+/// click needs a `Context` listener.
+fn assistant_header(
+    group: SharedString,
+    text: &str,
+    theme: Theme,
+    typo: &Typography,
+    cx: &mut Context<AgentChatView>,
+) -> AnyElement {
+    let copy_text = text.to_string();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .child(bubble::role_caption("Claude", theme.fg_muted, typo))
+        .child(
+            div()
+                .id(SharedString::from(format!("copy-{group}")))
+                .flex_none()
+                .text_size(px(typo.t_label_xs))
+                .text_color(theme.fg_subtle)
+                .cursor_pointer()
+                // Reserve its slot (invisible, not absent) so the caption never
+                // shifts; reveal on hover of the surrounding message block.
+                .invisible()
+                .group_hover(group, |s| s.visible())
+                .hover(|s| s.text_color(theme.fg_base))
+                .on_click(cx.listener(move |_this, _e, _w, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                }))
+                .child(SharedString::from("Copy")),
+        )
+        .into_any_element()
 }
 
 /// A collapsible thinking disclosure: a clickable header (chevron + "Thinking")
