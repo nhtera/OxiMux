@@ -49,7 +49,10 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
             detail: str_field(v, "status_detail"),
             category: str_field(v, "status_category"),
         }],
-        // hook_started / hook_response / status → noise.
+        // hook_started / hook_response → noise.
+        // TODO(chat-ui polish): `system/status` (spinner text) and init's
+        // tools/mcp_servers/slash_commands/agents/cwd are dropped for now;
+        // surface them when the spinner + session-detail UI is built.
         _ => Vec::new(),
     }
 }

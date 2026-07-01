@@ -2,9 +2,14 @@
 //!
 //! Mirrors the ACP `ToolCall`/`ToolCallStatus` shape (so a future ACP backend
 //! slots in without churn) but stays gpui-free: this crate is pure domain
-//! logic, the GPUI entity wrapper lives in the app crate. A tool call is a
-//! mutable record that streams from `Pending` → (`WaitingForConfirmation`) →
-//! `InProgress` → `Completed`/`Failed`/`Rejected`.
+//! logic, the GPUI entity wrapper lives in the app crate.
+//!
+//! A stream-json tool call is constructed directly as `InProgress` (the model
+//! already emitted the `tool_use` block, so it is being attempted); if approval
+//! is required it moves to `WaitingForConfirmation`, then to `Completed`/
+//! `Failed` on the tool result, or `Rejected` on deny. `Pending` is reserved
+//! for ACP parity (an announced-but-not-yet-started call) and is not
+//! constructed by the stream-json backend.
 
 use serde_json::Value;
 

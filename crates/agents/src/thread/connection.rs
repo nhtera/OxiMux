@@ -1,0 +1,184 @@
+//! The `AgentConnection` trait + stdin serializers + a test stub.
+//!
+//! `AgentConnection` is the transport-agnostic seam: the app holds a
+//! `Box<dyn AgentConnection>` and a `Receiver<ThreadEvent>`, drains events into
+//! a `ChatThread`, and calls back on user actions (send a prompt, answer a
+//! permission). The Claude `stream-json` impl lives in `claude_stream_json`; a
+//! future ACP impl would satisfy the same trait.
+
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use serde_json::{json, Value};
+
+use super::event::ThreadEvent;
+use super::tool_call::PermissionDecision;
+
+/// The user-facing control surface for one chat session.
+pub trait AgentConnection: Send {
+    /// Send a user prompt (a new turn, or a mid-turn steer).
+    fn send_user_message(&self, text: &str) -> Result<()>;
+    /// Answer a pending permission request by its `request_id`.
+    fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()>;
+    /// Terminate the session and its process.
+    fn shutdown(&self);
+}
+
+/// Build the stdin JSON for a user message (stream-json input format).
+pub fn user_message_json(text: &str) -> Value {
+    json!({"type": "user", "message": {"role": "user", "content": text}})
+}
+
+/// Build the stdin `control_response` JSON answering a `can_use_tool` request.
+///
+/// Fail-closed contract (verified in the Phase-1 spike):
+/// - **allow** MUST echo `updatedInput` — an allow without it is treated as
+///   malformed by the CLI and the tool is effectively denied.
+/// - **deny** carries a `message` shown to the model.
+///
+/// Applying a suggestion (e.g. "always accept edits this session") is not yet
+/// wired to its own wire field — `AllowWithSuggestion` is sent as a plain
+/// this-once allow for now; suggestion application is a later refinement once
+/// its wire shape is verified live.
+pub fn control_response_json(request_id: &str, decision: &PermissionDecision) -> Value {
+    let response = match decision {
+        PermissionDecision::Allow { updated_input }
+        | PermissionDecision::AllowWithSuggestion { updated_input, .. } => {
+            json!({"behavior": "allow", "updatedInput": updated_input})
+        }
+        PermissionDecision::Deny { message } => {
+            json!({"behavior": "deny", "message": message})
+        }
+    };
+    json!({"type": "control_response", "response": {
+        "subtype": "success", "request_id": request_id, "response": response}})
+}
+
+/// A test double: records everything sent to the "agent" and lets a test inject
+/// `ThreadEvent`s (via the returned `Sender`) as if the agent produced them.
+/// Used to exercise the app-facing loop (drain events → `ChatThread`; user
+/// actions → recorded stdin) without spawning a real subprocess.
+#[derive(Clone, Default)]
+pub struct StubConnection {
+    sent: Arc<Mutex<Vec<Value>>>,
+}
+
+impl StubConnection {
+    /// Returns the stub, the event receiver the app would drain, and the
+    /// sender a test uses to inject agent events.
+    pub fn new() -> (Self, Receiver<ThreadEvent>, Sender<ThreadEvent>) {
+        let (tx, rx) = mpsc::channel();
+        (Self::default(), rx, tx)
+    }
+
+    /// The JSON payloads that were written to the agent's stdin, in order.
+    pub fn sent(&self) -> Vec<Value> {
+        self.sent.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, v: Value) {
+        if let Ok(mut g) = self.sent.lock() {
+            g.push(v);
+        }
+    }
+}
+
+impl AgentConnection for StubConnection {
+    fn send_user_message(&self, text: &str) -> Result<()> {
+        self.record(user_message_json(text));
+        Ok(())
+    }
+    fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
+        self.record(control_response_json(request_id, &decision));
+        Ok(())
+    }
+    fn shutdown(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::state::ChatThread;
+    use crate::thread::tool_call::PermissionSuggestion;
+
+    #[test]
+    fn user_message_json_shape() {
+        assert_eq!(
+            user_message_json("hi"),
+            json!({"type":"user","message":{"role":"user","content":"hi"}})
+        );
+    }
+
+    #[test]
+    fn allow_response_carries_updated_input() {
+        let d = PermissionDecision::Allow { updated_input: json!({"file_path": "a"}) };
+        let v = control_response_json("rid-1", &d);
+        assert_eq!(v["type"], "control_response");
+        assert_eq!(v["response"]["subtype"], "success");
+        assert_eq!(v["response"]["request_id"], "rid-1");
+        assert_eq!(v["response"]["response"]["behavior"], "allow");
+        // updatedInput is REQUIRED — a bare allow is malformed.
+        assert_eq!(v["response"]["response"]["updatedInput"], json!({"file_path": "a"}));
+    }
+
+    #[test]
+    fn deny_response_carries_message() {
+        let d = PermissionDecision::Deny { message: "no".into() };
+        let v = control_response_json("rid-2", &d);
+        assert_eq!(v["response"]["response"]["behavior"], "deny");
+        assert_eq!(v["response"]["response"]["message"], "no");
+        assert!(v["response"]["response"].get("updatedInput").is_none());
+    }
+
+    #[test]
+    fn allow_with_suggestion_falls_back_to_plain_allow() {
+        let d = PermissionDecision::AllowWithSuggestion {
+            updated_input: json!({}),
+            suggestion: PermissionSuggestion {
+                kind: "setMode".into(), label: "x".into(), raw: json!({}),
+            },
+        };
+        assert_eq!(control_response_json("r", &d)["response"]["response"]["behavior"], "allow");
+    }
+
+    /// The full app-facing loop: inject agent events → they drive a ChatThread;
+    /// answering the permission → the stub records the exact allow JSON.
+    #[test]
+    fn stub_drives_thread_and_records_decision() {
+        let (conn, rx, inject) = StubConnection::new();
+        let mut thread = ChatThread::new();
+
+        // user sends a prompt
+        conn.send_user_message("edit notes").unwrap();
+        thread.push_user_message("edit notes");
+
+        // agent streams: tool_use + a permission request
+        inject.send(ThreadEvent::ToolCallStarted {
+            id: "toolu_1".into(), name: "Edit".into(), input: json!({"file_path": "notes.txt"}),
+        }).unwrap();
+        inject.send(ThreadEvent::PermissionRequested {
+            request_id: "rid-9".into(), tool_use_id: Some("toolu_1".into()),
+            tool_name: "Edit".into(), input: json!({"file_path": "notes.txt"}),
+            description: "notes.txt".into(), suggestions: vec![],
+        }).unwrap();
+        while let Ok(ev) = rx.try_recv() {
+            thread.apply(&ev);
+        }
+
+        // the UI would now show a pending permission; the user allows it
+        let (tool_id, req) = thread.pending_permission().expect("pending");
+        assert_eq!(tool_id, "toolu_1");
+        conn.resolve_permission(
+            &req.request_id.clone(),
+            PermissionDecision::Allow { updated_input: json!({"file_path": "notes.txt"}) },
+        ).unwrap();
+
+        // stub recorded: [user message, control_response allow]
+        let sent = conn.sent();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["message"]["content"], "edit notes");
+        assert_eq!(sent[1]["response"]["response"]["behavior"], "allow");
+        assert_eq!(sent[1]["response"]["request_id"], "rid-9");
+    }
+}
