@@ -12,6 +12,7 @@
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
 mod bubble;
+mod tool_card;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -52,6 +53,8 @@ pub struct AgentChatView {
     disconnected: bool,
     /// Assistant entry indices whose thinking disclosure is expanded.
     expanded_thinking: HashSet<usize>,
+    /// Tool-call ids whose card disclosure (raw input + result) is expanded.
+    expanded_tool_calls: HashSet<String>,
     /// Foreground event-drain task. Dropping it only cancels the *foreground*
     /// half at its next await point — it does NOT stop the forwarder/reader OS
     /// threads or reap the subprocess. Subprocess + thread teardown is owned by
@@ -118,6 +121,7 @@ impl AgentChatView {
             model,
             disconnected,
             expanded_thinking: HashSet::new(),
+            expanded_tool_calls: HashSet::new(),
             _drain_task: drain_task,
             _subscriptions: subscriptions,
         }
@@ -155,6 +159,7 @@ impl AgentChatView {
             model: None,
             disconnected: false,
             expanded_thinking: HashSet::new(),
+            expanded_tool_calls: HashSet::new(),
             _drain_task: None,
             _subscriptions: Vec::new(),
         }
@@ -249,6 +254,37 @@ impl AgentChatView {
         cx.notify();
     }
 
+    fn toggle_tool_expanded(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.expanded_tool_calls.insert(id.clone()) {
+            self.expanded_tool_calls.remove(&id);
+        }
+        cx.notify();
+    }
+
+    /// Answer a pending tool permission from a card button. Routes the decision
+    /// to the connection by `request_id`, then transitions the local status so
+    /// the card updates immediately: Allow → `InProgress` (the tool proceeds and
+    /// the later `ToolResult` finalizes it); Deny → `Rejected`.
+    fn resolve_permission(
+        &mut self,
+        tool_id: String,
+        request_id: String,
+        decision: PermissionDecision,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(conn) = &self.connection {
+            let _ = conn.resolve_permission(&request_id, decision.clone());
+        }
+        let status = match &decision {
+            PermissionDecision::Deny { .. } => ToolCallStatus::Rejected,
+            PermissionDecision::Allow { .. } | PermissionDecision::AllowWithSuggestion { .. } => {
+                ToolCallStatus::InProgress
+            }
+        };
+        self.thread.set_tool_status(&tool_id, status);
+        cx.notify();
+    }
+
     /// The scrollable transcript column.
     fn render_transcript(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
@@ -305,7 +341,10 @@ impl AgentChatView {
                     list = list.child(block);
                 }
                 ThreadEntry::ToolCall(tc) => {
-                    list = list.child(bubble::tool_line(tc, theme, density, &typo));
+                    let expanded = self.expanded_tool_calls.contains(&tc.id);
+                    list = list.child(tool_card::render_tool_card(
+                        tc, expanded, theme, density, &typo, cx,
+                    ));
                 }
             }
         }
@@ -565,5 +604,99 @@ mod tests {
                 assert!(!view.thread.turn_active, "turn ended");
             })
             .expect("window update");
+    }
+
+    /// Card buttons route Allow/Reject to the connection by request_id and flip
+    /// the local status (Allow → InProgress; Deny → Rejected), clearing the
+    /// pending prompt. Allow echoes the tool input as updatedInput.
+    #[gpui::test]
+    async fn approve_and_reject_route_permission_decisions(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default();
+        let stub_probe = stub.clone();
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("do two things");
+                for (tid, rid, name, input) in [
+                    ("t1", "r1", "Edit", json!({"file_path": "a.txt"})),
+                    ("t2", "r2", "Bash", json!({"command": "rm x"})),
+                ] {
+                    view.thread.apply(&ThreadEvent::ToolCallStarted {
+                        id: tid.into(),
+                        name: name.into(),
+                        input: input.clone(),
+                    });
+                    view.thread.apply(&ThreadEvent::PermissionRequested {
+                        request_id: rid.into(),
+                        tool_use_id: Some(tid.into()),
+                        tool_name: name.into(),
+                        input,
+                        description: name.into(),
+                        suggestions: vec![],
+                    });
+                }
+
+                view.resolve_permission(
+                    "t1".into(),
+                    "r1".into(),
+                    PermissionDecision::Allow { updated_input: json!({"file_path": "a.txt"}) },
+                    cx,
+                );
+                view.resolve_permission(
+                    "t2".into(),
+                    "r2".into(),
+                    PermissionDecision::Deny { message: "no".into() },
+                    cx,
+                );
+
+                assert!(
+                    view.thread.pending_permission().is_none(),
+                    "both permissions resolved"
+                );
+                assert_eq!(tool_status(view, "t1"), Some("InProgress"));
+                assert_eq!(tool_status(view, "t2"), Some("Rejected"));
+            })
+            .expect("window update");
+
+        let sent = stub_probe.sent();
+        let allow = sent
+            .iter()
+            .find(|s| s["response"]["request_id"] == "r1")
+            .expect("r1 control_response");
+        assert_eq!(allow["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            allow["response"]["response"]["updatedInput"],
+            json!({"file_path": "a.txt"})
+        );
+        let deny = sent
+            .iter()
+            .find(|s| s["response"]["request_id"] == "r2")
+            .expect("r2 control_response");
+        assert_eq!(deny["response"]["response"]["behavior"], "deny");
+    }
+
+    fn tool_status(view: &AgentChatView, id: &str) -> Option<&'static str> {
+        view.thread.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == id => Some(match tc.status {
+                ToolCallStatus::InProgress => "InProgress",
+                ToolCallStatus::Rejected => "Rejected",
+                ToolCallStatus::Completed => "Completed",
+                ToolCallStatus::WaitingForConfirmation(_) => "WaitingForConfirmation",
+                _ => "Other",
+            }),
+            _ => None,
+        })
     }
 }

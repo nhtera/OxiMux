@@ -83,42 +83,9 @@ pub(super) fn thinking_body(
         .into_any_element()
 }
 
-/// One-line tool-call placeholder (`✓ Edit src/x.rs`). The rich card — diff,
-/// output, Allow/Reject buttons — is a later phase; this keeps the transcript
-/// readable meanwhile.
-pub(super) fn tool_line(
-    tc: &ToolCall,
-    theme: Theme,
-    density: Density,
-    typo: &Typography,
-) -> AnyElement {
-    let (glyph, glyph_color) = status_glyph(&tc.status, theme);
-    let mut label = tc.name.clone();
-    if let Some(target) = tool_target(tc) {
-        label.push(' ');
-        label.push_str(&elide(&target, 80));
-    }
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(density.gap_inline))
-        .w_full()
-        .py(px(2.0))
-        .text_size(px(typo.t_body_sm))
-        .text_color(theme.fg_muted)
-        .child(
-            div()
-                .text_color(glyph_color)
-                .child(SharedString::from(glyph.to_string())),
-        )
-        .child(SharedString::from(label))
-        .into_any_element()
-}
-
 /// Status → (glyph, color). `WaitingForConfirmation` reads as a pause because
-/// the tool is gated on the user; the rich approval UI arrives in a later phase.
-fn status_glyph(status: &ToolCallStatus, theme: Theme) -> (&'static str, Hsla) {
+/// the tool is gated on the user's Allow/Reject decision.
+pub(super) fn status_glyph(status: &ToolCallStatus, theme: Theme) -> (&'static str, Hsla) {
     match status {
         ToolCallStatus::Pending | ToolCallStatus::InProgress => ("▸", theme.fg_subtle),
         ToolCallStatus::WaitingForConfirmation(_) => ("⏸", theme.status_warn),
@@ -130,7 +97,7 @@ fn status_glyph(status: &ToolCallStatus, theme: Theme) -> (&'static str, Hsla) {
 
 /// A short human target for the tool line — the file it touches, the command it
 /// runs, or the pattern it searches. `None` when the input carries none.
-fn tool_target(tc: &ToolCall) -> Option<String> {
+pub(super) fn tool_target(tc: &ToolCall) -> Option<String> {
     let input = &tc.input;
     for key in ["file_path", "path", "notebook_path"] {
         if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
@@ -147,8 +114,8 @@ fn tool_target(tc: &ToolCall) -> Option<String> {
 }
 
 /// Cap a label to `max` chars, appending an ellipsis when cut. Keeps the tool
-/// line one row regardless of a giant command/path.
-fn elide(s: &str, max: usize) -> String {
+/// header one row regardless of a giant command/path.
+pub(super) fn elide(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
