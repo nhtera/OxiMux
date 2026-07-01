@@ -30,3 +30,8 @@ toml = { workspace = true }
 [[example]]
 name = "commit_message_demo"
 path = "examples/commit_message_demo.rs"
+
+# Throwaway Phase-1 spike harness for the Claude stream-json transport (not shipped).
+[[example]]
+name = "stream_json_probe"
+path = "examples/stream_json_probe.rs"
