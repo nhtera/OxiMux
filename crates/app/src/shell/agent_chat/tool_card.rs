@@ -55,11 +55,21 @@ pub(super) fn render_tool_card(
     card = card.child(header_row(tc, expanded, has_detail, theme, density, typo, cx));
 
     // Inline diff for Edit/Write: shown while awaiting (so the user sees what
-    // they're approving) and whenever the card is expanded.
-    let diff = diff_card::build_edit_diff(tc);
-    if let Some(lines) = diff.as_ref()
-        && (awaiting || expanded)
-    {
+    // they're approving) and whenever the card is expanded. Only build the
+    // (Myers) diff when it will actually render — a collapsed, settled tool
+    // call (the bulk of a long transcript) skips the recompute every frame.
+    let diff = if awaiting || expanded {
+        diff_card::build_edit_diff(tc)
+    } else {
+        None
+    };
+    if let Some(lines) = diff.as_ref() {
+        // A whole-file Write shows only additions (its payload carries no prior
+        // content), so an all-green diff must not read as "purely additive /
+        // safe" — call out that it replaces the file.
+        if tc.name == "Write" {
+            card = card.child(write_replace_hint(theme, typo));
+        }
         card = card.child(diff_card::render_diff(lines, theme, density, typo));
     }
 
@@ -144,6 +154,10 @@ fn approval_row(
 ) -> AnyElement {
     let tool_id = tc.id.clone();
     let request_id = req.request_id.clone();
+    // Echo the tool's own input as `updatedInput` (required by the transport).
+    // For a matched call this is the `tool_use` block's input; the CLI sends the
+    // same input in its `can_use_tool` request, so the two are identical for the
+    // same tool call.
     let input = tc.input.clone();
 
     let prompt = if req.description.trim().is_empty() {
@@ -233,6 +247,19 @@ fn pill_button(
         .hover(|s| s.bg(accent.opacity(0.12)))
         .on_click(on_click)
         .child(SharedString::from(label))
+        .into_any_element()
+}
+
+/// A one-line safety note under a `Write` diff, since its all-additions diff
+/// omits whatever content is being overwritten.
+fn write_replace_hint(theme: Theme, typo: &Typography) -> AnyElement {
+    div()
+        .w_full()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.fg_subtle)
+        .child(SharedString::from(
+            "Write replaces the entire file — prior content isn't shown.",
+        ))
         .into_any_element()
 }
 

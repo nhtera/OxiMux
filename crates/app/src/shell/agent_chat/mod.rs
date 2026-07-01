@@ -281,7 +281,8 @@ impl AgentChatView {
         let still_awaiting = self.thread.entries.iter().any(|e| {
             matches!(e, ThreadEntry::ToolCall(tc)
                 if tc.id == tool_id
-                    && matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_)))
+                    && matches!(&tc.status,
+                        ToolCallStatus::WaitingForConfirmation(r) if r.request_id == request_id))
         });
         if !still_awaiting {
             return;
