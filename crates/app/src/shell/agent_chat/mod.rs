@@ -12,6 +12,7 @@
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
 mod bubble;
+mod composer;
 mod diff_card;
 mod tool_card;
 
@@ -21,10 +22,12 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, div, px,
+    IntoElement, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, WeakEntity, Window, div, px,
 };
-use gpui_component::input::{Enter as InputEnter, Input, InputEvent, InputState};
+use gpui_component::input::Enter as InputEnter;
+
+use composer::{ComposerEvent, ComposerView};
 use oximux_agents::thread::{
     AgentConnection, ChatThread, ClaudeStreamJsonConnection, PermissionDecision, ThreadEntry,
     ThreadEvent, ToolCallStatus,
@@ -38,8 +41,10 @@ pub struct AgentChatView {
     /// The live agent connection. `None` if the subprocess failed to spawn (a
     /// read-only error state) or after teardown.
     connection: Option<Box<dyn AgentConnection>>,
-    /// Multi-line prompt input. `⌘↵` sends; bare Enter inserts a newline.
-    composer: Entity<InputState>,
+    /// The bottom composer (status line + input + Send button), isolated into
+    /// its own view so typing repaints only it, never the transcript. It reports
+    /// submissions back via [`ComposerEvent`].
+    composer: Entity<ComposerView>,
     focus_handle: FocusHandle,
     list_scroll: ScrollHandle,
     theme: Theme,
@@ -78,19 +83,16 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder("Message Claude…  (⌘↵ to send)")
-        });
-        let subscriptions = vec![cx.subscribe_in(
+        let composer =
+            cx.new(|cx| ComposerView::new(theme, density, typography.clone(), window, cx));
+        // The composer owns its input and repaints itself per keystroke. We only
+        // react when it reports a finished submission — so typing never touches
+        // this view (and thus never rebuilds the transcript, which is the lag we
+        // want to avoid).
+        let subscriptions = vec![cx.subscribe(
             &composer,
-            window,
-            |_this, _input, ev: &InputEvent, _window, cx| {
-                // Repaint on edits so the composer reflects the typed value.
-                if matches!(ev, InputEvent::Change) {
-                    cx.notify();
-                }
+            |this, _composer, ev: &ComposerEvent, cx| match ev {
+                ComposerEvent::Submit(text) => this.send_text(text.clone(), cx),
             },
         )];
 
@@ -134,6 +136,32 @@ impl AgentChatView {
         self.composer.read(cx).focus_handle(cx)
     }
 
+    /// Push the current connection/turn state into the composer so its status
+    /// line + Send button reflect reality. Cheap no-op when nothing changed.
+    fn sync_composer(&self, cx: &mut Context<Self>) {
+        let (disconnected, turn_active) = (self.disconnected, self.thread.turn_active);
+        self.composer
+            .update(cx, |c, cx| c.set_state(disconnected, turn_active, cx));
+    }
+
+    /// Record + transmit a submitted prompt (from the composer's Submit event).
+    /// The composer has already cleared its own input.
+    fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() || self.disconnected {
+            return;
+        }
+        // Optimistically record the prompt; the reply streams in via `on_event`.
+        self.thread.push_user_message(text.clone());
+        if let Some(conn) = &self.connection {
+            if let Err(e) = conn.send_user_message(&text) {
+                self.thread.last_error = Some(format!("Send failed: {e}"));
+            }
+        }
+        self.list_scroll.scroll_to_bottom();
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
     /// Test-only constructor: inject a connection (a `StubConnection`) instead
     /// of spawning a real subprocess, and skip the background drain so a
     /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
@@ -146,7 +174,8 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+        let composer =
+            cx.new(|cx| ComposerView::new(theme, density, typography.clone(), window, cx));
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
@@ -198,6 +227,9 @@ impl AgentChatView {
     /// Fold one decoded event into the thread and repaint.
     fn on_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
         self.thread.apply(&ev);
+        // The turn's active flag may have flipped (e.g. `TurnEnded`); keep the
+        // composer's status line in step.
+        self.sync_composer(cx);
         cx.notify();
     }
 
@@ -225,25 +257,7 @@ impl AgentChatView {
         if self.thread.last_error.is_none() {
             self.thread.last_error = Some("Agent process exited.".into());
         }
-        cx.notify();
-    }
-
-    /// Send the composer's draft as a new user turn, then clear the input.
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().to_string();
-        let text = text.trim().to_string();
-        if text.is_empty() || self.disconnected {
-            return;
-        }
-        // Optimistically record the prompt + mark the turn active.
-        self.thread.push_user_message(text.clone());
-        if let Some(conn) = &self.connection
-            && let Err(e) = conn.send_user_message(&text)
-        {
-            self.thread.last_error = Some(format!("Send failed: {e}"));
-        }
-        self.composer.update(cx, |s, cx| s.set_value("", window, cx));
-        self.list_scroll.scroll_to_bottom();
+        self.sync_composer(cx);
         cx.notify();
     }
 
@@ -384,64 +398,6 @@ impl AgentChatView {
             .into_any_element()
     }
 
-    /// The bottom composer: a status/hint line plus the multi-line input.
-    fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.theme;
-        let density = self.density;
-        let typo = &self.typography;
-        let status = if self.disconnected {
-            "Disconnected — the agent process exited."
-        } else if self.thread.turn_active {
-            "Claude is working…"
-        } else {
-            "⌘↵ to send · Enter for newline"
-        };
-        let status_color = if self.disconnected {
-            theme.status_error
-        } else {
-            theme.fg_subtle
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .border_t_1()
-            .border_color(theme.border_inactive)
-            .p(px(density.pad_panel))
-            .gap(px(density.gap_inline))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .w_full()
-                    .child(
-                        div()
-                            .text_size(px(typo.t_label_xs))
-                            .text_color(status_color)
-                            .child(SharedString::from(status.to_string())),
-                    )
-                    .child(
-                        div()
-                            .id("agent-chat-send")
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .rounded(px(density.r_chip))
-                            .text_size(px(typo.t_label_xs))
-                            .text_color(theme.fg_muted)
-                            .hover(|s| s.text_color(theme.fg_base).bg(theme.hover_overlay))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _e, window, cx| this.submit(window, cx)),
-                            )
-                            .child(SharedString::from("Send ⌘↵")),
-                    ),
-            )
-            .child(Input::new(&self.composer).text_size(px(typo.t_body_md)))
-            .into_any_element()
-    }
 }
 
 impl Drop for AgentChatView {
@@ -460,10 +416,22 @@ impl Focusable for AgentChatView {
 }
 
 impl Render for AgentChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        // Keyboard focus must live on the composer, not this view's root. The
+        // pane focuses the composer on open, but an inline focus during action/
+        // click dispatch is clobbered onto the root's tracked handle — so
+        // keystrokes hit the root, the composer stays empty, and ⌘↵ never
+        // dispatches the field's Enter action. If the root holds focus, hand it
+        // to the composer (deferred so it wins the post-dispatch focus race).
+        // Self-limiting: once the composer is focused the root no longer is.
+        if self.focus_handle.is_focused(window) {
+            let composer = self.composer.clone();
+            window.defer(cx, move |window, cx| {
+                composer.read(cx).focus_handle(cx).focus(window, cx);
+            });
+        }
         let transcript = self.render_transcript(cx);
-        let composer = self.render_composer(cx);
         div()
             .track_focus(&self.focus_handle)
             .flex()
@@ -474,15 +442,16 @@ impl Render for AgentChatView {
             // and `⌘↵`/`ctrl+↵`→Enter{secondary:true}; both dispatch as the
             // `Enter` action and would be consumed by the field before any
             // `on_key_down` could see them, so submit MUST be captured here.
-            .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
-                if action.secondary {
-                    this.submit(window, cx);
-                } else {
-                    cx.propagate(); // bare Enter → newline in the field
-                }
+            .capture_action(cx.listener(|this, _action: &InputEnter, window, cx| {
+                // Both ↵ and ⌘↵ send. The field's key map collapses Enter and
+                // Shift+Enter into the same action, so a keyboard newline can't
+                // be distinguished here — multi-line prompts arrive via paste.
+                // The mouse Send button remains the IME-proof fallback. The
+                // composer emits `Submit`, which this view's subscription sends.
+                this.composer.update(cx, |c, cx| c.submit(window, cx));
             }))
             .child(transcript)
-            .child(composer)
+            .child(self.composer.clone())
     }
 }
 

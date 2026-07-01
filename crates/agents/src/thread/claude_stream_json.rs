@@ -78,7 +78,7 @@ impl ClaudeStreamJsonConnection {
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
-                let Ok(line) = line else { break };
+                let Ok(line) = line else { break }; // read error — treat as EOF
                 for ev in decode_line(&line) {
                     if tx.send(ev).is_err() {
                         return; // consumer gone — stop reading
