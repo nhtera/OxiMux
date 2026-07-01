@@ -52,6 +52,11 @@ pub struct AgentChatView {
     disconnected: bool,
     /// Assistant entry indices whose thinking disclosure is expanded.
     expanded_thinking: HashSet<usize>,
+    /// Foreground event-drain task. Dropping it only cancels the *foreground*
+    /// half at its next await point — it does NOT stop the forwarder/reader OS
+    /// threads or reap the subprocess. Subprocess + thread teardown is owned by
+    /// `Drop::shutdown()` (which kills the child → stdout EOF → both threads
+    /// unwind). Keep that the single cleanup owner across future refactors.
     _drain_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
