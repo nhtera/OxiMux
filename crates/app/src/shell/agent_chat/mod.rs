@@ -273,6 +273,19 @@ impl AgentChatView {
         decision: PermissionDecision,
         cx: &mut Context<Self>,
     ) {
+        // Idempotency guard: only answer a tool that is STILL awaiting. Once
+        // answered its status leaves `WaitingForConfirmation` (below) and the
+        // buttons drop on re-render, but this closes the sub-frame window where
+        // a stray second click could send a second control_response for an
+        // already-decided request_id.
+        let still_awaiting = self.thread.entries.iter().any(|e| {
+            matches!(e, ThreadEntry::ToolCall(tc)
+                if tc.id == tool_id
+                    && matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_)))
+        });
+        if !still_awaiting {
+            return;
+        }
         if let Some(conn) = &self.connection {
             let _ = conn.resolve_permission(&request_id, decision.clone());
         }
@@ -686,6 +699,72 @@ mod tests {
             .find(|s| s["response"]["request_id"] == "r2")
             .expect("r2 control_response");
         assert_eq!(deny["response"]["response"]["behavior"], "deny");
+    }
+
+    /// A stray second click after a card is answered must not send a second
+    /// control_response or flip the decision — the guard makes it a no-op.
+    #[gpui::test]
+    async fn second_answer_is_ignored(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default();
+        let stub_probe = stub.clone();
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("go");
+                view.thread.apply(&ThreadEvent::ToolCallStarted {
+                    id: "t1".into(),
+                    name: "Edit".into(),
+                    input: json!({}),
+                });
+                view.thread.apply(&ThreadEvent::PermissionRequested {
+                    request_id: "r1".into(),
+                    tool_use_id: Some("t1".into()),
+                    tool_name: "Edit".into(),
+                    input: json!({}),
+                    description: "x".into(),
+                    suggestions: vec![],
+                });
+                // First answer: allow.
+                view.resolve_permission(
+                    "t1".into(),
+                    "r1".into(),
+                    PermissionDecision::Allow { updated_input: json!({}) },
+                    cx,
+                );
+                // Stray second answer: deny — must be ignored (already decided).
+                view.resolve_permission(
+                    "t1".into(),
+                    "r1".into(),
+                    PermissionDecision::Deny { message: "no".into() },
+                    cx,
+                );
+                assert_eq!(
+                    tool_status(view, "t1"),
+                    Some("InProgress"),
+                    "stays allowed, not flipped to Rejected by the second click"
+                );
+            })
+            .expect("window update");
+
+        let responses: Vec<_> = stub_probe
+            .sent()
+            .into_iter()
+            .filter(|s| s["response"]["request_id"] == "r1")
+            .collect();
+        assert_eq!(responses.len(), 1, "exactly one control_response for r1");
+        assert_eq!(responses[0]["response"]["response"]["behavior"], "allow");
     }
 
     fn tool_status(view: &AgentChatView, id: &str) -> Option<&'static str> {
