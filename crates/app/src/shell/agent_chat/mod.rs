@@ -12,6 +12,7 @@
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
 mod bubble;
+mod diff_card;
 mod tool_card;
 
 use std::collections::HashSet;

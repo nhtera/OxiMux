@@ -16,6 +16,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use super::AgentChatView;
 use super::bubble;
+use super::diff_card;
 
 /// Cap on the rendered tool-result body so a chatty tool can't blow up a row.
 const RESULT_CHARS: usize = 4000;
@@ -53,12 +54,24 @@ pub(super) fn render_tool_card(
 
     card = card.child(header_row(tc, expanded, has_detail, theme, density, typo, cx));
 
+    // Inline diff for Edit/Write: shown while awaiting (so the user sees what
+    // they're approving) and whenever the card is expanded.
+    let diff = diff_card::build_edit_diff(tc);
+    if let Some(lines) = diff.as_ref()
+        && (awaiting || expanded)
+    {
+        card = card.child(diff_card::render_diff(lines, theme, density, typo));
+    }
+
     if let ToolCallStatus::WaitingForConfirmation(req) = &tc.status {
         card = card.child(approval_row(tc, req, theme, density, typo, cx));
     }
 
     if expanded {
-        card = card.child(raw_input_block(tc, theme, density, typo));
+        // Non-edit tools show the raw JSON payload (edits already show a diff).
+        if diff.is_none() {
+            card = card.child(raw_input_block(tc, theme, density, typo));
+        }
         if let Some(result) = &tc.result {
             card = card.child(result_block(result, theme, density, typo));
         }
