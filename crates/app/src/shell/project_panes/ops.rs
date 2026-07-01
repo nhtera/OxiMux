@@ -407,6 +407,9 @@ impl ProjectPanes {
     pub fn snapshot(&self, cx: &App) -> PersistedTabs {
         let mut tabs: Vec<PersistedTab> = Vec::new();
         let mut groups: Vec<PersistedGroup> = Vec::new();
+        // AgentChat transcripts collected from live views as we walk the tabs;
+        // written to per-session settings keys by `save_persisted_tabs`.
+        let mut chat_transcripts: Vec<crate::persisted_chat::PersistedChatTranscript> = Vec::new();
         let mut active_offset: Option<usize> = None;
         let mut active_group_dfs_idx: Option<usize> = None;
         let active_group_id = self.manager.active_group_id();
@@ -438,14 +441,37 @@ impl ProjectPanes {
                     // persisted. Diff/commit regenerate from current git state;
                     // Tasks reopens from the nav rail after restore.
                     // Skip the slot so the persisted tab list stays compact.
-                    // AgentChat transcript persistence + `--resume` is a
-                    // follow-up; until then a chat tab is not restored.
                     PaneGroupTabKind::Diff { .. }
                     | PaneGroupTabKind::Commit { .. }
                     | PaneGroupTabKind::BranchFile { .. }
                     | PaneGroupTabKind::CombinedDiff { .. }
-                    | PaneGroupTabKind::Tasks
-                    | PaneGroupTabKind::AgentChat { .. } => continue,
+                    | PaneGroupTabKind::Tasks => continue,
+                    // Agent Chat: persist the tab kind (cwd/model/session id)
+                    // plus, when a turn completed, the transcript blob (drained
+                    // to its own settings key by `save_persisted_tabs`). A chat
+                    // with no session id yet restores fresh.
+                    PaneGroupTabKind::AgentChat { cwd, model } => {
+                        let session_id = if let crate::shell::pane_content::PaneContent::AgentChat(
+                            view,
+                        ) = &tab.content
+                        {
+                            let v = view.read(cx);
+                            if let Some(t) = v.transcript_snapshot() {
+                                chat_transcripts.push(t);
+                            }
+                            v.session_id().map(str::to_string)
+                        } else {
+                            None
+                        };
+                        (
+                            None,
+                            PersistedTabKind::AgentChat {
+                                cwd: cwd.display().to_string(),
+                                model: model.clone(),
+                                session_id,
+                            },
+                        )
+                    }
                     // Browser tabs persist their LIVE url (read from the
                     // BrowserView) so a restored tab reopens where the user
                     // left off, including link-click navigations.
@@ -591,6 +617,7 @@ impl ProjectPanes {
             group_tree,
             groups: if multi_group { groups } else { Vec::new() },
             active_group,
+            chat_transcripts,
         }
     }
 
@@ -863,6 +890,28 @@ impl ProjectPanes {
         };
         group.update(cx, |g, cx| {
             g.open_browser_tab(url, profile_id, window, cx);
+        });
+    }
+
+    /// Restore an Agent Chat tab into a SPECIFIC group (multi-group restore).
+    /// Rehydrates the transcript + resumes the session. No-op when `group_id`
+    /// isn't registered.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_agent_chat_in_group_restore(
+        &mut self,
+        group_id: PaneGroupId,
+        cwd: PathBuf,
+        model: Option<String>,
+        session_id: Option<String>,
+        entries: Vec<oximux_agents::thread::ThreadEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(&group_id).cloned() else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            g.open_agent_chat_tab_restored(cwd, model, session_id, entries, window, cx);
         });
     }
 

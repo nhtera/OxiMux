@@ -749,6 +749,53 @@ impl PaneGroup {
                 cx,
             )
         });
+        self.push_agent_chat_view(view, cwd, model, window, cx)
+    }
+
+    /// Restore an Agent Chat tab: rehydrate the transcript and spawn the
+    /// subprocess with `--resume <session_id>` (via `new_resumed`). Shares the
+    /// tab-push path with [`open_agent_chat_tab`]; only the view construction
+    /// differs. Called by the session-restore factory.
+    pub fn open_agent_chat_tab_restored(
+        &mut self,
+        cwd: PathBuf,
+        model: Option<String>,
+        session_id: Option<String>,
+        entries: Vec<oximux_agents::thread::ThreadEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cwd_for_view = cwd.clone();
+        let model_for_view = model.clone();
+        let view = cx.new(|cx| {
+            crate::shell::agent_chat::AgentChatView::new_resumed(
+                cwd_for_view,
+                model_for_view,
+                session_id,
+                entries,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        self.push_agent_chat_view(view, cwd, model, window, cx)
+    }
+
+    /// Shared tab-push for a freshly-built chat view (new or restored): assigns
+    /// the running `Chat N` label, wires the repaint observer, and activates it.
+    fn push_agent_chat_view(
+        &mut self,
+        view: Entity<crate::shell::agent_chat::AgentChatView>,
+        cwd: PathBuf,
+        model: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let n = self
             .tabs

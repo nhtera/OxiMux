@@ -99,6 +99,15 @@ pub struct PersistedTabs {
     /// clamped to `groups.len() - 1` on restore.
     #[serde(default)]
     pub active_group: usize,
+    /// Agent-chat transcripts for the `AgentChat` tabs in this snapshot, one
+    /// per chat session that had a completed turn. **Not** part of the layout
+    /// blob JSON (`#[serde(skip)]`): each transcript is stored under its own
+    /// `agent_chat:<session_id>` settings key to avoid the layout blob's size
+    /// cap. `snapshot()` fills this from the live views; `save_persisted_tabs`
+    /// drains it to the per-session keys, and `load_persisted_tabs` re-populates
+    /// it from disk so the factory can rehydrate without the `SettingsRepo`.
+    #[serde(skip)]
+    pub chat_transcripts: Vec<crate::persisted_chat::PersistedChatTranscript>,
 }
 
 /// Per-group restore state emitted alongside the workspace-level
@@ -242,6 +251,18 @@ pub enum PersistedTabKind {
         url: String,
         #[serde(default)]
         profile_id: Option<uuid::Uuid>,
+    },
+    /// Agent Chat tab — a structured Claude chat surface (not a terminal).
+    /// `cwd` is the working directory to respawn in; `model` the launch model;
+    /// `session_id` (once Claude minted one) both keys the transcript blob and
+    /// drives `--resume`. A `None` session_id restores a fresh chat (the tab
+    /// never completed a turn, so there's nothing to resume).
+    AgentChat {
+        cwd: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
     },
 }
 
@@ -652,6 +673,7 @@ mod tests {
                 },
             ],
             active_group: 1,
+            ..PersistedTabs::default()
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
@@ -750,6 +772,7 @@ mod tests {
                 },
             ],
             active_group: 1,
+            ..PersistedTabs::default()
         };
         let s = serde_json::to_string(&blob).unwrap();
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();

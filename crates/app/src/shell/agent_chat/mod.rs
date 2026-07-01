@@ -91,6 +91,52 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::assemble(cwd, model, ChatThread::new(), theme, density, typography, window, cx)
+    }
+
+    /// Rebuild a chat view on session restore: seed the thread from the
+    /// persisted transcript and spawn the subprocess with `--resume
+    /// <session_id>` (via [`ChatThread::rehydrated`]'s captured id) so the
+    /// continued conversation keeps its context. The visible history paints
+    /// immediately from `entries` — it does not wait on the resumed process.
+    ///
+    /// LIVE-VERIFY: `claude -p --resume` in stream-json mode is expected to load
+    /// the session server-side and wait for input (not replay prior turns to
+    /// stdout). If it *does* replay, the drain would append duplicate entries
+    /// atop the rehydrated ones — watch for doubled bubbles on the first restore
+    /// eyeball; the fix would be to drop the rehydrated seed and render purely
+    /// from the replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_resumed(
+        cwd: PathBuf,
+        model: Option<String>,
+        session_id: Option<String>,
+        entries: Vec<ThreadEntry>,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let thread = ChatThread::rehydrated(session_id, model.clone(), entries);
+        Self::assemble(cwd, model, thread, theme, density, typography, window, cx)
+    }
+
+    /// Shared construction for [`new`]/[`new_resumed`]: wire the composer, spawn
+    /// the subprocess (resuming when `thread.session_id` is set), and start the
+    /// event drain. A spawn failure degrades to a read-only error state so the
+    /// tab still opens and explains what went wrong.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        cwd: PathBuf,
+        model: Option<String>,
+        mut thread: ChatThread,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let composer =
             cx.new(|cx| ComposerView::new(theme, density, typography.clone(), window, cx));
         // The composer owns its input and repaints itself per keystroke. We only
@@ -104,11 +150,17 @@ impl AgentChatView {
             },
         )];
 
-        let mut thread = ChatThread::new();
+        // A resumed thread carries the prior session id; a fresh one is `None`
+        // (spawn a new session). Either way the subprocess is spawned the same.
+        let resume_session_id = thread.session_id.clone();
         let mut connection: Option<Box<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
-        match ClaudeStreamJsonConnection::spawn(&cwd, model.as_deref()) {
+        match ClaudeStreamJsonConnection::spawn_resumed(
+            &cwd,
+            model.as_deref(),
+            resume_session_id.as_deref(),
+        ) {
             Ok((conn, rx)) => {
                 connection = Some(Box::new(conn));
                 drain_task = Some(Self::spawn_drain(rx, cx));
@@ -138,6 +190,29 @@ impl AgentChatView {
         }
     }
 
+    /// Snapshot the transcript for persistence, or `None` when there's nothing
+    /// worth restoring. A session id is required (it keys the blob and drives
+    /// `--resume`); a chat with no completed turn has neither an id nor history,
+    /// so it simply won't restore — the tab reopens fresh.
+    pub fn transcript_snapshot(&self) -> Option<crate::persisted_chat::PersistedChatTranscript> {
+        let session_id = self.thread.session_id.clone()?;
+        if self.thread.entries.is_empty() {
+            return None;
+        }
+        Some(crate::persisted_chat::PersistedChatTranscript {
+            session_id,
+            model: self.thread.model.clone().or_else(|| self.model.clone()),
+            entries: self.thread.entries.clone(),
+        })
+    }
+
+    /// The chat's session id once Claude has minted one (after the first turn
+    /// begins). Persisted in the tab's `PersistedTabKind::AgentChat` so restore
+    /// can find the matching transcript blob and `--resume`.
+    pub fn session_id(&self) -> Option<&str> {
+        self.thread.session_id.as_deref()
+    }
+
     /// FocusHandle of the inner composer — the pane focuses this on activate so
     /// keystrokes land in the draft without a click first.
     pub fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
@@ -160,10 +235,10 @@ impl AgentChatView {
         }
         // Optimistically record the prompt; the reply streams in via `on_event`.
         self.thread.push_user_message(text.clone());
-        if let Some(conn) = &self.connection {
-            if let Err(e) = conn.send_user_message(&text) {
-                self.thread.last_error = Some(format!("Send failed: {e}"));
-            }
+        if let Some(conn) = &self.connection
+            && let Err(e) = conn.send_user_message(&text)
+        {
+            self.thread.last_error = Some(format!("Send failed: {e}"));
         }
         self.list_scroll.scroll_to_bottom();
         self.sync_composer(cx);

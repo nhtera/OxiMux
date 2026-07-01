@@ -8,6 +8,7 @@
 //! hit the orphan rule. Re-exported at the crate root to preserve paths.
 
 pub mod git_state_cache;
+pub mod persisted_chat;
 pub mod persisted_terminals;
 pub mod relay_cold_restore;
 pub mod relay_supervisor;

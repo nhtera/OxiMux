@@ -11,10 +11,11 @@
 //! for ACP parity (an announced-but-not-yet-started call) and is not
 //! constructed by the stream-json backend.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A single tool invocation inside an assistant turn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// The `tool_use_id` from the assistant `tool_use` block — the join key
     /// used to correlate the later `tool_result` and any permission request.
@@ -46,7 +47,7 @@ impl ToolCall {
 /// permission request so the UI can render Allow/Reject; the decision is
 /// routed back to the agent by `request_id` (not an in-process channel),
 /// which suits the subprocess/stream-json transport.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolCallStatus {
     Pending,
     WaitingForConfirmation(PermissionRequest),
@@ -58,7 +59,7 @@ pub enum ToolCallStatus {
 }
 
 /// A permission prompt surfaced by the agent (`can_use_tool` control request).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     /// Correlation id echoed back in the `control_response`.
     pub request_id: String,
@@ -71,7 +72,7 @@ pub struct PermissionRequest {
 
 /// A single agent-offered permission shortcut. Kept as loosely-typed as the
 /// wire so unknown suggestion kinds degrade gracefully instead of failing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionSuggestion {
     /// `setMode` (e.g. mode=acceptEdits) or `addRules` (allow a pattern).
     pub kind: String,

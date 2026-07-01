@@ -44,6 +44,6 @@ pub use loaders::{
 pub use platform::{app_nap, menu, single_instance, window_factory, window_registry};
 #[doc(inline)]
 pub use session_restore::{
-    git_state_cache, persisted_terminals, relay_cold_restore, relay_supervisor,
+    git_state_cache, persisted_chat, persisted_terminals, relay_cold_restore, relay_supervisor,
 };
 pub(crate) use session_restore::restore_fallback;

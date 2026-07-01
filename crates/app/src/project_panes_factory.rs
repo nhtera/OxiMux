@@ -175,6 +175,19 @@ fn rank_in(order: &[usize], idx: usize) -> usize {
     order.iter().position(|&i| i == idx).unwrap_or(idx)
 }
 
+/// Look up a restored chat tab's transcript entries by session id. Empty when
+/// the tab had no session id (never completed a turn) or its blob is absent —
+/// the chat then restores as a fresh, empty conversation.
+fn restore_chat_entries(
+    snap: &PersistedTabs,
+    session_id: Option<&str>,
+) -> Vec<oximux_agents::thread::ThreadEntry> {
+    session_id
+        .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
+        .map(|t| t.entries.clone())
+        .unwrap_or_default()
+}
+
 // The factory threads the full project-pane construction context (cwd,
 // snapshot, runtime handles, callbacks); a bag struct would only relocate the
 // argument list without simplifying the single call site.
@@ -282,6 +295,22 @@ pub(crate) fn build_project_panes(
                     if let Some(group) = p.active_group() {
                         group.update(cx, |g, cx| {
                             g.open_browser_tab(url, profile_id, window, cx);
+                        });
+                    }
+                    p.place_restored_last_tab(None, meta, cx);
+                });
+            }
+            PersistedTabKind::AgentChat { cwd: chat_cwd, model, session_id } => {
+                let chat_cwd = PathBuf::from(chat_cwd);
+                let model = model.clone();
+                let session_id = session_id.clone();
+                let entries = restore_chat_entries(&snap, session_id.as_deref());
+                panes_entity.update(cx, |p, cx| {
+                    if let Some(group) = p.active_group() {
+                        group.update(cx, |g, cx| {
+                            g.open_agent_chat_tab_restored(
+                                chat_cwd, model, session_id, entries, window, cx,
+                            );
                         });
                     }
                     p.place_restored_last_tab(None, meta, cx);
@@ -433,6 +462,18 @@ fn restore_multi_group(
                     let profile_id = *profile_id;
                     panes_entity.update(cx, |p, cx| {
                         p.open_browser_in_group_restore(group_id, url, profile_id, window, cx);
+                        p.place_restored_last_tab(Some(group_id), meta, cx);
+                    });
+                }
+                PersistedTabKind::AgentChat { cwd: chat_cwd, model, session_id } => {
+                    let chat_cwd = PathBuf::from(chat_cwd);
+                    let model = model.clone();
+                    let session_id = session_id.clone();
+                    let entries = restore_chat_entries(&snap, session_id.as_deref());
+                    panes_entity.update(cx, |p, cx| {
+                        p.open_agent_chat_in_group_restore(
+                            group_id, chat_cwd, model, session_id, entries, window, cx,
+                        );
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
                 }
@@ -1283,10 +1324,23 @@ pub(crate) fn load_persisted_tabs(
         }
         None => return LoadedTabs::Absent,
     };
-    let snap = match serde_json::from_str::<PersistedTabs>(&raw) {
+    let mut snap = match serde_json::from_str::<PersistedTabs>(&raw) {
         Ok(snap) => snap,
         Err(err) => return reject_corrupt_payload(&used_key, &raw, &format!("parse: {err}")),
     };
+    // Re-hydrate each AgentChat tab's transcript from its own settings key
+    // (the layout blob only carries the session-id pointer). A missing/corrupt
+    // transcript is simply skipped — that chat restores empty. Dedup by session
+    // id so two tabs pointing at the same session don't double-load.
+    let mut seen_sessions: HashSet<&str> = HashSet::new();
+    for tab in &snap.tabs {
+        if let PersistedTabKind::AgentChat { session_id: Some(sid), .. } = &tab.kind
+            && seen_sessions.insert(sid.as_str())
+            && let Some(t) = crate::persisted_chat::load_chat_transcript(repo, sid)
+        {
+            snap.chat_transcripts.push(t);
+        }
+    }
     // Shape gate: a parseable blob can still violate tree invariants the
     // live `PaneTree` relies on (weights/children desync, empty splits,
     // NaN weights, group/tab counts out of sync) — those panic or drop
@@ -1334,21 +1388,35 @@ pub(crate) fn save_persisted_tabs(
             return;
         }
     };
-    // Skip byte-identical writes: the periodic layout autosave calls
-    // this every tick whether or not anything changed, and an idle
-    // session shouldn't churn SQLite. Keyed per settings key so multiple
-    // projects/windows dedupe independently. Quit/switch saves flow
-    // through the same gate — skipping an identical write is always
-    // correct.
+    // The layout blob excludes chat transcripts (`#[serde(skip)]`); each rides
+    // its own `agent_chat:<session_id>` key so a growing conversation never
+    // pushes the layout blob past its size cap. Write those first so a restore
+    // reading the layout always finds the matching transcript already on disk.
+    for transcript in &snap.chat_transcripts {
+        let chat_key = crate::persisted_chat::chat_settings_key(&transcript.session_id);
+        match serde_json::to_string(transcript) {
+            Ok(t_json) => set_deduped(repo, chat_key, &t_json),
+            Err(err) => tracing::warn!(?err, session_id = %transcript.session_id, "save chat transcript: serialize failed"),
+        }
+    }
+    set_deduped(repo, key, &json);
+}
+
+/// Write `json` under `key`, skipping a byte-identical repeat. The periodic
+/// layout autosave fires every tick whether or not anything changed, and an
+/// idle session shouldn't churn SQLite. Dedup is keyed per settings key so
+/// projects/windows/chat-sessions dedupe independently; quit/switch saves flow
+/// through the same gate (skipping an identical write is always correct).
+fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
     let digest = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         json.hash(&mut hasher);
         hasher.finish()
     };
-    // A poisoned lock only means some thread panicked mid-access; the
-    // map is plain data and stays usable — recover rather than abort a
-    // layout save (worst case: one redundant write).
+    // A poisoned lock only means some thread panicked mid-access; the map is
+    // plain data and stays usable — recover rather than abort the save (worst
+    // case: one redundant write).
     {
         let last = LAST_SAVED_TABS_HASH
             .lock()
@@ -1357,10 +1425,10 @@ pub(crate) fn save_persisted_tabs(
             return;
         }
     }
-    match repo.set(&key, &json) {
-        // Record only AFTER the write lands — a failed write must stay
-        // "dirty" so the next identical save retries instead of being
-        // deduped into a permanent loss.
+    match repo.set(&key, json) {
+        // Record only AFTER the write lands — a failed write must stay "dirty"
+        // so the next identical save retries instead of being deduped into a
+        // permanent loss.
         Ok(()) => {
             LAST_SAVED_TABS_HASH
                 .lock()
@@ -1368,12 +1436,7 @@ pub(crate) fn save_persisted_tabs(
                 .insert(key, digest);
         }
         Err(err) => {
-            tracing::warn!(
-                ?err,
-                project_id,
-                window_id,
-                "save_persisted_tabs: settings.set failed"
-            );
+            tracing::warn!(?err, key, "save_persisted_tabs: settings.set failed");
         }
     }
 }
@@ -1814,5 +1877,67 @@ mod tests {
             load_persisted_tabs(&repo, "proj", "main"),
             LoadedTabs::Absent
         ));
+    }
+
+    #[test]
+    fn chat_transcript_saves_to_own_key_and_reloads() {
+        // A snapshot with an AgentChat tab (session id set) + its transcript
+        // must: (a) write the transcript under `agent_chat:<sid>` — NOT inside
+        // the layout blob; (b) reload it into `chat_transcripts` so the factory
+        // can rehydrate. Uses a unique project + session id to sidestep the
+        // process-global save dedup shared across tests.
+        use crate::persisted_chat::{chat_settings_key, PersistedChatTranscript};
+        use oximux_agents::thread::{AssistantMessage, ThreadEntry};
+
+        let db = oximux_storage::open_memory().expect("memory db");
+        let repo = SettingsRepo::new(db);
+        let sid = "sess-chat-roundtrip";
+        let transcript = PersistedChatTranscript {
+            session_id: sid.into(),
+            model: Some("opus".into()),
+            entries: vec![
+                ThreadEntry::User("hi".into()),
+                ThreadEntry::Assistant(AssistantMessage {
+                    text: "hello".into(),
+                    thinking: String::new(),
+                }),
+            ],
+        };
+        let snap = PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "Chat 1".into(),
+                kind: PersistedTabKind::AgentChat {
+                    cwd: "/tmp/proj".into(),
+                    model: Some("opus".into()),
+                    session_id: Some(sid.into()),
+                },
+                ..PersistedTab::default()
+            }],
+            active: 0,
+            next_label_n: 2,
+            chat_transcripts: vec![transcript.clone()],
+            ..PersistedTabs::default()
+        };
+
+        save_persisted_tabs(&repo, "proj-chat", "main", &snap);
+
+        // The layout blob must NOT contain the transcript body (serde skip).
+        let layout_raw = repo
+            .get(&settings_key("proj-chat", "main"))
+            .unwrap()
+            .expect("layout blob written");
+        assert!(!layout_raw.contains("chat_transcripts"));
+        assert!(!layout_raw.contains("hello"), "transcript body stays out of layout blob");
+        // The transcript lives under its own key.
+        assert!(repo.get(&chat_settings_key(sid)).unwrap().is_some());
+
+        // Reload re-hydrates chat_transcripts from the per-session key.
+        match load_persisted_tabs(&repo, "proj-chat", "main") {
+            LoadedTabs::Snapshot(loaded) => {
+                assert_eq!(loaded.tabs.len(), 1);
+                assert_eq!(loaded.chat_transcripts, vec![transcript]);
+            }
+            _ => panic!("expected snapshot with rehydrated transcript"),
+        }
     }
 }

@@ -43,6 +43,36 @@ impl ChatThread {
         Self::default()
     }
 
+    /// Rebuild a thread from a persisted transcript on session restore. Seeds
+    /// `entries` + the `session_id`/`model` needed to `--resume`, and leaves the
+    /// streaming/turn flags at rest (no turn is in flight after a relaunch).
+    ///
+    /// **Fail-closed:** any tool call left `WaitingForConfirmation` when the app
+    /// last quit is downgraded to `Rejected`. The process that asked is dead, so
+    /// the request can never be answered — restoring it as pending would strand a
+    /// permanently-unanswerable prompt in the UI (and, worse, imply the edit is
+    /// still gated). Denying is the safe default, matching the live-disconnect
+    /// fail-closed rule in the view.
+    pub fn rehydrated(
+        session_id: Option<String>,
+        model: Option<String>,
+        mut entries: Vec<ThreadEntry>,
+    ) -> Self {
+        for entry in &mut entries {
+            if let ThreadEntry::ToolCall(tc) = entry
+                && matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_))
+            {
+                tc.status = ToolCallStatus::Rejected;
+            }
+        }
+        Self {
+            entries,
+            session_id,
+            model,
+            ..Self::default()
+        }
+    }
+
     /// Record a user prompt (called when we send one to the agent).
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.entries.push(ThreadEntry::User(text.into()));
@@ -343,6 +373,58 @@ mod tests {
             Some(ThreadEntry::ToolCall(tc)) => assert_eq!(tc.name, "Bash"),
             _ => panic!("a synthesized ToolCall entry should exist"),
         }
+    }
+
+    #[test]
+    fn rehydrated_seeds_entries_and_session_and_rests_flags() {
+        let entries = vec![
+            ThreadEntry::User("hi".into()),
+            ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
+        ];
+        let t = ChatThread::rehydrated(Some("sid-9".into()), Some("opus".into()), entries);
+        assert_eq!(t.session_id.as_deref(), Some("sid-9"));
+        assert_eq!(t.model.as_deref(), Some("opus"));
+        assert_eq!(t.entries.len(), 2);
+        assert!(!t.turn_active, "a restored thread has no turn in flight");
+        assert!(t.pending_permission().is_none());
+    }
+
+    #[test]
+    fn rehydrated_fail_closes_a_pending_permission() {
+        // A tool call left WaitingForConfirmation at quit must restore as
+        // Rejected — the process that asked is gone, so it can never be
+        // answered; leaving it pending would strand an unanswerable prompt.
+        let req = PermissionRequest {
+            request_id: "rid".into(),
+            description: "notes.txt".into(),
+            suggestions: vec![],
+        };
+        let mut tc = ToolCall::new("toolu_1", "Edit", serde_json::json!({}));
+        tc.status = ToolCallStatus::WaitingForConfirmation(req);
+        let t = ChatThread::rehydrated(None, None, vec![ThreadEntry::ToolCall(tc)]);
+        assert!(t.pending_permission().is_none(), "no pending permission survives restore");
+        match &t.entries[0] {
+            ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Rejected),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcript_survives_a_serde_round_trip() {
+        // The persisted-blob path serializes the entry list and reloads it.
+        // Prove a representative transcript (user + assistant + completed tool)
+        // round-trips byte-for-byte through serde_json.
+        let mut src = ChatThread::new();
+        src.push_user_message("read it");
+        src.apply(&ThreadEvent::AssistantText("On it.".into()));
+        src.apply(&ThreadEvent::ToolCallStarted {
+            id: "t1".into(), name: "Read".into(), input: json!({"file_path":"a"}) });
+        src.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "t1".into(), content: "body".into(), is_error: false });
+
+        let json = serde_json::to_string(&src.entries).expect("serialize entries");
+        let back: Vec<ThreadEntry> = serde_json::from_str(&json).expect("deserialize entries");
+        assert_eq!(back, src.entries);
     }
 
     #[test]

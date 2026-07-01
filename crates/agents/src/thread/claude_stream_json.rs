@@ -28,6 +28,15 @@ use super::tool_call::PermissionDecision;
 /// the session from the user's global `~/.claude` hooks (which otherwise
 /// corrupt the permission round-trip — a spike finding).
 pub fn build_args(model: Option<&str>) -> Vec<String> {
+    build_args_with_resume(model, None)
+}
+
+/// Same as [`build_args`], plus `--resume <session_id>` when restoring a
+/// persisted chat. Resuming reuses the original session id (no `--fork-session`)
+/// so the continued conversation keeps its server-side context; the UI already
+/// rehydrated the visible transcript from disk, so this only needs to reconnect
+/// the *next* turn to the prior history.
+pub fn build_args_with_resume(model: Option<&str>, resume_session_id: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--input-format",
@@ -48,6 +57,10 @@ pub fn build_args(model: Option<&str>) -> Vec<String> {
         args.push("--model".to_string());
         args.push(m.to_string());
     }
+    if let Some(sid) = resume_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
     args
 }
 
@@ -61,6 +74,21 @@ impl ClaudeStreamJsonConnection {
     pub fn spawn(cwd: &Path, model: Option<&str>) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new("claude");
         cmd.args(build_args(model)).current_dir(cwd);
+        Self::spawn_command(cmd)
+    }
+
+    /// Spawn `claude` resuming a persisted session (`--resume <session_id>`) so a
+    /// restored chat tab continues the same conversation. Falls back to a fresh
+    /// session when `session_id` is `None` (a chat tab that never completed a
+    /// turn has no id to resume).
+    pub fn spawn_resumed(
+        cwd: &Path,
+        model: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<(Self, Receiver<ThreadEvent>)> {
+        let mut cmd = Command::new("claude");
+        cmd.args(build_args_with_resume(model, session_id))
+            .current_dir(cwd);
         Self::spawn_command(cmd)
     }
 
@@ -162,6 +190,18 @@ mod tests {
         assert_eq!(a[i + 1], "opus");
         // blank model is skipped
         assert!(!build_args(Some("  ")).iter().any(|x| x == "--model"));
+    }
+
+    #[test]
+    fn build_args_appends_resume_when_session_id_set() {
+        let a = build_args_with_resume(None, Some("sid-123"));
+        let i = a.iter().position(|x| x == "--resume").expect("--resume present");
+        assert_eq!(a[i + 1], "sid-123");
+        // blank / absent session id → no --resume
+        assert!(!build_args_with_resume(None, Some("  ")).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, None).iter().any(|x| x == "--resume"));
+        // plain build_args never resumes
+        assert!(!build_args(None).iter().any(|x| x == "--resume"));
     }
 
     /// Spawn a FAKE program that prints two stream-json lines; the reader
