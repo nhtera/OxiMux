@@ -24,16 +24,13 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context,
-    Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
     Transformation, WeakEntity, Window, div, percentage, px,
 };
 use gpui_component::Icon;
-use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants, DropdownButton};
 use gpui_component::input::Enter as InputEnter;
-use gpui_component::menu::PopupMenuItem;
 use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
@@ -44,7 +41,25 @@ pub(super) const CONTENT_MAX_W: f32 = 720.0;
 /// Claude model aliases offered in the in-chat model picker. The CLI accepts
 /// these short aliases directly as `--model`. (There is no model *list* in
 /// settings — only a single default — so the selectable set is fixed here.)
-const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+pub(super) const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+
+/// Permission modes offered in the in-chat mode picker, as `(wire, label)`. The
+/// wire value is passed to `--permission-mode`; the label is what the user sees.
+/// The CLI also accepts `auto`/`dontAsk`, but this is the canonical, well-
+/// understood set (matching what other agent front-ends expose):
+/// - **default** — prompt before each tool.
+/// - **acceptEdits** — auto-approve file edits; still prompt for other tools.
+/// - **plan** — read-only planning; no tools execute.
+/// - **bypassPermissions** — never prompt (skip all approvals).
+pub(super) const CLAUDE_PERMISSION_MODES: &[(&str, &str)] = &[
+    ("default", "Ask each time"),
+    ("acceptEdits", "Accept edits"),
+    ("plan", "Plan mode"),
+    ("bypassPermissions", "Bypass all"),
+];
+
+/// The wire value treated as the baseline (no `--permission-mode` flag).
+pub(super) const DEFAULT_PERMISSION_MODE: &str = "default";
 
 /// Events the chat view raises for its host (the pane group) to act on.
 pub enum AgentChatEvent {
@@ -88,6 +103,12 @@ pub struct AgentChatView {
     /// (Stop→next-send resume) in the same directory with the same model.
     cwd: PathBuf,
     model: Option<String>,
+    /// The active permission mode's wire value (`acceptEdits`, `plan`, …), or
+    /// `None`/`"default"` for the CLI default. Like `--model` it's fixed at
+    /// spawn, so a live switch respawns via `--resume`. Intentionally *not*
+    /// persisted across relaunch: a session should reopen in the safe default
+    /// rather than silently inheriting a prior "bypass all".
+    permission_mode: Option<String>,
     /// Set once the event channel closes (process exit / EOF). Disables sending.
     disconnected: bool,
     /// True after the user pressed Stop: the turn was interrupted and the child
@@ -178,6 +199,10 @@ impl AgentChatView {
             |this, _composer, ev: &ComposerEvent, cx| match ev {
                 ComposerEvent::Submit(text) => this.send_text(text.clone(), cx),
                 ComposerEvent::Stop => this.stop_turn(cx),
+                ComposerEvent::ModelPicked(model) => this.change_model(model.clone(), cx),
+                ComposerEvent::PermissionModePicked(mode) => {
+                    this.change_permission_mode(mode.clone(), cx)
+                }
             },
         )];
 
@@ -187,10 +212,13 @@ impl AgentChatView {
         let mut connection: Option<Box<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
+        // A fresh/restored session always starts in the default permission mode
+        // (see the `permission_mode` field note); a live switch respawns.
         match ClaudeStreamJsonConnection::spawn_resumed(
             &cwd,
             model.as_deref(),
             resume_session_id.as_deref(),
+            None,
         ) {
             Ok((conn, rx)) => {
                 connection = Some(Box::new(conn));
@@ -201,6 +229,20 @@ impl AgentChatView {
                 disconnected = true;
             }
         }
+
+        // Seed the composer's bottom-toolbar pickers now, so they're correct on
+        // the very first paint — a restored chat that isn't streaming fires no
+        // event, so `sync_composer` wouldn't otherwise run until the next turn
+        // (and the permission picker, gated on `supports_modes`, would be
+        // missing until then). Permission mode always starts at the default.
+        let supports_modes = connection
+            .as_ref()
+            .map(|c| c.capabilities().supports_modes)
+            .unwrap_or(false);
+        composer.update(cx, |c, cx| {
+            c.set_state(disconnected, thread.turn_active, cx);
+            c.set_controls(model.clone(), None, supports_modes, cx);
+        });
 
         Self {
             thread,
@@ -214,6 +256,7 @@ impl AgentChatView {
             typography,
             cwd,
             model,
+            permission_mode: None,
             disconnected,
             interrupted: false,
             expanded_thinking: HashSet::new(),
@@ -252,12 +295,22 @@ impl AgentChatView {
         self.composer.read(cx).focus_handle(cx)
     }
 
-    /// Push the current connection/turn state into the composer so its status
-    /// line + Send button reflect reality. Cheap no-op when nothing changed.
+    /// Push the current connection/turn state + session controls into the
+    /// composer so its status line, Send button, and bottom-toolbar pickers all
+    /// reflect reality. Cheap no-op when nothing changed (both setters guard).
     fn sync_composer(&self, cx: &mut Context<Self>) {
         let (disconnected, turn_active) = (self.disconnected, self.thread.turn_active);
-        self.composer
-            .update(cx, |c, cx| c.set_state(disconnected, turn_active, cx));
+        // Advertise mode switching by capability, not by hard-coding the provider.
+        let supports_modes = self
+            .connection
+            .as_ref()
+            .map(|c| c.capabilities().supports_modes)
+            .unwrap_or(false);
+        let (model, permission_mode) = (self.model.clone(), self.permission_mode.clone());
+        self.composer.update(cx, |c, cx| {
+            c.set_state(disconnected, turn_active, cx);
+            c.set_controls(model, permission_mode, supports_modes, cx);
+        });
     }
 
     /// Record + transmit a submitted prompt (from the composer's Submit event).
@@ -269,7 +322,7 @@ impl AgentChatView {
         // A prior Stop killed the child but left the session resumable — bring it
         // back with `--resume` before sending so the conversation continues.
         if self.interrupted {
-            self.respawn(self.model.clone(), cx);
+            self.respawn(cx);
         }
         if self.disconnected {
             return; // unrecoverable (a crash, or the resume failed) — nothing to send to
@@ -307,11 +360,13 @@ impl AgentChatView {
     }
 
     /// Reap the current child and spawn a fresh one resuming the same session
-    /// (`--resume <session_id>`) on `model`, rewiring the event drain. The one
-    /// place a live chat re-establishes its subprocess — shared by Stop→next-send
-    /// and a later in-chat model switch. Degrades to a read-only error state if
-    /// the respawn fails.
-    fn respawn(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+    /// (`--resume <session_id>`) with the current model + permission mode,
+    /// rewiring the event drain. The one place a live chat re-establishes its
+    /// subprocess — shared by Stop→next-send, an in-chat model switch, and a
+    /// permission-mode switch (both are fixed at spawn). Reads `self.model` /
+    /// `self.permission_mode`, so callers set those first. Degrades to a
+    /// read-only error state if the respawn fails.
+    fn respawn(&mut self, cx: &mut Context<Self>) {
         // Reap the old connection before replacing it — `Child`'s Drop neither
         // kills nor waits, so after a Stop this harvests the already-dead child
         // (and hard-kills it if somehow still alive).
@@ -319,10 +374,13 @@ impl AgentChatView {
             old.shutdown();
         }
         let session_id = self.thread.session_id.clone();
+        let model = self.model.clone();
+        let permission_mode = self.permission_mode.clone();
         match ClaudeStreamJsonConnection::spawn_resumed(
             &self.cwd,
             model.as_deref(),
             session_id.as_deref(),
+            permission_mode.as_deref(),
         ) {
             Ok((conn, rx)) => {
                 self.connection = Some(Box::new(conn));
@@ -354,67 +412,27 @@ impl AgentChatView {
         }
         self.model = Some(model.clone());
         self.thread.model = Some(model.clone());
-        self.respawn(Some(model.clone()), cx);
+        self.respawn(cx);
+        self.sync_composer(cx); // reflect the new model in the toolbar label
         cx.emit(AgentChatEvent::ModelChanged(model));
         cx.notify();
     }
 
-    /// A slim header bar carrying the model picker (right-aligned). Hidden in
-    /// the read-only error state so that view stays calm.
-    fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.theme;
-        let density = self.density;
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .w_full()
-            .flex_none()
-            .px(px(density.pad_panel))
-            .py(px(density.pad_row))
-            .border_b_1()
-            .border_color(theme.border_inactive)
-            .child(self.render_model_picker(cx))
-            .into_any_element()
-    }
-
-    /// The in-chat model dropdown: a small ghost button labeled with the current
-    /// model, opening a menu of the Claude aliases. Picking one switches the
-    /// model (respawn-resumed). Reasoning-effort is capability-gated and hidden
-    /// for Claude (no runtime reasoning flag), so only the model control shows.
-    fn render_model_picker(&self, cx: &mut Context<Self>) -> DropdownButton {
-        let entity = cx.entity();
-        let current = self
-            .model
-            .clone()
-            .unwrap_or_else(|| CLAUDE_MODELS[1].to_string());
-        let current_for_menu = current.clone();
-        DropdownButton::new("chat-model")
-            .button(Button::new("chat-model-btn").label(current).small().ghost())
-            .small()
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
-                for m in CLAUDE_MODELS {
-                    let selected = current_for_menu == *m;
-                    let display = if selected {
-                        format!("\u{2713} {m}")
-                    } else {
-                        format!("   {m}")
-                    };
-                    let choice = m.to_string();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
-                            window.listener_for(
-                                &entity,
-                                move |view: &mut AgentChatView, _ev: &gpui::ClickEvent, _w, cx| {
-                                    view.change_model(choice.clone(), cx);
-                                },
-                            ),
-                        ),
-                    );
-                }
-                menu
-            })
+    /// Switch the permission mode for this chat tab. Like the model, `--permission
+    /// -mode` is fixed at spawn, so a live switch respawns resumed on the new
+    /// mode. Not persisted (see the field note), so no host event is raised.
+    /// No-op when the mode is unchanged.
+    fn change_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
+        let current = self.permission_mode.as_deref().unwrap_or(DEFAULT_PERMISSION_MODE);
+        if current == mode {
+            return;
+        }
+        // Normalize the baseline to `None` so `respawn` omits the flag entirely.
+        self.permission_mode =
+            (mode != DEFAULT_PERMISSION_MODE).then(|| mode.clone());
+        self.respawn(cx);
+        self.sync_composer(cx); // reflect the new mode in the toolbar label
+        cx.notify();
     }
 
     /// Test-only constructor: inject a connection (a `StubConnection`) instead
@@ -443,6 +461,7 @@ impl AgentChatView {
             typography,
             cwd: PathBuf::new(),
             model: None,
+            permission_mode: None,
             disconnected: false,
             interrupted: false,
             expanded_thinking: HashSet::new(),
@@ -845,7 +864,6 @@ impl Render for AgentChatView {
         if self.stick_to_bottom {
             self.list_scroll.scroll_to_bottom();
         }
-        let header = (!self.disconnected).then(|| self.render_header(cx));
         let transcript = self.render_transcript(cx);
         div()
             .track_focus(&self.focus_handle)
@@ -865,7 +883,6 @@ impl Render for AgentChatView {
                 // composer emits `Submit`, which this view's subscription sends.
                 this.composer.update(cx, |c, cx| c.submit(window, cx));
             }))
-            .children(header)
             .child(transcript)
             .child(self.composer.clone())
     }

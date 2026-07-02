@@ -30,15 +30,21 @@ use super::tool_call::PermissionDecision;
 /// the session from the user's global `~/.claude` hooks (which otherwise
 /// corrupt the permission round-trip — a spike finding).
 pub fn build_args(model: Option<&str>) -> Vec<String> {
-    build_args_with_resume(model, None)
+    build_args_with_resume(model, None, None)
 }
 
 /// Same as [`build_args`], plus `--resume <session_id>` when restoring a
-/// persisted chat. Resuming reuses the original session id (no `--fork-session`)
-/// so the continued conversation keeps its server-side context; the UI already
+/// persisted chat and `--permission-mode <mode>` when the tab is in a non-default
+/// mode. Resuming reuses the original session id (no `--fork-session`) so the
+/// continued conversation keeps its server-side context; the UI already
 /// rehydrated the visible transcript from disk, so this only needs to reconnect
-/// the *next* turn to the prior history.
-pub fn build_args_with_resume(model: Option<&str>, resume_session_id: Option<&str>) -> Vec<String> {
+/// the *next* turn to the prior history. Permission mode is fixed at spawn (like
+/// `--model`), so a live mode switch respawns via this same path.
+pub fn build_args_with_resume(
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+    permission_mode: Option<&str>,
+) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--input-format",
@@ -58,6 +64,17 @@ pub fn build_args_with_resume(model: Option<&str>, resume_session_id: Option<&st
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--model".to_string());
         args.push(m.to_string());
+    }
+    // Only a *non-default* mode is passed. "default" (or none) is the CLI's own
+    // default, so omitting the flag keeps the invocation clean — and because
+    // every mode change respawns a fresh process, omitting genuinely resets to
+    // default rather than inheriting a prior mode.
+    if let Some(pm) = permission_mode
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default")
+    {
+        args.push("--permission-mode".to_string());
+        args.push(pm.to_string());
     }
     if let Some(sid) = resume_session_id.map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--resume".to_string());
@@ -87,9 +104,10 @@ impl ClaudeStreamJsonConnection {
         cwd: &Path,
         model: Option<&str>,
         session_id: Option<&str>,
+        permission_mode: Option<&str>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new("claude");
-        cmd.args(build_args_with_resume(model, session_id))
+        cmd.args(build_args_with_resume(model, session_id, permission_mode))
             .current_dir(cwd);
         Self::spawn_command(cmd)
     }
@@ -239,14 +257,30 @@ mod tests {
 
     #[test]
     fn build_args_appends_resume_when_session_id_set() {
-        let a = build_args_with_resume(None, Some("sid-123"));
+        let a = build_args_with_resume(None, Some("sid-123"), None);
         let i = a.iter().position(|x| x == "--resume").expect("--resume present");
         assert_eq!(a[i + 1], "sid-123");
         // blank / absent session id → no --resume
-        assert!(!build_args_with_resume(None, Some("  ")).iter().any(|x| x == "--resume"));
-        assert!(!build_args_with_resume(None, None).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, Some("  "), None).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, None, None).iter().any(|x| x == "--resume"));
         // plain build_args never resumes
         assert!(!build_args(None).iter().any(|x| x == "--resume"));
+    }
+
+    #[test]
+    fn build_args_appends_permission_mode_only_when_non_default() {
+        let a = build_args_with_resume(None, None, Some("acceptEdits"));
+        let i = a.iter().position(|x| x == "--permission-mode").expect("--permission-mode present");
+        assert_eq!(a[i + 1], "acceptEdits");
+        // "default", blank, and none all omit the flag (a fresh spawn IS default).
+        for pm in [Some("default"), Some("  "), None] {
+            assert!(
+                !build_args_with_resume(None, None, pm).iter().any(|x| x == "--permission-mode"),
+                "{pm:?} must not emit --permission-mode"
+            );
+        }
+        // plain build_args never sets a mode
+        assert!(!build_args(None).iter().any(|x| x == "--permission-mode"));
     }
 
     /// Spawn a FAKE program that prints two stream-json lines; the reader
