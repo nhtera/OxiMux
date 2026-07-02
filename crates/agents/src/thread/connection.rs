@@ -81,20 +81,23 @@ pub fn user_message_json(text: &str) -> Value {
 
 /// Build the stdin `control_response` JSON answering a `can_use_tool` request.
 ///
-/// Fail-closed contract (verified in the Phase-1 spike):
+/// Fail-closed contract (verified against the live CLI):
 /// - **allow** MUST echo `updatedInput` — an allow without it is treated as
 ///   malformed by the CLI and the tool is effectively denied.
+/// - **allow + suggestion** additionally echoes the agent's suggestion verbatim
+///   under `updatedPermissions` (e.g. `setMode: acceptEdits`), which the CLI
+///   applies so it stops prompting for that tool/scope this session. A plain
+///   allow (no `updatedPermissions`) re-prompts the next call — the distinction
+///   is what makes "Allow always" stick.
 /// - **deny** carries a `message` shown to the model.
-///
-/// Applying a suggestion (e.g. "always accept edits this session") is not yet
-/// wired to its own wire field — `AllowWithSuggestion` is sent as a plain
-/// this-once allow for now; suggestion application is a later refinement once
-/// its wire shape is verified live.
 pub fn control_response_json(request_id: &str, decision: &PermissionDecision) -> Value {
     let response = match decision {
-        PermissionDecision::Allow { updated_input }
-        | PermissionDecision::AllowWithSuggestion { updated_input, .. } => {
+        PermissionDecision::Allow { updated_input } => {
             json!({"behavior": "allow", "updatedInput": updated_input})
+        }
+        PermissionDecision::AllowWithSuggestion { updated_input, suggestion } => {
+            json!({"behavior": "allow", "updatedInput": updated_input,
+                   "updatedPermissions": [suggestion.raw]})
         }
         PermissionDecision::Deny { message } => {
             json!({"behavior": "deny", "message": message})
@@ -194,14 +197,26 @@ mod tests {
     }
 
     #[test]
-    fn allow_with_suggestion_falls_back_to_plain_allow() {
+    fn allow_with_suggestion_echoes_updated_permissions() {
+        // "Allow always": allow this call AND apply the suggestion verbatim
+        // under updatedPermissions, so the CLI stops re-prompting.
+        let raw = json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"});
         let d = PermissionDecision::AllowWithSuggestion {
-            updated_input: json!({}),
+            updated_input: json!({"file_path": "a"}),
             suggestion: PermissionSuggestion {
-                kind: "setMode".into(), label: "x".into(), raw: json!({}),
+                kind: "setMode".into(), label: "Always (acceptEdits)".into(), raw: raw.clone(),
             },
         };
-        assert_eq!(control_response_json("r", &d)["response"]["response"]["behavior"], "allow");
+        let r = control_response_json("r", &d);
+        let inner = &r["response"]["response"];
+        assert_eq!(inner["behavior"], "allow");
+        assert_eq!(inner["updatedInput"], json!({"file_path": "a"}));
+        assert_eq!(inner["updatedPermissions"], json!([raw]));
+
+        // A plain allow must NOT carry updatedPermissions (else every allow
+        // would stick as always-allow).
+        let plain = control_response_json("r", &PermissionDecision::Allow { updated_input: json!({}) });
+        assert!(plain["response"]["response"].get("updatedPermissions").is_none());
     }
 
     /// The full app-facing loop: inject agent events → they drive a ChatThread;

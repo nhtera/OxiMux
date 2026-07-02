@@ -184,21 +184,56 @@ fn approval_row(
             }),
         )
     };
-    let reject = pill_button(
-        format!("tool-reject-{}", tc.id),
-        "Reject",
-        theme.status_error,
-        density,
-        typo,
-        cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
-            this.resolve_permission(
-                tool_id.clone(),
-                request_id.clone(),
-                PermissionDecision::Deny { message: "Denied by user".into() },
-                cx,
+    let reject = {
+        let (tool_id, request_id) = (tool_id.clone(), request_id.clone());
+        pill_button(
+            format!("tool-reject-{}", tc.id),
+            "Reject",
+            theme.status_error,
+            density,
+            typo,
+            cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
+                this.resolve_permission(
+                    tool_id.clone(),
+                    request_id.clone(),
+                    PermissionDecision::Deny { message: "Denied by user".into() },
+                    cx,
+                )
+            }),
+        )
+    };
+
+    // One pill per agent-offered suggestion (e.g. "Always (acceptEdits)",
+    // "Always allow this pattern"). Choosing one allows this call AND applies
+    // the suggestion so the CLI stops re-prompting for that tool/scope. Rendered
+    // in a distinct accent from Allow/Reject.
+    let suggestion_pills: Vec<AnyElement> = req
+        .suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, sugg)| {
+            let (tool_id, request_id, input, suggestion) =
+                (tool_id.clone(), request_id.clone(), input.clone(), sugg.clone());
+            pill_button(
+                format!("tool-always-{}-{}", tc.id, i),
+                sugg.label.clone(),
+                theme.status_info,
+                density,
+                typo,
+                cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
+                    this.resolve_permission(
+                        tool_id.clone(),
+                        request_id.clone(),
+                        PermissionDecision::AllowWithSuggestion {
+                            updated_input: input.clone(),
+                            suggestion: suggestion.clone(),
+                        },
+                        cx,
+                    )
+                }),
             )
-        }),
-    );
+        })
+        .collect();
 
     div()
         .flex()
@@ -215,20 +250,22 @@ fn approval_row(
             div()
                 .flex()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap(px(density.gap_inline))
                 .child(allow)
-                .child(reject),
+                .child(reject)
+                .children(suggestion_pills),
         )
         .into_any_element()
 }
 
-/// A small accent-tinted action pill (Allow/Reject). `accent` colors the label
-/// and border; the fill lights up on hover. `on_click` is an entity-bound
+/// A small accent-tinted action pill (Allow/Reject/Always). `accent` colors the
+/// label and border; the fill lights up on hover. `on_click` is an entity-bound
 /// listener (the output of `cx.listener`), passed straight to the element.
 fn pill_button(
     id: String,
-    label: &'static str,
+    label: impl Into<SharedString>,
     accent: gpui::Hsla,
     density: Density,
     typo: &Typography,
@@ -246,7 +283,7 @@ fn pill_button(
         .cursor_pointer()
         .hover(|s| s.bg(accent.opacity(0.12)))
         .on_click(on_click)
-        .child(SharedString::from(label))
+        .child(label.into())
         .into_any_element()
 }
 
