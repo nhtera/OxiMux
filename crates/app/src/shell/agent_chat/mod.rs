@@ -29,6 +29,7 @@ use gpui::{
 };
 use gpui_component::Icon;
 use gpui_component::input::Enter as InputEnter;
+use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
 /// the conversation centered in a comfortable measure rather than stretching
@@ -55,6 +56,14 @@ pub struct AgentChatView {
     composer: Entity<ComposerView>,
     focus_handle: FocusHandle,
     list_scroll: ScrollHandle,
+    /// Whether the transcript auto-follows the bottom. True by default and while
+    /// the user stays at the end; set false when they scroll up to read history
+    /// (so streaming doesn't yank them down), re-armed when they scroll back to
+    /// the bottom or send a new message. `render` re-pins every frame while true,
+    /// which keeps the newest row glued even as its height settles a frame after
+    /// it arrives (markdown/diff measuring) — a single per-event scroll lands
+    /// short in that case.
+    stick_to_bottom: bool,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -177,6 +186,7 @@ impl AgentChatView {
             composer,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
+            stick_to_bottom: true,
             theme,
             density,
             typography,
@@ -240,6 +250,8 @@ impl AgentChatView {
         {
             self.thread.last_error = Some(format!("Send failed: {e}"));
         }
+        // Jump to (and re-arm following of) the bottom for the new turn.
+        self.stick_to_bottom = true;
         self.list_scroll.scroll_to_bottom();
         self.sync_composer(cx);
         cx.notify();
@@ -265,6 +277,7 @@ impl AgentChatView {
             composer,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
+            stick_to_bottom: true,
             theme,
             density,
             typography,
@@ -310,10 +323,23 @@ impl AgentChatView {
     /// Fold one decoded event into the thread and repaint.
     fn on_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
         self.thread.apply(&ev);
+        // Following (and the actual `scroll_to_bottom`) is owned by `render` via
+        // `stick_to_bottom`, so newly-arrived content — streamed text, a tall
+        // tool card, an Allow/Reject row — stays glued as it settles. Nothing to
+        // scroll here; just repaint.
         // The turn's active flag may have flipped (e.g. `TurnEnded`); keep the
         // composer's status line in step.
         self.sync_composer(cx);
         cx.notify();
+    }
+
+    /// Whether the transcript is scrolled to (within one card of) the bottom.
+    /// `offset().y` is `<= 0` and reaches `-max_offset().y` at the very bottom,
+    /// so their sum is the remaining scroll distance. Fresh views (no paint yet)
+    /// report `0`, i.e. "at bottom", so the first turn follows.
+    fn is_near_bottom(&self) -> bool {
+        let sh = &self.list_scroll;
+        sh.max_offset().y + sh.offset().y <= px(160.0)
     }
 
     /// The event channel closed — the agent process exited or its stdout was
@@ -411,13 +437,42 @@ impl AgentChatView {
             .items_center()
             .w_full()
             .flex_1()
+            // `min_h(0)` is essential: a flex child defaults to `min-height:auto`
+            // (= content height), so without this the transcript grows to its
+            // content size instead of shrinking to the flex-allocated space —
+            // its scroll box then extends past the composer and the true bottom
+            // (the newest message / approval row) is never reachable, no matter
+            // the scroll offset. Pinning min-height to 0 lets it shrink so
+            // `overflow_y_scroll` actually bounds the box to the visible area.
+            .min_h(px(0.0))
             .px(px(density.pad_panel))
             .py(px(density.pad_panel))
             .overflow_y_scroll()
-            .track_scroll(&self.list_scroll);
+            .track_scroll(&self.list_scroll)
+            // Release auto-follow when the user scrolls UP to read history (so a
+            // streaming turn doesn't yank them back down); re-arm once they
+            // return to the bottom. gpui's scroll offset grows more negative as
+            // you scroll down, so a positive wheel delta means "toward the top".
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _window, cx| {
+                let dy = ev.delta.pixel_delta(px(20.0)).y;
+                let was = this.stick_to_bottom;
+                if dy > px(0.0) {
+                    this.stick_to_bottom = false;
+                } else if this.is_near_bottom() {
+                    this.stick_to_bottom = true;
+                }
+                if this.stick_to_bottom != was {
+                    cx.notify();
+                }
+            }));
 
         if self.thread.entries.is_empty() {
-            return scroll.child(self.render_empty_hint(&theme, &typo)).into_any_element();
+            // Even the empty state rides the scroll box + overlay so the layout
+            // is identical once messages arrive; the scrollbar auto-hides when
+            // content fits.
+            return self
+                .wrap_scroll(scroll.child(self.render_empty_hint(&theme, &typo)))
+                .into_any_element();
         }
 
         // Turns breathe a little more than inline content — a chat rhythm.
@@ -478,7 +533,33 @@ impl AgentChatView {
         } else if self.thread.turn_active {
             content = content.child(working_indicator(theme, &typo));
         }
-        scroll.child(content).into_any_element()
+        // Trailing clearance INSIDE the scrollable content, above the composer.
+        // `scroll_to_bottom` pins the offset to gpui's `scroll_max`, which is
+        // derived from the content height sampled at layout — but a rich-text /
+        // markdown row's final painted height settles a hair TALLER than that
+        // sample, so the pinned offset stops a few pixels short of the true
+        // bottom and the newest row's descenders (or an Allow/Reject row) tuck
+        // under the composer. A generous scrollable trailing gap absorbs that
+        // fixed shortfall: it's real content (folded into `scroll_max`), so the
+        // last real row always lands clear of the composer with breathing room.
+        content = content.child(div().flex_none().w_full().h(px(density.pad_panel * 3.0)));
+        self.wrap_scroll(scroll.child(content)).into_any_element()
+    }
+
+    /// Wrap the scrolling transcript box in a positioned container and overlay a
+    /// fading scrollbar bound to the SAME [`ScrollHandle`]. The bar paints on the
+    /// container's right edge, auto-hides when the content fits, and — being a
+    /// `Normal` hitbox gated to its own 16px strip — never blocks clicks on the
+    /// messages, tool cards, or Allow/Reject rows beneath it.
+    fn wrap_scroll(&self, scroll_box: impl IntoElement) -> gpui::Div {
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(scroll_box)
+            .child(Scrollbar::vertical(&self.list_scroll))
     }
 
     fn render_empty_hint(&self, theme: &Theme, typo: &Typography) -> AnyElement {
@@ -552,6 +633,16 @@ impl Render for AgentChatView {
             window.defer(cx, move |window, cx| {
                 composer.read(cx).focus_handle(cx).focus(window, cx);
             });
+        }
+        // Re-pin to the bottom every frame while following. Re-asserting each
+        // render (not just once per event) keeps the newest row glued as its
+        // height settles a frame after it arrives (markdown/diff measuring) and
+        // through the end of the turn — a single per-event scroll lands short in
+        // that case. Released when the user scrolls up (see the wheel handler on
+        // the transcript). `scroll_to_bottom` only sets a flag consumed at paint,
+        // so this is cheap.
+        if self.stick_to_bottom {
+            self.list_scroll.scroll_to_bottom();
         }
         let transcript = self.render_transcript(cx);
         div()
