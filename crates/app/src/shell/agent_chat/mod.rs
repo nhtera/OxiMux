@@ -24,19 +24,34 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Transformation,
-    WeakEntity, Window, div, percentage, px,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context,
+    Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    Transformation, WeakEntity, Window, div, percentage, px,
 };
 use gpui_component::Icon;
+use gpui_component::Sizable as _;
+use gpui_component::button::{Button, ButtonVariants, DropdownButton};
 use gpui_component::input::Enter as InputEnter;
+use gpui_component::menu::PopupMenuItem;
 use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
 /// the conversation centered in a comfortable measure rather than stretching
 /// text edge-to-edge — the calm, focused feel of a dedicated chat surface.
 pub(super) const CONTENT_MAX_W: f32 = 720.0;
+
+/// Claude model aliases offered in the in-chat model picker. The CLI accepts
+/// these short aliases directly as `--model`. (There is no model *list* in
+/// settings — only a single default — so the selectable set is fixed here.)
+const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+
+/// Events the chat view raises for its host (the pane group) to act on.
+pub enum AgentChatEvent {
+    /// The user picked a different model; the host persists it in the tab kind
+    /// so the choice survives relaunch (the view already respawned on it).
+    ModelChanged(String),
+}
 
 use composer::{ComposerEvent, ComposerView};
 use oximux_agents::thread::{
@@ -326,6 +341,80 @@ impl AgentChatView {
                 self.interrupted = false;
             }
         }
+    }
+
+    /// Switch the model for this chat tab. The CLI fixes `--model` at spawn, so
+    /// a live switch reuses the resume path: kill the child and respawn it
+    /// resumed on the new model (the conversation continues). The choice is
+    /// raised as an event so the host persists it in the tab kind. No-op when
+    /// the model is unchanged.
+    fn change_model(&mut self, model: String, cx: &mut Context<Self>) {
+        if self.model.as_deref() == Some(model.as_str()) {
+            return;
+        }
+        self.model = Some(model.clone());
+        self.thread.model = Some(model.clone());
+        self.respawn(Some(model.clone()), cx);
+        cx.emit(AgentChatEvent::ModelChanged(model));
+        cx.notify();
+    }
+
+    /// A slim header bar carrying the model picker (right-aligned). Hidden in
+    /// the read-only error state so that view stays calm.
+    fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let density = self.density;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .w_full()
+            .flex_none()
+            .px(px(density.pad_panel))
+            .py(px(density.pad_row))
+            .border_b_1()
+            .border_color(theme.border_inactive)
+            .child(self.render_model_picker(cx))
+            .into_any_element()
+    }
+
+    /// The in-chat model dropdown: a small ghost button labeled with the current
+    /// model, opening a menu of the Claude aliases. Picking one switches the
+    /// model (respawn-resumed). Reasoning-effort is capability-gated and hidden
+    /// for Claude (no runtime reasoning flag), so only the model control shows.
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> DropdownButton {
+        let entity = cx.entity();
+        let current = self
+            .model
+            .clone()
+            .unwrap_or_else(|| CLAUDE_MODELS[1].to_string());
+        let current_for_menu = current.clone();
+        DropdownButton::new("chat-model")
+            .button(Button::new("chat-model-btn").label(current).small().ghost())
+            .small()
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
+                for m in CLAUDE_MODELS {
+                    let selected = current_for_menu == *m;
+                    let display = if selected {
+                        format!("\u{2713} {m}")
+                    } else {
+                        format!("   {m}")
+                    };
+                    let choice = m.to_string();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
+                            window.listener_for(
+                                &entity,
+                                move |view: &mut AgentChatView, _ev: &gpui::ClickEvent, _w, cx| {
+                                    view.change_model(choice.clone(), cx);
+                                },
+                            ),
+                        ),
+                    );
+                }
+                menu
+            })
     }
 
     /// Test-only constructor: inject a connection (a `StubConnection`) instead
@@ -722,6 +811,8 @@ impl Drop for AgentChatView {
     }
 }
 
+impl EventEmitter<AgentChatEvent> for AgentChatView {}
+
 impl Focusable for AgentChatView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -754,6 +845,7 @@ impl Render for AgentChatView {
         if self.stick_to_bottom {
             self.list_scroll.scroll_to_bottom();
         }
+        let header = (!self.disconnected).then(|| self.render_header(cx));
         let transcript = self.render_transcript(cx);
         div()
             .track_focus(&self.focus_handle)
@@ -773,6 +865,7 @@ impl Render for AgentChatView {
                 // composer emits `Submit`, which this view's subscription sends.
                 this.composer.update(cx, |c, cx| c.submit(window, cx));
             }))
+            .children(header)
             .child(transcript)
             .child(self.composer.clone())
     }

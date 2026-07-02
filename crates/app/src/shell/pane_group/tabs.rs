@@ -797,6 +797,13 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) -> usize {
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        // Fold an in-chat model switch back into this tab's kind so the choice
+        // survives relaunch (the layout persists the kind). Detached: it stops
+        // firing and is cleaned up when the chat view is dropped (tab closed).
+        cx.subscribe(&view, |this, v, ev: &crate::shell::agent_chat::AgentChatEvent, cx| {
+            this.on_agent_chat_event(&v, ev, cx);
+        })
+        .detach();
         let n = self
             .tabs
             .iter()
@@ -825,6 +832,30 @@ impl PaneGroup {
         self.pin_tab_strip_to_end();
         cx.notify();
         new_idx
+    }
+
+    /// Handle an event raised by an Agent Chat view. Currently only a model
+    /// switch: fold it into the owning tab's kind so a relaunch reopens the
+    /// chat on the chosen model (the layout persists the kind).
+    fn on_agent_chat_event(
+        &mut self,
+        view: &Entity<crate::shell::agent_chat::AgentChatView>,
+        ev: &crate::shell::agent_chat::AgentChatEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match ev {
+            crate::shell::agent_chat::AgentChatEvent::ModelChanged(model) => {
+                for tab in &mut self.tabs {
+                    if let PaneContent::AgentChat(v) = &tab.content
+                        && v.entity_id() == view.entity_id()
+                        && let PaneGroupTabKind::AgentChat { model: m, .. } = &mut tab.kind
+                    {
+                        *m = Some(model.clone());
+                    }
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Open or activate a commit-detail tab. Dedup key is the full
