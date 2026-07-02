@@ -318,34 +318,36 @@ impl Render for ComposerView {
                 .child(SharedString::from("↑"))
         };
 
-        // The bottom toolbar (inside the pill, below the input), mirroring Claude
-        // Desktop's composer: the permission-mode picker on the far LEFT, then a
-        // `flex_1` spacer, then the model picker and the Send/Stop action on the
-        // far RIGHT. The model sits next to Send (the two most-used controls
-        // grouped) while the mode — a safety setting — anchors the opposite edge.
-        let mut toolbar = div()
+        // The controls row that sits BELOW the input box (outside the rounded
+        // pill, on the composer background), mirroring Claude Desktop's composer:
+        // the permission-mode picker on the far LEFT, then a `flex_1` spacer, then
+        // the model picker and the Send/Stop action on the far RIGHT. The model
+        // sits next to Send (the two most-used controls grouped) while the mode —
+        // a safety setting — anchors the opposite edge.
+        let mut controls = div()
             .flex()
             .flex_row()
             .items_center()
             .w_full()
+            .px(px(density.pad_row))
             .gap(px(density.gap_inline));
         if self.supports_modes {
-            toolbar = toolbar.child(self.render_permission_picker(cx));
+            controls = controls.child(self.render_permission_picker(cx));
         }
-        let toolbar = toolbar
+        let controls = controls
             .child(div().flex_1())
             .child(self.render_model_picker(cx))
             .child(action_button);
 
-        // The pill: a rounded, focus-reactive frame stacking the borderless input
-        // over the toolbar (a column). The single-line input self-sizes to one
-        // row and the toolbar is a fixed-height row, so the pill keeps a stable
-        // footprint that never resizes when a message is sent. `appearance(false)`
-        // drops the input's own box so it doesn't nest a second frame inside.
+        // The pill: a rounded, focus-reactive frame around the borderless input
+        // ONLY. The single-line input self-sizes to one row, so the pill keeps a
+        // stable, compact footprint that never resizes when a message is sent.
+        // `appearance(false)` drops the input's own box so it doesn't nest a
+        // second frame inside. The controls live below it, not within.
         let pill = div()
             .flex()
-            .flex_col()
-            .gap(px(density.gap_inline))
+            .flex_row()
+            .items_center()
             .w_full()
             .rounded(px(14.0))
             .border_1()
@@ -354,13 +356,10 @@ impl Render for ComposerView {
             .px(px(density.pad_panel))
             .py(px(density.pad_row))
             .child(
-                div().w_full().child(
-                    Input::new(&self.input)
-                        .appearance(false)
-                        .text_size(px(typo.t_body_md)),
-                ),
-            )
-            .child(toolbar);
+                Input::new(&self.input)
+                    .appearance(false)
+                    .text_size(px(typo.t_body_md)),
+            );
 
         div()
             .flex()
@@ -371,14 +370,18 @@ impl Render for ComposerView {
             .border_color(theme.border_inactive)
             .p(px(density.pad_panel))
             .child(
-                // Match the transcript's centered reading column so the pill
-                // lines up with the messages above it on wide windows.
+                // Match the transcript's centered reading column so the pill +
+                // controls line up with the messages above on wide windows. The
+                // input box on top, its controls on a row below (Claude Desktop
+                // layout).
                 div()
                     .flex()
                     .flex_col()
                     .w_full()
                     .max_w(px(super::CONTENT_MAX_W))
-                    .child(pill),
+                    .gap(px(density.gap_inline))
+                    .child(pill)
+                    .child(controls),
             )
     }
 }
