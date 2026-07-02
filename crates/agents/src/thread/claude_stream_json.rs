@@ -18,10 +18,11 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use super::connection::{
-    control_response_json, user_message_json, user_message_json_with_images, AgentCapabilities,
-    AgentConnection,
+    control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
+    AgentCapabilities, AgentConnection,
 };
 use super::entry::ChatImage;
+use super::question::{AskQuestion, QuestionAnswers};
 use super::event::ThreadEvent;
 use super::stream_json::decode_line;
 use super::tool_call::PermissionDecision;
@@ -182,6 +183,15 @@ impl AgentConnection for ClaudeStreamJsonConnection {
 
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         self.write_line(&control_response_json(request_id, &decision))
+    }
+
+    fn answer_question(
+        &self,
+        request_id: &str,
+        questions: &[AskQuestion],
+        answers: &QuestionAnswers,
+    ) -> Result<()> {
+        self.write_line(&question_answer_json(request_id, questions, answers))
     }
 
     fn capabilities(&self) -> AgentCapabilities {

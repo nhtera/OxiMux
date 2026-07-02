@@ -14,6 +14,7 @@
 
 use super::entry::{AssistantMessage, ChatImage, ThreadEntry};
 use super::event::{ThreadEvent, TurnUsage};
+use super::question::QuestionRequest;
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
 
 #[derive(Debug, Default)]
@@ -63,7 +64,10 @@ impl ChatThread {
     ) -> Self {
         for entry in &mut entries {
             if let ThreadEntry::ToolCall(tc) = entry
-                && matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_))
+                && matches!(
+                    tc.status,
+                    ToolCallStatus::WaitingForConfirmation(_) | ToolCallStatus::AwaitingAnswer(_)
+                )
             {
                 tc.status = ToolCallStatus::Rejected;
             }
@@ -189,6 +193,35 @@ impl ChatThread {
                     }
                 }
             }
+            ThreadEvent::QuestionAsked { request_id, tool_use_id, questions } => {
+                // Ignore a malformed/empty question set rather than entering an
+                // unanswerable `AwaitingAnswer` — an empty-indexed card render
+                // would panic, and there is nothing for the user to answer. The
+                // CLI validates 1-4 questions, so this only guards garbled input.
+                if !questions.is_empty() {
+                    let req = QuestionRequest {
+                        request_id: request_id.clone(),
+                        questions: questions.clone(),
+                    };
+                    let matched = tool_use_id.as_deref().and_then(|id| self.tool_call_mut(id));
+                    match matched {
+                        Some(tc) => tc.status = ToolCallStatus::AwaitingAnswer(req),
+                        None => {
+                            // No matching tool_use block (unexpected ordering /
+                            // null id) — synthesize the card anyway so the user
+                            // can still answer, keyed on the tool_use_id (fallback
+                            // request_id).
+                            let mut tc = ToolCall::new(
+                                tool_use_id.clone().unwrap_or_else(|| request_id.clone()),
+                                "AskUserQuestion",
+                                serde_json::Value::Null,
+                            );
+                            tc.status = ToolCallStatus::AwaitingAnswer(req);
+                            self.entries.push(ThreadEntry::ToolCall(tc));
+                        }
+                    }
+                }
+            }
             ThreadEvent::TurnSummary { detail, .. } => {
                 self.last_summary = Some(detail.clone());
                 self.end_assistant_window();
@@ -224,7 +257,10 @@ impl ChatThread {
         self.turn_active = false;
         for entry in &mut self.entries {
             if let ThreadEntry::ToolCall(tc) = entry
-                && matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_))
+                && matches!(
+                    tc.status,
+                    ToolCallStatus::WaitingForConfirmation(_) | ToolCallStatus::AwaitingAnswer(_)
+                )
             {
                 tc.status = ToolCallStatus::Rejected;
             }
@@ -245,6 +281,17 @@ impl ChatThread {
         self.entries.iter().find_map(|e| match e {
             ThreadEntry::ToolCall(tc) => match &tc.status {
                 ToolCallStatus::WaitingForConfirmation(req) => Some((tc.id.as_str(), req)),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// The pending AskUserQuestion (if any) awaiting the user's answers.
+    pub fn pending_question(&self) -> Option<(&str, &QuestionRequest)> {
+        self.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) => match &tc.status {
+                ToolCallStatus::AwaitingAnswer(req) => Some((tc.id.as_str(), req)),
                 _ => None,
             },
             _ => None,
@@ -393,6 +440,92 @@ mod tests {
         // deny → rejected, no longer pending
         t.set_tool_status("toolu_9", ToolCallStatus::Rejected);
         assert!(t.pending_permission().is_none());
+    }
+
+    #[test]
+    fn question_asked_marks_tool_call_and_settles_on_result() {
+        use crate::thread::question::parse_questions;
+        let mut t = ChatThread::new();
+        t.push_user_message("choose");
+        let input = json!({"questions":[{"question":"Tabs or spaces?","header":"Indent",
+            "options":[{"label":"Tabs","description":""},{"label":"Spaces","description":""}],
+            "multiSelect":false}]});
+        // The tool_use block lands first, then the AskUserQuestion control_request.
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_q".into(), name: "AskUserQuestion".into(), input: input.clone() });
+        t.apply(&ThreadEvent::QuestionAsked {
+            request_id: "rid-q".into(), tool_use_id: Some("toolu_q".into()),
+            questions: parse_questions(&input) });
+
+        let (tool_id, req) = t.pending_question().expect("a pending question");
+        assert_eq!(tool_id, "toolu_q");
+        assert_eq!(req.request_id, "rid-q");
+        assert_eq!(req.questions.len(), 1);
+        assert!(t.pending_permission().is_none(), "a question is not a permission");
+        // folded onto the existing tool_use — not duplicated
+        assert_eq!(t.entries.iter().filter(|e| matches!(e, ThreadEntry::ToolCall(_))).count(), 1);
+
+        // the real tool_result (after we answer) settles it to Completed
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "toolu_q".into(),
+            content: "Your questions have been answered: \"Tabs or spaces?\"=\"Tabs\".".into(),
+            is_error: false });
+        assert!(t.pending_question().is_none());
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Completed),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rehydrate_and_interrupt_fail_close_a_pending_question() {
+        use crate::thread::question::parse_questions;
+        let input = json!({"questions":[{"question":"Q?","header":"H",
+            "options":[{"label":"A","description":""}],"multiSelect":false}]});
+        let mut tc = ToolCall::new("toolu_q", "AskUserQuestion", input.clone());
+        tc.status = ToolCallStatus::AwaitingAnswer(QuestionRequest {
+            request_id: "rid".into(), questions: parse_questions(&input) });
+
+        // rehydrate fail-closes (the process that asked is gone)
+        let t = ChatThread::rehydrated(None, None, vec![ThreadEntry::ToolCall(tc.clone())]);
+        assert!(t.pending_question().is_none(), "no pending question survives restore");
+        match &t.entries[0] {
+            ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Rejected),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // interrupt (Stop) also fail-closes
+        let mut t2 = ChatThread::new();
+        t2.entries.push(ThreadEntry::ToolCall(tc));
+        t2.turn_active = true;
+        t2.interrupt();
+        assert!(t2.pending_question().is_none(), "interrupt fail-closes the question");
+    }
+
+    #[test]
+    fn empty_question_set_is_ignored_not_stranded() {
+        // A malformed/garbled AskUserQuestion with no questions must NOT become
+        // an AwaitingAnswer (an empty-indexed card render would panic) — the
+        // event is dropped and the tool_use is left untouched.
+        let mut t = ChatThread::new();
+        t.push_user_message("go");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "t1".into(),
+            name: "AskUserQuestion".into(),
+            input: json!({"questions": []}),
+        });
+        t.apply(&ThreadEvent::QuestionAsked {
+            request_id: "rq".into(),
+            tool_use_id: Some("t1".into()),
+            questions: vec![],
+        });
+        assert!(t.pending_question().is_none(), "empty questions never becomes pending");
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => {
+                assert_eq!(tc.status, ToolCallStatus::InProgress, "tool_use left untouched");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]

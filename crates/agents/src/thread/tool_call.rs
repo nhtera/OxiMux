@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::question::QuestionRequest;
+
 /// A single tool invocation inside an assistant turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -51,6 +53,9 @@ impl ToolCall {
 pub enum ToolCallStatus {
     Pending,
     WaitingForConfirmation(PermissionRequest),
+    /// An `AskUserQuestion` awaiting the user's selections (rendered as the
+    /// interactive question card rather than an Allow/Reject card).
+    AwaitingAnswer(QuestionRequest),
     InProgress,
     Completed,
     Failed(String),

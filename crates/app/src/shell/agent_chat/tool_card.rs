@@ -271,10 +271,11 @@ fn approval_row(
         .into_any_element()
 }
 
-/// A small accent-tinted action pill (Allow/Reject/Always). `accent` colors the
-/// label and border; the fill lights up on hover. `on_click` is an entity-bound
-/// listener (the output of `cx.listener`), passed straight to the element.
-fn pill_button(
+/// A small accent-tinted action pill (Allow/Reject/Always/Submit/Skip). `accent`
+/// colors the label and border; the fill lights up on hover. `on_click` is an
+/// entity-bound listener (the output of `cx.listener`), passed straight to the
+/// element. Shared with the question card.
+pub(super) fn pill_button(
     id: String,
     label: impl Into<SharedString>,
     accent: gpui::Hsla,

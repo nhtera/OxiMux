@@ -9,6 +9,7 @@
 use serde_json::Value;
 
 use super::event::{ThreadEvent, TurnUsage};
+use super::question::parse_questions;
 use super::tool_call::PermissionSuggestion;
 
 /// Decode one newline-delimited stream-json line. Returns the events it
@@ -128,6 +129,16 @@ fn decode_control_request(v: &Value) -> Vec<ThreadEvent> {
     let req = &v["request"];
     if req.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
         return Vec::new();
+    }
+    // AskUserQuestion rides the same `can_use_tool` channel but is answered with
+    // selections, not Allow/Reject — surface it as a distinct event so the UI
+    // renders the interactive question card instead of a permission card.
+    if req.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") {
+        return vec![ThreadEvent::QuestionAsked {
+            request_id: str_field(v, "request_id"),
+            tool_use_id: req.get("tool_use_id").and_then(Value::as_str).map(str::to_string),
+            questions: parse_questions(req.get("input").unwrap_or(&Value::Null)),
+        }];
     }
     let suggestions = req["permission_suggestions"]
         .as_array()
@@ -303,6 +314,34 @@ mod tests {
             }
             other => panic!("expected PermissionRequested, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_ask_user_question_as_question_event_not_permission() {
+        // AskUserQuestion arrives on the can_use_tool channel but must decode to
+        // QuestionAsked (the interactive card), NOT PermissionRequested.
+        let l = json!({"type":"control_request","request_id":"rid-q","request":{
+            "subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion",
+            "input":{"questions":[{"question":"Tabs or spaces?","header":"Indent",
+                "options":[{"label":"Tabs","description":"tab chars"},{"label":"Spaces","description":"space chars"}],
+                "multiSelect":false}]},
+            "tool_use_id":"toolu_q"}}).to_string();
+        match &decode_line(&l)[0] {
+            ThreadEvent::QuestionAsked { request_id, tool_use_id, questions } => {
+                assert_eq!(request_id, "rid-q");
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_q"));
+                assert_eq!(questions.len(), 1);
+                assert_eq!(questions[0].question, "Tabs or spaces?");
+                assert_eq!(questions[0].options.len(), 2);
+                assert!(!questions[0].multi_select());
+            }
+            other => panic!("expected QuestionAsked, got {other:?}"),
+        }
+        // A real gated tool on the same channel still decodes to a permission.
+        let edit = json!({"type":"control_request","request_id":"rid-e","request":{
+            "subtype":"can_use_tool","tool_name":"Edit","input":{"file_path":"a"},"description":"a",
+            "tool_use_id":"toolu_e"}}).to_string();
+        assert!(matches!(decode_line(&edit)[0], ThreadEvent::PermissionRequested { .. }));
     }
 
     #[test]

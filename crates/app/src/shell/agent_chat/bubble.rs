@@ -104,6 +104,9 @@ pub(super) fn status_glyph(status: &ToolCallStatus, theme: Theme) -> (&'static s
     match status {
         ToolCallStatus::Pending | ToolCallStatus::InProgress => ("▸", theme.fg_subtle),
         ToolCallStatus::WaitingForConfirmation(_) => ("⏸", theme.status_warn),
+        // Rendered by the dedicated question card, not this glyph — the arm just
+        // keeps the match exhaustive.
+        ToolCallStatus::AwaitingAnswer(_) => ("?", theme.status_warn),
         ToolCallStatus::Completed => ("✓", theme.status_ok),
         ToolCallStatus::Failed(_) => ("✗", theme.status_error),
         ToolCallStatus::Rejected | ToolCallStatus::Canceled => ("⊘", theme.fg_subtle),

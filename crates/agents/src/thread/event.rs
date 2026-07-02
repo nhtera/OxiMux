@@ -7,6 +7,7 @@
 
 use serde_json::Value;
 
+use super::question::AskQuestion;
 use super::tool_call::PermissionSuggestion;
 
 /// Per-turn token/cost usage, decoded from the final `result` event. All counts
@@ -61,6 +62,15 @@ pub enum ThreadEvent {
         input: Value,
         description: String,
         suggestions: Vec<PermissionSuggestion>,
+    },
+    /// Claude called `AskUserQuestion`: a multiple-choice clarification the user
+    /// answers via the interactive question card. Distinct from a permission
+    /// prompt — it arrives on the same `can_use_tool` control channel but is
+    /// answered with selections, not Allow/Reject.
+    QuestionAsked {
+        request_id: String,
+        tool_use_id: Option<String>,
+        questions: Vec<AskQuestion>,
     },
     /// One-line turn summary (`system/post_turn_summary`).
     TurnSummary {

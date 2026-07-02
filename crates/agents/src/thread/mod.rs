@@ -16,17 +16,22 @@ pub mod claude_stream_json;
 pub mod connection;
 pub mod entry;
 pub mod event;
+pub mod question;
 pub mod state;
 pub mod stream_json;
 pub mod tool_call;
 
 pub use claude_stream_json::{build_args, ClaudeStreamJsonConnection};
 pub use connection::{
-    control_response_json, user_message_json, user_message_json_with_images, AgentCapabilities,
-    AgentConnection, StubConnection,
+    control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
+    AgentCapabilities, AgentConnection, StubConnection,
 };
 pub use entry::{AssistantMessage, ChatImage, ThreadEntry};
 pub use event::{ThreadEvent, TurnUsage};
+pub use question::{
+    parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,
+    QuestionKind, QuestionOption, QuestionRequest,
+};
 pub use state::ChatThread;
 pub use stream_json::decode_line;
 pub use tool_call::{

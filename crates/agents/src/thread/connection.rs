@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use super::entry::ChatImage;
 use super::event::ThreadEvent;
+use super::question::{updated_input_json, AskQuestion, QuestionAnswers};
 use super::tool_call::PermissionDecision;
 
 /// What a backend can do, so the UI shows/hides controls by capability instead
@@ -59,6 +60,20 @@ pub trait AgentConnection: Send {
 
     /// Answer a pending permission request by its `request_id`.
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()>;
+
+    /// Answer a pending `AskUserQuestion` by its `request_id`, sending the user's
+    /// selections back as a control_response. Default: unsupported (so ACP/stub
+    /// backends compile unchanged); the Claude backend overrides it.
+    fn answer_question(
+        &self,
+        request_id: &str,
+        questions: &[AskQuestion],
+        answers: &QuestionAnswers,
+    ) -> Result<()> {
+        let _ = (request_id, questions, answers);
+        anyhow::bail!("this agent does not support answering questions")
+    }
+
     /// Terminate the session and its process.
     fn shutdown(&self);
 
@@ -141,6 +156,21 @@ pub fn control_response_json(request_id: &str, decision: &PermissionDecision) ->
         "subtype": "success", "request_id": request_id, "response": response}})
 }
 
+/// Build the stdin `control_response` JSON answering an `AskUserQuestion`
+/// `can_use_tool` request. Structurally a permission-style `allow`, but the
+/// `updatedInput` carries the echoed questions plus the user's `answers` map
+/// (keyed by question text) and an optional overall `response` — the shape the
+/// tool reads to produce its result (verified against the live CLI).
+pub fn question_answer_json(
+    request_id: &str,
+    questions: &[AskQuestion],
+    answers: &QuestionAnswers,
+) -> Value {
+    json!({"type": "control_response", "response": {
+        "subtype": "success", "request_id": request_id, "response": {
+            "behavior": "allow", "updatedInput": updated_input_json(questions, answers)}}})
+}
+
 /// A test double: records everything sent to the "agent" and lets a test inject
 /// `ThreadEvent`s (via the returned `Sender`) as if the agent produced them.
 /// Used to exercise the app-facing loop (drain events → `ChatThread`; user
@@ -177,6 +207,15 @@ impl AgentConnection for StubConnection {
     }
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         self.record(control_response_json(request_id, &decision));
+        Ok(())
+    }
+    fn answer_question(
+        &self,
+        request_id: &str,
+        questions: &[AskQuestion],
+        answers: &QuestionAnswers,
+    ) -> Result<()> {
+        self.record(question_answer_json(request_id, questions, answers));
         Ok(())
     }
     fn shutdown(&self) {}
@@ -235,6 +274,33 @@ mod tests {
         assert_eq!(v["response"]["response"]["behavior"], "allow");
         // updatedInput is REQUIRED — a bare allow is malformed.
         assert_eq!(v["response"]["response"]["updatedInput"], json!({"file_path": "a"}));
+    }
+
+    #[test]
+    fn answer_question_json_shape_and_stub_records() {
+        use crate::thread::question::{parse_questions, QuestionAnswer, QuestionAnswers};
+        let questions = parse_questions(&json!({"questions":[
+            {"question":"Tabs or spaces?","header":"Indent",
+             "options":[{"label":"Tabs","description":""}],"multiSelect":false}]}));
+        let mut answers = QuestionAnswers::default();
+        answers.by_question.insert(
+            "q-0".into(),
+            QuestionAnswer { selected: vec!["Tabs".into()], custom: None },
+        );
+        let v = question_answer_json("rid-q", &questions, &answers);
+        assert_eq!(v["type"], "control_response");
+        assert_eq!(v["response"]["subtype"], "success");
+        assert_eq!(v["response"]["request_id"], "rid-q");
+        assert_eq!(v["response"]["response"]["behavior"], "allow");
+        // answers map is keyed by the full question TEXT
+        assert_eq!(
+            v["response"]["response"]["updatedInput"]["answers"]["Tabs or spaces?"],
+            json!("Tabs")
+        );
+        // the stub records the identical control_response
+        let stub = StubConnection::default();
+        stub.answer_question("rid-q", &questions, &answers).unwrap();
+        assert_eq!(stub.sent()[0], v);
     }
 
     #[test]

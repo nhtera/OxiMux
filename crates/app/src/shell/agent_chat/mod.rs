@@ -16,6 +16,7 @@ mod composer;
 mod diff_card;
 mod image_attach;
 mod plan_panel;
+mod question_card;
 mod tool_bodies;
 mod tool_card;
 
@@ -41,6 +42,12 @@ use gpui_component::scroll::Scrollbar;
 /// the conversation centered in a comfortable measure rather than stretching
 /// text edge-to-edge — the calm, focused feel of a dedicated chat surface.
 pub(super) const CONTENT_MAX_W: f32 = 720.0;
+
+/// How many frames to keep re-pinning the transcript to the bottom after a
+/// content change (see [`AgentChatView::follow_frames`]). ~10 frames (≈160ms at
+/// 60fps) comfortably outlasts the async markdown parse/layout of a normal reply
+/// so the follow catches the message's settled height, then stops (no idle spin).
+const FOLLOW_FRAMES: u8 = 10;
 
 /// Claude model aliases offered in the in-chat model picker. The CLI accepts
 /// these short aliases directly as `--model`. (There is no model *list* in
@@ -93,9 +100,10 @@ pub enum AgentChatEvent {
 }
 
 use composer::{ComposerEvent, ComposerView};
+use question_card::{QuestionCard, QuestionCardEvent};
 use oximux_agents::thread::{
     AgentConnection, ChatImage, ChatThread, ClaudeStreamJsonConnection, PermissionDecision,
-    ThreadEntry, ThreadEvent, ToolCallStatus, TurnUsage,
+    QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus, TurnUsage,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -120,6 +128,24 @@ pub struct AgentChatView {
     /// it arrives (markdown/diff measuring) — a single per-event scroll lands
     /// short in that case.
     stick_to_bottom: bool,
+    /// Extra render frames to force after a content change while following. The
+    /// markdown renderer parses/lays out ASYNCHRONOUSLY, so the frame a message
+    /// arrives its final height isn't known yet — `scroll_to_bottom` pins to a
+    /// too-short `content_size` and the newest (tallest) reply tucks under the
+    /// composer. The async layout completes on the nested text entity and does
+    /// NOT re-run this view's `render`, so the pin never corrects (a tab-switch
+    /// re-triggers the same race, which is why it looked permanent). Counting a
+    /// few frames down here — each forcing a re-render that re-pins to the now-
+    /// settled `content_size` — lets the follow catch the true bottom. The count
+    /// is re-armed each frame the scrollable height keeps growing (see
+    /// [`Self::last_max_offset`]), so a slow or large async layout is followed to
+    /// completion rather than cut off after a fixed number of frames.
+    follow_frames: u8,
+    /// The transcript's scrollable extent (`max_offset().y`) as of the last
+    /// render, used to detect that the async layout is still settling: while this
+    /// keeps growing the follow re-arms; once it holds steady the follow winds
+    /// down and the frame loop stops (no idle repaint).
+    last_max_offset: f32,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -166,6 +192,12 @@ pub struct AgentChatView {
     /// unwind). Keep that the single cleanup owner across future refactors.
     _drain_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+    /// Interactive AskUserQuestion cards for tool calls awaiting answers, keyed
+    /// by tool-call id. Each is its own entity so its text inputs repaint without
+    /// rebuilding the transcript; reconciled from the thread each render.
+    question_cards: HashMap<String, Entity<QuestionCard>>,
+    /// Event subscriptions for the cards above, kept alive alongside each card.
+    question_card_subs: HashMap<String, Subscription>,
 }
 
 impl AgentChatView {
@@ -294,6 +326,11 @@ impl AgentChatView {
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             stick_to_bottom: true,
+            // Kick the follow so a restored transcript (which loads at
+            // construction, not via `on_event`) is pinned to the true bottom
+            // once its async markdown layout settles.
+            follow_frames: FOLLOW_FRAMES,
+            last_max_offset: 0.0,
             theme,
             density,
             typography,
@@ -309,6 +346,8 @@ impl AgentChatView {
             preview: None,
             _drain_task: drain_task,
             _subscriptions: subscriptions,
+            question_cards: HashMap::new(),
+            question_card_subs: HashMap::new(),
         }
     }
 
@@ -539,6 +578,11 @@ impl AgentChatView {
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             stick_to_bottom: true,
+            // Kick the follow so a restored transcript (which loads at
+            // construction, not via `on_event`) is pinned to the true bottom
+            // once its async markdown layout settles.
+            follow_frames: FOLLOW_FRAMES,
+            last_max_offset: 0.0,
             theme,
             density,
             typography,
@@ -554,6 +598,8 @@ impl AgentChatView {
             preview: None,
             _drain_task: None,
             _subscriptions: Vec::new(),
+            question_cards: HashMap::new(),
+            question_card_subs: HashMap::new(),
         }
     }
 
@@ -598,8 +644,13 @@ impl AgentChatView {
         }
         // Following (and the actual `scroll_to_bottom`) is owned by `render` via
         // `stick_to_bottom`, so newly-arrived content — streamed text, a tall
-        // tool card, an Allow/Reject row — stays glued as it settles. Nothing to
-        // scroll here; just repaint.
+        // tool card, an Allow/Reject row — stays glued as it settles. Arm a short
+        // run of follow frames so the pin keeps re-asserting for a moment after
+        // this event: the markdown lays out async, so its true height (and thus
+        // the correct `content_size`) only lands a few frames later.
+        if self.stick_to_bottom {
+            self.follow_frames = FOLLOW_FRAMES;
+        }
         // The turn's active flag may have flipped (e.g. `TurnEnded`); keep the
         // composer's status line in step.
         self.sync_composer(cx);
@@ -633,6 +684,14 @@ impl AgentChatView {
                 );
             }
             self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
+        }
+        // Fail-close a pending AskUserQuestion too: the process is gone, so it can
+        // never be answered — reject it and drop its card rather than stranding an
+        // unanswerable prompt.
+        if let Some(tool_id) = self.thread.pending_question().map(|(id, _)| id.to_string()) {
+            self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
+            self.question_cards.remove(&tool_id);
+            self.question_card_subs.remove(&tool_id);
         }
         self.thread.turn_active = false;
         if self.interrupted {
@@ -702,6 +761,83 @@ impl AgentChatView {
             }
         };
         self.thread.set_tool_status(&tool_id, status);
+        cx.notify();
+    }
+
+    /// Create/drop the interactive question-card entities to match the thread's
+    /// `AwaitingAnswer` tool calls. Runs each render (which owns `window`, needed
+    /// to build the cards' text inputs) and is idempotent once a card exists.
+    fn reconcile_question_cards(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let live: Vec<(String, QuestionRequest)> = self
+            .thread
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::ToolCall(tc) => match &tc.status {
+                    ToolCallStatus::AwaitingAnswer(req) => Some((tc.id.clone(), req.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        // Drop cards whose tool is no longer awaiting an answer (answered,
+        // rejected on disconnect/interrupt, etc.).
+        let live_ids: HashSet<&String> = live.iter().map(|(id, _)| id).collect();
+        self.question_cards.retain(|id, _| live_ids.contains(id));
+        self.question_card_subs.retain(|id, _| live_ids.contains(id));
+        // Create any missing cards, wiring each card's Submit/Skip to the answer.
+        let (theme, density, typo) = (self.theme, self.density, self.typography.clone());
+        for (tool_id, req) in live {
+            if self.question_cards.contains_key(&tool_id) {
+                continue;
+            }
+            let card = cx.new(|cx| {
+                QuestionCard::new(tool_id.clone(), req, theme, density, typo.clone(), window, cx)
+            });
+            let sub = cx.subscribe(&card, |this, _card, ev: &QuestionCardEvent, cx| match ev {
+                QuestionCardEvent::Submit { tool_id, answers } => {
+                    this.answer_question(tool_id.clone(), answers.clone(), cx)
+                }
+                QuestionCardEvent::Skip { tool_id } => {
+                    this.answer_question(tool_id.clone(), QuestionAnswers::default(), cx)
+                }
+            });
+            self.question_cards.insert(tool_id.clone(), card);
+            self.question_card_subs.insert(tool_id, sub);
+        }
+    }
+
+    /// Answer a pending `AskUserQuestion` by tool id: look up its request +
+    /// questions from the thread, send the selections back, and settle the tool
+    /// locally so the card drops immediately (the CLI's `tool_result` finalizes
+    /// the row to `Completed` right after). Empty `answers` = Skip — a plain
+    /// allow the CLI reads as "did not answer".
+    fn answer_question(
+        &mut self,
+        tool_id: String,
+        answers: QuestionAnswers,
+        cx: &mut Context<Self>,
+    ) {
+        // Idempotency: only answer a tool STILL awaiting (guards a stray second
+        // Submit racing the re-render that drops the card).
+        let found = self.thread.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == tool_id => match &tc.status {
+                ToolCallStatus::AwaitingAnswer(req) => {
+                    Some((req.request_id.clone(), req.questions.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        let Some((request_id, questions)) = found else {
+            return;
+        };
+        if let Some(conn) = &self.connection {
+            let _ = conn.answer_question(&request_id, &questions, &answers);
+        }
+        self.thread.set_tool_status(&tool_id, ToolCallStatus::InProgress);
+        self.question_cards.remove(&tool_id);
+        self.question_card_subs.remove(&tool_id);
         cx.notify();
     }
 
@@ -1007,9 +1143,19 @@ impl AgentChatView {
                     content = content.child(block);
                 }
                 ThreadEntry::ToolCall(tc) => {
-                    // A TodoWrite renders as a read-only plan checklist; every
-                    // other tool call uses the generic (expandable) card.
-                    if plan_panel::is_plan(tc) {
+                    // An AskUserQuestion awaiting answers renders as the dedicated
+                    // interactive question card (reconciled into `question_cards`
+                    // before this loop); a TodoWrite as a read-only plan checklist;
+                    // every other tool call uses the generic (expandable) card.
+                    if matches!(tc.status, ToolCallStatus::AwaitingAnswer(_)) {
+                        if let Some(card) = self.question_cards.get(&tc.id) {
+                            content = content.child(card.clone());
+                        }
+                    } else if question_card::is_question(tc) {
+                        // Answered/skipped question → a compact one-line summary.
+                        content = content
+                            .child(question_card::render_settled(tc, theme, density, &typo));
+                    } else if plan_panel::is_plan(tc) {
                         content =
                             content.child(plan_panel::render_plan_card(tc, theme, density, &typo));
                     } else {
@@ -1032,7 +1178,12 @@ impl AgentChatView {
                     .child(SharedString::from("Agent process exited.")),
             );
         } else if self.thread.turn_active {
-            content = content.child(working_indicator(theme, &typo));
+            // While a question card is pending, the agent isn't working — it's
+            // blocked on the user's answer — so don't show the "working…" spinner
+            // (it would also add height that pushes the card's controls down).
+            if self.thread.pending_question().is_none() {
+                content = content.child(working_indicator(theme, &typo));
+            }
         } else {
             // A settled turn: surface its one-line summary and token/cost usage
             // (both decoded by the backend; shown only when present).
@@ -1050,15 +1201,41 @@ impl AgentChatView {
             }
         }
         // Trailing clearance INSIDE the scrollable content, above the composer.
-        // `scroll_to_bottom` pins the offset to gpui's `scroll_max`, which is
-        // derived from the content height sampled at layout — but a rich-text /
-        // markdown row's final painted height settles a hair TALLER than that
-        // sample, so the pinned offset stops a few pixels short of the true
-        // bottom and the newest row's descenders (or an Allow/Reject row) tuck
-        // under the composer. A generous scrollable trailing gap absorbs that
-        // fixed shortfall: it's real content (folded into `scroll_max`), so the
-        // last real row always lands clear of the composer with breathing room.
-        content = content.child(div().flex_none().w_full().h(px(density.pad_panel * 3.0)));
+        // `scroll_to_bottom` pins the offset to gpui's `scroll_max`, derived from
+        // the content height sampled at layout. The catch: gpui-component's
+        // markdown reports a height that counts only its FIRST block — the rest of
+        // a multi-paragraph reply paints correctly but falls OUTSIDE the measured
+        // `content_size` (only the last message is affected; earlier ones sit
+        // above enough content to stay in range). The scroll box clips at its own
+        // viewport, not at `content_size`, so the fix is to add enough real
+        // scrollable room below the last message that scroll-to-bottom can bring
+        // the whole reply — overflow and all — up into the viewport. Size that
+        // room to the last reply's under-counted tail so short replies keep a
+        // tight bottom margin while long ones are fully reachable.
+        let tail_gap = if self.thread.pending_question().is_some() {
+            px(160.0)
+        } else {
+            // `base` is the breathing margin below the last line; `reveal` is the
+            // extra scroll room a multi-block reply needs to bring its under-
+            // counted tail into view. Stack them so the reveal room is always
+            // topped with a consistent margin (the reveal estimate alone can land
+            // flush against the composer), while keeping the estimate un-inflated
+            // so the bottom gap stays modest.
+            let base = density.pad_panel * 4.0;
+            let reveal = self
+                .thread
+                .entries
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    ThreadEntry::Assistant(m) if !m.text.is_empty() => Some(m.text.as_str()),
+                    _ => None,
+                })
+                .map(|t| markdown_reveal_gap(t, &typo))
+                .unwrap_or(0.0);
+            px(base + reveal)
+        };
+        content = content.child(div().flex_none().w_full().h(tail_gap));
         self.wrap_scroll(scroll.child(content)).into_any_element()
     }
 
@@ -1139,6 +1316,10 @@ impl Focusable for AgentChatView {
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        // Create/drop the interactive question cards to match the thread before
+        // the (immutable) transcript render reads them. Needs `window` for the
+        // cards' text inputs, so it lives here rather than in `render_transcript`.
+        self.reconcile_question_cards(window, cx);
         // Keyboard focus must live on the composer, not this view's root. The
         // pane focuses the composer on open, but an inline focus during action/
         // click dispatch is clobbered onto the root's tracked handle — so
@@ -1161,6 +1342,25 @@ impl Render for AgentChatView {
         // so this is cheap.
         if self.stick_to_bottom {
             self.list_scroll.scroll_to_bottom();
+            // The async markdown layout that follows a content change does not
+            // re-run this render, so one pin lands on a too-short `content_size`.
+            // Keep re-arming the follow while the scrollable extent is still
+            // growing (the layout settling), so a slow/large reply is followed to
+            // its true bottom; once it holds steady the counter drains and the
+            // frame loop stops. Each armed frame forces a re-render that re-pins
+            // to the freshly-settled height.
+            let max_y = f32::from(self.list_scroll.max_offset().y);
+            if (max_y - self.last_max_offset).abs() > 0.5 {
+                self.follow_frames = FOLLOW_FRAMES;
+            }
+            self.last_max_offset = max_y;
+            if self.follow_frames > 0 {
+                self.follow_frames -= 1;
+                let this = cx.entity().downgrade();
+                window.on_next_frame(move |_window, cx| {
+                    let _ = this.update(cx, |_this, cx| cx.notify());
+                });
+            }
         }
         let transcript = self.render_transcript(cx);
         div()
@@ -1190,6 +1390,43 @@ impl Render for AgentChatView {
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
     }
+}
+
+/// Estimate the extra scrollable room needed to reveal a reply's under-counted
+/// tail (see the tail-gap comment in `render_transcript`). gpui-component's
+/// markdown folds only its FIRST block into the measured height; the remaining
+/// blocks paint but sit past `content_size`, so scroll-to-bottom can't bring them
+/// into view without extra room. This returns a padded over-estimate of those
+/// trailing blocks' height — a text heuristic (wrapped lines × line height plus a
+/// per-block gap), biased high so a slightly-off estimate errs toward a hair of
+/// bottom slack rather than re-clipping, and capped so a runaway reply can't
+/// reserve an absurd gap. A single-block reply reserves nothing (it measures
+/// whole), keeping its bottom margin tight.
+fn markdown_reveal_gap(body: &str, typo: &Typography) -> f32 {
+    let Some((_, rest)) = body.split_once("\n\n") else {
+        return 0.0;
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return 0.0;
+    }
+    // Roughly the chars that fit on one line of the reading column at the body
+    // font size, times a per-line height plus a per-block gap. The markdown body
+    // renders at ~2x the font size per line (line + inter-line leading), so the
+    // reveal tracks that rather than a tight 1.5x — a smaller factor lands the
+    // gap just short of the reply's last line. Capped so a runaway reply can't
+    // reserve an absurd gap.
+    let chars_per_line = (CONTENT_MAX_W / (typo.t_body_md * 0.5)).max(1.0);
+    let line_height = typo.t_body_md * 2.0;
+    let mut lines = 0.0f32;
+    let mut blocks = 0.0f32;
+    for block in rest.split("\n\n") {
+        blocks += 1.0;
+        for raw in block.lines() {
+            lines += (raw.chars().count() as f32 / chars_per_line).ceil().max(1.0);
+        }
+    }
+    (lines * line_height + blocks * typo.t_body_md).min(1100.0)
 }
 
 /// A live "Claude is working…" row shown at the tail of the transcript while a
@@ -1348,6 +1585,23 @@ mod tests {
     use gpui::TestAppContext;
     use oximux_agents::thread::StubConnection;
     use serde_json::json;
+
+    #[test]
+    fn markdown_reveal_gap_zero_for_single_block_and_scales_with_tail() {
+        let typo = Typography::default();
+        // A single-block reply is measured whole → no extra reveal room.
+        assert_eq!(markdown_reveal_gap("just one paragraph, no blank line", &typo), 0.0);
+        assert_eq!(markdown_reveal_gap("", &typo), 0.0);
+        // The blocks AFTER the first drive the gap; more trailing text → more room.
+        let one_tail = markdown_reveal_gap("first\n\nsecond paragraph", &typo);
+        let two_tails =
+            markdown_reveal_gap("first\n\nsecond paragraph\n\nthird paragraph here", &typo);
+        assert!(one_tail > 0.0);
+        assert!(two_tails > one_tail);
+        // Runaway replies are capped so the tail can't reserve an absurd gap.
+        let huge = "first\n\n".to_string() + &"x ".repeat(20_000);
+        assert!(markdown_reveal_gap(&huge, &typo) <= 1100.0);
+    }
 
     /// The spike's central fail-closed requirement: if the agent channel
     /// disconnects (process exit / EOF) while a permission is pending, the view
@@ -1523,6 +1777,69 @@ mod tests {
             .find(|s| s["response"]["request_id"] == "r2")
             .expect("r2 control_response");
         assert_eq!(deny["response"]["response"]["behavior"], "deny");
+    }
+
+    /// Answering an AskUserQuestion routes the selection back as an `allow` whose
+    /// `updatedInput` carries the answers map (keyed by question text), settles
+    /// the tool locally, and clears the pending question.
+    #[gpui::test]
+    async fn answer_question_routes_selection_and_settles(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default();
+        let stub_probe = stub.clone();
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                use oximux_agents::thread::{parse_questions, QuestionAnswer, QuestionAnswers};
+                view.thread.push_user_message("choose");
+                let input = json!({"questions":[{"question":"Tabs or spaces?","header":"Indent",
+                    "options":[{"label":"Tabs","description":""},{"label":"Spaces","description":""}],
+                    "multiSelect":false}]});
+                view.thread.apply(&ThreadEvent::ToolCallStarted {
+                    id: "t1".into(),
+                    name: "AskUserQuestion".into(),
+                    input: input.clone(),
+                });
+                view.thread.apply(&ThreadEvent::QuestionAsked {
+                    request_id: "rq".into(),
+                    tool_use_id: Some("t1".into()),
+                    questions: parse_questions(&input),
+                });
+                assert_eq!(tool_status(view, "t1"), Some("AwaitingAnswer"));
+
+                let mut answers = QuestionAnswers::default();
+                answers.by_question.insert(
+                    "q-0".into(),
+                    QuestionAnswer { selected: vec!["Tabs".into()], custom: None },
+                );
+                view.answer_question("t1".into(), answers, cx);
+
+                assert!(view.thread.pending_question().is_none(), "question answered");
+                assert_eq!(tool_status(view, "t1"), Some("InProgress"));
+            })
+            .expect("window update");
+
+        let sent = stub_probe.sent();
+        let ans = sent
+            .iter()
+            .find(|s| s["response"]["request_id"] == "rq")
+            .expect("rq control_response");
+        assert_eq!(ans["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            ans["response"]["response"]["updatedInput"]["answers"]["Tabs or spaces?"],
+            json!("Tabs")
+        );
     }
 
     /// A stray second click after a card is answered must not send a second
@@ -1733,6 +2050,7 @@ mod tests {
                 ToolCallStatus::Rejected => "Rejected",
                 ToolCallStatus::Completed => "Completed",
                 ToolCallStatus::WaitingForConfirmation(_) => "WaitingForConfirmation",
+                ToolCallStatus::AwaitingAnswer(_) => "AwaitingAnswer",
                 _ => "Other",
             }),
             _ => None,
