@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::event::ThreadEvent;
+use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionSuggestion;
 
 /// Decode one newline-delimited stream-json line. Returns the events it
@@ -152,9 +152,33 @@ fn decode_result(v: &Value) -> ThreadEvent {
         || v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
     ThreadEvent::TurnEnded {
         result: v.get("result").and_then(Value::as_str).map(str::to_string),
-        cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+        usage: decode_usage(v),
         is_error,
     }
+}
+
+/// Decode the token/cost breakdown from a `result` event. Present when the
+/// result carries a `usage` object; `cost_usd` comes from the top-level
+/// `total_cost_usd` and `context_window` from the first `modelUsage` entry
+/// (the model's window size, for a "% of Nk" readout). Absent `usage` → `None`,
+/// which the UI reads as "no footer".
+fn decode_usage(v: &Value) -> Option<TurnUsage> {
+    let u = v.get("usage")?;
+    let count = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let context_window = v
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .and_then(|models| models.values().next())
+        .and_then(|mu| mu.get("contextWindow"))
+        .and_then(Value::as_u64);
+    Some(TurnUsage {
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        cache_read_tokens: count("cache_read_input_tokens"),
+        cache_creation_tokens: count("cache_creation_input_tokens"),
+        context_window,
+        cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+    })
 }
 
 fn parse_suggestion(s: &Value) -> PermissionSuggestion {
@@ -283,10 +307,33 @@ mod tests {
 
     #[test]
     fn decodes_result_success_and_error() {
+        // Real result shape (from the captured stream): usage tokens under
+        // `usage`, window size under `modelUsage`, cost at top level.
         let ok = json!({"type":"result","subtype":"success","is_error":false,
-            "result":"Done.","total_cost_usd":0.33}).to_string();
-        assert_eq!(decode_line(&ok), vec![ThreadEvent::TurnEnded {
-            result: Some("Done.".into()), cost_usd: Some(0.33), is_error: false }]);
+            "result":"Done.","total_cost_usd":0.33,
+            "usage":{"input_tokens":714,"output_tokens":7,
+                "cache_read_input_tokens":16681,"cache_creation_input_tokens":5571},
+            "modelUsage":{"claude-opus-4-8":{"contextWindow":200000}}}).to_string();
+        match &decode_line(&ok)[0] {
+            ThreadEvent::TurnEnded { result, usage, is_error } => {
+                assert_eq!(result.as_deref(), Some("Done."));
+                assert!(!is_error);
+                let u = usage.as_ref().expect("usage decoded");
+                assert_eq!(u.input_tokens, 714);
+                assert_eq!(u.output_tokens, 7);
+                assert_eq!(u.cache_read_tokens, 16681);
+                assert_eq!(u.cache_creation_tokens, 5571);
+                assert_eq!(u.context_window, Some(200000));
+                assert_eq!(u.cost_usd, Some(0.33));
+            }
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
+        // No `usage` object → no footer material.
+        let bare = json!({"type":"result","subtype":"success","result":"ok","total_cost_usd":0.1}).to_string();
+        match &decode_line(&bare)[0] {
+            ThreadEvent::TurnEnded { usage, .. } => assert!(usage.is_none(), "no usage key → None"),
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
         let err = json!({"type":"result","subtype":"error_max_turns","result":"stopped"}).to_string();
         match &decode_line(&err)[0] {
             ThreadEvent::TurnEnded { is_error, .. } => assert!(*is_error),

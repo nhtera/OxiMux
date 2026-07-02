@@ -9,6 +9,20 @@ use serde_json::Value;
 
 use super::tool_call::PermissionSuggestion;
 
+/// Per-turn token/cost usage, decoded from the final `result` event. All counts
+/// are best-effort (0 when the field is absent); `cost_usd`/`context_window` are
+/// optional because not every turn reports them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    /// The model's context-window size (from `modelUsage`), for a "% of Nk" readout.
+    pub context_window: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadEvent {
     /// Session bootstrap (`system/init`).
@@ -53,10 +67,11 @@ pub enum ThreadEvent {
         detail: String,
         category: String,
     },
-    /// The turn finished (`result`).
+    /// The turn finished (`result`). `usage` carries the token/cost breakdown
+    /// when the result reports it (see [`TurnUsage`]).
     TurnEnded {
         result: Option<String>,
-        cost_usd: Option<f64>,
+        usage: Option<TurnUsage>,
         is_error: bool,
     },
     /// A protocol/parse/transport error to surface in the thread.

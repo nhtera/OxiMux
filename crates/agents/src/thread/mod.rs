@@ -25,7 +25,7 @@ pub use connection::{
     control_response_json, user_message_json, AgentCapabilities, AgentConnection, StubConnection,
 };
 pub use entry::{AssistantMessage, ThreadEntry};
-pub use event::ThreadEvent;
+pub use event::{ThreadEvent, TurnUsage};
 pub use state::ChatThread;
 pub use stream_json::decode_line;
 pub use tool_call::{

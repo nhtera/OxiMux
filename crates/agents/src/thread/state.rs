@@ -13,7 +13,7 @@
 //! a fresh assistant message.
 
 use super::entry::{AssistantMessage, ThreadEntry};
-use super::event::ThreadEvent;
+use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
 
 #[derive(Debug, Default)]
@@ -29,6 +29,9 @@ pub struct ChatThread {
     /// Whether a turn is currently in flight (between a user send and
     /// `TurnEnded`). Drives the composer's send/stop affordance.
     pub turn_active: bool,
+    /// Latest per-turn token/cost usage (from the most recent `TurnEnded`), for
+    /// the usage footer. `None` until a turn reports usage.
+    pub usage: Option<TurnUsage>,
     /// Index of the assistant entry currently being streamed, if any.
     current_assistant: Option<usize>,
     /// True once a text delta has streamed into the current assistant block
@@ -77,6 +80,11 @@ impl ChatThread {
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.entries.push(ThreadEntry::User(text.into()));
         self.end_assistant_window();
+        // A new turn begins: the prior turn's usage/summary no longer apply.
+        // Clear them so the footer never implies stale numbers belong to this
+        // turn (e.g. if this turn ends in error before reporting any usage).
+        self.usage = None;
+        self.last_summary = None;
         self.turn_active = true;
     }
 
@@ -176,9 +184,12 @@ impl ChatThread {
                 self.last_summary = Some(detail.clone());
                 self.end_assistant_window();
             }
-            ThreadEvent::TurnEnded { is_error, result, .. } => {
+            ThreadEvent::TurnEnded { is_error, result, usage } => {
                 self.turn_active = false;
                 self.end_assistant_window();
+                if let Some(u) = usage {
+                    self.usage = Some(u.clone());
+                }
                 if *is_error {
                     self.last_error = result.clone().or(Some("turn ended with error".into()));
                 }
@@ -280,7 +291,7 @@ mod tests {
         t.apply(&ThreadEvent::AssistantTextDelta("Hel".into()));
         t.apply(&ThreadEvent::AssistantTextDelta("lo".into()));
         t.apply(&ThreadEvent::AssistantText("Hello!".into())); // finalize reconciles
-        t.apply(&ThreadEvent::TurnEnded { result: Some("Hello!".into()), cost_usd: Some(0.1), is_error: false });
+        t.apply(&ThreadEvent::TurnEnded { result: Some("Hello!".into()), usage: None, is_error: false });
 
         assert_eq!(t.entries.len(), 2);
         assert_eq!(t.entries[0], ThreadEntry::User("hi".into()));
@@ -431,6 +442,45 @@ mod tests {
     }
 
     #[test]
+    fn turn_ended_stores_usage_for_the_footer() {
+        let mut t = ChatThread::new();
+        t.push_user_message("hi");
+        assert!(t.usage.is_none(), "no usage before a turn ends");
+        t.apply(&ThreadEvent::TurnEnded {
+            result: Some("done".into()),
+            usage: Some(TurnUsage {
+                input_tokens: 714, output_tokens: 7,
+                cache_read_tokens: 16681, cache_creation_tokens: 5571,
+                context_window: Some(200000), cost_usd: Some(0.33),
+            }),
+            is_error: false,
+        });
+        let u = t.usage.as_ref().expect("usage stored");
+        assert_eq!(u.input_tokens, 714);
+        assert_eq!(u.output_tokens, 7);
+        assert_eq!(u.cost_usd, Some(0.33));
+    }
+
+    #[test]
+    fn new_turn_clears_prior_usage_and_summary() {
+        // The footer must not carry a prior turn's numbers into the next turn.
+        let mut t = ChatThread::new();
+        t.push_user_message("q1");
+        t.apply(&ThreadEvent::TurnSummary { detail: "did a thing".into(), category: "x".into() });
+        t.apply(&ThreadEvent::TurnEnded {
+            result: Some("a".into()),
+            usage: Some(TurnUsage { input_tokens: 100, ..Default::default() }),
+            is_error: false,
+        });
+        assert!(t.usage.is_some() && t.last_summary.is_some());
+
+        // Sending the next prompt wipes the stale footer/summary.
+        t.push_user_message("q2");
+        assert!(t.usage.is_none(), "prior usage cleared on a new turn");
+        assert!(t.last_summary.is_none(), "prior summary cleared on a new turn");
+    }
+
+    #[test]
     fn interrupt_ends_turn_and_fail_closes_pending_permission() {
         // Stop mid-turn: the turn flag clears and a pending approval downgrades
         // to Rejected (the process is being killed and can never answer it).
@@ -468,7 +518,7 @@ mod tests {
         // trailing events that arrive after SIGINT, before stdout EOF:
         t.apply(&ThreadEvent::AssistantTextDelta(" and Design".into()));
         t.apply(&ThreadEvent::AssistantText("The History and Design of Rust".into()));
-        t.apply(&ThreadEvent::TurnEnded { result: None, cost_usd: None, is_error: true });
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: true });
 
         let assistants: Vec<&str> = t.entries.iter().filter_map(|e| match e {
             ThreadEntry::Assistant(m) => Some(m.text.as_str()), _ => None }).collect();

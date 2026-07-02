@@ -14,6 +14,7 @@
 mod bubble;
 mod composer;
 mod diff_card;
+mod plan_panel;
 mod tool_card;
 
 use std::collections::HashSet;
@@ -39,7 +40,7 @@ pub(super) const CONTENT_MAX_W: f32 = 720.0;
 use composer::{ComposerEvent, ComposerView};
 use oximux_agents::thread::{
     AgentConnection, ChatThread, ClaudeStreamJsonConnection, PermissionDecision, ThreadEntry,
-    ThreadEvent, ToolCallStatus,
+    ThreadEvent, ToolCallStatus, TurnUsage,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -599,10 +600,17 @@ impl AgentChatView {
                     content = content.child(block);
                 }
                 ThreadEntry::ToolCall(tc) => {
-                    let expanded = self.expanded_tool_calls.contains(&tc.id);
-                    content = content.child(tool_card::render_tool_card(
-                        tc, expanded, theme, density, &typo, cx,
-                    ));
+                    // A TodoWrite renders as a read-only plan checklist; every
+                    // other tool call uses the generic (expandable) card.
+                    if plan_panel::is_plan(tc) {
+                        content =
+                            content.child(plan_panel::render_plan_card(tc, theme, density, &typo));
+                    } else {
+                        let expanded = self.expanded_tool_calls.contains(&tc.id);
+                        content = content.child(tool_card::render_tool_card(
+                            tc, expanded, theme, density, &typo, cx,
+                        ));
+                    }
                 }
             }
         }
@@ -618,6 +626,21 @@ impl AgentChatView {
             );
         } else if self.thread.turn_active {
             content = content.child(working_indicator(theme, &typo));
+        } else {
+            // A settled turn: surface its one-line summary and token/cost usage
+            // (both decoded by the backend; shown only when present).
+            if let Some(summary) = self
+                .thread
+                .last_summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                content = content.child(summary_line(summary, theme, &typo));
+            }
+            if let Some(usage) = self.thread.usage.as_ref() {
+                content = content.child(usage_footer(usage, theme, &typo));
+            }
         }
         // Trailing clearance INSIDE the scrollable content, above the composer.
         // `scroll_to_bottom` pins the offset to gpui's `scroll_max`, which is
@@ -788,6 +811,49 @@ fn working_indicator(theme: Theme, typo: &Typography) -> AnyElement {
         .into_any_element()
 }
 
+/// A muted one-line turn summary (the backend's `post_turn_summary` detail),
+/// shown under a settled turn like a subtle status caption.
+fn summary_line(text: &str, theme: Theme, typo: &Typography) -> AnyElement {
+    div()
+        .w_full()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.fg_subtle)
+        .child(SharedString::from(text.to_string()))
+        .into_any_element()
+}
+
+/// The per-turn usage footer: input/output tokens, an optional context-window
+/// percentage, and cost when reported — a calm, muted caption.
+fn usage_footer(usage: &TurnUsage, theme: Theme, typo: &Typography) -> AnyElement {
+    let mut parts = vec![
+        format!("{} in", fmt_tokens(usage.input_tokens)),
+        format!("{} out", fmt_tokens(usage.output_tokens)),
+    ];
+    if let Some(window) = usage.context_window.filter(|w| *w > 0) {
+        let used = usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens;
+        let pct = ((used as f64 / window as f64) * 100.0).round() as u64;
+        parts.push(format!("{pct}% ctx"));
+    }
+    if let Some(cost) = usage.cost_usd.filter(|c| *c > 0.0) {
+        parts.push(format!("${cost:.3}"));
+    }
+    div()
+        .w_full()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.fg_subtle)
+        .child(SharedString::from(parts.join(" · ")))
+        .into_any_element()
+}
+
+/// Compact token count for the footer: `714`, `1.2k`, `16.7k`.
+fn fmt_tokens(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
 /// The assistant caption row: the "Claude" label on the left and a Copy
 /// affordance on the right that's revealed while the message block is hovered
 /// (`group`) — the copy-on-hover pattern of a native chat. Clicking copies the
@@ -952,7 +1018,7 @@ mod tests {
                 view.on_event(
                     ThreadEvent::TurnEnded {
                         result: Some("Hello!".into()),
-                        cost_usd: None,
+                        usage: None,
                         is_error: false,
                     },
                     cx,
@@ -1161,7 +1227,7 @@ mod tests {
                 view.on_event(
                     ThreadEvent::TurnEnded {
                         result: None,
-                        cost_usd: None,
+                        usage: None,
                         is_error: true,
                     },
                     cx,
@@ -1212,7 +1278,7 @@ mod tests {
 
                 // A late error result then folds in — still suppressed.
                 view.on_event(
-                    ThreadEvent::TurnEnded { result: None, cost_usd: None, is_error: true },
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: true },
                     cx,
                 );
                 assert!(view.thread.last_error.is_none());
