@@ -11,12 +11,29 @@ use super::tool_call::ToolCall;
 /// One rendered item in the conversation, in arrival order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ThreadEntry {
-    /// A user prompt.
-    User(String),
+    /// A user prompt: the typed text plus any attached images.
+    User {
+        text: String,
+        /// Images attached to this prompt. `#[serde(default)]` keeps older
+        /// persisted transcripts (which had no images field) loadable.
+        #[serde(default)]
+        images: Vec<ChatImage>,
+    },
     /// An assistant message: visible text plus any thinking block.
     Assistant(AssistantMessage),
     /// A tool invocation (with its own streaming status + result).
     ToolCall(ToolCall),
+}
+
+/// An image attached to a user prompt. `data` is standard-base64 of the raw
+/// encoded image bytes — persisted verbatim in the transcript blob and sent to
+/// the agent as a base64 image content block. `media_type` is the MIME string
+/// (`image/png`, `image/jpeg`, `image/gif`, `image/webp`); it's both the wire
+/// `media_type` and the hint used to pick a decoder for the thumbnail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatImage {
+    pub media_type: String,
+    pub data: String,
 }
 
 /// An assistant message. `thinking` is the (optional) extended-thinking block

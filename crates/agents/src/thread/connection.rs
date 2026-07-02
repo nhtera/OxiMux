@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::entry::ChatImage;
 use super::event::ThreadEvent;
 use super::tool_call::PermissionDecision;
 
@@ -46,6 +47,16 @@ pub trait AgentConnection: Send {
     /// message mid-turn, but the chat UI currently gates sending behind Stop
     /// while a turn is streaming, so a live steer isn't issued from the UI.)
     fn send_user_message(&self, text: &str) -> Result<()>;
+
+    /// Send a user prompt that carries attached images. Default falls back to
+    /// text-only [`Self::send_user_message`] (dropping the images), so backends
+    /// that don't support image input compile unchanged; the Claude backend
+    /// overrides this to emit a base64 image content block per attachment.
+    fn send_user_message_with_images(&self, text: &str, images: &[ChatImage]) -> Result<()> {
+        let _ = images;
+        self.send_user_message(text)
+    }
+
     /// Answer a pending permission request by its `request_id`.
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()>;
     /// Terminate the session and its process.
@@ -77,6 +88,29 @@ pub trait AgentConnection: Send {
 /// Build the stdin JSON for a user message (stream-json input format).
 pub fn user_message_json(text: &str) -> Value {
     json!({"type": "user", "message": {"role": "user", "content": text}})
+}
+
+/// Build the stdin JSON for a user message that carries images. When `images`
+/// is empty this is byte-identical to [`user_message_json`] (a plain string
+/// `content`). With images, `content` becomes the Messages-API content-block
+/// array — one `text` block (only if non-empty) followed by a `base64` `image`
+/// block per attachment. Verified against the live CLI: `claude -p
+/// --input-format stream-json` reads and sees such image blocks.
+pub fn user_message_json_with_images(text: &str, images: &[ChatImage]) -> Value {
+    if images.is_empty() {
+        return user_message_json(text);
+    }
+    let mut content: Vec<Value> = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    for img in images {
+        content.push(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": img.media_type, "data": img.data},
+        }));
+    }
+    json!({"type": "user", "message": {"role": "user", "content": content}})
 }
 
 /// Build the stdin `control_response` JSON answering a `can_use_tool` request.
@@ -160,6 +194,35 @@ mod tests {
             user_message_json("hi"),
             json!({"type":"user","message":{"role":"user","content":"hi"}})
         );
+    }
+
+    #[test]
+    fn user_message_json_with_no_images_is_plain_string_content() {
+        // Empty attachments must be byte-identical to the text-only shape so the
+        // common path is unchanged.
+        assert_eq!(user_message_json_with_images("hi", &[]), user_message_json("hi"));
+    }
+
+    #[test]
+    fn user_message_json_with_images_builds_content_blocks() {
+        let imgs = vec![ChatImage { media_type: "image/png".into(), data: "QUJD".into() }];
+        let v = user_message_json_with_images("look", &imgs);
+        let content = &v["message"]["content"];
+        assert_eq!(content[0], json!({"type":"text","text":"look"}));
+        assert_eq!(
+            content[1],
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}})
+        );
+    }
+
+    #[test]
+    fn user_message_json_with_images_omits_empty_text_block() {
+        // An image-only prompt (no caption) sends just the image block.
+        let imgs = vec![ChatImage { media_type: "image/gif".into(), data: "R0lG".into() }];
+        let v = user_message_json_with_images("", &imgs);
+        let content = &v["message"]["content"];
+        assert_eq!(content.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(content[0]["type"], "image");
     }
 
     #[test]

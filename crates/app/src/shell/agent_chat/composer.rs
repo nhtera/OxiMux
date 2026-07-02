@@ -10,22 +10,30 @@
 //! cached. Submit is surfaced to the parent as a [`ComposerEvent`].
 
 use gpui::{
-    Anchor, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString, Styled,
-    Subscription, Window, div, prelude::FluentBuilder, px,
+    Anchor, App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ImageSource, InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render,
+    SharedString, Styled, Subscription, Window, div, img, prelude::FluentBuilder, px,
 };
+use gpui::StyledImage as _;
+use gpui_component::Icon;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Paste};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use oximux_agents::thread::ChatImage;
 use oximux_settings::{Density, Theme, Typography};
+
+use super::image_attach::{PendingImage, pending_from_bytes, pending_from_path};
 
 /// Raised by the composer for the parent [`super::AgentChatView`] to act on.
 /// The parent performs the actual send / interrupt / model+mode switch; on
 /// `Submit` the composer has already cleared its input by the time the event
 /// fires.
 pub enum ComposerEvent {
-    Submit(String),
+    Submit {
+        text: String,
+        images: Vec<ChatImage>,
+    },
     /// The user pressed Stop while a turn was streaming — interrupt it.
     Stop,
     /// The user picked a model in the bottom toolbar (a Claude alias).
@@ -56,6 +64,11 @@ pub struct ComposerView {
     /// Whether the backend accepts a reasoning-effort setting (hides the effort
     /// picker when it doesn't).
     supports_effort: bool,
+    /// Images staged for the next send (via the paperclip, ⌘V, or drag-drop).
+    /// Each holds both its wire/persist [`ChatImage`] and a pre-decoded thumbnail
+    /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
+    /// submit.
+    pending_images: Vec<PendingImage>,
     /// Repaints this view (only) on each keystroke so the draft stays visible.
     _sub: Subscription,
 }
@@ -103,7 +116,69 @@ impl ComposerView {
             effort: None,
             supports_modes: false,
             supports_effort: false,
+            pending_images: Vec::new(),
             _sub: sub,
+        }
+    }
+
+    /// Stage already-decoded attachments (from the file picker / drag-drop task
+    /// or a clipboard paste) and repaint the chip row.
+    pub fn add_pending_images(&mut self, images: Vec<PendingImage>, cx: &mut Context<Self>) {
+        if images.is_empty() {
+            return;
+        }
+        self.pending_images.extend(images);
+        cx.notify();
+    }
+
+    /// Attach image files chosen from the native file dialog. `rfd`'s async
+    /// dialog runs off the main thread; the read + decode also happens on a
+    /// background executor (decoding a large image is not cheap), then the staged
+    /// results are handed back to this view on the foreground.
+    fn attach_from_picker(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let files = rfd::AsyncFileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"])
+                .pick_files()
+                .await;
+            let Some(files) = files else { return };
+            let paths: Vec<_> = files.into_iter().map(|f| f.path().to_path_buf()).collect();
+            let staged = cx
+                .background_spawn(async move {
+                    paths.iter().filter_map(|p| pending_from_path(p)).collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.add_pending_images(staged, cx));
+        })
+        .detach();
+    }
+
+    /// Handle ⌘V: if the clipboard holds an image, stage it and report `true`
+    /// (so the caller consumes the paste); otherwise `false` to let the text
+    /// field paste normally. Decoding a pasted screenshot is done inline — it's a
+    /// one-shot user action, not a hot path.
+    fn try_paste_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else { return false };
+        let mut staged = Vec::new();
+        for entry in item.into_entries() {
+            if let ClipboardEntry::Image(image) = entry
+                && let Some(p) = pending_from_bytes(image.bytes, Some(image.format))
+            {
+                staged.push(p);
+            }
+        }
+        if staged.is_empty() {
+            return false;
+        }
+        self.add_pending_images(staged, cx);
+        true
+    }
+
+    /// Remove a staged attachment (its chip's ✕).
+    fn remove_image(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx < self.pending_images.len() {
+            self.pending_images.remove(idx);
+            cx.notify();
         }
     }
 
@@ -175,11 +250,15 @@ impl ComposerView {
         }
         let text = self.input.read(cx).value().to_string();
         let text = text.trim().to_string();
-        if text.is_empty() {
+        // An image-only prompt (attachments, no caption) is valid; only bail when
+        // there's nothing at all to send.
+        if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
+        let images: Vec<ChatImage> =
+            self.pending_images.drain(..).map(|p| p.chat).collect();
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
-        cx.emit(ComposerEvent::Submit(text));
+        cx.emit(ComposerEvent::Submit { text, images });
     }
 
     /// Ask the parent to interrupt the in-flight turn (the Stop button). Leaves
@@ -317,6 +396,72 @@ impl ComposerView {
                 menu
             })
     }
+
+    /// The image-attach control (far left of the toolbar): a flat ghost button
+    /// that opens the native image picker. Always enabled — attachments stage
+    /// for the next send even while a turn streams.
+    fn render_attach_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("chat-attach-btn")
+            .icon(Icon::default().path("icons/image.svg"))
+            .ghost()
+            .small()
+            .tooltip("Attach image")
+            .on_click(cx.listener(|this, _ev, _window, cx| this.attach_from_picker(cx)))
+    }
+
+    /// Staged-attachment chips shown above the input pill: a small thumbnail per
+    /// pending image, each with a ✕ to remove it. Rendered only when something is
+    /// staged. Thumbnails come pre-decoded (see [`PendingImage`]) so this row is
+    /// cheap to repaint per keystroke.
+    fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .w_full()
+            .gap(px(density.gap_inline));
+        for (idx, p) in self.pending_images.iter().enumerate() {
+            let thumb = div()
+                .size(px(48.0))
+                .flex_none()
+                .rounded(px(8.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.border_input)
+                .child(
+                    img(ImageSource::Image(p.render.clone()))
+                        .size_full()
+                        .object_fit(ObjectFit::Cover),
+                );
+            let remove = div()
+                .id(("chat-attach-remove", idx))
+                .absolute()
+                .top(px(-6.0))
+                .right(px(-6.0))
+                .size(px(16.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme.bg_base)
+                .border_1()
+                .border_color(theme.border_input)
+                .text_color(theme.fg_muted)
+                .text_size(px(9.0))
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.fg_base))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, _w, cx| this.remove_image(idx, cx)),
+                )
+                .child(SharedString::from("✕"));
+            row = row.child(div().relative().flex_none().child(thumb).child(remove));
+        }
+        row
+    }
 }
 
 impl Render for ComposerView {
@@ -395,6 +540,8 @@ impl Render for ComposerView {
             .w_full()
             .px(px(density.pad_row))
             .gap(px(density.gap_inline));
+        // Paperclip/image attach anchors the far left, before the safety mode.
+        controls = controls.child(self.render_attach_button(cx));
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }
@@ -435,17 +582,29 @@ impl Render for ComposerView {
             .border_t_1()
             .border_color(theme.border_inactive)
             .p(px(density.pad_panel))
+            // Intercept ⌘V before the text field: if the clipboard holds an
+            // image, stage it and swallow the paste; otherwise let it fall
+            // through so text pastes normally. Capture phase (this ancestor runs
+            // before the focused input) is what lets us pre-empt it.
+            .capture_action(cx.listener(|this, _: &Paste, _window, cx| {
+                if this.try_paste_image(cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 // Match the transcript's centered reading column so the pill +
                 // controls line up with the messages above on wide windows. The
-                // input box on top, its controls on a row below (Claude Desktop
-                // layout).
+                // attachment chips (if any) sit above the input box, its controls
+                // on a row below (Claude Desktop layout).
                 div()
                     .flex()
                     .flex_col()
                     .w_full()
                     .max_w(px(super::CONTENT_MAX_W))
                     .gap(px(density.gap_inline))
+                    .when(!self.pending_images.is_empty(), |d| {
+                        d.child(self.render_attachments(cx))
+                    })
                     .child(pill)
                     .child(controls),
             )

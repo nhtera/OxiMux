@@ -99,6 +99,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ),
     ("icons/x.svg", include_bytes!("../assets/icons/x.svg")),
     (
+        "icons/image.svg",
+        include_bytes!("../assets/icons/image.svg"),
+    ),
+    (
         "icons/chevron-down.svg",
         include_bytes!("../assets/icons/chevron-down.svg"),
     ),

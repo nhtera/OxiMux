@@ -94,7 +94,7 @@ mod tests {
             session_id: "sid-1".into(),
             model: Some("opus".into()),
             entries: vec![
-                ThreadEntry::User("hi".into()),
+                ThreadEntry::User { text: "hi".into(), images: vec![] },
                 ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
             ],
         };

@@ -30,8 +30,10 @@ gpui-component = { workspace = true }
 gpui-component-assets = { workspace = true }
 
 anyhow = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+image = { workspace = true }
 notify-debouncer-full = { workspace = true }
 regex = { workspace = true }
 rfd = { workspace = true }

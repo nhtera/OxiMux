@@ -18,8 +18,10 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use super::connection::{
-    control_response_json, user_message_json, AgentCapabilities, AgentConnection,
+    control_response_json, user_message_json, user_message_json_with_images, AgentCapabilities,
+    AgentConnection,
 };
+use super::entry::ChatImage;
 use super::event::ThreadEvent;
 use super::stream_json::decode_line;
 use super::tool_call::PermissionDecision;
@@ -172,6 +174,10 @@ impl ClaudeStreamJsonConnection {
 impl AgentConnection for ClaudeStreamJsonConnection {
     fn send_user_message(&self, text: &str) -> Result<()> {
         self.write_line(&user_message_json(text))
+    }
+
+    fn send_user_message_with_images(&self, text: &str, images: &[ChatImage]) -> Result<()> {
+        self.write_line(&user_message_json_with_images(text, images))
     }
 
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {

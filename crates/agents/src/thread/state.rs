@@ -12,7 +12,7 @@
 //! block). A tool call ends the current assistant block, so later text starts
 //! a fresh assistant message.
 
-use super::entry::{AssistantMessage, ThreadEntry};
+use super::entry::{AssistantMessage, ChatImage, ThreadEntry};
 use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
 
@@ -78,7 +78,16 @@ impl ChatThread {
 
     /// Record a user prompt (called when we send one to the agent).
     pub fn push_user_message(&mut self, text: impl Into<String>) {
-        self.entries.push(ThreadEntry::User(text.into()));
+        self.push_user_message_with_images(text, Vec::new());
+    }
+
+    /// Record a user prompt that carries attached images.
+    pub fn push_user_message_with_images(
+        &mut self,
+        text: impl Into<String>,
+        images: Vec<ChatImage>,
+    ) {
+        self.entries.push(ThreadEntry::User { text: text.into(), images });
         self.end_assistant_window();
         // A new turn begins: the prior turn's usage/summary no longer apply.
         // Clear them so the footer never implies stale numbers belong to this
@@ -294,7 +303,7 @@ mod tests {
         t.apply(&ThreadEvent::TurnEnded { result: Some("Hello!".into()), usage: None, is_error: false });
 
         assert_eq!(t.entries.len(), 2);
-        assert_eq!(t.entries[0], ThreadEntry::User("hi".into()));
+        assert_eq!(t.entries[0], ThreadEntry::User { text: "hi".into(), images: vec![] });
         assert_eq!(assistant_text(&t.entries[1]), "Hello!"); // not "Hellolo Hello!"
         assert!(!t.turn_active);
     }
@@ -410,7 +419,7 @@ mod tests {
     #[test]
     fn rehydrated_seeds_entries_and_session_and_rests_flags() {
         let entries = vec![
-            ThreadEntry::User("hi".into()),
+            ThreadEntry::User { text: "hi".into(), images: vec![] },
             ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
         ];
         let t = ChatThread::rehydrated(Some("sid-9".into()), Some("opus".into()), entries);
@@ -560,7 +569,7 @@ mod tests {
             ThreadEntry::Assistant(m) => Some(m.text.as_str()), _ => None }).collect();
         assert_eq!(assistants, vec!["Let me check.", "Done."]);
         // order: User, Assistant, ToolCall, Assistant
-        assert!(matches!(t.entries[0], ThreadEntry::User(_)));
+        assert!(matches!(t.entries[0], ThreadEntry::User { .. }));
         assert!(matches!(t.entries[1], ThreadEntry::Assistant(_)));
         assert!(matches!(t.entries[2], ThreadEntry::ToolCall(_)));
         assert!(matches!(t.entries[3], ThreadEntry::Assistant(_)));

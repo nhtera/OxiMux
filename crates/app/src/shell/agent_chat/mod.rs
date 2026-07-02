@@ -14,20 +14,23 @@
 mod bubble;
 mod composer;
 mod diff_card;
+mod image_attach;
 mod plan_panel;
 mod tool_bodies;
 mod tool_card;
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    Transformation, WeakEntity, Window, div, percentage, px,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, Image, InteractiveElement, IntoElement,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, Transformation, WeakEntity, Window, div, percentage, px,
 };
 use gpui_component::Icon;
 use gpui_component::input::Enter as InputEnter;
@@ -77,6 +80,10 @@ pub(super) const CLAUDE_EFFORTS: &[(&str, &str)] = &[
 /// `--effort` flag is passed, so the CLI applies whatever it's configured for.
 pub(super) const DEFAULT_EFFORT: &str = "high";
 
+/// Decoded user-attached image thumbnails, memoized by `(entry index, image
+/// index)`. Interior-mutable so the immutable `render` path can fill it lazily.
+type ImageCache = RefCell<HashMap<(usize, usize), Option<Arc<Image>>>>;
+
 /// Events the chat view raises for its host (the pane group) to act on.
 pub enum AgentChatEvent {
     /// The user picked a different model; the host persists it in the tab kind
@@ -86,8 +93,8 @@ pub enum AgentChatEvent {
 
 use composer::{ComposerEvent, ComposerView};
 use oximux_agents::thread::{
-    AgentConnection, ChatThread, ClaudeStreamJsonConnection, PermissionDecision, ThreadEntry,
-    ThreadEvent, ToolCallStatus, TurnUsage,
+    AgentConnection, ChatImage, ChatThread, ClaudeStreamJsonConnection, PermissionDecision,
+    ThreadEntry, ThreadEvent, ToolCallStatus, TurnUsage,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -140,6 +147,12 @@ pub struct AgentChatView {
     expanded_thinking: HashSet<usize>,
     /// Tool-call ids whose card disclosure (raw input + result) is expanded.
     expanded_tool_calls: HashSet<String>,
+    /// Decoded thumbnails for user-attached images, keyed by (entry index, image
+    /// index). Base64→decode happens once per attachment and is cached here so
+    /// the transcript doesn't re-decode every streaming repaint. `RefCell` because
+    /// `render` borrows the view immutably. Append-only entries keep the keys
+    /// stable; `None` marks an image whose base64 failed to decode.
+    image_cache: ImageCache,
     /// Foreground event-drain task. Dropping it only cancels the *foreground*
     /// half at its next await point — it does NOT stop the forwarder/reader OS
     /// threads or reap the subprocess. Subprocess + thread teardown is owned by
@@ -217,7 +230,9 @@ impl AgentChatView {
         let subscriptions = vec![cx.subscribe(
             &composer,
             |this, _composer, ev: &ComposerEvent, cx| match ev {
-                ComposerEvent::Submit(text) => this.send_text(text.clone(), cx),
+                ComposerEvent::Submit { text, images } => {
+                    this.send_text(text.clone(), images.clone(), cx)
+                }
                 ComposerEvent::Stop => this.stop_turn(cx),
                 ComposerEvent::ModelPicked(model) => this.change_model(model.clone(), cx),
                 ComposerEvent::PermissionModePicked(mode) => {
@@ -284,6 +299,7 @@ impl AgentChatView {
             interrupted: false,
             expanded_thinking: HashSet::new(),
             expanded_tool_calls: HashSet::new(),
+            image_cache: RefCell::new(HashMap::new()),
             _drain_task: drain_task,
             _subscriptions: subscriptions,
         }
@@ -337,10 +353,30 @@ impl AgentChatView {
         });
     }
 
+    /// Stage image files dropped onto the chat surface into the composer. The
+    /// read + decode runs on a background executor (an image can be large), then
+    /// the staged attachments are handed to the composer on the foreground.
+    fn attach_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let composer = self.composer.clone();
+        cx.spawn(async move |_this, cx| {
+            let staged = cx
+                .background_spawn(async move {
+                    paths
+                        .iter()
+                        .filter(|p| image_attach::is_image_path(p))
+                        .filter_map(|p| image_attach::pending_from_path(p))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            composer.update(cx, |c, cx| c.add_pending_images(staged, cx));
+        })
+        .detach();
+    }
+
     /// Record + transmit a submitted prompt (from the composer's Submit event).
     /// The composer has already cleared its own input.
-    fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.is_empty() {
+    fn send_text(&mut self, text: String, images: Vec<ChatImage>, cx: &mut Context<Self>) {
+        if text.is_empty() && images.is_empty() {
             return;
         }
         // A prior Stop killed the child but left the session resumable — bring it
@@ -352,9 +388,9 @@ impl AgentChatView {
             return; // unrecoverable (a crash, or the resume failed) — nothing to send to
         }
         // Optimistically record the prompt; the reply streams in via `on_event`.
-        self.thread.push_user_message(text.clone());
+        self.thread.push_user_message_with_images(text.clone(), images.clone());
         if let Some(conn) = &self.connection
-            && let Err(e) = conn.send_user_message(&text)
+            && let Err(e) = conn.send_user_message_with_images(&text, &images)
         {
             self.thread.last_error = Some(format!("Send failed: {e}"));
         }
@@ -507,6 +543,7 @@ impl AgentChatView {
             interrupted: false,
             expanded_thinking: HashSet::new(),
             expanded_tool_calls: HashSet::new(),
+            image_cache: RefCell::new(HashMap::new()),
             _drain_task: None,
             _subscriptions: Vec::new(),
         }
@@ -660,6 +697,22 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Decoded thumbnails for a user entry's attached images, memoized in
+    /// [`Self::image_cache`] by the stable (entry, image) position so a streaming
+    /// repaint never re-decodes base64. Corrupt attachments are skipped.
+    fn decoded_images(&self, idx: usize, images: &[ChatImage]) -> Vec<Arc<Image>> {
+        let mut cache = self.image_cache.borrow_mut();
+        let mut out = Vec::with_capacity(images.len());
+        for (i, chat) in images.iter().enumerate() {
+            let decoded =
+                cache.entry((idx, i)).or_insert_with(|| image_attach::decode_render(chat));
+            if let Some(arc) = decoded {
+                out.push(arc.clone());
+            }
+        }
+        out
+    }
+
     /// The scrollable transcript column. Entries stack in a centered reading
     /// column ([`CONTENT_MAX_W`]) so wide windows don't stretch text edge-to-
     /// edge; the outer element only scrolls and centers.
@@ -722,9 +775,11 @@ impl AgentChatView {
 
         for (idx, entry) in self.thread.entries.iter().enumerate() {
             match entry {
-                ThreadEntry::User(text) => {
+                ThreadEntry::User { text, images } => {
                     // No "You" caption — the right-aligned bubble is the signal.
-                    content = content.child(bubble::user_body(text, theme, density, &typo));
+                    let thumbs = self.decoded_images(idx, images);
+                    content =
+                        content.child(bubble::user_body(text, &thumbs, theme, density, &typo));
                 }
                 ThreadEntry::Assistant(msg) => {
                     if msg.is_empty() {
@@ -923,6 +978,10 @@ impl Render for AgentChatView {
                 // The mouse Send button remains the IME-proof fallback. The
                 // composer emits `Submit`, which this view's subscription sends.
                 this.composer.update(cx, |c, cx| c.submit(window, cx));
+            }))
+            // Drop image files anywhere on the chat surface to attach them.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.attach_dropped_paths(paths.paths().to_vec(), cx);
             }))
             .child(transcript)
             .child(self.composer.clone())

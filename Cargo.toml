@@ -96,6 +96,11 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 # Phase 4 prep
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Agent-chat image attachments: base64 for the wire/persist encoding; `image`
+# to transcode clipboard/file formats Claude doesn't accept (tiff/bmp/…) to PNG.
+base64 = "0.22"
+image = "0.25"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # Phase 5 editor + LSP. Pinned to match gpui-component's transitive

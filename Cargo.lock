@@ -5099,6 +5099,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
+ "base64",
  "block2",
  "cbc",
  "chrono",
@@ -5110,6 +5111,7 @@ dependencies = [
  "gpui_macros",
  "gpui_platform",
  "hmac",
+ "image",
  "libc",
  "notify-debouncer-full",
  "objc2",
