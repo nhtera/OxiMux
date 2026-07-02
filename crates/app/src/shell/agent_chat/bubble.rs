@@ -6,12 +6,7 @@
 //! toggle, the scroll container) lives in the view; keeping these pure means
 //! the view file stays small and this file needs no `Context`.
 
-use std::sync::Arc;
-
-use gpui::{
-    AnyElement, Hsla, Image, ImageSource, IntoElement, ObjectFit, ParentElement, SharedString,
-    Styled, StyledImage as _, div, img, px,
-};
+use gpui::{AnyElement, Hsla, IntoElement, ParentElement, SharedString, Styled, div, px};
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::{TextView, TextViewStyle};
 use oximux_agents::thread::{ToolCall, ToolCallStatus};
@@ -36,46 +31,16 @@ const USER_BUBBLE_MAX_W: f32 = 520.0;
 /// render blank in a flex column) — the width cap lets the text wrap naturally.
 pub(super) fn user_body(
     text: &str,
-    images: &[Arc<Image>],
     theme: Theme,
     density: Density,
     typo: &Typography,
 ) -> AnyElement {
-    // Right-aligned column: attached image thumbnails (if any) sit above the
-    // text bubble, matching the prompt's right edge.
-    let mut col = div().flex().flex_col().items_end().w_full().gap(px(6.0));
-    if !images.is_empty() {
-        let mut thumbs = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .justify_end()
-            .gap(px(6.0))
-            .max_w(px(USER_BUBBLE_MAX_W));
-        for im in images {
-            // A fixed thumbnail box (cropped to fill) keeps a tidy grid without
-            // needing each image's intrinsic dimensions; the full image goes to
-            // the agent regardless.
-            thumbs = thumbs.child(
-                div()
-                    .w(px(200.0))
-                    .h(px(150.0))
-                    .flex_none()
-                    .rounded(px(density.r_card))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(theme.border_inactive)
-                    .child(
-                        img(ImageSource::Image(im.clone()))
-                            .size_full()
-                            .object_fit(ObjectFit::Cover),
-                    ),
-            );
-        }
-        col = col.child(thumbs);
-    }
-    if !text.is_empty() {
-        col = col.child(
+    div()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .w_full()
+        .child(
             div()
                 .max_w(px(USER_BUBBLE_MAX_W))
                 .rounded(px(density.r_card))
@@ -85,10 +50,13 @@ pub(super) fn user_body(
                 .text_size(px(typo.t_body_md))
                 .text_color(theme.fg_base)
                 .child(SharedString::from(text.to_string())),
-        );
-    }
-    col.into_any_element()
+        )
+        .into_any_element()
 }
+
+/// The max width for the user's attached-image thumbnail strip — matches the
+/// text bubble so images and prose share the same right edge.
+pub(super) const USER_IMAGES_MAX_W: f32 = USER_BUBBLE_MAX_W;
 
 /// The assistant's visible reply, rendered as GitHub-flavored markdown. `key`
 /// discriminates the renderer's per-bubble state so two bubbles never share it.

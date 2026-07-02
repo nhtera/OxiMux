@@ -28,9 +28,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
-    EventEmitter, ExternalPaths, FocusHandle, Focusable, Image, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, Transformation, WeakEntity, Window, div, percentage, px,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, Image, ImageSource, InteractiveElement,
+    IntoElement, MouseButton, ObjectFit, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Task, Transformation,
+    WeakEntity, Window, div, img, percentage, px, relative,
 };
 use gpui_component::Icon;
 use gpui_component::input::Enter as InputEnter;
@@ -153,6 +154,11 @@ pub struct AgentChatView {
     /// `render` borrows the view immutably. Append-only entries keep the keys
     /// stable; `None` marks an image whose base64 failed to decode.
     image_cache: ImageCache,
+    /// When `Some((entry, image))`, a full-size lightbox is open on the `image`-th
+    /// attachment of the `entry`-th transcript entry. The ‹ › pager walks only
+    /// that one message's images (a per-message group); the backdrop / ✕ clears
+    /// it.
+    preview: Option<(usize, usize)>,
     /// Foreground event-drain task. Dropping it only cancels the *foreground*
     /// half at its next await point — it does NOT stop the forwarder/reader OS
     /// threads or reap the subprocess. Subprocess + thread teardown is owned by
@@ -300,6 +306,7 @@ impl AgentChatView {
             expanded_thinking: HashSet::new(),
             expanded_tool_calls: HashSet::new(),
             image_cache: RefCell::new(HashMap::new()),
+            preview: None,
             _drain_task: drain_task,
             _subscriptions: subscriptions,
         }
@@ -544,6 +551,7 @@ impl AgentChatView {
             expanded_thinking: HashSet::new(),
             expanded_tool_calls: HashSet::new(),
             image_cache: RefCell::new(HashMap::new()),
+            preview: None,
             _drain_task: None,
             _subscriptions: Vec::new(),
         }
@@ -713,6 +721,202 @@ impl AgentChatView {
         out
     }
 
+    /// A user prompt: its attached-image thumbnails (each clickable to open the
+    /// full-size lightbox) stacked above the right-aligned text bubble.
+    fn render_user_entry(
+        &self,
+        idx: usize,
+        text: &str,
+        images: &[ChatImage],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typo = self.typography.clone();
+        let decoded = self.decoded_images(idx, images);
+        let mut col = div().flex().flex_col().items_end().w_full().gap(px(6.0));
+        if !decoded.is_empty() {
+            let mut thumbs = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .justify_end()
+                .gap(px(6.0))
+                .max_w(px(bubble::USER_IMAGES_MAX_W));
+            for (i, im) in decoded.iter().enumerate() {
+                thumbs = thumbs.child(
+                    div()
+                        .id(SharedString::from(format!("user-img-{idx}-{i}")))
+                        .w(px(200.0))
+                        .h(px(150.0))
+                        .flex_none()
+                        .rounded(px(density.r_card))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme.border_inactive)
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(theme.focus_ring))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.open_image_preview(idx, i, cx)
+                            }),
+                        )
+                        .child(
+                            img(ImageSource::Image(im.clone()))
+                                .size_full()
+                                .object_fit(ObjectFit::Cover),
+                        ),
+                );
+            }
+            col = col.child(thumbs);
+        }
+        if !text.is_empty() {
+            col = col.child(bubble::user_body(text, theme, density, &typo));
+        }
+        col.into_any_element()
+    }
+
+    /// The decoded images of one transcript entry (empty for a non-user entry or
+    /// a stale index) — the group the lightbox pager walks.
+    fn entry_images(&self, entry_idx: usize) -> Vec<Arc<Image>> {
+        match self.thread.entries.get(entry_idx) {
+            Some(ThreadEntry::User { images, .. }) if !images.is_empty() => {
+                self.decoded_images(entry_idx, images)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Open the full-size lightbox on one message's image.
+    fn open_image_preview(&mut self, entry_idx: usize, img_idx: usize, cx: &mut Context<Self>) {
+        self.preview = Some((entry_idx, img_idx));
+        cx.notify();
+    }
+
+    /// Dismiss the lightbox (backdrop click or the ✕).
+    fn close_image_preview(&mut self, cx: &mut Context<Self>) {
+        if self.preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Step within the CURRENT message's image group, wrapping at the ends.
+    fn step_image_preview(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some((entry, img)) = self.preview {
+            let n = self.entry_images(entry).len();
+            if n == 0 {
+                return;
+            }
+            let next = (img as isize + delta).rem_euclid(n as isize) as usize;
+            self.preview = Some((entry, next));
+            cx.notify();
+        }
+    }
+
+    /// The full-size image lightbox: a dimmed backdrop (click to dismiss) with
+    /// the current image fit (aspect-preserved), a ‹ N of M › pager across the
+    /// SAME message's images, and a ✕ — Claude-Desktop-style. Rendered over
+    /// everything when [`Self::preview`] is set.
+    fn render_image_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (entry, img_idx) = self.preview?;
+        let group = self.entry_images(entry);
+        let i = img_idx.min(group.len().saturating_sub(1));
+        let image = group.get(i)?.clone();
+        let n = group.len();
+        let theme = self.theme;
+        let typo = &self.typography;
+
+        // A circular control glyph used for the ✕ and the ‹ › arrows.
+        let control = |id: &'static str, glyph: &'static str| {
+            div()
+                .id(id)
+                .size(px(30.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme.bg_panel)
+                .border_1()
+                .border_color(theme.border_input)
+                .text_color(theme.fg_muted)
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.fg_base))
+                .child(SharedString::from(glyph))
+        };
+
+        // The image box is sized RELATIVE TO THE BACKDROP (a definite full-window
+        // box), NOT a shrink-wrapped column — otherwise `relative(..)` resolves
+        // against an auto-sized parent and collapses to zero (blank image). It's
+        // a direct child of the backdrop for that reason. Clicking the image
+        // itself is swallowed so only the dark margin (or ✕) dismisses.
+        let image_box = div()
+            .w(relative(0.86))
+            .h(relative(0.78))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+            .child(
+                img(ImageSource::Image(image))
+                    .size_full()
+                    .object_fit(ObjectFit::Contain),
+            );
+
+        let pager = (n > 1).then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(16.0))
+                // Clicks on the pager (label / gaps) shouldn't close either.
+                .on_mouse_down(MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+                .child(control("chat-image-prev", "‹").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, _w, cx| this.step_image_preview(-1, cx)),
+                ))
+                .child(
+                    div()
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_muted)
+                        .child(SharedString::from(format!("{} of {}", i + 1, n))),
+                )
+                .child(control("chat-image-next", "›").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, _w, cx| this.step_image_preview(1, cx)),
+                ))
+        });
+
+        Some(
+            div()
+                .id("chat-image-preview")
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(12.0))
+                .bg(gpui::black().opacity(0.82))
+                // A click on the bare (dark) backdrop closes the lightbox.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, _w, cx| this.close_image_preview(cx)),
+                )
+                .child(image_box)
+                .children(pager)
+                // ✕ sits on the backdrop, so clicking it bubbles to the close
+                // handler.
+                .child(
+                    control("chat-image-preview-close", "✕")
+                        .absolute()
+                        .top(px(16.0))
+                        .right(px(16.0)),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The scrollable transcript column. Entries stack in a centered reading
     /// column ([`CONTENT_MAX_W`]) so wide windows don't stretch text edge-to-
     /// edge; the outer element only scrolls and centers.
@@ -777,9 +981,7 @@ impl AgentChatView {
             match entry {
                 ThreadEntry::User { text, images } => {
                     // No "You" caption — the right-aligned bubble is the signal.
-                    let thumbs = self.decoded_images(idx, images);
-                    content =
-                        content.child(bubble::user_body(text, &thumbs, theme, density, &typo));
+                    content = content.child(self.render_user_entry(idx, text, images, cx));
                 }
                 ThreadEntry::Assistant(msg) => {
                     if msg.is_empty() {
@@ -985,6 +1187,8 @@ impl Render for AgentChatView {
             }))
             .child(transcript)
             .child(self.composer.clone())
+            // The image lightbox overlays everything when a thumbnail is opened.
+            .children(self.render_image_preview(cx))
     }
 }
 
