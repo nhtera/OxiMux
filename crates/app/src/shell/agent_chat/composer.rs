@@ -32,6 +32,8 @@ pub enum ComposerEvent {
     ModelPicked(String),
     /// The user picked a permission mode in the bottom toolbar (a wire value).
     PermissionModePicked(String),
+    /// The user picked a reasoning-effort level in the bottom toolbar.
+    EffortPicked(String),
 }
 
 pub struct ComposerView {
@@ -47,9 +49,13 @@ pub struct ComposerView {
     /// [`Self::set_controls`]; the composer only renders them and emits a pick.
     model: Option<String>,
     permission_mode: Option<String>,
+    effort: Option<String>,
     /// Whether the backend honors a permission-mode switch (hides the mode picker
     /// when it doesn't). Model is always offered.
     supports_modes: bool,
+    /// Whether the backend accepts a reasoning-effort setting (hides the effort
+    /// picker when it doesn't).
+    supports_effort: bool,
     /// Repaints this view (only) on each keystroke so the draft stays visible.
     _sub: Subscription,
 }
@@ -94,7 +100,9 @@ impl ComposerView {
             turn_active: false,
             model: None,
             permission_mode: None,
+            effort: None,
             supports_modes: false,
+            supports_effort: false,
             _sub: sub,
         }
     }
@@ -115,23 +123,30 @@ impl ComposerView {
         }
     }
 
-    /// Mirror the parent's session controls (current model + permission mode, and
-    /// whether the backend supports mode switching) so the bottom toolbar renders
-    /// the right labels. Only repaints when something actually changed.
+    /// Mirror the parent's session controls (current model, permission mode,
+    /// effort, and which the backend supports) so the bottom toolbar renders the
+    /// right labels + pickers. Only repaints when something actually changed.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_controls(
         &mut self,
         model: Option<String>,
         permission_mode: Option<String>,
+        effort: Option<String>,
         supports_modes: bool,
+        supports_effort: bool,
         cx: &mut Context<Self>,
     ) {
         if self.model != model
             || self.permission_mode != permission_mode
+            || self.effort != effort
             || self.supports_modes != supports_modes
+            || self.supports_effort != supports_effort
         {
             self.model = model;
             self.permission_mode = permission_mode;
+            self.effort = effort;
             self.supports_modes = supports_modes;
+            self.supports_effort = supports_effort;
             cx.notify();
         }
     }
@@ -144,6 +159,10 @@ impl ComposerView {
 
     fn pick_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
         cx.emit(ComposerEvent::PermissionModePicked(mode));
+    }
+
+    fn pick_effort(&mut self, effort: String, cx: &mut Context<Self>) {
+        cx.emit(ComposerEvent::EffortPicked(effort));
     }
 
     /// Read + clear the draft, emitting [`ComposerEvent::Submit`] when it's a
@@ -253,6 +272,51 @@ impl ComposerView {
                 menu
             })
     }
+
+    /// The reasoning-effort control in the bottom toolbar: a flat ghost button
+    /// (label + subtle caret) labeled with the current effort, opening the level
+    /// menu upward.
+    fn render_effort_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let current_wire = self
+            .effort
+            .clone()
+            .unwrap_or_else(|| super::DEFAULT_EFFORT.to_string());
+        let current_label = super::CLAUDE_EFFORTS
+            .iter()
+            .find(|(w, _)| *w == current_wire)
+            .map(|(_, l)| *l)
+            .unwrap_or(current_wire.as_str())
+            .to_string();
+        let current_for_menu = current_wire.clone();
+        Button::new("chat-effort-btn")
+            .label(current_label)
+            .ghost()
+            .small()
+            .dropdown_caret(true)
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
+                for (wire, label) in super::CLAUDE_EFFORTS {
+                    let selected = current_for_menu == *wire;
+                    let display = if selected {
+                        format!("\u{2713} {label}")
+                    } else {
+                        format!("   {label}")
+                    };
+                    let choice = wire.to_string();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
+                            window.listener_for(
+                                &entity,
+                                move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
+                                    view.pick_effort(choice.clone(), cx);
+                                },
+                            ),
+                        ),
+                    );
+                }
+                menu
+            })
+    }
 }
 
 impl Render for ComposerView {
@@ -334,10 +398,12 @@ impl Render for ComposerView {
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }
-        let controls = controls
-            .child(div().flex_1())
-            .child(self.render_model_picker(cx))
-            .child(action_button);
+        // Spacer pushes the model/effort/Send cluster to the far right.
+        controls = controls.child(div().flex_1()).child(self.render_model_picker(cx));
+        if self.supports_effort {
+            controls = controls.child(self.render_effort_picker(cx));
+        }
+        let controls = controls.child(action_button);
 
         // The pill: a rounded, focus-reactive frame around the borderless input
         // ONLY. The single-line input self-sizes to one row, so the pill keeps a

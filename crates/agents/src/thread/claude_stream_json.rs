@@ -30,20 +30,22 @@ use super::tool_call::PermissionDecision;
 /// the session from the user's global `~/.claude` hooks (which otherwise
 /// corrupt the permission round-trip — a spike finding).
 pub fn build_args(model: Option<&str>) -> Vec<String> {
-    build_args_with_resume(model, None, None)
+    build_args_with_resume(model, None, None, None)
 }
 
 /// Same as [`build_args`], plus `--resume <session_id>` when restoring a
-/// persisted chat and `--permission-mode <mode>` when the tab is in a non-default
-/// mode. Resuming reuses the original session id (no `--fork-session`) so the
-/// continued conversation keeps its server-side context; the UI already
-/// rehydrated the visible transcript from disk, so this only needs to reconnect
-/// the *next* turn to the prior history. Permission mode is fixed at spawn (like
-/// `--model`), so a live mode switch respawns via this same path.
+/// persisted chat, `--permission-mode <mode>` for a non-default mode, and
+/// `--effort <level>` for a chosen reasoning effort. Resuming reuses the original
+/// session id (no `--fork-session`) so the continued conversation keeps its
+/// server-side context; the UI already rehydrated the visible transcript from
+/// disk, so this only needs to reconnect the *next* turn to the prior history.
+/// Permission mode and effort are both fixed at spawn (like `--model`), so a live
+/// switch of either respawns via this same path.
 pub fn build_args_with_resume(
     model: Option<&str>,
     resume_session_id: Option<&str>,
     permission_mode: Option<&str>,
+    effort: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
@@ -76,6 +78,12 @@ pub fn build_args_with_resume(
         args.push("--permission-mode".to_string());
         args.push(pm.to_string());
     }
+    // Reasoning effort (low/medium/high/xhigh/max). Only passed when explicitly
+    // chosen; omitting it lets the CLI use its own configured default.
+    if let Some(ef) = effort.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--effort".to_string());
+        args.push(ef.to_string());
+    }
     if let Some(sid) = resume_session_id.map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--resume".to_string());
         args.push(sid.to_string());
@@ -105,9 +113,10 @@ impl ClaudeStreamJsonConnection {
         model: Option<&str>,
         session_id: Option<&str>,
         permission_mode: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new("claude");
-        cmd.args(build_args_with_resume(model, session_id, permission_mode))
+        cmd.args(build_args_with_resume(model, session_id, permission_mode, effort))
             .current_dir(cwd);
         Self::spawn_command(cmd)
     }
@@ -171,10 +180,10 @@ impl AgentConnection for ClaudeStreamJsonConnection {
 
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
-            supports_modes: true,   // permission modes (acceptEdits, …)
-            supports_slash: true,   // system/init advertises slash_commands
-            supports_config: false, // no runtime reasoning/effort flag
-            emits_usage: true,      // result + stream_event carry token/cost usage
+            supports_modes: true,  // permission modes (acceptEdits, …)
+            supports_slash: true,  // system/init advertises slash_commands
+            supports_config: true, // reasoning effort via `--effort <level>`
+            emits_usage: true,     // result + stream_event carry token/cost usage
         }
     }
 
@@ -257,30 +266,41 @@ mod tests {
 
     #[test]
     fn build_args_appends_resume_when_session_id_set() {
-        let a = build_args_with_resume(None, Some("sid-123"), None);
+        let a = build_args_with_resume(None, Some("sid-123"), None, None);
         let i = a.iter().position(|x| x == "--resume").expect("--resume present");
         assert_eq!(a[i + 1], "sid-123");
         // blank / absent session id → no --resume
-        assert!(!build_args_with_resume(None, Some("  "), None).iter().any(|x| x == "--resume"));
-        assert!(!build_args_with_resume(None, None, None).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, Some("  "), None, None).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, None, None, None).iter().any(|x| x == "--resume"));
         // plain build_args never resumes
         assert!(!build_args(None).iter().any(|x| x == "--resume"));
     }
 
     #[test]
     fn build_args_appends_permission_mode_only_when_non_default() {
-        let a = build_args_with_resume(None, None, Some("acceptEdits"));
+        let a = build_args_with_resume(None, None, Some("acceptEdits"), None);
         let i = a.iter().position(|x| x == "--permission-mode").expect("--permission-mode present");
         assert_eq!(a[i + 1], "acceptEdits");
         // "default", blank, and none all omit the flag (a fresh spawn IS default).
         for pm in [Some("default"), Some("  "), None] {
             assert!(
-                !build_args_with_resume(None, None, pm).iter().any(|x| x == "--permission-mode"),
+                !build_args_with_resume(None, None, pm, None).iter().any(|x| x == "--permission-mode"),
                 "{pm:?} must not emit --permission-mode"
             );
         }
         // plain build_args never sets a mode
         assert!(!build_args(None).iter().any(|x| x == "--permission-mode"));
+    }
+
+    #[test]
+    fn build_args_appends_effort_when_set() {
+        let a = build_args_with_resume(None, None, None, Some("xhigh"));
+        let i = a.iter().position(|x| x == "--effort").expect("--effort present");
+        assert_eq!(a[i + 1], "xhigh");
+        // blank / none omit the flag (CLI uses its configured default)
+        assert!(!build_args_with_resume(None, None, None, Some("  ")).iter().any(|x| x == "--effort"));
+        assert!(!build_args_with_resume(None, None, None, None).iter().any(|x| x == "--effort"));
+        assert!(!build_args(None).iter().any(|x| x == "--effort"));
     }
 
     /// Spawn a FAKE program that prints two stream-json lines; the reader

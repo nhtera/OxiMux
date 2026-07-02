@@ -61,6 +61,22 @@ pub(super) const CLAUDE_PERMISSION_MODES: &[(&str, &str)] = &[
 /// The wire value treated as the baseline (no `--permission-mode` flag).
 pub(super) const DEFAULT_PERMISSION_MODE: &str = "default";
 
+/// Reasoning-effort levels offered in the in-chat effort picker, as
+/// `(wire, label)`. The wire value is passed to `--effort`. These are the levels
+/// the CLI accepts (`low`/`medium`/`high`/`xhigh`/`max`).
+pub(super) const CLAUDE_EFFORTS: &[(&str, &str)] = &[
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra high"),
+    ("max", "Max"),
+];
+
+/// The effort shown as the current selection when none has been chosen — the
+/// CLI's own default. Purely a display label; when the field is `None` no
+/// `--effort` flag is passed, so the CLI applies whatever it's configured for.
+pub(super) const DEFAULT_EFFORT: &str = "high";
+
 /// Events the chat view raises for its host (the pane group) to act on.
 pub enum AgentChatEvent {
     /// The user picked a different model; the host persists it in the tab kind
@@ -109,6 +125,10 @@ pub struct AgentChatView {
     /// persisted across relaunch: a session should reopen in the safe default
     /// rather than silently inheriting a prior "bypass all".
     permission_mode: Option<String>,
+    /// The chosen reasoning-effort level (`low`/`medium`/`high`/`xhigh`/`max`),
+    /// or `None` for the CLI's own default. Like `--model` it's fixed at spawn,
+    /// so a live switch respawns via `--resume`.
+    effort: Option<String>,
     /// Set once the event channel closes (process exit / EOF). Disables sending.
     disconnected: bool,
     /// True after the user pressed Stop: the turn was interrupted and the child
@@ -203,6 +223,7 @@ impl AgentChatView {
                 ComposerEvent::PermissionModePicked(mode) => {
                     this.change_permission_mode(mode.clone(), cx)
                 }
+                ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
             },
         )];
 
@@ -219,6 +240,7 @@ impl AgentChatView {
             model.as_deref(),
             resume_session_id.as_deref(),
             None,
+            None,
         ) {
             Ok((conn, rx)) => {
                 connection = Some(Box::new(conn));
@@ -233,15 +255,15 @@ impl AgentChatView {
         // Seed the composer's bottom-toolbar pickers now, so they're correct on
         // the very first paint — a restored chat that isn't streaming fires no
         // event, so `sync_composer` wouldn't otherwise run until the next turn
-        // (and the permission picker, gated on `supports_modes`, would be
-        // missing until then). Permission mode always starts at the default.
-        let supports_modes = connection
+        // (and the capability-gated pickers would be missing until then).
+        // Permission mode + effort both start unset (the CLI defaults apply).
+        let caps = connection
             .as_ref()
-            .map(|c| c.capabilities().supports_modes)
-            .unwrap_or(false);
+            .map(|c| c.capabilities())
+            .unwrap_or_default();
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
-            c.set_controls(model.clone(), None, supports_modes, cx);
+            c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, cx);
         });
 
         Self {
@@ -257,6 +279,7 @@ impl AgentChatView {
             cwd,
             model,
             permission_mode: None,
+            effort: None,
             disconnected,
             interrupted: false,
             expanded_thinking: HashSet::new(),
@@ -300,16 +323,17 @@ impl AgentChatView {
     /// reflect reality. Cheap no-op when nothing changed (both setters guard).
     fn sync_composer(&self, cx: &mut Context<Self>) {
         let (disconnected, turn_active) = (self.disconnected, self.thread.turn_active);
-        // Advertise mode switching by capability, not by hard-coding the provider.
-        let supports_modes = self
+        // Advertise controls by capability, not by hard-coding the provider.
+        let caps = self
             .connection
             .as_ref()
-            .map(|c| c.capabilities().supports_modes)
-            .unwrap_or(false);
-        let (model, permission_mode) = (self.model.clone(), self.permission_mode.clone());
+            .map(|c| c.capabilities())
+            .unwrap_or_default();
+        let (model, permission_mode, effort) =
+            (self.model.clone(), self.permission_mode.clone(), self.effort.clone());
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
-            c.set_controls(model, permission_mode, supports_modes, cx);
+            c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, cx);
         });
     }
 
@@ -360,12 +384,12 @@ impl AgentChatView {
     }
 
     /// Reap the current child and spawn a fresh one resuming the same session
-    /// (`--resume <session_id>`) with the current model + permission mode,
-    /// rewiring the event drain. The one place a live chat re-establishes its
-    /// subprocess — shared by Stop→next-send, an in-chat model switch, and a
-    /// permission-mode switch (both are fixed at spawn). Reads `self.model` /
-    /// `self.permission_mode`, so callers set those first. Degrades to a
-    /// read-only error state if the respawn fails.
+    /// (`--resume <session_id>`) with the current model + permission mode +
+    /// effort, rewiring the event drain. The one place a live chat re-establishes
+    /// its subprocess — shared by Stop→next-send and in-chat model / permission /
+    /// effort switches (all fixed at spawn). Reads `self.model` /
+    /// `self.permission_mode` / `self.effort`, so callers set those first.
+    /// Degrades to a read-only error state if the respawn fails.
     fn respawn(&mut self, cx: &mut Context<Self>) {
         // Reap the old connection before replacing it — `Child`'s Drop neither
         // kills nor waits, so after a Stop this harvests the already-dead child
@@ -376,11 +400,13 @@ impl AgentChatView {
         let session_id = self.thread.session_id.clone();
         let model = self.model.clone();
         let permission_mode = self.permission_mode.clone();
+        let effort = self.effort.clone();
         match ClaudeStreamJsonConnection::spawn_resumed(
             &self.cwd,
             model.as_deref(),
             session_id.as_deref(),
             permission_mode.as_deref(),
+            effort.as_deref(),
         ) {
             Ok((conn, rx)) => {
                 self.connection = Some(Box::new(conn));
@@ -435,6 +461,20 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Switch the reasoning effort for this chat tab. `--effort` is fixed at
+    /// spawn (like `--model`), so a live switch respawns resumed on the new
+    /// level. Not persisted, so no host event is raised. No-op when unchanged.
+    fn change_effort(&mut self, effort: String, cx: &mut Context<Self>) {
+        let current = self.effort.as_deref().unwrap_or(DEFAULT_EFFORT);
+        if current == effort {
+            return;
+        }
+        self.effort = Some(effort);
+        self.respawn(cx);
+        self.sync_composer(cx); // reflect the new effort in the toolbar label
+        cx.notify();
+    }
+
     /// Test-only constructor: inject a connection (a `StubConnection`) instead
     /// of spawning a real subprocess, and skip the background drain so a
     /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
@@ -462,6 +502,7 @@ impl AgentChatView {
             cwd: PathBuf::new(),
             model: None,
             permission_mode: None,
+            effort: None,
             disconnected: false,
             interrupted: false,
             expanded_thinking: HashSet::new(),
