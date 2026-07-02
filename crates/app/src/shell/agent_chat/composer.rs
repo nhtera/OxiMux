@@ -15,9 +15,9 @@ use gpui::{
     Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants, DropdownButton};
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::PopupMenuItem;
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use oximux_settings::{Density, Theme, Typography};
 
 /// Raised by the composer for the parent [`super::AgentChatView`] to act on.
@@ -169,19 +169,22 @@ impl ComposerView {
         cx.emit(ComposerEvent::Stop);
     }
 
-    /// The model dropdown in the bottom toolbar: a small ghost button labeled
-    /// with the current model, opening the Claude aliases upward (the composer
-    /// sits at the bottom, so the menu anchors to the button's bottom-right).
-    fn render_model_picker(&self, cx: &mut Context<Self>) -> DropdownButton {
+    /// The model control in the bottom toolbar: a flat ghost button (no box —
+    /// just the label + a subtle caret, like Claude Desktop) that opens the
+    /// Claude aliases upward (the composer sits at the bottom, so the menu
+    /// anchors to the button's bottom-right).
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let current = self
             .model
             .clone()
             .unwrap_or_else(|| super::CLAUDE_MODELS[1].to_string());
         let current_for_menu = current.clone();
-        DropdownButton::new("chat-model")
-            .button(Button::new("chat-model-btn").label(current).small().ghost())
+        Button::new("chat-model-btn")
+            .label(current)
+            .ghost()
             .small()
+            .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
                 for m in super::CLAUDE_MODELS {
                     let selected = current_for_menu == *m;
@@ -206,9 +209,10 @@ impl ComposerView {
             })
     }
 
-    /// The permission-mode dropdown in the bottom toolbar: a small ghost button
-    /// labeled with the current mode, opening the canonical mode menu upward.
-    fn render_permission_picker(&self, cx: &mut Context<Self>) -> DropdownButton {
+    /// The permission-mode control in the bottom toolbar: a flat ghost button
+    /// (label + subtle caret) labeled with the current mode, opening the
+    /// canonical mode menu upward.
+    fn render_permission_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let current_wire = self
             .permission_mode
@@ -221,9 +225,11 @@ impl ComposerView {
             .unwrap_or(current_wire.as_str())
             .to_string();
         let current_for_menu = current_wire.clone();
-        DropdownButton::new("chat-perm-mode")
-            .button(Button::new("chat-perm-mode-btn").label(current_label).small().ghost())
+        Button::new("chat-perm-mode-btn")
+            .label(current_label)
+            .ghost()
             .small()
+            .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
                 for (wire, label) in super::CLAUDE_PERMISSION_MODES {
                     let selected = current_for_menu == *wire;
