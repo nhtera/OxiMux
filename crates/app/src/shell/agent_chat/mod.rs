@@ -15,6 +15,7 @@ mod bubble;
 mod composer;
 mod diff_card;
 mod plan_panel;
+mod tool_bodies;
 mod tool_card;
 
 use std::collections::HashSet;

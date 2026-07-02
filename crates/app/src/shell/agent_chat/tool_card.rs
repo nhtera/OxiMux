@@ -17,6 +17,7 @@ use oximux_settings::{Density, Theme, Typography};
 use super::AgentChatView;
 use super::bubble;
 use super::diff_card;
+use super::tool_bodies;
 
 /// Cap on the rendered tool-result body so a chatty tool can't blow up a row.
 const RESULT_CHARS: usize = 4000;
@@ -78,12 +79,22 @@ pub(super) fn render_tool_card(
     }
 
     if expanded {
-        // Non-edit tools show the raw JSON payload (edits already show a diff).
-        if diff.is_none() {
+        if diff.is_some() {
+            // Edit/Write/MultiEdit: the diff is shown above; add any textual
+            // result too (e.g. an error message).
+            if let Some(result) = &tc.result {
+                card = card.child(result_block(result, theme, density, typo));
+            }
+        } else if let Some(body) = tool_bodies::render_tool_body(tc, theme, density, typo) {
+            // Bash/Read/Grep/Glob: a legible, tool-specific body (command +
+            // output, file slice, or match list) instead of raw JSON.
+            card = card.child(body);
+        } else {
+            // Unknown tool: the generic raw input + result disclosure.
             card = card.child(raw_input_block(tc, theme, density, typo));
-        }
-        if let Some(result) = &tc.result {
-            card = card.child(result_block(result, theme, density, typo));
+            if let Some(result) = &tc.result {
+                card = card.child(result_block(result, theme, density, typo));
+            }
         }
     }
 
