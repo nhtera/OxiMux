@@ -5077,6 +5077,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "libc",
  "oximux-core",
  "oximux-git",
  "oximux-pty",

@@ -22,7 +22,7 @@ pub mod tool_call;
 
 pub use claude_stream_json::{build_args, ClaudeStreamJsonConnection};
 pub use connection::{
-    control_response_json, user_message_json, AgentConnection, StubConnection,
+    control_response_json, user_message_json, AgentCapabilities, AgentConnection, StubConnection,
 };
 pub use entry::{AssistantMessage, ThreadEntry};
 pub use event::ThreadEvent;

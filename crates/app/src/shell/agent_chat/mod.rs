@@ -67,13 +67,17 @@ pub struct AgentChatView {
     theme: Theme,
     density: Density,
     typography: Typography,
-    /// Launch context, retained for a future `--resume`.
-    #[allow(dead_code)]
+    /// Launch context, retained so [`Self::respawn`] can re-spawn the subprocess
+    /// (Stop→next-send resume) in the same directory with the same model.
     cwd: PathBuf,
-    #[allow(dead_code)]
     model: Option<String>,
     /// Set once the event channel closes (process exit / EOF). Disables sending.
     disconnected: bool,
+    /// True after the user pressed Stop: the turn was interrupted and the child
+    /// exited, but the session is **resumable** — the next send transparently
+    /// respawns with `--resume`. Distinct from `disconnected` (an unexpected
+    /// crash, which stays unavailable), so an intentional Stop shows no error.
+    interrupted: bool,
     /// Assistant entry indices whose thinking disclosure is expanded.
     expanded_thinking: HashSet<usize>,
     /// Tool-call ids whose card disclosure (raw input + result) is expanded.
@@ -156,6 +160,7 @@ impl AgentChatView {
             &composer,
             |this, _composer, ev: &ComposerEvent, cx| match ev {
                 ComposerEvent::Submit(text) => this.send_text(text.clone(), cx),
+                ComposerEvent::Stop => this.stop_turn(cx),
             },
         )];
 
@@ -193,6 +198,7 @@ impl AgentChatView {
             cwd,
             model,
             disconnected,
+            interrupted: false,
             expanded_thinking: HashSet::new(),
             expanded_tool_calls: HashSet::new(),
             _drain_task: drain_task,
@@ -240,8 +246,16 @@ impl AgentChatView {
     /// Record + transmit a submitted prompt (from the composer's Submit event).
     /// The composer has already cleared its own input.
     fn send_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.is_empty() || self.disconnected {
+        if text.is_empty() {
             return;
+        }
+        // A prior Stop killed the child but left the session resumable — bring it
+        // back with `--resume` before sending so the conversation continues.
+        if self.interrupted {
+            self.respawn(self.model.clone(), cx);
+        }
+        if self.disconnected {
+            return; // unrecoverable (a crash, or the resume failed) — nothing to send to
         }
         // Optimistically record the prompt; the reply streams in via `on_event`.
         self.thread.push_user_message(text.clone());
@@ -255,6 +269,61 @@ impl AgentChatView {
         self.list_scroll.scroll_to_bottom();
         self.sync_composer(cx);
         cx.notify();
+    }
+
+    /// Interrupt the streaming turn (the composer's Stop button). SIGINTs the
+    /// child, finalizes the transcript, and fail-closes any pending approval,
+    /// then marks the session **resumable-idle**: the next send respawns via
+    /// `--resume`. Not marked `disconnected` — the stop was intentional, so no
+    /// error banner is shown.
+    fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        if !self.thread.turn_active {
+            return; // nothing is streaming
+        }
+        if let Some(conn) = &self.connection {
+            let _ = conn.cancel();
+        }
+        self.interrupted = true;
+        self.thread.interrupt();
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
+    /// Reap the current child and spawn a fresh one resuming the same session
+    /// (`--resume <session_id>`) on `model`, rewiring the event drain. The one
+    /// place a live chat re-establishes its subprocess — shared by Stop→next-send
+    /// and a later in-chat model switch. Degrades to a read-only error state if
+    /// the respawn fails.
+    fn respawn(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        // Reap the old connection before replacing it — `Child`'s Drop neither
+        // kills nor waits, so after a Stop this harvests the already-dead child
+        // (and hard-kills it if somehow still alive).
+        if let Some(old) = self.connection.take() {
+            old.shutdown();
+        }
+        let session_id = self.thread.session_id.clone();
+        match ClaudeStreamJsonConnection::spawn_resumed(
+            &self.cwd,
+            model.as_deref(),
+            session_id.as_deref(),
+        ) {
+            Ok((conn, rx)) => {
+                self.connection = Some(Box::new(conn));
+                // Reassigning drops the old drain task, cancelling its foreground
+                // half; its forwarder thread then exits on the dead child's
+                // stdout EOF. We're single-threaded here, so no stale
+                // `on_disconnect` can interleave onto the fresh connection.
+                self._drain_task = Some(Self::spawn_drain(rx, cx));
+                self.interrupted = false;
+                self.disconnected = false;
+                self.thread.last_error = None;
+            }
+            Err(e) => {
+                self.thread.last_error = Some(format!("Failed to resume agent: {e}"));
+                self.disconnected = true;
+                self.interrupted = false;
+            }
+        }
     }
 
     /// Test-only constructor: inject a connection (a `StubConnection`) instead
@@ -284,6 +353,7 @@ impl AgentChatView {
             cwd: PathBuf::new(),
             model: None,
             disconnected: false,
+            interrupted: false,
             expanded_thinking: HashSet::new(),
             expanded_tool_calls: HashSet::new(),
             _drain_task: None,
@@ -323,6 +393,13 @@ impl AgentChatView {
     /// Fold one decoded event into the thread and repaint.
     fn on_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
         self.thread.apply(&ev);
+        // A user-initiated Stop makes `claude` end the turn with an
+        // `error_during_execution` result (terminal_reason: aborted_streaming).
+        // That's the expected shape of an interrupt, not a failure — swallow it
+        // so an intentional Stop never flashes an error banner.
+        if self.interrupted {
+            self.thread.last_error = None;
+        }
         // Following (and the actual `scroll_to_bottom`) is owned by `render` via
         // `stick_to_bottom`, so newly-arrived content — streamed text, a tall
         // tool card, an Allow/Reject row — stays glued as it settles. Nothing to
@@ -362,6 +439,15 @@ impl AgentChatView {
             self.thread.set_tool_status(&tool_id, ToolCallStatus::Rejected);
         }
         self.thread.turn_active = false;
+        if self.interrupted {
+            // Intentional Stop: the child exited exactly as asked. Stay
+            // resumable-idle (the next send respawns via `--resume`) instead of
+            // marking the tab unavailable.
+            self.thread.last_error = None;
+            self.sync_composer(cx);
+            cx.notify();
+            return;
+        }
         self.disconnected = true;
         if self.thread.last_error.is_none() {
             self.thread.last_error = Some("Agent process exited.".into());
@@ -1022,6 +1108,141 @@ mod tests {
             .collect();
         assert_eq!(responses.len(), 1, "exactly one control_response for r1");
         assert_eq!(responses[0]["response"]["response"]["behavior"], "allow");
+    }
+
+    /// Stop mid-turn: the turn clears, a pending approval fail-closes, and the
+    /// tab enters resumable-idle (interrupted, NOT disconnected — no error).
+    #[gpui::test]
+    async fn stop_turn_interrupts_and_stays_resumable(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("do a long thing");
+                view.thread.apply(&ThreadEvent::ToolCallStarted {
+                    id: "t1".into(),
+                    name: "Edit".into(),
+                    input: json!({}),
+                });
+                view.thread.apply(&ThreadEvent::PermissionRequested {
+                    request_id: "r1".into(),
+                    tool_use_id: Some("t1".into()),
+                    tool_name: "Edit".into(),
+                    input: json!({}),
+                    description: "x".into(),
+                    suggestions: vec![],
+                });
+                assert!(view.thread.turn_active, "turn active before Stop");
+
+                view.stop_turn(cx);
+
+                assert!(!view.thread.turn_active, "Stop ends the turn");
+                assert!(view.interrupted, "session marked resumable-idle");
+                assert!(!view.disconnected, "an intentional Stop is not a disconnect");
+                assert!(
+                    view.thread.pending_permission().is_none(),
+                    "pending approval fail-closes on Stop"
+                );
+                assert_eq!(tool_status(view, "t1"), Some("Rejected"));
+
+                // The interrupt `result` arrives flagged as an error; it must be
+                // swallowed, not shown as a banner.
+                view.on_event(
+                    ThreadEvent::TurnEnded {
+                        result: None,
+                        cost_usd: None,
+                        is_error: true,
+                    },
+                    cx,
+                );
+                assert!(
+                    view.thread.last_error.is_none(),
+                    "the interrupt's error result is suppressed"
+                );
+
+                // The child's stdout then EOFs: still resumable, still no error.
+                view.on_disconnect(cx);
+                assert!(!view.disconnected, "EOF after an intentional Stop stays resumable");
+                assert!(view.interrupted);
+                assert!(view.thread.last_error.is_none());
+            })
+            .expect("window update");
+    }
+
+    /// Order-independence: if the child's stdout EOF is observed BEFORE the
+    /// interrupt's `result` event, the tab must still stay resumable-idle (not
+    /// flip to disconnected/unavailable), and a straggler error result arriving
+    /// afterward is still suppressed.
+    #[gpui::test]
+    async fn stop_then_eof_before_result_stays_resumable(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("go");
+                view.stop_turn(cx);
+                assert!(view.interrupted);
+
+                // EOF arrives first (before any TurnEnded is folded in).
+                view.on_disconnect(cx);
+                assert!(!view.disconnected, "EOF after Stop stays resumable, order-independent");
+                assert!(view.thread.last_error.is_none());
+
+                // A late error result then folds in — still suppressed.
+                view.on_event(
+                    ThreadEvent::TurnEnded { result: None, cost_usd: None, is_error: true },
+                    cx,
+                );
+                assert!(view.thread.last_error.is_none());
+                assert!(view.interrupted, "still resumable for the next send");
+            })
+            .expect("window update");
+    }
+
+    /// A Stop with no live turn is a no-op (nothing to interrupt).
+    #[gpui::test]
+    async fn stop_turn_without_active_turn_is_noop(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                assert!(!view.thread.turn_active);
+                view.stop_turn(cx);
+                assert!(!view.interrupted, "no turn → Stop does nothing");
+            })
+            .expect("window update");
     }
 
     fn tool_status(view: &AgentChatView, id: &str) -> Option<&'static str> {

@@ -22,6 +22,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+# Unix signal delivery (SIGINT to the headless `claude` child on Stop, so it
+# ends the turn gracefully and checkpoints the session for a clean `--resume`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 oximux-git = { workspace = true }
 tempfile = "3"

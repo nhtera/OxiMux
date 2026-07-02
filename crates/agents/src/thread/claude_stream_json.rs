@@ -17,7 +17,9 @@ use std::thread;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
-use super::connection::{control_response_json, user_message_json, AgentConnection};
+use super::connection::{
+    control_response_json, user_message_json, AgentCapabilities, AgentConnection,
+};
 use super::event::ThreadEvent;
 use super::stream_json::decode_line;
 use super::tool_call::PermissionDecision;
@@ -147,6 +149,49 @@ impl AgentConnection for ClaudeStreamJsonConnection {
 
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         self.write_line(&control_response_json(request_id, &decision))
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            supports_modes: true,   // permission modes (acceptEdits, …)
+            supports_slash: true,   // system/init advertises slash_commands
+            supports_config: false, // no runtime reasoning/effort flag
+            emits_usage: true,      // result + stream_event carry token/cost usage
+        }
+    }
+
+    /// Interrupt the in-flight turn by sending SIGINT to the child. `claude`
+    /// ends the turn gracefully, checkpoints the session server-side, then
+    /// exits (stdout EOF) — so the transcript stays consistent and the next send
+    /// can `--resume` the same session cleanly. SIGINT (not a hard kill) is what
+    /// keeps that checkpoint intact; the caller owns the resume-on-next-send.
+    #[cfg(unix)]
+    fn cancel(&self) -> Result<()> {
+        let child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("agent child lock poisoned"))?;
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: `pid` is our own spawned child; `kill(2)` with a real signal
+        // number is sound and simply delivers the signal (or returns an errno).
+        let rc = unsafe { libc::kill(pid, libc::SIGINT) };
+        if rc != 0 {
+            return Err(anyhow!(
+                "failed to interrupt agent: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn cancel(&self) -> Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("agent child lock poisoned"))?;
+        child.kill().context("interrupt agent")?;
+        Ok(())
     }
 
     fn shutdown(&self) {

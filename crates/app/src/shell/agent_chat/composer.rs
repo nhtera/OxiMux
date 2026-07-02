@@ -17,11 +17,13 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use oximux_settings::{Density, Theme, Typography};
 
-/// Raised when the user submits the draft (Enter or the Send button). The
-/// parent [`super::AgentChatView`] performs the actual send; the composer has
-/// already cleared its input by the time this fires.
+/// Raised by the composer for the parent [`super::AgentChatView`] to act on.
+/// The parent performs the actual send / interrupt; on `Submit` the composer
+/// has already cleared its input by the time the event fires.
 pub enum ComposerEvent {
     Submit(String),
+    /// The user pressed Stop while a turn was streaming — interrupt it.
+    Stop,
 }
 
 pub struct ComposerView {
@@ -95,15 +97,26 @@ impl ComposerView {
     }
 
     /// Read + clear the draft, emitting [`ComposerEvent::Submit`] when it's a
-    /// non-empty message and the agent is still connected.
+    /// non-empty message and the agent is available. Inert while a turn is
+    /// streaming: the primary affordance is Stop then, and a new message can't
+    /// be sent until the turn ends (or is stopped).
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disconnected || self.turn_active {
+            return;
+        }
         let text = self.input.read(cx).value().to_string();
         let text = text.trim().to_string();
-        if text.is_empty() || self.disconnected {
+        if text.is_empty() {
             return;
         }
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
         cx.emit(ComposerEvent::Submit(text));
+    }
+
+    /// Ask the parent to interrupt the in-flight turn (the Stop button). Leaves
+    /// the draft untouched so the user can send it once the turn is stopped.
+    fn request_stop(&mut self, cx: &mut Context<Self>) {
+        cx.emit(ComposerEvent::Stop);
     }
 }
 
@@ -120,34 +133,55 @@ impl Render for ComposerView {
         // in the transcript instead — the way a native chat surfaces it —
         // leaving the composer a calm, stable pill.
 
-        // Circular ↑ send button pinned to the bottom-right of the pill. A
-        // mouse target is the primary send affordance because keyboard ↵ can be
-        // swallowed by some input methods (e.g. Vietnamese Telex eats Enter
-        // before the app sees it).
-        let (send_bg, send_fg) = if can_send {
-            (theme.status_info, theme.bg_base)
+        // Circular action button pinned to the bottom-right of the pill. While a
+        // turn streams it becomes a Stop (■) that interrupts it; otherwise it's
+        // the ↑ Send. A mouse target is the primary affordance because keyboard
+        // ↵ can be swallowed by some input methods (e.g. Vietnamese Telex eats
+        // Enter before the app sees it).
+        let action_button = if self.turn_active {
+            // Stop: always live during a turn, in a muted attention tone.
+            div()
+                .id("agent-chat-stop")
+                .size(px(28.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme.fg_muted)
+                .text_color(theme.bg_base)
+                .text_size(px(typo.t_body_sm))
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, _window, cx| this.request_stop(cx)),
+                )
+                .child(SharedString::from("■"))
         } else {
-            (theme.bg_panel_alt, theme.fg_subtle)
+            let (send_bg, send_fg) = if can_send {
+                (theme.status_info, theme.bg_base)
+            } else {
+                (theme.bg_panel_alt, theme.fg_subtle)
+            };
+            div()
+                .id("agent-chat-send")
+                .size(px(28.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(send_bg)
+                .text_color(send_fg)
+                .text_size(px(typo.t_body_md))
+                .when(can_send, |s| s.cursor_pointer().hover(|s| s.opacity(0.85)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, window, cx| this.submit(window, cx)),
+                )
+                .child(SharedString::from("↑"))
         };
-        let send_button = div()
-            .id("agent-chat-send")
-            .size(px(28.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .bg(send_bg)
-            .text_color(send_fg)
-            .text_size(px(typo.t_body_md))
-            .when(can_send, |s| {
-                s.cursor_pointer().hover(|s| s.opacity(0.85))
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _e, window, cx| this.submit(window, cx)),
-            )
-            .child(SharedString::from("↑"));
 
         // The pill: a rounded, focus-reactive frame holding the borderless input
         // and, inline on the right, the send button. The single-line input
@@ -174,7 +208,7 @@ impl Render for ComposerView {
                         .text_size(px(typo.t_body_md)),
                 ),
             )
-            .child(send_button);
+            .child(action_button);
 
         div()
             .flex()

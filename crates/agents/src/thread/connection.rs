@@ -15,14 +15,63 @@ use serde_json::{json, Value};
 use super::event::ThreadEvent;
 use super::tool_call::PermissionDecision;
 
+/// What a backend can do, so the UI shows/hides controls by capability instead
+/// of branching on a hard-coded provider name. Defaults to the most
+/// conservative answer (nothing supported); each backend overrides what it can
+/// actually do via [`AgentConnection::capabilities`]. Grown here once so a
+/// future ACP backend advertises its own shape without a trait change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// Fields become live once the UI gates its usage/reasoning/mode controls on
+// `capabilities()`; until a control reads one, the field is intentionally unused.
+#[allow(dead_code)]
+pub struct AgentCapabilities {
+    /// Permission/edit modes can be set at runtime (ACP `session/set_mode`).
+    pub supports_modes: bool,
+    /// The backend advertises slash commands the UI can offer.
+    pub supports_slash: bool,
+    /// The backend accepts arbitrary config (e.g. a reasoning-effort control).
+    pub supports_config: bool,
+    /// Turns carry token/cost usage the UI can meter.
+    pub emits_usage: bool,
+}
+
 /// The user-facing control surface for one chat session.
+///
+/// Everything past the first three methods is **default-implemented** so
+/// existing impls (and the test stub) compile unchanged; a backend overrides
+/// only what it supports. The trait is deliberately grown once, provider-
+/// agnostically, so the future ACP backend satisfies the same seam.
 pub trait AgentConnection: Send {
-    /// Send a user prompt (a new turn, or a mid-turn steer).
+    /// Send a user prompt, starting a new turn. (The transport also accepts a
+    /// message mid-turn, but the chat UI currently gates sending behind Stop
+    /// while a turn is streaming, so a live steer isn't issued from the UI.)
     fn send_user_message(&self, text: &str) -> Result<()>;
     /// Answer a pending permission request by its `request_id`.
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()>;
     /// Terminate the session and its process.
     fn shutdown(&self);
+
+    /// Interrupt the in-flight turn. Claude: SIGINT the child (which ends the
+    /// turn and exits the process — the caller resumes on the next send). ACP:
+    /// `session/cancel`. Default is a no-op for backends that can't interrupt.
+    fn cancel(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// What this backend supports; the UI gates controls on it. Default: none.
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::default()
+    }
+
+    /// Switch the permission/edit mode at runtime (ACP). Unsupported by default.
+    fn set_mode(&self, _mode: &str) -> Result<()> {
+        anyhow::bail!("this agent does not support changing mode at runtime")
+    }
+
+    /// Set a backend config value at runtime (ACP). Unsupported by default.
+    fn set_config(&self, _key: &str, _value: Value) -> Result<()> {
+        anyhow::bail!("this agent does not support runtime configuration")
+    }
 }
 
 /// Build the stdin JSON for a user message (stream-json input format).
@@ -129,6 +178,19 @@ mod tests {
         assert_eq!(v["response"]["response"]["behavior"], "deny");
         assert_eq!(v["response"]["response"]["message"], "no");
         assert!(v["response"]["response"].get("updatedInput").is_none());
+    }
+
+    #[test]
+    fn stub_uses_conservative_default_capabilities_and_cancel() {
+        // A backend that doesn't override the grown-once methods gets no-op
+        // defaults: cancel succeeds silently, capabilities advertise nothing,
+        // and runtime mode/config are refused.
+        let stub = StubConnection::default();
+        assert!(stub.cancel().is_ok(), "default cancel is a no-op success");
+        assert_eq!(stub.capabilities(), super::AgentCapabilities::default());
+        assert!(!stub.capabilities().emits_usage);
+        assert!(stub.set_mode("acceptEdits").is_err(), "runtime mode refused by default");
+        assert!(stub.set_config("reasoning", json!("high")).is_err());
     }
 
     #[test]

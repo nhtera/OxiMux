@@ -190,6 +190,27 @@ impl ChatThread {
         }
     }
 
+    /// Interrupt the current turn (the user pressed Stop). Clears the turn flag
+    /// (drops the spinner) but deliberately leaves the current assistant block
+    /// OPEN: after SIGINT the agent still flushes a few trailing events (more
+    /// deltas, then a finalized `assistant` block) before its stdout closes, and
+    /// that finalized block must reconcile into the in-progress block rather than
+    /// starting a second one — closing the window here would duplicate the reply.
+    /// The turn's own `TurnEnded`/EOF closes the window normally afterward.
+    /// Fail-closed: any tool call still `WaitingForConfirmation` is downgraded to
+    /// `Rejected` — the process is being killed, so the request can never be
+    /// answered, exactly like a live disconnect.
+    pub fn interrupt(&mut self) {
+        self.turn_active = false;
+        for entry in &mut self.entries {
+            if let ThreadEntry::ToolCall(tc) = entry
+                && matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_))
+            {
+                tc.status = ToolCallStatus::Rejected;
+            }
+        }
+    }
+
     /// Transition a tool call's status directly (e.g. to `InProgress` when the
     /// user allows, or `Rejected` when they deny) — called by the connection
     /// layer alongside sending the control response.
@@ -407,6 +428,55 @@ mod tests {
             ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Rejected),
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn interrupt_ends_turn_and_fail_closes_pending_permission() {
+        // Stop mid-turn: the turn flag clears and a pending approval downgrades
+        // to Rejected (the process is being killed and can never answer it).
+        let mut t = ChatThread::new();
+        t.push_user_message("edit it");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "t1".into(), name: "Edit".into(), input: json!({}) });
+        t.apply(&ThreadEvent::PermissionRequested {
+            request_id: "r1".into(), tool_use_id: Some("t1".into()),
+            tool_name: "Edit".into(), input: json!({}), description: "x".into(),
+            suggestions: vec![] });
+        assert!(t.turn_active);
+        assert!(t.pending_permission().is_some());
+
+        t.interrupt();
+
+        assert!(!t.turn_active, "interrupt ends the turn");
+        assert!(t.pending_permission().is_none(), "pending approval is fail-closed");
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Rejected),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interrupt_does_not_duplicate_the_trailing_finalized_block() {
+        // After Stop, the agent flushes trailing deltas + a finalized `assistant`
+        // block before EOF. That finalized text must reconcile INTO the streamed
+        // block, not spawn a second identical one. (Interrupt must not close the
+        // assistant window, or the reply doubles.)
+        let mut t = ChatThread::new();
+        t.push_user_message("essay");
+        t.apply(&ThreadEvent::AssistantTextDelta("The History".into()));
+        t.interrupt(); // user hits Stop mid-stream
+        // trailing events that arrive after SIGINT, before stdout EOF:
+        t.apply(&ThreadEvent::AssistantTextDelta(" and Design".into()));
+        t.apply(&ThreadEvent::AssistantText("The History and Design of Rust".into()));
+        t.apply(&ThreadEvent::TurnEnded { result: None, cost_usd: None, is_error: true });
+
+        let assistants: Vec<&str> = t.entries.iter().filter_map(|e| match e {
+            ThreadEntry::Assistant(m) => Some(m.text.as_str()), _ => None }).collect();
+        assert_eq!(
+            assistants,
+            vec!["The History and Design of Rust"],
+            "exactly one assistant block, reconciled — not doubled"
+        );
     }
 
     #[test]
