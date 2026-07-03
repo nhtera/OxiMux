@@ -31,6 +31,8 @@ use oximux_settings::{Density, Theme, Typography};
 use super::image_attach::{PendingImage, pending_from_bytes, pending_from_path};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
 use super::slash_palette::{detect_slash_trigger, rank_commands};
+use crate::shell::compose_bar::mention_parser::pending_mention;
+use crate::shell::compose_bar::mention_resolver::{MAX_SUGGESTIONS, rank as rank_mentions};
 
 /// Open state of the slash-command palette: the in-progress query, the byte
 /// range of the `/token` it replaces on accept, the ranked command indices
@@ -39,6 +41,16 @@ use super::slash_palette::{detect_slash_trigger, rank_commands};
 struct SlashPaletteState {
     range: Range<usize>,
     matches: Vec<usize>,
+    highlight: usize,
+}
+
+/// Open state of the `@file` mention overlay: the byte range of the `@query` it
+/// replaces on accept, the ranked candidate paths, and which is highlighted
+/// (index into `matches`). Mutually exclusive with [`SlashPaletteState`] — a
+/// leading `/` opens the slash palette, which takes precedence.
+struct MentionState {
+    range: Range<usize>,
+    matches: Vec<String>,
     highlight: usize,
 }
 
@@ -97,6 +109,16 @@ pub struct ComposerView {
     /// The open slash-command palette, or `None` when the caret isn't inside a
     /// `/token` (or the palette is otherwise suppressed).
     palette: Option<SlashPaletteState>,
+    /// Project file paths for `@file` autocomplete, scanned once off the main
+    /// thread and pushed in by the parent. Empty until the scan lands — the
+    /// overlay shows a "scanning" hint while a mention is in progress.
+    mention_candidates: Vec<String>,
+    /// Whether the file scan has completed (distinguishes "scanning…" from "no
+    /// matching files" in the overlay).
+    mention_candidates_loaded: bool,
+    /// The open `@file` mention overlay, or `None` when the caret isn't inside an
+    /// `@query`. Mutually exclusive with `palette`.
+    mention: Option<MentionState>,
     /// Repaints this view (only) on each keystroke so the draft stays visible.
     _sub: Subscription,
 }
@@ -130,13 +152,14 @@ impl ComposerView {
             // brighter ring while typing), like a native chat field.
             match ev {
                 InputEvent::Change => {
-                    this.recompute_slash_palette(cx);
+                    this.recompute_overlays(cx);
                     cx.notify();
                 }
-                // Losing focus closes the palette so it can't linger over the
+                // Losing focus closes both overlays so they can't linger over the
                 // transcript while the field is inactive.
                 InputEvent::Blur => {
                     this.palette = None;
+                    this.mention = None;
                     cx.notify();
                 }
                 InputEvent::Focus => cx.notify(),
@@ -159,6 +182,9 @@ impl ComposerView {
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
             palette: None,
+            mention_candidates: Vec::new(),
+            mention_candidates_loaded: false,
+            mention: None,
             _sub: sub,
         }
     }
@@ -288,11 +314,119 @@ impl ComposerView {
         cx.notify();
     }
 
+    /// Push the project file list for `@file` autocomplete (scanned off the main
+    /// thread by the parent). Marks the list loaded so the overlay can tell
+    /// "scanning" from "no match", and refreshes an in-progress mention so it
+    /// gains results the moment the scan lands.
+    pub fn set_mention_candidates(&mut self, candidates: Vec<String>, cx: &mut Context<Self>) {
+        self.mention_candidates = candidates;
+        self.mention_candidates_loaded = true;
+        // Only the mention overlay depends on this list; leave the slash palette.
+        if self.palette.is_none() {
+            self.recompute_mention(cx);
+        }
+        cx.notify();
+    }
+
     /// The palette group for an advertised command name (defaults to Built-in
     /// when the catalog has no entry, e.g. before the scan lands or for a name
     /// with no on-disk definition).
     fn group_of(&self, name: &str) -> CommandGroup {
         self.slash_catalog.get(name).map(|m| m.group).unwrap_or(CommandGroup::BuiltIn)
+    }
+
+    /// Recompute both composer overlays after an edit. The slash palette wins
+    /// when both could apply (a leading `/` vs an `@query`): compute it first and
+    /// only try the mention overlay when the palette stayed closed, so at most one
+    /// overlay is ever open.
+    fn recompute_overlays(&mut self, cx: &mut Context<Self>) {
+        self.recompute_slash_palette(cx);
+        if self.palette.is_some() {
+            self.mention = None;
+        } else {
+            self.recompute_mention(cx);
+        }
+    }
+
+    /// Recompute the `@file` overlay from the draft + caret. Opens whenever the
+    /// caret sits inside an `@query` and the composer can send; shows a scanning /
+    /// no-match hint until the candidate list ranks something. Preserves the
+    /// highlighted path across a re-filter when it still matches.
+    fn recompute_mention(&mut self, cx: &mut Context<Self>) {
+        if self.turn_active || self.disconnected {
+            self.mention = None;
+            return;
+        }
+        let (text, cursor) = {
+            let s = self.input.read(cx);
+            (s.value().to_string(), s.cursor())
+        };
+        let Some(pm) = pending_mention(&text, cursor) else {
+            self.mention = None;
+            return;
+        };
+        let matches = rank_mentions(&self.mention_candidates, &pm.query, MAX_SUGGESTIONS);
+        // Keep the same path highlighted across a re-filter (highlight-by-value),
+        // else fall back to the top match.
+        let prev = self.mention.as_ref().and_then(|m| m.matches.get(m.highlight).cloned());
+        let highlight = prev
+            .and_then(|p| matches.iter().position(|m| *m == p))
+            .unwrap_or(0);
+        self.mention = Some(MentionState { range: pm.range, matches, highlight });
+    }
+
+    /// Move the mention highlight (`-1` up / `+1` down), wrapping. Returns whether
+    /// the overlay was open (so the caller consumes the key — even over a
+    /// scanning/no-match hint, so arrows don't move the text caret behind it).
+    fn mention_move(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(m) = self.mention.as_mut() else { return false };
+        let n = m.matches.len() as isize;
+        if n > 0 {
+            m.highlight = (((m.highlight as isize + delta) % n + n) % n) as usize;
+            cx.notify();
+        }
+        true
+    }
+
+    /// Close the mention overlay (Esc) keeping the typed text. Returns whether it
+    /// was open.
+    fn mention_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.mention.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Accept a ranked path: replace the `@query` with `@path ` (trailing space),
+    /// ready to keep typing. The path rides to the agent as ordinary text.
+    fn mention_accept_path(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.mention.take() else { return };
+        if let Some(path) = m.matches.get(idx).cloned() {
+            let text = self.input.read(cx).value().to_string();
+            if m.range.end <= text.len()
+                && text.is_char_boundary(m.range.start)
+                && text.is_char_boundary(m.range.end)
+            {
+                let next = format!("{}@{path} {}", &text[..m.range.start], &text[m.range.end..]);
+                self.input.update(cx, |s, cx| s.set_value(next, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Accept the highlighted path (keyboard Enter/Tab). Returns `false` when the
+    /// overlay is closed OR shows no real match, so Enter still submits / Tab
+    /// still indents rather than being swallowed by an empty hint.
+    fn mention_accept_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(m) = self.mention.as_ref() else { return false };
+        if m.matches.is_empty() {
+            return false;
+        }
+        let idx = m.highlight;
+        self.mention_accept_path(idx, window, cx);
+        true
     }
 
     /// Recompute the palette from the current draft + caret. Stateless: the
@@ -392,11 +526,13 @@ impl ComposerView {
     }
 
     /// The root Enter handler delegates here: accept a highlighted slash command
-    /// if the palette is open, otherwise submit the message.
+    /// or `@file` mention if an overlay is open, otherwise submit the message.
     pub fn on_enter_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.palette_accept_highlighted(window, cx) {
-            self.submit(window, cx);
+        if self.palette_accept_highlighted(window, cx) || self.mention_accept_highlighted(window, cx)
+        {
+            return;
         }
+        self.submit(window, cx);
     }
 
     /// Ask the parent to switch model / permission mode (the parent respawns the
@@ -763,6 +899,92 @@ impl ComposerView {
         }
         Some(list)
     }
+
+    /// The `@file` mention overlay: an inline block above the pill listing the
+    /// ranked file paths (or a scanning/no-match hint). Same visual language as
+    /// the slash palette; mutually exclusive with it, so both can be rendered
+    /// unconditionally — at most one is ever `Some`. The ranker caps at
+    /// [`MAX_SUGGESTIONS`], so the list never needs windowing.
+    fn render_mention_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let m = self.mention.as_ref()?;
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        let mut list = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border_input)
+            .bg(theme.bg_panel)
+            .py(px(density.pad_row))
+            .child(
+                div()
+                    .px(px(density.pad_panel))
+                    .pt(px(density.gap_inline))
+                    .pb(px(density.gap_inline * 0.5))
+                    .text_size(px(typo.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child(SharedString::from("Files")),
+            );
+        if m.matches.is_empty() {
+            // A pending `@` with nothing to show yet: distinguish the async scan
+            // still running from a query that matched no file.
+            let msg = if self.mention_candidates_loaded {
+                "No matching files"
+            } else {
+                "Scanning files…"
+            };
+            list = list.child(
+                div()
+                    .px(px(density.pad_panel))
+                    .py(px(density.gap_inline))
+                    .text_size(px(typo.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child(SharedString::from(msg)),
+            );
+            return Some(list);
+        }
+        for (row, path) in m.matches.iter().enumerate() {
+            let selected = row == m.highlight;
+            // Wrap the path in a flex_row so a long path can clip to one line —
+            // a nowrap/truncate text placed DIRECTLY in a flex-col renders blank.
+            let inner = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from(path.clone())),
+                );
+            let mut item = div()
+                .id(("mention-row", row))
+                .w_full()
+                .px(px(density.pad_panel))
+                .py(px(density.gap_inline))
+                .text_size(px(typo.t_body_md))
+                .text_color(theme.fg_base)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_panel_alt))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, window, cx| {
+                        this.mention_accept_path(row, window, cx)
+                    }),
+                )
+                .child(inner);
+            if selected {
+                item = item.bg(theme.status_info.opacity(0.16));
+            }
+            list = list.child(item);
+        }
+        Some(list)
+    }
 }
 
 impl Render for ComposerView {
@@ -895,28 +1117,31 @@ impl Render for ComposerView {
                     cx.stop_propagation();
                 }
             }))
-            // While the palette is open, capture the field's nav/accept/close
-            // actions before the input consumes them; when it's closed these are
-            // no-ops that fall through to the input's normal handling. Enter is
-            // captured at the view root (it also drives submit) — see
-            // `on_enter_key`.
+            // While an overlay (slash palette or `@file` mention) is open, capture
+            // the field's nav/accept/close actions before the input consumes them;
+            // when both are closed these are no-ops that fall through to the input's
+            // normal handling. The slash palette is tried first (it takes
+            // precedence). Enter is captured at the view root (it also drives
+            // submit) — see `on_enter_key`.
             .capture_action(cx.listener(|this, _: &MoveUp, _window, cx| {
-                if this.palette_move(-1, cx) {
+                if this.palette_move(-1, cx) || this.mention_move(-1, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &MoveDown, _window, cx| {
-                if this.palette_move(1, cx) {
+                if this.palette_move(1, cx) || this.mention_move(1, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &InputEscape, _window, cx| {
-                if this.palette_close(cx) {
+                if this.palette_close(cx) || this.mention_close(cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                if this.palette_accept_highlighted(window, cx) {
+                if this.palette_accept_highlighted(window, cx)
+                    || this.mention_accept_highlighted(window, cx)
+                {
                     cx.stop_propagation();
                 }
             }))
@@ -935,6 +1160,7 @@ impl Render for ComposerView {
                         d.child(self.render_attachments(cx))
                     })
                     .children(self.render_slash_palette(cx))
+                    .children(self.render_mention_overlay(cx))
                     .child(pill)
                     .child(controls),
             )

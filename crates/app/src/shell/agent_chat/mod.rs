@@ -345,6 +345,28 @@ impl AgentChatView {
             .detach();
         }
 
+        // Scan the project's files once for `@file` mention autocomplete. `rg`
+        // runs on the tokio runtime (not gpui's executor), so hop through the
+        // tokio handle like the terminal composer does, then fold the list back in
+        // on the UI thread. Missing `rg` / no runtime degrades to an empty list.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let scan_root = cwd.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<String>>();
+            handle.spawn(async move {
+                let files =
+                    crate::shell::compose_bar::mention_resolver::scan_candidates(scan_root).await;
+                let _ = tx.send(files);
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(files) = rx.await {
+                    let _ = this.update(cx, |this, cx| {
+                        this.composer.update(cx, |c, cx| c.set_mention_candidates(files, cx));
+                    });
+                }
+            })
+            .detach();
+        }
+
         Self {
             thread,
             connection,
