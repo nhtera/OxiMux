@@ -73,6 +73,28 @@ pub enum ComposerEvent {
     EffortPicked(String),
 }
 
+/// The composer grows one row per line of the draft up to this many rows, then
+/// holds that height and scrolls internally — so a long message never pushes the
+/// transcript off-screen. Tuned to Claude Desktop's feel: generous but bounded.
+const MAX_COMPOSER_ROWS: usize = 10;
+/// Vertical padding baked into the input's own box (`input_py` top + bottom for
+/// the medium size). Added to `rows * line_height` for the pill height.
+const COMPOSER_INPUT_PAD_V: f32 = 16.0;
+/// Fallback line height (1.25rem at the default 16px rem) used only on the very
+/// first frame, before the input has laid out and reported its real value.
+const COMPOSER_LINE_H_FALLBACK: f32 = 20.0;
+
+/// Pixel height for a composer showing `rows` lines at `line_height`, clamped to
+/// `[1, MAX_COMPOSER_ROWS]`: one row for an empty draft (caret centered, no
+/// clip), growing a row per newline, then capped so the field scrolls instead of
+/// growing without bound. The explicit height is required because the input's
+/// text element is absolutely positioned and can't size the pill from its
+/// content (the circular-height trap).
+fn composer_input_height(rows: usize, line_height: f32) -> f32 {
+    let rows = rows.clamp(1, MAX_COMPOSER_ROWS);
+    line_height * rows as f32 + COMPOSER_INPUT_PAD_V
+}
+
 pub struct ComposerView {
     input: Entity<InputState>,
     theme: Theme,
@@ -134,17 +156,17 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
-            // SINGLE-LINE field: it self-sizes to one centered row at a stable
-            // height, so the pill never resizes when a message is sent. A
-            // multi-line / `auto_grow` field lays its element out at height:100%
-            // of the parent (a circular height in this custom pill) and
-            // top-aligns its content — after Enter clears the draft the caret
-            // drops to the bottom and the pill stretches into dead space. Enter
-            // still submits: the parent root `capture_action(InputEnter)`
-            // intercepts the field's Enter action (see `AgentChatView::render`).
-            // Long drafts scroll horizontally; multi-line-grow is future work and
-            // must first solve the circular-height embedding.
-            InputState::new(window, cx).placeholder("Message Claude…  (↵ to send)")
+            // MULTI-LINE field that GROWS with the draft up to MAX_COMPOSER_ROWS,
+            // then holds height and scrolls (Claude-Desktop feel). ↵ submits; ⇧↵
+            // inserts a newline. `render` sets an explicit `.h()` from the row
+            // count because the field's text element lays out
+            // `position: absolute; height: 100%` and can't size the pill from its
+            // content (the circular-height trap). The ↵-vs-⇧↵ split is decided at
+            // the parent root `capture_action` from the live shift modifier —
+            // both keys map to the same Enter action.
+            InputState::new(window, cx)
+                .auto_grow(1, MAX_COMPOSER_ROWS)
+                .placeholder("Message Claude…  (↵ send · ⇧↵ newline)")
         });
         let sub = cx.subscribe(&input, |this, _input, ev: &InputEvent, cx| {
             // Repaint ONLY the composer on edits — the transcript is untouched.
@@ -525,14 +547,34 @@ impl ComposerView {
         true
     }
 
-    /// The root Enter handler delegates here: accept a highlighted slash command
-    /// or `@file` mention if an overlay is open, otherwise submit the message.
-    pub fn on_enter_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The root Enter handler delegates here. Returns `true` when the keystroke
+    /// was consumed (so the caller stops propagation and the field does NOT
+    /// insert a newline); `false` lets `⇧↵` fall through to the field as a
+    /// newline.
+    ///
+    /// - An open overlay always wins: ↵ accepts the highlighted slash command or
+    ///   `@file` mention.
+    /// - `⇧↵` (`shift`) inserts a newline (returns `false`).
+    /// - A plain `↵` submits the message.
+    ///
+    /// The mouse Send button stays the IME-proof submit path for input methods
+    /// (e.g. Vietnamese Telex) that swallow Enter before the app sees it.
+    pub fn on_enter_key(
+        &mut self,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.palette_accept_highlighted(window, cx) || self.mention_accept_highlighted(window, cx)
         {
-            return;
+            return true;
+        }
+        if shift {
+            // ⇧↵ inserts a newline — let it reach the field.
+            return false;
         }
         self.submit(window, cx);
+        true
     }
 
     /// Ask the parent to switch model / permission mode (the parent respawns the
@@ -1073,16 +1115,33 @@ impl Render for ComposerView {
         }
         let controls = controls;
 
+        // Auto-grow input height: one row per line of the draft, capped at
+        // MAX_COMPOSER_ROWS (then the field scrolls). The explicit `.h()` is what
+        // breaks the circular-height trap — the input's text element is
+        // absolutely positioned and can't size the pill from its content.
+        let line_h = self
+            .input
+            .read(cx)
+            .line_height()
+            .map(f32::from)
+            .unwrap_or(COMPOSER_LINE_H_FALLBACK);
+        let draft_rows = self.input.read(cx).value().split('\n').count();
+        let single_row = draft_rows <= 1;
+        let input_h = composer_input_height(draft_rows, line_h);
+
         // The pill: a rounded, focus-reactive frame holding the borderless input
-        // AND the Send/Stop action pinned to its right edge (like a native chat
-        // field). The input takes the remaining width (`flex_1`); the circular
-        // action sits after it. `appearance(false)` drops the input's own box so
-        // it doesn't nest a second frame inside. The other controls (attach, mode,
+        // AND the Send/Stop action at its right edge (like a native chat field).
+        // The input takes the remaining width (`flex_1`); the circular action is
+        // vertically centered while the draft is a single row, then pinned to the
+        // BOTTOM-right (`items_end`) once it grows so it stays put as lines are
+        // added upward. `appearance(false)` drops the input's own box so it
+        // doesn't nest a second frame inside. The other controls (attach, mode,
         // model, effort) live on the row below.
         let pill = div()
             .flex()
             .flex_row()
-            .items_center()
+            .when(single_row, |d| d.items_center())
+            .when(!single_row, |d| d.items_end())
             .w_full()
             .rounded(px(14.0))
             .border_1()
@@ -1095,7 +1154,8 @@ impl Render for ComposerView {
                 div().flex_1().min_w_0().child(
                     Input::new(&self.input)
                         .appearance(false)
-                        .text_size(px(typo.t_body_md)),
+                        .text_size(px(typo.t_body_md))
+                        .h(px(input_h)),
                 ),
             )
             .child(action_button);
@@ -1164,5 +1224,45 @@ impl Render for ComposerView {
                     .child(pill)
                     .child(controls),
             )
+    }
+}
+
+#[cfg(test)]
+impl ComposerView {
+    /// Set the draft text so a `#[gpui::test]` can exercise submit / newline
+    /// routing without synthesising keystrokes.
+    pub(crate) fn set_draft_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.update(cx, |s, cx| s.set_value(text, window, cx));
+    }
+
+    /// Read the current draft (to assert it survived a newline or was cleared by
+    /// submit).
+    pub(crate) fn draft_for_test(&self, cx: &Context<Self>) -> String {
+        self.input.read(cx).value().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composer_input_height_grows_per_row_then_caps() {
+        // Empty / one line = one row: must clear line height + vertical padding
+        // so the caret isn't clipped (the old 24px regression clipped it).
+        assert_eq!(composer_input_height(1, 20.0), 36.0);
+        assert_eq!(composer_input_height(0, 20.0), 36.0);
+        // Grows one line height per row.
+        assert_eq!(composer_input_height(4, 20.0), 96.0);
+        // Capped at MAX_COMPOSER_ROWS — beyond it the field scrolls, not grows.
+        assert_eq!(
+            composer_input_height(MAX_COMPOSER_ROWS + 20, 20.0),
+            composer_input_height(MAX_COMPOSER_ROWS, 20.0)
+        );
     }
 }

@@ -1423,19 +1423,22 @@ impl Render for AgentChatView {
             .flex_col()
             .size_full()
             .bg(theme.bg_panel)
-            // The Input context binds `enter`→Enter{secondary:false} (newline)
-            // and `⌘↵`/`ctrl+↵`→Enter{secondary:true}; both dispatch as the
-            // `Enter` action and would be consumed by the field before any
-            // `on_key_down` could see them, so submit MUST be captured here.
+            // The Input context binds BOTH `enter` and `shift+enter` to the same
+            // Enter{secondary:false} action, so the action alone can't tell them
+            // apart — read the live shift modifier. Capture here (the field would
+            // otherwise consume Enter before any `on_key_down`): a plain ↵
+            // submits, ⇧↵ falls through to the multi-line field as a newline.
+            // `on_enter_key` returns whether it consumed the key — only then do
+            // we stop propagation (otherwise the field inserts the newline). An
+            // open slash/mention overlay makes ↵ accept the highlighted item.
             .capture_action(cx.listener(|this, _action: &InputEnter, window, cx| {
-                // Both ↵ and ⌘↵ send. The field's key map collapses Enter and
-                // Shift+Enter into the same action, so a keyboard newline can't
-                // be distinguished here — multi-line prompts arrive via paste.
-                // The mouse Send button remains the IME-proof fallback. When the
-                // slash-command palette is open, Enter accepts the highlighted
-                // command instead of sending; otherwise the composer emits
-                // `Submit`, which this view's subscription sends.
-                this.composer.update(cx, |c, cx| c.on_enter_key(window, cx));
+                let shift = window.modifiers().shift;
+                let handled = this
+                    .composer
+                    .update(cx, |c, cx| c.on_enter_key(shift, window, cx));
+                if handled {
+                    cx.stop_propagation();
+                }
             }))
             // Drop image files anywhere on the chat surface to attach them.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
@@ -1752,6 +1755,71 @@ mod tests {
                 assert!(!view.thread.turn_active, "turn ended");
             })
             .expect("window update");
+    }
+
+    /// The multi-line composer splits Enter by the shift modifier: a plain ↵
+    /// submits and clears the draft; ⇧↵ falls through to the field as a newline
+    /// and does NOT submit; an empty draft submits nothing even on ↵.
+    #[gpui::test]
+    async fn enter_submits_shift_enter_newlines(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Capture the composer's Submit events (the test constructor wires no
+        // subscription, so observe them directly).
+        let submits = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        window
+            .update(cx, |view, _window, cx| {
+                let sink = submits.clone();
+                let sub = cx.subscribe(&view.composer, move |_this, _composer, ev, _cx| {
+                    if let ComposerEvent::Submit { text, .. } = ev {
+                        sink.borrow_mut().push(text.clone());
+                    }
+                });
+                view._subscriptions.push(sub);
+            })
+            .expect("window update");
+
+        window
+            .update(cx, |view, window, cx| {
+                view.composer.update(cx, |c, cx| {
+                    c.set_draft_for_test("hello", window, cx);
+                    // ⇧↵ (shift) is not consumed → falls through to a newline.
+                    assert!(
+                        !c.on_enter_key(true, window, cx),
+                        "Shift+Enter falls through to a newline"
+                    );
+                    assert_eq!(c.draft_for_test(cx), "hello", "Shift+Enter kept the draft");
+                    // Plain ↵ (no shift) submits and clears the draft.
+                    assert!(c.on_enter_key(false, window, cx), "Enter is consumed (submit)");
+                    assert!(c.draft_for_test(cx).is_empty(), "submit cleared the draft");
+                });
+            })
+            .expect("window update");
+        cx.run_until_parked();
+        assert_eq!(*submits.borrow(), vec!["hello".to_string()], "only plain Enter submitted");
+
+        // An empty draft never submits, even on ↵ (consumed, but no event).
+        window
+            .update(cx, |view, window, cx| {
+                view.composer.update(cx, |c, cx| {
+                    c.set_draft_for_test("", window, cx);
+                    assert!(c.on_enter_key(false, window, cx), "Enter is still consumed");
+                });
+            })
+            .expect("window update");
+        cx.run_until_parked();
+        assert_eq!(submits.borrow().len(), 1, "empty Enter emitted no Submit");
     }
 
     /// Card buttons route Allow/Reject to the connection by request_id and flip
