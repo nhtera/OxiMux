@@ -1822,6 +1822,68 @@ mod tests {
         assert_eq!(submits.borrow().len(), 1, "empty Enter emitted no Submit");
     }
 
+    /// Accepting a slash command parks the caret after the inserted `/name `
+    /// (not back at offset 0 in the multi-line box) and surfaces the command's
+    /// argument hint until an argument is typed.
+    #[gpui::test]
+    async fn accepting_command_parks_caret_and_shows_arg_hint(cx: &mut TestAppContext) {
+        use super::slash_command_catalog::{CommandCatalog, CommandGroup, CommandMeta};
+
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.composer.update(cx, |c, cx| {
+                    // A backend advertising `git`, enriched with an argument hint.
+                    c.set_slash_commands(vec!["git".into(), "compact".into()], cx);
+                    let mut cat = CommandCatalog::new();
+                    cat.insert(
+                        "git".into(),
+                        CommandMeta {
+                            description: Some("Git operations".into()),
+                            argument_hint: Some("cm|cp|pr|merge [args]".into()),
+                            group: CommandGroup::BuiltIn,
+                            source_label: None,
+                        },
+                    );
+                    c.set_command_catalog(cat, cx);
+
+                    // Type a partial command, open the palette, accept the match.
+                    c.set_draft_for_test("/gi", window, cx);
+                    c.recompute_overlays_for_test(cx);
+                    assert!(c.accept_highlighted_for_test(window, cx), "palette accepted a match");
+
+                    // The whole `/git ` is inserted and the caret sits AFTER the
+                    // trailing space — not jumped back to the start of the box.
+                    assert_eq!(c.draft_for_test(cx), "/git ");
+                    assert_eq!(c.cursor_for_test(cx), "/git ".len());
+
+                    // The argument hint now shows (palette closed by the space).
+                    assert_eq!(
+                        c.usage_hint_for_test(cx),
+                        Some(("git".to_string(), "cm|cp|pr|merge [args]".to_string())),
+                    );
+
+                    // Typing an argument hides the hint again.
+                    c.set_draft_for_test("/git cm", window, cx);
+                    c.recompute_overlays_for_test(cx);
+                    assert_eq!(c.usage_hint_for_test(cx), None);
+                });
+            })
+            .expect("window update");
+    }
+
     /// Card buttons route Allow/Reject to the connection by request_id and flip
     /// the local status (Allow → InProgress; Deny → Rejected), clearing the
     /// pending prompt. Allow echoes the tool input as updatedInput.

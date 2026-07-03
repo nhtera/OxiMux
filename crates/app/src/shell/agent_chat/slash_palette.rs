@@ -45,6 +45,31 @@ pub fn detect_slash_trigger(text: &str, cursor: usize) -> Option<SlashTrigger> {
     Some(SlashTrigger { query: token.to_string(), range: slash..cursor })
 }
 
+/// When `text` is a leading `/command` that's been *completed* — a trailing
+/// space but no argument typed yet — return the bare command name. That's the
+/// moment to surface the command's argument hint (the palette has just closed on
+/// the trailing space). Returns `None` while the command is still being typed
+/// (no space, palette still open) or once an argument follows the space, so the
+/// hint shows exactly in the gap between accepting a command and typing its args.
+///
+/// Only a command anchored at the very start of the draft qualifies — a `/` mid
+/// message (or a path like `/etc/hosts `) is not treated as a command here.
+pub fn completed_command(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    // Split on the first whitespace: `name` is the token, `after` is everything
+    // past that one separator (present only once the command is completed).
+    let mut it = rest.splitn(2, char::is_whitespace);
+    let name = it.next()?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let after = it.next()?; // `None` = no space yet → still typing the command.
+    if !after.trim().is_empty() {
+        return None; // An argument was typed → the hint's job is done.
+    }
+    Some(name)
+}
+
 /// Rank `commands` against `query`, returning indices best-first. Empty query →
 /// all indices in original order. Non-matches are dropped; ties break by
 /// original index so the sort is stable and predictable.
@@ -167,6 +192,23 @@ mod tests {
     #[test]
     fn cursor_past_end_is_clamped() {
         assert_eq!(trig("/co", 999), Some(SlashTrigger { query: "co".into(), range: 0..3 }));
+    }
+
+    #[test]
+    fn completed_command_fires_only_in_the_arg_gap() {
+        // Command + trailing space, no argument yet → show the hint.
+        assert_eq!(completed_command("/git "), Some("git"));
+        assert_eq!(completed_command("/ck:git "), Some("ck:git"));
+        assert_eq!(completed_command("/git  "), Some("git")); // extra spaces still count
+        assert_eq!(completed_command("/git\t"), Some("git")); // tab separator too
+        // Still typing the command (no space) → palette owns it, no hint.
+        assert_eq!(completed_command("/gi"), None);
+        assert_eq!(completed_command("/"), None);
+        // An argument has been typed → the hint's job is done.
+        assert_eq!(completed_command("/git cm"), None);
+        // Not a leading command: mid-message slash or a path.
+        assert_eq!(completed_command("hello /git "), None);
+        assert_eq!(completed_command("/etc/hosts "), None);
     }
 
     fn names(v: &[&str]) -> Vec<String> {

@@ -30,7 +30,7 @@ use oximux_settings::{Density, Theme, Typography};
 
 use super::image_attach::{PendingImage, pending_from_bytes, pending_from_path};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
-use super::slash_palette::{detect_slash_trigger, rank_commands};
+use super::slash_palette::{completed_command, detect_slash_trigger, rank_commands};
 use crate::shell::compose_bar::mention_parser::pending_mention;
 use crate::shell::compose_bar::mention_resolver::{MAX_SUGGESTIONS, rank as rank_mentions};
 
@@ -432,10 +432,24 @@ impl ComposerView {
                 && text.is_char_boundary(m.range.end)
             {
                 let next = format!("{}@{path} {}", &text[..m.range.start], &text[m.range.end..]);
-                self.input.update(cx, |s, cx| s.set_value(next, window, cx));
+                self.set_draft_end(next, window, cx);
             }
         }
         cx.notify();
+    }
+
+    /// Replace the whole draft with `next` and park the caret at its END. A bare
+    /// `set_value` on this multi-line field parks the caret at the START, so
+    /// after rewriting a `/command ` or `@path ` the user would be typing back at
+    /// the top of the box. Rebuilding via clear + `insert` moves the caret to the
+    /// end of the inserted text instead — right after the accepted token's
+    /// trailing space — and, unlike `set_cursor_position`, never forces a focus
+    /// relayout (which would need the window's `Root`).
+    fn set_draft_end(&self, next: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.insert(next, window, cx);
+        });
     }
 
     /// Accept the highlighted path (keyboard Enter/Tab). Returns `false` when the
@@ -517,11 +531,10 @@ impl ComposerView {
 
     /// Accept a specific ranked match: replace the `/token` with `/name ` and a
     /// trailing space, ready for arguments. The command still rides to the agent
-    /// as ordinary user text on submit. (The single-line field's `set_value`
-    /// puts the caret at the end of the draft — after the space in the common
-    /// case where the command is the whole draft; if the user accepted a
-    /// mid-line command with text after it, the caret lands after that trailing
-    /// text instead. Acceptable — commands are near-always typed at the start.)
+    /// as ordinary user text on submit. The caret is parked right after the
+    /// trailing space (via [`Self::set_draft_with_caret`]) so the user keeps
+    /// typing arguments there — a bare `set_value` on this multi-line field would
+    /// instead jump the caret to the start of the box.
     fn palette_accept_match(&mut self, match_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.palette.take() else { return };
         if let Some(&cmd) = p.matches.get(match_idx)
@@ -534,7 +547,7 @@ impl ComposerView {
                 && text.is_char_boundary(p.range.end)
             {
                 let next = format!("{}/{name} {}", &text[..p.range.start], &text[p.range.end..]);
-                self.input.update(cx, |s, cx| s.set_value(next, window, cx));
+                self.set_draft_end(next, window, cx);
             }
         }
         cx.notify();
@@ -1027,6 +1040,65 @@ impl ComposerView {
         }
         Some(list)
     }
+
+    /// The `(command name, argument hint)` to surface in the gap between
+    /// accepting a slash command and typing its arguments, or `None` when no hint
+    /// applies. `Some` only when the composer can send, the palette is closed,
+    /// and the draft is a completed bare command that advertises an
+    /// `argument-hint`; hidden the moment an argument is typed. Kept apart from
+    /// the rendering so it is unit-testable without a laid-out view.
+    fn usage_hint(&self, cx: &Context<Self>) -> Option<(String, String)> {
+        if self.disconnected || self.turn_active || self.palette.is_some() {
+            return None;
+        }
+        let draft = self.input.read(cx).value();
+        let name = completed_command(draft.as_ref())?;
+        let hint = self.slash_catalog.get(name)?.argument_hint.clone()?;
+        Some((name.to_string(), hint))
+    }
+
+    /// The argument-hint strip shown in the gap between accepting a slash command
+    /// and typing its arguments: a muted one-line usage cue (`/name  arg-hint`)
+    /// sitting where the palette was. The library input can't render true inline
+    /// ghost text through a public API, so this strip stands in for it — same
+    /// slot above the pill, same muted tone. Mutually exclusive with the palette
+    /// (which the command's trailing space closes); see [`Self::usage_hint`] for
+    /// when it applies.
+    fn render_usage_hint(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let (name, hint) = self.usage_hint(cx)?;
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        Some(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(theme.border_input)
+                .bg(theme.bg_panel)
+                .px(px(density.pad_panel))
+                .py(px(density.gap_inline))
+                .gap(px(density.gap_inline * 1.5))
+                .text_size(px(typo.t_body_sm))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.fg_muted)
+                        .child(SharedString::from(format!("/{name}"))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.fg_subtle)
+                        .child(SharedString::from(hint)),
+                ),
+        )
+    }
 }
 
 impl Render for ComposerView {
@@ -1221,6 +1293,7 @@ impl Render for ComposerView {
                     })
                     .children(self.render_slash_palette(cx))
                     .children(self.render_mention_overlay(cx))
+                    .children(self.render_usage_hint(cx))
                     .child(pill)
                     .child(controls),
             )
@@ -1229,21 +1302,48 @@ impl Render for ComposerView {
 
 #[cfg(test)]
 impl ComposerView {
-    /// Set the draft text so a `#[gpui::test]` can exercise submit / newline
-    /// routing without synthesising keystrokes.
+    /// Set the draft text so a `#[gpui::test]` can exercise submit / newline /
+    /// palette routing without synthesising keystrokes. Parks the caret at the
+    /// end (as if the text were typed) so trigger detection sees the token.
     pub(crate) fn set_draft_for_test(
         &mut self,
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.input.update(cx, |s, cx| s.set_value(text, window, cx));
+        self.set_draft_end(text.to_string(), window, cx);
     }
 
     /// Read the current draft (to assert it survived a newline or was cleared by
     /// submit).
     pub(crate) fn draft_for_test(&self, cx: &Context<Self>) -> String {
         self.input.read(cx).value().to_string()
+    }
+
+    /// The caret's byte offset — to assert an accepted command parks it after the
+    /// inserted token rather than jumping to the start of the box.
+    pub(crate) fn cursor_for_test(&self, cx: &Context<Self>) -> usize {
+        self.input.read(cx).cursor()
+    }
+
+    /// Recompute the overlays from the current draft (as an edit's `Change` would)
+    /// so a test can open the palette before accepting a command.
+    pub(crate) fn recompute_overlays_for_test(&mut self, cx: &mut Context<Self>) {
+        self.recompute_overlays(cx);
+    }
+
+    /// Accept the highlighted palette command (as Tab/Enter would).
+    pub(crate) fn accept_highlighted_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.palette_accept_highlighted(window, cx)
+    }
+
+    /// The `(command, argument-hint)` the usage strip would show, or `None`.
+    pub(crate) fn usage_hint_for_test(&self, cx: &Context<Self>) -> Option<(String, String)> {
+        self.usage_hint(cx)
     }
 }
 

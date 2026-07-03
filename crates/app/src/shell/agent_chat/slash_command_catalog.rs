@@ -31,6 +31,11 @@ impl CommandGroup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandMeta {
     pub description: Option<String>,
+    /// Usage hint from the command's `argument-hint` frontmatter (e.g.
+    /// `cm|cp|pr|merge [args]`). Surfaced once the command is accepted so the
+    /// user knows what arguments to type next; `None` when the command takes no
+    /// arguments or advertises no hint.
+    pub argument_hint: Option<String>,
     pub group: CommandGroup,
     /// Provider tag shown muted on the right (e.g. a plugin name); `None` for
     /// native/user entries.
@@ -80,6 +85,7 @@ fn built_in_catalog() -> CommandCatalog {
                 (*name).to_string(),
                 CommandMeta {
                     description: Some((*desc).to_string()),
+                    argument_hint: None,
                     group: CommandGroup::BuiltIn,
                     source_label: None,
                 },
@@ -93,10 +99,15 @@ fn scan_user_skills(skills_dir: &Path, cat: &mut CommandCatalog) {
     let Ok(entries) = fs::read_dir(skills_dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let desc = read_frontmatter_description(&entry.path().join("SKILL.md"));
+        let fm = read_frontmatter(&entry.path().join("SKILL.md"));
         cat.insert(
             name,
-            CommandMeta { description: desc, group: CommandGroup::Skill, source_label: None },
+            CommandMeta {
+                description: fm.description,
+                argument_hint: fm.argument_hint,
+                group: CommandGroup::Skill,
+                source_label: None,
+            },
         );
     }
 }
@@ -129,10 +140,12 @@ fn scan_plugin_commands(dir: &Path, plugin: &str, cat: &mut CommandCatalog) {
         let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
+        let fm = read_frontmatter(&path);
         cat.insert(
             format!("{plugin}:{stem}"),
             CommandMeta {
-                description: read_frontmatter_description(&path),
+                description: fm.description,
+                argument_hint: fm.argument_hint,
                 group: CommandGroup::BuiltIn,
                 source_label: Some(plugin.to_string()),
             },
@@ -144,10 +157,12 @@ fn scan_plugin_skills(dir: &Path, plugin: &str, cat: &mut CommandCatalog) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let skill = entry.file_name().to_string_lossy().into_owned();
+        let fm = read_frontmatter(&entry.path().join("SKILL.md"));
         cat.insert(
             format!("{plugin}:{skill}"),
             CommandMeta {
-                description: read_frontmatter_description(&entry.path().join("SKILL.md")),
+                description: fm.description,
+                argument_hint: fm.argument_hint,
                 group: CommandGroup::Skill,
                 source_label: Some(plugin.to_string()),
             },
@@ -164,18 +179,37 @@ fn scan_project_commands(dir: &Path, cat: &mut CommandCatalog) {
             continue;
         }
         if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) {
-            cat.entry(stem).or_insert_with(|| CommandMeta {
-                description: read_frontmatter_description(&path),
-                group: CommandGroup::BuiltIn,
-                source_label: None,
+            cat.entry(stem).or_insert_with(|| {
+                let fm = read_frontmatter(&path);
+                CommandMeta {
+                    description: fm.description,
+                    argument_hint: fm.argument_hint,
+                    group: CommandGroup::BuiltIn,
+                    source_label: None,
+                }
             });
         }
     }
 }
 
-fn read_frontmatter_description(file: &Path) -> Option<String> {
-    let content = fs::read_to_string(file).ok()?;
-    frontmatter_field(&content, "description")
+/// The frontmatter fields the palette cares about, read from one file pass.
+#[derive(Default)]
+struct FrontMeta {
+    description: Option<String>,
+    argument_hint: Option<String>,
+}
+
+/// Read a command/skill definition's frontmatter once, pulling both the
+/// description and the `argument-hint`. Best-effort: an unreadable file yields
+/// empty fields rather than an error.
+fn read_frontmatter(file: &Path) -> FrontMeta {
+    let Ok(content) = fs::read_to_string(file) else {
+        return FrontMeta::default();
+    };
+    FrontMeta {
+        description: frontmatter_field(&content, "description"),
+        argument_hint: frontmatter_field(&content, "argument-hint"),
+    }
 }
 
 /// Extract a scalar frontmatter field from the leading `--- … ---` block.
@@ -239,6 +273,20 @@ mod tests {
 
         let block = "---\ndescription: |\n  First line of block\n  second line\n---\n";
         assert_eq!(frontmatter_field(block, "description").as_deref(), Some("First line of block"));
+    }
+
+    #[test]
+    fn parses_argument_hint_field() {
+        // The `argument-hint` field (with a hyphen) is read the same way as
+        // `description` — it drives the usage hint shown after a command accepts.
+        let fm = "---\nname: g\nargument-hint: \"cm|cp|pr|merge [args]\"\n---\nbody";
+        assert_eq!(
+            frontmatter_field(fm, "argument-hint").as_deref(),
+            Some("cm|cp|pr|merge [args]")
+        );
+        // Absent field → None (a command that takes no arguments).
+        let none = "---\nname: g\ndescription: x\n---\n";
+        assert_eq!(frontmatter_field(none, "argument-hint"), None);
     }
 
     #[test]
