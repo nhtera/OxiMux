@@ -14,7 +14,8 @@ use std::ops::Range;
 use gpui::{
     Anchor, App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable,
     ImageSource, InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render,
-    SharedString, Styled, Subscription, Window, div, img, prelude::FluentBuilder, px,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, img,
+    prelude::FluentBuilder, px,
 };
 use gpui::StyledImage as _;
 use gpui_component::Icon;
@@ -28,6 +29,7 @@ use oximux_agents::thread::ChatImage;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::image_attach::{PendingImage, pending_from_bytes, pending_from_path};
+use super::slash_command_catalog::{CommandCatalog, CommandGroup};
 use super::slash_palette::{detect_slash_trigger, rank_commands};
 
 /// Open state of the slash-command palette: the in-progress query, the byte
@@ -88,6 +90,10 @@ pub struct ComposerView {
     /// offered in the slash-command palette. Empty when the backend advertises
     /// none — which also disables the palette.
     slash_commands: Vec<String>,
+    /// On-disk enrichment (description, group, source) for the advertised names,
+    /// discovered off the main thread and pushed in when ready. Empty until then;
+    /// names without an entry render bare under Built-in.
+    slash_catalog: CommandCatalog,
     /// The open slash-command palette, or `None` when the caret isn't inside a
     /// `/token` (or the palette is otherwise suppressed).
     palette: Option<SlashPaletteState>,
@@ -151,6 +157,7 @@ impl ComposerView {
             supports_effort: false,
             pending_images: Vec::new(),
             slash_commands: Vec::new(),
+            slash_catalog: CommandCatalog::new(),
             palette: None,
             _sub: sub,
         }
@@ -272,6 +279,22 @@ impl ComposerView {
         }
     }
 
+    /// Push the on-disk command enrichment (descriptions + grouping), discovered
+    /// off the main thread. Recomputes so an open palette regroups + gains
+    /// descriptions the moment it lands.
+    pub fn set_command_catalog(&mut self, catalog: CommandCatalog, cx: &mut Context<Self>) {
+        self.slash_catalog = catalog;
+        self.recompute_slash_palette(cx);
+        cx.notify();
+    }
+
+    /// The palette group for an advertised command name (defaults to Built-in
+    /// when the catalog has no entry, e.g. before the scan lands or for a name
+    /// with no on-disk definition).
+    fn group_of(&self, name: &str) -> CommandGroup {
+        self.slash_catalog.get(name).map(|m| m.group).unwrap_or(CommandGroup::BuiltIn)
+    }
+
     /// Recompute the palette from the current draft + caret. Stateless: the
     /// palette opens only when the caret sits inside a `/token`, commands are
     /// advertised, and the composer can send (no in-flight turn / disconnect —
@@ -291,11 +314,20 @@ impl ComposerView {
             self.palette = None;
             return;
         };
-        let matches = rank_commands(&trigger.query, &self.slash_commands);
+        let mut matches = rank_commands(&trigger.query, &self.slash_commands);
         if matches.is_empty() {
             self.palette = None;
             return;
         }
+        // Cluster the ranked results by group while keeping the group that holds
+        // the best overall match first (and rank order within each group). A
+        // stable sort keyed on each group's first appearance does exactly that.
+        let mut first_seen: std::collections::HashMap<CommandGroup, usize> =
+            std::collections::HashMap::new();
+        for (i, &cmd) in matches.iter().enumerate() {
+            first_seen.entry(self.group_of(&self.slash_commands[cmd])).or_insert(i);
+        }
+        matches.sort_by_key(|&cmd| first_seen[&self.group_of(&self.slash_commands[cmd])]);
         // Keep the same command highlighted across re-filter (highlight-by-id),
         // else fall back to the top match.
         let prev = self.palette.as_ref().and_then(|p| p.matches.get(p.highlight).copied());
@@ -604,19 +636,20 @@ impl ComposerView {
         row
     }
 
-    /// The floating command list shown while the palette is open. Anchored to
-    /// sit directly above the pill (bottom edge at 100% of the relative wrapper),
-    /// so it overlays the transcript upward without shifting the composer.
-    /// Rendered rows are capped so a large command list stays cheap per keystroke.
+    /// The command list shown while the palette is open: an inline panel above
+    /// the pill (grows upward over the transcript) with rows grouped under
+    /// "Built-in" / "Skills" headers, each row a `/name`, its description, and a
+    /// muted source tag. Rows are windowed around the highlight so a large list
+    /// stays a fixed height and cheap per keystroke.
     fn render_slash_palette(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let p = self.palette.as_ref()?;
         let theme = self.theme;
         let density = self.density;
         let typo = &self.typography;
-        // Window the rendered rows around the highlight: keeps the highlighted
-        // row on screen without a scroll container, and caps element count for a
-        // large command list.
         const VISIBLE: usize = 8;
+        // Comfortable reading column for the hover tooltip: a fixed width so long
+        // descriptions wrap onto several short lines instead of one wide line.
+        const SLASH_TOOLTIP_WIDTH: f32 = 340.0;
         let total = p.matches.len();
         let start = if p.highlight < VISIBLE {
             0
@@ -632,21 +665,69 @@ impl ComposerView {
             .border_1()
             .border_color(theme.border_input)
             .bg(theme.bg_panel)
-            .p(px(density.pad_row));
+            .py(px(density.pad_row));
+        let mut prev_group: Option<CommandGroup> = None;
         for (row, &cmd) in p.matches.iter().enumerate().skip(start).take(end - start) {
             let Some(name) = self.slash_commands.get(cmd) else { continue };
+            let meta = self.slash_catalog.get(name);
+            let group = meta.map(|m| m.group).unwrap_or(CommandGroup::BuiltIn);
+            // A group header when the section changes (also at the window top).
+            if prev_group != Some(group) {
+                prev_group = Some(group);
+                list = list.child(
+                    div()
+                        .px(px(density.pad_panel))
+                        .pt(px(density.gap_inline))
+                        .pb(px(density.gap_inline * 0.5))
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_subtle)
+                        .child(SharedString::from(group.label())),
+                );
+            }
             let selected = row == p.highlight;
-            let mut item = div()
-                .id(("slash-row", row))
+            let name_el = div()
+                .flex_none()
+                .text_color(theme.fg_base)
+                .child(SharedString::from(format!("/{name}")));
+            let mut inner = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .w_full()
-                .px(px(density.pad_row))
+                .gap(px(density.gap_inline * 1.5))
+                .child(name_el);
+            // Description (muted) fills the middle when present, clipped to a
+            // SINGLE line with an ellipsis so a long description never wraps and
+            // pushes the row taller (which broke the panel's uniform row height).
+            if let Some(desc) = meta.and_then(|m| m.description.as_deref()) {
+                inner = inner.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_muted)
+                        .child(SharedString::from(desc.to_string())),
+                );
+            } else {
+                inner = inner.child(div().flex_1());
+            }
+            // Source tag (plugin name) on the far right.
+            if let Some(src) = meta.and_then(|m| m.source_label.as_deref()) {
+                inner = inner.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_subtle)
+                        .child(SharedString::from(src.to_string())),
+                );
+            }
+            let mut item = div()
+                .id(("slash-row", row))
+                .w_full()
+                .px(px(density.pad_panel))
                 .py(px(density.gap_inline))
-                .rounded(px(8.0))
                 .text_size(px(typo.t_body_md))
-                .text_color(theme.fg_base)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.bg_panel_alt))
                 .on_mouse_down(
@@ -655,9 +736,27 @@ impl ComposerView {
                         this.palette_accept_match(row, window, cx)
                     }),
                 )
-                .child(format!("/{name}"));
+                .child(inner);
+            // Hover tooltip with the full description, so a row whose description
+            // is clipped on screen can still be read in full (Claude-Desktop-style).
+            // The tooltip content is rendered inside a fixed-width block so a long
+            // description wraps onto several short lines (a comfortable reading
+            // column) — the library tooltip is a flex row and would otherwise let
+            // one-line text run off-screen (a flex row won't shrink a single text
+            // child below its unwrapped width, so a plain `max_w` is ignored).
+            if let Some(desc) = meta.and_then(|m| m.description.clone()) {
+                item = item.tooltip(move |window, cx| {
+                    let desc = desc.clone();
+                    gpui_component::tooltip::Tooltip::element(move |_, _| {
+                        div()
+                            .w(px(SLASH_TOOLTIP_WIDTH))
+                            .child(SharedString::from(desc.clone()))
+                    })
+                    .build(window, cx)
+                });
+            }
             if selected {
-                // A soft accent tint marks the keyboard highlight.
+                // The keyboard highlight: a calm full-width accent tint.
                 item = item.bg(theme.status_info.opacity(0.16));
             }
             list = list.child(item);
@@ -729,12 +828,10 @@ impl Render for ComposerView {
                 .child(SharedString::from("↑"))
         };
 
-        // The controls row that sits BELOW the input box (outside the rounded
-        // pill, on the composer background), mirroring Claude Desktop's composer:
-        // the permission-mode picker on the far LEFT, then a `flex_1` spacer, then
-        // the model picker and the Send/Stop action on the far RIGHT. The model
-        // sits next to Send (the two most-used controls grouped) while the mode —
-        // a safety setting — anchors the opposite edge.
+        // The controls row that sits BELOW the input pill (on the composer
+        // background), mirroring Claude Desktop: the image-attach + permission-mode
+        // on the far LEFT, a `flex_1` spacer, then the model/effort pickers on the
+        // far RIGHT. Send/Stop is NOT here — it lives inside the input pill.
         let mut controls = div()
             .flex()
             .flex_row()
@@ -747,18 +844,19 @@ impl Render for ComposerView {
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }
-        // Spacer pushes the model/effort/Send cluster to the far right.
+        // Spacer pushes the model/effort cluster to the far right.
         controls = controls.child(div().flex_1()).child(self.render_model_picker(cx));
         if self.supports_effort {
             controls = controls.child(self.render_effort_picker(cx));
         }
-        let controls = controls.child(action_button);
+        let controls = controls;
 
-        // The pill: a rounded, focus-reactive frame around the borderless input
-        // ONLY. The single-line input self-sizes to one row, so the pill keeps a
-        // stable, compact footprint that never resizes when a message is sent.
-        // `appearance(false)` drops the input's own box so it doesn't nest a
-        // second frame inside. The controls live below it, not within.
+        // The pill: a rounded, focus-reactive frame holding the borderless input
+        // AND the Send/Stop action pinned to its right edge (like a native chat
+        // field). The input takes the remaining width (`flex_1`); the circular
+        // action sits after it. `appearance(false)` drops the input's own box so
+        // it doesn't nest a second frame inside. The other controls (attach, mode,
+        // model, effort) live on the row below.
         let pill = div()
             .flex()
             .flex_row()
@@ -770,11 +868,15 @@ impl Render for ComposerView {
             .bg(theme.bg_panel_alt)
             .px(px(density.pad_panel))
             .py(px(density.pad_row))
+            .gap(px(density.gap_inline))
             .child(
-                Input::new(&self.input)
-                    .appearance(false)
-                    .text_size(px(typo.t_body_md)),
-            );
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.input)
+                        .appearance(false)
+                        .text_size(px(typo.t_body_md)),
+                ),
+            )
+            .child(action_button);
 
         div()
             .flex()

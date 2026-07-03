@@ -17,6 +17,7 @@ mod diff_card;
 mod image_attach;
 mod plan_panel;
 mod question_card;
+mod slash_command_catalog;
 mod slash_palette;
 mod tool_bodies;
 mod tool_card;
@@ -325,6 +326,24 @@ impl AgentChatView {
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, cx);
             c.set_slash_commands(seed_slash, cx);
         });
+
+        // Enrich the palette with on-disk descriptions + grouping (the init list
+        // is bare names). The scan reads ~100 small files, so it runs off the
+        // main thread and pushes the result in when ready.
+        if caps.supports_slash {
+            let scan_cwd = cwd.clone();
+            cx.spawn(async move |this, cx| {
+                let catalog = cx
+                    .background_spawn(async move {
+                        slash_command_catalog::discover_catalog(&scan_cwd)
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.composer.update(cx, |c, cx| c.set_command_catalog(catalog, cx));
+                });
+            })
+            .detach();
+        }
 
         Self {
             thread,

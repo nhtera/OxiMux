@@ -29,9 +29,14 @@ use super::tool_call::PermissionDecision;
 
 /// Flags for the persistent, structured, interactive Claude session. Pure so
 /// it can be unit-tested. `--permission-prompt-tool stdio` routes approvals to
-/// us as `can_use_tool` control requests; `--setting-sources project` isolates
-/// the session from the user's global `~/.claude` hooks (which otherwise
-/// corrupt the permission round-trip — a spike finding).
+/// us as `can_use_tool` control requests. `--setting-sources user,project,local`
+/// loads the user's global skills/commands (so the slash-command palette offers
+/// everything installed, like a full Claude Code session) — at the cost of also
+/// loading the global `CLAUDE.md` + hooks (context per turn). An earlier spike
+/// flagged that global hooks could corrupt the permission round-trip; the
+/// current CLI emits clean `system` hook events instead, and a lean-vs-full
+/// comparison showed identical permission behavior — but if Allow/Reject or
+/// AskUserQuestion ever regresses, narrow this back to `project`.
 pub fn build_args(model: Option<&str>) -> Vec<String> {
     build_args_with_resume(model, None, None, None)
 }
@@ -60,8 +65,13 @@ pub fn build_args_with_resume(
         "--verbose",
         "--permission-prompt-tool",
         "stdio",
+        // Load user + project + local settings so the chat sees the user's
+        // global skills/commands/hooks (and CLAUDE.md), matching a full Claude
+        // Code session — the slash-command palette then offers everything the
+        // user has installed, not just project-scoped commands. (Trade-off:
+        // the global CLAUDE.md + skill catalog cost context per turn.)
         "--setting-sources",
-        "project",
+        "user,project,local",
     ]
     .into_iter()
     .map(String::from)
@@ -264,7 +274,7 @@ mod tests {
             "--permission-prompt-tool",
             "stdio",
             "--setting-sources",
-            "project",
+            "user,project,local",
         ] {
             assert!(a.iter().any(|x| x == flag), "missing {flag} in {a:?}");
         }
