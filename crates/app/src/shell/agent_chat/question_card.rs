@@ -14,7 +14,7 @@
 //! Esc) send a plain allow with no answers ("did not answer").
 
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
@@ -300,6 +300,15 @@ impl QuestionCard {
         (0..self.request.questions.len()).all(|i| self.question_answered(i, cx))
     }
 
+    /// Which action the footer's forward button offers on the current page:
+    /// `true` = the (gated) Submit — shown on the final page, or as soon as the
+    /// whole set is answerable from anywhere; `false` = a plain `Next →` that
+    /// steps to the following question. Single-question cards are always final,
+    /// so they only ever show Submit.
+    fn forward_is_submit(&self, cx: &Context<Self>) -> bool {
+        self.submit_enabled(cx) || self.page + 1 >= self.request.questions.len()
+    }
+
     fn build_answers(&self, cx: &Context<Self>) -> QuestionAnswers {
         let mut by_question = std::collections::HashMap::new();
         for (i, q) in self.request.questions.iter().enumerate() {
@@ -317,6 +326,7 @@ impl QuestionCard {
         self.selected[i] = vec![label];
         // A picked option clears any "Other" text so the selection takes effect.
         self.others[i].update(cx, |s, cx| s.set_value("", window, cx));
+        self.focus_self(window, cx);
         cx.notify();
     }
 
@@ -327,12 +337,32 @@ impl QuestionCard {
             self.selected[i].push(label);
             self.others[i].update(cx, |s, cx| s.set_value("", window, cx));
         }
+        self.focus_self(window, cx);
         cx.notify();
     }
 
-    fn goto(&mut self, page: usize, cx: &mut Context<Self>) {
+    fn goto(&mut self, page: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.page = page.min(self.request.questions.len().saturating_sub(1));
+        self.focus_self(window, cx);
         cx.notify();
+    }
+
+    /// Move focus onto the card container so ‹/› paging and Esc reach it after
+    /// the user touches a non-text control (an option, a dot, an arrow). Text
+    /// fields grab focus themselves when clicked, so this never fights the caret.
+    /// Deferred: a synchronous focus inside a click handler is clobbered by the
+    /// click's own post-dispatch focus pass, so the container would never end up
+    /// focused — the deferred pass runs after that settles and sticks.
+    fn focus_self(&self, window: &mut Window, cx: &mut App) {
+        let handle = self.focus_handle.clone();
+        window.defer(cx, move |window, cx| handle.focus(window, cx));
+    }
+
+    /// Whether a per-question "Other" or the overall response field holds focus —
+    /// arrow paging stands down while typing so ‹/› move the caret, not the page.
+    fn text_field_focused(&self, window: &Window, cx: &App) -> bool {
+        self.others.iter().any(|s| s.read(cx).focus_handle(cx).is_focused(window))
+            || self.overall.read(cx).focus_handle(cx).is_focused(window)
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -445,8 +475,34 @@ impl Render for QuestionCard {
                 .child(input_pill(&self.others[page], theme, density, &typo)),
         );
 
+        // The forward action. On any non-final page that isn't yet submittable, a
+        // plain `Next →` steps to the following question (dots/arrows still allow
+        // free jumping); on the final page — or once the whole set is answerable —
+        // it becomes the gated `Submit`. Single-question cards are always "final",
+        // so they only ever show Submit.
+        let primary: AnyElement = if self.forward_is_submit(cx) {
+            submit_button(
+                format!("q-submit-{}", self.tool_id),
+                submit_ok,
+                theme,
+                density,
+                &typo,
+                cx.listener(|this, _e: &ClickEvent, _w, cx| this.submit(cx)),
+            )
+        } else {
+            let target = page + 1;
+            pill_button(
+                format!("q-next-{}", self.tool_id),
+                "Next →",
+                theme.fg_base,
+                density,
+                &typo,
+                cx.listener(move |this, _e: &ClickEvent, window, cx| this.goto(target, window, cx)),
+            )
+        };
+
         // Footer: a divider, the overall free-text response (an alternative to
-        // the options above), then Skip / Submit.
+        // the options above), then Skip / the forward action.
         let footer = div()
             .flex()
             .flex_col()
@@ -469,21 +525,37 @@ impl Render for QuestionCard {
                         &typo,
                         cx.listener(|this, _e: &ClickEvent, _w, cx| this.skip(cx)),
                     ))
-                    .child(submit_button(
-                        format!("q-submit-{}", self.tool_id),
-                        submit_ok,
-                        theme,
-                        density,
-                        &typo,
-                        cx.listener(|this, _e: &ClickEvent, _w, cx| this.submit(cx)),
-                    )),
+                    .child(primary),
             );
 
         div()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
-                if ev.keystroke.key == "escape" {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                let key = ev.keystroke.key.as_str();
+                if key == "escape" {
                     this.skip(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // ‹/› page between questions — but only when the caret isn't in a
+                // text field (there the arrows edit) and no modifier is held (so
+                // ⌘←/⌥← stay as editor shortcuts).
+                let m = &ev.keystroke.modifiers;
+                if m.control || m.alt || m.platform || m.function || this.text_field_focused(window, cx)
+                {
+                    return;
+                }
+                let n = this.request.questions.len();
+                match key {
+                    "left" if this.page > 0 => {
+                        this.goto(this.page - 1, window, cx);
+                        cx.stop_propagation();
+                    }
+                    "right" if this.page + 1 < n => {
+                        this.goto(this.page + 1, window, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
                 }
             }))
             .flex()
@@ -503,38 +575,157 @@ impl Render for QuestionCard {
 }
 
 impl QuestionCard {
-    /// The `‹ i of N ›` pager control (only rendered for multi-question cards).
+    /// The pager control (only rendered for multi-question cards): a ‹ stepper,
+    /// one progress dot per question, then a › stepper. Each dot is filled once
+    /// its question is answered, hollow while outstanding, and ringed at the
+    /// current page — so at a glance the user sees how many remain and where they
+    /// are. Dots and arrows are all clickable; the arrows dim + go inert at the
+    /// range edge.
     fn pager(&self, page: usize, n: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let typo = self.typography.clone();
+        // Precompute answered-state so the dot builders don't re-borrow `self`
+        // while `cx.listener` is live.
+        let answered: Vec<bool> = (0..n).map(|i| self.question_answered(i, cx)).collect();
+
         let arrow = |glyph: &str, target: Option<usize>, cx: &mut Context<Self>| {
             let mut b = div()
                 .id(SharedString::from(format!("q-nav-{glyph}-{page}")))
-                .px(px(4.0))
+                .px(px(5.0))
+                .py(px(1.0))
+                .rounded(px(4.0))
                 .text_size(px(typo.t_body_md))
                 .text_color(if target.is_some() { theme.fg_muted } else { theme.fg_subtle })
                 .child(SharedString::from(glyph.to_string()));
             if let Some(t) = target {
                 b = b
                     .cursor_pointer()
-                    .hover(|s| s.text_color(theme.fg_base))
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.goto(t, cx)));
+                    .hover(|s| s.bg(theme.bg_base).text_color(theme.fg_base))
+                    .on_click(cx.listener(move |this, _e, window, cx| this.goto(t, window, cx)));
             }
             b
         };
+
+        let mut dots = div().flex().flex_row().items_center().gap(px(5.0)).flex_none();
+        for (i, &filled) in answered.iter().enumerate() {
+            let mut inner = div().size(px(7.0)).rounded_full();
+            inner = if filled {
+                inner.bg(theme.status_ok)
+            } else {
+                inner.border_1().border_color(theme.border_input)
+            };
+            // A fixed-size cell keeps every dot on the same baseline; only the
+            // current one carries the accent ring.
+            let mut cell = div()
+                .id(SharedString::from(format!("q-dot-{i}")))
+                .size(px(14.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .child(inner);
+            if i == page {
+                cell = cell.border_1().border_color(theme.border_active);
+            } else {
+                cell = cell.hover(|s| s.bg(theme.bg_base));
+            }
+            cell = cell.on_click(cx.listener(move |this, _e, window, cx| this.goto(i, window, cx)));
+            dots = dots.child(cell);
+        }
+
         div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(2.0))
+            .gap(px(4.0))
             .flex_none()
             .child(arrow("‹", page.checked_sub(1), cx))
-            .child(
-                div()
-                    .text_size(px(typo.t_label_xs))
-                    .text_color(theme.fg_muted)
-                    .child(SharedString::from(format!("{} of {n}", page + 1))),
-            )
+            .child(dots)
             .child(arrow("›", (page + 1 < n).then_some(page + 1), cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use oximux_agents::thread::{AskQuestion, QuestionKind, QuestionOption, QuestionRequest};
+
+    fn q(id: &str) -> AskQuestion {
+        AskQuestion {
+            id: id.to_string(),
+            header: "H".into(),
+            question: format!("Question {id}?"),
+            options: vec![
+                QuestionOption { label: "A".into(), description: "opt a".into() },
+                QuestionOption { label: "B".into(), description: "opt b".into() },
+            ],
+            kind: QuestionKind::SingleSelect,
+            other_allowed: true,
+        }
+    }
+
+    fn card(n: usize, cx: &mut TestAppContext) -> gpui::WindowHandle<QuestionCard> {
+        cx.update(gpui_component::init);
+        let req = QuestionRequest {
+            request_id: "req-1".into(),
+            questions: (0..n).map(|i| q(&format!("q-{i}"))).collect(),
+        };
+        cx.add_window(|window, cx| {
+            QuestionCard::new(
+                "tool-1".into(),
+                req,
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn pager_navigation_clamps_and_tracks_page(cx: &mut TestAppContext) {
+        let w = card(3, cx);
+        w.update(cx, |c, window, cx| {
+            assert_eq!(c.page, 0, "starts on the first question");
+            c.goto(1, window, cx);
+            assert_eq!(c.page, 1);
+            // Past the end clamps to the last question, never panics.
+            c.goto(99, window, cx);
+            assert_eq!(c.page, 2);
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn forward_button_is_next_until_final_or_answerable(cx: &mut TestAppContext) {
+        let w = card(3, cx);
+        w.update(cx, |c, window, cx| {
+            // Page 0 of 3, nothing answered → the forward action is Next, not Submit.
+            assert!(!c.forward_is_submit(cx));
+            // The final page always offers Submit (gated/disabled when unanswered).
+            c.goto(2, window, cx);
+            assert!(c.forward_is_submit(cx));
+            // Answering every question makes Submit available from any page.
+            c.goto(0, window, cx);
+            c.select_single(0, "A".into(), window, cx);
+            c.select_single(1, "A".into(), window, cx);
+            c.select_single(2, "A".into(), window, cx);
+            assert!(c.question_answered(0, cx));
+            assert!(c.forward_is_submit(cx), "all answered → Submit even on page 0");
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn single_question_card_only_ever_submits(cx: &mut TestAppContext) {
+        let w = card(1, cx);
+        w.update(cx, |c, _window, cx| {
+            // n == 1 is always "final" → the forward action is Submit, never Next.
+            assert!(c.forward_is_submit(cx));
+        })
+        .unwrap();
     }
 }
