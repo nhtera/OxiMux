@@ -762,6 +762,7 @@ impl PaneGroup {
         model: Option<String>,
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
+        slash_commands: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -776,6 +777,7 @@ impl PaneGroup {
                 model_for_view,
                 session_id,
                 entries,
+                slash_commands,
                 theme,
                 density,
                 typography,

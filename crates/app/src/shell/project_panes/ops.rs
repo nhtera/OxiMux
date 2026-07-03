@@ -904,6 +904,7 @@ impl ProjectPanes {
         model: Option<String>,
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
+        slash_commands: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -911,7 +912,7 @@ impl ProjectPanes {
             return;
         };
         group.update(cx, |g, cx| {
-            g.open_agent_chat_tab_restored(cwd, model, session_id, entries, window, cx);
+            g.open_agent_chat_tab_restored(cwd, model, session_id, entries, slash_commands, window, cx);
         });
     }
 

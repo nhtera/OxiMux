@@ -45,6 +45,7 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
             session_id: str_field(v, "session_id"),
             model: str_field(v, "model"),
             permission_mode: str_field(v, "permissionMode"),
+            slash_commands: str_list_field(v, "slash_commands"),
         }],
         Some("post_turn_summary") => vec![ThreadEvent::TurnSummary {
             detail: str_field(v, "status_detail"),
@@ -52,8 +53,8 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
         }],
         // hook_started / hook_response → noise.
         // TODO(chat-ui polish): `system/status` (spinner text) and init's
-        // tools/mcp_servers/slash_commands/agents/cwd are dropped for now;
-        // surface them when the spinner + session-detail UI is built.
+        // tools/mcp_servers/agents/cwd are dropped for now; surface them when
+        // the spinner + session-detail UI is built.
         _ => Vec::new(),
     }
 }
@@ -206,6 +207,16 @@ fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
+/// Decode a JSON array of strings into `Vec<String>`. Missing key or non-array
+/// → empty; non-string array entries are skipped (defensive against a wire
+/// shape drift). Used for `init.slash_commands`.
+fn str_list_field(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// A `tool_result.content` is either a plain string or an array of
 /// `{type:"text", text:"..."}` blocks — flatten both to a string.
 fn content_to_string(c: Option<&Value>) -> String {
@@ -238,11 +249,25 @@ mod tests {
 
     #[test]
     fn decodes_session_init() {
+        // slash_commands round-trips (names only); non-string entries skipped;
+        // unrelated keys ignored.
         let l = json!({"type":"system","subtype":"init","session_id":"sid-1",
-            "model":"claude-sonnet-5","permissionMode":"default","extra":"ignored"}).to_string();
+            "model":"claude-sonnet-5","permissionMode":"default","extra":"ignored",
+            "slash_commands":["compact","research",42,"codex:rescue"]}).to_string();
         assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
             session_id: "sid-1".into(), model: "claude-sonnet-5".into(),
-            permission_mode: "default".into() }]);
+            permission_mode: "default".into(),
+            slash_commands: vec!["compact".into(), "research".into(), "codex:rescue".into()] }]);
+    }
+
+    #[test]
+    fn session_init_without_slash_commands_is_empty() {
+        // Absent key → empty vec (older CLI / other backends), no panic.
+        let l = json!({"type":"system","subtype":"init","session_id":"s",
+            "model":"m","permissionMode":"default"}).to_string();
+        assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
+            session_id: "s".into(), model: "m".into(),
+            permission_mode: "default".into(), slash_commands: vec![] }]);
     }
 
     #[test]

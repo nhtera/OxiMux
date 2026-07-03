@@ -9,6 +9,8 @@
 //! input here, a keystroke dirties only THIS view; the transcript above stays
 //! cached. Submit is surfaced to the parent as a [`ComposerEvent`].
 
+use std::ops::Range;
+
 use gpui::{
     Anchor, App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable,
     ImageSource, InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render,
@@ -18,12 +20,25 @@ use gpui::StyledImage as _;
 use gpui_component::Icon;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Paste};
+use gpui_component::input::{
+    IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
+};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use oximux_agents::thread::ChatImage;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::image_attach::{PendingImage, pending_from_bytes, pending_from_path};
+use super::slash_palette::{detect_slash_trigger, rank_commands};
+
+/// Open state of the slash-command palette: the in-progress query, the byte
+/// range of the `/token` it replaces on accept, the ranked command indices
+/// (into [`ComposerView::slash_commands`]), and which match is highlighted
+/// (index into `matches`).
+struct SlashPaletteState {
+    range: Range<usize>,
+    matches: Vec<usize>,
+    highlight: usize,
+}
 
 /// Raised by the composer for the parent [`super::AgentChatView`] to act on.
 /// The parent performs the actual send / interrupt / model+mode switch; on
@@ -69,6 +84,13 @@ pub struct ComposerView {
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
     /// submit.
     pending_images: Vec<PendingImage>,
+    /// Command names the backend advertised at session init (from `SessionInit`),
+    /// offered in the slash-command palette. Empty when the backend advertises
+    /// none — which also disables the palette.
+    slash_commands: Vec<String>,
+    /// The open slash-command palette, or `None` when the caret isn't inside a
+    /// `/token` (or the palette is otherwise suppressed).
+    palette: Option<SlashPaletteState>,
     /// Repaints this view (only) on each keystroke so the draft stays visible.
     _sub: Subscription,
 }
@@ -96,12 +118,23 @@ impl ComposerView {
             // must first solve the circular-height embedding.
             InputState::new(window, cx).placeholder("Message Claude…  (↵ to send)")
         });
-        let sub = cx.subscribe(&input, |_this, _input, ev: &InputEvent, cx| {
+        let sub = cx.subscribe(&input, |this, _input, ev: &InputEvent, cx| {
             // Repaint ONLY the composer on edits — the transcript is untouched.
             // Focus/Blur repaint too so the pill's border can track focus (a
             // brighter ring while typing), like a native chat field.
-            if matches!(ev, InputEvent::Change | InputEvent::Focus | InputEvent::Blur) {
-                cx.notify();
+            match ev {
+                InputEvent::Change => {
+                    this.recompute_slash_palette(cx);
+                    cx.notify();
+                }
+                // Losing focus closes the palette so it can't linger over the
+                // transcript while the field is inactive.
+                InputEvent::Blur => {
+                    this.palette = None;
+                    cx.notify();
+                }
+                InputEvent::Focus => cx.notify(),
+                _ => {}
             }
         });
         Self {
@@ -117,6 +150,8 @@ impl ComposerView {
             supports_modes: false,
             supports_effort: false,
             pending_images: Vec::new(),
+            slash_commands: Vec::new(),
+            palette: None,
             _sub: sub,
         }
     }
@@ -223,6 +258,112 @@ impl ComposerView {
             self.supports_modes = supports_modes;
             self.supports_effort = supports_effort;
             cx.notify();
+        }
+    }
+
+    /// Push the backend's advertised slash-command names (from `SessionInit`).
+    /// A non-empty list enables the palette; an empty one disables it. Recomputes
+    /// in case the caret already sits in a `/token` when the list arrives.
+    pub fn set_slash_commands(&mut self, commands: Vec<String>, cx: &mut Context<Self>) {
+        if self.slash_commands != commands {
+            self.slash_commands = commands;
+            self.recompute_slash_palette(cx);
+            cx.notify();
+        }
+    }
+
+    /// Recompute the palette from the current draft + caret. Stateless: the
+    /// palette opens only when the caret sits inside a `/token`, commands are
+    /// advertised, and the composer can send (no in-flight turn / disconnect —
+    /// which also covers a pending permission or question card, since the turn
+    /// stays active until it resolves). Preserves the highlighted command across
+    /// a re-filter when it still matches.
+    fn recompute_slash_palette(&mut self, cx: &mut Context<Self>) {
+        if self.slash_commands.is_empty() || self.turn_active || self.disconnected {
+            self.palette = None;
+            return;
+        }
+        let (text, cursor) = {
+            let s = self.input.read(cx);
+            (s.value().to_string(), s.cursor())
+        };
+        let Some(trigger) = detect_slash_trigger(&text, cursor) else {
+            self.palette = None;
+            return;
+        };
+        let matches = rank_commands(&trigger.query, &self.slash_commands);
+        if matches.is_empty() {
+            self.palette = None;
+            return;
+        }
+        // Keep the same command highlighted across re-filter (highlight-by-id),
+        // else fall back to the top match.
+        let prev = self.palette.as_ref().and_then(|p| p.matches.get(p.highlight).copied());
+        let highlight = prev
+            .and_then(|cmd| matches.iter().position(|&m| m == cmd))
+            .unwrap_or(0);
+        self.palette = Some(SlashPaletteState { range: trigger.range, matches, highlight });
+    }
+
+    /// Move the palette highlight (`-1` up / `+1` down), wrapping. Returns
+    /// whether a palette was open (so the caller consumes the key).
+    fn palette_move(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(p) = self.palette.as_mut() else { return false };
+        let n = p.matches.len() as isize;
+        if n > 0 {
+            p.highlight = (((p.highlight as isize + delta) % n + n) % n) as usize;
+            cx.notify();
+        }
+        true
+    }
+
+    /// Close the palette (Esc) keeping the typed text. Returns whether it was open.
+    fn palette_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.palette.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Accept a specific ranked match: replace the `/token` with `/name ` and a
+    /// trailing space, ready for arguments. The command still rides to the agent
+    /// as ordinary user text on submit. (The single-line field's `set_value`
+    /// puts the caret at the end of the draft — after the space in the common
+    /// case where the command is the whole draft; if the user accepted a
+    /// mid-line command with text after it, the caret lands after that trailing
+    /// text instead. Acceptable — commands are near-always typed at the start.)
+    fn palette_accept_match(&mut self, match_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.palette.take() else { return };
+        if let Some(&cmd) = p.matches.get(match_idx)
+            && let Some(name) = self.slash_commands.get(cmd)
+        {
+            let text = self.input.read(cx).value().to_string();
+            // Guard against a stale range if the buffer moved underneath.
+            if p.range.end <= text.len()
+                && text.is_char_boundary(p.range.start)
+                && text.is_char_boundary(p.range.end)
+            {
+                let next = format!("{}/{name} {}", &text[..p.range.start], &text[p.range.end..]);
+                self.input.update(cx, |s, cx| s.set_value(next, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Accept the highlighted match (keyboard Enter/Tab).
+    fn palette_accept_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(highlight) = self.palette.as_ref().map(|p| p.highlight) else { return false };
+        self.palette_accept_match(highlight, window, cx);
+        true
+    }
+
+    /// The root Enter handler delegates here: accept a highlighted slash command
+    /// if the palette is open, otherwise submit the message.
+    pub fn on_enter_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.palette_accept_highlighted(window, cx) {
+            self.submit(window, cx);
         }
     }
 
@@ -462,6 +603,67 @@ impl ComposerView {
         }
         row
     }
+
+    /// The floating command list shown while the palette is open. Anchored to
+    /// sit directly above the pill (bottom edge at 100% of the relative wrapper),
+    /// so it overlays the transcript upward without shifting the composer.
+    /// Rendered rows are capped so a large command list stays cheap per keystroke.
+    fn render_slash_palette(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let p = self.palette.as_ref()?;
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        // Window the rendered rows around the highlight: keeps the highlighted
+        // row on screen without a scroll container, and caps element count for a
+        // large command list.
+        const VISIBLE: usize = 8;
+        let total = p.matches.len();
+        let start = if p.highlight < VISIBLE {
+            0
+        } else {
+            (p.highlight + 1 - VISIBLE).min(total.saturating_sub(VISIBLE))
+        };
+        let end = (start + VISIBLE).min(total);
+        let mut list = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border_input)
+            .bg(theme.bg_panel)
+            .p(px(density.pad_row));
+        for (row, &cmd) in p.matches.iter().enumerate().skip(start).take(end - start) {
+            let Some(name) = self.slash_commands.get(cmd) else { continue };
+            let selected = row == p.highlight;
+            let mut item = div()
+                .id(("slash-row", row))
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .px(px(density.pad_row))
+                .py(px(density.gap_inline))
+                .rounded(px(8.0))
+                .text_size(px(typo.t_body_md))
+                .text_color(theme.fg_base)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_panel_alt))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, window, cx| {
+                        this.palette_accept_match(row, window, cx)
+                    }),
+                )
+                .child(format!("/{name}"));
+            if selected {
+                // A soft accent tint marks the keyboard highlight.
+                item = item.bg(theme.status_info.opacity(0.16));
+            }
+            list = list.child(item);
+        }
+        Some(list)
+    }
 }
 
 impl Render for ComposerView {
@@ -591,6 +793,31 @@ impl Render for ComposerView {
                     cx.stop_propagation();
                 }
             }))
+            // While the palette is open, capture the field's nav/accept/close
+            // actions before the input consumes them; when it's closed these are
+            // no-ops that fall through to the input's normal handling. Enter is
+            // captured at the view root (it also drives submit) — see
+            // `on_enter_key`.
+            .capture_action(cx.listener(|this, _: &MoveUp, _window, cx| {
+                if this.palette_move(-1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, _window, cx| {
+                if this.palette_move(1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &InputEscape, _window, cx| {
+                if this.palette_close(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                if this.palette_accept_highlighted(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 // Match the transcript's centered reading column so the pill +
                 // controls line up with the messages above on wide windows. The
@@ -605,6 +832,7 @@ impl Render for ComposerView {
                     .when(!self.pending_images.is_empty(), |d| {
                         d.child(self.render_attachments(cx))
                     })
+                    .children(self.render_slash_palette(cx))
                     .child(pill)
                     .child(controls),
             )

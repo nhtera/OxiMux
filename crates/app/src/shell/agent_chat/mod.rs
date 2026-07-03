@@ -17,6 +17,7 @@ mod diff_card;
 mod image_attach;
 mod plan_panel;
 mod question_card;
+mod slash_palette;
 mod tool_bodies;
 mod tool_card;
 
@@ -234,13 +235,14 @@ impl AgentChatView {
         model: Option<String>,
         session_id: Option<String>,
         entries: Vec<ThreadEntry>,
+        slash_commands: Vec<String>,
         theme: Theme,
         density: Density,
         typography: Typography,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let thread = ChatThread::rehydrated(session_id, model.clone(), entries);
+        let thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
         Self::assemble(cwd, model, thread, theme, density, typography, window, cx)
     }
 
@@ -314,9 +316,14 @@ impl AgentChatView {
             .as_ref()
             .map(|c| c.capabilities())
             .unwrap_or_default();
+        // Seed the palette from the rehydrated list so a restored chat offers it
+        // on the first paint — `--resume` stays silent until the first message,
+        // so no init would otherwise arrive to populate it.
+        let seed_slash = if caps.supports_slash { thread.slash_commands.clone() } else { Vec::new() };
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, cx);
+            c.set_slash_commands(seed_slash, cx);
         });
 
         Self {
@@ -364,6 +371,7 @@ impl AgentChatView {
             session_id,
             model: self.thread.model.clone().or_else(|| self.model.clone()),
             entries: self.thread.entries.clone(),
+            slash_commands: self.thread.slash_commands.clone(),
         })
     }
 
@@ -393,9 +401,14 @@ impl AgentChatView {
             .unwrap_or_default();
         let (model, permission_mode, effort) =
             (self.model.clone(), self.permission_mode.clone(), self.effort.clone());
+        // The command palette is offered only when the backend advertises
+        // commands (Claude does; others send an empty list, which disables it).
+        let slash_commands =
+            if caps.supports_slash { self.thread.slash_commands.clone() } else { Vec::new() };
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
             c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, cx);
+            c.set_slash_commands(slash_commands, cx);
         });
     }
 
@@ -1377,9 +1390,11 @@ impl Render for AgentChatView {
                 // Both ↵ and ⌘↵ send. The field's key map collapses Enter and
                 // Shift+Enter into the same action, so a keyboard newline can't
                 // be distinguished here — multi-line prompts arrive via paste.
-                // The mouse Send button remains the IME-proof fallback. The
-                // composer emits `Submit`, which this view's subscription sends.
-                this.composer.update(cx, |c, cx| c.submit(window, cx));
+                // The mouse Send button remains the IME-proof fallback. When the
+                // slash-command palette is open, Enter accepts the highlighted
+                // command instead of sending; otherwise the composer emits
+                // `Submit`, which this view's subscription sends.
+                this.composer.update(cx, |c, cx| c.on_enter_key(window, cx));
             }))
             // Drop image files anywhere on the chat surface to attach them.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {

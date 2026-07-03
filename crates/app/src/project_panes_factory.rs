@@ -188,6 +188,15 @@ fn restore_chat_entries(
         .unwrap_or_default()
 }
 
+/// The cached slash-command names for a restored chat, so its palette works on
+/// the first paint (a `--resume`d session emits no init until the first message).
+fn restore_chat_slash_commands(snap: &PersistedTabs, session_id: Option<&str>) -> Vec<String> {
+    session_id
+        .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
+        .map(|t| t.slash_commands.clone())
+        .unwrap_or_default()
+}
+
 // The factory threads the full project-pane construction context (cwd,
 // snapshot, runtime handles, callbacks); a bag struct would only relocate the
 // argument list without simplifying the single call site.
@@ -305,11 +314,12 @@ pub(crate) fn build_project_panes(
                 let model = model.clone();
                 let session_id = session_id.clone();
                 let entries = restore_chat_entries(&snap, session_id.as_deref());
+                let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                 panes_entity.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
                         group.update(cx, |g, cx| {
                             g.open_agent_chat_tab_restored(
-                                chat_cwd, model, session_id, entries, window, cx,
+                                chat_cwd, model, session_id, entries, slash_commands, window, cx,
                             );
                         });
                     }
@@ -470,9 +480,10 @@ fn restore_multi_group(
                     let model = model.clone();
                     let session_id = session_id.clone();
                     let entries = restore_chat_entries(&snap, session_id.as_deref());
+                    let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                     panes_entity.update(cx, |p, cx| {
                         p.open_agent_chat_in_group_restore(
-                            group_id, chat_cwd, model, session_id, entries, window, cx,
+                            group_id, chat_cwd, model, session_id, entries, slash_commands, window, cx,
                         );
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
@@ -1902,6 +1913,7 @@ mod tests {
                     thinking: String::new(),
                 }),
             ],
+            slash_commands: vec!["compact".into()],
         };
         let snap = PersistedTabs {
             tabs: vec![PersistedTab {

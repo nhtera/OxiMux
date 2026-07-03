@@ -23,6 +23,11 @@ pub struct ChatThread {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    /// Command names advertised at session init (from `SessionInit`), for the
+    /// composer's slash-command palette. Empty until init arrives or when the
+    /// backend advertises none. Rides the restore snapshot so a resumed session
+    /// keeps its palette without waiting for a fresh init.
+    pub slash_commands: Vec<String>,
     /// Latest one-line turn summary (`post_turn_summary`), for a status chip.
     pub last_summary: Option<String>,
     /// Latest transport/protocol error, surfaced non-fatally.
@@ -61,6 +66,7 @@ impl ChatThread {
         session_id: Option<String>,
         model: Option<String>,
         mut entries: Vec<ThreadEntry>,
+        slash_commands: Vec<String>,
     ) -> Self {
         for entry in &mut entries {
             if let ThreadEntry::ToolCall(tc) = entry
@@ -76,6 +82,7 @@ impl ChatThread {
             entries,
             session_id,
             model,
+            slash_commands,
             ..Self::default()
         }
     }
@@ -104,10 +111,15 @@ impl ChatThread {
     /// Fold one decoded event into the transcript.
     pub fn apply(&mut self, event: &ThreadEvent) {
         match event {
-            ThreadEvent::SessionInit { session_id, model, permission_mode } => {
+            ThreadEvent::SessionInit { session_id, model, permission_mode, slash_commands } => {
                 self.session_id = Some(session_id.clone());
                 self.model = Some(model.clone());
                 self.permission_mode = Some(permission_mode.clone());
+                // Keep the last non-empty list: a resumed session may seed the
+                // palette before init, and a later init should never blank it.
+                if !slash_commands.is_empty() {
+                    self.slash_commands = slash_commands.clone();
+                }
             }
             ThreadEvent::AssistantTextDelta(t) => {
                 self.assistant_mut().text.push_str(t);
@@ -487,7 +499,7 @@ mod tests {
             request_id: "rid".into(), questions: parse_questions(&input) });
 
         // rehydrate fail-closes (the process that asked is gone)
-        let t = ChatThread::rehydrated(None, None, vec![ThreadEntry::ToolCall(tc.clone())]);
+        let t = ChatThread::rehydrated(None, None, vec![ThreadEntry::ToolCall(tc.clone())], vec![]);
         assert!(t.pending_question().is_none(), "no pending question survives restore");
         match &t.entries[0] {
             ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Rejected),
@@ -555,7 +567,7 @@ mod tests {
             ThreadEntry::User { text: "hi".into(), images: vec![] },
             ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
         ];
-        let t = ChatThread::rehydrated(Some("sid-9".into()), Some("opus".into()), entries);
+        let t = ChatThread::rehydrated(Some("sid-9".into()), Some("opus".into()), entries, vec![]);
         assert_eq!(t.session_id.as_deref(), Some("sid-9"));
         assert_eq!(t.model.as_deref(), Some("opus"));
         assert_eq!(t.entries.len(), 2);
@@ -575,7 +587,7 @@ mod tests {
         };
         let mut tc = ToolCall::new("toolu_1", "Edit", serde_json::json!({}));
         tc.status = ToolCallStatus::WaitingForConfirmation(req);
-        let t = ChatThread::rehydrated(None, None, vec![ThreadEntry::ToolCall(tc)]);
+        let t = ChatThread::rehydrated(None, None, vec![ThreadEntry::ToolCall(tc)], vec![]);
         assert!(t.pending_permission().is_none(), "no pending permission survives restore");
         match &t.entries[0] {
             ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Rejected),

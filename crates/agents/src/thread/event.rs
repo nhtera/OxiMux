@@ -31,6 +31,11 @@ pub enum ThreadEvent {
         session_id: String,
         model: String,
         permission_mode: String,
+        /// Command names the backend advertises for a `/`-prefixed message
+        /// (built-ins, skills, plugin commands). Names only — no descriptions.
+        /// Empty when the backend doesn't advertise any. The UI offers these in
+        /// a composer palette; the command itself rides as ordinary user text.
+        slash_commands: Vec<String>,
     },
     /// A live streaming text delta (from `content_block_delta` text_delta).
     /// The UI may render these for smooth typing; the authoritative text

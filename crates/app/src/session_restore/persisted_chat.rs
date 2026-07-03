@@ -38,6 +38,14 @@ pub struct PersistedChatTranscript {
     #[serde(default)]
     pub model: Option<String>,
     pub entries: Vec<ThreadEntry>,
+    /// The command names the session last advertised (from `system/init`), cached
+    /// so a restored chat can offer its slash-command palette immediately.
+    /// `--resume` stays silent until the first message, so without this cache the
+    /// palette would be empty until then. `#[serde(default)]` keeps blobs written
+    /// before this field loadable (they restore with an empty list, repopulated
+    /// by the next init).
+    #[serde(default)]
+    pub slash_commands: Vec<String>,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -97,6 +105,7 @@ mod tests {
                 ThreadEntry::User { text: "hi".into(), images: vec![] },
                 ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
             ],
+            slash_commands: vec!["compact".into(), "research".into()],
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
