@@ -241,19 +241,33 @@ impl SessionHistoryPanel {
         theme: Theme,
         typo: &Typography,
     ) -> impl IntoElement {
+        // The whole expanded body is one sunken container inset under the row —
+        // a distinct surface that separates the preview from the flat row list.
         let mut col = div()
             .flex()
             .flex_col()
             .w_full()
-            .gap(px(8.0))
-            .pl(px(22.0))
-            .pr(px(6.0))
-            .pt(px(2.0))
-            .pb(px(8.0));
+            .gap(px(6.0))
+            .mx(px(6.0))
+            .mt(px(2.0))
+            .mb(px(6.0))
+            .p(px(8.0))
+            .rounded(px(8.0))
+            .bg(theme.bg_base)
+            .border_1()
+            .border_color(theme.border_inactive)
+            // Section header — labels the block and anchors the visual grouping.
+            .child(
+                div()
+                    .text_size(px(typo.t_label_xs))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.fg_subtle)
+                    .child("LATEST TURNS"),
+            );
         if self.preview_loading.contains(sid) {
             col = col.child(
                 div()
-                    .text_size(px(typo.t_label_xs))
+                    .text_size(px(typo.t_body_sm))
                     .text_color(theme.fg_subtle)
                     .child("Loading preview…"),
             );
@@ -264,12 +278,13 @@ impl SessionHistoryPanel {
         } else {
             col = col.child(
                 div()
-                    .text_size(px(typo.t_label_xs))
+                    .text_size(px(typo.t_body_sm))
                     .text_color(theme.fg_subtle)
                     .child("No preview available."),
             );
         }
-        // Primary action for the expanded card.
+        // Primary action for the expanded card — a filled accent button so it
+        // reads as the card's call-to-action, not another line of text.
         let open = OpenChatSession {
             session_id: sid.to_string(),
             path: path.to_string(),
@@ -279,14 +294,20 @@ impl SessionHistoryPanel {
             div().flex().flex_row().pt(px(2.0)).child(
                 div()
                     .id(SharedString::from(format!("hist-open-{sid}")))
-                    .px(px(10.0))
-                    .py(px(4.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(12.0))
+                    .py(px(5.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
                     .text_size(px(typo.t_label_xs))
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.focus_ring)
-                    .bg(Hsla { a: 0.14, ..theme.focus_ring })
-                    .hover(|s| s.bg(Hsla { a: 0.24, ..theme.focus_ring }))
+                    .bg(Hsla { a: 0.16, ..theme.focus_ring })
+                    .border_1()
+                    .border_color(Hsla { a: 0.30, ..theme.focus_ring })
+                    .hover(|s| s.bg(Hsla { a: 0.28, ..theme.focus_ring }))
                     .child("Open as chat")
                     .on_mouse_down(MouseButton::Left, move |_e, window, cx| {
                         window.dispatch_action(Box::new(open.clone()), cx);
@@ -600,28 +621,39 @@ fn hint_row(msg: &str, theme: Theme, typo: &Typography) -> impl IntoElement {
         .child(SharedString::from(msg.to_string()))
 }
 
-/// One previewed turn: a small role label over its (capped) text body.
+/// One previewed turn: a lifted, bordered box (so consecutive turns read as
+/// distinct cards) with an uppercase role chip over its height-clamped body.
 fn preview_turn(m: &PreviewMessage, theme: Theme, typo: &Typography) -> impl IntoElement {
     let (label, label_color) = match m.role {
-        PreviewRole::User => ("You", theme.focus_ring),
-        PreviewRole::Assistant => ("Claude", theme.fg_muted),
+        PreviewRole::User => ("YOU", theme.focus_ring),
+        PreviewRole::Assistant => ("CLAUDE", theme.fg_muted),
     };
     div()
         .flex()
         .flex_col()
-        .gap(px(2.0))
+        .gap(px(3.0))
         .w_full()
+        .p(px(8.0))
+        .rounded(px(6.0))
+        .bg(theme.bg_panel_alt)
+        .border_1()
+        .border_color(theme.border_inactive)
         .child(
             div()
                 .text_size(px(typo.t_label_xs))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(label_color)
                 .child(label),
         )
         .child(
+            // Clamp to a few lines so a long turn doesn't blow out the card; the
+            // full text is on the opened session. Muted so the role chip leads.
             div()
                 .w_full()
+                .max_h(px(58.0))
+                .overflow_hidden()
                 .text_size(px(typo.t_body_sm))
-                .text_color(theme.fg_base)
+                .text_color(theme.fg_muted)
                 .child(SharedString::from(m.text.clone())),
         )
 }
