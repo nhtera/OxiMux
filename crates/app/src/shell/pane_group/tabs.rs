@@ -763,6 +763,7 @@ impl PaneGroup {
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
+        thinking_level: crate::shell::agent_chat::ThinkingLevel,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -778,6 +779,7 @@ impl PaneGroup {
                 session_id,
                 entries,
                 slash_commands,
+                thinking_level,
                 theme,
                 density,
                 typography,

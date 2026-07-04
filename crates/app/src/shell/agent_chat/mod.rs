@@ -24,6 +24,7 @@ mod slash_command_catalog;
 mod slash_palette;
 mod tool_bodies;
 mod tool_card;
+mod tool_grouping;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -105,11 +106,44 @@ pub enum AgentChatEvent {
     ModelChanged(String),
 }
 
+/// How assistant thinking blocks are shown across the whole chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ThinkingLevel {
+    /// Never render thinking blocks.
+    Hidden,
+    /// Auto-expand the thought currently streaming; collapse it once the reply
+    /// text starts. Past thoughts stay collapsed but remain individually
+    /// toggleable. The default — a live "thinking…" peek without clutter.
+    #[default]
+    Auto,
+    /// Always expand every thinking block.
+    Expanded,
+}
+
+impl ThinkingLevel {
+    fn next(self) -> Self {
+        match self {
+            Self::Hidden => Self::Auto,
+            Self::Auto => Self::Expanded,
+            Self::Expanded => Self::Hidden,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "Thinking: off",
+            Self::Auto => "Thinking: auto",
+            Self::Expanded => "Thinking: shown",
+        }
+    }
+}
+
 use composer::{ComposerEvent, ComposerView};
 use question_card::{QuestionCard, QuestionCardEvent};
+use tool_grouping::{plan_tool_grouping, EntryDisplay};
 use oximux_agents::thread::{
-    AgentConnection, ChatImage, ChatThread, ClaudeStreamJsonConnection, PermissionDecision,
-    QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus, TurnUsage,
+    AgentConnection, AssistantMessage, ChatImage, ChatThread, ClaudeStreamJsonConnection,
+    PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus,
+    TurnUsage,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -176,10 +210,21 @@ pub struct AgentChatView {
     /// respawns with `--resume`. Distinct from `disconnected` (an unexpected
     /// crash, which stays unavailable), so an intentional Stop shows no error.
     interrupted: bool,
-    /// Assistant entry indices whose thinking disclosure is expanded.
+    /// Assistant entry indices the user manually EXPANDED (per-entry override,
+    /// meaningful in `ThinkingLevel::Auto`).
     expanded_thinking: HashSet<usize>,
+    /// Assistant entry indices the user manually COLLAPSED — overrides Auto's
+    /// stream auto-expand so a manual collapse registers on the first click even
+    /// mid-stream.
+    collapsed_thinking: HashSet<usize>,
+    /// Chat-wide thinking display level (persisted). Cycled from a pill above
+    /// the composer.
+    thinking_level: ThinkingLevel,
     /// Tool-call ids whose card disclosure (raw input + result) is expanded.
     expanded_tool_calls: HashSet<String>,
+    /// Run-start entry indices of long tool-card runs the user has expanded
+    /// (collapsed runs show first-3 + "N more" + last-2 otherwise).
+    expanded_tool_runs: HashSet<usize>,
     /// Decoded thumbnails for user-attached images, keyed by (entry index, image
     /// index). Base64→decode happens once per attachment and is cached here so
     /// the transcript doesn't re-decode every streaming repaint. `RefCell` because
@@ -259,6 +304,7 @@ impl AgentChatView {
         session_id: Option<String>,
         entries: Vec<ThreadEntry>,
         slash_commands: Vec<String>,
+        thinking_level: ThinkingLevel,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -266,7 +312,9 @@ impl AgentChatView {
         cx: &mut Context<Self>,
     ) -> Self {
         let thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
-        Self::assemble(cwd, model, thread, theme, density, typography, window, cx)
+        let mut view = Self::assemble(cwd, model, thread, theme, density, typography, window, cx);
+        view.thinking_level = thinking_level;
+        view
     }
 
     /// Shared construction for [`new`]/[`new_resumed`]: wire the composer, spawn
@@ -453,7 +501,10 @@ impl AgentChatView {
             disconnected,
             interrupted: false,
             expanded_thinking: HashSet::new(),
+            collapsed_thinking: HashSet::new(),
+            thinking_level: ThinkingLevel::default(),
             expanded_tool_calls: HashSet::new(),
+            expanded_tool_runs: HashSet::new(),
             image_cache: RefCell::new(HashMap::new()),
             preview: None,
             _drain_task: drain_task,
@@ -483,6 +534,7 @@ impl AgentChatView {
             model: self.thread.model.clone().or_else(|| self.model.clone()),
             entries: self.thread.entries.clone(),
             slash_commands: self.thread.slash_commands.clone(),
+            thinking_level: self.thinking_level,
         })
     }
 
@@ -724,7 +776,10 @@ impl AgentChatView {
             disconnected: false,
             interrupted: false,
             expanded_thinking: HashSet::new(),
+            collapsed_thinking: HashSet::new(),
+            thinking_level: ThinkingLevel::default(),
             expanded_tool_calls: HashSet::new(),
+            expanded_tool_runs: HashSet::new(),
             image_cache: RefCell::new(HashMap::new()),
             preview: None,
             _drain_task: None,
@@ -935,12 +990,170 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Whether entry `idx`'s thinking block renders expanded, resolving the
+    /// chat-wide level against the user's per-entry expand/collapse overrides.
+    /// In `Auto`, the streaming thought (last entry, turn active, no text yet)
+    /// auto-expands UNLESS the user explicitly collapsed it.
+    fn thinking_expanded(&self, idx: usize, is_last: bool, msg: &AssistantMessage) -> bool {
+        match self.thinking_level {
+            ThinkingLevel::Hidden => false,
+            ThinkingLevel::Expanded => true,
+            ThinkingLevel::Auto => {
+                if self.collapsed_thinking.contains(&idx) {
+                    false
+                } else {
+                    self.expanded_thinking.contains(&idx)
+                        || (is_last && self.thread.turn_active && msg.text.is_empty())
+                }
+            }
+        }
+    }
+
+    /// Toggle a thinking block: compute its current resolved state and flip it
+    /// explicitly (so a manual collapse wins over Auto's stream auto-expand on
+    /// the first click, and vice-versa).
     fn toggle_thinking(&mut self, idx: usize, cx: &mut Context<Self>) {
-        // `insert` returns false when already present → toggle off.
-        if !self.expanded_thinking.insert(idx) {
+        let is_last = idx + 1 == self.thread.entries.len();
+        let currently = match self.thread.entries.get(idx) {
+            Some(ThreadEntry::Assistant(msg)) => self.thinking_expanded(idx, is_last, msg),
+            _ => self.expanded_thinking.contains(&idx),
+        };
+        if currently {
             self.expanded_thinking.remove(&idx);
+            self.collapsed_thinking.insert(idx);
+        } else {
+            self.collapsed_thinking.remove(&idx);
+            self.expanded_thinking.insert(idx);
         }
         cx.notify();
+    }
+
+    /// Expand a collapsed tool run (its "N more" click).
+    fn expand_tool_run(&mut self, run_start: usize, cx: &mut Context<Self>) {
+        self.expanded_tool_runs.insert(run_start);
+        cx.notify();
+    }
+
+    /// The "… N more tool calls" expander for a collapsed run.
+    fn render_tool_run_expander(
+        &self,
+        run_start: usize,
+        hidden: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = self.theme;
+        div()
+            .id(("tool-run-expander", run_start))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .w_full()
+            .py(px(2.0))
+            .text_xs()
+            .text_color(t.fg_subtle)
+            .cursor_pointer()
+            .hover(|s| s.text_color(t.fg_base))
+            .child(SharedString::from(format!("··· {hidden} more tool calls")))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _e, _w, cx| this.expand_tool_run(run_start, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Cycle the chat-wide thinking level (Hidden → Auto → Expanded → …), from
+    /// the pill above the composer. Persisted via `transcript_snapshot`.
+    fn cycle_thinking_level(&mut self, cx: &mut Context<Self>) {
+        self.thinking_level = self.thinking_level.next();
+        cx.notify();
+    }
+
+    /// Count tool calls still awaiting the user (permission or question).
+    fn awaiting_count(&self) -> usize {
+        self.thread
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ThreadEntry::ToolCall(tc)
+                        if matches!(
+                            tc.status,
+                            ToolCallStatus::WaitingForConfirmation(_)
+                                | ToolCallStatus::AwaitingAnswer(_)
+                        )
+                )
+            })
+            .count()
+    }
+
+    /// A pinned "awaiting your approval — Jump" banner, shown only when there IS
+    /// a pending card AND the user has scrolled up away from it (near-bottom is
+    /// treated as "the card is visible"). Conservative by design: index-based,
+    /// no per-entry pixel math (which fights the async markdown layout).
+    fn render_awaiting_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let n = self.awaiting_count();
+        if n == 0 || self.is_near_bottom() {
+            return None;
+        }
+        let t = self.theme;
+        Some(
+            div()
+                .id("awaiting-approval-banner")
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .max_w(px(CONTENT_MAX_W))
+                .px(px(10.0))
+                .py(px(5.0))
+                .rounded(px(8.0))
+                .bg(t.status_warn.opacity(0.15))
+                .text_sm()
+                .text_color(t.fg_base)
+                .cursor_pointer()
+                .hover(|s| s.bg(t.status_warn.opacity(0.22)))
+                .child(SharedString::from(format!(
+                    "Awaiting your approval ({n})"
+                )))
+                .child(div().text_xs().text_color(t.fg_muted).child("Jump ↓"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, _w, cx| {
+                        this.stick_to_bottom = true;
+                        this.follow_frames = FOLLOW_FRAMES;
+                        this.list_scroll.scroll_to_bottom();
+                        cx.notify();
+                    }),
+                ),
+        )
+    }
+
+    /// The compact thinking-level pill shown above the composer.
+    fn render_thinking_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        div()
+            .flex()
+            .justify_end()
+            .w_full()
+            .max_w(px(CONTENT_MAX_W))
+            .child(
+                div()
+                    .id("thinking-level-toggle")
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(6.0))
+                    .text_xs()
+                    .text_color(t.fg_subtle)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(t.fg_base).bg(t.bg_panel_alt))
+                    .child(SharedString::from(self.thinking_level.label()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, _w, cx| this.cycle_thinking_level(cx)),
+                    ),
+            )
     }
 
     fn toggle_tool_expanded(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1396,7 +1609,39 @@ impl AgentChatView {
             .max_w(px(CONTENT_MAX_W))
             .gap(px(density.pad_panel * 2.0));
 
+        // Group long runs of tool cards: a run of >8 collapses to first-3 +
+        // "N more" + last-2, with pending/failed cards always kept visible.
+        let is_tool: Vec<bool> = self
+            .thread
+            .entries
+            .iter()
+            .map(|e| matches!(e, ThreadEntry::ToolCall(_)))
+            .collect();
+        let force_show: Vec<bool> = self
+            .thread
+            .entries
+            .iter()
+            .map(|e| {
+                matches!(
+                    e,
+                    ThreadEntry::ToolCall(tc)
+                        if matches!(
+                            tc.status,
+                            ToolCallStatus::WaitingForConfirmation(_)
+                                | ToolCallStatus::AwaitingAnswer(_)
+                                | ToolCallStatus::Failed(_)
+                                | ToolCallStatus::Pending
+                                | ToolCallStatus::InProgress
+                        )
+                )
+            })
+            .collect();
+        let group_plan = plan_tool_grouping(&is_tool, &force_show, &self.expanded_tool_runs);
+
         for (idx, entry) in self.thread.entries.iter().enumerate() {
+            if matches!(group_plan[idx], EntryDisplay::Hide) {
+                continue;
+            }
             let el: Option<AnyElement> = match entry {
                 ThreadEntry::User { text, images, .. } => {
                     // No "You" caption — the right-aligned bubble is the signal.
@@ -1414,8 +1659,13 @@ impl AgentChatView {
                             .gap(px(4.0))
                             .w_full()
                             .child(assistant_header(group, &msg.text, theme, &typo, cx));
-                        if !msg.thinking.is_empty() {
-                            let expanded = self.expanded_thinking.contains(&idx);
+                        // Thinking display honors the chat-wide level (see
+                        // `thinking_expanded`): Hidden drops the block; Expanded
+                        // forces it open; Auto peeks the streaming thought and
+                        // otherwise respects the user's per-entry toggle.
+                        if !msg.thinking.is_empty() && self.thinking_level != ThinkingLevel::Hidden {
+                            let is_last = idx + 1 == self.thread.entries.len();
+                            let expanded = self.thinking_expanded(idx, is_last, msg);
                             block = block.child(thinking_block(
                                 idx, expanded, &msg.thinking, theme, density, &typo, cx,
                             ));
@@ -1454,6 +1704,10 @@ impl AgentChatView {
                 } else {
                     content = content.child(el);
                 }
+            }
+            // A collapsed tool-run expander follows its anchor entry.
+            if let EntryDisplay::ShowThenExpander { run_start, hidden } = group_plan[idx] {
+                content = content.child(self.render_tool_run_expander(run_start, hidden, cx));
             }
         }
         // Live turn / disconnect state lives at the tail of the transcript (like
@@ -1688,6 +1942,17 @@ impl Render for AgentChatView {
                 this.attach_dropped_paths(paths.paths().to_vec(), cx);
             }))
             .child(transcript)
+            // The thinking-level pill shows once any assistant thought exists in
+            // the transcript (nothing to toggle otherwise).
+            .when(
+                self.thread.entries.iter().any(|e| {
+                    matches!(e, ThreadEntry::Assistant(m) if !m.thinking.is_empty())
+                }),
+                |col| col.child(self.render_thinking_toggle(cx)),
+            )
+            // A pinned "awaiting approval — jump" banner when a pending card is
+            // scrolled off above the composer.
+            .children(self.render_awaiting_banner(cx))
             // Staged-edit banner + rewind-confirm card sit just above the
             // composer while active (mutually exclusive — entering edit clears
             // any open confirm).
@@ -2652,6 +2917,60 @@ mod tests {
                 assert_eq!(view.thread.session_id.as_deref(), Some("sid"), "session untouched");
             })
             .expect("window update");
+    }
+
+    /// A manual collapse during Auto stream auto-expand must register on the
+    /// first click (the collapsed override wins over the streaming peek).
+    #[gpui::test]
+    async fn thinking_manual_collapse_wins_over_auto_stream(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("go");
+                // A streaming thought on the last entry, no text yet, turn active.
+                view.thread.apply(&ThreadEvent::ThinkingDelta("pondering".into()));
+                assert!(view.thread.turn_active);
+                let last = view.thread.entries.len() - 1;
+                let msg = match &view.thread.entries[last] {
+                    ThreadEntry::Assistant(m) => m.clone(),
+                    _ => panic!("expected assistant entry"),
+                };
+                assert!(
+                    view.thinking_expanded(last, true, &msg),
+                    "Auto auto-expands the streaming thought"
+                );
+
+                // One click must collapse it despite the auto-expand.
+                view.toggle_thinking(last, cx);
+                assert!(
+                    !view.thinking_expanded(last, true, &msg),
+                    "manual collapse wins on the FIRST click"
+                );
+                // Toggling again re-expands.
+                view.toggle_thinking(last, cx);
+                assert!(view.thinking_expanded(last, true, &msg), "re-expands on next click");
+            })
+            .expect("window update");
+    }
+
+    #[test]
+    fn tool_grouping_leaves_short_runs_and_messages_alone() {
+        // messages interleaved with short tool runs: nothing collapses.
+        let is_tool = vec![false, true, true, false, true, false];
+        let force = vec![false; 6];
+        let plan = plan_tool_grouping(&is_tool, &force, &HashSet::new());
+        assert!(plan.iter().all(|d| matches!(d, EntryDisplay::Show)));
     }
 
     fn tool_status(view: &AgentChatView, id: &str) -> Option<&'static str> {

@@ -743,6 +743,24 @@ impl ComposerView {
         true
     }
 
+    /// Pop a specific queued message (its chip's ✎) back into the composer to
+    /// edit. Guarded on an empty draft + no staged images — mirrors
+    /// [`Self::edit_last_queued`] so it never silently clobbers work in
+    /// progress; the ✎ button is hidden when the draft is non-empty, this is
+    /// the defense-in-depth backstop.
+    fn edit_queued(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.queued.len() {
+            return;
+        }
+        if !self.input.read(cx).value().trim().is_empty() || !self.pending_images.is_empty() {
+            return;
+        }
+        let QueuedMessage { text, images } = self.queued.remove(idx);
+        self.pending_images = images;
+        self.set_draft_end(text, window, cx);
+        cx.notify();
+    }
+
     /// Cancel a parked message (its chip's ✕).
     fn cancel_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx < self.queued.len() {
@@ -1015,6 +1033,11 @@ impl ComposerView {
             .flex_col()
             .w_full()
             .gap(px(density.gap_inline * 0.5));
+        // ✎ (pop-to-edit) is offered only when the draft is empty — editing a
+        // chip replaces the composer contents, so it must not clobber a draft
+        // in progress (matches the ↑-to-edit guard).
+        let draft_empty =
+            self.input.read(cx).value().trim().is_empty() && self.pending_images.is_empty();
         for (idx, m) in self.queued.iter().enumerate() {
             // Prefer the caption; fall back to an image count for an image-only
             // queued message so its chip isn't blank.
@@ -1053,6 +1076,28 @@ impl ComposerView {
                         .text_color(theme.fg_muted)
                         .child(SharedString::from(preview)),
                 )
+                .when(draft_empty, |row| {
+                    row.child(
+                        div()
+                            .id(("chat-queued-edit", idx))
+                            .flex_none()
+                            .size(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme.fg_subtle)
+                            .text_size(px(typo.t_body_sm))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.fg_base))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _e, window, cx| {
+                                    this.edit_queued(idx, window, cx)
+                                }),
+                            )
+                            .child(SharedString::from("✎")),
+                    )
+                })
                 .child(
                     div()
                         .id(("chat-queued-cancel", idx))

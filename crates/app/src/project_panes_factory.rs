@@ -197,6 +197,18 @@ fn restore_chat_slash_commands(snap: &PersistedTabs, session_id: Option<&str>) -
         .unwrap_or_default()
 }
 
+/// The persisted thinking-display level for a restored chat (defaults to `Auto`
+/// when the blob predates the field or the session isn't found).
+fn restore_chat_thinking_level(
+    snap: &PersistedTabs,
+    session_id: Option<&str>,
+) -> crate::shell::agent_chat::ThinkingLevel {
+    session_id
+        .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
+        .map(|t| t.thinking_level)
+        .unwrap_or_default()
+}
+
 // The factory threads the full project-pane construction context (cwd,
 // snapshot, runtime handles, callbacks); a bag struct would only relocate the
 // argument list without simplifying the single call site.
@@ -315,11 +327,13 @@ pub(crate) fn build_project_panes(
                 let session_id = session_id.clone();
                 let entries = restore_chat_entries(&snap, session_id.as_deref());
                 let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
+                let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                 panes_entity.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
                         group.update(cx, |g, cx| {
                             g.open_agent_chat_tab_restored(
-                                chat_cwd, model, session_id, entries, slash_commands, window, cx,
+                                chat_cwd, model, session_id, entries, slash_commands,
+                                thinking_level, window, cx,
                             );
                         });
                     }
@@ -481,9 +495,11 @@ fn restore_multi_group(
                     let session_id = session_id.clone();
                     let entries = restore_chat_entries(&snap, session_id.as_deref());
                     let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
+                    let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                     panes_entity.update(cx, |p, cx| {
                         p.open_agent_chat_in_group_restore(
-                            group_id, chat_cwd, model, session_id, entries, slash_commands, window, cx,
+                            group_id, chat_cwd, model, session_id, entries, slash_commands,
+                            thinking_level, window, cx,
                         );
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
@@ -1914,6 +1930,7 @@ mod tests {
                 }),
             ],
             slash_commands: vec!["compact".into()],
+            thinking_level: Default::default(),
         };
         let snap = PersistedTabs {
             tabs: vec![PersistedTab {

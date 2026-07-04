@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use oximux_agents::thread::ThreadEntry;
 use oximux_storage::SettingsRepo;
 
+use crate::shell::agent_chat::ThinkingLevel;
+
 const KEY_PREFIX: &str = "agent_chat:";
 
 /// Settings key for one chat session's transcript. Format:
@@ -46,6 +48,10 @@ pub struct PersistedChatTranscript {
     /// by the next init).
     #[serde(default)]
     pub slash_commands: Vec<String>,
+    /// The chat-wide thinking display level. `#[serde(default)]` (→ `Auto`)
+    /// keeps blobs written before this field loadable.
+    #[serde(default)]
+    pub thinking_level: ThinkingLevel,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -106,9 +112,20 @@ mod tests {
                 ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
             ],
             slash_commands: vec!["compact".into(), "research".into()],
+            thinking_level: ThinkingLevel::Expanded,
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
+    }
+
+    #[test]
+    fn old_blob_without_thinking_level_defaults_to_auto() {
+        // A blob written before the field must load with thinking_level = Auto.
+        let repo = repo();
+        let json = r#"{"session_id":"old","model":null,"entries":[],"slash_commands":[]}"#;
+        repo.set(&chat_settings_key("old"), json).expect("seed old blob");
+        let loaded = load_chat_transcript(&repo, "old").expect("loads");
+        assert_eq!(loaded.thinking_level, ThinkingLevel::Auto);
     }
 
     #[test]
