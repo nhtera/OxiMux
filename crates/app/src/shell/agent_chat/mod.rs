@@ -13,6 +13,7 @@
 
 mod bubble;
 mod composer;
+mod composer_history;
 mod diff_card;
 mod image_attach;
 mod plan_panel;
@@ -321,10 +322,21 @@ impl AgentChatView {
         // on the first paint — `--resume` stays silent until the first message,
         // so no init would otherwise arrive to populate it.
         let seed_slash = if caps.supports_slash { thread.slash_commands.clone() } else { Vec::new() };
+        // Seed ↑/↓ prompt history from the restored transcript's user prompts
+        // (oldest→newest) so a resumed chat can recall what was already sent.
+        let history_seed: Vec<String> = thread
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::User { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, cx);
             c.set_slash_commands(seed_slash, cx);
+            c.seed_history(history_seed);
         });
 
         // Enrich the palette with on-disk descriptions + grouping (the init list
@@ -688,6 +700,7 @@ impl AgentChatView {
 
     /// Fold one decoded event into the thread and repaint.
     fn on_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
+        let was_active = self.thread.turn_active;
         self.thread.apply(&ev);
         // A user-initiated Stop makes `claude` end the turn with an
         // `error_during_execution` result (terminal_reason: aborted_streaming).
@@ -709,6 +722,23 @@ impl AgentChatView {
         // composer's status line in step.
         self.sync_composer(cx);
         cx.notify();
+        // A turn just completed normally (active→idle edge) — release the next
+        // message the user queued while it streamed, as a fresh turn. Skipped
+        // after an intentional Stop (`interrupted`) or a dead process
+        // (`disconnected`), where there is nothing live to send to; those leave
+        // the queued chips in place, to drain on the next send or be cancelled.
+        if was_active && !self.thread.turn_active && !self.interrupted && !self.disconnected {
+            self.flush_next_queued(cx);
+        }
+    }
+
+    /// Send the oldest message the composer parked while a turn streamed, if any.
+    /// Driven off the natural turn-end edge in [`Self::on_event`]; since each
+    /// completed turn releases exactly one, a lined-up batch drains in order.
+    fn flush_next_queued(&mut self, cx: &mut Context<Self>) {
+        if let Some((text, images)) = self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
+            self.send_text(text, images, cx);
+        }
     }
 
     /// Whether the transcript is scrolled to (within one card of) the bottom.
@@ -1820,6 +1850,66 @@ mod tests {
             .expect("window update");
         cx.run_until_parked();
         assert_eq!(submits.borrow().len(), 1, "empty Enter emitted no Submit");
+    }
+
+    /// A message submitted while a turn streams is QUEUED (not sent), then
+    /// released as a fresh turn when the streaming turn completes — the
+    /// composer-parks + parent-drains-on-turn-end loop, end to end.
+    #[gpui::test]
+    async fn message_submitted_mid_turn_queues_then_sends_on_turn_end(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let count_users = |view: &AgentChatView| {
+            view.thread
+                .entries
+                .iter()
+                .filter(|e| matches!(e, ThreadEntry::User { .. }))
+                .count()
+        };
+
+        window
+            .update(cx, |view, window, cx| {
+                // Start a turn.
+                view.send_text("first".into(), Vec::new(), cx);
+                assert!(view.thread.turn_active, "first send started a turn");
+                assert_eq!(count_users(view), 1);
+
+                // Submitting now parks the message instead of sending it (the
+                // composer sees turn_active via the sync above).
+                view.composer.update(cx, |c, cx| {
+                    c.set_draft_for_test("second", window, cx);
+                    c.submit(window, cx);
+                    assert!(c.draft_for_test(cx).is_empty(), "queued submit cleared the draft");
+                });
+                assert_eq!(count_users(view), 1, "queued, not sent while the turn is active");
+
+                // The turn completes → the queued message is released as a new turn.
+                view.on_event(
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                    cx,
+                );
+                assert_eq!(count_users(view), 2, "queued message sent on turn end");
+                assert!(view.thread.turn_active, "the flushed message started a fresh turn");
+
+                // Queue now empty → a second turn end sends nothing more.
+                view.on_event(
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                    cx,
+                );
+                assert_eq!(count_users(view), 2, "no phantom re-send when the queue is empty");
+            })
+            .expect("window update");
     }
 
     /// Accepting a slash command parks the caret after the inserted `/name `

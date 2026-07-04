@@ -28,6 +28,7 @@ use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use oximux_agents::thread::ChatImage;
 use oximux_settings::{Density, Theme, Typography};
 
+use super::composer_history::PromptHistory;
 use super::image_attach::{PendingImage, pending_from_bytes, pending_from_path};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
 use super::slash_palette::{completed_command, detect_slash_trigger, rank_commands};
@@ -54,6 +55,20 @@ struct MentionState {
     highlight: usize,
 }
 
+/// A message the user submitted while a turn was still streaming: parked here
+/// and sent (in order) as each turn completes, so they can line up follow-ups
+/// without waiting. Keeps the fully-staged [`PendingImage`]s (not just the wire
+/// [`ChatImage`]) so pulling the message back to edit (↑) restores its
+/// attachments without re-decoding; the wire form is extracted only on send.
+struct QueuedMessage {
+    text: String,
+    images: Vec<PendingImage>,
+}
+
+/// Upper bound on parked messages, so a stuck turn can't let the queue grow
+/// without bound. Generous — a user rarely lines up more than a few.
+const MAX_QUEUED: usize = 20;
+
 /// Raised by the composer for the parent [`super::AgentChatView`] to act on.
 /// The parent performs the actual send / interrupt / model+mode switch; on
 /// `Submit` the composer has already cleared its input by the time the event
@@ -73,27 +88,11 @@ pub enum ComposerEvent {
     EffortPicked(String),
 }
 
-/// The composer grows one row per line of the draft up to this many rows, then
-/// holds that height and scrolls internally — so a long message never pushes the
-/// transcript off-screen. Tuned to Claude Desktop's feel: generous but bounded.
+/// The composer's `auto_grow` input grows one row per WRAPPED line of the draft
+/// up to this many rows, then holds that height and scrolls internally — so a
+/// long message never pushes the transcript off-screen. Tuned to Claude
+/// Desktop's feel: generous but bounded.
 const MAX_COMPOSER_ROWS: usize = 10;
-/// Vertical padding baked into the input's own box (`input_py` top + bottom for
-/// the medium size). Added to `rows * line_height` for the pill height.
-const COMPOSER_INPUT_PAD_V: f32 = 16.0;
-/// Fallback line height (1.25rem at the default 16px rem) used only on the very
-/// first frame, before the input has laid out and reported its real value.
-const COMPOSER_LINE_H_FALLBACK: f32 = 20.0;
-
-/// Pixel height for a composer showing `rows` lines at `line_height`, clamped to
-/// `[1, MAX_COMPOSER_ROWS]`: one row for an empty draft (caret centered, no
-/// clip), growing a row per newline, then capped so the field scrolls instead of
-/// growing without bound. The explicit height is required because the input's
-/// text element is absolutely positioned and can't size the pill from its
-/// content (the circular-height trap).
-fn composer_input_height(rows: usize, line_height: f32) -> f32 {
-    let rows = rows.clamp(1, MAX_COMPOSER_ROWS);
-    line_height * rows as f32 + COMPOSER_INPUT_PAD_V
-}
 
 pub struct ComposerView {
     input: Entity<InputState>,
@@ -141,6 +140,13 @@ pub struct ComposerView {
     /// The open `@file` mention overlay, or `None` when the caret isn't inside an
     /// `@query`. Mutually exclusive with `palette`.
     mention: Option<MentionState>,
+    /// Shell-style recall of previously-sent prompts (↑/↓). Seeded from the
+    /// restored transcript and appended on every send; pure state lives in
+    /// [`PromptHistory`].
+    history: PromptHistory,
+    /// Messages the user lined up while a turn was streaming, oldest first. The
+    /// parent drains one per completed turn via [`Self::take_next_queued`].
+    queued: Vec<QueuedMessage>,
     /// Repaints this view (only) on each keystroke so the draft stays visible.
     _sub: Subscription,
 }
@@ -174,6 +180,17 @@ impl ComposerView {
             // brighter ring while typing), like a native chat field.
             match ev {
                 InputEvent::Change => {
+                    // A genuine edit while recalling history detaches back to the
+                    // live draft (so ↑ restarts from the newest entry). Ignore the
+                    // echo of our own programmatic reload: the intermediate empty
+                    // value from clear+insert and the final value that still equals
+                    // the shown entry are both us, not the user.
+                    if this.history.is_navigating() {
+                        let v = this.input.read(cx).value().to_string();
+                        if !v.is_empty() && this.history.current() != Some(v.as_str()) {
+                            this.history.detach();
+                        }
+                    }
                     this.recompute_overlays(cx);
                     cx.notify();
                 }
@@ -207,6 +224,8 @@ impl ComposerView {
             mention_candidates: Vec::new(),
             mention_candidates_loaded: false,
             mention: None,
+            history: PromptHistory::new(),
+            queued: Vec::new(),
             _sub: sub,
         }
     }
@@ -362,6 +381,16 @@ impl ComposerView {
     /// only try the mention overlay when the palette stayed closed, so at most one
     /// overlay is ever open.
     fn recompute_overlays(&mut self, cx: &mut Context<Self>) {
+        // While browsing prompt history, don't pop the slash/mention overlays for
+        // the recalled text — ↑/↓ belong to history until the user edits, which
+        // detaches (and this then runs again with overlays enabled). Otherwise a
+        // recalled `@file`/`/cmd` prompt would open an overlay that hijacks ↑/↓
+        // and traps the user on one history entry.
+        if self.history.is_navigating() {
+            self.palette = None;
+            self.mention = None;
+            return;
+        }
         self.recompute_slash_palette(cx);
         if self.palette.is_some() {
             self.mention = None;
@@ -604,12 +633,13 @@ impl ComposerView {
         cx.emit(ComposerEvent::EffortPicked(effort));
     }
 
-    /// Read + clear the draft, emitting [`ComposerEvent::Submit`] when it's a
-    /// non-empty message and the agent is available. Inert while a turn is
-    /// streaming: the primary affordance is Stop then, and a new message can't
-    /// be sent until the turn ends (or is stopped).
+    /// Read + clear the draft. When the agent is idle this emits
+    /// [`ComposerEvent::Submit`] straight away; while a turn is still streaming it
+    /// **queues** the message instead — parked in [`Self::queued`] and drained by
+    /// the parent (via [`Self::take_next_queued`]) as each turn completes, so the
+    /// user can line up follow-ups without waiting. Inert only when disconnected.
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.disconnected || self.turn_active {
+        if self.disconnected {
             return;
         }
         let text = self.input.read(cx).value().to_string();
@@ -619,10 +649,123 @@ impl ComposerView {
         if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
-        let images: Vec<ChatImage> =
-            self.pending_images.drain(..).map(|p| p.chat).collect();
+        let staged: Vec<PendingImage> = self.pending_images.drain(..).collect();
+        // Leaving the draft behind ends any history recall.
+        self.history.detach();
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
+        if self.turn_active {
+            // A turn is still streaming: park the message (bounded) and repaint
+            // the queued-chip row. It sends when the turn ends.
+            if self.queued.len() < MAX_QUEUED {
+                self.queued.push(QueuedMessage { text, images: staged });
+            }
+            cx.notify();
+            return;
+        }
+        self.history.record(&text);
+        let images: Vec<ChatImage> = staged.into_iter().map(|p| p.chat).collect();
         cx.emit(ComposerEvent::Submit { text, images });
+    }
+
+    /// Seed the ↑/↓ prompt history from a restored transcript's user prompts
+    /// (oldest→newest). Called once at construction so a resumed chat can recall
+    /// what was already sent.
+    pub fn seed_history(&mut self, prompts: Vec<String>) {
+        self.history.seed(prompts);
+    }
+
+    /// Pop the oldest queued message for the parent to send, recording it in the
+    /// prompt history as it goes out (it's now a sent prompt). Returns `None` when
+    /// nothing is queued. Repaints so the drained chip disappears.
+    pub fn take_next_queued(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, Vec<ChatImage>)> {
+        if self.queued.is_empty() {
+            return None;
+        }
+        let QueuedMessage { text, images } = self.queued.remove(0);
+        self.history.record(&text);
+        cx.notify();
+        let images: Vec<ChatImage> = images.into_iter().map(|p| p.chat).collect();
+        Some((text, images))
+    }
+
+    /// Pull the most-recently parked message back into the composer to edit it
+    /// (↑ with an empty draft while messages are queued — the Claude-Desktop
+    /// "arrow up to edit" gesture). Removes it from the queue and restores its
+    /// staged attachments; re-submitting re-queues it (or sends it if the turn
+    /// has since ended). Returns whether it consumed the key. Only fires with an
+    /// empty draft and no staged images, so it never clobbers work in progress.
+    fn edit_last_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.queued.is_empty() {
+            return false;
+        }
+        if !self.input.read(cx).value().trim().is_empty() || !self.pending_images.is_empty() {
+            return false;
+        }
+        let QueuedMessage { text, images } = self.queued.pop().expect("non-empty checked above");
+        self.pending_images = images;
+        self.set_draft_end(text, window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Cancel a parked message (its chip's ✕).
+    fn cancel_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx < self.queued.len() {
+            self.queued.remove(idx);
+            cx.notify();
+        }
+    }
+
+    /// Whether the caret sits on the first visual line of the draft (no newline
+    /// before it) — the entry condition for ↑ recalling history rather than
+    /// moving the caret up a line in a multi-line draft.
+    fn caret_on_first_line(&self, cx: &Context<Self>) -> bool {
+        let s = self.input.read(cx);
+        let cursor = s.cursor();
+        let text = s.value();
+        !text.get(..cursor).is_some_and(|before| before.contains('\n'))
+    }
+
+    /// Load a recalled history entry into the input, parking the caret at the end
+    /// (as if freshly typed). The Change echo is ignored by the subscription's
+    /// navigation guard, so this doesn't detach.
+    fn load_history(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_draft_end(text, window, cx);
+        cx.notify();
+    }
+
+    /// ↑ handler: recall an older prompt. Returns whether the key was consumed.
+    /// Only enters history from the first line (so ↑ still moves the caret up in a
+    /// multi-line draft); once navigating, ↑ keeps walking regardless of caret.
+    /// Falls through (returns `false`) only when there's no history to show.
+    fn history_older(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.history.is_navigating() && !self.caret_on_first_line(cx) {
+            return false;
+        }
+        let live = self.input.read(cx).value().to_string();
+        match self.history.older(&live) {
+            Some(text) => {
+                self.load_history(text, window, cx);
+                true
+            }
+            None => false, // empty history — let the caret move
+        }
+    }
+
+    /// ↓ handler: recall a newer prompt (or restore the live draft past the
+    /// newest). Consumes the key only while navigating; otherwise falls through so
+    /// ↓ moves the caret down a line.
+    fn history_newer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match self.history.newer() {
+            Some(text) => {
+                self.load_history(text, window, cx);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Ask the parent to interrupt the in-flight turn (the Stop button). Leaves
@@ -825,6 +968,106 @@ impl ComposerView {
             row = row.child(div().relative().flex_none().child(thumb).child(remove));
         }
         row
+    }
+
+    /// Parked-message chips shown above the input while a turn streams: one
+    /// compact row per queued message with a truncated preview and a ✕ to cancel
+    /// it, so the user can see (and drop) what will send next. Rendered only when
+    /// something is queued.
+    fn render_queued(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(density.gap_inline * 0.5));
+        for (idx, m) in self.queued.iter().enumerate() {
+            // Prefer the caption; fall back to an image count for an image-only
+            // queued message so its chip isn't blank.
+            let preview = if !m.text.is_empty() {
+                m.text.clone()
+            } else {
+                format!("{} image{}", m.images.len(), if m.images.len() == 1 { "" } else { "s" })
+            };
+            let row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .gap(px(density.gap_inline))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border_input)
+                .bg(theme.bg_panel)
+                .px(px(density.pad_panel))
+                .py(px(density.gap_inline))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_subtle)
+                        .child(SharedString::from("Queued")),
+                )
+                // Preview clips to one line — wrapped in this flex_row so a long
+                // prompt truncates instead of rendering blank (the flex-col trap).
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_muted)
+                        .child(SharedString::from(preview)),
+                )
+                .child(
+                    div()
+                        .id(("chat-queued-cancel", idx))
+                        .flex_none()
+                        .size(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .text_color(theme.fg_subtle)
+                        .text_size(px(typo.t_body_sm))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme.fg_base))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, _w, cx| this.cancel_queued(idx, cx)),
+                        )
+                        .child(SharedString::from("✕")),
+                );
+            col = col.child(row);
+        }
+        col
+    }
+
+    /// A muted "History i/N" strip shown above the pill while walking prompt
+    /// history — echoing a shell's recall indicator so ↑/↓ reads as browsing
+    /// sent prompts, not moving the caret. `None` when not navigating.
+    fn render_history_indicator(&self) -> Option<impl IntoElement> {
+        let (pos, total) = self.history.position()?;
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .px(px(density.pad_panel))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_subtle)
+                        .child(SharedString::from(format!("History {pos}/{total}"))),
+                ),
+        )
     }
 
     /// The command list shown while the palette is open: an inline panel above
@@ -1187,33 +1430,23 @@ impl Render for ComposerView {
         }
         let controls = controls;
 
-        // Auto-grow input height: one row per line of the draft, capped at
-        // MAX_COMPOSER_ROWS (then the field scrolls). The explicit `.h()` is what
-        // breaks the circular-height trap — the input's text element is
-        // absolutely positioned and can't size the pill from its content.
-        let line_h = self
-            .input
-            .read(cx)
-            .line_height()
-            .map(f32::from)
-            .unwrap_or(COMPOSER_LINE_H_FALLBACK);
-        let draft_rows = self.input.read(cx).value().split('\n').count();
-        let single_row = draft_rows <= 1;
-        let input_h = composer_input_height(draft_rows, line_h);
-
         // The pill: a rounded, focus-reactive frame holding the borderless input
         // AND the Send/Stop action at its right edge (like a native chat field).
         // The input takes the remaining width (`flex_1`); the circular action is
-        // vertically centered while the draft is a single row, then pinned to the
-        // BOTTOM-right (`items_end`) once it grows so it stays put as lines are
-        // added upward. `appearance(false)` drops the input's own box so it
+        // pinned to the BOTTOM-right (`items_end`) so it stays put as the field
+        // grows upward. `appearance(false)` drops the input's own box so it
         // doesn't nest a second frame inside. The other controls (attach, mode,
         // model, effort) live on the row below.
+        //
+        // Height: NO explicit `.h()` — the `auto_grow(1, MAX_COMPOSER_ROWS)` input
+        // sizes itself to its content, growing one line per WRAPPED row (not just
+        // per hard newline) and capping at MAX_COMPOSER_ROWS before it scrolls.
+        // An earlier hand-rolled `.h()` counted only `\n`s, so a long soft-wrapped
+        // draft under-measured and spilled its text over the controls below.
         let pill = div()
             .flex()
             .flex_row()
-            .when(single_row, |d| d.items_center())
-            .when(!single_row, |d| d.items_end())
+            .items_end()
             .w_full()
             .rounded(px(14.0))
             .border_1()
@@ -1226,8 +1459,7 @@ impl Render for ComposerView {
                 div().flex_1().min_w_0().child(
                     Input::new(&self.input)
                         .appearance(false)
-                        .text_size(px(typo.t_body_md))
-                        .h(px(input_h)),
+                        .text_size(px(typo.t_body_md)),
                 ),
             )
             .child(action_button);
@@ -1255,13 +1487,24 @@ impl Render for ComposerView {
             // normal handling. The slash palette is tried first (it takes
             // precedence). Enter is captured at the view root (it also drives
             // submit) — see `on_enter_key`.
-            .capture_action(cx.listener(|this, _: &MoveUp, _window, cx| {
-                if this.palette_move(-1, cx) || this.mention_move(-1, cx) {
+            // ↑/↓ first drive an open overlay; with none open, ↑ pulls a parked
+            // message back to edit (empty draft + queued), then recalls prompt
+            // history (shell-style) when the caret allows, else falls through to
+            // the field's normal per-line caret movement.
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                if this.palette_move(-1, cx)
+                    || this.mention_move(-1, cx)
+                    || this.edit_last_queued(window, cx)
+                    || this.history_older(window, cx)
+                {
                     cx.stop_propagation();
                 }
             }))
-            .capture_action(cx.listener(|this, _: &MoveDown, _window, cx| {
-                if this.palette_move(1, cx) || this.mention_move(1, cx) {
+            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                if this.palette_move(1, cx)
+                    || this.mention_move(1, cx)
+                    || this.history_newer(window, cx)
+                {
                     cx.stop_propagation();
                 }
             }))
@@ -1294,6 +1537,8 @@ impl Render for ComposerView {
                     .children(self.render_slash_palette(cx))
                     .children(self.render_mention_overlay(cx))
                     .children(self.render_usage_hint(cx))
+                    .when(!self.queued.is_empty(), |d| d.child(self.render_queued(cx)))
+                    .children(self.render_history_indicator())
                     .child(pill)
                     .child(controls),
             )
@@ -1345,24 +1590,124 @@ impl ComposerView {
     pub(crate) fn usage_hint_for_test(&self, cx: &Context<Self>) -> Option<(String, String)> {
         self.usage_hint(cx)
     }
+
+    /// Drive ↑ history recall (as the MoveUp capture would); returns whether it
+    /// consumed the key.
+    pub(crate) fn history_older_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.history_older(window, cx)
+    }
+
+    /// Drive ↓ history recall (as the MoveDown capture would).
+    pub(crate) fn history_newer_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.history_newer(window, cx)
+    }
+
+    /// How many messages are currently parked (queued while a turn streamed).
+    pub(crate) fn queued_len_for_test(&self) -> usize {
+        self.queued.len()
+    }
+
+    /// Drive ↑ "edit the last queued message"; returns whether it consumed the key.
+    pub(crate) fn edit_last_queued_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.edit_last_queued(window, cx)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
 
-    #[test]
-    fn composer_input_height_grows_per_row_then_caps() {
-        // Empty / one line = one row: must clear line height + vertical padding
-        // so the caret isn't clipped (the old 24px regression clipped it).
-        assert_eq!(composer_input_height(1, 20.0), 36.0);
-        assert_eq!(composer_input_height(0, 20.0), 36.0);
-        // Grows one line height per row.
-        assert_eq!(composer_input_height(4, 20.0), 96.0);
-        // Capped at MAX_COMPOSER_ROWS — beyond it the field scrolls, not grows.
-        assert_eq!(
-            composer_input_height(MAX_COMPOSER_ROWS + 20, 20.0),
-            composer_input_height(MAX_COMPOSER_ROWS, 20.0)
-        );
+    /// Build a bare composer in a test window (no parent needed).
+    fn test_composer(cx: &mut TestAppContext) -> gpui::WindowHandle<ComposerView> {
+        cx.update(gpui_component::init);
+        let w = cx.add_window(|window, cx| {
+            ComposerView::new(Theme::default(), Density::default(), Typography::default(), window, cx)
+        });
+        cx.run_until_parked();
+        w
+    }
+
+    /// ↑ recalls previously-sent prompts newest-first and stops at the oldest;
+    /// ↓ walks back forward and restores the live draft past the newest.
+    #[gpui::test]
+    async fn up_down_arrow_recall_prompt_history(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                c.seed_history(vec!["alpha".into(), "beta".into()]);
+                // Empty draft, caret on the first line → ↑ recalls the newest.
+                assert!(c.history_older_for_test(window, cx));
+                assert_eq!(c.draft_for_test(cx), "beta");
+                assert!(c.history_older_for_test(window, cx));
+                assert_eq!(c.draft_for_test(cx), "alpha");
+                // At the oldest: stays put but still consumes the key.
+                assert!(c.history_older_for_test(window, cx));
+                assert_eq!(c.draft_for_test(cx), "alpha");
+                // ↓ walks forward, then restores the (empty) live draft and stops
+                // consuming once out of history.
+                assert!(c.history_newer_for_test(window, cx));
+                assert_eq!(c.draft_for_test(cx), "beta");
+                assert!(c.history_newer_for_test(window, cx));
+                assert_eq!(c.draft_for_test(cx), "");
+                assert!(!c.history_newer_for_test(window, cx), "not navigating → fall through");
+            })
+            .expect("window update");
+    }
+
+    /// With no history, ↑ is not consumed (so the caret can still move).
+    #[gpui::test]
+    async fn up_arrow_falls_through_with_empty_history(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                assert!(!c.history_older_for_test(window, cx));
+            })
+            .expect("window update");
+    }
+
+    /// Submitting while a turn streams parks the message (the queue branch in
+    /// `submit` returns before it can emit a Submit) and clears the draft; the
+    /// parked message is then handed back on drain, emptying the queue.
+    #[gpui::test]
+    async fn submit_during_turn_queues_instead_of_sending(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                // Simulate a streaming turn.
+                c.set_state(false, true, cx);
+                c.set_draft_for_test("queued one", window, cx);
+                c.submit(window, cx);
+                assert_eq!(c.queued_len_for_test(), 1, "message parked, not sent");
+                assert!(c.draft_for_test(cx).is_empty(), "draft cleared on queue");
+                // Drain hands the parked message back and empties the queue.
+                let next = c.take_next_queued(cx);
+                assert_eq!(next.map(|(t, _)| t), Some("queued one".to_string()));
+                assert_eq!(c.queued_len_for_test(), 0);
+            })
+            .expect("window update");
+    }
+
+    /// ↑ with an empty draft while a message is parked pulls it back into the
+    /// composer to edit (removing it from the queue); with a non-empty draft it
+    /// does not clobber the in-progress text.
+    #[gpui::test]
+    async fn up_arrow_edits_the_last_queued_message(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                c.set_state(false, true, cx); // streaming turn
+                c.set_draft_for_test("park me", window, cx);
+                c.submit(window, cx);
+                assert_eq!(c.queued_len_for_test(), 1);
+                assert!(c.draft_for_test(cx).is_empty());
+                // Empty draft + a queued message → ↑ pulls it back for editing.
+                assert!(c.edit_last_queued_for_test(window, cx));
+                assert_eq!(c.draft_for_test(cx), "park me");
+                assert_eq!(c.queued_len_for_test(), 0, "pulled out of the queue");
+                // With a draft present now, ↑ must not pull (nothing queued anyway).
+                assert!(!c.edit_last_queued_for_test(window, cx));
+            })
+            .expect("window update");
     }
 }
