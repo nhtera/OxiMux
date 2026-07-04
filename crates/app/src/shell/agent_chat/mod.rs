@@ -16,6 +16,7 @@ mod composer;
 mod composer_history;
 mod diff_card;
 mod image_attach;
+mod pending_edit;
 mod plan_panel;
 mod question_card;
 mod rewind_menu;
@@ -31,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, Image, ImageSource, InteractiveElement,
@@ -39,7 +41,7 @@ use gpui::{
     WeakEntity, Window, div, img, percentage, px, relative,
 };
 use gpui_component::Icon;
-use gpui_component::input::Enter as InputEnter;
+use gpui_component::input::{Enter as InputEnter, Escape as InputEscape};
 use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
@@ -214,6 +216,12 @@ pub struct AgentChatView {
     /// True while a rewind's background half (stop → fork → restore) runs; gates
     /// the composer and prevents overlapping rewinds.
     rewinding: bool,
+    /// A message to send once the in-flight rewind lands (edit-and-resend). Set
+    /// before the rewind starts, consumed on success, dropped on failure.
+    rewind_then_send: Option<(String, Vec<ChatImage>)>,
+    /// Active staged edit-and-resend, if any. Nothing is destroyed until send —
+    /// Escape/cancel is a true no-op that restores the prior draft.
+    pending_edit: Option<pending_edit::PendingEdit>,
 }
 
 impl AgentChatView {
@@ -286,7 +294,13 @@ impl AgentChatView {
             &composer,
             |this, _composer, ev: &ComposerEvent, cx| match ev {
                 ComposerEvent::Submit { text, images } => {
-                    this.send_text(text.clone(), images.clone(), cx)
+                    // A staged edit reroutes: rewind to the edited message, then
+                    // send the edited text into the forked session.
+                    if this.pending_edit.is_some() {
+                        this.send_pending_edit(text.clone(), images.clone(), cx)
+                    } else {
+                        this.send_text(text.clone(), images.clone(), cx)
+                    }
                 }
                 ComposerEvent::Stop => this.stop_turn(cx),
                 ComposerEvent::ModelPicked(model) => this.change_model(model.clone(), cx),
@@ -450,6 +464,8 @@ impl AgentChatView {
             pre_turn_checkpoint: None,
             rewind_confirm: None,
             rewinding: false,
+            rewind_then_send: None,
+            pending_edit: None,
         }
     }
 
@@ -719,6 +735,8 @@ impl AgentChatView {
             pre_turn_checkpoint: None,
             rewind_confirm: None,
             rewinding: false,
+            rewind_then_send: None,
+            pending_edit: None,
         }
     }
 
@@ -1133,19 +1151,45 @@ impl AgentChatView {
                 .child(col)
                 .child(
                     div()
-                        .id(SharedString::from(format!("rewind-btn-{idx}")))
+                        .flex()
+                        .flex_row()
+                        .gap(px(10.0))
                         .invisible()
                         .group_hover(group, |s| s.visible())
-                        .text_xs()
-                        .text_color(theme.fg_subtle)
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(theme.fg_base))
-                        .child("↺ Rewind")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _e, _w, cx| {
-                                this.open_rewind_confirm(idx, cx)
-                            }),
+                        // Edit is offered only when the turn is idle (a live turn
+                        // would queue the resend instead of routing it) — Rewind,
+                        // which cancels the turn first, stays available.
+                        .when(!self.thread.turn_active, |row| {
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!("edit-btn-{idx}")))
+                                    .text_xs()
+                                    .text_color(theme.fg_subtle)
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(theme.fg_base))
+                                    .child("✎ Edit")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _e, window, cx| {
+                                            this.enter_pending_edit(idx, window, cx)
+                                        }),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("rewind-btn-{idx}")))
+                                .text_xs()
+                                .text_color(theme.fg_subtle)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.fg_base))
+                                .child("↺ Rewind")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _e, _w, cx| {
+                                        this.open_rewind_confirm(idx, cx)
+                                    }),
+                                ),
                         ),
                 );
         }
@@ -1353,33 +1397,34 @@ impl AgentChatView {
             .gap(px(density.pad_panel * 2.0));
 
         for (idx, entry) in self.thread.entries.iter().enumerate() {
-            match entry {
+            let el: Option<AnyElement> = match entry {
                 ThreadEntry::User { text, images, .. } => {
                     // No "You" caption — the right-aligned bubble is the signal.
-                    content = content.child(self.render_user_entry(idx, text, images, cx));
+                    Some(self.render_user_entry(idx, text, images, cx))
                 }
                 ThreadEntry::Assistant(msg) => {
                     if msg.is_empty() {
-                        continue;
+                        None
+                    } else {
+                        let group = SharedString::from(format!("chat-asst-{idx}"));
+                        let mut block = div()
+                            .group(group.clone())
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .w_full()
+                            .child(assistant_header(group, &msg.text, theme, &typo, cx));
+                        if !msg.thinking.is_empty() {
+                            let expanded = self.expanded_thinking.contains(&idx);
+                            block = block.child(thinking_block(
+                                idx, expanded, &msg.thinking, theme, density, &typo, cx,
+                            ));
+                        }
+                        if !msg.text.is_empty() {
+                            block = block.child(bubble::assistant_body(idx, &msg.text, &typo));
+                        }
+                        Some(block.into_any_element())
                     }
-                    let group = SharedString::from(format!("chat-asst-{idx}"));
-                    let mut block = div()
-                        .group(group.clone())
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .w_full()
-                        .child(assistant_header(group, &msg.text, theme, &typo, cx));
-                    if !msg.thinking.is_empty() {
-                        let expanded = self.expanded_thinking.contains(&idx);
-                        block = block.child(thinking_block(
-                            idx, expanded, &msg.thinking, theme, density, &typo, cx,
-                        ));
-                    }
-                    if !msg.text.is_empty() {
-                        block = block.child(bubble::assistant_body(idx, &msg.text, &typo));
-                    }
-                    content = content.child(block);
                 }
                 ThreadEntry::ToolCall(tc) => {
                     // An AskUserQuestion awaiting answers renders as the dedicated
@@ -1387,22 +1432,27 @@ impl AgentChatView {
                     // before this loop); a TodoWrite as a read-only plan checklist;
                     // every other tool call uses the generic (expandable) card.
                     if matches!(tc.status, ToolCallStatus::AwaitingAnswer(_)) {
-                        if let Some(card) = self.question_cards.get(&tc.id) {
-                            content = content.child(card.clone());
-                        }
+                        self.question_cards.get(&tc.id).map(|c| c.clone().into_any_element())
                     } else if question_card::is_question(tc) {
                         // Answered/skipped question → a compact one-line summary.
-                        content = content
-                            .child(question_card::render_settled(tc, theme, density, &typo));
+                        Some(question_card::render_settled(tc, theme, density, &typo)
+                            .into_any_element())
                     } else if plan_panel::is_plan(tc) {
-                        content =
-                            content.child(plan_panel::render_plan_card(tc, theme, density, &typo));
+                        Some(plan_panel::render_plan_card(tc, theme, density, &typo)
+                            .into_any_element())
                     } else {
                         let expanded = self.expanded_tool_calls.contains(&tc.id);
-                        content = content.child(tool_card::render_tool_card(
-                            tc, expanded, theme, density, &typo, cx,
-                        ));
+                        Some(tool_card::render_tool_card(tc, expanded, theme, density, &typo, cx)
+                            .into_any_element())
                     }
+                }
+            };
+            if let Some(el) = el {
+                // A staged edit dims the messages it will remove on send.
+                if self.is_pending_edit_dimmed(idx) {
+                    content = content.child(div().w_full().opacity(0.4).child(el));
+                } else {
+                    content = content.child(el);
                 }
             }
         }
@@ -1625,12 +1675,23 @@ impl Render for AgentChatView {
                     cx.stop_propagation();
                 }
             }))
+            // Escape cancels a staged edit (bubble phase — the composer's own
+            // capture dismisses any open slash/mention overlay FIRST and only
+            // then does Escape reach here, so overlay-dismiss keeps priority).
+            .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                if this.pending_edit.is_some() {
+                    this.cancel_pending_edit(window, cx);
+                }
+            }))
             // Drop image files anywhere on the chat surface to attach them.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.attach_dropped_paths(paths.paths().to_vec(), cx);
             }))
             .child(transcript)
-            // The rewind-confirm card sits just above the composer while open.
+            // Staged-edit banner + rewind-confirm card sit just above the
+            // composer while active (mutually exclusive — entering edit clears
+            // any open confirm).
+            .children(self.render_pending_edit_banner(window, cx))
             .children(self.render_rewind_confirm(window, cx))
             .child(self.composer.clone())
             // The image lightbox overlays everything when a thumbnail is opened.
@@ -2516,6 +2577,79 @@ mod tests {
                     "no error banner for the rewind's own intentional kill"
                 );
                 assert!(view.interrupted, "stays resumable-idle for finish_rewind");
+            })
+            .expect("window update");
+    }
+
+    /// Staged edit-and-resend must be a TRUE no-op on cancel: entering edit mode
+    /// prefills the composer and dims later messages, but Escape/cancel restores
+    /// the prior draft and touches neither the transcript nor the session.
+    #[gpui::test]
+    async fn pending_edit_cancel_is_a_no_op(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                view.thread.session_id = Some("sid".into());
+                view.thread.push_user_message("first");
+                view.thread.apply(&ThreadEvent::AssistantText("a1".into()));
+                view.thread.push_user_message("second");
+                view.thread.apply(&ThreadEvent::AssistantText("a2".into()));
+                // Edit is only offered on an idle turn (a live turn would queue
+                // the resend instead of routing it).
+                view.thread.apply(&ThreadEvent::TurnEnded {
+                    result: None,
+                    usage: None,
+                    is_error: false,
+                });
+                let entries_before = view.thread.entries.clone();
+
+                // The user was mid-typing an unrelated draft WITH a staged image.
+                let staged = ChatImage {
+                    media_type: "image/png".into(),
+                    // 1x1 transparent PNG.
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".into(),
+                };
+                view.composer.update(cx, |c, cx| {
+                    c.prefill("half-typed thought".into(), vec![staged.clone()], window, cx)
+                });
+
+                // Edit the FIRST user message (entry index 0).
+                view.enter_pending_edit(0, window, cx);
+                assert!(view.pending_edit.is_some(), "edit mode entered");
+                assert_eq!(
+                    view.composer.read(cx).current_draft(cx),
+                    "first",
+                    "composer prefilled with the edited message"
+                );
+                assert!(view.is_pending_edit_dimmed(1), "later messages dim");
+                assert!(!view.is_pending_edit_dimmed(0), "the edited message itself is not dimmed");
+
+                // Cancel: draft AND staged image restored, nothing removed.
+                view.cancel_pending_edit(window, cx);
+                assert!(view.pending_edit.is_none(), "edit mode exited");
+                assert_eq!(
+                    view.composer.read(cx).current_draft(cx),
+                    "half-typed thought",
+                    "the prior draft is restored verbatim"
+                );
+                assert_eq!(
+                    view.composer.read(cx).current_images(),
+                    vec![staged],
+                    "the pre-existing staged image is restored (true no-op)"
+                );
+                assert_eq!(view.thread.entries, entries_before, "transcript untouched");
+                assert_eq!(view.thread.session_id.as_deref(), Some("sid"), "session untouched");
             })
             .expect("window update");
     }

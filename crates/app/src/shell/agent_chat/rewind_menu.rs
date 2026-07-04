@@ -58,7 +58,7 @@ enum RewindOutcome {
 impl AgentChatView {
     /// Ordinal among user entries for `entries[entry_index]`, if it's a user
     /// entry.
-    fn user_ordinal_at(&self, entry_index: usize) -> Option<usize> {
+    pub(super) fn user_ordinal_at(&self, entry_index: usize) -> Option<usize> {
         if !matches!(self.thread.entries.get(entry_index), Some(ThreadEntry::User { .. })) {
             return None;
         }
@@ -133,7 +133,7 @@ impl AgentChatView {
     /// The strictly-sequenced rewind flow (see module docs). Background half on
     /// the tokio runtime; the state swap happens on the foreground ONLY after
     /// the fork (and optional restore) succeeded.
-    fn perform_rewind(
+    pub(super) fn perform_rewind(
         &mut self,
         ordinal: usize,
         entry_index: usize,
@@ -207,11 +207,19 @@ impl AgentChatView {
                             .into(),
                     );
                 }
+                // Edit-and-resend: send the edited message into the forked
+                // session, but only if the respawn actually connected.
+                if let Some((text, images)) = self.rewind_then_send.take()
+                    && !self.disconnected
+                {
+                    self.send_text(text, images, cx);
+                }
             }
             RewindOutcome::Failed(msg) => {
                 // Nothing was swapped. The child was killed by cancel_and_wait,
                 // so mark resumable-idle: the next send respawns the ORIGINAL
-                // session via `--resume`.
+                // session via `--resume`. Drop any queued edit-and-resend text.
+                self.rewind_then_send = None;
                 self.interrupted = true;
                 self.thread.turn_active = false;
                 self.thread.last_error = Some(format!("Rewind failed: {msg}"));

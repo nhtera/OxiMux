@@ -29,7 +29,7 @@ use oximux_agents::thread::ChatImage;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::composer_history::PromptHistory;
-use super::image_attach::{PendingImage, pending_from_bytes, pending_from_path};
+use super::image_attach::{self, PendingImage, pending_from_bytes, pending_from_path};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
 use super::slash_palette::{completed_command, detect_slash_trigger, rank_commands};
 use crate::shell::compose_bar::mention_parser::pending_mention;
@@ -672,6 +672,38 @@ impl ComposerView {
     /// what was already sent.
     pub fn seed_history(&mut self, prompts: Vec<String>) {
         self.history.seed(prompts);
+    }
+
+    /// The current draft text (for edit-and-resend to stash before prefilling).
+    pub fn current_draft(&self, cx: &App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+
+    /// The currently staged (not-yet-sent) attachments, as wire `ChatImage`s —
+    /// stashed alongside the draft so cancelling a staged edit restores them too.
+    pub fn current_images(&self) -> Vec<ChatImage> {
+        self.pending_images.iter().map(|p| p.chat.clone()).collect()
+    }
+
+    /// Replace the draft with `text` and restage `images` (edit-and-resend).
+    /// Re-decodes each stored `ChatImage` into a renderable thumbnail; a corrupt
+    /// image is dropped rather than aborting the prefill. Caret parks at the end.
+    pub fn prefill(
+        &mut self,
+        text: String,
+        images: Vec<ChatImage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.history.detach();
+        self.pending_images = images
+            .into_iter()
+            .filter_map(|chat| {
+                image_attach::decode_render(&chat).map(|render| PendingImage { chat, render })
+            })
+            .collect();
+        self.set_draft_end(text, window, cx);
+        cx.notify();
     }
 
     /// Pop the oldest queued message for the parent to send, recording it in the
