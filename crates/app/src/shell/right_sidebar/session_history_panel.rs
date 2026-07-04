@@ -645,25 +645,35 @@ fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -
     let (open_sid, open_path, open_cwd) = (sid.clone(), path.clone(), cwd.clone());
     let (resume_sid, resume_cwd) = (sid.clone(), cwd);
     let copy_sid = sid;
+    // These actions are handled by element-level `on_action` handlers on
+    // `WorkspaceRoot`, so they must be dispatched through the WINDOW (which
+    // bubbles up the focus tree) — `App::dispatch_action` only reaches GLOBAL
+    // handlers and would silently no-op.
     let mut menu = menu
         .min_w(px(210.0))
         .item(
-            PopupMenuItem::new("Open as chat").on_click(move |_, _window, cx| {
-                cx.dispatch_action(&OpenChatSession {
-                    session_id: open_sid.clone(),
-                    path: open_path.clone(),
-                    cwd: open_cwd.clone(),
-                });
+            PopupMenuItem::new("Open as chat").on_click(move |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(OpenChatSession {
+                        session_id: open_sid.clone(),
+                        path: open_path.clone(),
+                        cwd: open_cwd.clone(),
+                    }),
+                    cx,
+                );
             }),
         )
         .item(
-            PopupMenuItem::new("Resume in terminal").on_click(move |_, _window, cx| {
-                cx.dispatch_action(&ResumeAgentSession {
-                    session_id: resume_sid.clone(),
-                    adapter: AgentAdapter::ClaudeCode,
-                    cwd: resume_cwd.clone(),
-                    fork: false,
-                });
+            PopupMenuItem::new("Resume in terminal").on_click(move |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(ResumeAgentSession {
+                        session_id: resume_sid.clone(),
+                        adapter: AgentAdapter::ClaudeCode,
+                        cwd: resume_cwd.clone(),
+                        fork: false,
+                    }),
+                    cx,
+                );
             }),
         )
         .separator()
@@ -682,8 +692,8 @@ fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -
                 }),
             )
             .item(
-                PopupMenuItem::new("Reveal log in Finder").on_click(move |_, _window, cx| {
-                    cx.dispatch_action(&OpenInFinder { path: reveal_path.clone() });
+                PopupMenuItem::new("Reveal log in Finder").on_click(move |_, window, cx| {
+                    window.dispatch_action(Box::new(OpenInFinder { path: reveal_path.clone() }), cx);
                 }),
             );
     }
