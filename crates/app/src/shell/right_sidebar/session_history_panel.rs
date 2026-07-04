@@ -10,26 +10,36 @@
 //! pane group (import transcript + resume). Reopening as chat is the panel's one
 //! action; terminal-resume stays on the ⌘⇧H modal.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Task, Window, div, hsla, prelude::FluentBuilder, px, svg,
+    Anchor, App, ClipboardItem, Context, FocusHandle, Focusable, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Task, Window, div, hsla, prelude::FluentBuilder, px, svg,
+};
+use gpui_component::{
+    Icon, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
 };
 
 use oximux_agents::session_log::{
     now_unix_ms,
     session_index::{SessionEntry, SessionIndex, SessionScope},
+    session_preview::{PreviewMessage, PreviewRole, load_session_preview},
 };
+use oximux_core::AgentAdapter;
 use oximux_settings::{Theme, Typography};
 
-use crate::actions::OpenChatSession;
+use crate::actions::{OpenChatSession, OpenInFinder, ResumeAgentSession};
 use crate::shell::session_history::picker::{
     filter_sessions, session_row_subtitle, session_row_title,
 };
 
 const CARET_BLINK_MS: u64 = 530;
+/// Opening turns pulled into an expanded card's inline preview.
+const PREVIEW_MAX_MESSAGES: usize = 6;
 
 pub struct SessionHistoryPanel {
     theme: Theme,
@@ -51,7 +61,16 @@ pub struct SessionHistoryPanel {
     selected_idx: usize,
     now_ms: i64,
 
+    /// The one card currently expanded to show its inline turn preview (session
+    /// id), or `None`. Accordion-style — expanding one collapses the previous.
+    expanded: Option<String>,
+    /// Cached previews by session id, so re-expanding is instant.
+    previews: HashMap<String, Vec<PreviewMessage>>,
+    /// Session ids whose preview is being read off-thread (shows a spinner).
+    preview_loading: HashSet<String>,
+
     _load_task: Option<Task<()>>,
+    _preview_task: Option<Task<()>>,
     _caret_task: Task<()>,
 }
 
@@ -77,7 +96,11 @@ impl SessionHistoryPanel {
             entries: Vec::new(),
             selected_idx: 0,
             now_ms: now_unix_ms(),
+            expanded: None,
+            previews: HashMap::new(),
+            preview_loading: HashSet::new(),
             _load_task: None,
+            _preview_task: None,
             _caret_task: Self::start_caret_blink(cx),
         };
         this.rescan(cx);
@@ -155,8 +178,121 @@ impl SessionHistoryPanel {
             return;
         }
         self.show_all = show_all;
+        self.expanded = None;
         self.rescan(cx);
         cx.notify();
+    }
+
+    /// Expand/collapse a card's inline turn preview. Expanding one collapses the
+    /// previous (accordion) and lazily loads the preview off-thread.
+    fn toggle_expand(&mut self, sid: String, path: Option<String>, cx: &mut Context<Self>) {
+        if self.expanded.as_deref() == Some(sid.as_str()) {
+            self.expanded = None;
+        } else {
+            self.expanded = Some(sid.clone());
+            if !self.previews.contains_key(&sid)
+                && !self.preview_loading.contains(&sid)
+                && let Some(path) = path.filter(|p| !p.is_empty())
+            {
+                self.load_preview(sid, path, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Read a session's opening turns off the UI thread and cache them.
+    fn load_preview(&mut self, sid: String, path: String, cx: &mut Context<Self>) {
+        self.preview_loading.insert(sid.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone()) else {
+                return;
+            };
+            let msgs = executor
+                .spawn(async move {
+                    load_session_preview(std::path::Path::new(&path), PREVIEW_MAX_MESSAGES)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.previews.insert(sid.clone(), msgs);
+                this.preview_loading.remove(&sid);
+                cx.notify();
+            });
+        });
+        self._preview_task = Some(task);
+    }
+
+    /// Resolve a session's working directory (its logged cwd, else the panel's
+    /// project root) as a string — used by the row actions.
+    fn entry_cwd(&self, entry: &SessionEntry) -> String {
+        entry
+            .cwd
+            .clone()
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| self.project_root.to_string_lossy().into_owned())
+    }
+
+    /// The expanded card's inline turn preview (or a loading/empty hint) plus an
+    /// "Open as chat" action, indented under the chevron.
+    fn render_preview(
+        &self,
+        sid: &str,
+        path: &str,
+        cwd: &str,
+        theme: Theme,
+        typo: &Typography,
+    ) -> impl IntoElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(8.0))
+            .pl(px(22.0))
+            .pr(px(6.0))
+            .pt(px(2.0))
+            .pb(px(8.0));
+        if self.preview_loading.contains(sid) {
+            col = col.child(
+                div()
+                    .text_size(px(typo.t_label_xs))
+                    .text_color(theme.fg_subtle)
+                    .child("Loading preview…"),
+            );
+        } else if let Some(msgs) = self.previews.get(sid).filter(|m| !m.is_empty()) {
+            for m in msgs {
+                col = col.child(preview_turn(m, theme, typo));
+            }
+        } else {
+            col = col.child(
+                div()
+                    .text_size(px(typo.t_label_xs))
+                    .text_color(theme.fg_subtle)
+                    .child("No preview available."),
+            );
+        }
+        // Primary action for the expanded card.
+        let open = OpenChatSession {
+            session_id: sid.to_string(),
+            path: path.to_string(),
+            cwd: cwd.to_string(),
+        };
+        col.child(
+            div().flex().flex_row().pt(px(2.0)).child(
+                div()
+                    .id(SharedString::from(format!("hist-open-{sid}")))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(typo.t_label_xs))
+                    .text_color(theme.focus_ring)
+                    .bg(Hsla { a: 0.14, ..theme.focus_ring })
+                    .hover(|s| s.bg(Hsla { a: 0.24, ..theme.focus_ring }))
+                    .child("Open as chat")
+                    .on_mouse_down(MouseButton::Left, move |_e, window, cx| {
+                        window.dispatch_action(Box::new(open.clone()), cx);
+                    }),
+            ),
+        )
     }
 
     fn move_selection(&mut self, delta: isize, row_count: usize, cx: &mut Context<Self>) {
@@ -308,41 +444,86 @@ impl Render for SessionHistoryPanel {
                     // attributable; scoped view shares one project so it's omitted.
                     let subtitle =
                         session_row_subtitle(entry, self.now_ms, self.show_all, self.home.as_deref());
-                    list = list.child(
-                        div()
-                            .id(("session-history-row", list_idx))
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .gap(px(1.0))
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .when(selected, |d| d.bg(t.hover_overlay))
-                            .hover(|s| s.bg(t.hover_overlay))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _e, window, cx| {
-                                    this.selected_idx = list_idx;
-                                    this.open(list_idx, window, cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(typo.t_body_sm))
-                                    .text_color(t.fg_base)
-                                    .child(SharedString::from(title)),
-                            )
-                            .when(!subtitle.is_empty(), |d| {
-                                d.child(
+                    let sid = entry.session_id.clone();
+                    let path = entry.path.clone().unwrap_or_default();
+                    let cwd = self.entry_cwd(entry);
+                    let is_expanded = self.expanded.as_deref() == Some(sid.as_str());
+                    let chevron = if is_expanded { "▾" } else { "▸" };
+
+                    // Header row: an expand zone (chevron + title + meta) that
+                    // toggles the inline preview, plus a ⋯ actions menu. The zone
+                    // and the menu are siblings so their clicks never collide.
+                    let expand_sid = sid.clone();
+                    let expand_path = path.clone();
+                    let header = div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .w_full()
+                        .px(px(6.0))
+                        .py(px(5.0))
+                        .rounded(px(6.0))
+                        .when(selected || is_expanded, |d| d.bg(t.hover_overlay))
+                        .hover(|s| s.bg(t.hover_overlay))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .flex_1()
+                                .min_w_0()
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _e, _w, cx| {
+                                        this.selected_idx = list_idx;
+                                        this.toggle_expand(
+                                            expand_sid.clone(),
+                                            Some(expand_path.clone()),
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .child(
                                     div()
+                                        .flex_shrink_0()
+                                        .w(px(10.0))
                                         .text_size(px(typo.t_label_xs))
                                         .text_color(t.fg_subtle)
-                                        .child(SharedString::from(subtitle)),
+                                        .child(chevron),
                                 )
-                            }),
-                    );
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(px(1.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(typo.t_body_sm))
+                                                .text_color(t.fg_base)
+                                                .child(SharedString::from(title)),
+                                        )
+                                        .when(!subtitle.is_empty(), |d| {
+                                            d.child(
+                                                div()
+                                                    .text_size(px(typo.t_label_xs))
+                                                    .text_color(t.fg_subtle)
+                                                    .child(SharedString::from(subtitle)),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(dots_menu(sid.clone(), path.clone(), cwd.clone()));
+
+                    let mut card = div().flex().flex_col().w_full().child(header);
+                    if is_expanded {
+                        card = card.child(self.render_preview(&sid, &path, &cwd, t, &typo));
+                    }
+                    list = list.child(card);
                 }
             }
         }
@@ -417,4 +598,94 @@ fn hint_row(msg: &str, theme: Theme, typo: &Typography) -> impl IntoElement {
         .text_size(px(typo.t_label_xs))
         .text_color(theme.fg_subtle)
         .child(SharedString::from(msg.to_string()))
+}
+
+/// One previewed turn: a small role label over its (capped) text body.
+fn preview_turn(m: &PreviewMessage, theme: Theme, typo: &Typography) -> impl IntoElement {
+    let (label, label_color) = match m.role {
+        PreviewRole::User => ("You", theme.focus_ring),
+        PreviewRole::Assistant => ("Claude", theme.fg_muted),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .w_full()
+        .child(
+            div()
+                .text_size(px(typo.t_label_xs))
+                .text_color(label_color)
+                .child(label),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_base)
+                .child(SharedString::from(m.text.clone())),
+        )
+}
+
+/// The per-row `⋯` actions menu (reopen as chat, resume in terminal, copy ids,
+/// reveal the log). Actions are dispatched or write the clipboard directly, so
+/// the menu needs no entity handle — just the captured session facts.
+fn dots_menu(sid: String, path: String, cwd: String) -> impl IntoElement {
+    Button::new(SharedString::from(format!("hist-dots-{sid}")))
+        .ghost()
+        .xsmall()
+        .icon(Icon::default().path("icons/ellipsis.svg"))
+        .tooltip("Session actions")
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, _cx| {
+            build_session_menu(menu, sid.clone(), path.clone(), cwd.clone())
+        })
+}
+
+fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -> PopupMenu {
+    let has_path = !path.is_empty();
+    let (open_sid, open_path, open_cwd) = (sid.clone(), path.clone(), cwd.clone());
+    let (resume_sid, resume_cwd) = (sid.clone(), cwd);
+    let copy_sid = sid;
+    let mut menu = menu
+        .min_w(px(210.0))
+        .item(
+            PopupMenuItem::new("Open as chat").on_click(move |_, _window, cx| {
+                cx.dispatch_action(&OpenChatSession {
+                    session_id: open_sid.clone(),
+                    path: open_path.clone(),
+                    cwd: open_cwd.clone(),
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Resume in terminal").on_click(move |_, _window, cx| {
+                cx.dispatch_action(&ResumeAgentSession {
+                    session_id: resume_sid.clone(),
+                    adapter: AgentAdapter::ClaudeCode,
+                    cwd: resume_cwd.clone(),
+                    fork: false,
+                });
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Copy session id").on_click(move |_, _window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_sid.clone()));
+            }),
+        );
+    if has_path {
+        let copy_path = path.clone();
+        let reveal_path = path;
+        menu = menu
+            .item(
+                PopupMenuItem::new("Copy log path").on_click(move |_, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                }),
+            )
+            .item(
+                PopupMenuItem::new("Reveal log in Finder").on_click(move |_, _window, cx| {
+                    cx.dispatch_action(&OpenInFinder { path: reveal_path.clone() });
+                }),
+            );
+    }
+    menu
 }
