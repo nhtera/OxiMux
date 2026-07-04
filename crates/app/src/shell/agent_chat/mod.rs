@@ -37,7 +37,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, Image, ImageSource, InteractiveElement,
-    IntoElement, MouseButton, ObjectFit, ParentElement, Render, ScrollHandle, SharedString,
+    IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, ScrollHandle,
+    SharedString,
     StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Task, Transformation,
     WeakEntity, Window, div, img, percentage, px, relative,
 };
@@ -1366,44 +1367,32 @@ impl AgentChatView {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(10.0))
+                        .gap(px(6.0))
                         .invisible()
                         .group_hover(group, |s| s.visible())
                         // Edit is offered only when the turn is idle (a live turn
                         // would queue the resend instead of routing it) — Rewind,
                         // which cancels the turn first, stays available.
                         .when(!self.thread.turn_active, |row| {
-                            row.child(
-                                div()
-                                    .id(SharedString::from(format!("edit-btn-{idx}")))
-                                    .text_xs()
-                                    .text_color(theme.fg_subtle)
-                                    .cursor_pointer()
-                                    .hover(|s| s.text_color(theme.fg_base))
-                                    .child("✎ Edit")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _e, window, cx| {
-                                            this.enter_pending_edit(idx, window, cx);
-                                        }),
-                                    ),
-                            )
+                            row.child(message_action_chip(
+                                SharedString::from(format!("edit-btn-{idx}")),
+                                "✎",
+                                "Edit",
+                                theme,
+                                cx.listener(move |this, _e, window, cx| {
+                                    this.enter_pending_edit(idx, window, cx);
+                                }),
+                            ))
                         })
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("rewind-btn-{idx}")))
-                                .text_xs()
-                                .text_color(theme.fg_subtle)
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.fg_base))
-                                .child("↺ Rewind")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _e, _w, cx| {
-                                        this.open_rewind_confirm(idx, cx)
-                                    }),
-                                ),
-                        ),
+                        .child(message_action_chip(
+                            SharedString::from(format!("rewind-btn-{idx}")),
+                            "↺",
+                            "Rewind",
+                            theme,
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.open_rewind_confirm(idx, cx)
+                            }),
+                        )),
                 );
         }
         col.into_any_element()
@@ -2989,4 +2978,39 @@ mod tests {
             _ => None,
         })
     }
+}
+
+/// A hover-revealed action chip on a user message (Edit / Rewind). Rendered as a
+/// small ghost button — icon + label inside a subtle bordered pill that fills on
+/// hover — so the affordance reads as a control rather than loose link text.
+fn message_action_chip(
+    id: SharedString,
+    icon: &'static str,
+    label: &'static str,
+    theme: Theme,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .px(px(7.0))
+        .py(px(3.0))
+        .rounded(px(6.0))
+        .text_xs()
+        .text_color(theme.fg_muted)
+        .bg(theme.bg_panel_alt)
+        .border_1()
+        .border_color(theme.border_inactive)
+        .cursor_pointer()
+        .hover(|s| {
+            s.bg(theme.hover_overlay)
+                .text_color(theme.fg_base)
+                .border_color(theme.border_active)
+        })
+        .child(div().text_color(theme.fg_subtle).child(icon))
+        .child(label)
+        .on_mouse_down(MouseButton::Left, on_click)
 }

@@ -11,7 +11,7 @@
 //! must never silently lose conversation history.
 
 use gpui::prelude::FluentBuilder;
-use gpui::{div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+use gpui::{div, px, Context, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window};
 use oximux_agents::thread::{ChatImage, ThreadEntry};
 
@@ -136,35 +136,90 @@ impl AgentChatView {
         let t = &self.theme;
         let files_offerable = pe.sha.is_some();
         let include_files = pe.include_files;
-        let title: SharedString = format!(
-            "Editing this message — sending removes {} later message{}",
-            pe.messages_removed.saturating_sub(1),
-            if pe.messages_removed.saturating_sub(1) == 1 { "" } else { "s" }
-        )
-        .into();
+        let removed = pe.messages_removed.saturating_sub(1);
+        let subtitle: SharedString = if removed == 0 {
+            "Send to resend · nothing removed until you send".into()
+        } else {
+            format!(
+                "Send removes {removed} later message{} · nothing removed until you send",
+                if removed == 1 { "" } else { "s" }
+            )
+            .into()
+        };
+        // Faint accent wash for the leading pencil badge — same hue as the
+        // left stripe so the "you are editing" cue reads as one accent, not two.
+        let accent_soft = Hsla { a: 0.14, ..t.focus_ring };
 
         Some(
+            // Full-width row that centers a width-capped card, so the banner reads
+            // as a contained notification above the composer rather than a
+            // full-bleed strip that strands the Cancel button far to the right.
+            div().flex().w_full().justify_center().child(
             div()
                 .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .p(px(10.0))
-                .rounded(px(8.0))
-                .bg(t.bg_panel)
+                .flex_row()
+                .items_center()
+                .w_full()
+                .max_w(px(560.0))
+                .gap(px(10.0))
+                .pl(px(11.0))
+                .pr(px(9.0))
+                .py(px(8.0))
+                .rounded(px(9.0))
+                .bg(t.bg_panel_alt)
                 .border_1()
-                .border_color(t.border_active)
-                .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+                .border_color(t.border_inactive)
+                // Leading pencil badge — a small accent-tinted chip that marks the
+                // transient "edit in progress" mode (gpui borders are single-color,
+                // so the accent lives here rather than as a stripe).
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(24.0))
+                        .rounded(px(6.0))
+                        .bg(accent_soft)
+                        .text_sm()
+                        .text_color(t.fg_base)
+                        .child("✎"),
+                )
+                // Title + one-line disclosure, stacked tight.
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap(px(1.0))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(t.fg_base)
+                                .child("Editing message"),
+                        )
+                        .child(div().text_xs().text_color(t.fg_muted).child(subtitle)),
+                )
+                // Optional "restore files too" toggle — a compact inline pill so
+                // it doesn't force a second banner row.
                 .when(files_offerable, |el| {
                     el.child(
                         div()
                             .id("edit-files-toggle")
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(5.0))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
                             .cursor_pointer()
-                            .text_sm()
+                            .text_xs()
+                            .text_color(if include_files { t.fg_base } else { t.fg_muted })
+                            .when(include_files, |s| s.bg(accent_soft))
+                            .hover(|s| s.bg(t.hover_overlay))
                             .child(if include_files { "☑" } else { "☐" })
-                            .child("Also restore files to this point")
+                            .child("Files")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(pe) = &mut this.pending_edit {
                                     pe.include_files = !pe.include_files;
@@ -173,28 +228,26 @@ impl AgentChatView {
                             })),
                     )
                 })
+                // Cancel — a real ghost button, not loose text.
                 .child(
                     div()
+                        .id("edit-cancel")
+                        .flex_shrink_0()
+                        .px(px(10.0))
+                        .py(px(5.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
                         .text_xs()
                         .text_color(t.fg_muted)
-                        .child("Press Send to resend, or Cancel edit to discard — nothing is removed until you send."),
-                )
-                .child(
-                    div().flex().justify_end().child(
-                        div()
-                            .id("edit-cancel")
-                            .px(px(10.0))
-                            .py(px(4.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .text_sm()
-                            .hover(|s| s.bg(t.bg_panel_alt))
-                            .child("Cancel edit")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel_pending_edit(window, cx)
-                            })),
-                    ),
+                        .border_1()
+                        .border_color(t.border_inactive)
+                        .hover(|s| s.bg(t.hover_overlay).text_color(t.fg_base))
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel_pending_edit(window, cx)
+                        })),
                 ),
+            ),
         )
     }
 }

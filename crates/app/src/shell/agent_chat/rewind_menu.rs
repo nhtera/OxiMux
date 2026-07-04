@@ -257,17 +257,56 @@ impl AgentChatView {
         )
         .into();
 
+        // Soft error wash for the leading rewind badge — signals a destructive,
+        // history-removing action without shouting.
+        let badge_soft = gpui::Hsla { a: 0.15, ..t.status_error };
+
         Some(
+            // Center a width-capped card so the confirm reads as a contained
+            // dialog above the composer, not a full-bleed strip.
+            div().flex().w_full().justify_center().child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(6.0))
-                .p(px(10.0))
-                .rounded(px(8.0))
-                .bg(t.bg_panel)
+                .w_full()
+                .max_w(px(560.0))
+                .gap(px(8.0))
+                .pl(px(11.0))
+                .pr(px(10.0))
+                .py(px(10.0))
+                .rounded(px(9.0))
+                .bg(t.bg_panel_alt)
                 .border_1()
-                .border_color(t.border_active)
-                .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+                .border_color(t.border_inactive)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(9.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .flex_shrink_0()
+                                .size(px(24.0))
+                                .rounded(px(6.0))
+                                .bg(badge_soft)
+                                .text_sm()
+                                .text_color(t.status_error)
+                                .child("↺"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(t.fg_base)
+                                .child(title),
+                        ),
+                )
                 .when(files_offerable, |el| {
                     el.child(
                         div()
@@ -276,7 +315,8 @@ impl AgentChatView {
                             .items_center()
                             .gap(px(6.0))
                             .cursor_pointer()
-                            .text_sm()
+                            .text_xs()
+                            .text_color(if include_files { t.fg_base } else { t.fg_muted })
                             .child(if include_files { "☑" } else { "☐" })
                             .child("Also restore files to the snapshot")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -297,11 +337,14 @@ impl AgentChatView {
                             div()
                                 .id("rewind-cancel")
                                 .px(px(10.0))
-                                .py(px(4.0))
+                                .py(px(5.0))
                                 .rounded(px(6.0))
                                 .cursor_pointer()
-                                .text_sm()
-                                .hover(|s| s.bg(t.bg_panel_alt))
+                                .text_xs()
+                                .text_color(t.fg_muted)
+                                .border_1()
+                                .border_color(t.border_inactive)
+                                .hover(|s| s.bg(t.hover_overlay).text_color(t.fg_base))
                                 .child("Cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.cancel_rewind_confirm(cx)
@@ -311,17 +354,19 @@ impl AgentChatView {
                             div()
                                 .id("rewind-go")
                                 .px(px(10.0))
-                                .py(px(4.0))
+                                .py(px(5.0))
                                 .rounded(px(6.0))
                                 .cursor_pointer()
-                                .text_sm()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
                                 .bg(t.status_error.opacity(0.15))
                                 .text_color(t.status_error)
-                                .hover(|s| s.opacity(0.9))
+                                .hover(|s| s.bg(t.status_error.opacity(0.28)))
                                 .child("Rewind")
                                 .on_click(cx.listener(|this, _, _, cx| this.confirm_rewind(cx))),
                         ),
                 ),
+            ),
         )
     }
 }
