@@ -42,7 +42,7 @@ use gpui::{
     WeakEntity, Window, div, img, percentage, px, relative,
 };
 use gpui_component::Icon;
-use gpui_component::input::{Enter as InputEnter, Escape as InputEscape};
+use gpui_component::input::Enter as InputEnter;
 use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
@@ -1384,7 +1384,7 @@ impl AgentChatView {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _e, window, cx| {
-                                            this.enter_pending_edit(idx, window, cx)
+                                            this.enter_pending_edit(idx, window, cx);
                                         }),
                                     ),
                             )
@@ -1912,6 +1912,17 @@ impl Render for AgentChatView {
             .flex_col()
             .size_full()
             .bg(theme.bg_panel)
+            // Escape is bound app-wide to `DismissOverlay` (not the input's own
+            // Escape action), so a staged-edit cancel must hook THAT. This
+            // `on_action` fires on bubble before the workspace root's handler;
+            // consume it only when we actually had a staged edit to cancel, so
+            // a normal Escape still dismisses other overlays.
+            .on_action(cx.listener(|this, _: &crate::actions::DismissOverlay, window, cx| {
+                if this.pending_edit.is_some() {
+                    this.cancel_pending_edit(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             // The Input context binds BOTH `enter` and `shift+enter` to the same
             // Enter{secondary:false} action, so the action alone can't tell them
             // apart — read the live shift modifier. Capture here (the field would
@@ -1927,14 +1938,6 @@ impl Render for AgentChatView {
                     .update(cx, |c, cx| c.on_enter_key(shift, window, cx));
                 if handled {
                     cx.stop_propagation();
-                }
-            }))
-            // Escape cancels a staged edit (bubble phase — the composer's own
-            // capture dismisses any open slash/mention overlay FIRST and only
-            // then does Escape reach here, so overlay-dismiss keeps priority).
-            .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                if this.pending_edit.is_some() {
-                    this.cancel_pending_edit(window, cx);
                 }
             }))
             // Drop image files anywhere on the chat surface to attach them.

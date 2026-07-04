@@ -177,7 +177,7 @@ impl AgentChatView {
                     div()
                         .text_xs()
                         .text_color(t.fg_muted)
-                        .child("Press Send to resend, or Esc to cancel (nothing is removed until you send)."),
+                        .child("Press Send to resend, or Cancel edit to discard — nothing is removed until you send."),
                 )
                 .child(
                     div().flex().justify_end().child(
