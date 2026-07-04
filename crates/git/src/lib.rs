@@ -9,6 +9,7 @@
 
 pub mod branch;
 pub mod branch_diff;
+pub mod checkpoint;
 pub mod clone;
 pub mod commit;
 pub mod diff;
@@ -31,6 +32,7 @@ pub mod stash;
 pub mod status;
 pub mod worktree;
 
+pub use checkpoint::{CheckpointEngine, CheckpointError, CheckpointSha};
 pub use clone::{clone_repo, repo_name_from_url};
 pub use diff::{DiffParseError, parse_unified_diff};
 pub use error::{GitError, Result};

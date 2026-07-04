@@ -25,6 +25,9 @@ pub struct GitCmd {
     /// If `Some`, bytes piped to the child's stdin (and stdin handle closed
     /// after, so the child sees EOF). If `None`, stdin is `/dev/null`.
     stdin_bytes: Option<Vec<u8>>,
+    /// Extra environment variables for the child (e.g. `GIT_INDEX_FILE` for
+    /// temp-index checkpointing, author identity for synthetic commits).
+    envs: Vec<(OsString, OsString)>,
 }
 
 /// Successful git output (exit code zero). Stderr is dropped on success.
@@ -49,7 +52,20 @@ impl GitCmd {
             args: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             stdin_bytes: None,
+            envs: Vec::new(),
         }
+    }
+
+    /// Set an extra environment variable on the child process.
+    ///
+    /// Caller envs are applied AFTER the crate's baseline envs, so passing
+    /// `LANG`, `GIT_OPTIONAL_LOCKS`, `GIT_CONFIG_NOSYSTEM`, `GIT_PAGER`, or
+    /// `GIT_TERMINAL_PROMPT` here overrides the crate's safety defaults —
+    /// don't, unless you own the consequences.
+    pub fn env(mut self, key: impl AsRef<OsStr>, val: impl AsRef<OsStr>) -> Self {
+        self.envs
+            .push((key.as_ref().to_os_string(), val.as_ref().to_os_string()));
+        self
     }
 
     pub fn arg(mut self, a: impl AsRef<OsStr>) -> Self {
@@ -124,6 +140,7 @@ impl GitCmd {
             // Sandbox: ignore /etc/gitconfig (which can set `core.hooksPath` to
             // an arbitrary script and run it on every status poll).
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .envs(self.envs)
             .stdin(stdin_mode)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
