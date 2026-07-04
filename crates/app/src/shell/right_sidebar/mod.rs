@@ -6,6 +6,7 @@
 pub mod activity_bar;
 pub mod layout;
 pub mod resize;
+pub mod session_history_panel;
 pub mod tab;
 
 use std::path::PathBuf;
@@ -85,6 +86,10 @@ pub struct RightSidebar {
 
     // Search panel (ripgrep-backed).
     pub(crate) search_panel: Entity<SearchPanel>,
+
+    // Session History panel — past Claude sessions, reopen as chat. Always
+    // present (repo-independent); scoped to this workspace's root by default.
+    pub(crate) session_history: Entity<session_history_panel::SessionHistoryPanel>,
 
     // Files tab — workspace file tree. `FileTreeView` holds an
     // `Entity<FileTree>` internally, which keeps the model + watcher alive
@@ -249,6 +254,15 @@ impl RightSidebar {
                 cx,
             )
         });
+        let session_history = cx.new(|cx| {
+            session_history_panel::SessionHistoryPanel::new(
+                root_path.clone(),
+                theme,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
 
         // Files tab: construct the FileTree + FileTreeView only when the host
         // supplied an `on_open` callback. Tests skip the callback (no live
@@ -285,6 +299,7 @@ impl RightSidebar {
             source_control,
             file_explorer,
             search_panel,
+            session_history,
             file_tree_view,
             latest_poll_state: initial,
             _poller: poller,
@@ -399,8 +414,18 @@ impl RightSidebar {
                 cx,
             )
         });
-        let search_panel = cx
-            .new(|cx| SearchPanel::new(repo_root, theme, density, typography.clone(), window, cx));
+        let search_panel = cx.new(|cx| {
+            SearchPanel::new(repo_root.clone(), theme, density, typography.clone(), window, cx)
+        });
+        let session_history = cx.new(|cx| {
+            session_history_panel::SessionHistoryPanel::new(
+                repo_root,
+                theme,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
         let poll_observer = Self::start_poll_observer(bar_rx, cx);
 
         // Simulate repo presence via a live poller when has_repo=true, None otherwise.
@@ -424,6 +449,7 @@ impl RightSidebar {
             source_control,
             file_explorer,
             search_panel,
+            session_history,
             file_tree_view: None,
             latest_poll_state: PollState::Loading,
             _poller: poller,
@@ -496,6 +522,13 @@ impl RightSidebar {
             RightTab::Explorer
         };
         cx.notify();
+    }
+
+    /// Focus the Session History panel's search field (so keyboard nav/filter
+    /// work the instant the tab is opened).
+    pub fn focus_history(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.session_history
+            .update(cx, |p, cx| p.focus(window, cx));
     }
 
     /// Toggle the sidebar open/closed state.
@@ -646,6 +679,22 @@ impl Render for RightSidebar {
                     None => body_div.into_any_element(),
                 }
             }
+            RightTab::History => div()
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .overflow_hidden()
+                        .child(self.session_history.clone()),
+                )
+                .into_any_element(),
         };
 
         // Width is now state, not const — see set_panel_width / the

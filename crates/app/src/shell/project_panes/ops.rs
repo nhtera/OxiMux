@@ -97,6 +97,33 @@ impl ProjectPanes {
         }
     }
 
+    /// Reopen a past session as a chat tab in the active group (from the
+    /// Session History side panel). Dedups an already-open session; otherwise
+    /// imports the transcript from `path` and spawns a resumed chat.
+    pub fn open_session_as_chat_in_active_group(
+        &mut self,
+        session_id: &str,
+        path: Option<&str>,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied());
+        let Some(target_id) = target_id else {
+            return;
+        };
+        self.set_active_group(target_id, window, cx);
+        if let Some(target) = self.groups.get(&target_id).cloned() {
+            target.update(cx, |g, cx| {
+                g.open_session_as_chat(session_id, path, cwd, window, cx);
+            });
+        }
+    }
+
     /// Close the Tasks tab in the active group, if present. Used after a
     /// workspace is created from the Tasks page so the foreground leaves the
     /// issue browser and falls back to the group's prior tab.

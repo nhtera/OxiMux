@@ -804,13 +804,9 @@ impl PaneGroup {
         // Fold an in-chat model switch back into this tab's kind so the choice
         // survives relaunch (the layout persists the kind). Detached: it stops
         // firing and is cleaned up when the chat view is dropped (tab closed).
-        cx.subscribe_in(
-            &view,
-            window,
-            |this, v, ev: &crate::shell::agent_chat::AgentChatEvent, window, cx| {
-                this.on_agent_chat_event(v, ev, window, cx);
-            },
-        )
+        cx.subscribe(&view, |this, v, ev: &crate::shell::agent_chat::AgentChatEvent, cx| {
+            this.on_agent_chat_event(&v, ev, cx);
+        })
         .detach();
         let n = self
             .tabs
@@ -849,7 +845,6 @@ impl PaneGroup {
         &mut self,
         view: &Entity<crate::shell::agent_chat::AgentChatView>,
         ev: &crate::shell::agent_chat::AgentChatEvent,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match ev {
@@ -864,16 +859,13 @@ impl PaneGroup {
                 }
                 cx.notify();
             }
-            crate::shell::agent_chat::AgentChatEvent::OpenSessionAsChat { session_id, path, cwd } => {
-                self.open_session_as_chat(session_id, path.as_deref(), cwd.clone(), window, cx);
-            }
         }
     }
 
-    /// Open a past session (chosen in the in-chat browser) as a chat tab.
+    /// Open a past session (chosen in the Session History side panel) as a chat tab.
     /// Already-open sessions just activate their tab; otherwise the transcript
     /// is imported from the session `.jsonl` and a resumed chat is opened.
-    fn open_session_as_chat(
+    pub(crate) fn open_session_as_chat(
         &mut self,
         session_id: &str,
         path: Option<&str>,

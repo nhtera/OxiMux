@@ -7,6 +7,8 @@ pub enum RightTab {
     Explorer,
     Search,
     SourceControl,
+    /// Past agent sessions for the project — browse + reopen as a chat tab.
+    History,
 }
 
 /// Inputs that determine which tabs are visible.
@@ -31,14 +33,17 @@ pub struct TabVisibility {
 /// Source Control is hidden when there is no repository — avoids showing a
 /// broken panel before Phase 04 adds graceful no-repo handling.
 pub fn visible_tabs(v: TabVisibility) -> Vec<RightTab> {
+    // History is repo-independent — past sessions exist whether or not the
+    // current workspace is a git repo — so it shows in both cases.
     if v.has_repo {
         vec![
             RightTab::Explorer,
             RightTab::Search,
             RightTab::SourceControl,
+            RightTab::History,
         ]
     } else {
-        vec![RightTab::Explorer, RightTab::Search]
+        vec![RightTab::Explorer, RightTab::Search, RightTab::History]
     }
 }
 
@@ -52,6 +57,7 @@ impl RightTab {
             RightTab::Explorer => "icons/file.svg",
             RightTab::Search => "icons/search.svg",
             RightTab::SourceControl => "icons/git-branch.svg",
+            RightTab::History => "icons/history.svg",
         }
     }
 
@@ -62,6 +68,7 @@ impl RightTab {
             RightTab::Explorer => "E",
             RightTab::Search => "S",
             RightTab::SourceControl => "G",
+            RightTab::History => "H",
         }
     }
 
@@ -72,6 +79,7 @@ impl RightTab {
             RightTab::Explorer => "Explorer",
             RightTab::Search => "Search",
             RightTab::SourceControl => "Source Control",
+            RightTab::History => "Session History",
         }
     }
 }

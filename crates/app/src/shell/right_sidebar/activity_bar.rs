@@ -96,8 +96,17 @@ fn render_tab_button(
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
-            move |_: &MouseDownEvent, _window: &mut Window, cx: &mut App| {
+            move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                 sidebar.update(cx, |s, cx| s.select_tab(tab, cx));
+                // History's search field needs keyboard focus for typing/nav.
+                // Focus set *inside* the mouse-down is clobbered by the post-click
+                // focus dispatch, so defer it a tick (same fix as elsewhere).
+                if tab == RightTab::History {
+                    let sidebar = sidebar.clone();
+                    window.defer(cx, move |window, cx| {
+                        sidebar.update(cx, |s, cx| s.focus_history(window, cx));
+                    });
+                }
             },
         )
         .tooltip(move |window: &mut Window, cx| {
@@ -117,6 +126,7 @@ fn shortcut_hint(tab: RightTab) -> String {
         RightTab::Explorer => "select_explorer_tab",
         RightTab::Search => "select_search_tab",
         RightTab::SourceControl => "select_source_control_tab",
+        RightTab::History => "select_history_tab",
     };
     crate::keymap_registry::display_chord_for(id).unwrap_or_default()
 }

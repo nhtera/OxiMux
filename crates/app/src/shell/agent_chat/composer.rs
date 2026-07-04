@@ -86,8 +86,6 @@ pub enum ComposerEvent {
     PermissionModePicked(String),
     /// The user picked a reasoning-effort level in the bottom toolbar.
     EffortPicked(String),
-    /// The user clicked the history button — open the past-sessions browser.
-    BrowseSessions,
 }
 
 /// The composer's `auto_grow` input grows one row per WRAPPED line of the draft
@@ -968,17 +966,6 @@ impl ComposerView {
             .on_click(cx.listener(|this, _ev, _window, cx| this.attach_from_picker(cx)))
     }
 
-    /// History button — opens the past-sessions browser. The parent view owns
-    /// the picker overlay, so this just forwards the intent.
-    fn render_sessions_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("chat-sessions-btn")
-            .icon(Icon::default().path("icons/history.svg"))
-            .ghost()
-            .small()
-            .tooltip("Browse past sessions")
-            .on_click(cx.listener(|_this, _ev, _window, cx| cx.emit(ComposerEvent::BrowseSessions)))
-    }
-
     /// Staged-attachment chips shown above the input pill: a small thumbnail per
     /// pending image, each with a ✕ to remove it. Rendered only when something is
     /// staged. Thumbnails come pre-decoded (see [`PendingImage`]) so this row is
@@ -1510,8 +1497,6 @@ impl Render for ComposerView {
             .gap(px(density.gap_inline));
         // Paperclip/image attach anchors the far left, before the safety mode.
         controls = controls.child(self.render_attach_button(cx));
-        // History button sits next to attach — opens the past-sessions browser.
-        controls = controls.child(self.render_sessions_button(cx));
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }

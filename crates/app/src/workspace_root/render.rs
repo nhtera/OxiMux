@@ -1346,6 +1346,20 @@ impl Render for WorkspaceRoot {
                     }
                 }),
             )
+            .on_action(cx.listener(|this, _: &SelectHistoryTab, window, cx| {
+                if let Some(rs) = &this.right_sidebar {
+                    rs.update(cx, |s, cx| {
+                        s.select_tab(RightTab::History, cx);
+                        if !s.open {
+                            s.toggle(cx);
+                        }
+                        s.focus_history(window, cx);
+                    });
+                }
+            }))
+            .on_action(cx.listener(|this, action: &OpenChatSession, window, cx| {
+                this.open_chat_session(action, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenCommitDialog, window, cx| {
                 // Cmd+K: jump to Source Control tab and focus the commit input.
                 if let Some(rs) = &this.right_sidebar {

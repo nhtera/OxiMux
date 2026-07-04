@@ -321,6 +321,18 @@ pub struct ResumeAgentSession {
     pub fork: bool,
 }
 
+/// Payload action raised by the Session History side panel to reopen a past
+/// Claude session as a chat tab. The workspace routes it to the active pane
+/// group, which imports the transcript from `path` (empty → resume with no
+/// pre-rendered history) and spawns a resumed chat rooted at `cwd`.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenChatSession {
+    pub session_id: String,
+    pub path: String,
+    pub cwd: String,
+}
+
 actions!(
     oximux,
     [
@@ -457,6 +469,8 @@ actions!(
         SelectSearchTab,
         /// Switch to the Source Control tab in the right sidebar (Cmd+Shift+G).
         SelectSourceControlTab,
+        /// Switch to the Session History tab in the right sidebar (Cmd+Shift+Y).
+        SelectHistoryTab,
         /// Open the file/worktree Quick Open palette (Cmd+P). Phase 05 shell;
         /// backend file index lands in a later plan.
         OpenQuickOpen,

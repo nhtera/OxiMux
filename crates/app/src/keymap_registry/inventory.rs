@@ -17,7 +17,8 @@ use crate::actions::{
     NewAgentChat, NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
     OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
-    ReloadCustomCommands, Search, SelectExplorerTab, SelectSearchTab, SelectSourceControlTab,
+    ReloadCustomCommands, Search, SelectExplorerTab, SelectHistoryTab, SelectSearchTab,
+    SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
     SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleFloatingTerminal, ToggleLeftSidebar,
     ToggleRightSidebar, ToggleZoomSubPane,
@@ -209,6 +210,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ),
     entry!("select_explorer_tab", "Explorer tab", Navigation, "cmd-shift-e", SelectExplorerTab),
     entry!("select_search_tab", "Search tab", Navigation, "cmd-shift-f", SelectSearchTab),
+    entry!("select_history_tab", "Session History tab", Navigation, "cmd-shift-y", SelectHistoryTab),
     // Browser-style steps through this window's workspace-activation history.
     entry!(
         "nav_workspace_back",

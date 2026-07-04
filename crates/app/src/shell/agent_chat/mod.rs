@@ -20,7 +20,6 @@ mod pending_edit;
 mod plan_panel;
 mod question_card;
 mod rewind_menu;
-mod session_picker;
 mod slash_command_catalog;
 mod slash_palette;
 mod tool_bodies;
@@ -106,17 +105,6 @@ pub enum AgentChatEvent {
     /// The user picked a different model; the host persists it in the tab kind
     /// so the choice survives relaunch (the view already respawned on it).
     ModelChanged(String),
-    /// The user chose a past session in the in-chat browser — open it as a new
-    /// chat tab. The pane group handles this: activate the tab if the session is
-    /// already open, else import the transcript (preferring an OxiMux-native
-    /// persisted blob over the raw `.jsonl`) and open a resumed chat.
-    OpenSessionAsChat {
-        session_id: String,
-        /// Session log path for JSONL import (external sessions).
-        path: Option<String>,
-        /// Directory to root the resumed subprocess in.
-        cwd: std::path::PathBuf,
-    },
 }
 
 /// How assistant thinking blocks are shown across the whole chat.
@@ -280,11 +268,6 @@ pub struct AgentChatView {
     /// Active staged edit-and-resend, if any. Nothing is destroyed until send —
     /// Escape/cancel is a true no-op that restores the prior draft.
     pending_edit: Option<pending_edit::PendingEdit>,
-    /// Open "Sessions" browser overlay (an inline child entity), toggled from
-    /// the composer's history button. `None` when closed.
-    session_picker: Option<Entity<session_picker::SessionPickerView>>,
-    /// Subscription to the open session picker's events; dropped with it.
-    session_picker_sub: Option<Subscription>,
 }
 
 impl AgentChatView {
@@ -356,10 +339,9 @@ impl AgentChatView {
         // react when it reports a finished submission — so typing never touches
         // this view (and thus never rebuilds the transcript, which is the lag we
         // want to avoid).
-        let subscriptions = vec![cx.subscribe_in(
+        let subscriptions = vec![cx.subscribe(
             &composer,
-            window,
-            |this, _composer, ev: &ComposerEvent, window, cx| match ev {
+            |this, _composer, ev: &ComposerEvent, cx| match ev {
                 ComposerEvent::Submit { text, images } => {
                     // A staged edit reroutes: rewind to the edited message, then
                     // send the edited text into the forked session.
@@ -375,7 +357,6 @@ impl AgentChatView {
                     this.change_permission_mode(mode.clone(), cx)
                 }
                 ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
-                ComposerEvent::BrowseSessions => this.toggle_session_picker(window, cx),
             },
         )];
 
@@ -537,8 +518,6 @@ impl AgentChatView {
             rewinding: false,
             rewind_then_send: None,
             pending_edit: None,
-            session_picker: None,
-            session_picker_sub: None,
         }
     }
 
@@ -565,56 +544,6 @@ impl AgentChatView {
     /// can find the matching transcript blob and `--resume`.
     pub fn session_id(&self) -> Option<&str> {
         self.thread.session_id.as_deref()
-    }
-
-    /// Toggle the in-chat "Sessions" browser. Opening spawns a child picker
-    /// entity scoped to this chat's project directory; choosing a session
-    /// bubbles `AgentChatEvent::OpenSessionAsChat` up to the pane group.
-    fn toggle_session_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session_picker.is_some() {
-            self.close_session_picker(window, cx);
-            return;
-        }
-        // Scope discovery to this chat's project root. `cwd` is the launch dir;
-        // worktree paths aren't tracked here, so a single-element scope is used
-        // (the index still matches the project's slug dir).
-        let scope_paths = vec![self.cwd.to_string_lossy().into_owned()];
-        let fallback_cwd = self.cwd.clone();
-        let (theme, typo) = (self.theme, self.typography.clone());
-        let picker = cx.new(|cx| {
-            session_picker::SessionPickerView::new(
-                scope_paths, fallback_cwd, theme, typo, window, cx,
-            )
-        });
-        let sub = cx.subscribe_in(
-            &picker,
-            window,
-            |this, _picker, ev: &session_picker::SessionPickerEvent, window, cx| match ev {
-                session_picker::SessionPickerEvent::Chosen { session_id, path, cwd } => {
-                    this.close_session_picker(window, cx);
-                    cx.emit(AgentChatEvent::OpenSessionAsChat {
-                        session_id: session_id.clone(),
-                        path: path.clone(),
-                        cwd: cwd.clone(),
-                    });
-                }
-                session_picker::SessionPickerEvent::Closed => {
-                    this.close_session_picker(window, cx);
-                }
-            },
-        );
-        self.session_picker = Some(picker);
-        self.session_picker_sub = Some(sub);
-        cx.notify();
-    }
-
-    /// Close the session browser and return focus to the chat.
-    fn close_session_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session_picker.take().is_some() {
-            self.session_picker_sub = None;
-            window.focus(&self.focus_handle, cx);
-            cx.notify();
-        }
     }
 
     /// FocusHandle of the inner composer — the pane focuses this on activate so
@@ -864,8 +793,6 @@ impl AgentChatView {
             rewinding: false,
             rewind_then_send: None,
             pending_edit: None,
-            session_picker: None,
-            session_picker_sub: None,
         }
     }
 
@@ -2026,11 +1953,6 @@ impl Render for AgentChatView {
             // any open confirm).
             .children(self.render_pending_edit_banner(window, cx))
             .children(self.render_rewind_confirm(window, cx))
-            // The in-chat session browser, when open, sits above the composer as
-            // a centered, width-capped card (matching the banners).
-            .children(self.session_picker.clone().map(|picker| {
-                div().flex().w_full().justify_center().child(picker)
-            }))
             .child(self.composer.clone())
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))

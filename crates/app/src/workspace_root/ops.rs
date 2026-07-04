@@ -192,6 +192,31 @@ impl WorkspaceRoot {
         self.project_panes_by_project.get(id).cloned()
     }
 
+    /// Reopen a past session as a chat tab in the active project's active pane
+    /// group. Raised by the Session History side panel (`OpenChatSession`).
+    pub(crate) fn open_chat_session(
+        &mut self,
+        action: &crate::actions::OpenChatSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        let path = (!action.path.is_empty()).then(|| action.path.clone());
+        let cwd = std::path::PathBuf::from(&action.cwd);
+        let session_id = action.session_id.clone();
+        panes.update(cx, |p, cx| {
+            p.open_session_as_chat_in_active_group(
+                &session_id,
+                path.as_deref(),
+                cwd,
+                window,
+                cx,
+            );
+        });
+    }
+
     /// Resolve the right-clicked terminal grid's view plus its
     /// `(group_id, tab_idx)` from the session id carried in
     /// `OpenTerminalContextMenuAt`. Walks the active project's groups → tabs →
