@@ -23,6 +23,11 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/git-branch.svg",
         include_bytes!("../assets/icons/git-branch.svg"),
     ),
+    // Clock/history glyph for the chat composer's "Sessions" browser button.
+    (
+        "icons/history.svg",
+        include_bytes!("../assets/icons/history.svg"),
+    ),
     // Terminal glyph for the new-tab picker's "New Terminal" quick action.
     (
         "icons/square-terminal.svg",

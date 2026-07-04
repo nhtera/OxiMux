@@ -804,9 +804,13 @@ impl PaneGroup {
         // Fold an in-chat model switch back into this tab's kind so the choice
         // survives relaunch (the layout persists the kind). Detached: it stops
         // firing and is cleaned up when the chat view is dropped (tab closed).
-        cx.subscribe(&view, |this, v, ev: &crate::shell::agent_chat::AgentChatEvent, cx| {
-            this.on_agent_chat_event(&v, ev, cx);
-        })
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, v, ev: &crate::shell::agent_chat::AgentChatEvent, window, cx| {
+                this.on_agent_chat_event(v, ev, window, cx);
+            },
+        )
         .detach();
         let n = self
             .tabs
@@ -845,6 +849,7 @@ impl PaneGroup {
         &mut self,
         view: &Entity<crate::shell::agent_chat::AgentChatView>,
         ev: &crate::shell::agent_chat::AgentChatEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match ev {
@@ -859,7 +864,50 @@ impl PaneGroup {
                 }
                 cx.notify();
             }
+            crate::shell::agent_chat::AgentChatEvent::OpenSessionAsChat { session_id, path, cwd } => {
+                self.open_session_as_chat(session_id, path.as_deref(), cwd.clone(), window, cx);
+            }
         }
+    }
+
+    /// Open a past session (chosen in the in-chat browser) as a chat tab.
+    /// Already-open sessions just activate their tab; otherwise the transcript
+    /// is imported from the session `.jsonl` and a resumed chat is opened.
+    fn open_session_as_chat(
+        &mut self,
+        session_id: &str,
+        path: Option<&str>,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Dedup: if this session is already open in a chat tab, activate it
+        // rather than spawning a second `--resume` on the same session file.
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.content, PaneContent::AgentChat(v) if v.read(cx).session_id() == Some(session_id))
+        }) {
+            self.active = idx;
+            self.bump_mru(idx);
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        // Import the transcript off the session log (bounded + capped inside).
+        let entries = match path {
+            Some(p) => oximux_agents::thread::transcript_from_jsonl(std::path::Path::new(p))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.open_agent_chat_tab_restored(
+            cwd,
+            None,
+            Some(session_id.to_string()),
+            entries,
+            Vec::new(),
+            crate::shell::agent_chat::ThinkingLevel::default(),
+            window,
+            cx,
+        );
     }
 
     /// Open or activate a commit-detail tab. Dedup key is the full

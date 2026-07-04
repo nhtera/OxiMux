@@ -18,6 +18,7 @@ pub mod entry;
 pub mod event;
 pub mod question;
 pub mod session_file_fork;
+pub mod session_import;
 pub mod state;
 pub mod stream_json;
 pub mod tool_call;
@@ -28,6 +29,7 @@ pub use connection::{
     AgentCapabilities, AgentConnection, StubConnection,
 };
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
+pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES};
 pub use event::{ThreadEvent, TurnUsage};
 pub use question::{
     parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,

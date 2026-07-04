@@ -29,6 +29,12 @@ pub enum ThreadEntry {
     Assistant(AssistantMessage),
     /// A tool invocation (with its own streaming status + result).
     ToolCall(ToolCall),
+    /// A context-compaction / truncation divider, rendered as a subtle centered
+    /// rule rather than a bubble. Produced only by session import: the CLI
+    /// summarized earlier history to reclaim context, or the importer capped a
+    /// very long transcript ("older messages not shown"). The live state machine
+    /// never emits this.
+    ContextCompaction { summary: String },
 }
 
 /// A git checkpoint anchored to a user message. `sha` is the dangling commit
