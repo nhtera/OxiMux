@@ -17,6 +17,7 @@ pub mod connection;
 pub mod entry;
 pub mod event;
 pub mod question;
+pub mod session_file_fork;
 pub mod state;
 pub mod stream_json;
 pub mod tool_call;
@@ -26,7 +27,7 @@ pub use connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
     AgentCapabilities, AgentConnection, StubConnection,
 };
-pub use entry::{AssistantMessage, ChatImage, ThreadEntry};
+pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 pub use event::{ThreadEvent, TurnUsage};
 pub use question::{
     parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,

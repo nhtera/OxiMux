@@ -18,6 +18,7 @@ mod diff_card;
 mod image_attach;
 mod plan_panel;
 mod question_card;
+mod rewind_menu;
 mod slash_command_catalog;
 mod slash_palette;
 mod tool_bodies;
@@ -201,6 +202,18 @@ pub struct AgentChatView {
     question_cards: HashMap<String, Entity<QuestionCard>>,
     /// Event subscriptions for the cards above, kept alive alongside each card.
     question_card_subs: HashMap<String, Subscription>,
+    /// Git checkpoint engine for this chat's `cwd`, or `None` when the dir isn't
+    /// a git repo (or git is too old). Shared into background tasks via `Arc`.
+    checkpoint_engine: Option<Arc<oximux_git::checkpoint::CheckpointEngine>>,
+    /// The checkpoint taken when the CURRENT (in-flight) turn was sent, held so
+    /// the turn-end compare can decide whether the rewind "files" affordance
+    /// should light up. Cleared at each new send and after a rewind.
+    pre_turn_checkpoint: Option<(usize, oximux_git::checkpoint::CheckpointSha)>,
+    /// Open rewind-confirm card, rendered above the composer.
+    rewind_confirm: Option<rewind_menu::RewindConfirm>,
+    /// True while a rewind's background half (stop → fork → restore) runs; gates
+    /// the composer and prevents overlapping rewinds.
+    rewinding: bool,
 }
 
 impl AgentChatView {
@@ -357,6 +370,31 @@ impl AgentChatView {
             .detach();
         }
 
+        // Resolve the git checkpoint engine for `cwd` off-thread (it shells out
+        // to `git rev-parse`). Folds into `checkpoint_engine` when ready; a
+        // non-repo cwd or old git leaves it `None` (rewind offers conversation
+        // -only). Runs on the tokio runtime like the mention scan.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let engine_cwd = cwd.clone();
+            let (tx, rx) =
+                tokio::sync::oneshot::channel::<Option<oximux_git::checkpoint::CheckpointEngine>>();
+            handle.spawn(async move {
+                let engine = oximux_git::checkpoint::CheckpointEngine::new(&engine_cwd)
+                    .await
+                    .ok()
+                    .flatten();
+                let _ = tx.send(engine);
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Some(engine)) = rx.await {
+                    let _ = this.update(cx, |this, _cx| {
+                        this.checkpoint_engine = Some(Arc::new(engine));
+                    });
+                }
+            })
+            .detach();
+        }
+
         // Scan the project's files once for `@file` mention autocomplete. `rg`
         // runs on the tokio runtime (not gpui's executor), so hop through the
         // tokio handle like the terminal composer does, then fold the list back in
@@ -408,6 +446,10 @@ impl AgentChatView {
             _subscriptions: subscriptions,
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
+            checkpoint_engine: None,
+            pre_turn_checkpoint: None,
+            rewind_confirm: None,
+            rewinding: false,
         }
     }
 
@@ -445,7 +487,10 @@ impl AgentChatView {
     /// composer so its status line, Send button, and bottom-toolbar pickers all
     /// reflect reality. Cheap no-op when nothing changed (both setters guard).
     fn sync_composer(&self, cx: &mut Context<Self>) {
-        let (disconnected, turn_active) = (self.disconnected, self.thread.turn_active);
+        // A rewind in flight disables the composer just like a disconnect until
+        // it resolves (respawn or error).
+        let (disconnected, turn_active) =
+            (self.disconnected || self.rewinding, self.thread.turn_active);
         // Advertise controls by capability, not by hard-coding the provider.
         let caps = self
             .connection
@@ -501,6 +546,10 @@ impl AgentChatView {
         }
         // Optimistically record the prompt; the reply streams in via `on_event`.
         self.thread.push_user_message_with_images(text.clone(), images.clone());
+        // Snapshot the repo for this turn's rewind anchor (background — never
+        // blocks the send). The user entry we just pushed is the last one.
+        let user_index = self.thread.entries.len() - 1;
+        self.take_checkpoint_for(user_index, cx);
         if let Some(conn) = &self.connection
             && let Err(e) = conn.send_user_message_with_images(&text, &images)
         {
@@ -666,6 +715,10 @@ impl AgentChatView {
             _subscriptions: Vec::new(),
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
+            checkpoint_engine: None,
+            pre_turn_checkpoint: None,
+            rewind_confirm: None,
+            rewinding: false,
         }
     }
 
@@ -728,8 +781,77 @@ impl AgentChatView {
         // (`disconnected`), where there is nothing live to send to; those leave
         // the queued chips in place, to drain on the next send or be cancelled.
         if was_active && !self.thread.turn_active && !self.interrupted && !self.disconnected {
+            // A turn just completed — decide whether it changed repo state, so
+            // the rewind "restore files" affordance only lights up when there's
+            // something to restore. Background compare against the pre-turn sha.
+            self.compare_turn_checkpoint(cx);
             self.flush_next_queued(cx);
         }
+    }
+
+    /// Take a checkpoint anchored to the user entry at `user_index`, off-thread.
+    /// Attaches the sha to that entry when done (a no-op if the thread moved on)
+    /// and records it as the pre-turn snapshot for the turn-end compare.
+    fn take_checkpoint_for(&mut self, user_index: usize, cx: &mut Context<Self>) {
+        let Some(engine) = self.checkpoint_engine.clone() else { return };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+        // Bind the snapshot to the session it was taken for. A rewind mints a
+        // new session id and renumbers entries, so a straggling callback from a
+        // pre-rewind turn must not misattach onto a same-index entry.
+        let session = self.thread.session_id.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.spawn(async move {
+            let _ = tx.send(engine.create().await.ok());
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(sha)) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.thread.session_id != session {
+                        return; // stale — the session was rewound out from under us
+                    }
+                    this.thread.attach_checkpoint(user_index, sha.0.clone());
+                    this.pre_turn_checkpoint =
+                        Some((user_index, oximux_git::checkpoint::CheckpointSha(sha.0)));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// After a turn ends, compare a fresh snapshot against the pre-turn one; if
+    /// they differ, light up the rewind "restore files" affordance on that
+    /// turn's user entry. The fresh snapshot is only used for the compare.
+    fn compare_turn_checkpoint(&mut self, cx: &mut Context<Self>) {
+        let (Some(engine), Some((index, pre_sha))) =
+            (self.checkpoint_engine.clone(), self.pre_turn_checkpoint.take())
+        else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+        let session = self.thread.session_id.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        handle.spawn(async move {
+            let changed = match engine.create().await {
+                Ok(post) => engine.differs(&pre_sha, &post).await.unwrap_or(false),
+                Err(_) => false,
+            };
+            let _ = tx.send(changed);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(changed) = rx.await
+                && changed
+            {
+                let _ = this.update(cx, |this, cx| {
+                    if this.thread.session_id != session {
+                        return; // stale — session rewound before the compare landed
+                    }
+                    this.thread.set_checkpoint_show(index, true);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// Send the oldest message the composer parked while a turn streamed, if any.
@@ -994,6 +1116,39 @@ impl AgentChatView {
         if !text.is_empty() {
             col = col.child(bubble::user_body(text, theme, density, &typo));
         }
+        // A ↺ Rewind affordance appears on hover once this turn has a session to
+        // fork (session id present) and we're not mid-rewind. It's shown for any
+        // prior user message; the confirm card gates the files axis on whether
+        // the checkpoint actually captured a change.
+        let can_rewind = self.thread.session_id.is_some() && !self.rewinding;
+        if can_rewind {
+            let group = SharedString::from(format!("user-entry-{idx}"));
+            col = div()
+                .group(group.clone())
+                .flex()
+                .flex_col()
+                .items_end()
+                .w_full()
+                .gap(px(6.0))
+                .child(col)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("rewind-btn-{idx}")))
+                        .invisible()
+                        .group_hover(group, |s| s.visible())
+                        .text_xs()
+                        .text_color(theme.fg_subtle)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme.fg_base))
+                        .child("↺ Rewind")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.open_rewind_confirm(idx, cx)
+                            }),
+                        ),
+                );
+        }
         col.into_any_element()
     }
 
@@ -1199,7 +1354,7 @@ impl AgentChatView {
 
         for (idx, entry) in self.thread.entries.iter().enumerate() {
             match entry {
-                ThreadEntry::User { text, images } => {
+                ThreadEntry::User { text, images, .. } => {
                     // No "You" caption — the right-aligned bubble is the signal.
                     content = content.child(self.render_user_entry(idx, text, images, cx));
                 }
@@ -1475,6 +1630,8 @@ impl Render for AgentChatView {
                 this.attach_dropped_paths(paths.paths().to_vec(), cx);
             }))
             .child(transcript)
+            // The rewind-confirm card sits just above the composer while open.
+            .children(self.render_rewind_confirm(window, cx))
             .child(self.composer.clone())
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
@@ -2315,6 +2472,50 @@ mod tests {
                 assert!(!view.thread.turn_active);
                 view.stop_turn(cx);
                 assert!(!view.interrupted, "no turn → Stop does nothing");
+            })
+            .expect("window update");
+    }
+
+    /// Rewind race: while a rewind is in flight the connection is taken and the
+    /// old child killed, so the old drain task's `on_disconnect` fires on the
+    /// foreground racing the rewind's completion. Because `perform_rewind` marks
+    /// the kill intentional (`interrupted = true`), that stray `on_disconnect`
+    /// must take its resumable-idle branch — NOT strand the tab as disconnected.
+    #[gpui::test]
+    async fn on_disconnect_during_rewind_does_not_strand_tab(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                // Simulate the state perform_rewind establishes before its
+                // background half runs: connection taken, kill marked intentional.
+                view.thread.session_id = Some("old-sid".into());
+                view.rewinding = true;
+                view.interrupted = true;
+                view.connection = None;
+
+                // The killed child's stdout EOFs mid-rewind.
+                view.on_disconnect(cx);
+
+                assert!(
+                    !view.disconnected,
+                    "EOF during a rewind must not mark the tab disconnected"
+                );
+                assert!(
+                    view.thread.last_error.is_none(),
+                    "no error banner for the rewind's own intentional kill"
+                );
+                assert!(view.interrupted, "stays resumable-idle for finish_rewind");
             })
             .expect("window update");
     }

@@ -18,11 +18,28 @@ pub enum ThreadEntry {
         /// persisted transcripts (which had no images field) loadable.
         #[serde(default)]
         images: Vec<ChatImage>,
+        /// Repo snapshot taken when this prompt was sent (rewind anchor).
+        /// `None` when the chat cwd isn't a git repo, the engine is
+        /// unsupported, or the snapshot hasn't finished yet. `#[serde(default)]`
+        /// keeps older persisted transcripts loadable.
+        #[serde(default)]
+        checkpoint: Option<CheckpointState>,
     },
     /// An assistant message: visible text plus any thinking block.
     Assistant(AssistantMessage),
     /// A tool invocation (with its own streaming status + result).
     ToolCall(ToolCall),
+}
+
+/// A git checkpoint anchored to a user message. `sha` is the dangling commit
+/// created by the checkpoint engine (a plain string here — this crate stays
+/// git-free). `show` is set once the turn is known to have changed repo state,
+/// gating the "restore files" affordance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointState {
+    pub sha: String,
+    #[serde(default)]
+    pub show: bool,
 }
 
 /// An image attached to a user prompt. `data` is standard-base64 of the raw

@@ -84,6 +84,16 @@ pub trait AgentConnection: Send {
         Ok(())
     }
 
+    /// Interrupt AND block until the agent process is confirmed dead (reaped).
+    /// Required before any operation that reads the agent's on-disk session
+    /// file (rewind's truncate-fork): `cancel()` alone is fire-and-forget and
+    /// the process may still be flushing its transcript. BLOCKS the calling
+    /// thread — run it off the UI foreground. Default falls back to `cancel`
+    /// for backends without a process to reap.
+    fn cancel_and_wait(&self) -> Result<()> {
+        self.cancel()
+    }
+
     /// What this backend supports; the UI gates controls on it. Default: none.
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities::default()

@@ -12,7 +12,7 @@
 //! block). A tool call ends the current assistant block, so later text starts
 //! a fresh assistant message.
 
-use super::entry::{AssistantMessage, ChatImage, ThreadEntry};
+use super::entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 use super::event::{ThreadEvent, TurnUsage};
 use super::question::QuestionRequest;
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
@@ -98,7 +98,7 @@ impl ChatThread {
         text: impl Into<String>,
         images: Vec<ChatImage>,
     ) {
-        self.entries.push(ThreadEntry::User { text: text.into(), images });
+        self.entries.push(ThreadEntry::User { text: text.into(), images, checkpoint: None });
         self.end_assistant_window();
         // A new turn begins: the prior turn's usage/summary no longer apply.
         // Clear them so the footer never implies stale numbers belong to this
@@ -279,6 +279,51 @@ impl ChatThread {
         }
     }
 
+    /// Ordinal (0-based, counting only user entries) → entry index.
+    pub fn user_entry_index(&self, ordinal: usize) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, ThreadEntry::User { .. }))
+            .nth(ordinal)
+            .map(|(i, _)| i)
+    }
+
+    /// Attach the just-created snapshot to the LAST user entry, if it is still
+    /// the one at `expected_index` (the thread may have moved on while the
+    /// checkpoint was being created in the background).
+    pub fn attach_checkpoint(&mut self, expected_index: usize, sha: String) {
+        if let Some(ThreadEntry::User { checkpoint, .. }) = self.entries.get_mut(expected_index) {
+            *checkpoint = Some(CheckpointState { sha, show: false });
+        }
+    }
+
+    /// Flip the "restore files" affordance on the user entry at `index` once
+    /// the turn is known to have changed repo state.
+    pub fn set_checkpoint_show(&mut self, index: usize, show: bool) {
+        if let Some(ThreadEntry::User { checkpoint: Some(cp), .. }) = self.entries.get_mut(index) {
+            cp.show = show;
+        }
+    }
+
+    /// Rewind: drop the user entry at `ordinal` (0-based among user entries)
+    /// and everything after it, returning the removed user message's payload
+    /// (for edit-and-resend prefill). Leaves the thread at rest — no turn in
+    /// flight, streaming windows closed, stale footer cleared. Returns `None`
+    /// (and mutates nothing) when the ordinal doesn't resolve.
+    pub fn truncate_to_user(&mut self, ordinal: usize) -> Option<(String, Vec<ChatImage>)> {
+        let idx = self.user_entry_index(ordinal)?;
+        let removed = self.entries.drain(idx..).next();
+        self.end_assistant_window();
+        self.turn_active = false;
+        self.usage = None;
+        self.last_summary = None;
+        match removed {
+            Some(ThreadEntry::User { text, images, .. }) => Some((text, images)),
+            _ => unreachable!("user_entry_index always indexes a User entry"),
+        }
+    }
+
     /// Transition a tool call's status directly (e.g. to `InProgress` when the
     /// user allows, or `Rejected` when they deny) — called by the connection
     /// layer alongside sending the control response.
@@ -362,7 +407,7 @@ mod tests {
         t.apply(&ThreadEvent::TurnEnded { result: Some("Hello!".into()), usage: None, is_error: false });
 
         assert_eq!(t.entries.len(), 2);
-        assert_eq!(t.entries[0], ThreadEntry::User { text: "hi".into(), images: vec![] });
+        assert_eq!(t.entries[0], ThreadEntry::User { text: "hi".into(), images: vec![], checkpoint: None });
         assert_eq!(assistant_text(&t.entries[1]), "Hello!"); // not "Hellolo Hello!"
         assert!(!t.turn_active);
     }
@@ -564,7 +609,7 @@ mod tests {
     #[test]
     fn rehydrated_seeds_entries_and_session_and_rests_flags() {
         let entries = vec![
-            ThreadEntry::User { text: "hi".into(), images: vec![] },
+            ThreadEntry::User { text: "hi".into(), images: vec![], checkpoint: None },
             ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
         ];
         let t = ChatThread::rehydrated(Some("sid-9".into()), Some("opus".into()), entries, vec![]);
@@ -699,6 +744,69 @@ mod tests {
         let json = serde_json::to_string(&src.entries).expect("serialize entries");
         let back: Vec<ThreadEntry> = serde_json::from_str(&json).expect("deserialize entries");
         assert_eq!(back, src.entries);
+    }
+
+    #[test]
+    fn checkpoint_attach_show_and_truncate() {
+        let mut t = ChatThread::new();
+        t.push_user_message("one");
+        t.apply(&ThreadEvent::AssistantText("A1".into()));
+        t.push_user_message("two");
+        t.apply(&ThreadEvent::AssistantText("A2".into()));
+        t.push_user_message("three");
+        t.apply(&ThreadEvent::AssistantText("A3".into()));
+
+        // Attach a checkpoint to user #1 ("two") and flip its show flag.
+        let idx = t.user_entry_index(1).expect("second user entry");
+        t.attach_checkpoint(idx, "sha-2".into());
+        t.set_checkpoint_show(idx, true);
+        match &t.entries[idx] {
+            ThreadEntry::User { checkpoint: Some(cp), .. } => {
+                assert_eq!(cp.sha, "sha-2");
+                assert!(cp.show);
+            }
+            other => panic!("expected checkpointed user entry, got {other:?}"),
+        }
+
+        // Rewind to "two": it and everything after are dropped; payload returned.
+        let (text, images) = t.truncate_to_user(1).expect("truncate succeeds");
+        assert_eq!(text, "two");
+        assert!(images.is_empty());
+        assert_eq!(t.entries.len(), 2, "only 'one' + 'A1' remain");
+        assert!(!t.turn_active);
+        assert!(t.usage.is_none() && t.last_summary.is_none());
+
+        // Out-of-range ordinal mutates nothing.
+        assert!(t.truncate_to_user(5).is_none());
+        assert_eq!(t.entries.len(), 2);
+    }
+
+    #[test]
+    fn attach_checkpoint_skips_non_user_index() {
+        let mut t = ChatThread::new();
+        t.push_user_message("hi");
+        t.apply(&ThreadEvent::AssistantText("yo".into()));
+        // Index 1 is the assistant entry — attach must be a no-op, not a panic.
+        t.attach_checkpoint(1, "sha-x".into());
+        assert!(matches!(&t.entries[1], ThreadEntry::Assistant(_)));
+    }
+
+    #[test]
+    fn checkpointed_entry_survives_serde_and_old_blobs_default() {
+        let mut t = ChatThread::new();
+        t.push_user_message("snap");
+        t.attach_checkpoint(0, "abc123".into());
+        let json = serde_json::to_string(&t.entries).unwrap();
+        let back: Vec<ThreadEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t.entries);
+
+        // A pre-checkpoint blob (no field at all) still loads.
+        let old = r#"[{"User":{"text":"legacy","images":[]}}]"#;
+        let entries: Vec<ThreadEntry> = serde_json::from_str(old).unwrap();
+        match &entries[0] {
+            ThreadEntry::User { checkpoint, .. } => assert!(checkpoint.is_none()),
+            other => panic!("expected User, got {other:?}"),
+        }
     }
 
     #[test]

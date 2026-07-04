@@ -102,7 +102,7 @@ mod tests {
             session_id: "sid-1".into(),
             model: Some("opus".into()),
             entries: vec![
-                ThreadEntry::User { text: "hi".into(), images: vec![] },
+                ThreadEntry::User { text: "hi".into(), images: vec![], checkpoint: None },
                 ThreadEntry::Assistant(AssistantMessage { text: "hello".into(), thinking: String::new() }),
             ],
             slash_commands: vec!["compact".into(), "research".into()],

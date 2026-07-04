@@ -247,6 +247,32 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         Ok(())
     }
 
+    /// SIGINT, then poll `try_wait` until the child is reaped (its transcript
+    /// file is fully flushed once the process is gone). Escalates to a hard
+    /// kill after 5s in case the CLI wedges on the way down. Blocking — the
+    /// rewind flow runs this on a background thread.
+    fn cancel_and_wait(&self) -> Result<()> {
+        // Best-effort SIGINT first; if the process already exited this errors
+        // (ESRCH) and the reap below still succeeds, so don't bail on it.
+        let _ = self.cancel();
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("agent child lock poisoned"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if child.try_wait().context("reap agent process")?.is_some() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     fn shutdown(&self) {
         // Even if the lock is poisoned (a prior panic while holding it), still
         // kill+reap the child so a `claude` process isn't leaked.

@@ -1907,7 +1907,7 @@ mod tests {
             session_id: sid.into(),
             model: Some("opus".into()),
             entries: vec![
-                ThreadEntry::User { text: "hi".into(), images: vec![] },
+                ThreadEntry::User { text: "hi".into(), images: vec![], checkpoint: None },
                 ThreadEntry::Assistant(AssistantMessage {
                     text: "hello".into(),
                     thinking: String::new(),
