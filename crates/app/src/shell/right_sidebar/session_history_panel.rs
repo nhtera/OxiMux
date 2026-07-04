@@ -32,7 +32,7 @@ use oximux_agents::session_log::{
 use oximux_core::AgentAdapter;
 use oximux_settings::{Theme, Typography};
 
-use crate::actions::{OpenChatSession, OpenInFinder, ResumeAgentSession};
+use crate::actions::{OpenChatSession, ResumeAgentSession};
 use crate::shell::session_history::picker::{
     filter_sessions, session_row_subtitle, session_row_title,
 };
@@ -724,8 +724,14 @@ fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -
                 }),
             )
             .item(
-                PopupMenuItem::new("Reveal log in Finder").on_click(move |_, window, cx| {
-                    window.dispatch_action(Box::new(OpenInFinder { path: reveal_path.clone() }), cx);
+                // `open -R` reveals AND selects the file in Finder — plain `open`
+                // (what `OpenInFinder` dispatches) would instead try to OPEN the
+                // .jsonl in a text editor. Run it directly; no action needed.
+                PopupMenuItem::new("Reveal log in Finder").on_click(move |_, _window, _cx| {
+                    let _ = std::process::Command::new("open")
+                        .arg("-R")
+                        .arg(&reveal_path)
+                        .spawn();
                 }),
             );
     }
