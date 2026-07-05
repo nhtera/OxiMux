@@ -11,6 +11,7 @@
 //! Fail-closed: if the subprocess dies (stdout EOF) while a permission is
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
+mod background_tasks_panel;
 mod bubble;
 mod composer;
 mod composer_history;
@@ -274,6 +275,9 @@ pub struct AgentChatView {
     /// Active staged edit-and-resend, if any. Nothing is destroyed until send —
     /// Escape/cancel is a true no-op that restores the prior draft.
     pending_edit: Option<pending_edit::PendingEdit>,
+    /// Whether the Background Tasks drawer (subagents + background bash) is
+    /// expanded. The toggle chip only shows once the turn has spawned a task.
+    show_background_tasks: bool,
     /// Weak handle to the owning pane group, set after construction by the tab
     /// factory. Lets the `@terminal` context provider enumerate sibling terminal
     /// tabs and pull their scrollback. Weak so it never keeps the group alive (the
@@ -535,6 +539,7 @@ impl AgentChatView {
             rewind_then_send: None,
             pending_edit: None,
             pane_group: None,
+            show_background_tasks: false,
         }
     }
 
@@ -931,6 +936,7 @@ impl AgentChatView {
             rewind_then_send: None,
             pending_edit: None,
             pane_group: None,
+            show_background_tasks: false,
         }
     }
 
@@ -1967,6 +1973,71 @@ impl AgentChatView {
             .into_any_element()
     }
 
+    /// The Background Tasks toggle chip + inline drawer, shown once the current
+    /// chat has spawned any subagent / background bash. The chip carries a
+    /// running-count badge and expands a Running/Finished list above the composer.
+    fn render_background_tasks(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.thread.background_tasks.is_empty() {
+            return None;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        let running = self.thread.running_task_count();
+        let total = self.thread.background_tasks.len();
+        let expanded = self.show_background_tasks;
+
+        let label = if running > 0 {
+            format!("Background tasks · {running} running")
+        } else {
+            format!("Background tasks · {total}")
+        };
+        let header = div()
+            .id("bg-tasks-toggle")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline))
+            .w_full()
+            .cursor_pointer()
+            .text_size(px(typo.t_label_xs))
+            .text_color(theme.fg_subtle)
+            .hover(|s| s.text_color(theme.fg_muted))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, _w, cx| {
+                    this.show_background_tasks = !this.show_background_tasks;
+                    cx.notify();
+                }),
+            )
+            .child(SharedString::from(if expanded { "▾" } else { "▸" }))
+            .child(SharedString::from(label));
+
+        let mut container = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .max_w(px(CONTENT_MAX_W))
+            .gap(px(density.gap_inline * 0.5))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border_inactive)
+            .bg(theme.bg_panel_alt)
+            .px(px(density.pad_panel))
+            .py(px(density.gap_inline))
+            .child(header);
+        if expanded {
+            container = container.child(background_tasks_panel::render_drawer(
+                &self.thread.background_tasks,
+                theme,
+                density,
+                typo,
+            ));
+        }
+        // Center on the reading column so it lines up with the composer + messages.
+        Some(div().flex().flex_col().items_center().w_full().child(container))
+    }
+
 }
 
 impl Drop for AgentChatView {
@@ -2086,6 +2157,9 @@ impl Render for AgentChatView {
             // A pinned "awaiting approval — jump" banner when a pending card is
             // scrolled off above the composer.
             .children(self.render_awaiting_banner(cx))
+            // Background-tasks drawer (subagents + background bash) — shown once
+            // the turn has spawned any; sits above the composer like the banners.
+            .children(self.render_background_tasks(cx))
             // Staged-edit banner + rewind-confirm card sit just above the
             // composer while active (mutually exclusive — entering edit clears
             // any open confirm).
