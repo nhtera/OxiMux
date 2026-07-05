@@ -1314,6 +1314,12 @@ impl Render for WorkspaceRoot {
                 this.adapter_picker.update(cx, |p, cx| p.close(cx));
                 this.row_menu.update(cx, |m, cx| m.close(cx));
                 this.project_menu.update(cx, |m, cx| m.close(cx));
+                // The session-history picker is counted in `any_open` above (so
+                // Escape is consumed rather than leaking to the terminal even
+                // when the modal is open-but-unfocused). It must therefore be
+                // closed here too — its own `on_key_down` escape arm never fires
+                // once the binding consumes the key.
+                this.session_history.update(cx, |m, cx| m.close(cx));
                 if this.usage_popover_open {
                     this.usage_popover_open = false;
                     cx.notify();

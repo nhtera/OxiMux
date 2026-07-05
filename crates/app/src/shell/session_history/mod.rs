@@ -27,9 +27,27 @@ use oximux_agents::session_log::{
     session_preview::{PreviewMessage, PreviewRole, load_session_preview},
 };
 
-use crate::actions::ResumeAgentSession;
+use crate::actions::{OpenChatSession, OpenHistoryEntryAsChat, ResumeAgentSession};
 use crate::shell::session_history::picker::LaunchKind;
 use crate::ui::FloatingSurface;
+
+/// Key context carried by the modal's root while it's open, so the
+/// `Cmd+Enter` binding below only participates in dispatch when the modal is
+/// focused (mirrors the terminal's context-scoped shadow bindings).
+const SESSION_HISTORY_KEY_CONTEXT: &str = "SessionHistoryModal";
+
+/// Install the modal-scoped `Cmd+Enter` → [`OpenHistoryEntryAsChat`] binding.
+/// Context-scoped so it never shadows `Cmd+Enter` elsewhere. Called once at
+/// boot alongside the global keymap. It must be a keymap action (not an
+/// `on_key_down` case) because macOS delivers Cmd-modified keys via
+/// `performKeyEquivalent:`, bypassing element key listeners.
+pub fn register_session_history_key_bindings(cx: &mut App) {
+    cx.bind_keys([gpui::KeyBinding::new(
+        "cmd-enter",
+        OpenHistoryEntryAsChat,
+        Some(SESSION_HISTORY_KEY_CONTEXT),
+    )]);
+}
 
 const MODAL_WIDTH: f32 = 940.0;
 const LIST_WIDTH: f32 = 380.0;
@@ -332,6 +350,38 @@ impl SessionHistoryModal {
         self.close(cx);
         window.dispatch_action(Box::new(action), cx);
     }
+
+    /// Reopen the session at filtered-list position `list_idx` as a chat tab
+    /// (Claude only): dispatch [`OpenChatSession`] — which imports the
+    /// transcript and spawns a resumed chat — then close. No-op for Codex rows
+    /// (no importable transcript / chat runner) or when out of range.
+    fn open_as_chat(&mut self, list_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.filtered();
+        let Some(&entry_idx) = order.get(list_idx) else {
+            return;
+        };
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return;
+        };
+        if !entry_opens_as_chat(entry) {
+            return;
+        }
+        let action = OpenChatSession {
+            session_id: entry.session_id.clone(),
+            // Empty when the log omits a transcript path: the handler resumes
+            // with no pre-rendered history.
+            path: entry.path.clone().unwrap_or_default(),
+            cwd: entry.cwd.clone().unwrap_or_default(),
+        };
+        self.close(cx);
+        window.dispatch_action(Box::new(action), cx);
+    }
+}
+
+/// Whether a session can reopen as a chat tab. Only Claude Code transcripts
+/// import into the chat surface; Codex (and other) rows resume in a terminal.
+fn entry_opens_as_chat(entry: &SessionEntry) -> bool {
+    entry.adapter == oximux_core::AgentAdapter::ClaudeCode
 }
 
 impl EventEmitter<SessionHistoryEvent> for SessionHistoryModal {}
@@ -537,10 +587,17 @@ impl Render for SessionHistoryModal {
             .items_center()
             .pt(px(MODAL_TOP_OFFSET_PX))
             .bg(hsla(0.0, 0.0, 0.0, SCRIM_ALPHA))
+            // Carries the modal's key context so the `Cmd+Enter` binding (see
+            // `register_session_history_key_bindings`) resolves only while the
+            // modal is focused.
+            .key_context(SESSION_HISTORY_KEY_CONTEXT)
             .on_mouse_down(MouseButton::Left, move |_e, _window, cx| {
                 dismiss_entity.update(cx, |m, cx| m.close(cx));
             })
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &OpenHistoryEntryAsChat, window, cx| {
+                this.open_as_chat(this.selected_idx, window, cx);
+            }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 match key {
@@ -548,6 +605,11 @@ impl Render for SessionHistoryModal {
                     "up" => this.move_selection(-1, row_count, cx),
                     "down" => this.move_selection(1, row_count, cx),
                     "enter" => {
+                        // Plain ↵ resumes, ⇧↵ forks — both into a terminal.
+                        // ⌘↵ (open as chat) can't be handled here: macOS routes
+                        // Cmd-modified keys through `performKeyEquivalent:`, so
+                        // they never reach `on_key_down`. It's a modal-scoped
+                        // action instead (`OpenHistoryEntryAsChat`).
                         let kind = if event.keystroke.modifiers.shift {
                             LaunchKind::Fork
                         } else {
@@ -753,6 +815,7 @@ fn footer_hints(
         .child(hint("↑↓ navigate"))
         .child(hint("↵ resume"))
         .child(hint("⇧↵ fork"))
+        .child(hint("⌘↵ open as chat"))
         // The scope toggle is meaningless with no active project (always all).
         .when(!no_project, |d| {
             d.child(hint(if show_all {

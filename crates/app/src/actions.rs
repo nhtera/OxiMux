@@ -343,6 +343,12 @@ actions!(
         /// Open the session-history picker — a centered modal listing past
         /// Claude Code / Codex sessions to resume or fork. Bound to Cmd+Shift+H.
         OpenSessionHistory,
+        /// Reopen the highlighted session-history entry as a chat tab (Claude
+        /// only). Dispatched by a modal-scoped `Cmd+Enter` binding — a real
+        /// action rather than the modal's `on_key_down`, since macOS routes
+        /// Cmd-modified keys through `performKeyEquivalent:` and they never
+        /// reach element key listeners.
+        OpenHistoryEntryAsChat,
         /// Split the focused pane horizontally — new pane on the right.
         /// Alias of `SplitRight`. Kept for legacy callers; the Cmd+D
         /// keybinding now drives `SplitSubPaneRight` instead so it
