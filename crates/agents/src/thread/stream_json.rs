@@ -28,13 +28,21 @@ pub fn decode_line(line: &str) -> Vec<ThreadEvent> {
 }
 
 fn decode_value(v: &Value) -> Vec<ThreadEvent> {
+    // A subagent's internal turn streams inline, every event tagged with the
+    // spawning tool's id in `parent_tool_use_id`. Those events belong to the
+    // background-tasks surface, not the main transcript — dropping them here keeps
+    // a subagent's thinking / tool_use / tool_result from masquerading as the main
+    // agent's own. (The `system/task_*` events carry the summarized activity.)
+    if v.get("parent_tool_use_id").and_then(Value::as_str).is_some() {
+        return Vec::new();
+    }
     match v.get("type").and_then(Value::as_str) {
         Some("system") => decode_system(v),
         Some("stream_event") => decode_stream_event(v),
         Some("assistant") => decode_assistant(v),
         Some("user") => decode_user(v),
         Some("control_request") => decode_control_request(v),
-        Some("result") => vec![decode_result(v)],
+        Some("result") => decode_result(v),
         _ => Vec::new(),
     }
 }
@@ -155,18 +163,29 @@ fn decode_control_request(v: &Value) -> Vec<ThreadEvent> {
     }]
 }
 
-fn decode_result(v: &Value) -> ThreadEvent {
+fn decode_result(v: &Value) -> Vec<ThreadEvent> {
+    // When a turn spawns a subagent or a background bash, the CLI wakes the parent
+    // once per completed task to react — and each wake emits its OWN `result`,
+    // marked `origin.kind == "task-notification"`. Those are NOT the user's turn
+    // ending: honoring them would flip `turn_active` mid-flight and overwrite the
+    // real turn's usage footer with a continuation's tiny total. Only the
+    // origin-less `result` (the user's own turn) ends the turn.
+    if v.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str)
+        == Some("task-notification")
+    {
+        return Vec::new();
+    }
     // Real error subtypes are `error_max_turns`, `error_during_execution`, …
     let is_error = v
         .get("subtype")
         .and_then(Value::as_str)
         .is_some_and(|s| s.starts_with("error"))
         || v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-    ThreadEvent::TurnEnded {
+    vec![ThreadEvent::TurnEnded {
         result: v.get("result").and_then(Value::as_str).map(str::to_string),
         usage: decode_usage(v),
         is_error,
-    }
+    }]
 }
 
 /// Decode the token/cost breakdown from a `result` event. Present when the
@@ -411,5 +430,69 @@ mod tests {
             "status_category":"review_ready","status_detail":"appended 'line four' to notes.txt"}).to_string();
         assert_eq!(decode_line(&l), vec![ThreadEvent::TurnSummary {
             detail: "appended 'line four' to notes.txt".into(), category: "review_ready".into() }]);
+    }
+
+    // --- Background-task stream hygiene (subagents + background bash) ---
+
+    /// A subagent's internal events stream inline tagged with the spawning tool's
+    /// id; they must be dropped so they don't fold into the main transcript.
+    #[test]
+    fn parent_tool_use_id_event_is_dropped() {
+        let sub = json!({
+            "type":"assistant","parent_tool_use_id":"toolu_ABC",
+            "message":{"content":[{"type":"tool_use","id":"toolu_x","name":"Read","input":{}}]}
+        }).to_string();
+        assert!(decode_line(&sub).is_empty(), "subagent tool_use must not reach the main stream");
+        // The same shape WITHOUT the tag decodes normally.
+        let main = json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"tool_use","id":"toolu_x","name":"Read","input":{}}]}
+        }).to_string();
+        assert_eq!(decode_line(&main).len(), 1);
+    }
+
+    /// A `result` marked `origin.kind == "task-notification"` is a background-task
+    /// continuation, not the user's turn ending — it must not emit `TurnEnded`.
+    #[test]
+    fn task_notification_result_does_not_end_the_turn() {
+        let cont = json!({
+            "type":"result","subtype":"success","origin":{"kind":"task-notification"},
+            "usage":{"output_tokens":30}
+        }).to_string();
+        assert!(decode_line(&cont).is_empty(), "task-notification result must not end the turn");
+        // An origin-less result still ends the turn.
+        let real = json!({"type":"result","subtype":"success","usage":{"output_tokens":381}}).to_string();
+        assert!(matches!(decode_line(&real).as_slice(), [ThreadEvent::TurnEnded { .. }]));
+    }
+
+    /// End-to-end against the captured spike fixture (one turn spawning a subagent
+    /// + a background bash): the subagent's own tool calls stay out of the main
+    /// stream, and exactly one — the primary — `TurnEnded` is emitted with the
+    /// real turn's usage (not a continuation's tiny total).
+    #[test]
+    fn spike_fixture_keeps_main_stream_clean() {
+        let fixture = include_str!("testdata/stream_json_subagent.jsonl");
+        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
+
+        let tool_names: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Only the parent's two tool calls survive; the subagent's Read/Bash calls
+        // (which are `parent_tool_use_id`-tagged) are dropped.
+        assert_eq!(tool_names, ["Agent", "Bash"], "subagent tool calls leaked: {tool_names:?}");
+
+        let turn_ends: Vec<&TurnUsage> = events
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEvent::TurnEnded { usage: Some(u), .. } => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turn_ends.len(), 1, "exactly one turn-end (not the task-notification continuations)");
+        assert_eq!(turn_ends[0].output_tokens, 381, "usage footer must be the primary turn's, not a continuation's");
     }
 }
