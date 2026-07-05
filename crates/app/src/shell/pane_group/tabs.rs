@@ -800,6 +800,11 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
+        // Hand the chat view a weak handle to this group so its `@terminal`
+        // context provider can enumerate sibling terminal tabs. Weak — the group
+        // already owns the view's `Entity`.
+        let weak_group = cx.entity().downgrade();
+        view.update(cx, |v, _cx| v.set_pane_group(weak_group));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         // Fold an in-chat model switch back into this tab's kind so the choice
         // survives relaunch (the layout persists the kind). Detached: it stops

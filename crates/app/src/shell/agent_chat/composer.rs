@@ -25,10 +25,11 @@ use gpui_component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
 };
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use oximux_agents::thread::ChatImage;
+use oximux_agents::thread::{prepend_context, ChatImage, ContextChip};
 use oximux_settings::{Density, Theme, Typography};
 
 use super::composer_history::PromptHistory;
+use super::context_providers::{ContextRequest, ContextSource};
 use super::image_attach::{self, PendingImage, pending_from_bytes, pending_from_path};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
 use super::slash_palette::{completed_command, detect_slash_trigger, rank_commands};
@@ -45,14 +46,47 @@ struct SlashPaletteState {
     highlight: usize,
 }
 
-/// Open state of the `@file` mention overlay: the byte range of the `@query` it
-/// replaces on accept, the ranked candidate paths, and which is highlighted
-/// (index into `matches`). Mutually exclusive with [`SlashPaletteState`] — a
-/// leading `/` opens the slash palette, which takes precedence.
+/// Open state of the `@` mention overlay: the byte range of the `@query` it
+/// replaces on accept, the ranked candidates, and which is highlighted (index
+/// into `matches`). Mutually exclusive with [`SlashPaletteState`] — a leading `/`
+/// opens the slash palette, which takes precedence.
 struct MentionState {
     range: Range<usize>,
-    matches: Vec<String>,
+    /// Context providers first (a small curated set), then file paths. The
+    /// highlight is a flat index across both.
+    matches: Vec<MentionMatch>,
     highlight: usize,
+}
+
+/// One ranked row in the `@` overlay: either a context provider (index into
+/// [`ComposerView::context_sources`]) or a project file path. Context matches sort
+/// ahead of files so the three providers are always reachable at the top.
+#[derive(Clone, PartialEq)]
+enum MentionMatch {
+    Context(usize),
+    File(String),
+}
+
+/// Rank the context providers against the `@query` (case-insensitive): prefix
+/// matches first, then substring matches, preserving source order within each
+/// tier. An empty query returns all sources, so a bare `@` reveals the providers.
+/// Returns indices into the passed `sources`.
+fn rank_context_sources(sources: &[ContextSource], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return (0..sources.len()).collect();
+    }
+    let mut prefix = Vec::new();
+    let mut substr = Vec::new();
+    for (i, s) in sources.iter().enumerate() {
+        if s.match_key.starts_with(&q) {
+            prefix.push(i);
+        } else if s.match_key.contains(&q) {
+            substr.push(i);
+        }
+    }
+    prefix.extend(substr);
+    prefix
 }
 
 /// A message the user submitted while a turn was still streaming: parked here
@@ -63,6 +97,10 @@ struct MentionState {
 struct QueuedMessage {
     text: String,
     images: Vec<PendingImage>,
+    /// Context chips staged with this message. Held structured (not serialized)
+    /// so pulling the message back to edit (↑) restores the chips, mirroring
+    /// `images`; the `<context>` blocks are rendered onto the wire only at drain.
+    context: Vec<ContextChip>,
 }
 
 /// Upper bound on parked messages, so a stuck turn can't let the queue grow
@@ -86,6 +124,14 @@ pub enum ComposerEvent {
     PermissionModePicked(String),
     /// The user picked a reasoning-effort level in the bottom toolbar.
     EffortPicked(String),
+    /// The `@` overlay just opened. The parent refreshes the composer's context
+    /// sources (esp. the live sibling-terminal list) in response, so the "Context"
+    /// section is current without the composer reaching into the pane group.
+    MentionOpened,
+    /// The user picked a context provider in the `@` overlay. The parent captures
+    /// the content (clipboard / git diff / terminal scrollback) and hands the
+    /// resulting chip back via [`ComposerView::add_context_chip`].
+    CaptureContext(ContextRequest),
 }
 
 /// The composer's `auto_grow` input grows one row per WRAPPED line of the draft
@@ -137,9 +183,18 @@ pub struct ComposerView {
     /// Whether the file scan has completed (distinguishes "scanning…" from "no
     /// matching files" in the overlay).
     mention_candidates_loaded: bool,
-    /// The open `@file` mention overlay, or `None` when the caret isn't inside an
+    /// The open `@` mention overlay, or `None` when the caret isn't inside an
     /// `@query`. Mutually exclusive with `palette`.
     mention: Option<MentionState>,
+    /// Context providers offered in the `@` overlay's "Context" section (`@diff`,
+    /// `@clipboard`, one `@terminal` per sibling tab). Pushed by the parent —
+    /// refreshed each time the overlay opens so the terminal list stays live.
+    context_sources: Vec<ContextSource>,
+    /// Context chips staged for the next send (captured terminal output / diff /
+    /// clipboard), shown as removable chips above the input. Serialized into the
+    /// outgoing message as `<context>` blocks and cleared on submit — mirrors
+    /// `pending_images`.
+    context_chips: Vec<ContextChip>,
     /// Shell-style recall of previously-sent prompts (↑/↓). Seeded from the
     /// restored transcript and appended on every send; pure state lives in
     /// [`PromptHistory`].
@@ -224,6 +279,8 @@ impl ComposerView {
             mention_candidates: Vec::new(),
             mention_candidates_loaded: false,
             mention: None,
+            context_sources: Vec::new(),
+            context_chips: Vec::new(),
             history: PromptHistory::new(),
             queued: Vec::new(),
             _sub: sub,
@@ -287,6 +344,33 @@ impl ComposerView {
     fn remove_image(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx < self.pending_images.len() {
             self.pending_images.remove(idx);
+            cx.notify();
+        }
+    }
+
+    /// Replace the context providers offered in the `@` overlay (pushed by the
+    /// parent when the overlay opens). Refreshes an in-progress mention so the
+    /// "Context" section reflects the new list. Cheap — labels only, no captured
+    /// content.
+    pub fn set_context_sources(&mut self, sources: Vec<ContextSource>, cx: &mut Context<Self>) {
+        self.context_sources = sources;
+        if self.mention.is_some() {
+            self.recompute_mention(cx);
+            cx.notify();
+        }
+    }
+
+    /// Stage a captured context chip (handed back by the parent after it captured
+    /// clipboard / diff / terminal content) and repaint the chip row.
+    pub fn add_context_chip(&mut self, chip: ContextChip, cx: &mut Context<Self>) {
+        self.context_chips.push(chip);
+        cx.notify();
+    }
+
+    /// Remove a staged context chip (its chip's ✕).
+    fn remove_context_chip(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx < self.context_chips.len() {
+            self.context_chips.remove(idx);
             cx.notify();
         }
     }
@@ -399,10 +483,13 @@ impl ComposerView {
         }
     }
 
-    /// Recompute the `@file` overlay from the draft + caret. Opens whenever the
-    /// caret sits inside an `@query` and the composer can send; shows a scanning /
-    /// no-match hint until the candidate list ranks something. Preserves the
-    /// highlighted path across a re-filter when it still matches.
+    /// Recompute the `@` overlay from the draft + caret. Opens whenever the caret
+    /// sits inside an `@query` and the composer can send; ranks the context
+    /// providers first (curated set) then file paths, and shows a scanning /
+    /// no-match hint until something ranks. Preserves the highlighted row across a
+    /// re-filter when it still matches. On a fresh open it raises
+    /// [`ComposerEvent::MentionOpened`] so the parent can refresh the context
+    /// sources (esp. the live terminal list).
     fn recompute_mention(&mut self, cx: &mut Context<Self>) {
         if self.turn_active || self.disconnected {
             self.mention = None;
@@ -416,14 +503,31 @@ impl ComposerView {
             self.mention = None;
             return;
         };
-        let matches = rank_mentions(&self.mention_candidates, &pm.query, MAX_SUGGESTIONS);
-        // Keep the same path highlighted across a re-filter (highlight-by-value),
-        // else fall back to the top match.
+        let was_open = self.mention.is_some();
+        let mut matches: Vec<MentionMatch> = rank_context_sources(&self.context_sources, &pm.query)
+            .into_iter()
+            .map(MentionMatch::Context)
+            .collect();
+        matches.extend(
+            rank_mentions(&self.mention_candidates, &pm.query, MAX_SUGGESTIONS)
+                .into_iter()
+                .map(MentionMatch::File),
+        );
+        // Keep the same row highlighted across a re-filter (highlight-by-value),
+        // else fall back to the top match. A `Context(i)` compares by its index
+        // into `context_sources`; that's stable because the source list has a
+        // fixed base order (diff, clipboard, then terminals in tab order), so a
+        // refresh keeps each provider at the same index. A terminal closing while
+        // the menu is open could at most drift the highlight one row — never
+        // change what an accept captures (accept always reads the live list).
         let prev = self.mention.as_ref().and_then(|m| m.matches.get(m.highlight).cloned());
         let highlight = prev
             .and_then(|p| matches.iter().position(|m| *m == p))
             .unwrap_or(0);
         self.mention = Some(MentionState { range: pm.range, matches, highlight });
+        if !was_open {
+            cx.emit(ComposerEvent::MentionOpened);
+        }
     }
 
     /// Move the mention highlight (`-1` up / `+1` down), wrapping. Returns whether
@@ -450,19 +554,39 @@ impl ComposerView {
         }
     }
 
-    /// Accept a ranked path: replace the `@query` with `@path ` (trailing space),
-    /// ready to keep typing. The path rides to the agent as ordinary text.
-    fn mention_accept_path(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Accept the row at flat index `idx`. A file path replaces the `@query` with
+    /// `@path ` (trailing space) and rides to the agent as ordinary text. A
+    /// context provider instead *deletes* the `@query` (it becomes a chip, not
+    /// inline text) and asks the parent to capture its content via
+    /// [`ComposerEvent::CaptureContext`].
+    fn mention_accept(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(m) = self.mention.take() else { return };
-        if let Some(path) = m.matches.get(idx).cloned() {
+        let range = m.range.clone();
+        // What replaces the `@query` span, and whether to also capture context.
+        // A file keeps its `@path ` inline; a provider deletes the token (it
+        // becomes a chip) and asks the parent to capture its content.
+        let (replacement, capture): (Option<String>, Option<ContextRequest>) =
+            match m.matches.get(idx) {
+                Some(MentionMatch::File(path)) => (Some(format!("@{path} ")), None),
+                Some(MentionMatch::Context(src_idx)) => (
+                    Some(String::new()),
+                    self.context_sources.get(*src_idx).map(|s| s.request.clone()),
+                ),
+                None => (None, None),
+            };
+        if let Some(replacement) = replacement {
             let text = self.input.read(cx).value().to_string();
-            if m.range.end <= text.len()
-                && text.is_char_boundary(m.range.start)
-                && text.is_char_boundary(m.range.end)
+            if range.end <= text.len()
+                && text.is_char_boundary(range.start)
+                && text.is_char_boundary(range.end)
             {
-                let next = format!("{}@{path} {}", &text[..m.range.start], &text[m.range.end..]);
+                let next =
+                    format!("{}{replacement}{}", &text[..range.start], &text[range.end..]);
                 self.set_draft_end(next, window, cx);
             }
+        }
+        if let Some(request) = capture {
+            cx.emit(ComposerEvent::CaptureContext(request));
         }
         cx.notify();
     }
@@ -481,7 +605,7 @@ impl ComposerView {
         });
     }
 
-    /// Accept the highlighted path (keyboard Enter/Tab). Returns `false` when the
+    /// Accept the highlighted row (keyboard Enter/Tab). Returns `false` when the
     /// overlay is closed OR shows no real match, so Enter still submits / Tab
     /// still indents rather than being swallowed by an empty hint.
     fn mention_accept_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -490,7 +614,7 @@ impl ComposerView {
             return false;
         }
         let idx = m.highlight;
-        self.mention_accept_path(idx, window, cx);
+        self.mention_accept(idx, window, cx);
         true
     }
 
@@ -644,27 +768,32 @@ impl ComposerView {
         }
         let text = self.input.read(cx).value().to_string();
         let text = text.trim().to_string();
-        // An image-only prompt (attachments, no caption) is valid; only bail when
-        // there's nothing at all to send.
-        if text.is_empty() && self.pending_images.is_empty() {
+        // An attachment-only prompt (images or context chips, no caption) is
+        // valid; only bail when there's nothing at all to send.
+        if text.is_empty() && self.pending_images.is_empty() && self.context_chips.is_empty() {
             return;
         }
         let staged: Vec<PendingImage> = self.pending_images.drain(..).collect();
+        let context: Vec<ContextChip> = self.context_chips.drain(..).collect();
         // Leaving the draft behind ends any history recall.
         self.history.detach();
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
         if self.turn_active {
             // A turn is still streaming: park the message (bounded) and repaint
-            // the queued-chip row. It sends when the turn ends.
+            // the queued-chip row. It sends when the turn ends. Context chips ride
+            // along structured so they still serialize at drain.
             if self.queued.len() < MAX_QUEUED {
-                self.queued.push(QueuedMessage { text, images: staged });
+                self.queued.push(QueuedMessage { text, images: staged, context });
             }
             cx.notify();
             return;
         }
         self.history.record(&text);
         let images: Vec<ChatImage> = staged.into_iter().map(|p| p.chat).collect();
-        cx.emit(ComposerEvent::Submit { text, images });
+        // Prepend any context chips as `<context>` blocks; history keeps the
+        // TYPED text (recall shows what the user wrote, not the wire form).
+        let wire = prepend_context(&context, &text);
+        cx.emit(ComposerEvent::Submit { text: wire, images });
     }
 
     /// Seed the ↑/↓ prompt history from a restored transcript's user prompts
@@ -716,11 +845,12 @@ impl ComposerView {
         if self.queued.is_empty() {
             return None;
         }
-        let QueuedMessage { text, images } = self.queued.remove(0);
+        let QueuedMessage { text, images, context } = self.queued.remove(0);
         self.history.record(&text);
         cx.notify();
         let images: Vec<ChatImage> = images.into_iter().map(|p| p.chat).collect();
-        Some((text, images))
+        let wire = prepend_context(&context, &text);
+        Some((wire, images))
     }
 
     /// Pull the most-recently parked message back into the composer to edit it
@@ -728,16 +858,19 @@ impl ComposerView {
     /// "arrow up to edit" gesture). Removes it from the queue and restores its
     /// staged attachments; re-submitting re-queues it (or sends it if the turn
     /// has since ended). Returns whether it consumed the key. Only fires with an
-    /// empty draft and no staged images, so it never clobbers work in progress.
+    /// empty draft and no staged attachments, so it never clobbers work in
+    /// progress.
     fn edit_last_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.queued.is_empty() {
             return false;
         }
-        if !self.input.read(cx).value().trim().is_empty() || !self.pending_images.is_empty() {
+        if !self.draft_is_empty(cx) {
             return false;
         }
-        let QueuedMessage { text, images } = self.queued.pop().expect("non-empty checked above");
+        let QueuedMessage { text, images, context } =
+            self.queued.pop().expect("non-empty checked above");
         self.pending_images = images;
+        self.context_chips = context;
         self.set_draft_end(text, window, cx);
         cx.notify();
         true
@@ -752,13 +885,23 @@ impl ComposerView {
         if idx >= self.queued.len() {
             return;
         }
-        if !self.input.read(cx).value().trim().is_empty() || !self.pending_images.is_empty() {
+        if !self.draft_is_empty(cx) {
             return;
         }
-        let QueuedMessage { text, images } = self.queued.remove(idx);
+        let QueuedMessage { text, images, context } = self.queued.remove(idx);
         self.pending_images = images;
+        self.context_chips = context;
         self.set_draft_end(text, window, cx);
         cx.notify();
+    }
+
+    /// Whether the draft is empty AND nothing is staged (no images, no context
+    /// chips) — the precondition for pulling a queued message back to edit so it
+    /// never clobbers work in progress.
+    fn draft_is_empty(&self, cx: &Context<Self>) -> bool {
+        self.input.read(cx).value().trim().is_empty()
+            && self.pending_images.is_empty()
+            && self.context_chips.is_empty()
     }
 
     /// Cancel a parked message (its chip's ✕).
@@ -1020,6 +1163,63 @@ impl ComposerView {
         row
     }
 
+    /// Staged context chips shown above the input pill: one pill per captured
+    /// attachment (`@diff · 128 lines`, `@terminal build · 42 lines`,
+    /// `@clipboard · 3 lines`), each with a ✕ to drop it. The label carries the
+    /// line count so the user sees the prompt cost of what they attached. Rendered
+    /// only when something is staged.
+    fn render_context_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .w_full()
+            .gap(px(density.gap_inline));
+        for (idx, chip) in self.context_chips.iter().enumerate() {
+            let pill = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_none()
+                .gap(px(density.gap_inline * 0.5))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(theme.border_input)
+                .bg(theme.bg_panel)
+                .px(px(density.gap_inline))
+                .py(px(density.gap_inline * 0.5))
+                .child(
+                    div()
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_muted)
+                        .child(SharedString::from(chip.label())),
+                )
+                .child(
+                    div()
+                        .id(("chat-context-remove", idx))
+                        .size(px(14.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.fg_subtle)
+                        .text_size(px(9.0))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme.fg_base))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, _w, cx| this.remove_context_chip(idx, cx)),
+                        )
+                        .child(SharedString::from("✕")),
+                );
+            row = row.child(pill);
+        }
+        row
+    }
+
     /// Parked-message chips shown above the input while a turn streams: one
     /// compact row per queued message with a truncated preview and a ✕ to cancel
     /// it, so the user can see (and drop) what will send next. Rendered only when
@@ -1036,8 +1236,7 @@ impl ComposerView {
         // ✎ (pop-to-edit) is offered only when the draft is empty — editing a
         // chip replaces the composer contents, so it must not clobber a draft
         // in progress (matches the ↑-to-edit guard).
-        let draft_empty =
-            self.input.read(cx).value().trim().is_empty() && self.pending_images.is_empty();
+        let draft_empty = self.draft_is_empty(cx);
         for (idx, m) in self.queued.iter().enumerate() {
             // Prefer the caption; fall back to an image count for an image-only
             // queued message so its chip isn't blank.
@@ -1293,25 +1492,27 @@ impl ComposerView {
             .border_1()
             .border_color(theme.border_input)
             .bg(theme.bg_panel)
-            .py(px(density.pad_row))
-            .child(
-                div()
-                    .px(px(density.pad_panel))
-                    .pt(px(density.gap_inline))
-                    .pb(px(density.gap_inline * 0.5))
-                    .text_size(px(typo.t_body_sm))
-                    .text_color(theme.fg_subtle)
-                    .child(SharedString::from("Files")),
-            );
+            .py(px(density.pad_row));
+        // A muted section label (Context / Files), inserted whenever the ranked
+        // list crosses from one group to the other.
+        let header = |label: &'static str| {
+            div()
+                .px(px(density.pad_panel))
+                .pt(px(density.gap_inline))
+                .pb(px(density.gap_inline * 0.5))
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_subtle)
+                .child(SharedString::from(label))
+        };
         if m.matches.is_empty() {
             // A pending `@` with nothing to show yet: distinguish the async scan
-            // still running from a query that matched no file.
+            // still running from a query that matched no provider or file.
             let msg = if self.mention_candidates_loaded {
-                "No matching files"
+                "No matches"
             } else {
                 "Scanning files…"
             };
-            list = list.child(
+            list = list.child(header("Files")).child(
                 div()
                     .px(px(density.pad_panel))
                     .py(px(density.gap_inline))
@@ -1321,22 +1522,29 @@ impl ComposerView {
             );
             return Some(list);
         }
-        for (row, path) in m.matches.iter().enumerate() {
+        let mut prev_was_context: Option<bool> = None;
+        for (row, mm) in m.matches.iter().enumerate() {
+            let is_context = matches!(mm, MentionMatch::Context(_));
+            // Section header at each group boundary (Context rows sort first).
+            if prev_was_context != Some(is_context) {
+                list = list.child(header(if is_context { "Context" } else { "Files" }));
+                prev_was_context = Some(is_context);
+            }
+            let label: String = match mm {
+                MentionMatch::Context(i) => {
+                    self.context_sources.get(*i).map(|s| s.label.clone()).unwrap_or_default()
+                }
+                MentionMatch::File(path) => path.clone(),
+            };
             let selected = row == m.highlight;
-            // Wrap the path in a flex_row so a long path can clip to one line —
+            // Wrap the label in a flex_row so a long entry clips to one line —
             // a nowrap/truncate text placed DIRECTLY in a flex-col renders blank.
             let inner = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .w_full()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(SharedString::from(path.clone())),
-                );
+                .child(div().flex_1().min_w_0().truncate().child(SharedString::from(label)));
             let mut item = div()
                 .id(("mention-row", row))
                 .w_full()
@@ -1348,9 +1556,7 @@ impl ComposerView {
                 .hover(|s| s.bg(theme.bg_panel_alt))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _e, window, cx| {
-                        this.mention_accept_path(row, window, cx)
-                    }),
+                    cx.listener(move |this, _e, window, cx| this.mention_accept(row, window, cx)),
                 )
                 .child(inner);
             if selected {
@@ -1611,6 +1817,9 @@ impl Render for ComposerView {
                     .when(!self.pending_images.is_empty(), |d| {
                         d.child(self.render_attachments(cx))
                     })
+                    .when(!self.context_chips.is_empty(), |d| {
+                        d.child(self.render_context_chips(cx))
+                    })
                     .children(self.render_slash_palette(cx))
                     .children(self.render_mention_overlay(cx))
                     .children(self.render_usage_hint(cx))
@@ -1687,6 +1896,17 @@ impl ComposerView {
     /// Drive ↑ "edit the last queued message"; returns whether it consumed the key.
     pub(crate) fn edit_last_queued_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.edit_last_queued(window, cx)
+    }
+
+    /// Stage a context chip directly (as the parent's capture would), so a test
+    /// can exercise serialization / clear-on-send without a live provider.
+    pub(crate) fn stage_context_chip_for_test(&mut self, chip: ContextChip, cx: &mut Context<Self>) {
+        self.add_context_chip(chip, cx);
+    }
+
+    /// How many context chips are currently staged.
+    pub(crate) fn context_chips_len_for_test(&self) -> usize {
+        self.context_chips.len()
     }
 }
 
@@ -1786,5 +2006,78 @@ mod tests {
                 assert!(!c.edit_last_queued_for_test(window, cx));
             })
             .expect("window update");
+    }
+
+    /// A staged context chip serializes into the drained message as a `<context>`
+    /// block prepended to the typed text — and a chip alone (no caption) is enough
+    /// to send (the empty-guard allows an attachment-only prompt).
+    #[gpui::test]
+    async fn context_chip_serializes_into_wire_on_drain(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                c.set_state(false, true, cx); // streaming → submit parks it
+                c.stage_context_chip_for_test(
+                    ContextChip::new(
+                        oximux_agents::thread::ContextKind::Diff,
+                        None,
+                        "diff --git a b".into(),
+                        false,
+                    ),
+                    cx,
+                );
+                c.set_draft_for_test("what changed?", window, cx);
+                c.submit(window, cx);
+                assert_eq!(c.queued_len_for_test(), 1, "parked with its chip");
+                assert_eq!(c.context_chips_len_for_test(), 0, "chip drained off staging");
+                let (wire, _) = c.take_next_queued(cx).expect("one queued");
+                assert!(wire.starts_with("<context name=\"diff\">"), "block prepended: {wire}");
+                assert!(wire.ends_with("what changed?"), "typed text preserved: {wire}");
+            })
+            .expect("window update");
+    }
+
+    /// Pulling a queued message back to edit restores its context chips (they
+    /// re-serialize on the next send), mirroring image restore.
+    #[gpui::test]
+    async fn queued_context_chip_restored_on_edit(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                c.set_state(false, true, cx);
+                c.stage_context_chip_for_test(
+                    ContextChip::new(
+                        oximux_agents::thread::ContextKind::Clipboard,
+                        None,
+                        "pasted".into(),
+                        false,
+                    ),
+                    cx,
+                );
+                c.submit(window, cx);
+                assert_eq!(c.queued_len_for_test(), 1);
+                assert_eq!(c.context_chips_len_for_test(), 0);
+                assert!(c.edit_last_queued_for_test(window, cx));
+                assert_eq!(c.context_chips_len_for_test(), 1, "chip restored on edit");
+                assert_eq!(c.queued_len_for_test(), 0);
+            })
+            .expect("window update");
+    }
+
+    #[test]
+    fn rank_context_sources_prefix_then_substring_then_all() {
+        let sources = vec![
+            ContextSource::diff(),                                    // key "diff"
+            ContextSource::clipboard(),                              // key "clipboard"
+            ContextSource::terminal(oximux_pty::TerminalSessionId(1), "diffbuild"), // key "terminal diffbuild"
+        ];
+        // Empty query → all sources in order.
+        assert_eq!(rank_context_sources(&sources, ""), vec![0, 1, 2]);
+        // "diff" prefixes source 0, is a substring of source 2 → prefix first.
+        assert_eq!(rank_context_sources(&sources, "diff"), vec![0, 2]);
+        // "clip" prefixes only clipboard.
+        assert_eq!(rank_context_sources(&sources, "clip"), vec![1]);
+        // No match.
+        assert!(rank_context_sources(&sources, "zzz").is_empty());
     }
 }

@@ -1108,6 +1108,54 @@ impl TerminalView {
         true
     }
 
+    /// Capture text for an agent context chip: the active selection if the user
+    /// has one, otherwise the last `max_lines` lines of the full scrollback.
+    /// Returns `(text, truncated)` — `truncated` marks that earlier scrollback was
+    /// clipped by the cap (only meaningful on the no-selection path; an explicit
+    /// selection is honored verbatim). Read-only: unlike [`copy_selection`] it
+    /// never writes the clipboard or clears the selection.
+    pub(crate) fn capture_agent_context(&self, max_lines: usize) -> (String, bool) {
+        // A live selection is an explicit "attach exactly this" — re-extract from
+        // the backend grid when it runs past the viewport (the Select-All case),
+        // mirroring `copy_selection`.
+        if let Some(sel) = self.selection {
+            let visible_rows = self.snapshot.cells.len();
+            let text = if sel.2 >= visible_rows {
+                let grid = self.with_backend(|be| be.search_grid(self.session_id));
+                if grid.is_empty() {
+                    extract_selection_text(&self.snapshot, sel)
+                } else {
+                    extract_selection_text_cells(&grid, sel)
+                }
+            } else {
+                extract_selection_text(&self.snapshot, sel)
+            };
+            if !text.trim().is_empty() {
+                return (text, false);
+            }
+        }
+        // No selection: take the TAIL of the full scrollback, capped to
+        // `max_lines`. Fall back to the visible snapshot when the backend has no
+        // grid (relay attach mid-handshake).
+        let grid = self.with_backend(|be| be.search_grid(self.session_id));
+        let rows: &[Vec<oximux_pty::Cell>] =
+            if grid.is_empty() { &self.snapshot.cells } else { &grid };
+        if rows.is_empty() {
+            return (String::new(), false);
+        }
+        let total = rows.len();
+        let start = total.saturating_sub(max_lines);
+        let end_col = rows
+            .iter()
+            .map(|r| r.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let tail = &rows[start..];
+        let text = extract_selection_text_cells(tail, (0, 0, tail.len() - 1, end_col));
+        (text, total > max_lines)
+    }
+
     /// Select the FULL scrollback (history + visible), so a follow-up Copy
     /// yields everything the pane retains — not just the on-screen rows.
     /// Driven by Cmd+A and the context menu's Select All row. The selection

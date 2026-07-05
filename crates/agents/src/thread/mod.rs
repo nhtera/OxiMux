@@ -14,6 +14,7 @@
 
 pub mod claude_stream_json;
 pub mod connection;
+pub mod context_chip;
 pub mod entry;
 pub mod event;
 pub mod question;
@@ -28,6 +29,7 @@ pub use connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
     AgentCapabilities, AgentConnection, StubConnection,
 };
+pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES};
 pub use event::{ThreadEvent, TurnUsage};

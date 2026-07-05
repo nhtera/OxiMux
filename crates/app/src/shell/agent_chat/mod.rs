@@ -14,6 +14,7 @@
 mod bubble;
 mod composer;
 mod composer_history;
+mod context_providers;
 mod diff_card;
 mod image_attach;
 mod pending_edit;
@@ -139,13 +140,18 @@ impl ThinkingLevel {
 }
 
 use composer::{ComposerEvent, ComposerView};
+use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, EntryDisplay};
+use crate::shell::pane_content::PaneContent;
+use crate::shell::pane_group::PaneGroup;
+use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
     AgentConnection, AssistantMessage, ChatImage, ChatThread, ClaudeStreamJsonConnection,
     PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus,
     TurnUsage,
 };
+use oximux_git::GitCmd;
 use oximux_settings::{Density, Theme, Typography};
 
 pub struct AgentChatView {
@@ -268,6 +274,12 @@ pub struct AgentChatView {
     /// Active staged edit-and-resend, if any. Nothing is destroyed until send —
     /// Escape/cancel is a true no-op that restores the prior draft.
     pending_edit: Option<pending_edit::PendingEdit>,
+    /// Weak handle to the owning pane group, set after construction by the tab
+    /// factory. Lets the `@terminal` context provider enumerate sibling terminal
+    /// tabs and pull their scrollback. Weak so it never keeps the group alive (the
+    /// group already owns this view's `Entity`). `None` in tests / standalone use,
+    /// which simply omits the terminal sources.
+    pane_group: Option<WeakEntity<PaneGroup>>,
 }
 
 impl AgentChatView {
@@ -357,6 +369,10 @@ impl AgentChatView {
                     this.change_permission_mode(mode.clone(), cx)
                 }
                 ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
+                ComposerEvent::MentionOpened => this.refresh_context_sources(cx),
+                ComposerEvent::CaptureContext(request) => {
+                    this.capture_context(request.clone(), cx)
+                }
             },
         )];
 
@@ -518,6 +534,7 @@ impl AgentChatView {
             rewinding: false,
             rewind_then_send: None,
             pending_edit: None,
+            pane_group: None,
         }
     }
 
@@ -741,6 +758,126 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Wire the owning pane group (called by the tab factory right after
+    /// construction) so the `@terminal` context provider can enumerate sibling
+    /// terminal tabs.
+    pub fn set_pane_group(&mut self, group: WeakEntity<PaneGroup>) {
+        self.pane_group = Some(group);
+    }
+
+    /// Rebuild the composer's `@`-menu context sources (`@diff`, `@clipboard`, one
+    /// `@terminal` per sibling terminal tab) and push them in. Called each time the
+    /// menu opens so the terminal list is live — terminals opened/closed since the
+    /// last open are reflected.
+    fn refresh_context_sources(&mut self, cx: &mut Context<Self>) {
+        let sources = self.context_sources(cx);
+        self.composer.update(cx, |c, cx| c.set_context_sources(sources, cx));
+    }
+
+    /// The context sources to offer: always `@diff` + `@clipboard`, plus one
+    /// `@terminal` per sibling terminal tab in the owning group (each named by its
+    /// tab title, keyed by the stable PTY session id for capture).
+    fn context_sources(&self, cx: &App) -> Vec<ContextSource> {
+        let mut sources = vec![ContextSource::diff(), ContextSource::clipboard()];
+        let Some(group) = self.pane_group.as_ref().and_then(|w| w.upgrade()) else {
+            return sources;
+        };
+        let group = group.read(cx);
+        for (_idx, tab) in group.visible_tabs() {
+            let PaneContent::Terminal(tree) = &tab.content else {
+                continue;
+            };
+            let Some(view) = tree.active_view() else { continue };
+            let tv = view.read(cx);
+            let title = tab
+                .custom_title
+                .as_ref()
+                .map(|s| s.to_string())
+                .or_else(|| tv.title().map(str::to_string))
+                .unwrap_or_else(|| tab.label.to_string());
+            sources.push(ContextSource::terminal(tv.session_id(), &title));
+        }
+        sources
+    }
+
+    /// Capture a picked context provider and hand the resulting chip back to the
+    /// composer. Clipboard is synchronous; diff shells out to git off-thread;
+    /// terminal re-resolves the tab by its PTY id (it may have closed since the
+    /// menu opened) and reads its scrollback / selection.
+    fn capture_context(&mut self, request: ContextRequest, cx: &mut Context<Self>) {
+        match request {
+            ContextRequest::Clipboard => {
+                let text = cx.read_from_clipboard().and_then(|i| i.text());
+                if let Some(chip) = context_providers::clipboard_chip(text) {
+                    self.composer.update(cx, |c, cx| c.add_context_chip(chip, cx));
+                }
+            }
+            ContextRequest::Diff => self.capture_diff(cx),
+            ContextRequest::Terminal { id, title } => {
+                let Some(group) = self.pane_group.as_ref().and_then(|w| w.upgrade()) else {
+                    return;
+                };
+                // Re-resolve the live view by PTY id, cloning the entity so the
+                // group borrow ends before we read the terminal.
+                let view: Option<Entity<TerminalView>> = {
+                    let group = group.read(cx);
+                    group.visible_tabs().find_map(|(_i, tab)| {
+                        let PaneContent::Terminal(tree) = &tab.content else {
+                            return None;
+                        };
+                        tree.iter_all_views()
+                            .find(|(_l, _t, v)| v.read(cx).session_id() == id)
+                            .map(|(_l, _t, v)| v.clone())
+                    })
+                };
+                let Some(view) = view else { return };
+                let (text, truncated) =
+                    view.read(cx).capture_agent_context(context_providers::TERMINAL_MAX_LINES);
+                if let Some(chip) = context_providers::terminal_chip(&title, text, truncated) {
+                    self.composer.update(cx, |c, cx| c.add_context_chip(chip, cx));
+                }
+            }
+        }
+    }
+
+    /// Shell out `git diff` + `git diff --cached` in the chat cwd off the tokio
+    /// runtime (like the checkpoint engine — never `cx.background_spawn`, which has
+    /// no reactor), combine + cap them into a chip, and hand it to the composer.
+    fn capture_diff(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.cwd.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
+        handle.spawn(async move {
+            async fn run(cwd: &std::path::Path, extra: &[&str]) -> String {
+                let mut args = vec!["diff", "--no-color", "--no-ext-diff"];
+                args.extend_from_slice(extra);
+                GitCmd::new(cwd)
+                    .timeout(Duration::from_secs(30))
+                    .args(args)
+                    .run()
+                    .await
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .unwrap_or_default()
+            }
+            let unstaged = run(&cwd, &[]).await;
+            let staged = run(&cwd, &["--cached"]).await;
+            let _ = tx.send((unstaged, staged));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((unstaged, staged)) = rx.await else {
+                return;
+            };
+            let chip = context_providers::diff_chip(&unstaged, &staged);
+            let _ = this.update(cx, |this, cx| {
+                this.composer.update(cx, |c, cx| c.add_context_chip(chip, cx));
+            });
+        })
+        .detach();
+    }
+
     /// Test-only constructor: inject a connection (a `StubConnection`) instead
     /// of spawning a real subprocess, and skip the background drain so a
     /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
@@ -793,6 +930,7 @@ impl AgentChatView {
             rewinding: false,
             rewind_then_send: None,
             pending_edit: None,
+            pane_group: None,
         }
     }
 
