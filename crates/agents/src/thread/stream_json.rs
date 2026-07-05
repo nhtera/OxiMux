@@ -8,6 +8,7 @@
 
 use serde_json::Value;
 
+use super::background_task::BackgroundTaskKind;
 use super::event::{ThreadEvent, TurnUsage};
 use super::question::parse_questions;
 use super::tool_call::PermissionSuggestion;
@@ -59,12 +60,67 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
             detail: str_field(v, "status_detail"),
             category: str_field(v, "status_category"),
         }],
-        // hook_started / hook_response → noise.
+        // Background-task lifecycle (subagents + background bash) → the Background
+        // Tasks panel. The task's own internal stream is dropped in `decode_value`
+        // via `parent_tool_use_id`; these summaries carry the panel's data.
+        Some("task_started") => vec![ThreadEvent::BackgroundTaskStarted {
+            task_id: str_field(v, "task_id"),
+            tool_use_id: str_field(v, "tool_use_id"),
+            kind: BackgroundTaskKind::from_wire(
+                v.get("task_type").and_then(Value::as_str).unwrap_or_default(),
+                v.get("subagent_type").and_then(Value::as_str),
+            ),
+            description: str_field(v, "description"),
+        }],
+        Some("task_progress") => vec![ThreadEvent::BackgroundTaskProgress {
+            task_id: str_field(v, "task_id"),
+            last_tool: v.get("last_tool_name").and_then(Value::as_str).map(str::to_string),
+        }],
+        Some("task_updated") => decode_task_updated(v),
+        Some("task_notification") => decode_task_notification(v),
+        // hook_started / hook_response / thinking_tokens → noise.
         // TODO(chat-ui polish): `system/status` (spinner text) and init's
         // tools/mcp_servers/agents/cwd are dropped for now; surface them when
         // the spinner + session-detail UI is built.
         _ => Vec::new(),
     }
+}
+
+/// A `system/task_updated` carries a `patch` — the panel only cares about the
+/// terminal transition, which brings the completion `end_time`.
+fn decode_task_updated(v: &Value) -> Vec<ThreadEvent> {
+    let patch = v.get("patch");
+    let status = patch.and_then(|p| p.get("status")).and_then(Value::as_str);
+    match status {
+        Some(s) if is_terminal_status(s) => vec![ThreadEvent::BackgroundTaskFinished {
+            task_id: str_field(v, "task_id"),
+            failed: s != "completed",
+            ended_at_ms: patch.and_then(|p| p.get("end_time")).and_then(Value::as_u64),
+            summary: None,
+            output_file: None,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// A `system/task_notification` at terminal status carries the completion summary
+/// + the task's output file (for "View transcript").
+fn decode_task_notification(v: &Value) -> Vec<ThreadEvent> {
+    match v.get("status").and_then(Value::as_str) {
+        Some(s) if is_terminal_status(s) => vec![ThreadEvent::BackgroundTaskFinished {
+            task_id: str_field(v, "task_id"),
+            failed: s != "completed",
+            ended_at_ms: None,
+            summary: v.get("summary").and_then(Value::as_str).map(str::to_string),
+            output_file: v.get("output_file").and_then(Value::as_str).map(str::to_string),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a task status string is terminal (completion or a failure/cancel).
+fn is_terminal_status(s: &str) -> bool {
+    matches!(s, "completed" | "failed" | "cancelled" | "canceled") || s.starts_with("error")
 }
 
 fn decode_stream_event(v: &Value) -> Vec<ThreadEvent> {
@@ -494,5 +550,38 @@ mod tests {
             .collect();
         assert_eq!(turn_ends.len(), 1, "exactly one turn-end (not the task-notification continuations)");
         assert_eq!(turn_ends[0].output_tokens, 381, "usage footer must be the primary turn's, not a continuation's");
+    }
+
+    /// The fixture's `system/task_*` events decode into one subagent + one
+    /// background-bash task, each with a start and a terminal finish.
+    #[test]
+    fn spike_fixture_emits_background_task_events() {
+        use super::super::background_task::BackgroundTaskKind;
+        let fixture = include_str!("testdata/stream_json_subagent.jsonl");
+        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
+
+        let started: Vec<&ThreadEvent> = events
+            .iter()
+            .filter(|e| matches!(e, ThreadEvent::BackgroundTaskStarted { .. }))
+            .collect();
+        assert_eq!(started.len(), 2, "one subagent + one background bash started");
+        let kinds: Vec<&BackgroundTaskKind> = started
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEvent::BackgroundTaskStarted { kind, .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert!(kinds.iter().any(|k| matches!(k, BackgroundTaskKind::BackgroundBash)));
+        assert!(kinds.iter().any(|k| matches!(
+            k,
+            BackgroundTaskKind::Subagent { subagent_type } if subagent_type == "general-purpose"
+        )));
+
+        let finished = events
+            .iter()
+            .filter(|e| matches!(e, ThreadEvent::BackgroundTaskFinished { .. }))
+            .count();
+        assert!(finished >= 2, "both tasks reach a terminal finish, got {finished}");
     }
 }

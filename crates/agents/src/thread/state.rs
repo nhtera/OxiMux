@@ -12,6 +12,7 @@
 //! block). A tool call ends the current assistant block, so later text starts
 //! a fresh assistant message.
 
+use super::background_task::{BackgroundTask, TaskStatus};
 use super::entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 use super::event::{ThreadEvent, TurnUsage};
 use super::question::QuestionRequest;
@@ -38,6 +39,11 @@ pub struct ChatThread {
     /// Latest per-turn token/cost usage (from the most recent `TurnEnded`), for
     /// the usage footer. `None` until a turn reports usage.
     pub usage: Option<TurnUsage>,
+    /// Background tasks (subagents + background bash) folded from `task_*` events,
+    /// in start order, for the Background Tasks panel. In-memory only (not
+    /// persisted): a task's output files are ephemeral, so a restored chat starts
+    /// with none rather than dangling references.
+    pub background_tasks: Vec<BackgroundTask>,
     /// Index of the assistant entry currently being streamed, if any.
     current_assistant: Option<usize>,
     /// True once a text delta has streamed into the current assistant block
@@ -248,11 +254,68 @@ impl ChatThread {
                     self.last_error = result.clone().or(Some("turn ended with error".into()));
                 }
             }
+            ThreadEvent::BackgroundTaskStarted { task_id, tool_use_id, kind, description } => {
+                // Idempotent: a duplicate start (defensive against a re-emit) just
+                // refreshes the existing record rather than adding a second row.
+                if let Some(t) = self.background_task_mut(task_id) {
+                    t.tool_use_id = tool_use_id.clone();
+                    t.kind = kind.clone();
+                    t.description = description.clone();
+                } else {
+                    self.background_tasks.push(BackgroundTask::started(
+                        task_id.clone(),
+                        tool_use_id.clone(),
+                        kind.clone(),
+                        description.clone(),
+                    ));
+                }
+            }
+            ThreadEvent::BackgroundTaskProgress { task_id, last_tool } => {
+                if let Some(t) = self.background_task_mut(task_id) {
+                    t.tool_uses = t.tool_uses.saturating_add(1);
+                    if last_tool.is_some() {
+                        t.last_tool = last_tool.clone();
+                    }
+                }
+            }
+            ThreadEvent::BackgroundTaskFinished {
+                task_id,
+                failed,
+                ended_at_ms,
+                summary,
+                output_file,
+            } => {
+                if let Some(t) = self.background_task_mut(task_id) {
+                    // Terminal status wins; two completion signals (task_updated +
+                    // task_notification) may both arrive — merge, don't overwrite
+                    // populated fields with a later `None`.
+                    t.status = if *failed { TaskStatus::Failed } else { TaskStatus::Completed };
+                    if ended_at_ms.is_some() {
+                        t.ended_at_ms = *ended_at_ms;
+                    }
+                    if summary.is_some() {
+                        t.summary = summary.clone();
+                    }
+                    if output_file.is_some() {
+                        t.output_file = output_file.clone();
+                    }
+                }
+            }
             ThreadEvent::Error(msg) => {
                 self.last_error = Some(msg.clone());
                 self.turn_active = false;
             }
         }
+    }
+
+    /// Mutable lookup of a background task by its `task_id`.
+    fn background_task_mut(&mut self, task_id: &str) -> Option<&mut BackgroundTask> {
+        self.background_tasks.iter_mut().find(|t| t.task_id == task_id)
+    }
+
+    /// Count of background tasks still running — the header badge value.
+    pub fn running_task_count(&self) -> usize {
+        self.background_tasks.iter().filter(|t| t.is_running()).count()
     }
 
     /// Interrupt the current turn (the user pressed Stop). Clears the turn flag
@@ -388,6 +451,7 @@ impl ChatThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::background_task::BackgroundTaskKind;
     use serde_json::json;
 
     fn assistant_text(e: &ThreadEntry) -> &str {
@@ -826,5 +890,96 @@ mod tests {
         assert!(matches!(t.entries[1], ThreadEntry::Assistant(_)));
         assert!(matches!(t.entries[2], ThreadEntry::ToolCall(_)));
         assert!(matches!(t.entries[3], ThreadEntry::Assistant(_)));
+    }
+
+    #[test]
+    fn background_task_lifecycle_folds_into_state() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::BackgroundTaskStarted {
+            task_id: "T1".into(),
+            tool_use_id: "toolu_a".into(),
+            kind: BackgroundTaskKind::Subagent { subagent_type: "general-purpose".into() },
+            description: "read files".into(),
+        });
+        assert_eq!(t.running_task_count(), 1);
+        t.apply(&ThreadEvent::BackgroundTaskProgress {
+            task_id: "T1".into(),
+            last_tool: Some("Read".into()),
+        });
+        t.apply(&ThreadEvent::BackgroundTaskProgress {
+            task_id: "T1".into(),
+            last_tool: Some("Read".into()),
+        });
+        let task = &t.background_tasks[0];
+        assert_eq!(task.tool_uses, 2);
+        assert_eq!(task.last_tool.as_deref(), Some("Read"));
+        assert!(task.is_running());
+
+        // task_updated (end_time) then task_notification (summary+output_file) —
+        // both terminal signals merge, neither clobbers the other's fields.
+        t.apply(&ThreadEvent::BackgroundTaskFinished {
+            task_id: "T1".into(),
+            failed: false,
+            ended_at_ms: Some(1000),
+            summary: None,
+            output_file: None,
+        });
+        t.apply(&ThreadEvent::BackgroundTaskFinished {
+            task_id: "T1".into(),
+            failed: false,
+            ended_at_ms: None,
+            summary: Some("done".into()),
+            output_file: Some("/tmp/x.jsonl".into()),
+        });
+        let task = &t.background_tasks[0];
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.ended_at_ms, Some(1000), "end_time not clobbered by the later None");
+        assert_eq!(task.summary.as_deref(), Some("done"));
+        assert!(task.has_transcript());
+        assert_eq!(t.running_task_count(), 0);
+    }
+
+    #[test]
+    fn background_task_finished_failed_marks_failed() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::BackgroundTaskStarted {
+            task_id: "T1".into(),
+            tool_use_id: "toolu_a".into(),
+            kind: BackgroundTaskKind::BackgroundBash,
+            description: "boom".into(),
+        });
+        t.apply(&ThreadEvent::BackgroundTaskFinished {
+            task_id: "T1".into(),
+            failed: true,
+            ended_at_ms: None,
+            summary: None,
+            output_file: None,
+        });
+        assert_eq!(t.background_tasks[0].status, TaskStatus::Failed);
+    }
+
+    /// End-to-end: folding the captured spike stream tracks exactly the two tasks,
+    /// both completed, without polluting the transcript with subagent chatter.
+    #[test]
+    fn spike_fixture_folds_to_two_completed_tasks() {
+        let fixture = include_str!("testdata/stream_json_subagent.jsonl");
+        let mut t = ChatThread::new();
+        for line in fixture.lines() {
+            for ev in super::super::stream_json::decode_line(line) {
+                t.apply(&ev);
+            }
+        }
+        assert_eq!(t.background_tasks.len(), 2, "one subagent + one bash");
+        assert!(t.background_tasks.iter().all(|task| task.status == TaskStatus::Completed));
+        assert_eq!(t.running_task_count(), 0);
+        // Both carry an output_file for "View transcript".
+        assert!(t.background_tasks.iter().all(|task| task.has_transcript()));
+        // The subagent ran tools; its activity counter advanced.
+        let subagent = t
+            .background_tasks
+            .iter()
+            .find(|task| matches!(task.kind, BackgroundTaskKind::Subagent { .. }))
+            .expect("a subagent task");
+        assert!(subagent.tool_uses > 0, "subagent progress steps counted");
     }
 }

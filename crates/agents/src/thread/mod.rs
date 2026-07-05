@@ -12,6 +12,7 @@
 //! The event model is deliberately ACP-shaped so a future ACP backend can feed
 //! the same `ChatThread` without changing the state machine or the view.
 
+pub mod background_task;
 pub mod claude_stream_json;
 pub mod connection;
 pub mod context_chip;
@@ -29,6 +30,7 @@ pub use connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
     AgentCapabilities, AgentConnection, StubConnection,
 };
+pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
 pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES};

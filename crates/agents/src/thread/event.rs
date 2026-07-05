@@ -89,6 +89,32 @@ pub enum ThreadEvent {
         usage: Option<TurnUsage>,
         is_error: bool,
     },
+    /// A background task (subagent / background bash) started
+    /// (`system/task_started`). Feeds the Background Tasks panel; the task's own
+    /// internal stream stays out of the main transcript (see the decoder).
+    BackgroundTaskStarted {
+        task_id: String,
+        tool_use_id: String,
+        kind: super::background_task::BackgroundTaskKind,
+        description: String,
+    },
+    /// Progress on a background task (`system/task_progress`): the tool it is now
+    /// running. Advances the panel's per-task activity readout.
+    BackgroundTaskProgress {
+        task_id: String,
+        last_tool: Option<String>,
+    },
+    /// A background task reached a terminal state (`system/task_updated` completion
+    /// patch or `system/task_notification`). Either signal can arrive — fields are
+    /// optional so a partial one still transitions the status; the fold merges
+    /// them.
+    BackgroundTaskFinished {
+        task_id: String,
+        failed: bool,
+        ended_at_ms: Option<u64>,
+        summary: Option<String>,
+        output_file: Option<String>,
+    },
     /// A protocol/parse/transport error to surface in the thread.
     Error(String),
 }
