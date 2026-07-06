@@ -18,6 +18,8 @@ mod composer_history;
 mod context_providers;
 mod diff_card;
 mod image_attach;
+mod jump_menu;
+mod message_rail;
 mod pending_edit;
 mod plan_panel;
 mod question_card;
@@ -52,6 +54,10 @@ use gpui_component::scroll::Scrollbar;
 /// the conversation centered in a comfortable measure rather than stretching
 /// text edge-to-edge — the calm, focused feel of a dedicated chat surface.
 pub(super) const CONTENT_MAX_W: f32 = 720.0;
+
+/// Width of the left timeline gutter (the message tick-rail). The reading column
+/// sits to its right; overlays (jump dropdown, hover preview) offset by this.
+pub(super) const RAIL_W: f32 = 30.0;
 
 /// How many frames to keep re-pinning the transcript to the bottom after a
 /// content change (see [`AgentChatView::follow_frames`]). ~10 frames (≈160ms at
@@ -295,6 +301,13 @@ pub struct AgentChatView {
     /// `ScrollHandle::scroll_to_item` the exact bubble. `RefCell` because the
     /// transcript renders behind `&self`; only touched on the main thread.
     user_child_ix: RefCell<Vec<usize>>,
+    /// Pointer is over the left tick-rail. Either this or [`Self::menu_hover`]
+    /// being set expands the jump-to-message list next to the rail — hovering
+    /// the rail reveals it, hovering the list keeps it open (they sit edge-to-
+    /// edge, so the pointer never leaves both at once while crossing between).
+    rail_hover: bool,
+    /// Pointer is over the expanded jump-to-message list. See [`Self::rail_hover`].
+    menu_hover: bool,
     /// Weak handle to the owning pane group, set after construction by the tab
     /// factory. Lets the `@terminal` context provider enumerate sibling terminal
     /// tabs and pull their scrollback. Weak so it never keeps the group alive (the
@@ -586,6 +599,8 @@ impl AgentChatView {
             flash_entry: None,
             flash_frames: 0,
             user_child_ix: RefCell::new(Vec::new()),
+            rail_hover: false,
+            menu_hover: false,
         }
     }
 
@@ -986,6 +1001,8 @@ impl AgentChatView {
             flash_entry: None,
             flash_frames: 0,
             user_child_ix: RefCell::new(Vec::new()),
+            rail_hover: false,
+            menu_hover: false,
         }
     }
 
@@ -1143,9 +1160,8 @@ impl AgentChatView {
     /// messages) and briefly highlight it. Releases auto-follow so the jump
     /// sticks, and re-issues the scroll once next frame in case the target's
     /// markdown height is still settling. No-op if `n` is out of range or that
-    /// turn wasn't rendered this frame. Shared primitive for the jump menu
-    /// (Phase 2) and the message rail (Phase 3).
-    #[allow(dead_code)] // wired by the jump menu / message rail in later phases
+    /// turn wasn't rendered this frame. Shared primitive for the jump menu and
+    /// (later) the message rail.
     fn scroll_to_user_ordinal(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         let child_ix = match self.user_child_ix.borrow().get(n) {
             Some(&ix) => ix,
@@ -1178,27 +1194,12 @@ impl AgentChatView {
     /// ascending (child index grows with ordinal), so a binary search over it
     /// against the top visible child maps back to an ordinal. Returns 0 when
     /// nothing is scrolled or there are no user turns.
-    #[allow(dead_code)] // wired by the jump menu / message rail in later phases
     fn current_user_ordinal(&self) -> usize {
         let top_child = self.list_scroll.top_item();
         match self.user_child_ix.borrow().binary_search(&top_child) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
         }
-    }
-
-    /// Move the jump target by `delta` user turns from the current top and scroll
-    /// there, clamped to the first/last user turn. Backs the prev/next-message
-    /// keyboard actions (Phase 2).
-    #[allow(dead_code)] // wired by the jump menu / message rail in later phases
-    fn jump_user_relative(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.user_child_ix.borrow().len();
-        if count == 0 {
-            return;
-        }
-        let cur = self.current_user_ordinal() as isize;
-        let target = (cur + delta).clamp(0, count as isize - 1) as usize;
-        self.scroll_to_user_ordinal(target, window, cx);
     }
 
     /// The event channel closed — the agent process exited or its stdout was
@@ -2099,7 +2100,20 @@ impl AgentChatView {
             px(base + reveal)
         };
         scroll = scroll.child(div().flex_none().w_full().h(tail_gap));
-        self.wrap_scroll(scroll).into_any_element()
+        // Compose the timeline row: the left tick-rail, the scrolling transcript,
+        // and the top-left jump dropdown + hover preview as absolute overlays over
+        // it. The `relative` row is the positioning context all three overlays
+        // (and the rail's per-tick fractions) resolve against.
+        div()
+            .relative()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h(px(0.0))
+            .children(self.render_message_rail(cx))
+            .child(self.wrap_scroll(scroll))
+            .children(self.render_jump_list(cx))
+            .into_any_element()
     }
 
     /// Wrap the scrolling transcript box in a positioned container and overlay a

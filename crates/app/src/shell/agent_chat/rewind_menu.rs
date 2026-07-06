@@ -195,8 +195,9 @@ impl AgentChatView {
         match outcome {
             RewindOutcome::Done { new_sid, files_degraded } => {
                 self.thread.truncate_to_user(ordinal);
-                // Entry indices shift when the tail is dropped — clear any jump
-                // highlight so it can't tint the wrong bubble after the rewind.
+                // Entry indices shift when the tail is dropped — clear the jump
+                // highlight so it can't tint the wrong bubble. The rail/list read
+                // live entries each render, so their hover state needs no reset.
                 self.flash_entry = None;
                 self.flash_frames = 0;
                 self.pre_turn_checkpoint = None;
