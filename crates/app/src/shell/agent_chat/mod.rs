@@ -59,6 +59,12 @@ pub(super) const CONTENT_MAX_W: f32 = 720.0;
 /// so the follow catches the message's settled height, then stops (no idle spin).
 const FOLLOW_FRAMES: u8 = 10;
 
+/// How many frames the jumped-to-message highlight lingers before it clears.
+/// ~48 frames (≈0.8s at 60fps) — long enough to catch the eye after a jump,
+/// short enough not to distract. The tint alpha scales with the remaining
+/// frames so it fades out rather than snapping off.
+const FLASH_FRAMES: u8 = 48;
+
 /// Claude model aliases offered in the in-chat model picker. The CLI accepts
 /// these short aliases directly as `--model`. (There is no model *list* in
 /// settings — only a single default — so the selectable set is fixed here.)
@@ -278,12 +284,49 @@ pub struct AgentChatView {
     /// Whether the Background Tasks drawer (subagents + background bash) is
     /// expanded. The toggle chip only shows once the turn has spawned a task.
     show_background_tasks: bool,
+    /// Transient highlight on a message the user jumped to (rewind menu, jump
+    /// nav, message rail), by entry index. Set on jump, fades over
+    /// [`FLASH_FRAMES`] frames, then clears. Cleared on rewind/truncate so a
+    /// shifted index never tints the wrong bubble.
+    flash_entry: Option<usize>,
+    flash_frames: u8,
+    /// Child index within the tracked scroll box for each USER turn, in order
+    /// (user ordinal → child index). Rebuilt every render so a jump can
+    /// `ScrollHandle::scroll_to_item` the exact bubble. `RefCell` because the
+    /// transcript renders behind `&self`; only touched on the main thread.
+    user_child_ix: RefCell<Vec<usize>>,
     /// Weak handle to the owning pane group, set after construction by the tab
     /// factory. Lets the `@terminal` context provider enumerate sibling terminal
     /// tabs and pull their scrollback. Weak so it never keeps the group alive (the
     /// group already owns this view's `Entity`). `None` in tests / standalone use,
     /// which simply omits the terminal sources.
     pane_group: Option<WeakEntity<PaneGroup>>,
+}
+
+/// Compute, for each USER turn in order, its child index within the flattened
+/// transcript scroll box — the input to `ScrollHandle::scroll_to_item` for a
+/// jump. Each slice is indexed by entry position in transcript order:
+/// `produces[i]` = entry `i` rendered a direct child element; `is_user[i]` =
+/// it's a user turn; `has_expander[i]` = a collapsed-tool-run expander child is
+/// pushed right after it. Children are counted in the exact push order
+/// `render_transcript` uses, so the returned indices line up with the tracked
+/// `list_scroll` child bounds. Pure + unit-tested; render feeds it the live
+/// per-entry flags.
+fn user_turn_child_indices(produces: &[bool], is_user: &[bool], has_expander: &[bool]) -> Vec<usize> {
+    let mut child_ord = 0usize;
+    let mut out = Vec::new();
+    for (i, &produced) in produces.iter().enumerate() {
+        if produced {
+            if is_user.get(i).copied().unwrap_or(false) {
+                out.push(child_ord);
+            }
+            child_ord += 1;
+        }
+        if has_expander.get(i).copied().unwrap_or(false) {
+            child_ord += 1;
+        }
+    }
+    out
 }
 
 impl AgentChatView {
@@ -540,6 +583,9 @@ impl AgentChatView {
             pending_edit: None,
             pane_group: None,
             show_background_tasks: false,
+            flash_entry: None,
+            flash_frames: 0,
+            user_child_ix: RefCell::new(Vec::new()),
         }
     }
 
@@ -937,6 +983,9 @@ impl AgentChatView {
             pending_edit: None,
             pane_group: None,
             show_background_tasks: false,
+            flash_entry: None,
+            flash_frames: 0,
+            user_child_ix: RefCell::new(Vec::new()),
         }
     }
 
@@ -1088,6 +1137,68 @@ impl AgentChatView {
     fn is_near_bottom(&self) -> bool {
         let sh = &self.list_scroll;
         sh.max_offset().y + sh.offset().y <= px(160.0)
+    }
+
+    /// Jump the transcript to the `n`-th user turn (0-based ordinal among user
+    /// messages) and briefly highlight it. Releases auto-follow so the jump
+    /// sticks, and re-issues the scroll once next frame in case the target's
+    /// markdown height is still settling. No-op if `n` is out of range or that
+    /// turn wasn't rendered this frame. Shared primitive for the jump menu
+    /// (Phase 2) and the message rail (Phase 3).
+    #[allow(dead_code)] // wired by the jump menu / message rail in later phases
+    fn scroll_to_user_ordinal(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let child_ix = match self.user_child_ix.borrow().get(n) {
+            Some(&ix) => ix,
+            None => return,
+        };
+        let Some(entry_idx) = self.thread.user_entry_index(n) else {
+            return;
+        };
+        self.stick_to_bottom = false;
+        self.list_scroll.scroll_to_item(child_ix);
+        self.flash_entry = Some(entry_idx);
+        self.flash_frames = FLASH_FRAMES;
+        // The target's height can settle a frame late (async markdown), which
+        // leaves a first scroll landing short when a long reply sits above it;
+        // re-issue once on the next frame against the freshly-measured bounds.
+        let this = cx.entity().downgrade();
+        window.on_next_frame(move |_window, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if let Some(&ix) = this.user_child_ix.borrow().get(n) {
+                    this.list_scroll.scroll_to_item(ix);
+                }
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
+    /// The user-turn ordinal currently at (or just above) the top of the
+    /// viewport — the anchor for prev/next navigation. `user_child_ix` is sorted
+    /// ascending (child index grows with ordinal), so a binary search over it
+    /// against the top visible child maps back to an ordinal. Returns 0 when
+    /// nothing is scrolled or there are no user turns.
+    #[allow(dead_code)] // wired by the jump menu / message rail in later phases
+    fn current_user_ordinal(&self) -> usize {
+        let top_child = self.list_scroll.top_item();
+        match self.user_child_ix.borrow().binary_search(&top_child) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    }
+
+    /// Move the jump target by `delta` user turns from the current top and scroll
+    /// there, clamped to the first/last user turn. Backs the prev/next-message
+    /// keyboard actions (Phase 2).
+    #[allow(dead_code)] // wired by the jump menu / message rail in later phases
+    fn jump_user_relative(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.user_child_ix.borrow().len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.current_user_ordinal() as isize;
+        let target = (cur + delta).clamp(0, count as isize - 1) as usize;
+        self.scroll_to_user_ordinal(target, window, cx);
     }
 
     /// The event channel closed — the agent process exited or its stdout was
@@ -1734,13 +1845,14 @@ impl AgentChatView {
                 .into_any_element();
         }
 
-        // Turns breathe a little more than inline content — a chat rhythm.
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .max_w(px(CONTENT_MAX_W))
-            .gap(px(density.pad_panel * 2.0));
+        // Flatten the transcript: each turn is a DIRECT child of the tracked
+        // scroll box (wrapped in a centered max-width column so the reading
+        // measure is unchanged) rather than sharing one inner `content` column.
+        // gpui records child bounds for direct children only, so this is what
+        // lets `ScrollHandle::scroll_to_item` reveal an exact user turn for jump
+        // navigation. The inter-turn gap moves from the old column onto the
+        // scroll box; turns breathe a little more than inline content.
+        let mut scroll = scroll.gap(px(density.pad_panel * 2.0));
 
         // Group long runs of tool cards: a run of >8 collapses to first-3 +
         // "N more" + last-2, with pending/failed cards always kept visible.
@@ -1771,10 +1883,22 @@ impl AgentChatView {
             .collect();
         let group_plan = plan_tool_grouping(&is_tool, &force_show, &self.expanded_tool_runs);
 
+        // Build each visible entry's element first, capturing per-entry flags so
+        // "which scroll child is which user turn" is a pure, unit-tested function
+        // (`user_turn_child_indices`) rather than logic tangled into the push loop.
+        struct Row {
+            entry_idx: usize,
+            el: Option<AnyElement>,
+            dimmed: bool,
+            is_user: bool,
+            expander: Option<AnyElement>,
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(self.thread.entries.len());
         for (idx, entry) in self.thread.entries.iter().enumerate() {
             if matches!(group_plan[idx], EntryDisplay::Hide) {
                 continue;
             }
+            let is_user = matches!(entry, ThreadEntry::User { .. });
             let el: Option<AnyElement> = match entry {
                 ThreadEntry::User { text, images, .. } => {
                     // No "You" caption — the right-aligned bubble is the signal.
@@ -1833,25 +1957,64 @@ impl AgentChatView {
                     Some(compaction_divider(summary, theme, &typo).into_any_element())
                 }
             };
-            if let Some(el) = el {
-                // A staged edit dims the messages it will remove on send.
-                if self.is_pending_edit_dimmed(idx) {
-                    content = content.child(div().w_full().opacity(0.4).child(el));
-                } else {
-                    content = content.child(el);
+            // A collapsed tool-run expander follows its anchor entry as its own child.
+            let expander = match group_plan[idx] {
+                EntryDisplay::ShowThenExpander { run_start, hidden } => {
+                    Some(self.render_tool_run_expander(run_start, hidden, cx))
                 }
+                _ => None,
+            };
+            let dimmed = el.is_some() && self.is_pending_edit_dimmed(idx);
+            rows.push(Row { entry_idx: idx, el, dimmed, is_user, expander });
+        }
+
+        // Pure child-index map (user ordinal → scroll child index), rebuilt every
+        // render and read by `scroll_to_user_ordinal` for jump nav / the rail.
+        let produces: Vec<bool> = rows.iter().map(|r| r.el.is_some()).collect();
+        let user_flags: Vec<bool> = rows.iter().map(|r| r.is_user).collect();
+        let expander_flags: Vec<bool> = rows.iter().map(|r| r.expander.is_some()).collect();
+        *self.user_child_ix.borrow_mut() =
+            user_turn_child_indices(&produces, &user_flags, &expander_flags);
+
+        // Push each entry (then any trailing tool-run expander) as a DIRECT child
+        // of the scroll box, in the exact order the index map counted, each in a
+        // centered max-width wrapper matching the old single column. The wrapper
+        // MUST be `flex().flex_col()` (not a bare block) so the max-width actually
+        // caps the child — a plain block lets a wide bubble overflow past the edge.
+        for row in rows {
+            if let Some(el) = row.el {
+                let mut wrap =
+                    div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(el);
+                if row.dimmed {
+                    // A staged edit dims the messages it will remove on send.
+                    wrap = wrap.opacity(0.4);
+                }
+                // A jumped-to turn briefly tints its wrapper (whole-row highlight),
+                // fading with the frame counter so it settles rather than snaps.
+                if self.flash_entry == Some(row.entry_idx) {
+                    let a = (self.flash_frames as f32 / FLASH_FRAMES as f32).clamp(0.0, 1.0);
+                    wrap = wrap
+                        .rounded(px(density.r_card))
+                        .bg(theme.focus_ring.opacity(0.16 * a));
+                }
+                scroll = scroll.child(wrap);
             }
-            // A collapsed tool-run expander follows its anchor entry.
-            if let EntryDisplay::ShowThenExpander { run_start, hidden } = group_plan[idx] {
-                content = content.child(self.render_tool_run_expander(run_start, hidden, cx));
+            if let Some(expander) = row.expander {
+                scroll = scroll.child(
+                    div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(expander),
+                );
             }
         }
         // Live turn / disconnect state lives at the tail of the transcript (like
         // a native chat), NOT above the composer — so it never resizes the input.
+        // These trail every user turn, so they never shift the child-index map.
         if self.disconnected {
-            content = content.child(
+            scroll = scroll.child(
                 div()
+                    .flex()
+                    .flex_col()
                     .w_full()
+                    .max_w(px(CONTENT_MAX_W))
                     .text_size(px(typo.t_body_sm))
                     .text_color(theme.fg_subtle)
                     .child(SharedString::from("Agent process exited.")),
@@ -1861,7 +2024,14 @@ impl AgentChatView {
             // blocked on the user's answer — so don't show the "working…" spinner
             // (it would also add height that pushes the card's controls down).
             if self.thread.pending_question().is_none() {
-                content = content.child(working_indicator(theme, &typo));
+                scroll = scroll.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_w(px(CONTENT_MAX_W))
+                        .child(working_indicator(theme, &typo)),
+                );
             }
         } else {
             // A settled turn: surface its one-line summary and token/cost usage
@@ -1873,10 +2043,24 @@ impl AgentChatView {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                content = content.child(summary_line(summary, theme, &typo));
+                scroll = scroll.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_w(px(CONTENT_MAX_W))
+                        .child(summary_line(summary, theme, &typo)),
+                );
             }
             if let Some(usage) = self.thread.usage.as_ref() {
-                content = content.child(usage_footer(usage, theme, &typo));
+                scroll = scroll.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_w(px(CONTENT_MAX_W))
+                        .child(usage_footer(usage, theme, &typo)),
+                );
             }
         }
         // Trailing clearance INSIDE the scrollable content, above the composer.
@@ -1914,8 +2098,8 @@ impl AgentChatView {
                 .unwrap_or(0.0);
             px(base + reveal)
         };
-        content = content.child(div().flex_none().w_full().h(tail_gap));
-        self.wrap_scroll(scroll.child(content)).into_any_element()
+        scroll = scroll.child(div().flex_none().w_full().h(tail_gap));
+        self.wrap_scroll(scroll).into_any_element()
     }
 
     /// Wrap the scrolling transcript box in a positioned container and overlay a
@@ -2105,6 +2289,23 @@ impl Render for AgentChatView {
                     let _ = this.update(cx, |_this, cx| cx.notify());
                 });
             }
+        }
+        // Fade out the jump highlight: the tinted bubble's alpha scales with
+        // `flash_frames` in `render_transcript`, so drain the counter a frame at a
+        // time (forcing a re-render each step) until it clears. A jump releases
+        // stick-to-bottom, so this normally runs alone; if the user scrolls back
+        // to the bottom while a flash is still fading, the follow loop above
+        // re-arms and both run for the remaining frames — harmless, as each
+        // counter is independently bounded (no shared state, no runaway).
+        if self.flash_frames > 0 {
+            self.flash_frames -= 1;
+            if self.flash_frames == 0 {
+                self.flash_entry = None;
+            }
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_window, cx| {
+                let _ = this.update(cx, |_this, cx| cx.notify());
+            });
         }
         let transcript = self.render_transcript(cx);
         div()
@@ -2387,6 +2588,45 @@ mod tests {
     use gpui::TestAppContext;
     use oximux_agents::thread::StubConnection;
     use serde_json::json;
+
+    #[test]
+    fn user_child_indices_map_ordinals_to_scroll_children() {
+        // Alternating user/assistant, every entry renders a child: user turns sit
+        // at even child indices.
+        assert_eq!(
+            user_turn_child_indices(
+                &[true, true, true, true],
+                &[true, false, true, false],
+                &[false, false, false, false],
+            ),
+            vec![0, 2],
+        );
+
+        // An empty assistant renders no child, so it doesn't consume a child
+        // index — the following user turn shifts up by one.
+        assert_eq!(
+            user_turn_child_indices(
+                &[true, false, true],
+                &[true, false, true],
+                &[false, false, false],
+            ),
+            vec![0, 1],
+        );
+
+        // A collapsed tool-run expander is its own extra child pushed after its
+        // anchor, so it advances the child counter without being a user turn.
+        assert_eq!(
+            user_turn_child_indices(
+                &[true, true, true, true],
+                &[true, false, false, true],
+                &[false, true, false, false],
+            ),
+            vec![0, 4],
+        );
+
+        // No entries → no user turns.
+        assert_eq!(user_turn_child_indices(&[], &[], &[]), Vec::<usize>::new());
+    }
 
     #[test]
     fn markdown_reveal_gap_zero_for_single_block_and_scales_with_tail() {

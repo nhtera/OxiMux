@@ -195,6 +195,10 @@ impl AgentChatView {
         match outcome {
             RewindOutcome::Done { new_sid, files_degraded } => {
                 self.thread.truncate_to_user(ordinal);
+                // Entry indices shift when the tail is dropped — clear any jump
+                // highlight so it can't tint the wrong bubble after the rewind.
+                self.flash_entry = None;
+                self.flash_frames = 0;
                 self.pre_turn_checkpoint = None;
                 self.thread.session_id = Some(new_sid);
                 // Respawn resumes the FORKED session. On failure it sets
