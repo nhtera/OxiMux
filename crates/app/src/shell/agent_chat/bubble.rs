@@ -70,6 +70,12 @@ pub(super) fn assistant_body(key: usize, body: &str, typo: &Typography) -> AnyEl
     };
     div()
         .w_full()
+        // `min_w_0` is load-bearing: the markdown view reports its longest
+        // *unwrapped* line as min-content width, and without this a flex ancestor
+        // honors that and lets the text overflow the column (clipping at the pane
+        // edge) instead of wrapping. Zeroing the min-width forces it to shrink to
+        // the column and wrap.
+        .min_w_0()
         .text_size(px(typo.t_body_md))
         .child(
             TextView::markdown(("chat-assistant-md", key), body.to_string())

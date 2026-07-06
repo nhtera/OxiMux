@@ -809,9 +809,13 @@ impl PaneGroup {
         // Fold an in-chat model switch back into this tab's kind so the choice
         // survives relaunch (the layout persists the kind). Detached: it stops
         // firing and is cleaned up when the chat view is dropped (tab closed).
-        cx.subscribe(&view, |this, v, ev: &crate::shell::agent_chat::AgentChatEvent, cx| {
-            this.on_agent_chat_event(&v, ev, cx);
-        })
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, v, ev: &crate::shell::agent_chat::AgentChatEvent, window, cx| {
+                this.on_agent_chat_event(v, ev, window, cx);
+            },
+        )
         .detach();
         let n = self
             .tabs
@@ -850,6 +854,7 @@ impl PaneGroup {
         &mut self,
         view: &Entity<crate::shell::agent_chat::AgentChatView>,
         ev: &crate::shell::agent_chat::AgentChatEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match ev {
@@ -863,6 +868,27 @@ impl PaneGroup {
                     }
                 }
                 cx.notify();
+            }
+            crate::shell::agent_chat::AgentChatEvent::ForkReady {
+                cwd,
+                model,
+                session_id,
+                entries,
+                slash_commands,
+                thinking_level,
+            } => {
+                // Open the truncated fork as a separate tab; the source tab is
+                // untouched (this is the whole point of Fork vs Rewind).
+                self.open_agent_chat_tab_restored(
+                    cwd.clone(),
+                    model.clone(),
+                    Some(session_id.clone()),
+                    entries.clone(),
+                    slash_commands.clone(),
+                    *thinking_level,
+                    window,
+                    cx,
+                );
             }
         }
     }

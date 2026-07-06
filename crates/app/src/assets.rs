@@ -28,6 +28,11 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/history.svg",
         include_bytes!("../assets/icons/history.svg"),
     ),
+    // Pencil glyph for the "Edit message" action on a user chat bubble.
+    (
+        "icons/pencil.svg",
+        include_bytes!("../assets/icons/pencil.svg"),
+    ),
     // Terminal glyph for the new-tab picker's "New Terminal" quick action.
     (
         "icons/square-terminal.svg",

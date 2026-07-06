@@ -117,6 +117,77 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// "Fork from here": branch the conversation at `entry_index` into a NEW
+    /// chat tab, leaving THIS tab and its session fully intact. Reuses the same
+    /// truncate-fork as rewind (keep everything before the target user message)
+    /// but hands the result to the host to open as a separate tab instead of
+    /// replacing this one — so the original thread stays put while the fork
+    /// explores a different direction.
+    ///
+    /// Idle-only: the on-disk session file is read directly (no child cancel),
+    /// so the CLI must have flushed the last turn. The original file is never
+    /// modified; the truncated copy lands under a fresh session id.
+    pub(super) fn request_fork(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        if self.rewinding || self.thread.turn_active {
+            return;
+        }
+        let Some(old_sid) = self.thread.session_id.clone() else { return };
+        let Some(ordinal) = self.user_ordinal_at(entry_index) else { return };
+        let Some(expected_text) = (match self.thread.entries.get(entry_index) {
+            Some(ThreadEntry::User { text, .. }) => Some(text.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.thread.last_error = Some("Fork unavailable: no async runtime".into());
+            cx.notify();
+            return;
+        };
+
+        // The forked tab's in-memory transcript matches the file cut: everything
+        // before the target user message.
+        let entries = self.thread.entries[..entry_index].to_vec();
+        let cwd = self.cwd.clone();
+        let model = self.model.clone();
+        let slash_commands = self.thread.slash_commands.clone();
+        let thinking_level = self.thinking_level;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        handle.spawn(async move {
+            let res = match session_file_fork::default_projects_root() {
+                Some(root) => tokio::task::spawn_blocking(move || {
+                    session_file_fork::fork_truncated(&root, &old_sid, ordinal, &expected_text)
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("fork task: {e}"))),
+                None => Err("cannot locate ~/.claude/projects".into()),
+            };
+            let _ = tx.send(res);
+        });
+        cx.spawn(async move |this, cx| {
+            let res = rx.await.unwrap_or_else(|_| Err("fork task dropped".into()));
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(session_id) => {
+                    cx.emit(super::AgentChatEvent::ForkReady {
+                        cwd,
+                        model,
+                        session_id,
+                        entries,
+                        slash_commands,
+                        thinking_level,
+                    });
+                }
+                Err(msg) => {
+                    this.thread.last_error = Some(format!("Fork failed: {msg}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn cancel_rewind_confirm(&mut self, cx: &mut Context<Self>) {
         if self.rewind_confirm.take().is_some() {
             cx.notify();

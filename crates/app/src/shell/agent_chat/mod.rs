@@ -119,6 +119,18 @@ pub enum AgentChatEvent {
     /// The user picked a different model; the host persists it in the tab kind
     /// so the choice survives relaunch (the view already respawned on it).
     ModelChanged(String),
+    /// "Fork from here": a truncated fork of this session was written to disk;
+    /// the host should open it as a NEW chat tab (this tab is left untouched).
+    /// Carries everything `open_agent_chat_tab_restored` needs to rehydrate the
+    /// branch and resume it with `--resume <session_id>`.
+    ForkReady {
+        cwd: PathBuf,
+        model: Option<String>,
+        session_id: String,
+        entries: Vec<ThreadEntry>,
+        slash_commands: Vec<String>,
+        thinking_level: ThinkingLevel,
+    },
 }
 
 /// How assistant thinking blocks are shown across the whole chat.
@@ -296,6 +308,14 @@ pub struct AgentChatView {
     /// shifted index never tints the wrong bubble.
     flash_entry: Option<usize>,
     flash_frames: u8,
+    /// Entry index whose Copy action just fired — swaps that bubble's copy glyph
+    /// to a ✓ for a beat as confirmation. Transient/cosmetic, so an index that
+    /// shifts under a rewind at worst mistints for <1.5s. Reverted by
+    /// [`Self::_copied_clear_task`].
+    recently_copied: Option<usize>,
+    /// Reverts `recently_copied` to `None` a beat after a copy. Held so a rapid
+    /// second copy replaces (cancels) the prior revert timer.
+    _copied_clear_task: Option<Task<()>>,
     /// Child index within the tracked scroll box for each USER turn, in order
     /// (user ordinal → child index). Rebuilt every render so a jump can
     /// `ScrollHandle::scroll_to_item` the exact bubble. `RefCell` because the
@@ -598,6 +618,8 @@ impl AgentChatView {
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
+            recently_copied: None,
+            _copied_clear_task: None,
             user_child_ix: RefCell::new(Vec::new()),
             rail_hover: false,
             menu_hover: false,
@@ -1000,6 +1022,8 @@ impl AgentChatView {
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
+            recently_copied: None,
+            _copied_clear_task: None,
             user_child_ix: RefCell::new(Vec::new()),
             rail_hover: false,
             menu_hover: false,
@@ -1604,54 +1628,105 @@ impl AgentChatView {
         if !text.is_empty() {
             col = col.child(bubble::user_body(text, theme, density, &typo));
         }
-        // A ↺ Rewind affordance appears on hover once this turn has a session to
-        // fork (session id present) and we're not mid-rewind. It's shown for any
-        // prior user message; the confirm card gates the files axis on whether
-        // the checkpoint actually captured a change.
+        // Hover-revealed action row of minimal icon buttons (native-chat style):
+        // Copy is always available; Edit / Rewind appear once this turn has a
+        // session to fork (session id present) and we're not mid-rewind. Edit is
+        // idle-only (a live turn would queue the resend instead of routing it);
+        // Rewind cancels the turn first, so it stays available.
         let can_rewind = self.thread.session_id.is_some() && !self.rewinding;
-        if can_rewind {
-            let group = SharedString::from(format!("user-entry-{idx}"));
-            col = div()
-                .group(group.clone())
-                .flex()
-                .flex_col()
-                .items_end()
-                .w_full()
-                .gap(px(6.0))
-                .child(col)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(6.0))
-                        .invisible()
-                        .group_hover(group, |s| s.visible())
-                        // Edit is offered only when the turn is idle (a live turn
-                        // would queue the resend instead of routing it) — Rewind,
-                        // which cancels the turn first, stays available.
-                        .when(!self.thread.turn_active, |row| {
-                            row.child(message_action_chip(
-                                SharedString::from(format!("edit-btn-{idx}")),
-                                "✎",
-                                "Edit",
-                                theme,
-                                cx.listener(move |this, _e, window, cx| {
-                                    this.enter_pending_edit(idx, window, cx);
-                                }),
-                            ))
-                        })
-                        .child(message_action_chip(
+        let copied = self.recently_copied == Some(idx);
+        let copy_text = text.to_string();
+        let group = SharedString::from(format!("user-entry-{idx}"));
+        col = div()
+            .group(group.clone())
+            .flex()
+            .flex_col()
+            .items_end()
+            .w_full()
+            .gap(px(6.0))
+            .child(col)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(2.0))
+                    .invisible()
+                    .group_hover(group, |s| s.visible())
+                    .child(message_action_icon(
+                        SharedString::from(format!("copy-btn-{idx}")),
+                        if copied { "icons/check.svg" } else { "icons/copy.svg" },
+                        if copied { "Copied" } else { "Copy" },
+                        if copied { theme.status_ok } else { theme.fg_muted },
+                        theme,
+                        cx.listener(move |this, _e, _w, cx| {
+                            this.copy_message(idx, copy_text.clone(), cx);
+                        }),
+                    ))
+                    .when(can_rewind && !self.thread.turn_active, |row| {
+                        row.child(message_action_icon(
+                            SharedString::from(format!("edit-btn-{idx}")),
+                            "icons/pencil.svg",
+                            "Edit message",
+                            theme.fg_muted,
+                            theme,
+                            cx.listener(move |this, _e, window, cx| {
+                                this.enter_pending_edit(idx, window, cx);
+                            }),
+                        ))
+                    })
+                    .when(can_rewind, |row| {
+                        row.child(message_action_icon(
                             SharedString::from(format!("rewind-btn-{idx}")),
-                            "↺",
-                            "Rewind",
+                            "icons/undo-2.svg",
+                            "Rewind to here",
+                            theme.fg_muted,
                             theme,
                             cx.listener(move |this, _e, _w, cx| {
                                 this.open_rewind_confirm(idx, cx)
                             }),
-                        )),
-                );
-        }
+                        ))
+                    })
+                    // Fork branches to a NEW tab, reading the on-disk session
+                    // file directly — so it's idle-only (like Edit), whereas
+                    // Rewind cancels the turn first.
+                    .when(can_rewind && !self.thread.turn_active, |row| {
+                        row.child(message_action_icon(
+                            SharedString::from(format!("fork-btn-{idx}")),
+                            "icons/git-branch.svg",
+                            "Fork from here",
+                            theme.fg_muted,
+                            theme,
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.request_fork(idx, cx)
+                            }),
+                        ))
+                    }),
+            );
         col.into_any_element()
+    }
+
+    /// Copy a message's text to the clipboard and flash the source bubble's copy
+    /// glyph to a ✓ for a beat as confirmation. A rapid second copy replaces the
+    /// prior revert timer (held in `_copied_clear_task`) so the ✓ tracks the
+    /// latest copy.
+    fn copy_message(&mut self, entry_idx: usize, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.recently_copied = Some(entry_idx);
+        cx.notify();
+        self._copied_clear_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1400))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.recently_copied == Some(entry_idx) {
+                    view.recently_copied = None;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     /// The decoded images of one transcript entry (empty for a non-user entry or
@@ -1914,9 +1989,21 @@ impl AgentChatView {
                             .group(group.clone())
                             .flex()
                             .flex_col()
+                            // Let the column shrink to the max-width wrapper so a
+                            // long markdown line wraps instead of overflowing the
+                            // edge (see `bubble::assistant_body`).
+                            .min_w_0()
                             .gap(px(4.0))
                             .w_full()
-                            .child(assistant_header(group, &msg.text, theme, &typo, cx));
+                            .child(assistant_header(
+                                idx,
+                                self.recently_copied == Some(idx),
+                                group,
+                                &msg.text,
+                                theme,
+                                &typo,
+                                cx,
+                            ));
                         // Thinking display honors the chat-wide level (see
                         // `thinking_expanded`): Hidden drops the block; Expanded
                         // forces it open; Auto peeks the streaming thought and
@@ -2529,6 +2616,8 @@ fn fmt_tokens(n: u64) -> String {
 /// reply's raw markdown to the clipboard. Built here (not `bubble`) because the
 /// click needs a `Context` listener.
 fn assistant_header(
+    entry_idx: usize,
+    copied: bool,
     group: SharedString,
     text: &str,
     theme: Theme,
@@ -2536,6 +2625,7 @@ fn assistant_header(
     cx: &mut Context<AgentChatView>,
 ) -> AnyElement {
     let copy_text = text.to_string();
+    let tip: SharedString = if copied { "Copied".into() } else { "Copy".into() };
     div()
         .flex()
         .flex_row()
@@ -2547,18 +2637,29 @@ fn assistant_header(
             div()
                 .id(SharedString::from(format!("copy-{group}")))
                 .flex_none()
-                .text_size(px(typo.t_label_xs))
-                .text_color(theme.fg_subtle)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.0))
+                .rounded(px(6.0))
                 .cursor_pointer()
                 // Reserve its slot (invisible, not absent) so the caption never
                 // shifts; reveal on hover of the surrounding message block.
                 .invisible()
                 .group_hover(group, |s| s.visible())
-                .hover(|s| s.text_color(theme.fg_base))
-                .on_click(cx.listener(move |_this, _e, _w, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                .hover(|s| s.bg(theme.hover_overlay))
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.copy_message(entry_idx, copy_text.clone(), cx);
                 }))
-                .child(SharedString::from("Copy")),
+                .child(
+                    Icon::default()
+                        .path(if copied { "icons/check.svg" } else { "icons/copy.svg" })
+                        .size(px(13.0))
+                        .text_color(if copied { theme.status_ok } else { theme.fg_subtle }),
+                ),
         )
         .into_any_element()
 }
@@ -3472,37 +3573,36 @@ mod tests {
     }
 }
 
-/// A hover-revealed action chip on a user message (Edit / Rewind). Rendered as a
-/// small ghost button — icon + label inside a subtle bordered pill that fills on
-/// hover — so the affordance reads as a control rather than loose link text.
-fn message_action_chip(
+/// A hover-revealed icon action on a user message (Copy / Edit / Rewind).
+/// Minimal ghost button — just the glyph with a soft hover wash and a tooltip
+/// naming the action — matching the restrained affordances of a native chat
+/// client. `icon_color` lets the caller tint it (e.g. green ✓ right after Copy).
+fn message_action_icon(
     id: SharedString,
-    icon: &'static str,
-    label: &'static str,
+    icon_path: &'static str,
+    tooltip: &'static str,
+    icon_color: gpui::Hsla,
     theme: Theme,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let tip = SharedString::from(tooltip);
     div()
         .id(id)
         .flex()
-        .flex_row()
         .items_center()
-        .gap(px(4.0))
-        .px(px(7.0))
-        .py(px(3.0))
+        .justify_center()
+        .size(px(24.0))
         .rounded(px(6.0))
-        .text_xs()
-        .text_color(theme.fg_muted)
-        .bg(theme.bg_panel_alt)
-        .border_1()
-        .border_color(theme.border_inactive)
         .cursor_pointer()
-        .hover(|s| {
-            s.bg(theme.hover_overlay)
-                .text_color(theme.fg_base)
-                .border_color(theme.border_active)
+        .hover(|s| s.bg(theme.hover_overlay))
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
         })
-        .child(div().text_color(theme.fg_subtle).child(icon))
-        .child(label)
+        .child(
+            Icon::default()
+                .path(icon_path)
+                .size(px(14.0))
+                .text_color(icon_color),
+        )
         .on_mouse_down(MouseButton::Left, on_click)
 }
