@@ -4,6 +4,23 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-07 — Agent Chat: Claude-Desktop completion tail (6 view-layer gaps)
+
+**Touches**: `crates/app/src/shell/agent_chat/{mod,bubble,tool_bodies,rewind_menu,composer,error_card (new),find_bar (new)}.rs`, `crates/agents/src/thread/state.rs`, `crates/app/src/assets.rs`
+
+Closes the short, high-value tail between the shipped Claude chat and a Claude-Desktop-grade experience. All changes are view-layer + one `ChatThread` method; none touch the stream-json transport or the `AgentConnection` seam, so this ships independently of the multi-provider work.
+
+- **Reliability bug — silent mid-conversation error (P1).** A turn that errored *after* the first message was swallowed: `last_error` was only rendered by the empty-state hint, which paints solely on a blank transcript. Now an inline error card sits at the transcript tail (idle + connected + non-empty + `last_error`), with a **Retry** that re-sends the last prompt (alive → direct; crashed/interrupted → respawn-then-send), gated on `!turn_active` so it never double-sends. `last_error` clears on turn start; the disconnected banner gained the same Retry(respawn) affordance.
+- **Regenerate.** Settled assistant replies in the *last* turn expose a Regenerate action beside Copy, reusing the rewind machinery verbatim (session-file fork + respawn-then-send via `rewind_then_send`) so the resumed CLI session matches the truncated transcript — no second truncation path. Restricted to the tail turn (UI gate + method guard) so it can never silently drop earlier turns.
+- **Markdown polish.** Code fences in replies get a language tag + one-click copy (ported from the markdown preview pane); thinking blocks render as markdown instead of raw source.
+- **Generic tool cards.** WebFetch / WebSearch / `mcp__*` now render legible bodies (URL/query header + capped result, compact MCP arg line) instead of raw key:value JSON; Task/Agent was already covered. Unknown tools still fall back to the generic card.
+- **New / Clear in place.** `ChatThread::clear()` + a "New chat" composer button reset the tab to a fresh non-resumed session (old child reaped); typing `/clear` is intercepted and resets locally instead of being sent as literal text. Guards on `rewinding` to avoid racing an in-flight rewind's respawn.
+- **In-chat find (Cmd+F).** A find bar over the transcript searches user/assistant/tool text and steps between matches (`n/total`, ↑/↓), reusing a new entry→scroll-child map and the shared row-flash. `Search` is handled on the focused chat (stops propagation before the workspace-root→terminal fallback); Enter/Shift+Enter route to next/prev only while the find input is focused. Counter only counts jumpable (visible-transcript) matches. Close: the ✕ button, Escape (via `capture_action(InputEscape)`), OR a second Cmd+F (toggle) — the toggle is a deliberate keyboard-close fallback because some macOS input methods swallow Escape while a text field is focused.
+
+Gates: `cargo check -p oximux-app` clean; `cargo test -p oximux-app -p oximux-agents --lib` green (1197 + 400, incl. new tests for the error/retry path, regenerate selection + non-tail refusal, tool-card dispatch, `clear()`, `recompute_matches`, and the entry-child map); `cargo test --workspace --no-fail-fast` shows only 2 pre-existing unrelated `right_sidebar_tab` stale-test failures (flagged separately). Clippy clean on all touched files. A `code-reviewer` pass found 6 issues (1 critical, 1 high, 2 medium, 2 low); all addressed in-session (see `plans/reports/reviewer-260707-agent-chat-completion.md`). **GUI-verified via computer-use** on the fresh build: code-block copy button, Regenerate present on the last reply + hidden on earlier replies (the critical fix), New-chat reset + empty-restore, and the find bar (open/`n/total`/Enter-next/toggle-close). Found + fixed one GUI bug during verification: the find bar didn't close on Escape (this machine's IME eats Escape) → added the Cmd+F toggle-close. Plan: `plans/260707-0253-oximux-agent-chat-claude-desktop-completion/`.
+
+---
+
 ### 2026-06-30 — Fix: Send-to-Agent routes to the agent you last used
 
 **Touches**: `crates/app/src/shell/pane_group/state.rs`, `crates/app/src/shell/project_panes/state.rs`

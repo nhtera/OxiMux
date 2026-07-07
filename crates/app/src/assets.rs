@@ -67,6 +67,11 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/refresh-cw.svg",
         include_bytes!("../assets/icons/refresh-cw.svg"),
     ),
+    // "New chat" glyph for the agent-chat composer toolbar.
+    (
+        "icons/plus.svg",
+        include_bytes!("../assets/icons/plus.svg"),
+    ),
     (
         "icons/circle-slash.svg",
         include_bytes!("../assets/icons/circle-slash.svg"),

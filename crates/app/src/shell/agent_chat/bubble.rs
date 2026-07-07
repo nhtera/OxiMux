@@ -6,9 +6,11 @@
 //! toggle, the scroll container) lives in the view; keeping these pure means
 //! the view file stays small and this file needs no `Context`.
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{AnyElement, Hsla, IntoElement, ParentElement, SharedString, Styled, div, px};
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::{ActiveTheme, clipboard::Clipboard, h_flex};
 use oximux_agents::thread::{ToolCall, ToolCallStatus};
 use oximux_settings::{Density, Theme, Typography};
 use serde_json::Value;
@@ -81,27 +83,62 @@ pub(super) fn assistant_body(key: usize, body: &str, typo: &Typography) -> AnyEl
         .child(
             TextView::markdown(("chat-assistant-md", key), body.to_string())
                 .style(style)
+                // Fenced code gets a language tag + one-click copy on hover, the
+                // way a polished chat surfaces a code answer (selection-copy is
+                // still available; this is the affordance). The closure resolves
+                // the active theme at render time, so this stays cx-free here.
+                .code_block_actions(|code_block, _window, cx| {
+                    let code = code_block.code();
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .when_some(code_block.lang(), |this, lang| {
+                            this.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(lang),
+                            )
+                        })
+                        .child(Clipboard::new("chat-code-copy").value(code))
+                })
                 .selectable(true),
         )
         .into_any_element()
 }
 
 /// The extended-thinking body shown when its disclosure is expanded. Muted +
-/// left-ruled so it reads as secondary to the reply.
+/// left-ruled so it reads as secondary to the reply, and rendered as markdown
+/// (thinking traces routinely contain lists / code / emphasis that read as raw
+/// source otherwise). `key` discriminates the renderer's per-block state so two
+/// thinking blocks never share it.
 pub(super) fn thinking_body(
+    key: usize,
     text: &str,
     theme: Theme,
     density: Density,
     typo: &Typography,
 ) -> AnyElement {
+    let style = TextViewStyle {
+        is_dark: true,
+        highlight_theme: HighlightTheme::default_dark(),
+        ..Default::default()
+    };
     div()
         .w_full()
+        // Same wrap trap as `assistant_body`: markdown reports its longest
+        // unwrapped line as min-content, so zero the min-width to force wrapping.
+        .min_w_0()
         .border_l_2()
         .border_color(theme.border_inactive)
         .pl(px(density.pad_panel))
         .text_size(px(typo.t_body_sm))
         .text_color(theme.fg_muted)
-        .child(SharedString::from(text.to_string()))
+        .child(
+            TextView::markdown(("chat-thinking-md", key), text.to_string())
+                .style(style)
+                .selectable(true),
+        )
         .into_any_element()
 }
 

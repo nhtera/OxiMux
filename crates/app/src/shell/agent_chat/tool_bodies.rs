@@ -1,7 +1,8 @@
 //! Legible per-tool body renderers for the transcript, so common tools read
 //! like a chat instead of a raw-JSON log dump. Only Edit/Write/MultiEdit have a
-//! diff (see `diff_card`); this covers Bash/Read/Grep/Glob. Everything else
-//! falls back to the generic raw-input + result blocks in `tool_card`.
+//! diff (see `diff_card`); this covers Bash/Read/Grep/Glob, Agent/Task, the web
+//! tools (WebFetch/WebSearch), and any `mcp__*` tool. Everything else falls back
+//! to the generic key:value input + result blocks in `tool_card`.
 //!
 //! Read-only and built on demand (the caller only invokes these when a card is
 //! expanded), and every output is capped by chars then rows so a chatty tool
@@ -33,6 +34,11 @@ pub(super) fn render_tool_body(
         "Grep" => Some(render_matches(tc, "match", theme, density, typo)),
         "Glob" => Some(render_matches(tc, "file", theme, density, typo)),
         "Agent" | "Task" => Some(render_agent(tc, theme, density, typo)),
+        "WebFetch" => Some(render_webfetch(tc, theme, density, typo)),
+        "WebSearch" => Some(render_websearch(tc, theme, density, typo)),
+        // MCP tools are journaled as `mcp__<server>__<tool>`; the header already
+        // humanizes the name, so the body stays a terse input+result view.
+        name if name.starts_with("mcp__") => Some(render_mcp(tc, theme, density, typo)),
         _ => None,
     }
 }
@@ -177,6 +183,64 @@ fn render_agent(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography
     col.into_any_element()
 }
 
+/// WebFetch → the fetched URL (prominent) plus the extraction prompt and a
+/// capped slice of the returned page text. The result carries the payload, so
+/// the input is just a header here.
+fn render_webfetch(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+    let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
+    let url = input_str(tc, "url");
+    if !url.trim().is_empty() {
+        col = col.child(code_block(url, theme.status_info, theme, density, typo));
+    }
+    let prompt = input_str(tc, "prompt");
+    if !prompt.trim().is_empty() {
+        col = col.child(caption(bubble::elide(prompt, 200), theme, typo));
+    }
+    if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
+        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+    }
+    col.into_any_element()
+}
+
+/// WebSearch → the query (prominent) plus the returned result list. The result
+/// list (titles/URLs) is the payload, shown as a capped block.
+fn render_websearch(
+    tc: &ToolCall,
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> AnyElement {
+    let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
+    let query = input_str(tc, "query");
+    if !query.trim().is_empty() {
+        col = col.child(code_block(query, theme.status_info, theme, density, typo));
+    }
+    if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
+        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+    }
+    col.into_any_element()
+}
+
+/// MCP (`mcp__<server>__<tool>`) → a single compact-JSON line of the arguments
+/// (the header names the server/tool) followed by the capped result. Terser
+/// than the generic per-field view for tools whose args are position/coordinate
+/// heavy (browser/computer-use), where one line reads better than many.
+fn render_mcp(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+    let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
+    let summary = match &tc.input {
+        Value::Null => String::new(),
+        Value::Object(map) if map.is_empty() => String::new(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    if !summary.is_empty() {
+        col = col.child(code_block(&summary, theme.fg_muted, theme, density, typo));
+    }
+    if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
+        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+    }
+    col.into_any_element()
+}
+
 /// Grep/Glob → a count header + the match/file list (`noun` = "match"/"file").
 fn render_matches(
     tc: &ToolCall,
@@ -261,13 +325,18 @@ mod tests {
             tc.result = Some("line one\nline two".into());
             tc
         };
-        for t in ["Bash", "Read", "Grep", "Glob", "Agent", "Task"] {
+        for t in [
+            "Bash", "Read", "Grep", "Glob", "Agent", "Task", "WebFetch", "WebSearch",
+            "mcp__chrome-devtools-mcp__click",
+        ] {
             assert!(
                 render_tool_body(&mk(t), Theme::default(), Density::default(), &Typography::default()).is_some(),
                 "{t} should render a bespoke body"
             );
         }
-        for t in ["Edit", "Write", "MultiEdit", "WebFetch", "SomethingNew"] {
+        // Edit/Write/MultiEdit render a diff in `tool_card`, not here; a truly
+        // unknown tool falls back to the generic key:value card.
+        for t in ["Edit", "Write", "MultiEdit", "SomethingNew"] {
             assert!(
                 render_tool_body(&mk(t), Theme::default(), Density::default(), &Typography::default()).is_none(),
                 "{t} should fall back to the generic card"
@@ -295,6 +364,24 @@ mod tests {
             "totalTokens": 12345u64, "totalDurationMs": 8200u64, "content": "found it"
         }));
         let _ = render_tool_body(&agent, theme, density, &typo);
+        // Web tools + MCP: URL/query header + result, and a compact MCP input
+        // line — all must build, and must degrade gracefully on missing fields.
+        let mut fetch = ToolCall::new("t", "WebFetch", json!({"url": "https://ex.com", "prompt": "get x"}));
+        fetch.result = Some("page text".into());
+        let _ = render_tool_body(&fetch, theme, density, &typo);
+        let _ = render_tool_body(&ToolCall::new("t", "WebFetch", json!({})), theme, density, &typo);
+        let mut search = ToolCall::new("t", "WebSearch", json!({"query": "gpui focus"}));
+        search.result = Some("1. Title — https://a\n2. Title — https://b".into());
+        let _ = render_tool_body(&search, theme, density, &typo);
+        let mut mcp = ToolCall::new("t", "mcp__chrome-devtools-mcp__click", json!({"uid": "42"}));
+        mcp.result = Some("clicked".into());
+        let _ = render_tool_body(&mcp, theme, density, &typo);
+        let _ = render_tool_body(
+            &ToolCall::new("t", "mcp__x__y", json!(null)),
+            theme,
+            density,
+            &typo,
+        );
     }
 
     #[test]

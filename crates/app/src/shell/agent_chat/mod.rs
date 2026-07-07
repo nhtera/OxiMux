@@ -17,6 +17,8 @@ mod composer;
 mod composer_history;
 mod context_providers;
 mod diff_card;
+mod error_card;
+mod find_bar;
 mod image_attach;
 mod jump_menu;
 mod message_rail;
@@ -48,6 +50,7 @@ use gpui::{
 };
 use gpui_component::Icon;
 use gpui_component::input::Enter as InputEnter;
+use gpui_component::input::Escape as InputEscape;
 use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
@@ -321,6 +324,13 @@ pub struct AgentChatView {
     /// `ScrollHandle::scroll_to_item` the exact bubble. `RefCell` because the
     /// transcript renders behind `&self`; only touched on the main thread.
     user_child_ix: RefCell<Vec<usize>>,
+    /// Child index within the tracked scroll box for each RENDERED entry
+    /// (`entry index → child index`), rebuilt every render. Unlike
+    /// [`Self::user_child_ix`] this covers assistant/tool entries too, so the
+    /// in-chat find bar can jump to any matching entry, not just user turns.
+    entry_child_ix: RefCell<HashMap<usize, usize>>,
+    /// The in-transcript find bar (Cmd+F), when open. See [`find_bar`].
+    find_bar: Option<find_bar::FindBar>,
     /// Pointer is over the left tick-rail. Either this or [`Self::menu_hover`]
     /// being set expands the jump-to-message list next to the rail — hovering
     /// the rail reveals it, hovering the list keeps it open (they sit edge-to-
@@ -353,6 +363,29 @@ fn user_turn_child_indices(produces: &[bool], is_user: &[bool], has_expander: &[
             if is_user.get(i).copied().unwrap_or(false) {
                 out.push(child_ord);
             }
+            child_ord += 1;
+        }
+        if has_expander.get(i).copied().unwrap_or(false) {
+            child_ord += 1;
+        }
+    }
+    out
+}
+
+/// Map every RENDERED entry's transcript index → its scroll-child index (for the
+/// in-chat find bar's jump-to-match), mirroring the push order in
+/// `render_transcript`: one child per producing row, plus one per trailing
+/// expander. Rows that produce no element are absent. Pure for unit testing.
+fn entry_child_indices(
+    entry_idx: &[usize],
+    produces: &[bool],
+    has_expander: &[bool],
+) -> Vec<(usize, usize)> {
+    let mut child_ord = 0usize;
+    let mut out = Vec::new();
+    for i in 0..produces.len() {
+        if produces[i] {
+            out.push((entry_idx[i], child_ord));
             child_ord += 1;
         }
         if has_expander.get(i).copied().unwrap_or(false) {
@@ -444,6 +477,7 @@ impl AgentChatView {
                     }
                 }
                 ComposerEvent::Stop => this.stop_turn(cx),
+                ComposerEvent::NewChat => this.new_chat(cx),
                 ComposerEvent::ModelPicked(model) => this.change_model(model.clone(), cx),
                 ComposerEvent::PermissionModePicked(mode) => {
                     this.change_permission_mode(mode.clone(), cx)
@@ -621,6 +655,8 @@ impl AgentChatView {
             recently_copied: None,
             _copied_clear_task: None,
             user_child_ix: RefCell::new(Vec::new()),
+            entry_child_ix: RefCell::new(HashMap::new()),
+            find_bar: None,
             rail_hover: false,
             menu_hover: false,
         }
@@ -710,6 +746,14 @@ impl AgentChatView {
         if text.is_empty() && images.is_empty() {
             return;
         }
+        // `/clear` is a UI command (blank the transcript + free context), not
+        // agent input — reset in place rather than transmitting the literal text
+        // to the subprocess (matching the CLI's own TUI). `/compact` stays a
+        // pass-through; real compaction is a backend concern.
+        if images.is_empty() && text.trim() == "/clear" {
+            self.new_chat(cx);
+            return;
+        }
         // A prior Stop killed the child but left the session resumable — bring it
         // back with `--resume` before sending so the conversation continues.
         if self.interrupted {
@@ -730,6 +774,133 @@ impl AgentChatView {
             self.thread.last_error = Some(format!("Send failed: {e}"));
         }
         // Jump to (and re-arm following of) the bottom for the new turn.
+        self.stick_to_bottom = true;
+        self.list_scroll.scroll_to_bottom();
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
+    /// Re-send the last user prompt after a turn ended in error (or the child
+    /// crashed). Reachable only from the idle error / disconnected tail cards —
+    /// gated on `!turn_active` so it never double-sends mid-turn. A crashed or
+    /// stopped child is respawned (via `--resume`) before the prompt is
+    /// retransmitted; the prompt bubble is already the tail entry, so it is NOT
+    /// pushed again.
+    fn retry_last_turn(&mut self, cx: &mut Context<Self>) {
+        if self.thread.turn_active {
+            return; // a turn is already streaming — nothing to retry
+        }
+        // A crashed / stopped child can't receive input — bring it back first.
+        if self.disconnected || self.interrupted {
+            self.respawn(cx);
+            if self.disconnected {
+                // Respawn failed (e.g. the resume file is gone); `respawn` left
+                // its own error text — keep the card rather than silently no-op.
+                cx.notify();
+                return;
+            }
+        }
+        let last_user_idx = self
+            .thread
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, ThreadEntry::User { .. }));
+        let last_user = last_user_idx.and_then(|i| match &self.thread.entries[i] {
+            ThreadEntry::User { text, images, .. } => Some((i, text.clone(), images.clone())),
+            _ => None,
+        });
+        match last_user {
+            Some((idx, text, images)) => {
+                let sent = match &self.connection {
+                    Some(conn) => match conn.send_user_message_with_images(&text, &images) {
+                        Ok(()) => {
+                            self.thread.last_error = None;
+                            self.thread.turn_active = true;
+                            true
+                        }
+                        Err(e) => {
+                            self.thread.last_error = Some(format!("Send failed: {e}"));
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                // Re-anchor the pre-turn checkpoint to the retried turn (as a
+                // fresh send would), so the "restore files" rewind affordance
+                // keeps tracking repo changes for it.
+                if sent {
+                    self.take_checkpoint_for(idx, cx);
+                }
+            }
+            None => {
+                // No prompt to replay (the connection failed before any turn) —
+                // the respawn above already restored a working, error-free idle
+                // state, so just drop the card.
+                self.thread.last_error = None;
+            }
+        }
+        self.stick_to_bottom = true;
+        self.list_scroll.scroll_to_bottom();
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
+    /// A small "Retry" control for the error / disconnected tail cards. Its
+    /// click re-sends the last user prompt (respawning the child first if it
+    /// crashed or was stopped).
+    fn retry_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let typo = &self.typography;
+        div()
+            .id("chat-retry-turn")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(theme.status_error.opacity(0.15))
+            .text_size(px(typo.t_body_sm))
+            .text_color(theme.status_error)
+            .hover(|s| s.bg(theme.status_error.opacity(0.28)))
+            .child(
+                Icon::default()
+                    .path("icons/refresh-cw.svg")
+                    .size(px(13.0))
+                    .text_color(theme.status_error),
+            )
+            .child(SharedString::from("Retry"))
+            .on_click(cx.listener(|this, _e, _window, cx| this.retry_last_turn(cx)))
+    }
+
+    /// Start a fresh conversation in this tab without closing it (Claude-Desktop
+    /// "New chat" / the CLI's `/clear`). Blanks the transcript, drops any
+    /// transient UI bound to it, and respawns a **non-resumed** session (the
+    /// cleared thread has no session id, so `respawn` starts clean and reaps the
+    /// old child). A fresh session mints its own id on the first turn, so the tab
+    /// persists empty until then (`transcript_snapshot` returns `None`).
+    fn new_chat(&mut self, cx: &mut Context<Self>) {
+        // A rewind in flight will, on completion, overwrite this tab's session id
+        // with its forked id and respawn again — which would silently resurrect
+        // the discarded conversation into the "blank" new chat. Refuse until it
+        // settles (mirrors every other rewind-adjacent entry point).
+        if self.rewinding {
+            return;
+        }
+        self.thread.clear();
+        // Transient view state keyed to the old transcript must not survive.
+        self.pending_edit = None;
+        self.rewind_confirm = None;
+        self.rewind_then_send = None;
+        self.pre_turn_checkpoint = None;
+        self.flash_entry = None;
+        self.flash_frames = 0;
+        self.recently_copied = None;
+        // Respawn reads the now-`None` session id → a fresh session, and clears
+        // `disconnected`/`interrupted`/`last_error` itself on success.
+        self.respawn(cx);
         self.stick_to_bottom = true;
         self.list_scroll.scroll_to_bottom();
         self.sync_composer(cx);
@@ -1025,6 +1196,8 @@ impl AgentChatView {
             recently_copied: None,
             _copied_clear_task: None,
             user_child_ix: RefCell::new(Vec::new()),
+            entry_child_ix: RefCell::new(HashMap::new()),
+            find_bar: None,
             rail_hover: false,
             menu_hover: false,
         }
@@ -1210,6 +1383,22 @@ impl AgentChatView {
                 cx.notify();
             });
         });
+        cx.notify();
+    }
+
+    /// Scroll so the entry at `entry_idx` is in view and briefly flash it — the
+    /// find bar's jump-to-match. Window-free (a single `scroll_to_item`, no
+    /// next-frame re-measure) because it's driven from the find input's change
+    /// subscription, which has no `Window`. Reads the per-entry child map
+    /// rebuilt each render (`entry_child_ix`).
+    fn scroll_to_entry(&mut self, entry_idx: usize, cx: &mut Context<Self>) {
+        let Some(&child_ix) = self.entry_child_ix.borrow().get(&entry_idx) else {
+            return;
+        };
+        self.stick_to_bottom = false;
+        self.list_scroll.scroll_to_item(child_ix);
+        self.flash_entry = Some(entry_idx);
+        self.flash_frames = FLASH_FRAMES;
         cx.notify();
     }
 
@@ -1998,6 +2187,20 @@ impl AgentChatView {
                             .child(assistant_header(
                                 idx,
                                 self.recently_copied == Some(idx),
+                                // Regenerate is a constrained rewind: offer it only
+                                // on a settled, resumable, connected thread AND only
+                                // on a reply in the LAST turn (no user prompt after
+                                // it). Regenerating an earlier reply would silently
+                                // fork + drop every later turn in one click, with no
+                                // confirmation — so it's restricted to the tail turn,
+                                // where the only thing dropped is the reply itself.
+                                !self.thread.turn_active
+                                    && !self.disconnected
+                                    && !self.rewinding
+                                    && self.thread.session_id.is_some()
+                                    && !self.thread.entries[idx + 1..]
+                                        .iter()
+                                        .any(|e| matches!(e, ThreadEntry::User { .. })),
                                 group,
                                 &msg.text,
                                 theme,
@@ -2063,6 +2266,11 @@ impl AgentChatView {
         let expander_flags: Vec<bool> = rows.iter().map(|r| r.expander.is_some()).collect();
         *self.user_child_ix.borrow_mut() =
             user_turn_child_indices(&produces, &user_flags, &expander_flags);
+        // Same child accounting, but keyed by entry index across all rendered
+        // entries — the find bar jumps to any matching entry, not just user turns.
+        let rows_entry_idx: Vec<usize> = rows.iter().map(|r| r.entry_idx).collect();
+        *self.entry_child_ix.borrow_mut() =
+            entry_child_indices(&rows_entry_idx, &produces, &expander_flags).into_iter().collect();
 
         // Push each entry (then any trailing tool-run expander) as a DIRECT child
         // of the scroll box, in the exact order the index map counted, each in a
@@ -2097,15 +2305,22 @@ impl AgentChatView {
         // a native chat), NOT above the composer — so it never resizes the input.
         // These trail every user turn, so they never shift the child-index map.
         if self.disconnected {
+            // A crash is terminal for this child, but the session is usually
+            // resumable — offer Retry, which respawns via `--resume` then
+            // re-sends the last prompt.
+            let msg = self
+                .thread
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Agent process exited.".to_string());
+            let retry = self.retry_button(cx);
             scroll = scroll.child(
                 div()
                     .flex()
                     .flex_col()
                     .w_full()
                     .max_w(px(CONTENT_MAX_W))
-                    .text_size(px(typo.t_body_sm))
-                    .text_color(theme.fg_subtle)
-                    .child(SharedString::from("Agent process exited.")),
+                    .child(error_card::error_card(&msg, theme, &typo, retry)),
             );
         } else if self.thread.turn_active {
             // While a question card is pending, the agent isn't working — it's
@@ -2121,6 +2336,20 @@ impl AgentChatView {
                         .child(working_indicator(theme, &typo)),
                 );
             }
+        } else if let Some(err) = self.thread.last_error.clone() {
+            // An idle turn that ended in error: surface it inline at the tail
+            // with a Retry. This is the ONLY place a failure after the first
+            // message becomes visible — the empty-state hint that also renders
+            // `last_error` only paints when the transcript is empty.
+            let retry = self.retry_button(cx);
+            scroll = scroll.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(CONTENT_MAX_W))
+                    .child(error_card::error_card(&err, theme, &typo, retry)),
+            );
         } else {
             // A settled turn: surface its one-line summary and token/cost usage
             // (both decoded by the backend; shown only when present).
@@ -2200,6 +2429,7 @@ impl AgentChatView {
             .children(self.render_message_rail(cx))
             .child(self.wrap_scroll(scroll))
             .children(self.render_jump_list(cx))
+            .children(self.render_find_bar(cx))
             .into_any_element()
     }
 
@@ -2421,10 +2651,28 @@ impl Render for AgentChatView {
             // consume it only when we actually had a staged edit to cancel, so
             // a normal Escape still dismisses other overlays.
             .on_action(cx.listener(|this, _: &crate::actions::DismissOverlay, window, cx| {
-                if this.pending_edit.is_some() {
+                if this.find_bar.is_some() {
+                    this.close_find(window, cx);
+                    cx.stop_propagation();
+                } else if this.pending_edit.is_some() {
                     this.cancel_pending_edit(window, cx);
                     cx.stop_propagation();
                 }
+            }))
+            // Cmd+F toggles the in-transcript find bar. This listener sits on the
+            // focused chat's dispatch path, so it fires (and stops propagation)
+            // before the workspace-root fallback routes `Search` to the active
+            // terminal's scrollback search — no collision. Toggling also gives a
+            // reliable keyboard CLOSE: some macOS input methods swallow Escape
+            // while a text field is focused (so the Esc-to-close below can't fire
+            // for those users), but a cmd-chord always reaches the app.
+            .on_action(cx.listener(|this, _: &crate::actions::Search, window, cx| {
+                if this.find_bar.is_some() {
+                    this.close_find(window, cx);
+                } else {
+                    this.open_find(window, cx);
+                }
+                cx.stop_propagation();
             }))
             // The Input context binds BOTH `enter` and `shift+enter` to the same
             // Enter{secondary:false} action, so the action alone can't tell them
@@ -2435,11 +2683,35 @@ impl Render for AgentChatView {
             // we stop propagation (otherwise the field inserts the newline). An
             // open slash/mention overlay makes ↵ accept the highlighted item.
             .capture_action(cx.listener(|this, _action: &InputEnter, window, cx| {
+                // The find bar owns Enter while its input is focused: ↵ steps to
+                // the next match, ⇧↵ to the previous. Otherwise route to the
+                // composer as before.
+                if this.find_bar_focused(window, cx) {
+                    if window.modifiers().shift {
+                        this.find_prev(cx);
+                    } else {
+                        this.find_next(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 let shift = window.modifiers().shift;
                 let handled = this
                     .composer
                     .update(cx, |c, cx| c.on_enter_key(shift, window, cx));
                 if handled {
+                    cx.stop_propagation();
+                }
+            }))
+            // A focused gpui-component input dispatches its OWN `Escape`
+            // (`InputEscape`), never the app-wide `DismissOverlay`, so the
+            // bubble-phase DismissOverlay handler above never sees Escape while
+            // the find input holds focus. Capture it here (ancestor-first, so it
+            // runs before the composer's own InputEscape) and close the bar; fall
+            // through otherwise so the composer keeps owning its Escape.
+            .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                if this.find_bar_focused(window, cx) {
+                    this.close_find(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -2610,14 +2882,16 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// The assistant caption row: the "Claude" label on the left and a Copy
-/// affordance on the right that's revealed while the message block is hovered
-/// (`group`) — the copy-on-hover pattern of a native chat. Clicking copies the
-/// reply's raw markdown to the clipboard. Built here (not `bubble`) because the
-/// click needs a `Context` listener.
+/// The assistant caption row: the "Claude" label on the left and hover-revealed
+/// actions on the right (`group`) — the affordance-on-hover pattern of a native
+/// chat. Copy copies the reply's raw markdown; Regenerate (shown only on a
+/// settled, resumable thread) re-rolls the reply to the preceding prompt. Built
+/// here (not `bubble`) because the clicks need a `Context` listener.
+#[allow(clippy::too_many_arguments)]
 fn assistant_header(
     entry_idx: usize,
     copied: bool,
+    can_regenerate: bool,
     group: SharedString,
     text: &str,
     theme: Theme,
@@ -2626,6 +2900,54 @@ fn assistant_header(
 ) -> AnyElement {
     let copy_text = text.to_string();
     let tip: SharedString = if copied { "Copied".into() } else { "Copy".into() };
+    // A hover-revealed ghost action button (reserves its slot so the caption
+    // never shifts). The trailing `child` (the glyph) is supplied per action.
+    let action_slot = |id: SharedString, group: SharedString| {
+        div()
+            .id(id)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .invisible()
+            .group_hover(group, |s| s.visible())
+            .hover(|s| s.bg(theme.hover_overlay))
+    };
+    let mut actions = div().flex().flex_row().items_center().gap(px(2.0));
+    if can_regenerate {
+        let regen_tip: SharedString = "Regenerate".into();
+        actions = actions.child(
+            action_slot(SharedString::from(format!("regen-{group}")), group.clone())
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(regen_tip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _e, _w, cx| this.regenerate(entry_idx, cx)))
+                .child(
+                    Icon::default()
+                        .path("icons/refresh-cw.svg")
+                        .size(px(13.0))
+                        .text_color(theme.fg_subtle),
+                ),
+        );
+    }
+    actions = actions.child(
+        action_slot(SharedString::from(format!("copy-{group}")), group)
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.copy_message(entry_idx, copy_text.clone(), cx);
+            }))
+            .child(
+                Icon::default()
+                    .path(if copied { "icons/check.svg" } else { "icons/copy.svg" })
+                    .size(px(13.0))
+                    .text_color(if copied { theme.status_ok } else { theme.fg_subtle }),
+            ),
+    );
     div()
         .flex()
         .flex_row()
@@ -2633,34 +2955,7 @@ fn assistant_header(
         .justify_between()
         .w_full()
         .child(bubble::role_caption("Claude", theme.fg_muted, typo))
-        .child(
-            div()
-                .id(SharedString::from(format!("copy-{group}")))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(22.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                // Reserve its slot (invisible, not absent) so the caption never
-                // shifts; reveal on hover of the surrounding message block.
-                .invisible()
-                .group_hover(group, |s| s.visible())
-                .hover(|s| s.bg(theme.hover_overlay))
-                .tooltip(move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                })
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.copy_message(entry_idx, copy_text.clone(), cx);
-                }))
-                .child(
-                    Icon::default()
-                        .path(if copied { "icons/check.svg" } else { "icons/copy.svg" })
-                        .size(px(13.0))
-                        .text_color(if copied { theme.status_ok } else { theme.fg_subtle }),
-                ),
-        )
+        .child(actions)
         .into_any_element()
 }
 
@@ -2692,7 +2987,7 @@ fn thinking_block(
 
     let mut block = div().flex().flex_col().gap(px(2.0)).w_full().child(header);
     if expanded {
-        block = block.child(bubble::thinking_body(text, theme, density, typo));
+        block = block.child(bubble::thinking_body(idx, text, theme, density, typo));
     }
     block.into_any_element()
 }
@@ -2741,6 +3036,22 @@ mod tests {
 
         // No entries → no user turns.
         assert_eq!(user_turn_child_indices(&[], &[], &[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn entry_child_indices_map_every_rendered_entry() {
+        // entry_idx per row, produces, has_expander. Row 1 (an empty assistant)
+        // produces no child; row 2 carries a trailing expander.
+        let entry_idx = [0usize, 1, 2, 3];
+        let produces = [true, false, true, true];
+        let has_expander = [false, false, true, false];
+        // Child indices: entry0→0, entry1 skipped, entry2→1 (+expander at 2),
+        // entry3→3. Keyed by entry index, not ordinal.
+        let mut got = entry_child_indices(&entry_idx, &produces, &has_expander);
+        got.sort();
+        assert_eq!(got, vec![(0, 0), (2, 1), (3, 3)]);
+        // Empty transcript → empty map.
+        assert!(entry_child_indices(&[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -3431,6 +3742,63 @@ mod tests {
             .expect("window update");
     }
 
+    /// Regenerate stages the PRECEDING user prompt (unchanged) for re-send via
+    /// the rewind machinery — the selection logic that decides *what* re-rolls.
+    /// The fork/respawn half is the shared rewind path (covered elsewhere); here
+    /// we assert the pick + the idle-only guard without a live async runtime.
+    #[gpui::test]
+    async fn regenerate_stages_preceding_user_prompt(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.session_id = Some("sid".into());
+                view.thread.push_user_message("first prompt");
+                view.thread.apply(&ThreadEvent::AssistantText("first reply".into()));
+                view.thread.push_user_message("second prompt");
+                view.thread.apply(&ThreadEvent::AssistantText("second reply".into()));
+                view.thread.apply(&ThreadEvent::TurnEnded {
+                    result: None,
+                    usage: None,
+                    is_error: false,
+                });
+
+                // Guard: while a turn is active, regenerate stages nothing.
+                view.thread.turn_active = true;
+                let asst_idx = view.thread.entries.len() - 1;
+                view.regenerate(asst_idx, cx);
+                assert!(view.rewind_then_send.is_none(), "no regenerate mid-turn");
+                view.thread.turn_active = false;
+
+                // Regenerating an EARLIER reply (the first, which has a later user
+                // turn) is refused — it would silently drop the later turn.
+                view.regenerate(1, cx);
+                assert!(
+                    view.rewind_then_send.is_none(),
+                    "regenerate refuses a non-tail reply (later turns would be lost)",
+                );
+
+                // Regenerating the last reply stages its owning prompt ("second
+                // prompt") unchanged for re-send — not the earlier turn.
+                view.regenerate(asst_idx, cx);
+                let staged =
+                    view.rewind_then_send.as_ref().expect("prompt staged for re-send");
+                assert_eq!(staged.0, "second prompt");
+                assert!(staged.1.is_empty(), "no images on this prompt");
+            })
+            .expect("window update");
+    }
+
     /// Staged edit-and-resend must be a TRUE no-op on cancel: entering edit mode
     /// prefills the composer and dims later messages, but Escape/cancel restores
     /// the prior draft and touches neither the transcript nor the session.
@@ -3556,6 +3924,64 @@ mod tests {
         let force = vec![false; 6];
         let plan = plan_tool_grouping(&is_tool, &force, &HashSet::new());
         assert!(plan.iter().all(|d| matches!(d, EntryDisplay::Show)));
+    }
+
+    /// A turn that ends in error on a NON-empty transcript records the error and
+    /// stays idle — the state the tail error-card arm renders against. Retry
+    /// clears the error, re-opens the turn, and re-sends the last prompt (without
+    /// pushing a duplicate user bubble).
+    #[gpui::test]
+    async fn turn_error_surfaces_and_retry_resends_last_prompt(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default();
+        let stub_probe = stub.clone();
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("do the thing");
+                view.thread.apply(&ThreadEvent::TurnEnded {
+                    result: Some("API error: overloaded".into()),
+                    usage: None,
+                    is_error: true,
+                });
+
+                // Precondition the tail error-card arm keys on: idle, connected,
+                // non-empty transcript, an error recorded — and nothing sent yet.
+                assert!(!view.thread.turn_active, "turn settled");
+                assert!(!view.disconnected, "still connected");
+                assert!(!view.thread.entries.is_empty(), "transcript non-empty");
+                assert_eq!(
+                    view.thread.last_error.as_deref(),
+                    Some("API error: overloaded"),
+                    "error recorded for the tail card",
+                );
+                assert!(stub_probe.sent().is_empty(), "push_user_message does not transmit");
+
+                view.retry_last_turn(cx);
+                assert!(view.thread.last_error.is_none(), "error cleared on retry");
+                assert!(view.thread.turn_active, "retry re-opened the turn");
+                assert_eq!(
+                    view.thread.entries.len(),
+                    1,
+                    "retry re-sends the existing prompt, not a duplicate bubble",
+                );
+            })
+            .expect("window update");
+
+        let sent = stub_probe.sent();
+        assert_eq!(sent.len(), 1, "exactly the retried prompt was transmitted");
+        assert_eq!(sent[0]["message"]["content"], json!("do the thing"));
     }
 
     fn tool_status(view: &AgentChatView, id: &str) -> Option<&'static str> {

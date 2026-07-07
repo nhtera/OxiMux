@@ -118,6 +118,9 @@ pub enum ComposerEvent {
     },
     /// The user pressed Stop while a turn was streaming — interrupt it.
     Stop,
+    /// The user asked to start a fresh conversation in this tab ("New chat").
+    /// The parent blanks the transcript and respawns a non-resumed session.
+    NewChat,
     /// The user picked a model in the bottom toolbar (a Claude alias).
     ModelPicked(String),
     /// The user picked a permission mode in the bottom toolbar (a wire value).
@@ -1109,6 +1112,17 @@ impl ComposerView {
             .on_click(cx.listener(|this, _ev, _window, cx| this.attach_from_picker(cx)))
     }
 
+    /// "New chat" — blank the transcript and start a fresh session in this tab.
+    /// Raises [`ComposerEvent::NewChat`]; the parent does the reset.
+    fn render_new_chat_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("chat-new-btn")
+            .icon(Icon::default().path("icons/plus.svg"))
+            .ghost()
+            .small()
+            .tooltip("New chat")
+            .on_click(cx.listener(|_this, _ev, _window, cx| cx.emit(ComposerEvent::NewChat)))
+    }
+
     /// Staged-attachment chips shown above the input pill: a small thumbnail per
     /// pending image, each with a ✕ to remove it. Rendered only when something is
     /// staged. Thumbnails come pre-decoded (see [`PendingImage`]) so this row is
@@ -1714,6 +1728,7 @@ impl Render for ComposerView {
             .gap(px(density.gap_inline));
         // Paperclip/image attach anchors the far left, before the safety mode.
         controls = controls.child(self.render_attach_button(cx));
+        controls = controls.child(self.render_new_chat_button(cx));
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }

@@ -93,6 +93,18 @@ impl ChatThread {
         }
     }
 
+    /// Reset to a blank conversation ("New chat" / the CLI's own `/clear`) while
+    /// keeping the picker-facing config the composer reads — the model, the
+    /// permission mode, and the slash-command palette. Everything tied to the old
+    /// turn/session (entries, session id, streaming state, usage, background
+    /// tasks) is dropped so a fresh (non-resumed) session can start clean.
+    pub fn clear(&mut self) {
+        let model = self.model.take();
+        let permission_mode = self.permission_mode.take();
+        let slash_commands = std::mem::take(&mut self.slash_commands);
+        *self = Self { model, permission_mode, slash_commands, ..Self::default() };
+    }
+
     /// Record a user prompt (called when we send one to the agent).
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.push_user_message_with_images(text, Vec::new());
@@ -109,8 +121,11 @@ impl ChatThread {
         // A new turn begins: the prior turn's usage/summary no longer apply.
         // Clear them so the footer never implies stale numbers belong to this
         // turn (e.g. if this turn ends in error before reporting any usage).
+        // Clearing `last_error` too dismisses a prior turn's error card the
+        // moment the user sends again (a fresh send is an implicit retry).
         self.usage = None;
         self.last_summary = None;
+        self.last_error = None;
         self.turn_active = true;
     }
 
@@ -1019,5 +1034,36 @@ mod tests {
             .find(|task| matches!(task.kind, BackgroundTaskKind::Subagent { .. }))
             .expect("a subagent task");
         assert!(subagent.tool_uses > 0, "subagent progress steps counted");
+    }
+
+    #[test]
+    fn clear_blanks_conversation_but_keeps_pickers() {
+        let mut t = ChatThread::new();
+        t.push_user_message("hello");
+        t.apply(&ThreadEvent::SessionInit {
+            session_id: "sid-1".into(),
+            model: "claude-opus".into(),
+            permission_mode: "default".into(),
+            slash_commands: vec![],
+        });
+        // The picker-facing config that must survive a reset (set after init to
+        // reflect the live state the composer reads at `clear` time).
+        t.model = Some("claude-opus".into());
+        t.permission_mode = Some("acceptEdits".into());
+        t.slash_commands = vec!["clear".into(), "compact".into()];
+        t.last_error = Some("boom".into());
+
+        t.clear();
+
+        // Conversation/session state is gone.
+        assert!(t.entries.is_empty(), "transcript blanked");
+        assert!(t.session_id.is_none(), "session id dropped (fresh, non-resumed)");
+        assert!(t.last_error.is_none(), "error cleared");
+        assert!(!t.turn_active, "no turn in flight");
+        assert!(t.usage.is_none() && t.last_summary.is_none());
+        // Picker-facing config the composer reads is preserved.
+        assert_eq!(t.model.as_deref(), Some("claude-opus"), "model kept");
+        assert_eq!(t.permission_mode.as_deref(), Some("acceptEdits"), "mode kept");
+        assert_eq!(t.slash_commands, vec!["clear".to_string(), "compact".to_string()]);
     }
 }

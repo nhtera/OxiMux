@@ -201,6 +201,48 @@ impl AgentChatView {
         self.perform_rewind(rc.ordinal, rc.entry_index, sha_for_restore, cx);
     }
 
+    /// Regenerate the assistant reply at `assistant_entry_idx`: rewind to the
+    /// user turn that produced it and re-send that same prompt so a fresh reply
+    /// streams in. Reuses the rewind machinery (session-file fork + respawn-
+    /// then-send) verbatim, so the resumed CLI session matches the truncated
+    /// transcript — never a second truncation path. Anything after the target
+    /// turn is dropped (rewind semantics); on the last reply that's nothing.
+    /// Conversation-only (no files axis): a re-roll shouldn't revert the repo.
+    pub(super) fn regenerate(&mut self, assistant_entry_idx: usize, cx: &mut Context<Self>) {
+        if self.thread.turn_active || self.rewinding || self.thread.session_id.is_none() {
+            return;
+        }
+        // Only the LAST turn's reply is regenerable. Regenerating an earlier reply
+        // would fork the session and drop every later turn — a destructive,
+        // unconfirmed action. The UI hides the affordance off-tail; this guards
+        // the method itself so no caller can trip it.
+        if self
+            .thread
+            .entries
+            .iter()
+            .skip(assistant_entry_idx + 1)
+            .any(|e| matches!(e, ThreadEntry::User { .. }))
+        {
+            return;
+        }
+        // The prompt that produced this reply is the nearest preceding user turn.
+        let end = assistant_entry_idx.min(self.thread.entries.len());
+        let Some(user_idx) =
+            self.thread.entries[..end].iter().rposition(|e| matches!(e, ThreadEntry::User { .. }))
+        else {
+            return; // no user prompt precedes this reply
+        };
+        let Some(ordinal) = self.user_ordinal_at(user_idx) else { return };
+        let (text, images) = match self.thread.entries.get(user_idx) {
+            Some(ThreadEntry::User { text, images, .. }) => (text.clone(), images.clone()),
+            _ => return,
+        };
+        // The rewind lands, respawns on the forked session, then re-sends this
+        // (same prompt, unchanged) — `finish_rewind` drains `rewind_then_send`.
+        self.rewind_then_send = Some((text, images));
+        self.perform_rewind(ordinal, user_idx, None, cx);
+    }
+
     /// The strictly-sequenced rewind flow (see module docs). Background half on
     /// the tokio runtime; the state swap happens on the foreground ONLY after
     /// the fork (and optional restore) succeeded.
