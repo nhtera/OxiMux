@@ -179,10 +179,14 @@ fn decode_user(v: &Value) -> Vec<ThreadEvent> {
     if let Some(blocks) = v["message"]["content"].as_array() {
         for b in blocks {
             if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                // The structured result sits at the line's top level (a sibling
+                // of `message`), not inside the content block — same shape as
+                // the on-disk `toolUseResult`, just snake_cased on the wire.
                 out.push(ThreadEvent::ToolResult {
                     tool_use_id: str_field(b, "tool_use_id"),
                     content: flatten_tool_result_content(b.get("content")),
                     is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                    structured: v.get("tool_use_result").cloned(),
                 });
             }
         }
@@ -370,12 +374,27 @@ mod tests {
         let s = json!({"type":"user","message":{"content":[
             {"tool_use_id":"toolu_9","type":"tool_result","content":"1\tline one"}]}}).to_string();
         assert_eq!(decode_line(&s), vec![ThreadEvent::ToolResult {
-            tool_use_id: "toolu_9".into(), content: "1\tline one".into(), is_error: false }]);
+            tool_use_id: "toolu_9".into(), content: "1\tline one".into(), is_error: false,
+            structured: None }]);
         let arr = json!({"type":"user","message":{"content":[
             {"tool_use_id":"t2","type":"tool_result","is_error":true,
              "content":[{"type":"text","text":"boom"}]}]}}).to_string();
         assert_eq!(decode_line(&arr), vec![ThreadEvent::ToolResult {
-            tool_use_id: "t2".into(), content: "boom".into(), is_error: true }]);
+            tool_use_id: "t2".into(), content: "boom".into(), is_error: true,
+            structured: None }]);
+    }
+
+    #[test]
+    fn decodes_tool_result_captures_top_level_structured() {
+        // The rich `tool_use_result` rides at the line's top level (snake_case),
+        // a sibling of `message` — not inside the content block. It must reach
+        // `ThreadEvent::ToolResult.structured` so live cards enrich like history.
+        let l = json!({"type":"user","message":{"content":[
+            {"tool_use_id":"tb","type":"tool_result","content":"done"}]},
+            "tool_use_result":{"stdout":"","stderr":"boom","interrupted":true}}).to_string();
+        assert_eq!(decode_line(&l), vec![ThreadEvent::ToolResult {
+            tool_use_id: "tb".into(), content: "done".into(), is_error: false,
+            structured: Some(json!({"stdout":"","stderr":"boom","interrupted":true})) }]);
     }
 
     #[test]

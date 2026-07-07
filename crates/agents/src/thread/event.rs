@@ -58,6 +58,13 @@ pub enum ThreadEvent {
         tool_use_id: String,
         content: String,
         is_error: bool,
+        /// The line's top-level `tool_use_result` (snake_case on the live wire) —
+        /// the structured sibling of the flattened `content`, carrying Bash
+        /// `{stdout, stderr, interrupted}`, subagent stats, a Read's `numLines`,
+        /// etc. `None` when the backend didn't emit one. Fed into
+        /// `ToolCall.structured` so the shared renderers enrich live chats the
+        /// same way they enrich imported history.
+        structured: Option<Value>,
     },
     /// A tool needs the user's permission (`can_use_tool` control request).
     PermissionRequested {

@@ -171,12 +171,17 @@ impl ChatThread {
                 // starts a fresh assistant message.
                 self.end_assistant_window();
             }
-            ThreadEvent::ToolResult { tool_use_id, content, is_error } => {
+            ThreadEvent::ToolResult { tool_use_id, content, is_error, structured } => {
                 // A result for an unknown id is silently dropped (no matching
                 // tool call to attach it to) rather than mutating the wrong
                 // entry — see the `tool_result_for_unknown_id_is_ignored` test.
                 if let Some(tc) = self.tool_call_mut(tool_use_id) {
                     tc.result = Some(content.clone());
+                    // Only overwrite when the wire actually carried a structured
+                    // sibling — a bare result must not wipe one captured earlier.
+                    if structured.is_some() {
+                        tc.structured = structured.clone();
+                    }
                     tc.status = if *is_error {
                         ToolCallStatus::Failed(content.clone())
                     } else {
@@ -509,13 +514,44 @@ mod tests {
         t.apply(&ThreadEvent::ToolCallStarted {
             id: "toolu_1".into(), name: "Read".into(), input: json!({"file_path":"a"}) });
         t.apply(&ThreadEvent::ToolResult {
-            tool_use_id: "toolu_1".into(), content: "file body".into(), is_error: false });
+            tool_use_id: "toolu_1".into(), content: "file body".into(), is_error: false,
+            structured: None });
 
         match &t.entries[1] {
             ThreadEntry::ToolCall(tc) => {
                 assert_eq!(tc.name, "Read");
                 assert_eq!(tc.status, ToolCallStatus::Completed);
                 assert_eq!(tc.result.as_deref(), Some("file body"));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_structured_settles_and_survives_bare_followup() {
+        // The live wire's top-level `tool_use_result` must land in
+        // `tc.structured` so the shared renderers (Bash stderr split, subagent
+        // stats, interrupted badge) enrich live chats — not just imported
+        // history. A later bare result must not wipe what was captured.
+        let mut t = ChatThread::new();
+        t.push_user_message("run it");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "tb".into(), name: "Bash".into(), input: json!({"command":"x"}) });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "tb".into(), content: "done".into(), is_error: false,
+            structured: Some(json!({"stdout":"","stderr":"boom","interrupted":true})) });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "tb".into(), content: "done".into(), is_error: false,
+            structured: None });
+
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => {
+                assert_eq!(tc.status, ToolCallStatus::Completed);
+                assert_eq!(
+                    tc.structured,
+                    Some(json!({"stdout":"","stderr":"boom","interrupted":true})),
+                    "structured captured, and not clobbered by the bare follow-up",
+                );
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
@@ -530,7 +566,8 @@ mod tests {
         t.apply(&ThreadEvent::ToolCallStarted {
             id: "toolu_1".into(), name: "Read".into(), input: json!({}) });
         t.apply(&ThreadEvent::ToolResult {
-            tool_use_id: "toolu_UNKNOWN".into(), content: "stray".into(), is_error: false });
+            tool_use_id: "toolu_UNKNOWN".into(), content: "stray".into(), is_error: false,
+            structured: None });
         match &t.entries[1] {
             ThreadEntry::ToolCall(tc) => {
                 assert_eq!(tc.status, ToolCallStatus::InProgress, "existing tool call untouched");
@@ -590,7 +627,7 @@ mod tests {
         t.apply(&ThreadEvent::ToolResult {
             tool_use_id: "toolu_q".into(),
             content: "Your questions have been answered: \"Tabs or spaces?\"=\"Tabs\".".into(),
-            is_error: false });
+            is_error: false, structured: None });
         assert!(t.pending_question().is_none());
         match &t.entries[1] {
             ThreadEntry::ToolCall(tc) => assert_eq!(tc.status, ToolCallStatus::Completed),
@@ -803,7 +840,8 @@ mod tests {
         src.apply(&ThreadEvent::ToolCallStarted {
             id: "t1".into(), name: "Read".into(), input: json!({"file_path":"a"}) });
         src.apply(&ThreadEvent::ToolResult {
-            tool_use_id: "t1".into(), content: "body".into(), is_error: false });
+            tool_use_id: "t1".into(), content: "body".into(), is_error: false,
+            structured: None });
 
         let json = serde_json::to_string(&src.entries).expect("serialize entries");
         let back: Vec<ThreadEntry> = serde_json::from_str(&json).expect("deserialize entries");
@@ -879,7 +917,7 @@ mod tests {
         t.push_user_message("go");
         t.apply(&ThreadEvent::AssistantText("Let me check.".into()));
         t.apply(&ThreadEvent::ToolCallStarted { id: "t1".into(), name: "Bash".into(), input: json!({}) });
-        t.apply(&ThreadEvent::ToolResult { tool_use_id: "t1".into(), content: "ok".into(), is_error: false });
+        t.apply(&ThreadEvent::ToolResult { tool_use_id: "t1".into(), content: "ok".into(), is_error: false, structured: None });
         t.apply(&ThreadEvent::AssistantText("Done.".into()));
 
         let assistants: Vec<&str> = t.entries.iter().filter_map(|e| match e {
