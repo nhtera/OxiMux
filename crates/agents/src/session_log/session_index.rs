@@ -393,23 +393,14 @@ fn clean_command_xml(s: &str) -> String {
 }
 
 /// The slash-command unwrap (and stray-tag strip) without the title cap, for
-/// the preview pane which applies its own longer limit.
+/// the preview pane which applies its own longer limit. Command parsing is the
+/// shared [`crate::command_envelope`] helper; the non-command fallback keeps the
+/// lossy stray-tag strip (fine for a one-line preview, unlike a full transcript).
 pub(super) fn unwrap_command_xml(s: &str) -> String {
-    if let Some(name) = tag_inner(s, "command-name") {
-        let args = tag_inner(s, "command-args").unwrap_or_default();
-        return format!("{name} {args}").trim().to_string();
+    if let Some(cmd) = crate::command_envelope::parse_slash_command(s) {
+        return cmd.normalized();
     }
     strip_tags(s)
-}
-
-/// Inner text of the first `<tag>…</tag>`, trimmed.
-fn tag_inner(s: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = s.find(&open)? + open.len();
-    let rest = &s[start..];
-    let end = rest.find(&close)?;
-    Some(rest[..end].trim().to_string())
 }
 
 /// Drop `<…>` tag runs, keep the text between them.

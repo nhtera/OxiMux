@@ -11,6 +11,7 @@ use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::{TextView, TextViewStyle};
 use oximux_agents::thread::{ToolCall, ToolCallStatus};
 use oximux_settings::{Density, Theme, Typography};
+use serde_json::Value;
 
 /// A small role caption above a message ("You" / "Claude").
 pub(super) fn role_caption(label: &str, color: Hsla, typo: &Typography) -> impl IntoElement {
@@ -119,22 +120,63 @@ pub(super) fn status_glyph(status: &ToolCallStatus, theme: Theme) -> (&'static s
     }
 }
 
+/// A friendly tool label for the header. MCP tools are journaled as
+/// `mcp__<server>__<tool>`; show `<server> · <tool>` instead of the raw id so a
+/// history full of `mcp__computer-use__left_click` reads like a chat, not a log.
+pub(super) fn tool_display_name(name: &str) -> String {
+    match name.strip_prefix("mcp__") {
+        Some(rest) => rest.replacen("__", " · ", 1),
+        None => name.to_string(),
+    }
+}
+
 /// A short human target for the tool line — the file it touches, the command it
-/// runs, or the pattern it searches. `None` when the input carries none.
+/// runs, the query it searches, a click coordinate, or a subagent/task brief.
+/// `None` when the input carries none. Kept legible for the collapsed header,
+/// which is what the user sees without expanding the card.
 pub(super) fn tool_target(tc: &ToolCall) -> Option<String> {
     let input = &tc.input;
+    // A file the tool touches.
     for key in ["file_path", "path", "notebook_path"] {
-        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
+        if let Some(s) = input.get(key).and_then(Value::as_str) {
             return Some(s.to_string());
         }
     }
-    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-        return Some(cmd.to_string());
+    // A command / pattern / url / query the tool acts on.
+    for key in ["command", "pattern", "url", "query"] {
+        if let Some(s) = input.get(key).and_then(Value::as_str) {
+            return Some(s.to_string());
+        }
     }
-    if let Some(p) = input.get("pattern").and_then(|v| v.as_str()) {
-        return Some(p.to_string());
+    // A pointer target, e.g. computer-use clicks: `coordinate: [x, y]`.
+    if let Some(coord) = input.get("coordinate").and_then(Value::as_array)
+        && coord.len() >= 2
+    {
+        return Some(format!("({}, {})", round_num(&coord[0]), round_num(&coord[1])));
+    }
+    // A batch of UI actions → a count, not the whole array.
+    if let Some(actions) = input.get("actions").and_then(Value::as_array) {
+        let n = actions.len();
+        return Some(format!("{n} action{}", if n == 1 { "" } else { "s" }));
+    }
+    // Typed text / key chord, or a subagent/task brief → its first line.
+    for key in ["text", "description", "prompt"] {
+        if let Some(s) = input.get(key).and_then(Value::as_str) {
+            let first = s.lines().next().unwrap_or(s);
+            if !first.trim().is_empty() {
+                return Some(first.to_string());
+            }
+        }
     }
     None
+}
+
+/// A JSON number rendered as a whole integer (drops `.0` on coordinates).
+fn round_num(v: &Value) -> String {
+    v.as_i64()
+        .map(|n| n.to_string())
+        .or_else(|| v.as_f64().map(|f| (f.round() as i64).to_string()))
+        .unwrap_or_default()
 }
 
 /// Cap a label to `max` chars, appending an ellipsis when cut. Keeps the tool
@@ -186,5 +228,51 @@ mod tests {
         let out = elide(&long, 80);
         assert_eq!(out.chars().count(), 81);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_target_covers_mcp_and_agent_shapes() {
+        // computer-use click → coordinate tuple
+        assert_eq!(
+            tool_target(&tc(
+                "mcp__computer-use__left_click",
+                json!({"coordinate": [948, 810]}),
+                ToolCallStatus::InProgress
+            )),
+            Some("(948, 810)".to_string())
+        );
+        // computer-use batch → action count
+        assert_eq!(
+            tool_target(&tc(
+                "mcp__computer-use__computer_batch",
+                json!({"actions": [{}, {}, {}]}),
+                ToolCallStatus::InProgress
+            )),
+            Some("3 actions".to_string())
+        );
+        // web fetch → url; search → query
+        assert_eq!(
+            tool_target(&tc("WebFetch", json!({"url": "https://x.dev"}), ToolCallStatus::InProgress)),
+            Some("https://x.dev".to_string())
+        );
+        assert_eq!(
+            tool_target(&tc("WebSearch", json!({"query": "gpui focus"}), ToolCallStatus::InProgress)),
+            Some("gpui focus".to_string())
+        );
+        // Agent → first line of the prompt
+        assert_eq!(
+            tool_target(&tc(
+                "Agent",
+                json!({"prompt": "Find the bug\nin detail"}),
+                ToolCallStatus::InProgress
+            )),
+            Some("Find the bug".to_string())
+        );
+    }
+
+    #[test]
+    fn display_name_humanizes_mcp_ids() {
+        assert_eq!(tool_display_name("mcp__computer-use__left_click"), "computer-use · left_click");
+        assert_eq!(tool_display_name("Bash"), "Bash");
     }
 }

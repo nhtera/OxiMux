@@ -28,7 +28,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::entry::{AssistantMessage, ChatImage, ThreadEntry};
-use super::tool_call::{ToolCall, ToolCallStatus};
+use super::tool_call::{ToolCall, ToolCallStatus, flatten_tool_result_content};
+use crate::command_envelope;
 
 /// Cap on imported entries. A very long session renders the most recent slice;
 /// older history is elided behind a single divider so the transcript stays
@@ -100,36 +101,48 @@ pub fn transcript_from_str(raw: &str) -> Vec<ThreadEntry> {
 
 /// A real user prompt (string or non-tool_result blocks) → a `User` entry; a
 /// `tool_result` carrier → settle the matching tool call; a compaction summary
-/// → a divider.
+/// → a divider. Slash-command envelopes are unwrapped to `"/name args"` and
+/// machine scaffolding (`<system-reminder>`, `<local-command-*>`) is stripped so
+/// the bubble shows what the user said, not the plumbing.
 fn import_user(v: &Value, entries: &mut Vec<ThreadEntry>, tool_index: &HashMap<String, usize>) {
-    // The injected post-compaction summary arrives as a user turn.
+    // The injected post-compaction summary arrives as a user turn — checked
+    // before the meta skip so its divider survives even if it's flagged meta.
     if v.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
         let text = user_text(v);
         let label = if text.trim().is_empty() { "Context compacted" } else { text.trim() };
         push_compaction(entries, label);
         return;
     }
+    // Injected/meta turns (IDE context, slash-command skill expansions,
+    // reminders) are plumbing the CLI records but never a real prompt — drop
+    // them rather than render them as user messages.
+    if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
     match v.pointer("/message/content") {
-        Some(Value::String(s)) if !s.trim().is_empty() => {
-            entries.push(ThreadEntry::User {
-                text: s.clone(),
-                images: Vec::new(),
-                checkpoint: None,
-            });
+        Some(Value::String(s)) => {
+            let text = command_envelope::normalize_user_text(s);
+            if !text.is_empty() {
+                entries.push(ThreadEntry::User { text, images: Vec::new(), checkpoint: None });
+            }
         }
         Some(Value::Array(blocks)) => {
             let has_tool_result = blocks
                 .iter()
                 .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"));
             if has_tool_result {
+                // The structured result sits at the line's top level (camelCase
+                // in the file format), paired with the tool_result block(s).
+                let structured = v.get("toolUseResult");
                 for b in blocks {
                     if b.get("type").and_then(Value::as_str) == Some("tool_result") {
-                        settle_tool_result(entries, tool_index, b);
+                        settle_tool_result(entries, tool_index, b, structured);
                     }
                 }
             } else {
-                let (text, images) = text_and_images(blocks);
-                if !text.trim().is_empty() || !images.is_empty() {
+                let (raw, images) = text_and_images(blocks);
+                let text = command_envelope::normalize_user_text(&raw);
+                if !text.is_empty() || !images.is_empty() {
                     entries.push(ThreadEntry::User { text, images, checkpoint: None });
                 }
             }
@@ -139,11 +152,13 @@ fn import_user(v: &Value, entries: &mut Vec<ThreadEntry>, tool_index: &HashMap<S
 }
 
 /// Attach a `tool_result` block to its `ToolCall` entry (found by id), moving it
-/// to `Completed`/`Failed`. An unmatched id is dropped (nothing to settle).
+/// to `Completed`/`Failed` and recording the structured result. An unmatched id
+/// is dropped (nothing to settle).
 fn settle_tool_result(
     entries: &mut [ThreadEntry],
     tool_index: &HashMap<String, usize>,
     block: &Value,
+    structured: Option<&Value>,
 ) {
     let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
         return;
@@ -152,9 +167,10 @@ fn settle_tool_result(
         return;
     };
     if let Some(ThreadEntry::ToolCall(tc)) = entries.get_mut(idx) {
-        let content = content_to_string(block.get("content"));
+        let content = flatten_tool_result_content(block.get("content"));
         let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         tc.result = Some(content.clone());
+        tc.structured = structured.cloned();
         tc.status = if is_error {
             ToolCallStatus::Failed(content)
         } else {
@@ -274,19 +290,6 @@ fn user_text(v: &Value) -> String {
         Some(Value::Array(blocks)) => blocks
             .iter()
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-/// Flatten a `tool_result.content` (plain string, or array of `{text}` blocks).
-fn content_to_string(c: Option<&Value>) -> String {
-    match c {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
-            .iter()
             .filter_map(|b| b.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("\n"),

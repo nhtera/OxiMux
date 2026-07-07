@@ -90,8 +90,9 @@ pub(super) fn render_tool_card(
             // output, file slice, or match list) instead of raw JSON.
             card = card.child(body);
         } else {
-            // Unknown tool: the generic raw input + result disclosure.
-            card = card.child(raw_input_block(tc, theme, density, typo));
+            // Any other tool: a key:value view of the input (not raw JSON) plus
+            // any textual result.
+            card = card.child(tool_bodies::render_generic_input(tc, theme, density, typo));
             if let Some(result) = &tc.result {
                 card = card.child(result_block(result, theme, density, typo));
             }
@@ -113,7 +114,7 @@ fn header_row(
     cx: &mut Context<AgentChatView>,
 ) -> AnyElement {
     let (glyph, glyph_color) = bubble::status_glyph(&tc.status, theme);
-    let mut label = tc.name.clone();
+    let mut label = bubble::tool_display_name(&tc.name);
     if let Some(target) = bubble::tool_target(tc) {
         label.push(' ');
         label.push_str(&bubble::elide(&target, 80));
@@ -310,17 +311,6 @@ fn write_replace_hint(theme: Theme, typo: &Typography) -> AnyElement {
             "Write replaces the entire file — prior content isn't shown.",
         ))
         .into_any_element()
-}
-
-/// The raw tool input as pretty JSON, framed as a muted block.
-fn raw_input_block(
-    tc: &ToolCall,
-    theme: Theme,
-    density: Density,
-    typo: &Typography,
-) -> AnyElement {
-    let json = serde_json::to_string_pretty(&tc.input).unwrap_or_default();
-    labeled_block("Input", &json, theme, density, typo)
 }
 
 /// The tool result/output, capped, framed as a muted block.

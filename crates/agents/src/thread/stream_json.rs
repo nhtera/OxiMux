@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::background_task::BackgroundTaskKind;
 use super::event::{ThreadEvent, TurnUsage};
 use super::question::parse_questions;
-use super::tool_call::PermissionSuggestion;
+use super::tool_call::{PermissionSuggestion, flatten_tool_result_content};
 
 /// Decode one newline-delimited stream-json line. Returns the events it
 /// yields (possibly empty for noise: `system/hook_*`, `system/status`,
@@ -181,7 +181,7 @@ fn decode_user(v: &Value) -> Vec<ThreadEvent> {
             if b.get("type").and_then(Value::as_str) == Some("tool_result") {
                 out.push(ThreadEvent::ToolResult {
                     tool_use_id: str_field(b, "tool_use_id"),
-                    content: content_to_string(b.get("content")),
+                    content: flatten_tool_result_content(b.get("content")),
                     is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
                 });
             }
@@ -290,20 +290,6 @@ fn str_list_field(v: &Value, key: &str) -> Vec<String> {
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default()
-}
-
-/// A `tool_result.content` is either a plain string or an array of
-/// `{type:"text", text:"..."}` blocks — flatten both to a string.
-fn content_to_string(c: Option<&Value>) -> String {
-    match c {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
 }
 
 #[cfg(test)]

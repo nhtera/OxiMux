@@ -19,7 +19,8 @@ use super::bubble;
 const MAX_ROWS: usize = 200;
 const MAX_CHARS: usize = 8000;
 
-/// Dispatch a tool call to its bespoke body, or `None` to fall back to generic.
+/// Dispatch a tool call to its bespoke body, or `None` to fall back to the
+/// generic key:value view ([`render_generic_input`]).
 pub(super) fn render_tool_body(
     tc: &ToolCall,
     theme: Theme,
@@ -31,7 +32,46 @@ pub(super) fn render_tool_body(
         "Read" => Some(render_read(tc, theme, density, typo)),
         "Grep" => Some(render_matches(tc, "match", theme, density, typo)),
         "Glob" => Some(render_matches(tc, "file", theme, density, typo)),
+        "Agent" | "Task" => Some(render_agent(tc, theme, density, typo)),
         _ => None,
+    }
+}
+
+/// Read a string field from the structured (`toolUseResult`) result, if present.
+fn structured_str<'a>(tc: &'a ToolCall, key: &str) -> Option<&'a str> {
+    tc.structured.as_ref()?.get(key)?.as_str()
+}
+
+/// A legible key:value view of a tool's input — one row per top-level field —
+/// so a tool with no bespoke body reads better than a pretty-printed JSON blob.
+/// Object values collapse to compact one-line JSON (char-capped by `code_block`);
+/// a non-object input renders as a single summary row.
+pub(super) fn render_generic_input(
+    tc: &ToolCall,
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> AnyElement {
+    let rows: Vec<String> = match &tc.input {
+        Value::Object(map) if !map.is_empty() => {
+            map.iter().map(|(k, v)| format!("{k}: {}", value_summary(v))).collect()
+        }
+        Value::Null => Vec::new(),
+        other => vec![value_summary(other)],
+    };
+    let body = if rows.is_empty() { "(no input)".to_string() } else { rows.join("\n") };
+    code_block(&body, theme.fg_muted, theme, density, typo)
+}
+
+/// Collapse a JSON value to a one-line summary for a key:value row. Strings keep
+/// their text (newlines flattened to spaces); containers become compact JSON.
+fn value_summary(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.replace('\n', " "),
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(v).unwrap_or_default(),
     }
 }
 
@@ -40,6 +80,9 @@ fn input_str<'a>(tc: &'a ToolCall, key: &str) -> &'a str {
 }
 
 /// Bash → a terminal-style card: the `$`-prefixed command, then its output.
+/// When the structured result splits stdout/stderr, stderr renders in a warn
+/// tone and an interrupted run is called out; otherwise the flattened result is
+/// shown as one block.
 fn render_bash(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let cmd = input_str(tc, "command");
     let prompted = cmd
@@ -51,17 +94,87 @@ fn render_bash(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography)
 
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
     col = col.child(code_block(&prompted, theme.status_info, theme, density, typo));
-    if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
+
+    let stdout = structured_str(tc, "stdout").filter(|s| !s.trim().is_empty());
+    let stderr = structured_str(tc, "stderr").filter(|s| !s.trim().is_empty());
+    if stdout.is_some() || stderr.is_some() {
+        if let Some(o) = stdout {
+            col = col.child(code_block(o, theme.fg_muted, theme, density, typo));
+        }
+        if let Some(e) = stderr {
+            col = col.child(code_block(e, theme.status_warn, theme, density, typo));
+        }
+    } else if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
         col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+    }
+
+    let interrupted = tc
+        .structured
+        .as_ref()
+        .and_then(|s| s.get("interrupted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if interrupted {
+        col = col.child(caption("interrupted".to_string(), theme, typo));
     }
     col.into_any_element()
 }
 
-/// Read → the returned file slice as a code block (the path is already in the
-/// card header).
+/// Read → the returned file slice as a code block, with a line-count caption
+/// from the structured result when present (the path is already in the header).
 fn render_read(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let body = tc.result.as_deref().unwrap_or("");
-    code_block(body, theme.fg_muted, theme, density, typo)
+    let lines = tc
+        .structured
+        .as_ref()
+        .and_then(|s| s.get("file"))
+        .and_then(|f| f.get("numLines"))
+        .and_then(Value::as_u64);
+    let mut col = div().flex().flex_col().gap(px(2.0)).w_full();
+    if let Some(n) = lines {
+        col = col.child(caption(format!("{n} line{}", if n == 1 { "" } else { "s" }), theme, typo));
+    }
+    col = col.child(code_block(body, theme.fg_muted, theme, density, typo));
+    col.into_any_element()
+}
+
+/// Agent / Task → the subagent brief (from input) plus a summary line from the
+/// structured result (type · status · tokens · duration) and, when present, the
+/// subagent's final content. Falls back to the flattened result when unsettled.
+fn render_agent(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+    let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
+
+    let prompt = input_str(tc, "prompt");
+    let brief = if prompt.is_empty() { input_str(tc, "description") } else { prompt };
+    if !brief.trim().is_empty() {
+        col = col.child(code_block(brief, theme.fg_muted, theme, density, typo));
+    }
+
+    if let Some(s) = &tc.structured {
+        let mut bits: Vec<String> = Vec::new();
+        if let Some(t) = s.get("agentType").and_then(Value::as_str) {
+            bits.push(t.to_string());
+        }
+        if let Some(st) = s.get("status").and_then(Value::as_str) {
+            bits.push(st.to_string());
+        }
+        if let Some(tok) = s.get("totalTokens").and_then(Value::as_u64) {
+            bits.push(format!("{tok} tokens"));
+        }
+        if let Some(ms) = s.get("totalDurationMs").and_then(Value::as_u64) {
+            bits.push(format!("{}s", ms / 1000));
+        }
+        if !bits.is_empty() {
+            col = col.child(caption(bits.join(" · "), theme, typo));
+        }
+        if let Some(content) = s.get("content").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+        {
+            col = col.child(code_block(content, theme.fg_muted, theme, density, typo));
+        }
+    } else if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
+        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+    }
+    col.into_any_element()
 }
 
 /// Grep/Glob → a count header + the match/file list (`noun` = "match"/"file").
@@ -148,7 +261,7 @@ mod tests {
             tc.result = Some("line one\nline two".into());
             tc
         };
-        for t in ["Bash", "Read", "Grep", "Glob"] {
+        for t in ["Bash", "Read", "Grep", "Glob", "Agent", "Task"] {
             assert!(
                 render_tool_body(&mk(t), Theme::default(), Density::default(), &Typography::default()).is_some(),
                 "{t} should render a bespoke body"
@@ -160,6 +273,46 @@ mod tests {
                 "{t} should fall back to the generic card"
             );
         }
+    }
+
+    #[test]
+    fn structured_bodies_render_without_panic() {
+        let theme = Theme::default();
+        let density = Density::default();
+        let typo = Typography::default();
+        // Bash with split stdout/stderr + interrupted.
+        let mut bash = ToolCall::new("t", "Bash", json!({"command": "make"}));
+        bash.structured = Some(json!({"stdout": "ok", "stderr": "warn: x", "interrupted": true}));
+        let _ = render_tool_body(&bash, theme, density, &typo);
+        // Read with a numLines caption.
+        let mut read = ToolCall::new("t", "Read", json!({"file_path": "a.rs"}));
+        read.structured = Some(json!({"file": {"numLines": 42}}));
+        let _ = render_tool_body(&read, theme, density, &typo);
+        // Agent with a subagent summary.
+        let mut agent = ToolCall::new("t", "Agent", json!({"prompt": "do the thing"}));
+        agent.structured = Some(json!({
+            "agentType": "researcher", "status": "completed",
+            "totalTokens": 12345u64, "totalDurationMs": 8200u64, "content": "found it"
+        }));
+        let _ = render_tool_body(&agent, theme, density, &typo);
+    }
+
+    #[test]
+    fn generic_input_summarizes_values_not_raw_json() {
+        // Scalars pass through; containers compact; newlines flatten.
+        assert_eq!(value_summary(&json!("hi\nthere")), "hi there");
+        assert_eq!(value_summary(&json!(42)), "42");
+        assert_eq!(value_summary(&json!(true)), "true");
+        assert_eq!(value_summary(&json!([1, 2])), "[1,2]");
+        assert_eq!(value_summary(&json!({"a": 1})), "{\"a\":1}");
+        // The generic body builds for any input shape without panicking.
+        let theme = Theme::default();
+        let density = Density::default();
+        let typo = Typography::default();
+        let tc = ToolCall::new("t", "mcp__x__y", json!({"coordinate": [1, 2], "text": "ok"}));
+        let _ = render_generic_input(&tc, theme, density, &typo);
+        let _ = render_generic_input(&ToolCall::new("t", "n", json!({})), theme, density, &typo);
+        let _ = render_generic_input(&ToolCall::new("t", "n", json!(null)), theme, density, &typo);
     }
 
     #[test]

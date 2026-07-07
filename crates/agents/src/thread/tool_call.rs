@@ -31,6 +31,14 @@ pub struct ToolCall {
     pub status: ToolCallStatus,
     /// Textual tool result once it completes (Read body, Bash output, …).
     pub result: Option<String>,
+    /// The structured result recorded alongside `result` — `toolUseResult` in
+    /// the session file (camelCase), `tool_use_result` on the live wire
+    /// (snake_case). Carries what the flattened string loses: Bash `{stdout,
+    /// stderr, interrupted}`, an `Agent` subagent `{agentType, status,
+    /// totalTokens, …}`, a Read's `numLines`, etc. `None` when absent.
+    /// `#[serde(default)]` keeps older persisted transcript blobs loadable.
+    #[serde(default)]
+    pub structured: Option<Value>,
 }
 
 impl ToolCall {
@@ -41,7 +49,54 @@ impl ToolCall {
             input,
             status: ToolCallStatus::InProgress,
             result: None,
+            structured: None,
         }
+    }
+}
+
+/// Flatten a `tool_result.content` (a plain string, or an array of content
+/// blocks) into a display string, shared by the live decoder and the session
+/// importer. Text blocks pass through; an `image` block becomes an `[image]`
+/// placeholder (the base64 payload isn't rendered inline in the transcript);
+/// a `tool_reference` becomes its `tool_name`. Without this an image-returning
+/// tool (a screenshot) or a tool-search result would flatten to a blank output.
+pub fn flatten_tool_result_content(c: Option<&Value>) -> String {
+    match c {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => {
+            let mut parts: Vec<String> = Vec::new();
+            let mut images = 0usize;
+            let mut refs: Vec<String> = Vec::new();
+            for b in arr {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("image") => images += 1,
+                    Some("tool_reference") => {
+                        if let Some(n) = b.get("tool_name").and_then(Value::as_str) {
+                            refs.push(n.to_string());
+                        }
+                    }
+                    // Text blocks — and, defensively, any other block that still
+                    // carries a `text` field.
+                    _ => {
+                        if let Some(t) = b.get("text").and_then(Value::as_str) {
+                            parts.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            if images > 0 {
+                parts.push(if images == 1 {
+                    "[image]".to_string()
+                } else {
+                    format!("[{images} images]")
+                });
+            }
+            if !refs.is_empty() {
+                parts.push(format!("Tools: {}", refs.join(", ")));
+            }
+            parts.join("\n")
+        }
+        _ => String::new(),
     }
 }
 

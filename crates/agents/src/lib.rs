@@ -7,6 +7,7 @@
 
 pub mod agent_title;
 pub mod cli;
+pub mod command_envelope;
 pub mod commit_message;
 pub mod commit_message_heuristic;
 pub mod osc_sideband;

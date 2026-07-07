@@ -282,3 +282,95 @@ fn text_then_tool_then_text_makes_two_assistants() {
     assert!(matches!(t[1], ThreadEntry::ToolCall(_)));
     assert!(matches!(t[2], ThreadEntry::Assistant(_)));
 }
+
+/// A `user` line flagged `isMeta` (IDE context, skill expansions, reminders).
+fn meta_user_line(text: &str) -> String {
+    json!({"type":"user","isMeta":true,"message":{"role":"user","content":text}}).to_string()
+}
+
+#[test]
+fn slash_command_envelope_is_unwrapped_not_rendered_raw() {
+    // The real on-disk shape: the command turn is NOT meta; the skill expansion
+    // that follows IS meta. Only the clean `/research …` bubble should survive.
+    let raw = join(&[
+        user_line(
+            "<command-message>research</command-message>\n\
+             <command-name>/research</command-name>\n\
+             <command-args>find the bug</command-args>",
+        ),
+        meta_user_line("Base directory for this skill: /x\n# Research\n..."),
+        assistant_line(json!([{"type":"text","text":"On it."}])),
+    ]);
+    let t = transcript_from_str(&raw);
+    assert_eq!(t.len(), 2, "meta skill-expansion turn must be dropped");
+    assert_eq!(
+        t[0],
+        ThreadEntry::User { text: "/research find the bug".into(), images: vec![], checkpoint: None }
+    );
+    assert!(matches!(t[1], ThreadEntry::Assistant(_)));
+}
+
+#[test]
+fn meta_turns_are_dropped() {
+    let raw = join(&[
+        meta_user_line("<ide-context/>"),
+        user_line("real question"),
+    ]);
+    let t = transcript_from_str(&raw);
+    assert_eq!(t.len(), 1);
+    assert_eq!(
+        t[0],
+        ThreadEntry::User { text: "real question".into(), images: vec![], checkpoint: None }
+    );
+}
+
+#[test]
+fn system_reminder_scaffolding_stripped_but_message_kept() {
+    let raw = user_line("Fix the parser.\n<system-reminder>injected</system-reminder>");
+    let t = transcript_from_str(&raw);
+    assert_eq!(
+        t[0],
+        ThreadEntry::User { text: "Fix the parser.".into(), images: vec![], checkpoint: None }
+    );
+}
+
+#[test]
+fn a_turn_that_is_only_scaffolding_is_dropped() {
+    // After stripping, nothing real remains → no empty bubble.
+    let raw = user_line("<system-reminder>just plumbing</system-reminder>");
+    let t = transcript_from_str(&raw);
+    assert!(t.is_empty());
+}
+
+#[test]
+fn image_tool_result_becomes_placeholder_and_structured_is_captured() {
+    let result_line = json!({
+        "type": "user",
+        "toolUseResult": {"isImage": true, "stdout": ""},
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]}
+        ]}
+    })
+    .to_string();
+    let raw = join(&[
+        assistant_line(json!([
+            {"type": "tool_use", "id": "t1", "name": "mcp__computer-use__screenshot", "input": {}}
+        ])),
+        result_line,
+    ]);
+    let t = transcript_from_str(&raw);
+    let tc = t
+        .iter()
+        .find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .expect("a settled tool call");
+    // An image result flattens to a visible placeholder, not a blank output.
+    assert_eq!(tc.result.as_deref(), Some("[image]"));
+    // The structured result is captured for richer rendering.
+    assert!(tc.structured.is_some());
+    assert_eq!(tc.status, ToolCallStatus::Completed);
+}

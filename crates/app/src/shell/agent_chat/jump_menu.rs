@@ -118,11 +118,9 @@ fn collapse_first_line(text: &str) -> String {
 /// prepends — `@`-context blocks and the local-command caveat/scaffolding — are
 /// stripped so the row shows what the user actually said, not the plumbing.
 fn readable_text(text: &str) -> String {
-    if let Some(name) = between(text, "<command-name>", "</command-name>") {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_string();
-        }
+    // Shared slash-command parse: the jump list shows just the command name.
+    if let Some(cmd) = oximux_agents::command_envelope::parse_slash_command(text) {
+        return cmd.name;
     }
     // Drop whole noise blocks (inner content and all), then any stray tags.
     let mut s = text.to_string();
@@ -135,14 +133,6 @@ fn readable_text(text: &str) -> String {
         s = remove_blocks(&s, open, close);
     }
     strip_angle_tags(&s)
-}
-
-/// The text between the first `open`…`close` pair, if both are present.
-fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = text.find(open)? + open.len();
-    let rest = &text[start..];
-    let end = rest.find(close)?;
-    Some(&rest[..end])
 }
 
 /// Remove every `open`…`close` span (inclusive) from `text`. `open` may be a tag
