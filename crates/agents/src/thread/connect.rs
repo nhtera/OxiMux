@@ -9,6 +9,7 @@ use std::sync::mpsc::Receiver;
 use anyhow::Result;
 
 use super::claude_stream_json::ClaudeStreamJsonConnection;
+use super::codex::CodexAppServerConnection;
 use super::connection::AgentConnection;
 use super::event::ThreadEvent;
 use super::transport::Transport;
@@ -72,6 +73,11 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
                 spec.permission_mode.as_deref(),
                 spec.effort.as_deref(),
             )?;
+            Ok((Box::new(conn), rx))
+        }
+        Transport::AppServer => {
+            let (conn, rx) =
+                CodexAppServerConnection::spawn(&spec.cwd, spec.model.as_deref())?;
             Ok((Box::new(conn), rx))
         }
         Transport::Acp => {

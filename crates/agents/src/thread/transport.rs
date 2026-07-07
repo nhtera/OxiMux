@@ -11,14 +11,16 @@ use serde::{Deserialize, Serialize};
 
 /// Which backend transport a chat session runs over. `StreamJson` is Claude's
 /// native stream-json subprocess — the default, so an old persisted blob that
-/// names no provider restores as Claude. `Acp` drives an external agent over
-/// the Agent Client Protocol. Serde `lowercase` so the persisted tag is a
-/// stable short string (`"streamjson"` / `"acp"`).
+/// names no provider restores as Claude. `AppServer` drives Codex over its
+/// native `codex app-server` JSON-RPC. `Acp` drives an external agent over the
+/// Agent Client Protocol. Serde `lowercase` so the persisted tag is a stable
+/// short string (`"streamjson"` / `"appserver"` / `"acp"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     #[default]
     StreamJson,
+    AppServer,
     Acp,
 }
 

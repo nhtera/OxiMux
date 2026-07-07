@@ -23,15 +23,18 @@ use serde::{Deserialize, Serialize};
 
 /// Which backend a Chat-mode launch of an adapter speaks to. `StreamJson` is
 /// the native subprocess path (Claude's stream-json protocol) and the default,
-/// so an existing TOML that names no transport keeps Claude's behavior. `Acp`
+/// so an existing TOML that names no transport keeps Claude's behavior.
+/// `AppServer` drives Codex over its native `codex app-server` JSON-RPC. `Acp`
 /// drives an external agent over the Agent Client Protocol, spawned from the
 /// adapter's [`PerAgentLaunch::acp_command`]. Only consulted for Chat launches;
-/// a Terminal launch ignores it. Serde `lowercase` → `"streamjson"` / `"acp"`.
+/// a Terminal launch ignores it. Serde `lowercase` → `"streamjson"` /
+/// `"appserver"` / `"acp"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     #[default]
     StreamJson,
+    AppServer,
     Acp,
 }
 
