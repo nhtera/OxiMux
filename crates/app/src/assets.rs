@@ -147,6 +147,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/arrow-right.svg",
         include_bytes!("../assets/icons/arrow-right.svg"),
     ),
+    (
+        "icons/arrow-up.svg",
+        include_bytes!("../assets/icons/arrow-up.svg"),
+    ),
     // Browser agent-context: camera captures a screenshot to the clipboard
     // (crosshair / file-code / list-tree, already registered above, drive the
     // element picker, DOM snapshot, and console copy).

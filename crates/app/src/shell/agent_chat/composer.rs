@@ -1681,13 +1681,24 @@ impl Render for ComposerView {
                 .rounded_full()
                 .bg(send_bg)
                 .text_color(send_fg)
-                .text_size(px(typo.t_body_md))
                 .when(can_send, |s| s.cursor_pointer().hover(|s| s.opacity(0.85)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _e, window, cx| this.submit(window, cx)),
                 )
-                .child(SharedString::from("↑"))
+                // An SVG arrow, not the "↑" glyph: a text arrow centers by
+                // line-box metrics and reads high in the filled circle. The
+                // icon's geometry centers cleanly under `items_center`; the
+                // arrowhead's visual mass still sits a hair above its midpoint,
+                // so a 1px downward nudge optically centers it.
+                .child(
+                    div().relative().top(px(1.0)).child(
+                        Icon::default()
+                            .path("icons/arrow-up.svg")
+                            .size(px(15.0))
+                            .text_color(send_fg),
+                    ),
+                )
         };
 
         // The controls row that sits BELOW the input pill (on the composer
