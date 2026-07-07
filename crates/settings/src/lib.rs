@@ -17,7 +17,7 @@ pub mod terminal;
 pub mod theme;
 pub mod typography;
 
-pub use agent_launch::{AgentLaunchSettings, OpenMode, PerAgentLaunch, split_args};
+pub use agent_launch::{AgentLaunchSettings, OpenMode, PerAgentLaunch, Transport, split_args};
 pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
 pub use custom_commands::{CustomCommand, CustomCommandsFile, load_and_merge};

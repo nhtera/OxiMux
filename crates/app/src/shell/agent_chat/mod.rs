@@ -74,44 +74,25 @@ const FOLLOW_FRAMES: u8 = 10;
 /// frames so it fades out rather than snapping off.
 const FLASH_FRAMES: u8 = 48;
 
-/// Claude model aliases offered in the in-chat model picker. The CLI accepts
-/// these short aliases directly as `--model`. (There is no model *list* in
-/// settings — only a single default — so the selectable set is fixed here.)
-pub(super) const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
-
-/// Permission modes offered in the in-chat mode picker, as `(wire, label)`. The
-/// wire value is passed to `--permission-mode`; the label is what the user sees.
-/// The CLI also accepts `auto`/`dontAsk`, but this is the canonical, well-
-/// understood set (matching what other agent front-ends expose):
-/// - **default** — prompt before each tool.
-/// - **acceptEdits** — auto-approve file edits; still prompt for other tools.
-/// - **plan** — read-only planning; no tools execute.
-/// - **bypassPermissions** — never prompt (skip all approvals).
-pub(super) const CLAUDE_PERMISSION_MODES: &[(&str, &str)] = &[
-    ("default", "Ask each time"),
-    ("acceptEdits", "Accept edits"),
-    ("plan", "Plan mode"),
-    ("bypassPermissions", "Bypass all"),
-];
-
-/// The wire value treated as the baseline (no `--permission-mode` flag).
-pub(super) const DEFAULT_PERMISSION_MODE: &str = "default";
-
-/// Reasoning-effort levels offered in the in-chat effort picker, as
-/// `(wire, label)`. The wire value is passed to `--effort`. These are the levels
-/// the CLI accepts (`low`/`medium`/`high`/`xhigh`/`max`).
-pub(super) const CLAUDE_EFFORTS: &[(&str, &str)] = &[
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "Extra high"),
-    ("max", "Max"),
-];
-
-/// The effort shown as the current selection when none has been chosen — the
-/// CLI's own default. Purely a display label; when the field is `None` no
-/// `--effort` flag is passed, so the CLI applies whatever it's configured for.
-pub(super) const DEFAULT_EFFORT: &str = "high";
+/// Bundle the live connection's picker vocabulary (models / permission modes /
+/// efforts + their "current when unset" defaults) for the composer. Empty when
+/// there's no connection (spawn failed) — the pickers then show only the current
+/// value as static text. The vocab now lives with the backend that speaks it
+/// (the agents crate), not as app-crate constants, so a non-Claude provider
+/// advertises its own set with no view change.
+fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
+    match conn {
+        Some(c) => ControlVocab {
+            models: c.models(),
+            permission_modes: c.permission_modes(),
+            efforts: c.efforts(),
+            default_model: c.default_model(),
+            default_mode: c.default_mode(),
+            default_effort: c.default_effort(),
+        },
+        None => ControlVocab::default(),
+    }
+}
 
 /// Decoded user-attached image thumbnails, memoized by `(entry index, image
 /// index)`. Interior-mutable so the immutable `render` path can fill it lazily.
@@ -167,7 +148,7 @@ impl ThinkingLevel {
     }
 }
 
-use composer::{ComposerEvent, ComposerView};
+use composer::{ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, EntryDisplay};
@@ -175,7 +156,7 @@ use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
-    AgentConnection, AssistantMessage, ChatImage, ChatThread, ClaudeStreamJsonConnection,
+    connect, AgentConnection, AssistantMessage, ChatImage, ChatThread, ConnectSpec,
     PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus,
     TurnUsage,
 };
@@ -498,15 +479,15 @@ impl AgentChatView {
         let mut drain_task = None;
         // A fresh/restored session always starts in the default permission mode
         // (see the `permission_mode` field note); a live switch respawns.
-        match ClaudeStreamJsonConnection::spawn_resumed(
-            &cwd,
-            model.as_deref(),
-            resume_session_id.as_deref(),
+        match connect(ConnectSpec::stream_json(
+            cwd.clone(),
+            model.clone(),
+            resume_session_id.clone(),
             None,
             None,
-        ) {
+        )) {
             Ok((conn, rx)) => {
-                connection = Some(Box::new(conn));
+                connection = Some(conn);
                 drain_task = Some(Self::spawn_drain(rx, cx));
             }
             Err(e) => {
@@ -524,6 +505,7 @@ impl AgentChatView {
             .as_ref()
             .map(|c| c.capabilities())
             .unwrap_or_default();
+        let vocab = control_vocab_of(connection.as_deref());
         // Seed the palette from the rehydrated list so a restored chat offers it
         // on the first paint — `--resume` stays silent until the first message,
         // so no init would otherwise arrive to populate it.
@@ -540,7 +522,7 @@ impl AgentChatView {
             .collect();
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
-            c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, cx);
+            c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_slash_commands(seed_slash, cx);
             c.seed_history(history_seed);
         });
@@ -677,6 +659,10 @@ impl AgentChatView {
             entries: self.thread.entries.clone(),
             slash_commands: self.thread.slash_commands.clone(),
             thinking_level: self.thinking_level,
+            // P0 chat is Claude-only (native stream-json); recorded so a restored
+            // tab routes back through the factory's matching arm. When a second
+            // provider lands, the view carries its transport and writes it here.
+            provider: oximux_agents::thread::Transport::StreamJson,
         })
     }
 
@@ -707,6 +693,7 @@ impl AgentChatView {
             .as_ref()
             .map(|c| c.capabilities())
             .unwrap_or_default();
+        let vocab = control_vocab_of(self.connection.as_deref());
         let (model, permission_mode, effort) =
             (self.model.clone(), self.permission_mode.clone(), self.effort.clone());
         // The command palette is offered only when the backend advertises
@@ -715,7 +702,7 @@ impl AgentChatView {
             if caps.supports_slash { self.thread.slash_commands.clone() } else { Vec::new() };
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
-            c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, cx);
+            c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_slash_commands(slash_commands, cx);
         });
     }
@@ -943,15 +930,15 @@ impl AgentChatView {
         let model = self.model.clone();
         let permission_mode = self.permission_mode.clone();
         let effort = self.effort.clone();
-        match ClaudeStreamJsonConnection::spawn_resumed(
-            &self.cwd,
-            model.as_deref(),
-            session_id.as_deref(),
-            permission_mode.as_deref(),
-            effort.as_deref(),
-        ) {
+        match connect(ConnectSpec::stream_json(
+            self.cwd.clone(),
+            model,
+            session_id,
+            permission_mode,
+            effort,
+        )) {
             Ok((conn, rx)) => {
-                self.connection = Some(Box::new(conn));
+                self.connection = Some(conn);
                 // Reassigning drops the old drain task, cancelling its foreground
                 // half; its forwarder thread then exits on the dead child's
                 // stdout EOF. We're single-threaded here, so no stale
@@ -991,13 +978,19 @@ impl AgentChatView {
     /// mode. Not persisted (see the field note), so no host event is raised.
     /// No-op when the mode is unchanged.
     fn change_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
-        let current = self.permission_mode.as_deref().unwrap_or(DEFAULT_PERMISSION_MODE);
+        // The baseline ("no flag") mode comes from the backend, not a const —
+        // Claude's is "default"; another provider advertises its own.
+        let default_mode = self
+            .connection
+            .as_ref()
+            .and_then(|c| c.default_mode())
+            .unwrap_or_default();
+        let current = self.permission_mode.clone().unwrap_or_else(|| default_mode.clone());
         if current == mode {
             return;
         }
         // Normalize the baseline to `None` so `respawn` omits the flag entirely.
-        self.permission_mode =
-            (mode != DEFAULT_PERMISSION_MODE).then(|| mode.clone());
+        self.permission_mode = (mode != default_mode).then(|| mode.clone());
         self.respawn(cx);
         self.sync_composer(cx); // reflect the new mode in the toolbar label
         cx.notify();
@@ -1007,7 +1000,13 @@ impl AgentChatView {
     /// spawn (like `--model`), so a live switch respawns resumed on the new
     /// level. Not persisted, so no host event is raised. No-op when unchanged.
     fn change_effort(&mut self, effort: String, cx: &mut Context<Self>) {
-        let current = self.effort.as_deref().unwrap_or(DEFAULT_EFFORT);
+        // The "current when unset" effort comes from the backend, not a const.
+        let default_effort = self
+            .connection
+            .as_ref()
+            .and_then(|c| c.default_effort())
+            .unwrap_or_default();
+        let current = self.effort.clone().unwrap_or(default_effort);
         if current == effort {
             return;
         }

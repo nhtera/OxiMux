@@ -661,15 +661,23 @@ impl WorkspaceRoot {
                             std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
-                    // When the user set "open new agents as Chat" and picked
-                    // Claude, route to the structured chat view instead of the
-                    // raw-PTY agent. Every other adapter (and Terminal mode)
-                    // takes the classic path unchanged.
-                    let open_chat = id == "claude-code"
-                        && cx
-                            .try_global::<oximux_settings::AgentLaunchSettings>()
-                            .map(|s| s.default_open_mode == oximux_settings::OpenMode::Chat)
-                            .unwrap_or(false);
+                    // When the user set "open new agents as Chat" and the picked
+                    // adapter declares chat support over a transport we can drive,
+                    // route to the structured chat view instead of the raw-PTY
+                    // agent. Every terminal-only adapter (and Terminal mode) takes
+                    // the classic path unchanged. Only the stream-json backend is
+                    // wired today, so an adapter configured for a not-yet-wired
+                    // transport (ACP) stays on the terminal path rather than
+                    // opening a chat the factory can't connect — a later phase
+                    // that wires that connect arm relaxes this transport guard.
+                    let open_chat = cx
+                        .try_global::<oximux_settings::AgentLaunchSettings>()
+                        .map(|s| {
+                            s.default_open_mode == oximux_settings::OpenMode::Chat
+                                && s.chat_capable(id)
+                                && s.transport_for(id) == oximux_settings::Transport::StreamJson
+                        })
+                        .unwrap_or(false);
                     if open_chat {
                         if let Some(panes) = this.active_project_panes() {
                             panes.update(cx, |p, cx| {

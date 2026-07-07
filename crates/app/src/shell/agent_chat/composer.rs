@@ -25,7 +25,23 @@ use gpui_component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
 };
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use oximux_agents::thread::{prepend_context, ChatImage, ContextChip};
+use oximux_agents::thread::{
+    prepend_context, ChatImage, ContextChip, EffortChoice, ModeChoice, ModelChoice,
+};
+
+/// The model/mode/effort options plus their "current when unset" defaults,
+/// sourced from the live [`oximux_agents::thread::AgentConnection`] and pushed
+/// into the composer so the bottom-toolbar pickers render whatever the backend
+/// advertises — no hardcoded provider vocabulary lives in the view.
+#[derive(Clone, Default, PartialEq)]
+pub struct ControlVocab {
+    pub models: Vec<ModelChoice>,
+    pub permission_modes: Vec<ModeChoice>,
+    pub efforts: Vec<EffortChoice>,
+    pub default_model: Option<String>,
+    pub default_mode: Option<String>,
+    pub default_effort: Option<String>,
+}
 use oximux_settings::{Density, Theme, Typography};
 
 use super::composer_history::PromptHistory;
@@ -163,6 +179,10 @@ pub struct ComposerView {
     /// Whether the backend accepts a reasoning-effort setting (hides the effort
     /// picker when it doesn't).
     supports_effort: bool,
+    /// The model/mode/effort options the live backend advertises, pushed in via
+    /// [`Self::set_controls`]. The pickers render from this (no hardcoded
+    /// provider vocab); empty until a connection is attached.
+    vocab: ControlVocab,
     /// Images staged for the next send (via the paperclip, ⌘V, or drag-drop).
     /// Each holds both its wire/persist [`ChatImage`] and a pre-decoded thumbnail
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
@@ -275,6 +295,7 @@ impl ComposerView {
             effort: None,
             supports_modes: false,
             supports_effort: false,
+            vocab: ControlVocab::default(),
             pending_images: Vec::new(),
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
@@ -405,6 +426,7 @@ impl ComposerView {
         effort: Option<String>,
         supports_modes: bool,
         supports_effort: bool,
+        vocab: ControlVocab,
         cx: &mut Context<Self>,
     ) {
         if self.model != model
@@ -412,12 +434,14 @@ impl ComposerView {
             || self.effort != effort
             || self.supports_modes != supports_modes
             || self.supports_effort != supports_effort
+            || self.vocab != vocab
         {
             self.model = model;
             self.permission_mode = permission_mode;
             self.effort = effort;
             self.supports_modes = supports_modes;
             self.supports_effort = supports_effort;
+            self.vocab = vocab;
             cx.notify();
         }
     }
@@ -976,10 +1000,12 @@ impl ComposerView {
     /// anchors to the button's bottom-right).
     fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        let models: Vec<String> = self.vocab.models.iter().map(|m| m.wire.clone()).collect();
         let current = self
             .model
             .clone()
-            .unwrap_or_else(|| super::CLAUDE_MODELS[1].to_string());
+            .or_else(|| self.vocab.default_model.clone())
+            .unwrap_or_default();
         let current_for_menu = current.clone();
         Button::new("chat-model-btn")
             .label(current)
@@ -987,7 +1013,7 @@ impl ComposerView {
             .small()
             .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
-                for m in super::CLAUDE_MODELS {
+                for m in &models {
                     let selected = current_for_menu == *m;
                     let display = if selected {
                         format!("\u{2713} {m}")
@@ -1015,16 +1041,22 @@ impl ComposerView {
     /// canonical mode menu upward.
     fn render_permission_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        let modes: Vec<(String, String)> = self
+            .vocab
+            .permission_modes
+            .iter()
+            .map(|m| (m.wire.clone(), m.label.clone()))
+            .collect();
         let current_wire = self
             .permission_mode
             .clone()
-            .unwrap_or_else(|| super::DEFAULT_PERMISSION_MODE.to_string());
-        let current_label = super::CLAUDE_PERMISSION_MODES
+            .or_else(|| self.vocab.default_mode.clone())
+            .unwrap_or_default();
+        let current_label = modes
             .iter()
             .find(|(w, _)| *w == current_wire)
-            .map(|(_, l)| *l)
-            .unwrap_or(current_wire.as_str())
-            .to_string();
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| current_wire.clone());
         let current_for_menu = current_wire.clone();
         Button::new("chat-perm-mode-btn")
             .label(current_label)
@@ -1032,7 +1064,7 @@ impl ComposerView {
             .small()
             .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
-                for (wire, label) in super::CLAUDE_PERMISSION_MODES {
+                for (wire, label) in &modes {
                     let selected = current_for_menu == *wire;
                     let display = if selected {
                         format!("\u{2713} {label}")
@@ -1060,16 +1092,22 @@ impl ComposerView {
     /// menu upward.
     fn render_effort_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        let efforts: Vec<(String, String)> = self
+            .vocab
+            .efforts
+            .iter()
+            .map(|e| (e.wire.clone(), e.label.clone()))
+            .collect();
         let current_wire = self
             .effort
             .clone()
-            .unwrap_or_else(|| super::DEFAULT_EFFORT.to_string());
-        let current_label = super::CLAUDE_EFFORTS
+            .or_else(|| self.vocab.default_effort.clone())
+            .unwrap_or_default();
+        let current_label = efforts
             .iter()
             .find(|(w, _)| *w == current_wire)
-            .map(|(_, l)| *l)
-            .unwrap_or(current_wire.as_str())
-            .to_string();
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| current_wire.clone());
         let current_for_menu = current_wire.clone();
         Button::new("chat-effort-btn")
             .label(current_label)
@@ -1077,7 +1115,7 @@ impl ComposerView {
             .small()
             .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
-                for (wire, label) in super::CLAUDE_EFFORTS {
+                for (wire, label) in &efforts {
                     let selected = current_for_menu == *wire;
                     let display = if selected {
                         format!("\u{2713} {label}")
@@ -1733,7 +1771,13 @@ impl Render for ComposerView {
             controls = controls.child(self.render_permission_picker(cx));
         }
         // Spacer pushes the model/effort cluster to the far right.
-        controls = controls.child(div().flex_1()).child(self.render_model_picker(cx));
+        controls = controls.child(div().flex_1());
+        // Show the model picker only when the backend advertises models (like the
+        // mode/effort pickers). A vocab-less/disconnected state hides it rather
+        // than rendering a blank button.
+        if !self.vocab.models.is_empty() {
+            controls = controls.child(self.render_model_picker(cx));
+        }
         if self.supports_effort {
             controls = controls.child(self.render_effort_picker(cx));
         }

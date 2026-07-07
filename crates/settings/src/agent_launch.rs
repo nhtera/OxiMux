@@ -21,6 +21,20 @@ use std::collections::BTreeMap;
 use gpui::Global;
 use serde::{Deserialize, Serialize};
 
+/// Which backend a Chat-mode launch of an adapter speaks to. `StreamJson` is
+/// the native subprocess path (Claude's stream-json protocol) and the default,
+/// so an existing TOML that names no transport keeps Claude's behavior. `Acp`
+/// drives an external agent over the Agent Client Protocol, spawned from the
+/// adapter's [`PerAgentLaunch::acp_command`]. Only consulted for Chat launches;
+/// a Terminal launch ignores it. Serde `lowercase` → `"streamjson"` / `"acp"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    StreamJson,
+    Acp,
+}
+
 /// One agent's launch defaults. All fields optional via `#[serde(default)]`
 /// so a partial table only sets what it cares about.
 ///
@@ -38,11 +52,24 @@ pub struct PerAgentLaunch {
     pub model: String,
     /// Hide this agent from the launch picker. Detection still runs.
     pub disabled: bool,
+    /// Which backend a Chat-mode launch uses. Default `StreamJson` (Claude's
+    /// native path); set `Acp` to open this adapter as a chat over the Agent
+    /// Client Protocol. Ignored for Terminal launches.
+    pub transport: Transport,
+    /// The command that speaks ACP (e.g. `gemini`), spawned when
+    /// `transport == Acp`. Empty = no ACP backend configured, so the adapter is
+    /// not chat-capable over ACP. Read only when `transport == Acp`.
+    pub acp_command: String,
+    /// Free-text argv fragment appended after `acp_command` (shell-split like
+    /// `args`) — typically the protocol flag, e.g. `--acp`. Read only when
+    /// `transport == Acp`.
+    pub acp_args: String,
 }
 
 /// How a new agent launch opens by default. `Terminal` = the classic raw-PTY
-/// agent; `Chat` opens Claude as a structured chat thread (stream-json). Chat
-/// currently applies to Claude only — other adapters always open as terminals.
+/// agent; `Chat` opens the adapter as a structured chat thread. Chat is offered
+/// only for chat-capable adapters (see [`AgentLaunchSettings::chat_capable`]);
+/// every other adapter always opens as a terminal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenMode {
@@ -132,8 +159,35 @@ impl AgentLaunchSettings {
         for v in self.agents.values_mut() {
             v.args = v.args.trim().to_string();
             v.model = v.model.trim().to_string();
+            v.acp_command = v.acp_command.trim().to_string();
+            v.acp_args = v.acp_args.trim().to_string();
         }
         self
+    }
+
+    /// The Chat-mode backend transport for `adapter_id`. Defaults to
+    /// `StreamJson` (Claude's native path) when the adapter has no entry or
+    /// names no transport.
+    pub fn transport_for(&self, adapter_id: &str) -> Transport {
+        self.for_agent(adapter_id).map(|a| a.transport).unwrap_or_default()
+    }
+
+    /// Whether `adapter_id` can open as a structured chat (vs a raw terminal).
+    /// This is the capability seam the chat-routing gate consults instead of a
+    /// hard-coded provider name. An adapter qualifies when it is either:
+    /// - the built-in Claude adapter (`claude-code`), which chats over native
+    ///   stream-json; or
+    /// - configured with `transport = "acp"` and a non-empty `acp_command`
+    ///   (an external ACP agent to spawn).
+    pub fn chat_capable(&self, adapter_id: &str) -> bool {
+        if adapter_id == "claude-code" {
+            return true;
+        }
+        matches!(
+            self.for_agent(adapter_id),
+            Some(PerAgentLaunch { transport: Transport::Acp, acp_command, .. })
+                if !acp_command.trim().is_empty()
+        )
     }
 
     /// The launch entry for `adapter_id`, if the user has configured one.
@@ -304,6 +358,42 @@ model = "opus"
         // Round-trips through TOML.
         let parsed = AgentLaunchSettings::from_toml_str(&chat.to_toml_string()).expect("round-trip");
         assert_eq!(parsed.default_open_mode, OpenMode::Chat);
+    }
+
+    #[test]
+    fn transport_defaults_stream_json_and_acp_round_trips() {
+        // Absent key → StreamJson (Claude's native path; existing configs
+        // unchanged on upgrade).
+        let s = AgentLaunchSettings::from_toml_str("").expect("empty parses");
+        assert_eq!(s.transport_for("claude-code"), Transport::StreamJson);
+        // An adapter configured for ACP round-trips transport + command + args.
+        let toml = r#"
+[agents.gemini]
+transport = "acp"
+acp_command = "gemini"
+acp_args = "--acp"
+"#;
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("parse acp");
+        assert_eq!(s.transport_for("gemini"), Transport::Acp);
+        assert_eq!(s.for_agent("gemini").unwrap().acp_command, "gemini");
+        assert_eq!(s.for_agent("gemini").unwrap().acp_args, "--acp");
+        let parsed = AgentLaunchSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
+        assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn chat_capable_claude_always_and_acp_when_configured() {
+        let mut s = AgentLaunchSettings::default();
+        // Built-in Claude chats over stream-json, no config needed.
+        assert!(s.chat_capable("claude-code"));
+        // A plain adapter with no ACP config is terminal-only.
+        assert!(!s.chat_capable("codex"));
+        // transport=acp but an empty command → NOT chat-capable (nothing to spawn).
+        s.entry_mut("gemini").transport = Transport::Acp;
+        assert!(!s.chat_capable("gemini"), "acp without a command is not chat-capable");
+        // With a command → chat-capable.
+        s.entry_mut("gemini").acp_command = "gemini".into();
+        assert!(s.chat_capable("gemini"));
     }
 
     #[test]

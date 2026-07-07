@@ -1931,6 +1931,7 @@ mod tests {
             ],
             slash_commands: vec!["compact".into()],
             thinking_level: Default::default(),
+            provider: oximux_agents::thread::Transport::StreamJson,
         };
         let snap = PersistedTabs {
             tabs: vec![PersistedTab {

@@ -14,6 +14,7 @@
 
 pub mod background_task;
 pub mod claude_stream_json;
+pub mod connect;
 pub mod connection;
 pub mod context_chip;
 pub mod entry;
@@ -24,12 +25,15 @@ pub mod session_import;
 pub mod state;
 pub mod stream_json;
 pub mod tool_call;
+pub mod transport;
 
 pub use claude_stream_json::{build_args, ClaudeStreamJsonConnection};
+pub use connect::{connect, ConnectSpec};
 pub use connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
-    AgentCapabilities, AgentConnection, StubConnection,
+    AgentCapabilities, AgentConnection, EffortChoice, ModeChoice, ModelChoice, StubConnection,
 };
+pub use transport::Transport;
 pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
 pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};

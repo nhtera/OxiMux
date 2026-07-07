@@ -19,13 +19,55 @@ use serde_json::Value;
 
 use super::connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
-    AgentCapabilities, AgentConnection,
+    AgentCapabilities, AgentConnection, EffortChoice, ModeChoice, ModelChoice,
 };
 use super::entry::ChatImage;
 use super::question::{AskQuestion, QuestionAnswers};
 use super::event::ThreadEvent;
 use super::stream_json::decode_line;
 use super::tool_call::PermissionDecision;
+
+// --- In-chat picker vocabulary -------------------------------------------
+// The model/mode/effort options Claude offers, owned by the backend that
+// speaks them (not the view) so the composer can render whatever the live
+// connection advertises. Surfaced through the `AgentConnection` accessors below.
+
+/// Claude model aliases offered in the model picker. The CLI accepts these
+/// short aliases directly as `--model`.
+const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+
+/// Permission modes as `(wire, label)`: `wire` → `--permission-mode`, `label`
+/// is shown to the user.
+/// - **default** — prompt before each tool.
+/// - **acceptEdits** — auto-approve file edits; still prompt for other tools.
+/// - **plan** — read-only planning; no tools execute.
+/// - **bypassPermissions** — never prompt.
+const CLAUDE_PERMISSION_MODES: &[(&str, &str)] = &[
+    ("default", "Ask each time"),
+    ("acceptEdits", "Accept edits"),
+    ("plan", "Plan mode"),
+    ("bypassPermissions", "Bypass all"),
+];
+
+/// The permission mode treated as baseline (no `--permission-mode` flag), also
+/// the value shown as current when the user hasn't picked one.
+const DEFAULT_PERMISSION_MODE: &str = "default";
+
+/// Reasoning-effort levels as `(wire, label)`: `wire` → `--effort`.
+const CLAUDE_EFFORTS: &[(&str, &str)] = &[
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra high"),
+    ("max", "Max"),
+];
+
+/// The effort shown as current when none is chosen — the CLI's own default.
+const DEFAULT_EFFORT: &str = "high";
+
+/// The model shown as current when none is chosen — Claude's mid alias
+/// (`CLAUDE_MODELS[1]`, "sonnet").
+const DEFAULT_MODEL: &str = "sonnet";
 
 /// Flags for the persistent, structured, interactive Claude session. Pure so
 /// it can be unit-tested. `--permission-prompt-tool stdio` routes approvals to
@@ -206,11 +248,45 @@ impl AgentConnection for ClaudeStreamJsonConnection {
 
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
-            supports_modes: true,  // permission modes (acceptEdits, …)
-            supports_slash: true,  // system/init advertises slash_commands
-            supports_config: true, // reasoning effort via `--effort <level>`
-            emits_usage: true,     // result + stream_event carry token/cost usage
+            supports_modes: true,   // permission modes (acceptEdits, …)
+            supports_slash: true,   // system/init advertises slash_commands
+            supports_config: true,  // reasoning effort via `--effort <level>`
+            emits_usage: true,      // result + stream_event carry token/cost usage
+            supports_rewind: true,  // keeps ~/.claude/projects/*.jsonl for truncate-fork
         }
+    }
+
+    fn models(&self) -> Vec<ModelChoice> {
+        CLAUDE_MODELS
+            .iter()
+            .map(|m| ModelChoice { wire: (*m).to_string() })
+            .collect()
+    }
+
+    fn permission_modes(&self) -> Vec<ModeChoice> {
+        CLAUDE_PERMISSION_MODES
+            .iter()
+            .map(|(w, l)| ModeChoice { wire: (*w).to_string(), label: (*l).to_string() })
+            .collect()
+    }
+
+    fn efforts(&self) -> Vec<EffortChoice> {
+        CLAUDE_EFFORTS
+            .iter()
+            .map(|(w, l)| EffortChoice { wire: (*w).to_string(), label: (*l).to_string() })
+            .collect()
+    }
+
+    fn default_model(&self) -> Option<String> {
+        Some(DEFAULT_MODEL.to_string())
+    }
+
+    fn default_mode(&self) -> Option<String> {
+        Some(DEFAULT_PERMISSION_MODE.to_string())
+    }
+
+    fn default_effort(&self) -> Option<String> {
+        Some(DEFAULT_EFFORT.to_string())
     }
 
     /// Interrupt the in-flight turn by sending SIGINT to the child. `claude`
@@ -353,6 +429,34 @@ mod tests {
         assert!(!build_args_with_resume(None, None, None, Some("  ")).iter().any(|x| x == "--effort"));
         assert!(!build_args_with_resume(None, None, None, None).iter().any(|x| x == "--effort"));
         assert!(!build_args(None).iter().any(|x| x == "--effort"));
+    }
+
+    /// The Claude connection advertises exactly the vocab the pickers expect
+    /// (moved here from the app crate). Accessors ignore `self`, so a trivially
+    /// spawned connection exercises them without a real `claude`.
+    #[test]
+    fn claude_vocab_matches_expected() {
+        let (conn, _rx) =
+            ClaudeStreamJsonConnection::spawn_command(Command::new("true")).expect("spawn");
+        let models: Vec<String> = conn.models().into_iter().map(|m| m.wire).collect();
+        assert_eq!(models, vec!["opus", "sonnet", "haiku"]);
+        assert_eq!(conn.default_model().as_deref(), Some("sonnet"));
+        let modes: Vec<(String, String)> =
+            conn.permission_modes().into_iter().map(|m| (m.wire, m.label)).collect();
+        assert_eq!(
+            modes,
+            vec![
+                ("default".to_string(), "Ask each time".to_string()),
+                ("acceptEdits".to_string(), "Accept edits".to_string()),
+                ("plan".to_string(), "Plan mode".to_string()),
+                ("bypassPermissions".to_string(), "Bypass all".to_string()),
+            ]
+        );
+        assert_eq!(conn.default_mode().as_deref(), Some("default"));
+        let efforts: Vec<String> = conn.efforts().into_iter().map(|e| e.wire).collect();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(conn.default_effort().as_deref(), Some("high"));
+        assert!(conn.capabilities().supports_rewind);
     }
 
     /// Spawn a FAKE program that prints two stream-json lines; the reader

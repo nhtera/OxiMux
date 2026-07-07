@@ -73,7 +73,7 @@ impl ProjectPanes {
     /// Open a new Agent Chat tab in the active group (or the first group if the
     /// active id is stale). Not a singleton — each call opens a fresh chat
     /// session with its own headless subprocess. Routed to by the launch picker
-    /// when `default_open_mode` is `Chat` and the picked adapter is Claude.
+    /// when `default_open_mode` is `Chat` and the picked adapter is chat-capable.
     pub fn open_agent_chat_tab_in_active_group(
         &mut self,
         cwd: PathBuf,

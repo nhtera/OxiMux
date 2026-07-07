@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use oximux_agents::thread::ThreadEntry;
+use oximux_agents::thread::{ThreadEntry, Transport};
 use oximux_storage::SettingsRepo;
 
 use crate::shell::agent_chat::ThinkingLevel;
@@ -52,6 +52,12 @@ pub struct PersistedChatTranscript {
     /// keeps blobs written before this field loadable.
     #[serde(default)]
     pub thinking_level: ThinkingLevel,
+    /// Which backend transport minted this session, so a restored tab routes
+    /// back through the connection factory's matching arm. `#[serde(default)]`
+    /// (→ `StreamJson`, i.e. Claude) keeps blobs written before this field
+    /// loadable and identical.
+    #[serde(default)]
+    pub provider: Transport,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -113,9 +119,40 @@ mod tests {
             ],
             slash_commands: vec!["compact".into(), "research".into()],
             thinking_level: ThinkingLevel::Expanded,
+            provider: Transport::StreamJson,
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
+    }
+
+    #[test]
+    fn old_blob_without_provider_defaults_to_stream_json() {
+        // A blob written before the provider field must load as StreamJson (Claude).
+        let repo = repo();
+        let json = r#"{"session_id":"old","model":null,"entries":[],"slash_commands":[]}"#;
+        repo.set(&chat_settings_key("old"), json).expect("seed old blob");
+        let loaded = load_chat_transcript(&repo, "old").expect("loads");
+        assert_eq!(loaded.provider, Transport::StreamJson);
+    }
+
+    #[test]
+    fn present_provider_round_trips() {
+        // A non-default provider is genuinely carried through save/load (not just
+        // filled by the serde default).
+        let repo = repo();
+        let t = PersistedChatTranscript {
+            session_id: "acp-sess".into(),
+            model: None,
+            entries: vec![],
+            slash_commands: vec![],
+            thinking_level: Default::default(),
+            provider: Transport::Acp,
+        };
+        save_chat_transcript(&repo, &t);
+        assert_eq!(
+            load_chat_transcript(&repo, "acp-sess").unwrap().provider,
+            Transport::Acp
+        );
     }
 
     #[test]

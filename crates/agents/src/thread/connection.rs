@@ -35,6 +35,32 @@ pub struct AgentCapabilities {
     pub supports_config: bool,
     /// Turns carry token/cost usage the UI can meter.
     pub emits_usage: bool,
+    /// The backend keeps an on-disk session log the rewind/fork truncate-fork
+    /// can read (`~/.claude/projects/*.jsonl`). Claude sets this true; ACP
+    /// backends without such a log report false → the UI hides rewind for them.
+    pub supports_rewind: bool,
+}
+
+/// One selectable model for the model picker. `wire` is passed to the backend
+/// as-is (Claude: `--model opus`) and shown verbatim in the menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub wire: String,
+}
+
+/// One permission/edit mode for the mode picker: `wire` is the backend value,
+/// `label` is what the user sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeChoice {
+    pub wire: String,
+    pub label: String,
+}
+
+/// One reasoning-effort level for the effort picker, `(wire, label)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortChoice {
+    pub wire: String,
+    pub label: String,
 }
 
 /// The user-facing control surface for one chat session.
@@ -107,6 +133,40 @@ pub trait AgentConnection: Send {
     /// Set a backend config value at runtime (ACP). Unsupported by default.
     fn set_config(&self, _key: &str, _value: Value) -> Result<()> {
         anyhow::bail!("this agent does not support runtime configuration")
+    }
+
+    /// The model choices this backend offers in the model picker. Default: none
+    /// (the picker then shows only the current model as static text).
+    fn models(&self) -> Vec<ModelChoice> {
+        Vec::new()
+    }
+
+    /// The permission/edit modes this backend offers in the mode picker.
+    /// Default: none.
+    fn permission_modes(&self) -> Vec<ModeChoice> {
+        Vec::new()
+    }
+
+    /// The reasoning-effort levels this backend offers in the effort picker.
+    /// Default: none.
+    fn efforts(&self) -> Vec<EffortChoice> {
+        Vec::new()
+    }
+
+    /// The model shown as current when the user hasn't picked one (the
+    /// backend's own default). Default: none.
+    fn default_model(&self) -> Option<String> {
+        None
+    }
+
+    /// The permission mode shown as current when unset. Default: none.
+    fn default_mode(&self) -> Option<String> {
+        None
+    }
+
+    /// The reasoning effort shown as current when unset. Default: none.
+    fn default_effort(&self) -> Option<String> {
+        None
     }
 }
 
