@@ -16,10 +16,12 @@
 //! Phase 3 makes approvals/usage/pickers real. Fixed posture: `on-request`
 //! approvals + `workspace-write` sandbox (`supports_modes = false`).
 
+mod approvals;
 mod map;
 pub mod protocol;
 pub mod transport;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Child;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -30,6 +32,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
+use approvals::ServerRequestAction;
 use super::connection::{AgentConnection, AgentCapabilities};
 use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionDecision;
@@ -52,6 +55,12 @@ struct CodexState {
     thread_id: Option<String>,
     current_turn_id: Option<String>,
     last_usage: Option<TurnUsage>,
+    /// Tool items (commandExecution / fileChange) by itemId, so a later approval
+    /// request — which carries only the itemId — can show the command / changes.
+    cmd_items: HashMap<String, Value>,
+    /// Pending approvals: our permission-card `request_id` → the Codex JSON-RPC
+    /// request id we must answer with a `{decision}` once the user chooses.
+    pending_approvals: HashMap<String, Value>,
 }
 
 pub struct CodexAppServerConnection {
@@ -118,17 +127,31 @@ impl AgentConnection for CodexAppServerConnection {
             .map_err(|_| anyhow!("codex worker is gone"))
     }
 
-    fn resolve_permission(&self, _request_id: &str, _decision: PermissionDecision) -> Result<()> {
-        // Phase 1 auto-declines approvals in the mapper, so no interactive
-        // permission card is shown for Codex yet; a later phase wires this.
-        anyhow::bail!("codex interactive approvals arrive in a later phase")
+    fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
+        // Look up the stashed Codex JSON-RPC request id and answer it directly
+        // (the reader never blocked on the decision). A no-op if already answered.
+        let id = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("codex state poisoned"))?
+            .pending_approvals
+            .remove(request_id);
+        match id {
+            Some(id) => self
+                .rpc
+                .respond(id, json!({ "decision": approvals::to_codex_decision(&decision) })),
+            None => Ok(()),
+        }
     }
 
     fn capabilities(&self) -> AgentCapabilities {
-        // Phase 1: fixed on-request posture, no modes, no usage/vocab yet (a
-        // later phase flips emits_usage + fills the model/effort vocab). No
-        // ~/.claude JSONL → no rewind.
-        AgentCapabilities::default()
+        AgentCapabilities {
+            supports_modes: false,  // fixed on-request posture in P1 (no mode picker)
+            supports_slash: false,  // no slash-command palette wired for Codex yet
+            supports_config: false, // effort picker vocab lands with model/list
+            emits_usage: true,      // thread/tokenUsage/updated → the usage footer
+            supports_rewind: false, // no ~/.claude JSONL; rewind stays Claude-only
+        }
     }
 
     /// Interrupt the in-flight turn (`turn/interrupt`). Fire-and-forget so the
@@ -244,10 +267,28 @@ fn map_inbound(
                     }
                 }
             }
-            Inbound::ServerRequest { id, .. } => {
-                // Decline every approval so a turn that requests one doesn't
-                // stall waiting on us. Phase 3 renders a real approval card.
-                let _ = rpc.respond(id, json!({ "decision": "denied" }));
+            Inbound::ServerRequest { id, method, params } => {
+                let action = {
+                    let mut st = match state.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    approvals::map_server_request(&id, &method, &params, &mut st)
+                };
+                match action {
+                    // A permission card was emitted; the reply follows the user's
+                    // decision (via resolve_permission) — don't answer here.
+                    ServerRequestAction::Emit(events) => {
+                        for ev in events {
+                            if event_tx.send(ev).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    ServerRequestAction::AutoRespond(result) => {
+                        let _ = rpc.respond(id, result);
+                    }
+                }
             }
         }
     }

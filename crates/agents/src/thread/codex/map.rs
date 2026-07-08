@@ -29,10 +29,22 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
             .collect(),
 
         // --- item lifecycle -----------------------------------------------
-        "item/started" => params
-            .get("item")
-            .map(item_started)
-            .unwrap_or_default(),
+        "item/started" => match params.get("item") {
+            Some(item) => {
+                // Cache tool items so a later approval request (which carries
+                // only the itemId) can render the command / changes.
+                if let Some(id) = item.get("id").and_then(|v| v.as_str())
+                    && matches!(
+                        item.get("type").and_then(|v| v.as_str()),
+                        Some("commandExecution" | "fileChange")
+                    )
+                {
+                    st.cmd_items.insert(id.to_string(), item.clone());
+                }
+                item_started(item)
+            }
+            None => Vec::new(),
+        },
         "item/completed" => params
             .get("item")
             .map(item_completed)
