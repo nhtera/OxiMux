@@ -60,6 +60,13 @@ pub enum AdapterSelection {
         kind: AgentAdapter,
         id: &'static str,
     },
+    /// A built-in ACP preset (Cursor/Amp). Chat-only by nature, so the owner
+    /// opens it straight as a structured chat tab (via the generic ACP backend)
+    /// rather than routing through the terminal-capable adapter path. `id` keys
+    /// the preset's backend resolution in `AgentLaunchSettings`.
+    AcpPreset {
+        id: &'static str,
+    },
 }
 
 /// Boxed handler for selections. Boxed so the picker can be constructed
@@ -82,6 +89,11 @@ pub struct AdapterPicker {
     /// the "Loading…" placeholder on first open and the silent background
     /// refresh on subsequent opens.
     is_refreshing: bool,
+    /// PATH availability of each built-in ACP preset (parallel to
+    /// [`oximux_settings::ACP_PRESETS`]), detected alongside the adapters.
+    /// `None` until the first detection completes; a preset whose command isn't
+    /// installed renders greyed (like an unavailable adapter).
+    preset_available: Option<Vec<bool>>,
     registry: Arc<AdapterRegistry>,
     on_select: OnSelect,
     theme: Theme,
@@ -102,6 +114,7 @@ impl AdapterPicker {
             left_anchor_px: 0.0,
             entries: None,
             is_refreshing: false,
+            preset_available: None,
             registry,
             on_select,
             theme,
@@ -154,6 +167,14 @@ impl AdapterPicker {
         self.close(cx);
     }
 
+    /// Click on a built-in ACP preset row: open it as a structured chat tab
+    /// (Cursor/Amp), then close. Chat-only, so it bypasses the terminal adapter
+    /// path entirely.
+    fn select_preset(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        (self.on_select)(AdapterSelection::AcpPreset { id }, window, cx);
+        self.close(cx);
+    }
+
     /// Spawn the async detect task. Fires when:
     /// - First open (`entries.is_none()`), or
     /// - Subsequent open with a cache present and no refresh already in
@@ -166,12 +187,21 @@ impl AdapterPicker {
         cx.notify();
         let registry = self.registry.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result =
-                tokio::time::timeout(Duration::from_millis(500), registry.detect_available())
-                    .await;
+            // Detect the registry adapters and the ACP presets under one timeout —
+            // both are `which`-style PATH probes, so a slow mount caps them together.
+            let detect = async {
+                let entries = registry.detect_available().await;
+                let mut presets = Vec::with_capacity(oximux_settings::ACP_PRESETS.len());
+                for preset in oximux_settings::ACP_PRESETS {
+                    presets.push(oximux_agents::cli::which_on_path(preset.command).await);
+                }
+                (entries, presets)
+            };
+            let result = tokio::time::timeout(Duration::from_millis(500), detect).await;
             let update_result = this.update(cx, |p, cx| match result {
-                Ok(entries) => {
+                Ok((entries, presets)) => {
                     p.entries = Some(entries);
+                    p.preset_available = Some(presets);
                     p.is_refreshing = false;
                     cx.notify();
                 }
@@ -179,9 +209,12 @@ impl AdapterPicker {
                     if p.entries.is_none() {
                         p.entries = Some(Vec::new());
                     }
+                    if p.preset_available.is_none() {
+                        p.preset_available = Some(vec![false; oximux_settings::ACP_PRESETS.len()]);
+                    }
                     p.is_refreshing = false;
                     tracing::warn!(
-                        "adapter-picker: detect_available timed out after 500ms; PATH may be on a slow mount"
+                        "adapter-picker: detect timed out after 500ms; PATH may be on a slow mount"
                     );
                     cx.notify();
                 }
@@ -368,8 +401,74 @@ impl AdapterPicker {
             }
         };
 
+        // Built-in ACP presets (Cursor/Amp) follow the adapter list once detection
+        // has run, greyed when their CLI isn't installed.
+        if let Some(avail) = self.preset_available.clone() {
+            card = append_preset_rows(card, &avail, theme, density, typography.clone(), cx);
+        }
+
         card
     }
+}
+
+/// Append the built-in ACP preset rows (Cursor/Amp) after the adapter list. Each
+/// is greyed when its command isn't on PATH; a user-disabled preset is hidden.
+/// Selecting one opens it as a chat tab (see [`AdapterPicker::select_preset`]).
+fn append_preset_rows(
+    mut card: gpui::Div,
+    preset_available: &[bool],
+    theme: Theme,
+    density: Density,
+    typography: Typography,
+    cx: &mut Context<AdapterPicker>,
+) -> gpui::Div {
+    let launch = cx
+        .try_global::<AgentLaunchSettings>()
+        .cloned()
+        .unwrap_or_default();
+    // Only surface a preset that actually resolves to a working ACP chat backend:
+    // `chat_capable` is true for a zero-config preset AND for a user ACP override
+    // of the id, but FALSE when a non-ACP `[agents.<id>]` entry has taken the id
+    // over — in which case resolution would fall back to stream-json and silently
+    // launch the wrong agent, so the row is omitted rather than misrouting.
+    let rows: Vec<(usize, &oximux_settings::AcpPreset)> = oximux_settings::ACP_PRESETS
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !launch.is_disabled(p.id) && launch.chat_capable(p.id))
+        .collect();
+    if rows.is_empty() {
+        return card;
+    }
+    // Separator between the adapters and the preset section.
+    card = card.child(
+        div().h(px(SEP_HEIGHT)).bg(theme.border_inactive).mx(px(4.0)).my(px(4.0)),
+    );
+    for (ix, preset) in rows {
+        let available = preset_available.get(ix).copied().unwrap_or(false);
+        let id = preset.id;
+        let (state, trailing) = if available {
+            (RowState::Active, None)
+        } else {
+            (RowState::Disabled, Some(RowTrailing::Hint(SharedString::from("not installed"))))
+        };
+        let handler = cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+            if matches!(state, RowState::Active) {
+                this.select_preset(id, window, cx);
+            }
+        });
+        card = card.child(picker_row(
+            ("preset-row", ix),
+            Some(adapter_icon_path(id)),
+            SharedString::from(preset.title),
+            trailing,
+            state,
+            theme,
+            density,
+            typography.clone(),
+            handler,
+        ));
+    }
+    card
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

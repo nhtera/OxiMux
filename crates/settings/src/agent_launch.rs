@@ -67,6 +67,11 @@ pub struct PerAgentLaunch {
     /// `args`) — typically the protocol flag, e.g. `--acp`. Read only when
     /// `transport == Acp`.
     pub acp_args: String,
+    /// How a launch of THIS agent opens by default, overriding the global
+    /// [`AgentLaunchSettings::default_open_mode`]. `None` = inherit the global.
+    /// The ACP presets set this to `Chat` so Cursor/Amp open as a structured chat
+    /// even when the global default is `Terminal`; any agent can set it too.
+    pub default_open_mode: Option<OpenMode>,
 }
 
 /// How a new agent launch opens by default. `Terminal` = the classic raw-PTY
@@ -79,6 +84,41 @@ pub enum OpenMode {
     #[default]
     Terminal,
     Chat,
+}
+
+/// A built-in ACP agent preset: a ready-to-launch chat agent that needs no
+/// hand-written `[agents.<id>]` block. Resolution (`chat_capable`, backend
+/// command/args, open mode) falls back to a matching preset when the user hasn't
+/// configured that id — so the agent is one-click without any TOML, while a user
+/// entry for the same id still wins (see the resolution accessors). Presets are
+/// **data, not new adapters**: they drive the generic ACP chat path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpPreset {
+    /// Stable id (used as the adapter id in resolution + the launcher row).
+    pub id: &'static str,
+    /// Human label for the launcher row.
+    pub title: &'static str,
+    /// The program that speaks ACP (also the `which`-detection target).
+    pub command: &'static str,
+    /// Space-separated argv fragment after `command` (e.g. `acp`).
+    pub args: &'static str,
+}
+
+/// The built-in ACP presets, surfaced one-click in the launcher.
+///
+/// - **Cursor** — `cursor-agent acp` is native ACP (confirmed against the live
+///   ACP registry + Paseo's catalog).
+/// - **Amp** — Sourcegraph's ACP wrapper binary (`amp-acp`, the invocation Paseo
+///   uses). The `which amp-acp` detection greys it when absent; its exact
+///   invocation is pinned from research and should be re-confirmed live.
+pub const ACP_PRESETS: &[AcpPreset] = &[
+    AcpPreset { id: "cursor", title: "Cursor", command: "cursor-agent", args: "acp" },
+    AcpPreset { id: "amp", title: "Amp", command: "amp-acp", args: "" },
+];
+
+/// The preset for `id`, if one is built in.
+pub fn acp_preset(id: &str) -> Option<&'static AcpPreset> {
+    ACP_PRESETS.iter().find(|p| p.id == id)
 }
 
 /// The skip-permissions ("YOLO") flag seeded for each built-in agent on a
@@ -170,13 +210,18 @@ impl AgentLaunchSettings {
 
     /// The Chat-mode backend transport for `adapter_id`. An explicitly
     /// configured non-default transport on the entry wins (e.g. an ACP adapter);
-    /// otherwise the built-in default per adapter applies — Codex speaks
-    /// `app-server`, everything else stream-json.
+    /// then a built-in ACP preset (Cursor/Amp → `Acp`); otherwise the built-in
+    /// default per adapter applies — Codex speaks `app-server`, everything else
+    /// stream-json.
     pub fn transport_for(&self, adapter_id: &str) -> Transport {
         if let Some(a) = self.for_agent(adapter_id)
             && a.transport != Transport::StreamJson
         {
             return a.transport;
+        }
+        // A preset resolves to ACP only when the user hasn't configured the id.
+        if self.for_agent(adapter_id).is_none() && acp_preset(adapter_id).is_some() {
+            return Transport::Acp;
         }
         match adapter_id {
             "codex" => Transport::AppServer,
@@ -190,16 +235,17 @@ impl AgentLaunchSettings {
     /// - a built-in chat adapter — Claude (`claude-code`, native stream-json) or
     ///   Codex (`codex`, native app-server); or
     /// - configured with `transport = "acp"` and a non-empty `acp_command`
-    ///   (an external ACP agent to spawn).
+    ///   (an external ACP agent to spawn); or
+    /// - a built-in ACP preset (Cursor/Amp) the user hasn't overridden.
     pub fn chat_capable(&self, adapter_id: &str) -> bool {
         if matches!(adapter_id, "claude-code" | "codex") {
             return true;
         }
-        matches!(
-            self.for_agent(adapter_id),
-            Some(PerAgentLaunch { transport: Transport::Acp, acp_command, .. })
-                if !acp_command.trim().is_empty()
-        )
+        if let Some(a) = self.for_agent(adapter_id) {
+            return matches!(a.transport, Transport::Acp) && !a.acp_command.trim().is_empty();
+        }
+        // No user entry → a matching preset makes it chat-capable.
+        acp_preset(adapter_id).is_some()
     }
 
     /// The launch entry for `adapter_id`, if the user has configured one.
@@ -231,20 +277,40 @@ impl AgentLaunchSettings {
 
     /// The ACP command for `adapter_id` (trimmed; `None` when unset/blank).
     /// Only meaningful when the adapter's transport is [`Transport::Acp`] —
-    /// it's the program the chat factory spawns to speak ACP.
+    /// it's the program the chat factory spawns to speak ACP. Falls back to a
+    /// built-in preset's command when the user hasn't configured the id.
     pub fn acp_command_for(&self, adapter_id: &str) -> Option<String> {
-        self.for_agent(adapter_id)
-            .map(|a| a.acp_command.trim())
-            .filter(|c| !c.is_empty())
-            .map(str::to_string)
+        if let Some(a) = self.for_agent(adapter_id) {
+            let cmd = a.acp_command.trim();
+            return (!cmd.is_empty()).then(|| cmd.to_string());
+        }
+        acp_preset(adapter_id).map(|p| p.command.to_string())
     }
 
     /// The ACP args for `adapter_id`, shell-split into argv tokens (e.g.
     /// `--experimental-acp`). Empty when unset. Appended after `acp_command`.
+    /// Falls back to a built-in preset's args when the user hasn't configured it.
     pub fn acp_args_for(&self, adapter_id: &str) -> Vec<String> {
-        self.for_agent(adapter_id)
-            .map(|a| split_args(&a.acp_args))
-            .unwrap_or_default()
+        if let Some(a) = self.for_agent(adapter_id) {
+            return split_args(&a.acp_args);
+        }
+        acp_preset(adapter_id).map(|p| split_args(p.args)).unwrap_or_default()
+    }
+
+    /// How a launch of `adapter_id` opens, resolving the precedence:
+    /// per-agent override (from the user's TOML) → a preset's mode (Cursor/Amp =
+    /// `Chat`) → the global [`Self::default_open_mode`]. This is what the routing
+    /// gate consults so a chat-default agent can coexist with a terminal-default
+    /// global.
+    pub fn open_mode_for(&self, adapter_id: &str) -> OpenMode {
+        if let Some(m) = self.for_agent(adapter_id).and_then(|a| a.default_open_mode) {
+            return m;
+        }
+        // A preset opens as chat unless the user overrode the id above.
+        if self.for_agent(adapter_id).is_none() && acp_preset(adapter_id).is_some() {
+            return OpenMode::Chat;
+        }
+        self.default_open_mode
     }
 
     /// Whether `adapter_id` is hidden from the picker.
@@ -448,6 +514,75 @@ acp_args = "--experimental-acp --foo"
         s.entry_mut("gemini").acp_command = "gemini".into();
         assert!(s.chat_capable("gemini"));
         assert_eq!(s.transport_for("gemini"), Transport::Acp);
+    }
+
+    #[test]
+    fn acp_presets_resolve_without_config() {
+        // Cursor/Amp are one-click with zero TOML: chat-capable, ACP transport,
+        // command/args from the preset, and they open as chat.
+        let s = AgentLaunchSettings::default();
+        assert!(s.chat_capable("cursor"));
+        assert_eq!(s.transport_for("cursor"), Transport::Acp);
+        assert_eq!(s.acp_command_for("cursor").as_deref(), Some("cursor-agent"));
+        assert_eq!(s.acp_args_for("cursor"), vec!["acp"]);
+        assert_eq!(s.open_mode_for("cursor"), OpenMode::Chat);
+        // Amp: its wrapper binary, no args.
+        assert_eq!(s.acp_command_for("amp").as_deref(), Some("amp-acp"));
+        assert!(s.acp_args_for("amp").is_empty());
+        assert_eq!(s.open_mode_for("amp"), OpenMode::Chat);
+        // A non-preset, non-builtin adapter is still terminal-only.
+        assert!(!s.chat_capable("aider"));
+        assert_eq!(s.open_mode_for("aider"), OpenMode::Terminal);
+    }
+
+    #[test]
+    fn user_config_wins_over_preset() {
+        // A hand-written [agents.cursor] block overrides the preset entirely.
+        let toml = r#"
+[agents.cursor]
+transport = "acp"
+acp_command = "my-cursor"
+acp_args = "--acp"
+"#;
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("parse");
+        assert_eq!(s.acp_command_for("cursor").as_deref(), Some("my-cursor"));
+        assert_eq!(s.acp_args_for("cursor"), vec!["--acp"]);
+        assert!(s.chat_capable("cursor"));
+        // The user didn't set a per-agent open mode, and a configured entry
+        // suppresses the preset's Chat default → the global applies.
+        assert_eq!(s.open_mode_for("cursor"), OpenMode::Terminal);
+    }
+
+    #[test]
+    fn non_acp_entry_on_a_preset_id_suppresses_the_preset() {
+        // A bare `[agents.cursor] model = "..."` (no transport/command) takes the
+        // id over: the preset fallback is suppressed AND the id is NOT chat-capable
+        // (transport defaults to stream-json), so the launcher must not surface it
+        // as a working preset — otherwise a click would misroute to Claude.
+        let s = AgentLaunchSettings::from_toml_str("[agents.cursor]\nmodel = \"foo\"\n").expect("parse");
+        assert!(!s.chat_capable("cursor"), "a non-ACP override is not chat-capable");
+        assert_eq!(s.transport_for("cursor"), Transport::StreamJson);
+        assert_eq!(s.acp_command_for("cursor"), None, "no ACP command resolves");
+    }
+
+    #[test]
+    fn open_mode_precedence_per_agent_then_preset_then_global() {
+        // Unset agent inherits the global.
+        let mut s = AgentLaunchSettings { default_open_mode: OpenMode::Chat, ..Default::default() };
+        assert_eq!(s.open_mode_for("aider"), OpenMode::Chat, "inherits global chat");
+        // A per-agent override wins over the global.
+        s.entry_mut("aider").default_open_mode = Some(OpenMode::Terminal);
+        assert_eq!(s.open_mode_for("aider"), OpenMode::Terminal, "per-agent override wins");
+        // Round-trips through TOML.
+        let parsed = AgentLaunchSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
+        assert_eq!(parsed.open_mode_for("aider"), OpenMode::Terminal);
+    }
+
+    #[test]
+    fn per_agent_open_mode_defaults_none_on_old_blobs() {
+        // An existing entry without the key loads with None (inherit global).
+        let s = AgentLaunchSettings::from_toml_str("[agents.aider]\nargs = \"--x\"\n").expect("parse");
+        assert_eq!(s.for_agent("aider").unwrap().default_open_mode, None);
     }
 
     #[test]

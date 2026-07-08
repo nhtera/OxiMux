@@ -688,18 +688,20 @@ impl WorkspaceRoot {
                             std::env::current_dir()
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
-                    // When the user set "open new agents as Chat" and the picked
-                    // adapter declares chat support (Claude stream-json, Codex
-                    // app-server, or an ACP adapter with a configured command),
-                    // route to the structured chat view instead of the raw-PTY
-                    // agent. `chat_capable` is the whole gate — for ACP it already
-                    // requires a non-empty command, so no separate transport
-                    // whitelist is needed. Every terminal-only adapter (and
-                    // Terminal mode) takes the classic path unchanged.
+                    // Route to the structured chat view when the resolved open
+                    // mode for THIS agent is Chat and the adapter declares chat
+                    // support (Claude stream-json, Codex app-server, or an ACP
+                    // adapter/preset with a command). `open_mode_for` layers a
+                    // per-agent override + a preset's Chat default over the global,
+                    // so an ACP preset (Cursor/Amp) opens as chat even when the
+                    // global default is Terminal. `chat_capable` is the whole gate —
+                    // for ACP it already requires a command. Every terminal-only
+                    // adapter (and Terminal mode) takes the classic path unchanged.
                     let launch = cx.try_global::<oximux_settings::AgentLaunchSettings>();
                     let open_chat = launch
                         .map(|s| {
-                            s.default_open_mode == oximux_settings::OpenMode::Chat && s.chat_capable(id)
+                            s.open_mode_for(id) == oximux_settings::OpenMode::Chat
+                                && s.chat_capable(id)
                         })
                         .unwrap_or(false);
                     if open_chat {
@@ -725,6 +727,37 @@ impl WorkspaceRoot {
                             window,
                             cx,
                         )
+                    }
+                }
+                AdapterSelection::AcpPreset { id } => {
+                    // A built-in ACP preset (Cursor/Amp) is chat-only: open it
+                    // straight as a structured chat tab over the generic ACP
+                    // backend, rooted at the active project's cwd (same rooting as
+                    // a spawned agent, so its status dot binds to the workspace).
+                    // Guard on `chat_capable` (belt-and-suspenders with the picker
+                    // filter): a preset id the user overrode with a non-ACP entry
+                    // would otherwise resolve to stream-json and misroute to Claude,
+                    // so bail rather than launch the wrong agent.
+                    let backend = match cx.try_global::<oximux_settings::AgentLaunchSettings>() {
+                        Some(s) if s.chat_capable(id) => chat_backend_for(s, id),
+                        _ => return,
+                    };
+                    let cwd = this
+                        .active_project_panes()
+                        .map(|panes| panes.read(cx).cwd().clone())
+                        .or_else(|| {
+                            this.active_project
+                                .as_ref()
+                                .map(|p| std::path::PathBuf::from(&p.root_path))
+                        })
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        });
+                    if let Some(panes) = this.active_project_panes() {
+                        panes.update(cx, |p, cx| {
+                            p.open_agent_chat_tab_in_active_group(cwd, None, backend, window, cx);
+                        });
                     }
                 }
             });
@@ -1257,6 +1290,17 @@ mod tests {
         assert_eq!(claude.transport, AgentTransport::StreamJson);
         assert_eq!(claude.acp_command, None);
         assert!(claude.acp_args.is_empty());
+    }
+
+    #[test]
+    fn chat_backend_for_resolves_a_builtin_preset_without_config() {
+        // A Cursor preset launch resolves its ACP command/args with zero TOML —
+        // the one-click AcpPreset routing path relies on this.
+        let s = AgentLaunchSettings::default();
+        let cursor = chat_backend_for(&s, "cursor");
+        assert_eq!(cursor.transport, AgentTransport::Acp);
+        assert_eq!(cursor.acp_command.as_deref(), Some("cursor-agent"));
+        assert_eq!(cursor.acp_args, vec!["acp".to_string()]);
     }
 }
 
