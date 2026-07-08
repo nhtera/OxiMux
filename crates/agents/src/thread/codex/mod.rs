@@ -16,6 +16,7 @@
 //! Phase 3 makes approvals/usage/pickers real. Fixed posture: `on-request`
 //! approvals + `workspace-write` sandbox (`supports_modes = false`).
 
+mod map;
 pub mod protocol;
 pub mod transport;
 
@@ -30,7 +31,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use super::connection::{AgentConnection, AgentCapabilities};
-use super::event::ThreadEvent;
+use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionDecision;
 use transport::{Inbound, RpcClient};
 
@@ -44,11 +45,13 @@ enum Outbound {
     Shutdown,
 }
 
-/// Thread ids captured during the session, shared reader↔worker↔interrupt.
+/// Session state shared reader(mapper)↔worker↔interrupt: the thread + in-flight
+/// turn ids, and the latest token usage (attached to the next `TurnEnded`).
 #[derive(Default)]
 struct CodexState {
     thread_id: Option<String>,
     current_turn_id: Option<String>,
+    last_usage: Option<TurnUsage>,
 }
 
 pub struct CodexAppServerConnection {
@@ -217,55 +220,33 @@ fn worker_loop(
     }
 }
 
-/// The mapper: `Inbound` → `ThreadEvent` (Phase-1 slice) + approval auto-decline.
+/// The mapper: `Inbound` → `ThreadEvent` via [`map::map_notification`], plus the
+/// Phase-1 approval auto-decline (Phase 3 makes approvals interactive).
 fn map_inbound(
     rx: Receiver<Inbound>,
     event_tx: Sender<ThreadEvent>,
     state: Arc<Mutex<CodexState>>,
     rpc: RpcClient,
 ) {
-    // Accumulate streamed deltas so a finalized AssistantText lands on turn end
-    // (mirrors Claude's delta-then-finalized pattern).
-    let mut assistant_buf = String::new();
     for inbound in rx {
         match inbound {
-            Inbound::Notification { method, params } => match method.as_str() {
-                protocol::SN_AGENT_MESSAGE_DELTA => {
-                    if let Some(d) = protocol::agent_message_delta(&params) {
-                        assistant_buf.push_str(&d);
-                        let _ = event_tx.send(ThreadEvent::AssistantTextDelta(d));
+            Inbound::Notification { method, params } => {
+                let events = {
+                    let mut st = match state.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    map::map_notification(&method, &params, &mut st)
+                };
+                for ev in events {
+                    if event_tx.send(ev).is_err() {
+                        return; // consumer gone
                     }
                 }
-                protocol::SN_TURN_STARTED => {
-                    if let Some(tid) = protocol::turn_id(&params)
-                        && let Ok(mut s) = state.lock()
-                    {
-                        s.current_turn_id = Some(tid);
-                    }
-                    assistant_buf.clear();
-                }
-                protocol::SN_TURN_COMPLETED => {
-                    let failed = protocol::turn_failed(&params);
-                    if !assistant_buf.is_empty() {
-                        let _ = event_tx.send(ThreadEvent::AssistantText(std::mem::take(&mut assistant_buf)));
-                    }
-                    let _ = event_tx.send(ThreadEvent::TurnEnded {
-                        result: None,
-                        usage: None,
-                        is_error: failed,
-                    });
-                    if let Ok(mut s) = state.lock() {
-                        s.current_turn_id = None;
-                    }
-                }
-                protocol::SN_ERROR => {
-                    let _ = event_tx.send(ThreadEvent::Error(protocol::error_message(&params)));
-                }
-                _ => { /* Phase 2 maps reasoning/tool/item events */ }
-            },
+            }
             Inbound::ServerRequest { id, .. } => {
-                // Phase 1: decline every approval so a turn that requests one
-                // doesn't stall waiting on us. Phase 3 renders a real card.
+                // Decline every approval so a turn that requests one doesn't
+                // stall waiting on us. Phase 3 renders a real approval card.
                 let _ = rpc.respond(id, json!({ "decision": "denied" }));
             }
         }

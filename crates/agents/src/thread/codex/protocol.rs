@@ -22,19 +22,14 @@ use serde_json::{json, Value};
 // --- Method names (client → server requests) -----------------------------
 pub const M_INITIALIZE: &str = "initialize";
 pub const M_THREAD_START: &str = "thread/start";
-pub const M_THREAD_RESUME: &str = "thread/resume";
 pub const M_TURN_START: &str = "turn/start";
 pub const M_TURN_INTERRUPT: &str = "turn/interrupt";
 
 // --- Client → server notifications ---------------------------------------
 pub const N_INITIALIZED: &str = "initialized";
 
-// --- Server → client notification method names (the slice Phase 1 maps) ---
-pub const SN_AGENT_MESSAGE_DELTA: &str = "item/agentMessage/delta";
-pub const SN_TURN_STARTED: &str = "turn/started";
-pub const SN_TURN_COMPLETED: &str = "turn/completed";
-pub const SN_TOKEN_USAGE_UPDATED: &str = "thread/tokenUsage/updated";
-pub const SN_ERROR: &str = "error";
+// (Server → client notification method literals + their parsing live in `map.rs`,
+//  which owns the notification → ThreadEvent mapping.)
 
 // --- Fixed P1 posture (validated): on-request approvals + workspace sandbox
 pub const APPROVAL_ON_REQUEST: &str = "on-request";
@@ -87,35 +82,6 @@ pub fn model_from_start_response(result: &Value) -> Option<String> {
     result.get("model")?.as_str().map(String::from)
 }
 
-/// The text delta from an `item/agentMessage/delta` notification (`.delta`).
-pub fn agent_message_delta(params: &Value) -> Option<String> {
-    params.get("delta")?.as_str().map(String::from)
-}
-
-/// The turn id from a `turn/started` / `turn/completed` notification (`.turn.id`).
-pub fn turn_id(params: &Value) -> Option<String> {
-    params.get("turn")?.get("id")?.as_str().map(String::from)
-}
-
-/// Whether a `turn/completed` notification's turn ended in a failure state.
-pub fn turn_failed(params: &Value) -> bool {
-    params
-        .get("turn")
-        .and_then(|t| t.get("status"))
-        .and_then(|s| s.as_str())
-        .map(|s| s.eq_ignore_ascii_case("failed"))
-        .unwrap_or(false)
-}
-
-/// A human-readable message from an `error` notification.
-pub fn error_message(params: &Value) -> String {
-    params
-        .get("message")
-        .and_then(|m| m.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| params.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,16 +107,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_thread_id_and_delta_and_turn_id() {
+    fn parses_thread_start_response() {
         let start = json!({"thread": {"id": "th_9", "sessionId": "s"}, "model": "gpt"});
         assert_eq!(thread_id_from_start_response(&start).as_deref(), Some("th_9"));
         assert_eq!(model_from_start_response(&start).as_deref(), Some("gpt"));
-        assert_eq!(
-            agent_message_delta(&json!({"delta": "hel"})).as_deref(),
-            Some("hel")
-        );
-        assert_eq!(turn_id(&json!({"turn": {"id": "t_1"}})).as_deref(), Some("t_1"));
-        assert!(turn_failed(&json!({"turn": {"id": "t", "status": "failed"}})));
-        assert!(!turn_failed(&json!({"turn": {"id": "t", "status": "completed"}})));
     }
 }
