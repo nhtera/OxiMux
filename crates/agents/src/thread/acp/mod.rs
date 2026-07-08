@@ -16,9 +16,11 @@
 //! usage capabilities. Gemini keeps `emits_usage = false` and
 //! `supports_rewind = false` (no `~/.claude` session log to truncate-fork).
 
+mod approvals;
 mod map;
 mod worker;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -28,6 +30,7 @@ use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use agent_client_protocol::{Agent, ConnectionTo};
 use anyhow::{Result, anyhow};
 use futures::channel::mpsc as fmpsc;
+use futures::channel::oneshot;
 
 use super::connection::{AgentCapabilities, AgentConnection};
 use super::event::ThreadEvent;
@@ -52,6 +55,10 @@ pub(crate) struct AcpState {
     /// A clone of the live connection (thread-safe: `send_notification` is sync
     /// and the client's driver flushes it), so cancel works off the worker.
     pub connection: Option<ConnectionTo<Agent>>,
+    /// Permission requests awaiting the user's decision, keyed by the card's
+    /// `request_id`. The async request handler parks on the receiver; the sync
+    /// `resolve_permission` sends the decision so the handler can answer the agent.
+    pub pending: HashMap<String, oneshot::Sender<PermissionDecision>>,
 }
 
 /// A live chat connection to an ACP agent.
@@ -90,9 +97,18 @@ impl AgentConnection for AcpConnection {
             .map_err(|_| anyhow!("acp worker is gone"))
     }
 
-    fn resolve_permission(&self, _request_id: &str, _decision: PermissionDecision) -> Result<()> {
-        // Phase 1 auto-declines in the request handler; Phase 3 wires the user's
-        // decision back through here to the parked responder.
+    fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
+        // Wake the parked request handler with the user's decision; it translates
+        // to the agent's option and answers. A no-op if already resolved / gone.
+        let tx = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("acp state poisoned"))?
+            .pending
+            .remove(request_id);
+        if let Some(tx) = tx {
+            let _ = tx.send(decision);
+        }
         Ok(())
     }
 

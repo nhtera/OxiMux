@@ -20,10 +20,12 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
 use futures::StreamExt;
 use futures::channel::mpsc as fmpsc;
+use futures::channel::oneshot;
 
 use super::map::map_session_update;
-use super::{AcpState, Outbound};
+use super::{AcpState, Outbound, approvals};
 use crate::thread::event::ThreadEvent;
+use crate::thread::tool_call::PermissionDecision;
 
 /// Run the whole ACP session to completion (blocks the worker thread). A spawn
 /// or protocol failure is surfaced as a [`ThreadEvent::Error`] so the app's
@@ -76,13 +78,34 @@ async fn session(
             },
             agent_client_protocol::on_receive_notification!(),
         )
-        // Phase 1 declines every permission request (safe default). Phase 3 routes
-        // it to the UI's approval card and answers with the user's choice.
+        // Route a permission request to the UI's approval card and answer with the
+        // user's choice: emit the card, park on a per-request oneshot, then
+        // translate the decision to the agent's option. A dropped sender (the
+        // connection is closing) resolves to Cancelled so the turn never hangs.
         .on_receive_request(
-            move |_req: RequestPermissionRequest,
-                  responder: agent_client_protocol::Responder<RequestPermissionResponse>,
-                  _cx: ConnectionTo<Agent>| async move {
-                responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled))
+            {
+                let tx = event_tx.clone();
+                let st = state.clone();
+                move |req: RequestPermissionRequest,
+                      responder: agent_client_protocol::Responder<RequestPermissionResponse>,
+                      _cx: ConnectionTo<Agent>| {
+                    let tx = tx.clone();
+                    let st = st.clone();
+                    async move {
+                        let request_id = req.tool_call.tool_call_id.0.to_string();
+                        let (otx, orx) = oneshot::channel::<PermissionDecision>();
+                        {
+                            let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+                            s.pending.insert(request_id.clone(), otx);
+                        }
+                        let _ = tx.send(approvals::permission_event(&req, &request_id));
+                        let outcome = match orx.await {
+                            Ok(decision) => approvals::decision_to_outcome(&decision, &req.options),
+                            Err(_) => RequestPermissionOutcome::Cancelled,
+                        };
+                        responder.respond(RequestPermissionResponse::new(outcome))
+                    }
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )

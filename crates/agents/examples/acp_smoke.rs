@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use oximux_agents::thread::acp::AcpConnection;
 use oximux_agents::thread::connection::AgentConnection;
 use oximux_agents::thread::event::ThreadEvent;
+use oximux_agents::thread::tool_call::PermissionDecision;
 
 fn main() {
     let cwd = std::env::current_dir().expect("cwd");
@@ -44,6 +45,17 @@ fn main() {
                             .unwrap_or_else(|_| "Reply with exactly one word: pong".to_string());
                         println!(">>> sending prompt: {prompt}");
                         conn.send_user_message(&prompt).expect("send");
+                    }
+                    ThreadEvent::PermissionRequested { request_id, tool_name, .. } => {
+                        let approve = std::env::var("ACP_APPROVE").as_deref() != Ok("0");
+                        println!(">>> permission for '{tool_name}' → {}",
+                            if approve { "APPROVE" } else { "DENY" });
+                        let decision = if approve {
+                            PermissionDecision::Allow { updated_input: serde_json::Value::Null }
+                        } else {
+                            PermissionDecision::Deny { message: "denied by smoke test".into() }
+                        };
+                        conn.resolve_permission(&request_id, decision).expect("resolve");
                     }
                     ThreadEvent::TurnEnded { .. } => {
                         println!("<<< turn ended");
