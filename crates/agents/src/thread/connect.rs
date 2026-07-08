@@ -15,6 +15,40 @@ use super::connection::AgentConnection;
 use super::event::ThreadEvent;
 use super::transport::Transport;
 
+/// Which backend a chat tab runs over, plus — for ACP — the external command to
+/// spawn. Bundled so the launch/restore call-chain threads one value through its
+/// many hops instead of three loose params, and so the view stores/persists one
+/// field. The `acp_*` fields are meaningful only when `transport == Acp`
+/// (Claude/Codex leave them empty). Gpui-free so it lives beside [`ConnectSpec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatBackend {
+    pub transport: Transport,
+    /// The command that speaks ACP (e.g. `gemini`); `None` for non-ACP backends.
+    pub acp_command: Option<String>,
+    /// argv appended after `acp_command`; empty for non-ACP backends.
+    pub acp_args: Vec<String>,
+}
+
+impl ChatBackend {
+    /// The native Claude backend (stream-json, no ACP command) — the default a
+    /// provider-agnostic entry point (e.g. the "New Agent Chat" action) opens.
+    pub fn stream_json() -> Self {
+        Self::default()
+    }
+
+    /// Human-facing provider name ("Claude"/"Codex"/"Agent") for captions.
+    pub fn provider_display_name(&self) -> &'static str {
+        self.transport.provider_display_name()
+    }
+}
+
+impl From<Transport> for ChatBackend {
+    /// A backend that carries only a transport (Claude/Codex — no ACP command).
+    fn from(transport: Transport) -> Self {
+        Self { transport, acp_command: None, acp_args: Vec::new() }
+    }
+}
+
 /// Everything the factory needs to open one chat connection. The `acp_*` fields
 /// are only consulted by the `Acp` arm; the `StreamJson` (Claude) arm ignores
 /// them.
@@ -37,10 +71,12 @@ pub struct ConnectSpec {
 }
 
 impl ConnectSpec {
-    /// Build a spec for Claude's native stream-json transport (the only
-    /// transport wired today). Callers that already know the session's provider
-    /// set `transport` themselves; this keeps the common Claude sites tidy.
-    pub fn stream_json(
+    /// Build a spec from a resolved [`ChatBackend`] plus the per-session bits
+    /// (cwd, model, resume id, permission mode, effort). One place carries the
+    /// backend's transport + `acp_*` into the spec, so the fresh-launch and
+    /// respawn call sites stay a single line each.
+    pub fn for_backend(
+        backend: &ChatBackend,
         cwd: PathBuf,
         model: Option<String>,
         resume_session_id: Option<String>,
@@ -48,14 +84,14 @@ impl ConnectSpec {
         effort: Option<String>,
     ) -> Self {
         Self {
-            transport: Transport::StreamJson,
+            transport: backend.transport,
             cwd,
             model,
             resume_session_id,
             permission_mode,
             effort,
-            acp_command: None,
-            acp_args: Vec::new(),
+            acp_command: backend.acp_command.clone(),
+            acp_args: backend.acp_args.clone(),
         }
     }
 }

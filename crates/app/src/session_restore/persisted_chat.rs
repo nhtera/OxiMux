@@ -58,6 +58,18 @@ pub struct PersistedChatTranscript {
     /// loadable and identical.
     #[serde(default)]
     pub provider: Transport,
+    /// For an ACP session: the command that was spawned (e.g. `gemini`). The
+    /// launch settings key ACP configs by adapter id, which the persisted tab
+    /// doesn't carry — so the command rides in the transcript to make restore
+    /// self-contained (and faithful to the command that minted the session).
+    /// `#[serde(default)]` (→ `None`) keeps older blobs and Claude/Codex blobs
+    /// loadable unchanged.
+    #[serde(default)]
+    pub acp_command: Option<String>,
+    /// argv that followed `acp_command` at launch (e.g. `--experimental-acp`).
+    /// `#[serde(default)]` (→ empty) for older / non-ACP blobs.
+    #[serde(default)]
+    pub acp_args: Vec<String>,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -120,6 +132,8 @@ mod tests {
             slash_commands: vec!["compact".into(), "research".into()],
             thinking_level: ThinkingLevel::Expanded,
             provider: Transport::StreamJson,
+            acp_command: None,
+            acp_args: vec![],
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
@@ -147,12 +161,15 @@ mod tests {
             slash_commands: vec![],
             thinking_level: Default::default(),
             provider: Transport::Acp,
+            acp_command: Some("gemini".into()),
+            acp_args: vec!["--experimental-acp".into()],
         };
         save_chat_transcript(&repo, &t);
-        assert_eq!(
-            load_chat_transcript(&repo, "acp-sess").unwrap().provider,
-            Transport::Acp
-        );
+        let loaded = load_chat_transcript(&repo, "acp-sess").unwrap();
+        assert_eq!(loaded.provider, Transport::Acp);
+        // The ACP command + args round-trip so restore can respawn the same agent.
+        assert_eq!(loaded.acp_command.as_deref(), Some("gemini"));
+        assert_eq!(loaded.acp_args, vec!["--experimental-acp".to_string()]);
     }
 
     #[test]

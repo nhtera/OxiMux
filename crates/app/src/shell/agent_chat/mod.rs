@@ -156,9 +156,9 @@ use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
-    connect, AgentConnection, AssistantMessage, ChatImage, ChatThread, ConnectSpec,
+    connect, AgentConnection, AssistantMessage, ChatBackend, ChatImage, ChatThread, ConnectSpec,
     PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus,
-    Transport, TurnUsage,
+    TurnUsage,
 };
 use oximux_git::GitCmd;
 use oximux_settings::{Density, Theme, Typography};
@@ -209,10 +209,12 @@ pub struct AgentChatView {
     /// (Stop→next-send resume) in the same directory with the same model.
     cwd: PathBuf,
     model: Option<String>,
-    /// Which backend this chat runs over (Claude stream-json / Codex app-server).
-    /// Threaded into every `ConnectSpec` (fresh + respawn) and written to the
-    /// persisted transcript so a restore reconnects the same provider.
-    transport: oximux_agents::thread::Transport,
+    /// Which backend this chat runs over (Claude stream-json / Codex app-server /
+    /// an external ACP command). Threaded into every `ConnectSpec` (fresh +
+    /// respawn) and written to the persisted transcript so a restore reconnects
+    /// the same provider — including the ACP command, which settings don't retain
+    /// per session.
+    backend: ChatBackend,
     /// The active permission mode's wire value (`acceptEdits`, `plan`, …), or
     /// `None`/`"default"` for the CLI default. Like `--model` it's fixed at
     /// spawn, so a live switch respawns via `--resume`. Intentionally *not*
@@ -388,14 +390,14 @@ impl AgentChatView {
     pub fn new(
         cwd: PathBuf,
         model: Option<String>,
-        transport: Transport,
+        backend: ChatBackend,
         theme: Theme,
         density: Density,
         typography: Typography,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::assemble(cwd, model, transport, ChatThread::new(), theme, density, typography, window, cx)
+        Self::assemble(cwd, model, backend, ChatThread::new(), theme, density, typography, window, cx)
     }
 
     /// Rebuild a chat view on session restore: seed the thread from the
@@ -414,7 +416,7 @@ impl AgentChatView {
     pub fn new_resumed(
         cwd: PathBuf,
         model: Option<String>,
-        transport: Transport,
+        backend: ChatBackend,
         session_id: Option<String>,
         entries: Vec<ThreadEntry>,
         slash_commands: Vec<String>,
@@ -427,7 +429,7 @@ impl AgentChatView {
     ) -> Self {
         let thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
         let mut view =
-            Self::assemble(cwd, model, transport, thread, theme, density, typography, window, cx);
+            Self::assemble(cwd, model, backend, thread, theme, density, typography, window, cx);
         view.thinking_level = thinking_level;
         view
     }
@@ -440,7 +442,7 @@ impl AgentChatView {
     fn assemble(
         cwd: PathBuf,
         model: Option<String>,
-        transport: Transport,
+        backend: ChatBackend,
         mut thread: ChatThread,
         theme: Theme,
         density: Density,
@@ -453,7 +455,7 @@ impl AgentChatView {
                 theme,
                 density,
                 typography.clone(),
-                transport.provider_display_name(),
+                backend.provider_display_name(),
                 window,
                 cx,
             )
@@ -496,10 +498,14 @@ impl AgentChatView {
         let mut drain_task = None;
         // A fresh/restored session always starts in the default permission mode
         // (see the `permission_mode` field note); a live switch respawns.
-        match connect(ConnectSpec {
-            transport,
-            ..ConnectSpec::stream_json(cwd.clone(), model.clone(), resume_session_id.clone(), None, None)
-        }) {
+        match connect(ConnectSpec::for_backend(
+            &backend,
+            cwd.clone(),
+            model.clone(),
+            resume_session_id.clone(),
+            None,
+            None,
+        )) {
             Ok((conn, rx)) => {
                 connection = Some(conn);
                 drain_task = Some(Self::spawn_drain(rx, cx));
@@ -609,7 +615,7 @@ impl AgentChatView {
         Self {
             thread,
             connection,
-            transport,
+            backend,
             composer,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
@@ -679,7 +685,7 @@ impl AgentChatView {
     /// Sourced from the transport (fixed at launch) so it's correct even before a
     /// connection exists — the empty state and composer render immediately.
     fn provider_label(&self) -> &'static str {
-        self.transport.provider_display_name()
+        self.backend.provider_display_name()
     }
 
     pub fn transcript_snapshot(&self) -> Option<crate::persisted_chat::PersistedChatTranscript> {
@@ -693,9 +699,14 @@ impl AgentChatView {
             entries: self.thread.entries.clone(),
             slash_commands: self.thread.slash_commands.clone(),
             thinking_level: self.thinking_level,
-            // The transport that minted this session, so a restored tab
-            // reconnects the same provider (Claude stream-json / Codex app-server).
-            provider: self.transport,
+            // The backend that minted this session, so a restored tab reconnects
+            // the same provider (Claude stream-json / Codex app-server / an ACP
+            // command). The ACP command + args ride along because settings don't
+            // retain them per session — the transcript is the source of truth on
+            // restore. Empty for Claude/Codex.
+            provider: self.backend.transport,
+            acp_command: self.backend.acp_command.clone(),
+            acp_args: self.backend.acp_args.clone(),
         })
     }
 
@@ -963,10 +974,14 @@ impl AgentChatView {
         let model = self.model.clone();
         let permission_mode = self.permission_mode.clone();
         let effort = self.effort.clone();
-        match connect(ConnectSpec {
-            transport: self.transport,
-            ..ConnectSpec::stream_json(self.cwd.clone(), model, session_id, permission_mode, effort)
-        }) {
+        match connect(ConnectSpec::for_backend(
+            &self.backend,
+            self.cwd.clone(),
+            model,
+            session_id,
+            permission_mode,
+            effort,
+        )) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
                 // Reassigning drops the old drain task, cancelling its foreground
@@ -1183,7 +1198,7 @@ impl AgentChatView {
                 theme,
                 density,
                 typography.clone(),
-                Transport::StreamJson.provider_display_name(),
+                ChatBackend::stream_json().provider_display_name(),
                 window,
                 cx,
             )
@@ -1191,7 +1206,7 @@ impl AgentChatView {
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
-            transport: Transport::StreamJson,
+            backend: ChatBackend::stream_json(),
             composer,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),

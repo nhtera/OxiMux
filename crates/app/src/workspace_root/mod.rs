@@ -153,6 +153,23 @@ fn to_agents_transport(t: oximux_settings::Transport) -> oximux_agents::thread::
     }
 }
 
+/// Resolve the chat backend a launch of `adapter_id` should open over: the
+/// mapped transport plus, for an ACP adapter, its configured command + args
+/// (shell-split). Non-ACP adapters carry an empty command — the factory ignores
+/// the `acp_*` fields for them.
+fn chat_backend_for(
+    settings: &oximux_settings::AgentLaunchSettings,
+    adapter_id: &str,
+) -> oximux_agents::thread::ChatBackend {
+    let transport = to_agents_transport(settings.transport_for(adapter_id));
+    let is_acp = transport == oximux_agents::thread::Transport::Acp;
+    oximux_agents::thread::ChatBackend {
+        transport,
+        acp_command: is_acp.then(|| settings.acp_command_for(adapter_id)).flatten(),
+        acp_args: if is_acp { settings.acp_args_for(adapter_id) } else { Vec::new() },
+    }
+}
+
 pub struct WorkspaceRoot {
     pub(crate) theme: Theme,
     pub(crate) density: Density,
@@ -672,32 +689,27 @@ impl WorkspaceRoot {
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
                     // When the user set "open new agents as Chat" and the picked
-                    // adapter declares chat support over a transport we can drive
-                    // (stream-json for Claude, app-server for Codex), route to the
-                    // structured chat view instead of the raw-PTY agent. Every
-                    // terminal-only adapter (and Terminal mode) takes the classic
-                    // path unchanged; an adapter on a not-yet-wired transport (ACP)
-                    // stays on the terminal path rather than opening a chat the
-                    // factory can't connect.
+                    // adapter declares chat support (Claude stream-json, Codex
+                    // app-server, or an ACP adapter with a configured command),
+                    // route to the structured chat view instead of the raw-PTY
+                    // agent. `chat_capable` is the whole gate — for ACP it already
+                    // requires a non-empty command, so no separate transport
+                    // whitelist is needed. Every terminal-only adapter (and
+                    // Terminal mode) takes the classic path unchanged.
                     let launch = cx.try_global::<oximux_settings::AgentLaunchSettings>();
-                    let chat_transport = launch.map(|s| s.transport_for(id));
                     let open_chat = launch
                         .map(|s| {
                             s.default_open_mode == oximux_settings::OpenMode::Chat && s.chat_capable(id)
                         })
-                        .unwrap_or(false)
-                        && matches!(
-                            chat_transport,
-                            Some(
-                                oximux_settings::Transport::StreamJson
-                                    | oximux_settings::Transport::AppServer
-                            )
-                        );
+                        .unwrap_or(false);
                     if open_chat {
-                        let transport = to_agents_transport(chat_transport.unwrap_or_default());
+                        // `open_chat` is only true when `launch` is `Some`.
+                        let backend = launch
+                            .map(|s| chat_backend_for(s, id))
+                            .unwrap_or_default();
                         if let Some(panes) = this.active_project_panes() {
                             panes.update(cx, |p, cx| {
-                                p.open_agent_chat_tab_in_active_group(cwd, None, transport, window, cx);
+                                p.open_agent_chat_tab_in_active_group(cwd, None, backend, window, cx);
                             });
                         }
                     } else {
@@ -1212,6 +1224,40 @@ fn gather_agent_activity(targets: Vec<(String, String)>) -> HashMap<String, Stri
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_backend_for;
+    use oximux_agents::thread::Transport as AgentTransport;
+    use oximux_settings::{AgentLaunchSettings, Transport as SettingsTransport};
+
+    #[test]
+    fn chat_backend_for_carries_acp_command_only_for_acp_adapters() {
+        let mut s = AgentLaunchSettings::default();
+        // A user-configured ACP adapter: transport + command + args flow through.
+        {
+            let e = s.entry_mut("gemini");
+            e.transport = SettingsTransport::Acp;
+            e.acp_command = "gemini".into();
+            e.acp_args = "--experimental-acp".into();
+        }
+        let acp = chat_backend_for(&s, "gemini");
+        assert_eq!(acp.transport, AgentTransport::Acp);
+        assert_eq!(acp.acp_command.as_deref(), Some("gemini"));
+        assert_eq!(acp.acp_args, vec!["--experimental-acp".to_string()]);
+
+        // Built-in Codex (app-server) and Claude (stream-json) carry no acp_*.
+        let codex = chat_backend_for(&s, "codex");
+        assert_eq!(codex.transport, AgentTransport::AppServer);
+        assert_eq!(codex.acp_command, None);
+        assert!(codex.acp_args.is_empty());
+
+        let claude = chat_backend_for(&s, "claude-code");
+        assert_eq!(claude.transport, AgentTransport::StreamJson);
+        assert_eq!(claude.acp_command, None);
+        assert!(claude.acp_args.is_empty());
+    }
 }
 
 mod ops;

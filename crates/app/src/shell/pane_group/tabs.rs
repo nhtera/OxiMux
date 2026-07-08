@@ -730,7 +730,7 @@ impl PaneGroup {
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
-        transport: oximux_agents::thread::Transport,
+        backend: oximux_agents::thread::ChatBackend,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -743,7 +743,7 @@ impl PaneGroup {
             crate::shell::agent_chat::AgentChatView::new(
                 cwd_for_view,
                 model_for_view,
-                transport,
+                backend,
                 theme,
                 density,
                 typography,
@@ -763,7 +763,7 @@ impl PaneGroup {
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
-        transport: oximux_agents::thread::Transport,
+        backend: oximux_agents::thread::ChatBackend,
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
@@ -780,7 +780,7 @@ impl PaneGroup {
             crate::shell::agent_chat::AgentChatView::new_resumed(
                 cwd_for_view,
                 model_for_view,
-                transport,
+                backend,
                 session_id,
                 entries,
                 slash_commands,
@@ -888,7 +888,7 @@ impl PaneGroup {
                 self.open_agent_chat_tab_restored(
                     cwd.clone(),
                     model.clone(),
-                    oximux_agents::thread::Transport::StreamJson,
+                    oximux_agents::thread::ChatBackend::stream_json(),
                     Some(session_id.clone()),
                     entries.clone(),
                     slash_commands.clone(),
@@ -932,7 +932,7 @@ impl PaneGroup {
         self.open_agent_chat_tab_restored(
             cwd,
             None,
-            oximux_agents::thread::Transport::StreamJson,
+            oximux_agents::thread::ChatBackend::stream_json(),
             Some(session_id.to_string()),
             entries,
             Vec::new(),

@@ -78,7 +78,7 @@ impl ProjectPanes {
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
-        transport: oximux_agents::thread::Transport,
+        backend: oximux_agents::thread::ChatBackend,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -93,7 +93,7 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         if let Some(target) = self.groups.get(&target_id).cloned() {
             target.update(cx, |g, cx| {
-                g.open_agent_chat_tab(cwd, model, transport, window, cx);
+                g.open_agent_chat_tab(cwd, model, backend, window, cx);
             });
         }
     }
@@ -930,7 +930,7 @@ impl ProjectPanes {
         group_id: PaneGroupId,
         cwd: PathBuf,
         model: Option<String>,
-        transport: oximux_agents::thread::Transport,
+        backend: oximux_agents::thread::ChatBackend,
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
@@ -943,7 +943,7 @@ impl ProjectPanes {
         };
         group.update(cx, |g, cx| {
             g.open_agent_chat_tab_restored(
-                cwd, model, transport, session_id, entries, slash_commands, thinking_level, window, cx,
+                cwd, model, backend, session_id, entries, slash_commands, thinking_level, window, cx,
             );
         });
     }

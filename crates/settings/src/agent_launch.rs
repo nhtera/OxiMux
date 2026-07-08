@@ -229,6 +229,24 @@ impl AgentLaunchSettings {
             .map(str::to_string)
     }
 
+    /// The ACP command for `adapter_id` (trimmed; `None` when unset/blank).
+    /// Only meaningful when the adapter's transport is [`Transport::Acp`] —
+    /// it's the program the chat factory spawns to speak ACP.
+    pub fn acp_command_for(&self, adapter_id: &str) -> Option<String> {
+        self.for_agent(adapter_id)
+            .map(|a| a.acp_command.trim())
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The ACP args for `adapter_id`, shell-split into argv tokens (e.g.
+    /// `--experimental-acp`). Empty when unset. Appended after `acp_command`.
+    pub fn acp_args_for(&self, adapter_id: &str) -> Vec<String> {
+        self.for_agent(adapter_id)
+            .map(|a| split_args(&a.acp_args))
+            .unwrap_or_default()
+    }
+
     /// Whether `adapter_id` is hidden from the picker.
     pub fn is_disabled(&self, adapter_id: &str) -> bool {
         self.for_agent(adapter_id).map(|a| a.disabled).unwrap_or(false)
@@ -391,6 +409,26 @@ acp_args = "--acp"
         assert_eq!(s.for_agent("gemini").unwrap().acp_args, "--acp");
         let parsed = AgentLaunchSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
         assert_eq!(parsed, s);
+    }
+
+    #[test]
+    fn acp_command_and_args_accessors() {
+        let toml = r#"
+[agents.gemini]
+transport = "acp"
+acp_command = "  gemini  "
+acp_args = "--experimental-acp --foo"
+"#;
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("parse");
+        assert_eq!(s.acp_command_for("gemini").as_deref(), Some("gemini"));
+        assert_eq!(s.acp_args_for("gemini"), vec!["--experimental-acp", "--foo"]);
+        // An unconfigured adapter → no command, no args.
+        assert_eq!(s.acp_command_for("aider"), None);
+        assert!(s.acp_args_for("aider").is_empty());
+        // A blank command is treated as unset.
+        let blank =
+            AgentLaunchSettings::from_toml_str("[agents.x]\nacp_command = \"   \"\n").expect("parse");
+        assert_eq!(blank.acp_command_for("x"), None);
     }
 
     #[test]

@@ -209,16 +209,22 @@ fn restore_chat_thinking_level(
         .unwrap_or_default()
 }
 
-/// The persisted transport for a restored chat, so it reconnects the same
-/// backend (Claude stream-json / Codex app-server). Defaults to `StreamJson`
-/// when the blob predates the field or the session isn't found.
-fn restore_chat_provider(
+/// The persisted backend for a restored chat, so it reconnects the same
+/// provider (Claude stream-json / Codex app-server / an ACP command). Defaults
+/// to the Claude stream-json backend when the blob predates these fields or the
+/// session isn't found. The ACP command + args come from the transcript, not
+/// settings, so restore is self-contained.
+fn restore_chat_backend(
     snap: &PersistedTabs,
     session_id: Option<&str>,
-) -> oximux_agents::thread::Transport {
+) -> oximux_agents::thread::ChatBackend {
     session_id
         .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
-        .map(|t| t.provider)
+        .map(|t| oximux_agents::thread::ChatBackend {
+            transport: t.provider,
+            acp_command: t.acp_command.clone(),
+            acp_args: t.acp_args.clone(),
+        })
         .unwrap_or_default()
 }
 
@@ -341,12 +347,12 @@ pub(crate) fn build_project_panes(
                 let entries = restore_chat_entries(&snap, session_id.as_deref());
                 let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                 let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
-                let provider = restore_chat_provider(&snap, session_id.as_deref());
+                let backend = restore_chat_backend(&snap, session_id.as_deref());
                 panes_entity.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
                         group.update(cx, |g, cx| {
                             g.open_agent_chat_tab_restored(
-                                chat_cwd, model, provider, session_id, entries, slash_commands,
+                                chat_cwd, model, backend, session_id, entries, slash_commands,
                                 thinking_level, window, cx,
                             );
                         });
@@ -510,10 +516,10 @@ fn restore_multi_group(
                     let entries = restore_chat_entries(&snap, session_id.as_deref());
                     let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                     let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
-                    let provider = restore_chat_provider(&snap, session_id.as_deref());
+                    let backend = restore_chat_backend(&snap, session_id.as_deref());
                     panes_entity.update(cx, |p, cx| {
                         p.open_agent_chat_in_group_restore(
-                            group_id, chat_cwd, model, provider, session_id, entries, slash_commands,
+                            group_id, chat_cwd, model, backend, session_id, entries, slash_commands,
                             thinking_level, window, cx,
                         );
                         p.place_restored_last_tab(Some(group_id), meta, cx);
@@ -1947,6 +1953,8 @@ mod tests {
             slash_commands: vec!["compact".into()],
             thinking_level: Default::default(),
             provider: oximux_agents::thread::Transport::StreamJson,
+            acp_command: None,
+            acp_args: vec![],
         };
         let snap = PersistedTabs {
             tabs: vec![PersistedTab {
