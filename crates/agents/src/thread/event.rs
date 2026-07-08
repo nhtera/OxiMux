@@ -24,6 +24,20 @@ pub struct TurnUsage {
     pub cost_usd: Option<f64>,
 }
 
+/// One entry of an agent execution plan, in a gpui-free shape mirroring ACP's
+/// `PlanEntry` (`content` + a three-state status + a priority). Rendered by the
+/// plan panel as a checklist row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanEntryLite {
+    pub content: String,
+    /// Lifecycle: `"pending"`, `"in_progress"`, or `"completed"`. String-typed so
+    /// the view reuses the same `from_wire` mapping the `TodoWrite` path already
+    /// uses (no second status enum to keep in sync).
+    pub status: String,
+    /// Relative importance: `"high"`, `"medium"`, or `"low"`.
+    pub priority: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadEvent {
     /// Session bootstrap (`system/init`).
@@ -121,6 +135,28 @@ pub enum ThreadEvent {
         ended_at_ms: Option<u64>,
         summary: Option<String>,
         output_file: Option<String>,
+    },
+    /// The agent replaced its execution plan (ACP `session/update` `Plan`). Carries
+    /// the full entry list (ACP sends a complete replacement each time), rendered
+    /// as one pinned checklist card that survives turn boundaries.
+    PlanUpdated {
+        entries: Vec<PlanEntryLite>,
+    },
+    /// The backend published/changed its slash commands mid-session (ACP
+    /// `available_commands_update`) — e.g. Cursor, which advertises them
+    /// asynchronously after session start. Refreshes the composer's palette.
+    SlashCommandsUpdated {
+        commands: Vec<String>,
+    },
+    /// The session's permission/edit mode changed (ACP `current_mode_update`),
+    /// whether the user picked it or the agent switched it itself. Keeps the mode
+    /// picker in sync.
+    ModeChanged {
+        mode_id: String,
+    },
+    /// The session title changed (ACP `session_info_update`), for the tab label.
+    TitleUpdated {
+        title: String,
     },
     /// A protocol/parse/transport error to surface in the thread.
     Error(String),

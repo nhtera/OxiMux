@@ -21,7 +21,7 @@ use tokio::process::Command;
 ///
 /// macOS-only target (per the v1 plan); `which` ships at `/usr/bin/which`
 /// on every macOS install so the bare-name lookup is safe.
-pub(crate) async fn which_on_path(bin: &str) -> bool {
+pub async fn which_on_path(bin: &str) -> bool {
     Command::new("which")
         .arg(bin)
         .output()

@@ -42,7 +42,7 @@ pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
 pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES};
-pub use event::{ThreadEvent, TurnUsage};
+pub use event::{PlanEntryLite, ThreadEvent, TurnUsage};
 pub use question::{
     parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,
     QuestionKind, QuestionOption, QuestionRequest,

@@ -14,7 +14,7 @@
 
 use super::background_task::{BackgroundTask, TaskStatus};
 use super::entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
-use super::event::{ThreadEvent, TurnUsage};
+use super::event::{PlanEntryLite, ThreadEvent, TurnUsage};
 use super::question::QuestionRequest;
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
 
@@ -29,6 +29,14 @@ pub struct ChatThread {
     /// backend advertises none. Rides the restore snapshot so a resumed session
     /// keeps its palette without waiting for a fresh init.
     pub slash_commands: Vec<String>,
+    /// The agent's current execution plan (ACP `Plan` session update), rendered as
+    /// a pinned checklist. `None` when there's no plan (or it was cleared). Held
+    /// in-memory only — a restored chat starts planless and re-renders when the
+    /// agent re-emits (like `background_tasks`). Survives turn boundaries.
+    pub plan: Option<Vec<PlanEntryLite>>,
+    /// The agent-set session title (ACP `session_info_update`), for the tab label.
+    /// `None` until the agent sets one.
+    pub title: Option<String>,
     /// Latest one-line turn summary (`post_turn_summary`), for a status chip.
     pub last_summary: Option<String>,
     /// Latest transport/protocol error, surfaced non-fatally.
@@ -320,6 +328,23 @@ impl ChatThread {
                         t.output_file = output_file.clone();
                     }
                 }
+            }
+            ThreadEvent::PlanUpdated { entries } => {
+                // ACP sends a full replacement each time; an empty list clears the
+                // plan card rather than pinning an empty one.
+                self.plan = (!entries.is_empty()).then(|| entries.clone());
+            }
+            ThreadEvent::SlashCommandsUpdated { commands } => {
+                // An explicit mid-session refresh is authoritative (unlike the
+                // keep-last-non-empty `SessionInit` seed): the agent is telling us
+                // its current command set.
+                self.slash_commands = commands.clone();
+            }
+            ThreadEvent::ModeChanged { mode_id } => {
+                self.permission_mode = Some(mode_id.clone());
+            }
+            ThreadEvent::TitleUpdated { title } => {
+                self.title = Some(title.clone());
             }
             ThreadEvent::Error(msg) => {
                 self.last_error = Some(msg.clone());
@@ -1034,6 +1059,50 @@ mod tests {
             .find(|task| matches!(task.kind, BackgroundTaskKind::Subagent { .. }))
             .expect("a subagent task");
         assert!(subagent.tool_uses > 0, "subagent progress steps counted");
+    }
+
+    #[test]
+    fn acp_session_updates_fold_into_thread_state() {
+        use crate::thread::event::PlanEntryLite;
+        let mut t = ChatThread::new();
+        t.push_user_message("go");
+
+        // Plan → pinned checklist; survives the turn boundary.
+        t.apply(&ThreadEvent::PlanUpdated {
+            entries: vec![
+                PlanEntryLite { content: "a".into(), status: "in_progress".into(), priority: "high".into() },
+                PlanEntryLite { content: "b".into(), status: "pending".into(), priority: "low".into() },
+            ],
+        });
+        // Slash refresh replaces the palette; mode + title update their fields.
+        t.apply(&ThreadEvent::SlashCommandsUpdated { commands: vec!["plan".into(), "review".into()] });
+        t.apply(&ThreadEvent::ModeChanged { mode_id: "acceptEdits".into() });
+        t.apply(&ThreadEvent::TitleUpdated { title: "Fix auth".into() });
+
+        assert_eq!(t.plan.as_ref().map(|p| p.len()), Some(2));
+        assert_eq!(t.slash_commands, vec!["plan".to_string(), "review".to_string()]);
+        assert_eq!(t.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(t.title.as_deref(), Some("Fix auth"));
+
+        // A new turn keeps the plan/title pinned (they persist across turns) even
+        // as the footer/summary reset.
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false });
+        t.push_user_message("next");
+        assert!(t.plan.is_some(), "plan survives a turn boundary");
+        assert_eq!(t.title.as_deref(), Some("Fix auth"), "title survives a turn boundary");
+    }
+
+    #[test]
+    fn empty_plan_update_clears_the_card() {
+        use crate::thread::event::PlanEntryLite;
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::PlanUpdated {
+            entries: vec![PlanEntryLite { content: "a".into(), status: "pending".into(), priority: "low".into() }],
+        });
+        assert!(t.plan.is_some());
+        // ACP full-replaces with an empty list to clear the plan.
+        t.apply(&ThreadEvent::PlanUpdated { entries: vec![] });
+        assert!(t.plan.is_none(), "an empty plan hides the card");
     }
 
     #[test]
