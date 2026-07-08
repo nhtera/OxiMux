@@ -24,6 +24,22 @@ pub enum Transport {
     Acp,
 }
 
+impl Transport {
+    /// Human-facing provider name for chat captions, composer placeholders, and
+    /// permission prompts. Derived from the transport so the UI can label a chat
+    /// synchronously — before (or without) an established connection, which the
+    /// empty state and placeholder both need. `Acp` has no single provider (many
+    /// agents share it), so it gets a neutral name until an ACP adapter can thread
+    /// a real one.
+    pub fn provider_display_name(self) -> &'static str {
+        match self {
+            Transport::StreamJson => "Claude",
+            Transport::AppServer => "Codex",
+            Transport::Acp => "Agent",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +55,12 @@ mod tests {
         assert_eq!(serde_json::to_string(&Transport::Acp).unwrap(), "\"acp\"");
         let acp: Transport = serde_json::from_str("\"acp\"").unwrap();
         assert_eq!(acp, Transport::Acp);
+    }
+
+    #[test]
+    fn provider_display_name_is_provider_specific() {
+        assert_eq!(Transport::StreamJson.provider_display_name(), "Claude");
+        assert_eq!(Transport::AppServer.provider_display_name(), "Codex");
+        assert_eq!(Transport::Acp.provider_display_name(), "Agent");
     }
 }

@@ -448,8 +448,16 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer =
-            cx.new(|cx| ComposerView::new(theme, density, typography.clone(), window, cx));
+        let composer = cx.new(|cx| {
+            ComposerView::new(
+                theme,
+                density,
+                typography.clone(),
+                transport.provider_display_name(),
+                window,
+                cx,
+            )
+        });
         // The composer owns its input and repaints itself per keystroke. We only
         // react when it reports a finished submission — so typing never touches
         // this view (and thus never rebuilds the transcript, which is the lag we
@@ -664,6 +672,14 @@ impl AgentChatView {
             .as_ref()
             .map(|c| c.capabilities().supports_rewind)
             .unwrap_or(false)
+    }
+
+    /// Human-facing provider name for this chat's captions, placeholder, and
+    /// permission prompts ("Claude" for stream-json, "Codex" for app-server).
+    /// Sourced from the transport (fixed at launch) so it's correct even before a
+    /// connection exists — the empty state and composer render immediately.
+    fn provider_label(&self) -> &'static str {
+        self.transport.provider_display_name()
     }
 
     pub fn transcript_snapshot(&self) -> Option<crate::persisted_chat::PersistedChatTranscript> {
@@ -1162,8 +1178,16 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer =
-            cx.new(|cx| ComposerView::new(theme, density, typography.clone(), window, cx));
+        let composer = cx.new(|cx| {
+            ComposerView::new(
+                theme,
+                density,
+                typography.clone(),
+                Transport::StreamJson.provider_display_name(),
+                window,
+                cx,
+            )
+        });
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
@@ -2219,6 +2243,7 @@ impl AgentChatView {
                                         .any(|e| matches!(e, ThreadEntry::User { .. })),
                                 group,
                                 &msg.text,
+                                self.provider_label(),
                                 theme,
                                 &typo,
                                 cx,
@@ -2256,8 +2281,18 @@ impl AgentChatView {
                             .into_any_element())
                     } else {
                         let expanded = self.expanded_tool_calls.contains(&tc.id);
-                        Some(tool_card::render_tool_card(tc, expanded, theme, density, &typo, cx)
-                            .into_any_element())
+                        Some(
+                            tool_card::render_tool_card(
+                                tc,
+                                expanded,
+                                self.provider_label(),
+                                theme,
+                                density,
+                                &typo,
+                                cx,
+                            )
+                            .into_any_element(),
+                        )
                     }
                 }
                 ThreadEntry::ContextCompaction { summary } => {
@@ -2349,7 +2384,7 @@ impl AgentChatView {
                         .flex_col()
                         .w_full()
                         .max_w(px(CONTENT_MAX_W))
-                        .child(working_indicator(theme, &typo)),
+                        .child(working_indicator(self.provider_label(), theme, &typo)),
                 );
             }
         } else if let Some(err) = self.thread.last_error.clone() {
@@ -2471,13 +2506,13 @@ impl AgentChatView {
         let (title, subtitle, title_color) = if self.disconnected {
             (
                 "Agent unavailable",
-                self.thread.last_error.as_deref().unwrap_or("The agent process exited."),
+                self.thread.last_error.as_deref().unwrap_or("The agent process exited.").to_string(),
                 theme.status_error,
             )
         } else {
             (
                 "Start a conversation",
-                "Ask Claude to explain code, make edits, or run commands.",
+                format!("Ask {} to explain code, make edits, or run commands.", self.provider_label()),
                 theme.fg_muted,
             )
         };
@@ -2499,7 +2534,7 @@ impl AgentChatView {
                 div()
                     .text_size(px(typo.t_body_sm))
                     .text_color(theme.fg_subtle)
-                    .child(SharedString::from(subtitle.to_string())),
+                    .child(SharedString::from(subtitle)),
             )
             .into_any_element()
     }
@@ -2798,11 +2833,11 @@ fn markdown_reveal_gap(body: &str, typo: &Typography) -> f32 {
     (lines * line_height + blocks * typo.t_body_md).min(1100.0)
 }
 
-/// A live "Claude is working…" row shown at the tail of the transcript while a
-/// turn streams — a stepped rotating spinner (the reused rail cadence: 12
+/// A live "<provider> is working…" row shown at the tail of the transcript while
+/// a turn streams — a stepped rotating spinner (the reused rail cadence: 12
 /// mechanical ticks/sec) plus muted text. Keeping it here rather than above the
 /// composer means the input never resizes when a turn starts or ends.
-fn working_indicator(theme: Theme, typo: &Typography) -> AnyElement {
+fn working_indicator(label: &str, theme: Theme, typo: &Typography) -> AnyElement {
     div()
         .flex()
         .flex_row()
@@ -2827,7 +2862,7 @@ fn working_indicator(theme: Theme, typo: &Typography) -> AnyElement {
             div()
                 .text_size(px(typo.t_body_sm))
                 .text_color(theme.fg_muted)
-                .child(SharedString::from("Claude is working…")),
+                .child(SharedString::from(format!("{label} is working…"))),
         )
         .into_any_element()
 }
@@ -2898,11 +2933,12 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// The assistant caption row: the "Claude" label on the left and hover-revealed
-/// actions on the right (`group`) — the affordance-on-hover pattern of a native
-/// chat. Copy copies the reply's raw markdown; Regenerate (shown only on a
-/// settled, resumable thread) re-rolls the reply to the preceding prompt. Built
-/// here (not `bubble`) because the clicks need a `Context` listener.
+/// The assistant caption row: the provider label ("Claude"/"Codex") on the left
+/// and hover-revealed actions on the right (`group`) — the affordance-on-hover
+/// pattern of a native chat. Copy copies the reply's raw markdown; Regenerate
+/// (shown only on a settled, resumable thread) re-rolls the reply to the
+/// preceding prompt. Built here (not `bubble`) because the clicks need a
+/// `Context` listener.
 #[allow(clippy::too_many_arguments)]
 fn assistant_header(
     entry_idx: usize,
@@ -2910,6 +2946,7 @@ fn assistant_header(
     can_regenerate: bool,
     group: SharedString,
     text: &str,
+    provider: &str,
     theme: Theme,
     typo: &Typography,
     cx: &mut Context<AgentChatView>,
@@ -2970,7 +3007,7 @@ fn assistant_header(
         .items_center()
         .justify_between()
         .w_full()
-        .child(bubble::role_caption("Claude", theme.fg_muted, typo))
+        .child(bubble::role_caption(provider, theme.fg_muted, typo))
         .child(actions)
         .into_any_element()
 }

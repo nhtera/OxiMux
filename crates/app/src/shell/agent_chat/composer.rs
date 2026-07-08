@@ -236,9 +236,11 @@ impl ComposerView {
         theme: Theme,
         density: Density,
         typography: Typography,
+        provider_label: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let placeholder = format!("Message {provider_label}…  (↵ send · ⇧↵ newline)");
         let input = cx.new(|cx| {
             // MULTI-LINE field that GROWS with the draft up to MAX_COMPOSER_ROWS,
             // then holds height and scrolls (Claude-Desktop feel). ↵ submits; ⇧↵
@@ -248,9 +250,7 @@ impl ComposerView {
             // content (the circular-height trap). The ↵-vs-⇧↵ split is decided at
             // the parent root `capture_action` from the live shift modifier —
             // both keys map to the same Enter action.
-            InputState::new(window, cx)
-                .auto_grow(1, MAX_COMPOSER_ROWS)
-                .placeholder("Message Claude…  (↵ send · ⇧↵ newline)")
+            InputState::new(window, cx).auto_grow(1, MAX_COMPOSER_ROWS).placeholder(placeholder)
         });
         let sub = cx.subscribe(&input, |this, _input, ev: &InputEvent, cx| {
             // Repaint ONLY the composer on edits — the transcript is untouched.
@@ -1989,7 +1989,14 @@ mod tests {
     fn test_composer(cx: &mut TestAppContext) -> gpui::WindowHandle<ComposerView> {
         cx.update(gpui_component::init);
         let w = cx.add_window(|window, cx| {
-            ComposerView::new(Theme::default(), Density::default(), Typography::default(), window, cx)
+            ComposerView::new(
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                "Claude",
+                window,
+                cx,
+            )
         });
         cx.run_until_parked();
         w

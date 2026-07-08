@@ -28,6 +28,7 @@ const RESULT_CHARS: usize = 4000;
 pub(super) fn render_tool_card(
     tc: &ToolCall,
     expanded: bool,
+    provider: &str,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -75,7 +76,7 @@ pub(super) fn render_tool_card(
     }
 
     if let ToolCallStatus::WaitingForConfirmation(req) = &tc.status {
-        card = card.child(approval_row(tc, req, theme, density, typo, cx));
+        card = card.child(approval_row(tc, req, provider, theme, density, typo, cx));
     }
 
     if expanded {
@@ -159,6 +160,7 @@ fn header_row(
 fn approval_row(
     tc: &ToolCall,
     req: &PermissionRequest,
+    provider: &str,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -173,7 +175,7 @@ fn approval_row(
     let input = tc.input.clone();
 
     let prompt = if req.description.trim().is_empty() {
-        format!("Allow Claude to run {}?", tc.name)
+        format!("Allow {provider} to run {}?", tc.name)
     } else {
         format!("Allow {}?", req.description.trim())
     };
