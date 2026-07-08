@@ -111,9 +111,13 @@ pub struct AcpPreset {
 /// - **Amp** — Sourcegraph's ACP wrapper binary (`amp-acp`, the invocation Paseo
 ///   uses). The `which amp-acp` detection greys it when absent; its exact
 ///   invocation is pinned from research and should be re-confirmed live.
+/// - **OpenCode** — `opencode acp` is a built-in ACP server (verified live end
+///   to end: handshake, streamed chunks, tool cards, usage, slash commands).
+///   The `which opencode` detection greys it when absent.
 pub const ACP_PRESETS: &[AcpPreset] = &[
     AcpPreset { id: "cursor", title: "Cursor", command: "cursor-agent", args: "acp" },
     AcpPreset { id: "amp", title: "Amp", command: "amp-acp", args: "" },
+    AcpPreset { id: "opencode", title: "OpenCode", command: "opencode", args: "acp" },
 ];
 
 /// The preset for `id`, if one is built in.
@@ -530,6 +534,12 @@ acp_args = "--experimental-acp --foo"
         assert_eq!(s.acp_command_for("amp").as_deref(), Some("amp-acp"));
         assert!(s.acp_args_for("amp").is_empty());
         assert_eq!(s.open_mode_for("amp"), OpenMode::Chat);
+        // OpenCode: `opencode acp`, one-click chat like the others.
+        assert!(s.chat_capable("opencode"));
+        assert_eq!(s.transport_for("opencode"), Transport::Acp);
+        assert_eq!(s.acp_command_for("opencode").as_deref(), Some("opencode"));
+        assert_eq!(s.acp_args_for("opencode"), vec!["acp"]);
+        assert_eq!(s.open_mode_for("opencode"), OpenMode::Chat);
         // A non-preset, non-builtin adapter is still terminal-only.
         assert!(!s.chat_capable("aider"));
         assert_eq!(s.open_mode_for("aider"), OpenMode::Terminal);
