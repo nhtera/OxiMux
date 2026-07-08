@@ -874,6 +874,18 @@ impl PaneGroup {
                 }
                 cx.notify();
             }
+            crate::shell::agent_chat::AgentChatEvent::TitleChanged(title) => {
+                // Update the tab's fallback label (a user's manual `custom_title`
+                // rename still wins over it in the header render).
+                for tab in &mut self.tabs {
+                    if let PaneContent::AgentChat(v) = &tab.content
+                        && v.entity_id() == view.entity_id()
+                    {
+                        tab.label = SharedString::from(title.clone());
+                    }
+                }
+                cx.notify();
+            }
             crate::shell::agent_chat::AgentChatEvent::ForkReady {
                 cwd,
                 model,

@@ -103,6 +103,9 @@ pub enum AgentChatEvent {
     /// The user picked a different model; the host persists it in the tab kind
     /// so the choice survives relaunch (the view already respawned on it).
     ModelChanged(String),
+    /// The agent set a session title (ACP `session_info_update`); the host uses it
+    /// as the tab's fallback label (a user's manual rename still wins over it).
+    TitleChanged(String),
     /// "Fork from here": a truncated fork of this session was written to disk;
     /// the host should open it as a NEW chat tab (this tab is left untouched).
     /// Carries everything `open_agent_chat_tab_restored` needs to rehydrate the
@@ -1018,10 +1021,12 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Switch the permission mode for this chat tab. Like the model, `--permission
-    /// -mode` is fixed at spawn, so a live switch respawns resumed on the new
-    /// mode. Not persisted (see the field note), so no host event is raised.
-    /// No-op when the mode is unchanged.
+    /// Switch the permission mode for this chat tab. Two backends, two paths:
+    /// Claude fixes `--permission-mode` at spawn, so a live switch respawns resumed
+    /// on the new mode; an ACP agent switches modes **in-session** via
+    /// `session/set_mode`, so its `set_mode` succeeds and we skip the respawn
+    /// (respawning an ACP child would drop the live session). Not persisted (see
+    /// the field note). No-op when the mode is unchanged.
     fn change_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
         // The baseline ("no flag") mode comes from the backend, not a const —
         // Claude's is "default"; another provider advertises its own.
@@ -1036,7 +1041,15 @@ impl AgentChatView {
         }
         // Normalize the baseline to `None` so `respawn` omits the flag entirely.
         self.permission_mode = (mode != default_mode).then(|| mode.clone());
-        self.respawn(cx);
+        // Prefer an in-session runtime switch (ACP); fall back to the resume-respawn
+        // path when the backend can't switch live (Claude's `set_mode` bails).
+        let switched_live = self
+            .connection
+            .as_ref()
+            .is_some_and(|c| c.set_mode(&mode).is_ok());
+        if !switched_live {
+            self.respawn(cx);
+        }
         self.sync_composer(cx); // reflect the new mode in the toolbar label
         cx.notify();
     }
@@ -1289,6 +1302,26 @@ impl AgentChatView {
     fn on_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
         let was_active = self.thread.turn_active;
         self.thread.apply(&ev);
+        // A couple of ACP session updates drive view/host state the ChatThread
+        // fold alone doesn't reach: an agent-driven mode switch must sync the
+        // picker's own field; a title update rides up to the tab label.
+        match &ev {
+            ThreadEvent::ModeChanged { mode_id } => {
+                // Normalize the backend baseline to `None` (matching the manual
+                // switch path) so the picker shows the default, not a redundant
+                // explicit value.
+                let default_mode = self
+                    .connection
+                    .as_ref()
+                    .and_then(|c| c.default_mode())
+                    .unwrap_or_default();
+                self.permission_mode = (*mode_id != default_mode).then(|| mode_id.clone());
+            }
+            ThreadEvent::TitleUpdated { title } => {
+                cx.emit(AgentChatEvent::TitleChanged(title.clone()));
+            }
+            _ => {}
+        }
         // A user-initiated Stop makes `claude` end the turn with an
         // `error_during_execution` result (terminal_reason: aborted_streaming).
         // That's the expected shape of an interrupt, not a failure — swallow it
@@ -2366,6 +2399,19 @@ impl AgentChatView {
                     div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(expander),
                 );
             }
+        }
+        // The agent's execution plan (ACP `Plan`) as a pinned checklist at the tail
+        // of the transcript — one card, full-replaced on each `PlanUpdated`, kept
+        // across turns until cleared. Reuses the `TodoWrite` checklist renderer.
+        if let Some(entries) = self.thread.plan.as_ref().filter(|e| !e.is_empty()) {
+            scroll = scroll.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(CONTENT_MAX_W))
+                    .child(plan_panel::render_plan_entries(entries, theme, density, &typo)),
+            );
         }
         // Live turn / disconnect state lives at the tail of the transcript (like
         // a native chat), NOT above the composer — so it never resizes the input.

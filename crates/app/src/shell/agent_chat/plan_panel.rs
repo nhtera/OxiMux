@@ -4,7 +4,7 @@
 //! update can reuse this same renderer with no changes.
 
 use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
-use oximux_agents::thread::ToolCall;
+use oximux_agents::thread::{PlanEntryLite, ToolCall};
 use oximux_settings::{Density, Theme, Typography};
 use serde_json::Value;
 
@@ -62,6 +62,25 @@ pub(super) fn is_plan(tc: &ToolCall) -> bool {
     tc.name == "TodoWrite" && !parse_todos(&tc.input).is_empty()
 }
 
+/// Render an ACP `Plan` (its `PlanEntry` list) as the same checklist card the
+/// `TodoWrite` path uses. The entry shape is identical (`content` + a three-state
+/// status), so both feed one renderer — no ACP-specific widget.
+pub(super) fn render_plan_entries(
+    entries: &[PlanEntryLite],
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> AnyElement {
+    let items = entries
+        .iter()
+        .map(|e| PlanItem {
+            content: e.content.clone(),
+            status: PlanStatus::from_wire(&e.status),
+        })
+        .collect();
+    render_items(items, theme, density, typo)
+}
+
 /// Render the plan as a framed checklist: a "Plan · N/M done" header, then one
 /// row per step with a status glyph. Read-only — no approve/edit affordances.
 pub(super) fn render_plan_card(
@@ -70,7 +89,16 @@ pub(super) fn render_plan_card(
     density: Density,
     typo: &Typography,
 ) -> AnyElement {
-    let items = parse_todos(&tc.input);
+    render_items(parse_todos(&tc.input), theme, density, typo)
+}
+
+/// Shared checklist renderer for both the `TodoWrite` and ACP `Plan` paths.
+fn render_items(
+    items: Vec<PlanItem>,
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> AnyElement {
     let total = items.len();
     let done = items.iter().filter(|i| i.status == PlanStatus::Completed).count();
 
