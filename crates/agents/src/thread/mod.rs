@@ -12,6 +12,7 @@
 //! The event model is deliberately ACP-shaped so a future ACP backend can feed
 //! the same `ChatThread` without changing the state machine or the view.
 
+pub mod acp;
 pub mod background_task;
 pub mod claude_stream_json;
 pub mod codex;
@@ -28,6 +29,7 @@ pub mod stream_json;
 pub mod tool_call;
 pub mod transport;
 
+pub use acp::AcpConnection;
 pub use claude_stream_json::{build_args, ClaudeStreamJsonConnection};
 pub use codex::CodexAppServerConnection;
 pub use connect::{connect, ConnectSpec};

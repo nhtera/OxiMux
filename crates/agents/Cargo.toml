@@ -22,6 +22,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+# ACP (Agent Client Protocol) client — drives an external agent subprocess
+# (Gemini `--experimental-acp`) over stdio. Core is stable since 1.0.0; no
+# `unstable` features (Gemini needs neither token-usage nor session-fork).
+agent-client-protocol = "1.2"
+futures = { workspace = true }
+
 # Unix signal delivery (SIGINT to the headless `claude` child on Stop, so it
 # ends the turn gracefully and checkpoints the session for a clean `--resume`).
 [target.'cfg(unix)'.dependencies]
@@ -40,3 +46,8 @@ path = "examples/commit_message_demo.rs"
 [[example]]
 name = "stream_json_probe"
 path = "examples/stream_json_probe.rs"
+
+# Throwaway live smoke test for the ACP (Gemini) connection (not shipped).
+[[example]]
+name = "acp_smoke"
+path = "examples/acp_smoke.rs"

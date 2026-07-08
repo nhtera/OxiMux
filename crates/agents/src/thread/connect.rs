@@ -8,6 +8,7 @@ use std::sync::mpsc::Receiver;
 
 use anyhow::Result;
 
+use super::acp::AcpConnection;
 use super::claude_stream_json::ClaudeStreamJsonConnection;
 use super::codex::CodexAppServerConnection;
 use super::connection::AgentConnection;
@@ -85,7 +86,13 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
             Ok((Box::new(conn), rx))
         }
         Transport::Acp => {
-            anyhow::bail!("ACP transport not yet implemented")
+            let command = spec
+                .acp_command
+                .as_deref()
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("ACP transport requires an acp_command"))?;
+            let (conn, rx) = AcpConnection::spawn(command, &spec.acp_args, &spec.cwd)?;
+            Ok((Box::new(conn), rx))
         }
     }
 }
@@ -95,7 +102,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acp_transport_is_a_clear_stub() {
+    fn acp_transport_requires_a_command() {
+        // The ACP arm needs an `acp_command` to know what to spawn; without one it
+        // fails fast rather than spawning nothing. (A configured command would
+        // spawn a real subprocess, so the happy path is covered by a live smoke
+        // test, not a unit test.)
         let spec = ConnectSpec {
             transport: Transport::Acp,
             cwd: PathBuf::from("."),
@@ -103,14 +114,16 @@ mod tests {
             resume_session_id: None,
             permission_mode: None,
             effort: None,
-            acp_command: Some("gemini".into()),
-            acp_args: vec!["--acp".into()],
+            acp_command: None,
+            acp_args: vec![],
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
         match connect(spec) {
-            Ok(_) => panic!("ACP arm must not connect yet"),
-            Err(err) => assert!(err.to_string().contains("ACP"), "unexpected error: {err}"),
+            Ok(_) => panic!("ACP arm must not connect without a command"),
+            Err(err) => {
+                assert!(err.to_string().contains("acp_command"), "unexpected error: {err}")
+            }
         }
     }
 }
