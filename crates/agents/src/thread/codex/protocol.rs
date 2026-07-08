@@ -22,6 +22,8 @@ use serde_json::{json, Value};
 // --- Method names (client → server requests) -----------------------------
 pub const M_INITIALIZE: &str = "initialize";
 pub const M_THREAD_START: &str = "thread/start";
+pub const M_THREAD_RESUME: &str = "thread/resume";
+pub const M_MODEL_LIST: &str = "model/list";
 pub const M_TURN_START: &str = "turn/start";
 pub const M_TURN_INTERRUPT: &str = "turn/interrupt";
 
@@ -58,13 +60,35 @@ pub fn thread_start_params(model: Option<&str>, cwd: &Path) -> Value {
     p
 }
 
+/// `thread/resume` params — reconnect an existing thread by id under the fixed
+/// posture, optionally overriding the model.
+pub fn thread_resume_params(thread_id: &str, model: Option<&str>) -> Value {
+    let mut p = json!({
+        "threadId": thread_id,
+        "approvalPolicy": APPROVAL_ON_REQUEST,
+        "sandbox": SANDBOX_WORKSPACE_WRITE,
+    });
+    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+        p["model"] = json!(m);
+    }
+    p
+}
+
 /// `turn/start` params carrying one plain-text user message. The thread posture
-/// (approval/sandbox) set at `thread/start` is inherited, so no per-turn override.
-pub fn turn_start_params(thread_id: &str, text: &str) -> Value {
-    json!({
+/// (approval/sandbox) is inherited; `model`/`effort` override per turn when set
+/// (how the model/effort pickers take effect).
+pub fn turn_start_params(thread_id: &str, text: &str, model: Option<&str>, effort: Option<&str>) -> Value {
+    let mut p = json!({
         "threadId": thread_id,
         "input": [ { "type": "text", "text": text, "text_elements": [] } ]
-    })
+    });
+    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+        p["model"] = json!(m);
+    }
+    if let Some(e) = effort.map(str::trim).filter(|s| !s.is_empty()) {
+        p["effort"] = json!(e);
+    }
+    p
 }
 
 /// `turn/interrupt` params — cancels the in-flight turn on `thread_id`/`turn_id`.
@@ -77,9 +101,49 @@ pub fn thread_id_from_start_response(result: &Value) -> Option<String> {
     result.get("thread")?.get("id")?.as_str().map(String::from)
 }
 
-/// The resolved model from a `thread/start` response, if present.
+/// The resolved model from a `thread/start` / `thread/resume` response.
 pub fn model_from_start_response(result: &Value) -> Option<String> {
     result.get("model")?.as_str().map(String::from)
+}
+
+/// One entry from `model/list` (the fields the picker needs). `wire` is the id
+/// passed to `turn/start`'s `model`; `efforts` are the reasoning-effort options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexModel {
+    pub wire: String,
+    pub display: String,
+    pub efforts: Vec<String>,
+    pub default_effort: String,
+    pub is_default: bool,
+}
+
+/// Parse a `model/list` response into the non-hidden model catalog.
+pub fn parse_model_list(result: &Value) -> Vec<CodexModel> {
+    let Some(arr) = result.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|m| !m.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false))
+        .filter_map(|m| {
+            let wire = m.get("id").and_then(|v| v.as_str())?.to_string();
+            let efforts = m
+                .get("supportedReasoningEfforts")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e.get("reasoningEffort").and_then(|r| r.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(CodexModel {
+                display: m.get("displayName").and_then(|v| v.as_str()).unwrap_or(&wire).to_string(),
+                default_effort: m.get("defaultReasoningEffort").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                is_default: m.get("isDefault").and_then(|v| v.as_bool()).unwrap_or(false),
+                efforts,
+                wire,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -99,11 +163,32 @@ mod tests {
 
     #[test]
     fn turn_start_shapes_text_input() {
-        let p = turn_start_params("th_1", "hi");
+        let p = turn_start_params("th_1", "hi", None, None);
         assert_eq!(p["threadId"], "th_1");
         assert_eq!(p["input"][0]["type"], "text");
         assert_eq!(p["input"][0]["text"], "hi");
         assert!(p["input"][0]["text_elements"].is_array());
+        assert!(p.get("model").is_none());
+        // model + effort ride as per-turn overrides when set.
+        let p2 = turn_start_params("th_1", "hi", Some("gpt-5.5"), Some("high"));
+        assert_eq!(p2["model"], "gpt-5.5");
+        assert_eq!(p2["effort"], "high");
+    }
+
+    #[test]
+    fn parses_model_list_catalog() {
+        let result = json!({"data": [
+            {"id": "gpt-5.5", "displayName": "GPT-5.5", "isDefault": true, "hidden": false,
+             "defaultReasoningEffort": "medium",
+             "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}]},
+            {"id": "secret", "displayName": "Secret", "hidden": true},
+        ]});
+        let models = parse_model_list(&result);
+        assert_eq!(models.len(), 1, "hidden models are dropped");
+        assert_eq!(models[0].wire, "gpt-5.5");
+        assert!(models[0].is_default);
+        assert_eq!(models[0].efforts, vec!["low", "high"]);
+        assert_eq!(models[0].default_effort, "medium");
     }
 
     #[test]

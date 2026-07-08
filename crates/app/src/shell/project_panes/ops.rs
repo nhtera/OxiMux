@@ -78,6 +78,7 @@ impl ProjectPanes {
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
+        transport: oximux_agents::thread::Transport,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -92,7 +93,7 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         if let Some(target) = self.groups.get(&target_id).cloned() {
             target.update(cx, |g, cx| {
-                g.open_agent_chat_tab(cwd, model, window, cx);
+                g.open_agent_chat_tab(cwd, model, transport, window, cx);
             });
         }
     }
@@ -924,11 +925,13 @@ impl ProjectPanes {
     /// Rehydrates the transcript + resumes the session. No-op when `group_id`
     /// isn't registered.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn open_agent_chat_in_group_restore(
         &mut self,
         group_id: PaneGroupId,
         cwd: PathBuf,
         model: Option<String>,
+        transport: oximux_agents::thread::Transport,
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
@@ -941,7 +944,7 @@ impl ProjectPanes {
         };
         group.update(cx, |g, cx| {
             g.open_agent_chat_tab_restored(
-                cwd, model, session_id, entries, slash_commands, thinking_level, window, cx,
+                cwd, model, transport, session_id, entries, slash_commands, thinking_level, window, cx,
             );
         });
     }

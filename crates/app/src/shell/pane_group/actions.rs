@@ -444,7 +444,8 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         let cwd = self.cwd.clone();
-        self.open_agent_chat_tab(cwd, None, window, cx);
+        // The New-Agent-Chat action always opens a Claude (stream-json) chat.
+        self.open_agent_chat_tab(cwd, None, oximux_agents::thread::Transport::StreamJson, window, cx);
     }
 
     /// Toggle the prompt composer over the active agent tab. A second press

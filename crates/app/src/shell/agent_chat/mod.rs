@@ -158,7 +158,7 @@ use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
     connect, AgentConnection, AssistantMessage, ChatImage, ChatThread, ConnectSpec,
     PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus,
-    TurnUsage,
+    Transport, TurnUsage,
 };
 use oximux_git::GitCmd;
 use oximux_settings::{Density, Theme, Typography};
@@ -209,6 +209,10 @@ pub struct AgentChatView {
     /// (Stop→next-send resume) in the same directory with the same model.
     cwd: PathBuf,
     model: Option<String>,
+    /// Which backend this chat runs over (Claude stream-json / Codex app-server).
+    /// Threaded into every `ConnectSpec` (fresh + respawn) and written to the
+    /// persisted transcript so a restore reconnects the same provider.
+    transport: oximux_agents::thread::Transport,
     /// The active permission mode's wire value (`acceptEdits`, `plan`, …), or
     /// `None`/`"default"` for the CLI default. Like `--model` it's fixed at
     /// spawn, so a live switch respawns via `--resume`. Intentionally *not*
@@ -380,16 +384,18 @@ impl AgentChatView {
     /// Construct a chat view and spawn its headless `claude` subprocess in
     /// `cwd`. A spawn failure degrades to a read-only error state rather than
     /// panicking, so the tab still opens and explains what went wrong.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cwd: PathBuf,
         model: Option<String>,
+        transport: Transport,
         theme: Theme,
         density: Density,
         typography: Typography,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::assemble(cwd, model, ChatThread::new(), theme, density, typography, window, cx)
+        Self::assemble(cwd, model, transport, ChatThread::new(), theme, density, typography, window, cx)
     }
 
     /// Rebuild a chat view on session restore: seed the thread from the
@@ -408,6 +414,7 @@ impl AgentChatView {
     pub fn new_resumed(
         cwd: PathBuf,
         model: Option<String>,
+        transport: Transport,
         session_id: Option<String>,
         entries: Vec<ThreadEntry>,
         slash_commands: Vec<String>,
@@ -419,7 +426,8 @@ impl AgentChatView {
         cx: &mut Context<Self>,
     ) -> Self {
         let thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
-        let mut view = Self::assemble(cwd, model, thread, theme, density, typography, window, cx);
+        let mut view =
+            Self::assemble(cwd, model, transport, thread, theme, density, typography, window, cx);
         view.thinking_level = thinking_level;
         view
     }
@@ -432,6 +440,7 @@ impl AgentChatView {
     fn assemble(
         cwd: PathBuf,
         model: Option<String>,
+        transport: Transport,
         mut thread: ChatThread,
         theme: Theme,
         density: Density,
@@ -479,13 +488,10 @@ impl AgentChatView {
         let mut drain_task = None;
         // A fresh/restored session always starts in the default permission mode
         // (see the `permission_mode` field note); a live switch respawns.
-        match connect(ConnectSpec::stream_json(
-            cwd.clone(),
-            model.clone(),
-            resume_session_id.clone(),
-            None,
-            None,
-        )) {
+        match connect(ConnectSpec {
+            transport,
+            ..ConnectSpec::stream_json(cwd.clone(), model.clone(), resume_session_id.clone(), None, None)
+        }) {
             Ok((conn, rx)) => {
                 connection = Some(conn);
                 drain_task = Some(Self::spawn_drain(rx, cx));
@@ -595,6 +601,7 @@ impl AgentChatView {
         Self {
             thread,
             connection,
+            transport,
             composer,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
@@ -659,10 +666,9 @@ impl AgentChatView {
             entries: self.thread.entries.clone(),
             slash_commands: self.thread.slash_commands.clone(),
             thinking_level: self.thinking_level,
-            // P0 chat is Claude-only (native stream-json); recorded so a restored
-            // tab routes back through the factory's matching arm. When a second
-            // provider lands, the view carries its transport and writes it here.
-            provider: oximux_agents::thread::Transport::StreamJson,
+            // The transport that minted this session, so a restored tab
+            // reconnects the same provider (Claude stream-json / Codex app-server).
+            provider: self.transport,
         })
     }
 
@@ -930,13 +936,10 @@ impl AgentChatView {
         let model = self.model.clone();
         let permission_mode = self.permission_mode.clone();
         let effort = self.effort.clone();
-        match connect(ConnectSpec::stream_json(
-            self.cwd.clone(),
-            model,
-            session_id,
-            permission_mode,
-            effort,
-        )) {
+        match connect(ConnectSpec {
+            transport: self.transport,
+            ..ConnectSpec::stream_json(self.cwd.clone(), model, session_id, permission_mode, effort)
+        }) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
                 // Reassigning drops the old drain task, cancelling its foreground
@@ -1153,6 +1156,7 @@ impl AgentChatView {
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
+            transport: Transport::StreamJson,
             composer,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),

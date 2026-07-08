@@ -33,7 +33,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use approvals::ServerRequestAction;
-use super::connection::{AgentConnection, AgentCapabilities};
+use super::connection::{AgentCapabilities, AgentConnection, EffortChoice, ModelChoice};
 use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionDecision;
 use transport::{Inbound, RpcClient};
@@ -61,6 +61,13 @@ struct CodexState {
     /// Pending approvals: our permission-card `request_id` → the Codex JSON-RPC
     /// request id we must answer with a `{decision}` once the user chooses.
     pending_approvals: HashMap<String, Value>,
+    /// Codex's model catalog (from `model/list`), cached after the handshake so
+    /// the pickers render it.
+    models: Vec<protocol::CodexModel>,
+    /// The model/effort applied to each `turn/start` (a switch respawns with
+    /// these seeded). `None` = Codex's own default.
+    current_model: Option<String>,
+    current_effort: Option<String>,
 }
 
 pub struct CodexAppServerConnection {
@@ -76,11 +83,22 @@ impl CodexAppServerConnection {
     /// Spawn `codex app-server` in `cwd` and start streaming decoded events.
     /// Returns immediately; the handshake runs on the worker thread and emits
     /// [`ThreadEvent::SessionInit`] once `thread/start` resolves.
-    pub fn spawn(cwd: &Path, model: Option<&str>) -> Result<(Self, Receiver<ThreadEvent>)> {
+    pub fn spawn(
+        cwd: &Path,
+        model: Option<&str>,
+        resume_session_id: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (rpc, inbound_rx, child) = RpcClient::spawn(cwd)?;
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
         let state = Arc::new(Mutex::new(CodexState::default()));
+        // Seed the current model/effort so the first turn — and the picker
+        // labels — reflect the tab's choice.
+        if let Ok(mut s) = state.lock() {
+            s.current_model = model.map(str::to_string);
+            s.current_effort = effort.map(str::to_string);
+        }
 
         let mapper = {
             let event_tx = event_tx.clone();
@@ -93,7 +111,8 @@ impl CodexAppServerConnection {
             let state = state.clone();
             let cwd = cwd.to_path_buf();
             let model = model.map(str::to_string);
-            thread::spawn(move || worker_loop(rpc, event_tx, state, out_rx, cwd, model))
+            let resume = resume_session_id.map(str::to_string);
+            thread::spawn(move || worker_loop(rpc, event_tx, state, out_rx, cwd, model, resume))
         };
 
         Ok((
@@ -148,10 +167,47 @@ impl AgentConnection for CodexAppServerConnection {
         AgentCapabilities {
             supports_modes: false,  // fixed on-request posture in P1 (no mode picker)
             supports_slash: false,  // no slash-command palette wired for Codex yet
-            supports_config: false, // effort picker vocab lands with model/list
+            supports_config: true,  // reasoning-effort picker (from model/list)
             emits_usage: true,      // thread/tokenUsage/updated → the usage footer
             supports_rewind: false, // no ~/.claude JSONL; rewind stays Claude-only
         }
+    }
+
+    fn models(&self) -> Vec<ModelChoice> {
+        self.state
+            .lock()
+            .map(|s| s.models.iter().map(|m| ModelChoice { wire: m.wire.clone() }).collect())
+            .unwrap_or_default()
+    }
+
+    fn efforts(&self) -> Vec<EffortChoice> {
+        self.state
+            .lock()
+            .map(|s| {
+                current_or_default_model(&s)
+                    .map(|m| {
+                        m.efforts
+                            .iter()
+                            .map(|e| EffortChoice { wire: e.clone(), label: title_case(e) })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    fn default_model(&self) -> Option<String> {
+        let s = self.state.lock().ok()?;
+        s.current_model
+            .clone()
+            .or_else(|| current_or_default_model(&s).map(|m| m.wire.clone()))
+    }
+
+    fn default_effort(&self) -> Option<String> {
+        let s = self.state.lock().ok()?;
+        s.current_effort
+            .clone()
+            .or_else(|| current_or_default_model(&s).map(|m| m.default_effort.clone()))
     }
 
     /// Interrupt the in-flight turn (`turn/interrupt`). Fire-and-forget so the
@@ -184,7 +240,28 @@ impl Drop for CodexAppServerConnection {
     }
 }
 
-/// The worker: async handshake, then forward prompts as `turn/start`.
+/// The current model (if the picker chose one), else the catalog default, else
+/// the first entry.
+fn current_or_default_model(st: &CodexState) -> Option<&protocol::CodexModel> {
+    let cur = st.current_model.as_deref();
+    st.models
+        .iter()
+        .find(|m| Some(m.wire.as_str()) == cur)
+        .or_else(|| st.models.iter().find(|m| m.is_default))
+        .or_else(|| st.models.first())
+}
+
+/// Capitalize the first letter for an effort label ("low" → "Low").
+fn title_case(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The worker: async handshake (`initialize` → cache `model/list` → `initialized`
+/// → `thread/resume` or `thread/start`), then forward prompts as `turn/start`.
 fn worker_loop(
     rpc: RpcClient,
     event_tx: Sender<ThreadEvent>,
@@ -192,49 +269,84 @@ fn worker_loop(
     out_rx: Receiver<Outbound>,
     cwd: std::path::PathBuf,
     model: Option<String>,
+    resume: Option<String>,
 ) {
     if let Err(e) = rpc.request(protocol::M_INITIALIZE, protocol::initialize_params(), HANDSHAKE_TIMEOUT) {
         let _ = event_tx.send(ThreadEvent::Error(format!("codex initialize failed: {e}")));
         return;
     }
+    // Fetch the model catalog BEFORE emitting SessionInit, so the composer's
+    // controls seed (which runs on that event) already has the picker vocab.
+    if let Ok(res) = rpc.request(protocol::M_MODEL_LIST, json!({}), HANDSHAKE_TIMEOUT) {
+        let models = protocol::parse_model_list(&res);
+        if let Ok(mut s) = state.lock() {
+            s.models = models;
+        }
+    }
     let _ = rpc.notify(protocol::N_INITIALIZED, Value::Null);
-    match rpc.request(
-        protocol::M_THREAD_START,
-        protocol::thread_start_params(model.as_deref(), &cwd),
-        HANDSHAKE_TIMEOUT,
-    ) {
-        Ok(res) => {
-            let tid = protocol::thread_id_from_start_response(&res).unwrap_or_default();
-            let resolved_model = protocol::model_from_start_response(&res)
-                .or(model.clone())
-                .unwrap_or_default();
-            if let Ok(mut s) = state.lock() {
-                s.thread_id = Some(tid.clone());
-            }
-            let _ = event_tx.send(ThreadEvent::SessionInit {
-                session_id: tid,
-                model: resolved_model,
-                permission_mode: String::new(),
-                slash_commands: Vec::new(),
-            });
+
+    // Resume the persisted thread when restoring; else start fresh. A failed
+    // resume (thread gone / experimental) degrades to a fresh start.
+    let resume_id = resume.as_deref().filter(|s| !s.is_empty());
+    let started = match resume_id {
+        Some(tid) => rpc.request(
+            protocol::M_THREAD_RESUME,
+            protocol::thread_resume_params(tid, model.as_deref()),
+            HANDSHAKE_TIMEOUT,
+        ),
+        None => rpc.request(
+            protocol::M_THREAD_START,
+            protocol::thread_start_params(model.as_deref(), &cwd),
+            HANDSHAKE_TIMEOUT,
+        ),
+    };
+    let res = match started {
+        Ok(r) => Some(r),
+        Err(e) if resume_id.is_some() => {
+            tracing::warn!(error = %e, "codex thread/resume failed; starting a fresh thread");
+            rpc.request(
+                protocol::M_THREAD_START,
+                protocol::thread_start_params(model.as_deref(), &cwd),
+                HANDSHAKE_TIMEOUT,
+            )
+            .ok()
         }
         Err(e) => {
             let _ = event_tx.send(ThreadEvent::Error(format!("codex thread/start failed: {e}")));
             return;
         }
+    };
+    let Some(res) = res else {
+        let _ = event_tx.send(ThreadEvent::Error("codex thread/start failed after resume".into()));
+        return;
+    };
+    let tid = protocol::thread_id_from_start_response(&res).unwrap_or_default();
+    let resolved_model = protocol::model_from_start_response(&res).or(model.clone()).unwrap_or_default();
+    if let Ok(mut s) = state.lock() {
+        s.thread_id = Some(tid.clone());
     }
+    let _ = event_tx.send(ThreadEvent::SessionInit {
+        session_id: tid,
+        model: resolved_model,
+        permission_mode: String::new(),
+        slash_commands: Vec::new(),
+    });
 
     for cmd in out_rx {
         match cmd {
             Outbound::Prompt(text) => {
-                let tid = state
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.thread_id.clone())
-                    .unwrap_or_default();
+                let (tid, model, effort) = match state.lock() {
+                    Ok(s) => (
+                        s.thread_id.clone().unwrap_or_default(),
+                        s.current_model.clone(),
+                        s.current_effort.clone(),
+                    ),
+                    Err(_) => (String::new(), None, None),
+                };
                 // Fire-and-forget: the turn's text + turnId arrive as notifications;
                 // we don't block the worker on the turn's lifetime.
-                if let Err(e) = rpc.fire(protocol::M_TURN_START, protocol::turn_start_params(&tid, &text)) {
+                let params = protocol::turn_start_params(&tid, &text, model.as_deref(), effort.as_deref());
+                if let Err(e) = rpc.fire(protocol::M_TURN_START, params) {
                     let _ = event_tx.send(ThreadEvent::Error(format!("codex turn/start failed: {e}")));
                 }
             }

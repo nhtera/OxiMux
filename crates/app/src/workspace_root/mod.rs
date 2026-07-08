@@ -143,6 +143,16 @@ use std::rc::Rc;
 /// stable approximation rather than a live layout query.
 const ADAPTER_PICKER_LEFT_INSET: f32 = 8.0;
 
+/// Map a settings-layer launch transport to the agents-layer runtime transport
+/// (two deliberately separate enums — see the P0 seam design).
+fn to_agents_transport(t: oximux_settings::Transport) -> oximux_agents::thread::Transport {
+    match t {
+        oximux_settings::Transport::StreamJson => oximux_agents::thread::Transport::StreamJson,
+        oximux_settings::Transport::AppServer => oximux_agents::thread::Transport::AppServer,
+        oximux_settings::Transport::Acp => oximux_agents::thread::Transport::Acp,
+    }
+}
+
 pub struct WorkspaceRoot {
     pub(crate) theme: Theme,
     pub(crate) density: Density,
@@ -662,26 +672,32 @@ impl WorkspaceRoot {
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                         });
                     // When the user set "open new agents as Chat" and the picked
-                    // adapter declares chat support over a transport we can drive,
-                    // route to the structured chat view instead of the raw-PTY
-                    // agent. Every terminal-only adapter (and Terminal mode) takes
-                    // the classic path unchanged. Only the stream-json backend is
-                    // wired today, so an adapter configured for a not-yet-wired
-                    // transport (ACP) stays on the terminal path rather than
-                    // opening a chat the factory can't connect — a later phase
-                    // that wires that connect arm relaxes this transport guard.
-                    let open_chat = cx
-                        .try_global::<oximux_settings::AgentLaunchSettings>()
+                    // adapter declares chat support over a transport we can drive
+                    // (stream-json for Claude, app-server for Codex), route to the
+                    // structured chat view instead of the raw-PTY agent. Every
+                    // terminal-only adapter (and Terminal mode) takes the classic
+                    // path unchanged; an adapter on a not-yet-wired transport (ACP)
+                    // stays on the terminal path rather than opening a chat the
+                    // factory can't connect.
+                    let launch = cx.try_global::<oximux_settings::AgentLaunchSettings>();
+                    let chat_transport = launch.map(|s| s.transport_for(id));
+                    let open_chat = launch
                         .map(|s| {
-                            s.default_open_mode == oximux_settings::OpenMode::Chat
-                                && s.chat_capable(id)
-                                && s.transport_for(id) == oximux_settings::Transport::StreamJson
+                            s.default_open_mode == oximux_settings::OpenMode::Chat && s.chat_capable(id)
                         })
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        && matches!(
+                            chat_transport,
+                            Some(
+                                oximux_settings::Transport::StreamJson
+                                    | oximux_settings::Transport::AppServer
+                            )
+                        );
                     if open_chat {
+                        let transport = to_agents_transport(chat_transport.unwrap_or_default());
                         if let Some(panes) = this.active_project_panes() {
                             panes.update(cx, |p, cx| {
-                                p.open_agent_chat_tab_in_active_group(cwd, None, window, cx);
+                                p.open_agent_chat_tab_in_active_group(cwd, None, transport, window, cx);
                             });
                         }
                     } else {

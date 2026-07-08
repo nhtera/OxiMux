@@ -730,6 +730,7 @@ impl PaneGroup {
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
+        transport: oximux_agents::thread::Transport,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -742,6 +743,7 @@ impl PaneGroup {
             crate::shell::agent_chat::AgentChatView::new(
                 cwd_for_view,
                 model_for_view,
+                transport,
                 theme,
                 density,
                 typography,
@@ -756,10 +758,12 @@ impl PaneGroup {
     /// subprocess with `--resume <session_id>` (via `new_resumed`). Shares the
     /// tab-push path with [`open_agent_chat_tab`]; only the view construction
     /// differs. Called by the session-restore factory.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_agent_chat_tab_restored(
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
+        transport: oximux_agents::thread::Transport,
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
@@ -776,6 +780,7 @@ impl PaneGroup {
             crate::shell::agent_chat::AgentChatView::new_resumed(
                 cwd_for_view,
                 model_for_view,
+                transport,
                 session_id,
                 entries,
                 slash_commands,
@@ -878,10 +883,12 @@ impl PaneGroup {
                 thinking_level,
             } => {
                 // Open the truncated fork as a separate tab; the source tab is
-                // untouched (this is the whole point of Fork vs Rewind).
+                // untouched (this is the whole point of Fork vs Rewind). Fork is a
+                // Claude-only feature (rewind/fork is hidden for Codex).
                 self.open_agent_chat_tab_restored(
                     cwd.clone(),
                     model.clone(),
+                    oximux_agents::thread::Transport::StreamJson,
                     Some(session_id.clone()),
                     entries.clone(),
                     slash_commands.clone(),
@@ -921,9 +928,11 @@ impl PaneGroup {
                 .unwrap_or_default(),
             None => Vec::new(),
         };
+        // Session-History reopen imports a Claude `.jsonl` session log.
         self.open_agent_chat_tab_restored(
             cwd,
             None,
+            oximux_agents::thread::Transport::StreamJson,
             Some(session_id.to_string()),
             entries,
             Vec::new(),

@@ -76,8 +76,12 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
             Ok((Box::new(conn), rx))
         }
         Transport::AppServer => {
-            let (conn, rx) =
-                CodexAppServerConnection::spawn(&spec.cwd, spec.model.as_deref())?;
+            let (conn, rx) = CodexAppServerConnection::spawn(
+                &spec.cwd,
+                spec.model.as_deref(),
+                spec.resume_session_id.as_deref(),
+                spec.effort.as_deref(),
+            )?;
             Ok((Box::new(conn), rx))
         }
         Transport::Acp => {

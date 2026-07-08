@@ -168,22 +168,31 @@ impl AgentLaunchSettings {
         self
     }
 
-    /// The Chat-mode backend transport for `adapter_id`. Defaults to
-    /// `StreamJson` (Claude's native path) when the adapter has no entry or
-    /// names no transport.
+    /// The Chat-mode backend transport for `adapter_id`. An explicitly
+    /// configured non-default transport on the entry wins (e.g. an ACP adapter);
+    /// otherwise the built-in default per adapter applies — Codex speaks
+    /// `app-server`, everything else stream-json.
     pub fn transport_for(&self, adapter_id: &str) -> Transport {
-        self.for_agent(adapter_id).map(|a| a.transport).unwrap_or_default()
+        if let Some(a) = self.for_agent(adapter_id)
+            && a.transport != Transport::StreamJson
+        {
+            return a.transport;
+        }
+        match adapter_id {
+            "codex" => Transport::AppServer,
+            _ => Transport::StreamJson,
+        }
     }
 
     /// Whether `adapter_id` can open as a structured chat (vs a raw terminal).
     /// This is the capability seam the chat-routing gate consults instead of a
     /// hard-coded provider name. An adapter qualifies when it is either:
-    /// - the built-in Claude adapter (`claude-code`), which chats over native
-    ///   stream-json; or
+    /// - a built-in chat adapter — Claude (`claude-code`, native stream-json) or
+    ///   Codex (`codex`, native app-server); or
     /// - configured with `transport = "acp"` and a non-empty `acp_command`
     ///   (an external ACP agent to spawn).
     pub fn chat_capable(&self, adapter_id: &str) -> bool {
-        if adapter_id == "claude-code" {
+        if matches!(adapter_id, "claude-code" | "codex") {
             return true;
         }
         matches!(
@@ -385,18 +394,22 @@ acp_args = "--acp"
     }
 
     #[test]
-    fn chat_capable_claude_always_and_acp_when_configured() {
+    fn chat_capable_builtins_and_acp_when_configured() {
         let mut s = AgentLaunchSettings::default();
-        // Built-in Claude chats over stream-json, no config needed.
+        // Built-in chat adapters, no config needed.
         assert!(s.chat_capable("claude-code"));
-        // A plain adapter with no ACP config is terminal-only.
-        assert!(!s.chat_capable("codex"));
+        assert_eq!(s.transport_for("claude-code"), Transport::StreamJson);
+        assert!(s.chat_capable("codex"));
+        assert_eq!(s.transport_for("codex"), Transport::AppServer, "codex speaks app-server by default");
+        // A plain non-built-in adapter with no ACP config is terminal-only.
+        assert!(!s.chat_capable("aider"));
         // transport=acp but an empty command → NOT chat-capable (nothing to spawn).
         s.entry_mut("gemini").transport = Transport::Acp;
         assert!(!s.chat_capable("gemini"), "acp without a command is not chat-capable");
-        // With a command → chat-capable.
+        // With a command → chat-capable, and the explicit transport wins.
         s.entry_mut("gemini").acp_command = "gemini".into();
         assert!(s.chat_capable("gemini"));
+        assert_eq!(s.transport_for("gemini"), Transport::Acp);
     }
 
     #[test]
