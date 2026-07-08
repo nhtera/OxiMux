@@ -82,8 +82,9 @@ pub(super) fn render_tool_card(
     if expanded {
         if diff.is_some() {
             // Edit/Write/MultiEdit: the diff is shown above; add any textual
-            // result too (e.g. an error message).
-            if let Some(result) = &tc.result {
+            // result too (e.g. an error message). Skip an empty result — an ACP
+            // edit's body is the diff, so its result text is often blank.
+            if let Some(result) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
                 card = card.child(result_block(result, theme, density, typo));
             }
         } else if let Some(body) = tool_bodies::render_tool_body(tc, theme, density, typo) {

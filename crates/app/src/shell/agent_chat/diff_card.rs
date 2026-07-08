@@ -10,6 +10,7 @@ use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px
 use oximux_agents::thread::ToolCall;
 use oximux_core::{DiffLine, DiffLineKind};
 use oximux_settings::{Density, Theme, Typography};
+use serde_json::Value;
 
 /// Cap on rendered diff rows so a huge edit can't blow up a card; the overflow
 /// is summarized as a trailing note.
@@ -19,6 +20,22 @@ const MAX_DIFF_ROWS: usize = 200;
 /// `None` for any other tool (or a payload missing the expected fields). Pure
 /// so it is unit-testable without a render.
 pub(super) fn build_edit_diff(tc: &ToolCall) -> Option<Vec<DiffLine>> {
+    // ACP edits arrive as a normalized `__acp_diff__` payload (on the input at
+    // start, or the structured result if the diff only lands at completion) —
+    // rendered like an Edit: a line-level diff of old→new, all-additions when
+    // there's no prior content (a new-file write). Provider-neutral: the view
+    // never learns which backend produced the edit.
+    if let Some(d) = acp_diff(tc) {
+        let old = d.get("old_text").and_then(Value::as_str).unwrap_or("");
+        let new = d.get("new_text").and_then(Value::as_str).unwrap_or("");
+        return Some(if old.is_empty() {
+            new.lines()
+                .map(|l| DiffLine { kind: DiffLineKind::Added, content: l.to_string() })
+                .collect()
+        } else {
+            lines_from_change(old, new)
+        });
+    }
     let obj = tc.input.as_object()?;
     match tc.name.as_str() {
         "Edit" => {
@@ -48,6 +65,14 @@ pub(super) fn build_edit_diff(tc: &ToolCall) -> Option<Vec<DiffLine>> {
         }
         _ => None,
     }
+}
+
+/// The normalized ACP diff payload (`{path, old_text, new_text}`) for this tool
+/// call, from the input (edit start) or the structured result (late diff), if any.
+fn acp_diff(tc: &ToolCall) -> Option<&Value> {
+    tc.input
+        .get("__acp_diff__")
+        .or_else(|| tc.structured.as_ref().and_then(|s| s.get("__acp_diff__")))
 }
 
 /// Line-level diff of two strings → `DiffLine`s (trailing newline stripped for
@@ -165,5 +190,41 @@ mod tests {
     fn non_edit_tool_has_no_diff() {
         let tc = ToolCall::new("id", "Bash", json!({"command": "ls"}));
         assert!(build_edit_diff(&tc).is_none());
+    }
+
+    #[test]
+    fn acp_diff_payload_on_input_builds_a_diff() {
+        // An ACP edit's normalized `__acp_diff__` payload renders like an Edit.
+        let tc = ToolCall::new(
+            "id",
+            "Edit",
+            json!({"file_path": "a.rs", "__acp_diff__": {"old_text": "a\nb", "new_text": "a\nc"}}),
+        );
+        let lines = build_edit_diff(&tc).expect("acp diff");
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Removed && l.content == "b"));
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Added && l.content == "c"));
+    }
+
+    #[test]
+    fn acp_diff_without_old_text_is_all_added() {
+        // A whole-file write (no prior content) is all additions.
+        let tc = ToolCall::new(
+            "id",
+            "Write",
+            json!({"__acp_diff__": {"old_text": null, "new_text": "one\ntwo"}}),
+        );
+        let lines = build_edit_diff(&tc).expect("acp write diff");
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.kind == DiffLineKind::Added));
+    }
+
+    #[test]
+    fn acp_diff_on_structured_result_builds_a_diff() {
+        // A diff that only arrived at completion lands in the structured slot.
+        let mut tc = ToolCall::new("id", "Modify x", json!({"file_path": "x"}));
+        tc.structured = Some(json!({"__acp_diff__": {"old_text": "x", "new_text": "y"}}));
+        let lines = build_edit_diff(&tc).expect("structured acp diff");
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Added && l.content == "y"));
+        assert!(lines.iter().any(|l| l.kind == DiffLineKind::Removed && l.content == "x"));
     }
 }
