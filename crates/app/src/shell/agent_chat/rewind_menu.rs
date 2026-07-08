@@ -72,7 +72,7 @@ impl AgentChatView {
 
     /// Open the confirm card for the user message at `entry_index`.
     pub(super) fn open_rewind_confirm(&mut self, entry_index: usize, cx: &mut Context<Self>) {
-        if self.rewinding || self.thread.session_id.is_none() {
+        if self.rewinding || self.thread.session_id.is_none() || !self.backend_supports_rewind() {
             return;
         }
         let Some(ordinal) = self.user_ordinal_at(entry_index) else { return };
@@ -128,7 +128,7 @@ impl AgentChatView {
     /// so the CLI must have flushed the last turn. The original file is never
     /// modified; the truncated copy lands under a fresh session id.
     pub(super) fn request_fork(&mut self, entry_index: usize, cx: &mut Context<Self>) {
-        if self.rewinding || self.thread.turn_active {
+        if self.rewinding || self.thread.turn_active || !self.backend_supports_rewind() {
             return;
         }
         let Some(old_sid) = self.thread.session_id.clone() else { return };
@@ -209,7 +209,11 @@ impl AgentChatView {
     /// turn is dropped (rewind semantics); on the last reply that's nothing.
     /// Conversation-only (no files axis): a re-roll shouldn't revert the repo.
     pub(super) fn regenerate(&mut self, assistant_entry_idx: usize, cx: &mut Context<Self>) {
-        if self.thread.turn_active || self.rewinding || self.thread.session_id.is_none() {
+        if self.thread.turn_active
+            || self.rewinding
+            || self.thread.session_id.is_none()
+            || !self.backend_supports_rewind()
+        {
             return;
         }
         // Only the LAST turn's reply is regenerable. Regenerating an earlier reply

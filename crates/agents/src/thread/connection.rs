@@ -248,6 +248,10 @@ pub fn question_answer_json(
 #[derive(Clone, Default)]
 pub struct StubConnection {
     sent: Arc<Mutex<Vec<Value>>>,
+    /// Advertised capabilities; default is the conservative all-false so an
+    /// unconfigured stub behaves like the trait default. A test that exercises a
+    /// capability-gated affordance (e.g. rewind) sets it via `with_capabilities`.
+    caps: AgentCapabilities,
 }
 
 impl StubConnection {
@@ -256,6 +260,13 @@ impl StubConnection {
     pub fn new() -> (Self, Receiver<ThreadEvent>, Sender<ThreadEvent>) {
         let (tx, rx) = mpsc::channel();
         (Self::default(), rx, tx)
+    }
+
+    /// Make the stub advertise `caps` (e.g. a rewind-capable Claude-like backend
+    /// for UI tests that gate on `supports_rewind`).
+    pub fn with_capabilities(mut self, caps: AgentCapabilities) -> Self {
+        self.caps = caps;
+        self
     }
 
     /// The JSON payloads that were written to the agent's stdin, in order.
@@ -287,6 +298,9 @@ impl AgentConnection for StubConnection {
     ) -> Result<()> {
         self.record(question_answer_json(request_id, questions, answers));
         Ok(())
+    }
+    fn capabilities(&self) -> AgentCapabilities {
+        self.caps
     }
     fn shutdown(&self) {}
 }

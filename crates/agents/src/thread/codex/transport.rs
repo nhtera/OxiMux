@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -42,6 +42,12 @@ pub struct RpcClient {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: Arc<AtomicU64>,
     pending: Pending,
+    /// Cleared by the reader thread when the child's stdout hits EOF (the
+    /// process exited). The actor's worker polls this so it stops parking on its
+    /// command channel and drops its event sender when the subprocess dies —
+    /// otherwise a crash would leave the chat frozen (the `Receiver` never
+    /// closes, so the app's disconnect handler never fires).
+    alive: Arc<AtomicBool>,
 }
 
 impl RpcClient {
@@ -61,14 +67,24 @@ impl RpcClient {
     /// wire its stdout into the reader/router.
     pub fn spawn_command(mut cmd: Command) -> Result<(RpcClient, Receiver<Inbound>, Child)> {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Put codex in its own process group so teardown can kill the whole
+            // tree — its `workspace-write` sandbox spawns helper processes for
+            // tool execution that would otherwise be orphaned.
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn().context("spawn codex app-server")?;
         let stdout = child.stdout.take().context("codex stdout missing")?;
         let stdin = child.stdin.take().context("codex stdin missing")?;
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
 
         let pending_r = pending.clone();
+        let alive_r = alive.clone();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -83,10 +99,19 @@ impl RpcClient {
                     continue;
                 };
                 if route(msg, &pending_r, &inbound_tx).is_break() {
-                    return; // consumer gone
+                    break; // consumer gone — still run the exit cleanup below
                 }
             }
-            // stdout closed → inbound_tx drops here → the actor's mapper ends.
+            // stdout closed (EOF / process exit) or the consumer went away. Mark
+            // dead and fail every outstanding request so blocked `request()`
+            // callers unblock immediately instead of waiting out their timeout;
+            // `inbound_tx` drops here too, ending the mapper.
+            alive_r.store(false, Ordering::SeqCst);
+            if let Ok(mut p) = pending_r.lock() {
+                for (_, tx) in p.drain() {
+                    let _ = tx.send(Err("codex app-server exited".to_string()));
+                }
+            }
         });
 
         Ok((
@@ -94,10 +119,17 @@ impl RpcClient {
                 stdin: Arc::new(Mutex::new(stdin)),
                 next_id: Arc::new(AtomicU64::new(1)),
                 pending,
+                alive,
             },
             inbound_rx,
             child,
         ))
+    }
+
+    /// Whether the `codex app-server` child is still running (its stdout hasn't
+    /// hit EOF). The actor's worker polls this to notice a crash.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 
     /// Send a request and block (up to `timeout`) for its response.
@@ -225,6 +257,27 @@ sleep 0.2
             }
             other => panic!("expected a notification, got {}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn child_exit_marks_dead_and_fails_pending_fast() {
+        // A fake that reads the request then exits WITHOUT responding. The
+        // pending request must fail via the EOF drain (fast) rather than waiting
+        // out its timeout, and is_alive() must flip false.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("read line; exit 0");
+        let (rpc, _inbound, mut child) = RpcClient::spawn_command(cmd).expect("spawn fake");
+        assert!(rpc.is_alive());
+        let start = std::time::Instant::now();
+        let res = rpc.request("x", json!({}), Duration::from_secs(30));
+        assert!(res.is_err(), "request must fail once the child exits");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "should fail fast via EOF drain, not wait out the 30s timeout"
+        );
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!rpc.is_alive(), "connection must be marked dead after child exit");
     }
 
     #[test]

@@ -925,7 +925,6 @@ impl ProjectPanes {
     /// Rehydrates the transcript + resumes the session. No-op when `group_id`
     /// isn't registered.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn open_agent_chat_in_group_restore(
         &mut self,
         group_id: PaneGroupId,

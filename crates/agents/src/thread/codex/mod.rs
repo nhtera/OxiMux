@@ -68,6 +68,10 @@ struct CodexState {
     /// these seeded). `None` = Codex's own default.
     current_model: Option<String>,
     current_effort: Option<String>,
+    /// Set when Stop was pressed before the turn id was known (the `turn/started`
+    /// notification hadn't landed yet). The mapper interrupts as soon as the id
+    /// arrives, so a fast Send→Stop doesn't silently no-op.
+    cancel_requested: bool,
 }
 
 pub struct CodexAppServerConnection {
@@ -128,12 +132,21 @@ impl CodexAppServerConnection {
         ))
     }
 
-    /// SIGTERM/kill + reap the child (and its sandbox helpers).
+    /// Kill + reap the codex process group — the direct child AND its sandbox
+    /// helper processes (spawned in the same group, see `spawn_command`).
     fn reap(&self) {
         let mut child = match self.child.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        #[cfg(unix)]
+        {
+            // SAFETY: `pgid` is our own child's process group (it leads the group
+            // via `process_group(0)`); `kill(2)` with a negative pid signals the
+            // whole group. Best-effort — a gone group returns ESRCH, ignored.
+            let pgid = child.id() as libc::pid_t;
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -214,7 +227,14 @@ impl AgentConnection for CodexAppServerConnection {
     /// Stop button never blocks; no-op when nothing is in flight.
     fn cancel(&self) -> Result<()> {
         let (tid, turn) = match self.state.lock() {
-            Ok(s) => (s.thread_id.clone(), s.current_turn_id.clone()),
+            Ok(mut s) => {
+                // Turn id not known yet (turn/started still in flight) → remember
+                // the request so the mapper interrupts the moment it arrives.
+                if s.current_turn_id.is_none() {
+                    s.cancel_requested = true;
+                }
+                (s.thread_id.clone(), s.current_turn_id.clone())
+            }
             Err(_) => return Ok(()),
         };
         match (tid, turn) {
@@ -320,7 +340,12 @@ fn worker_loop(
         let _ = event_tx.send(ThreadEvent::Error("codex thread/start failed after resume".into()));
         return;
     };
-    let tid = protocol::thread_id_from_start_response(&res).unwrap_or_default();
+    // A handshake with no thread id is a hard failure — every later turn/cancel
+    // would target an empty id. Surface it rather than pretending to connect.
+    let Some(tid) = protocol::thread_id_from_start_response(&res).filter(|t| !t.is_empty()) else {
+        let _ = event_tx.send(ThreadEvent::Error("codex handshake returned no thread id".into()));
+        return;
+    };
     let resolved_model = protocol::model_from_start_response(&res).or(model.clone()).unwrap_or_default();
     if let Ok(mut s) = state.lock() {
         s.thread_id = Some(tid.clone());
@@ -332,9 +357,12 @@ fn worker_loop(
         slash_commands: Vec::new(),
     });
 
-    for cmd in out_rx {
-        match cmd {
-            Outbound::Prompt(text) => {
+    // Poll for commands, but wake periodically to notice a subprocess crash:
+    // if the child died, break so `event_tx` drops and the app's disconnect
+    // handler fires (a plain blocking `recv` would park here forever on a crash).
+    loop {
+        match out_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Outbound::Prompt(text)) => {
                 let (tid, model, effort) = match state.lock() {
                     Ok(s) => (
                         s.thread_id.clone().unwrap_or_default(),
@@ -350,7 +378,13 @@ fn worker_loop(
                     let _ = event_tx.send(ThreadEvent::Error(format!("codex turn/start failed: {e}")));
                 }
             }
-            Outbound::Shutdown => break,
+            Ok(Outbound::Shutdown) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !rpc.is_alive() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -366,13 +400,30 @@ fn map_inbound(
     for inbound in rx {
         match inbound {
             Inbound::Notification { method, params } => {
-                let events = {
+                let (events, deferred_interrupt) = {
                     let mut st = match state.lock() {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
-                    map::map_notification(&method, &params, &mut st)
+                    let events = map::map_notification(&method, &params, &mut st);
+                    // Honor a Stop pressed before the turn id was known, now that
+                    // this notification (turn/started) may have set it.
+                    let deferred = if st.cancel_requested {
+                        match (st.thread_id.clone(), st.current_turn_id.clone()) {
+                            (Some(tid), Some(turn)) => {
+                                st.cancel_requested = false;
+                                Some((tid, turn))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    (events, deferred)
                 };
+                if let Some((tid, turn)) = deferred_interrupt {
+                    let _ = rpc.fire(protocol::M_TURN_INTERRUPT, protocol::turn_interrupt_params(&tid, &turn));
+                }
                 for ev in events {
                     if event_tx.send(ev).is_err() {
                         return; // consumer gone

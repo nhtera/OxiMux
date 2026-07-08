@@ -655,6 +655,17 @@ impl AgentChatView {
     /// worth restoring. A session id is required (it keys the blob and drives
     /// `--resume`); a chat with no completed turn has neither an id nor history,
     /// so it simply won't restore — the tab reopens fresh.
+    /// Whether the live backend keeps an on-disk session log the rewind/fork
+    /// truncate-fork can read (Claude's `~/.claude/projects/*.jsonl`; Codex/ACP
+    /// don't). Gates the Edit / Rewind / Regenerate / Fork affordances so they
+    /// aren't offered on a backend whose session file the fork can't locate.
+    fn backend_supports_rewind(&self) -> bool {
+        self.connection
+            .as_ref()
+            .map(|c| c.capabilities().supports_rewind)
+            .unwrap_or(false)
+    }
+
     pub fn transcript_snapshot(&self) -> Option<crate::persisted_chat::PersistedChatTranscript> {
         let session_id = self.thread.session_id.clone()?;
         if self.thread.entries.is_empty() {
@@ -1825,7 +1836,8 @@ impl AgentChatView {
         // session to fork (session id present) and we're not mid-rewind. Edit is
         // idle-only (a live turn would queue the resend instead of routing it);
         // Rewind cancels the turn first, so it stays available.
-        let can_rewind = self.thread.session_id.is_some() && !self.rewinding;
+        let can_rewind =
+            self.thread.session_id.is_some() && !self.rewinding && self.backend_supports_rewind();
         let copied = self.recently_copied == Some(idx);
         let copy_text = text.to_string();
         let group = SharedString::from(format!("user-entry-{idx}"));
@@ -2201,6 +2213,7 @@ impl AgentChatView {
                                     && !self.disconnected
                                     && !self.rewinding
                                     && self.thread.session_id.is_some()
+                                    && self.backend_supports_rewind()
                                     && !self.thread.entries[idx + 1..]
                                         .iter()
                                         .any(|e| matches!(e, ThreadEntry::User { .. })),
@@ -3754,7 +3767,10 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                // Regenerate is a rewind-gated (Claude) feature.
+                Box::new(StubConnection::default().with_capabilities(
+                    oximux_agents::thread::AgentCapabilities { supports_rewind: true, ..Default::default() },
+                )),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -3810,7 +3826,10 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                // Edit-and-resend is a rewind-gated (Claude) feature.
+                Box::new(StubConnection::default().with_capabilities(
+                    oximux_agents::thread::AgentCapabilities { supports_rewind: true, ..Default::default() },
+                )),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),

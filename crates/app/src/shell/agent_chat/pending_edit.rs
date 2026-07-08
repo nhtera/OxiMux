@@ -50,7 +50,11 @@ impl AgentChatView {
         // instead of routing it to `send_pending_edit`. Requiring idle keeps
         // "capture happens at send" honest and avoids the queue interleave
         // (Stop first, then edit — like the rest of the resumable-idle model).
-        if self.rewinding || self.thread.turn_active || self.thread.session_id.is_none() {
+        if self.rewinding
+            || self.thread.turn_active
+            || self.thread.session_id.is_none()
+            || !self.backend_supports_rewind()
+        {
             return;
         }
         let Some(ordinal) = self.user_ordinal_at(entry_index) else { return };

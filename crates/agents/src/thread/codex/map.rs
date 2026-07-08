@@ -45,16 +45,27 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
             }
             None => Vec::new(),
         },
-        "item/completed" => params
-            .get("item")
-            .map(item_completed)
-            .unwrap_or_default(),
+        "item/completed" => match params.get("item") {
+            Some(item) => {
+                // Drop the cached tool item now its lifecycle is over (any
+                // approval already resolved), so `cmd_items` can't grow unbounded
+                // over a long chat.
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    st.cmd_items.remove(id);
+                }
+                item_completed(item)
+            }
+            None => Vec::new(),
+        },
 
         // --- turn lifecycle -----------------------------------------------
         "turn/started" => {
             if let Some(tid) = params.get("turn").and_then(|t| t.get("id")).and_then(|v| v.as_str()) {
                 st.current_turn_id = Some(tid.to_string());
             }
+            // Start each turn's usage fresh, so a turn that never reports its own
+            // usage doesn't inherit the previous turn's counts on TurnEnded.
+            st.last_usage = None;
             Vec::new()
         }
         "turn/completed" => {
@@ -65,6 +76,7 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
                 .map(|s| !s.eq_ignore_ascii_case("completed"))
                 .unwrap_or(false);
             st.current_turn_id = None;
+            st.cancel_requested = false; // turn over — drop any stale Stop request
             let usage = st.last_usage.take();
             vec![ThreadEvent::TurnEnded { result: None, usage, is_error }]
         }
