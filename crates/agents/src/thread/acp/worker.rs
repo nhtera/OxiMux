@@ -64,16 +64,10 @@ async fn session(
         .on_receive_notification(
             {
                 let tx = event_tx.clone();
-                let st = state.clone();
                 move |n: SessionNotification, _cx: ConnectionTo<Agent>| {
                     let tx = tx.clone();
-                    let st = st.clone();
                     async move {
-                        let events = {
-                            let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
-                            map_session_update(n.update, &mut s)
-                        };
-                        for ev in events {
+                        for ev in map_session_update(n.update) {
                             let _ = tx.send(ev);
                         }
                         Ok(())
@@ -123,7 +117,15 @@ async fn session(
                             ))
                             .block_task()
                             .await;
-                        finalize_turn(&event_tx, &state, resp.err());
+                        // The streamed chunks are authoritative and already built
+                        // the assistant blocks; `TurnEnded` seals the window (no
+                        // finalized text — that would clobber tool-interleaved text).
+                        let err = resp.err();
+                        let _ = event_tx.send(ThreadEvent::TurnEnded {
+                            result: err.as_ref().map(|e| e.to_string()),
+                            usage: None,
+                            is_error: err.is_some(),
+                        });
                     }
                     Outbound::Shutdown => break,
                 }
@@ -132,28 +134,4 @@ async fn session(
         });
 
     connect.await.map_err(|e| format!("acp connection: {e}"))
-}
-
-/// Drain the streamed buffers into finalized assistant blocks and close the turn.
-/// `err` is `Some` when the prompt request itself failed (turn errored).
-fn finalize_turn(
-    event_tx: &Sender<ThreadEvent>,
-    state: &Arc<Mutex<AcpState>>,
-    err: Option<agent_client_protocol::Error>,
-) {
-    let (text, thinking) = {
-        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (std::mem::take(&mut s.text_buf), std::mem::take(&mut s.thinking_buf))
-    };
-    if !thinking.is_empty() {
-        let _ = event_tx.send(ThreadEvent::AssistantThinking(thinking));
-    }
-    if !text.is_empty() {
-        let _ = event_tx.send(ThreadEvent::AssistantText(text));
-    }
-    let _ = event_tx.send(ThreadEvent::TurnEnded {
-        result: err.as_ref().map(|e| e.to_string()),
-        usage: None,
-        is_error: err.is_some(),
-    });
 }

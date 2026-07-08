@@ -41,16 +41,12 @@ pub(crate) enum Outbound {
     Shutdown,
 }
 
-/// State shared between the notification handler (which accumulates the streamed
-/// assistant text) and the worker closure (which finalizes each turn). Also
-/// holds a clone of the live connection + session id so [`AcpConnection::cancel`]
-/// can fire `session/cancel` while a prompt future is parked on the worker.
+/// Holds a clone of the live connection + session id so [`AcpConnection::cancel`]
+/// can fire `session/cancel` while a prompt future is parked on the worker. (The
+/// notification→ThreadEvent mapping is stateless; the `ChatThread` accumulates
+/// the streamed chunks itself.)
 #[derive(Default)]
 pub(crate) struct AcpState {
-    /// Streamed assistant text for the in-flight turn (finalized at turn end).
-    pub text_buf: String,
-    /// Streamed assistant reasoning for the in-flight turn.
-    pub thinking_buf: String,
     /// Set once the session is open; the cancel target.
     pub session_id: Option<SessionId>,
     /// A clone of the live connection (thread-safe: `send_notification` is sync

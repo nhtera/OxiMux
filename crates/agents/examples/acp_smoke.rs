@@ -40,9 +40,10 @@ fn main() {
                 match ev {
                     ThreadEvent::SessionInit { .. } if !prompted => {
                         prompted = true;
-                        println!(">>> sending prompt");
-                        conn.send_user_message("Reply with exactly one word: pong")
-                            .expect("send");
+                        let prompt = std::env::var("ACP_PROMPT")
+                            .unwrap_or_else(|_| "Reply with exactly one word: pong".to_string());
+                        println!(">>> sending prompt: {prompt}");
+                        conn.send_user_message(&prompt).expect("send");
                     }
                     ThreadEvent::TurnEnded { .. } => {
                         println!("<<< turn ended");
