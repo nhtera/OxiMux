@@ -802,6 +802,13 @@ impl AgentChatView {
         self.thread.session_id.as_deref()
     }
 
+    /// Whether this is still an unbound *New Agent* draft (no subprocess has
+    /// spawned; the first send binds it). The host reads this to label the tab
+    /// "New Agent" and to skip persisting the empty draft.
+    pub fn is_unbound(&self) -> bool {
+        self.unbound
+    }
+
     /// FocusHandle of the inner composer — the pane focuses this on activate so
     /// keystrokes land in the draft without a click first.
     pub fn composer_focus_handle(&self, cx: &App) -> FocusHandle {

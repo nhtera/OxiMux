@@ -508,6 +508,14 @@ impl ProjectPanes {
                         ) = &tab.content
                         {
                             let v = view.read(cx);
+                            // An unbound *New Agent* draft never spawned a
+                            // subprocess and has no session or messages — nothing
+                            // to restore. Skip it (like Diff/Tasks) so it doesn't
+                            // mis-restore as a bound Claude chat; the user reopens
+                            // a fresh draft from the launcher.
+                            if v.is_unbound() {
+                                continue;
+                            }
                             if let Some(t) = v.transcript_snapshot() {
                                 chat_transcripts.push(t);
                             }

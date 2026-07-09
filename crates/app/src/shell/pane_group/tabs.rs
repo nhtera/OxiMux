@@ -853,14 +853,22 @@ impl PaneGroup {
             },
         )
         .detach();
-        let n = self
-            .tabs
-            .iter()
-            .filter(|t| matches!(t.kind, PaneGroupTabKind::AgentChat { .. }))
-            .count()
-            + 1;
+        // An unbound *New Agent* draft reads as a draft ("New Agent") until its
+        // first send binds it, at which point `TitleChanged` relabels it to the
+        // chosen agent. A bound chat gets the running `Chat N` label.
+        let label = if view.read(cx).is_unbound() {
+            SharedString::from("New Agent")
+        } else {
+            let n = self
+                .tabs
+                .iter()
+                .filter(|t| matches!(t.kind, PaneGroupTabKind::AgentChat { .. }))
+                .count()
+                + 1;
+            SharedString::from(format!("Chat {n}"))
+        };
         let tab = PaneGroupTab {
-            label: SharedString::from(format!("Chat {n}")),
+            label,
             content: PaneContent::AgentChat(view),
             kind: PaneGroupTabKind::AgentChat { cwd, model },
             color: None,
