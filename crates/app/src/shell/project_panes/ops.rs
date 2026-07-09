@@ -98,6 +98,30 @@ impl ProjectPanes {
         }
     }
 
+    /// Open an unbound *New Agent* draft chat in the active group (deferred
+    /// transport binding — see [`PaneGroup::open_agent_chat_tab_unbound`]).
+    pub fn open_agent_chat_tab_unbound_in_active_group(
+        &mut self,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied());
+        let Some(target_id) = target_id else {
+            return;
+        };
+        self.set_active_group(target_id, window, cx);
+        if let Some(target) = self.groups.get(&target_id).cloned() {
+            target.update(cx, |g, cx| {
+                g.open_agent_chat_tab_unbound(cwd, window, cx);
+            });
+        }
+    }
+
     /// Reopen a past session as a chat tab in the active group (from the
     /// Session History side panel). Dedups an already-open session; otherwise
     /// imports the transcript from `path` and spawns a resumed chat.

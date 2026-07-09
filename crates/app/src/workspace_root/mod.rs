@@ -670,6 +670,29 @@ impl WorkspaceRoot {
                 AdapterSelection::NewBrowserTab => {
                     window.dispatch_action(Box::new(NewBrowserTab), cx);
                 }
+                AdapterSelection::NewAgentDraft => {
+                    // Unified draft chat: open an unbound chat rooted at the active
+                    // project (same rooting as a spawned agent, so its status dot
+                    // binds to the workspace). The agent + model are picked in the
+                    // composer; the transport binds on the first message.
+                    let cwd = this
+                        .active_project_panes()
+                        .map(|panes| panes.read(cx).cwd().clone())
+                        .or_else(|| {
+                            this.active_project
+                                .as_ref()
+                                .map(|p| std::path::PathBuf::from(&p.root_path))
+                        })
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        });
+                    if let Some(panes) = this.active_project_panes() {
+                        panes.update(cx, |p, cx| {
+                            p.open_agent_chat_tab_unbound_in_active_group(cwd, window, cx);
+                        });
+                    }
+                }
                 AdapterSelection::Adapter { kind, id } => {
                     // Root the agent at the active project (its panes' cwd),
                     // so the worktree the agent runs in matches a sidebar

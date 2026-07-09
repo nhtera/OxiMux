@@ -26,6 +26,7 @@ mod pending_edit;
 mod plan_panel;
 mod question_card;
 mod rewind_menu;
+mod roster;
 mod slash_command_catalog;
 mod slash_palette;
 mod tool_bodies;
@@ -235,6 +236,13 @@ pub struct AgentChatView {
     /// respawns with `--resume`. Distinct from `disconnected` (an unexpected
     /// crash, which stays unavailable), so an intentional Stop shows no error.
     interrupted: bool,
+    /// A "draft" chat opened via the unified **New Agent** entry: no subprocess
+    /// has spawned yet, and `self.backend`/`self.model` reflect the *currently
+    /// picked* (but not yet committed) agent + model. Deferred binding — the
+    /// first `send_text` flips this off and `respawn()`s to spawn the chosen
+    /// agent (see [`Self::bind_now`]). A chat opened via a per-agent quick-launch
+    /// starts already bound (`false`), so its lifecycle is unchanged.
+    unbound: bool,
     /// Assistant entry indices the user manually EXPANDED (per-entry override,
     /// meaningful in `ThinkingLevel::Auto`).
     expanded_thinking: HashSet<usize>,
@@ -400,7 +408,48 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::assemble(cwd, model, backend, ChatThread::new(), theme, density, typography, window, cx)
+        Self::assemble(
+            cwd,
+            model,
+            backend,
+            ChatThread::new(),
+            true,
+            theme,
+            density,
+            typography,
+            window,
+            cx,
+        )
+    }
+
+    /// Construct an **unbound** chat view for the unified *New Agent* entry: no
+    /// subprocess is spawned. `backend`/`model` seed the *currently picked* agent
+    /// (the composer's agent picker can change them before the first send); the
+    /// first `send_text` binds the transport and spawns the chosen agent. A
+    /// provider-agnostic caller defaults to [`ChatBackend::stream_json`] (Claude).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unbound(
+        cwd: PathBuf,
+        model: Option<String>,
+        backend: ChatBackend,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::assemble(
+            cwd,
+            model,
+            backend,
+            ChatThread::new(),
+            false,
+            theme,
+            density,
+            typography,
+            window,
+            cx,
+        )
     }
 
     /// Rebuild a chat view on session restore: seed the thread from the
@@ -431,8 +480,9 @@ impl AgentChatView {
         cx: &mut Context<Self>,
     ) -> Self {
         let thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
-        let mut view =
-            Self::assemble(cwd, model, backend, thread, theme, density, typography, window, cx);
+        let mut view = Self::assemble(
+            cwd, model, backend, thread, true, theme, density, typography, window, cx,
+        );
         view.thinking_level = thinking_level;
         view
     }
@@ -447,6 +497,9 @@ impl AgentChatView {
         model: Option<String>,
         backend: ChatBackend,
         mut thread: ChatThread,
+        // `false` opens an unbound **New Agent** draft: skip the subprocess spawn
+        // entirely and wait for the first send to bind (see [`Self::new_unbound`]).
+        connect_now: bool,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -501,21 +554,25 @@ impl AgentChatView {
         let mut drain_task = None;
         // A fresh/restored session always starts in the default permission mode
         // (see the `permission_mode` field note); a live switch respawns.
-        match connect(ConnectSpec::for_backend(
-            &backend,
-            cwd.clone(),
-            model.clone(),
-            resume_session_id.clone(),
-            None,
-            None,
-        )) {
-            Ok((conn, rx)) => {
-                connection = Some(conn);
-                drain_task = Some(Self::spawn_drain(rx, cx));
-            }
-            Err(e) => {
-                thread.last_error = Some(format!("Failed to start agent: {e}"));
-                disconnected = true;
+        // An unbound draft (`!connect_now`) spawns nothing yet — the first send
+        // binds via `respawn()`, which connects `self.backend` fresh.
+        if connect_now {
+            match connect(ConnectSpec::for_backend(
+                &backend,
+                cwd.clone(),
+                model.clone(),
+                resume_session_id.clone(),
+                None,
+                None,
+            )) {
+                Ok((conn, rx)) => {
+                    connection = Some(conn);
+                    drain_task = Some(Self::spawn_drain(rx, cx));
+                }
+                Err(e) => {
+                    thread.last_error = Some(format!("Failed to start agent: {e}"));
+                    disconnected = true;
+                }
             }
         }
 
@@ -637,6 +694,7 @@ impl AgentChatView {
             effort: None,
             disconnected,
             interrupted: false,
+            unbound: !connect_now,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
             thinking_level: ThinkingLevel::default(),
@@ -787,6 +845,12 @@ impl AgentChatView {
         if images.is_empty() && text.trim() == "/clear" {
             self.new_chat(cx);
             return;
+        }
+        // First message on an unbound *New Agent* draft: spawn the picked agent
+        // now (deferred binding), then send into the fresh session. A bind failure
+        // leaves `disconnected` set with the error, handled by the guard below.
+        if self.unbound {
+            self.bind_now(cx);
         }
         // A prior Stop killed the child but left the session resumable — bring it
         // back with `--resume` before sending so the conversation continues.
@@ -957,6 +1021,28 @@ impl AgentChatView {
         self.thread.interrupt();
         self.sync_composer(cx);
         cx.notify();
+    }
+
+    /// Commit an unbound *New Agent* draft: spawn the picked agent for the first
+    /// time and relabel the tab from "New Agent" to the bound provider. `respawn`
+    /// does the actual connect — with no session id and no old child to reap it
+    /// simply starts a fresh session over `self.backend` (the currently-picked
+    /// agent). After this the chat behaves like any bound chat. No-op if already
+    /// bound. A connect failure leaves `disconnected` set (with the error), so the
+    /// send path bails just as it does for a failed initial spawn.
+    fn bind_now(&mut self, cx: &mut Context<Self>) {
+        if !self.unbound {
+            return;
+        }
+        self.unbound = false;
+        self.respawn(cx);
+        // Pick up the now-live connection's capability-gated pickers + vocab.
+        self.sync_composer(cx);
+        // Relabel the tab to the bound provider (a user rename still wins; see the
+        // host's `TitleChanged` handling).
+        cx.emit(AgentChatEvent::TitleChanged(
+            self.backend.provider_display_name().to_string(),
+        ));
     }
 
     /// Reap the current child and spawn a fresh one resuming the same session
@@ -1238,6 +1324,8 @@ impl AgentChatView {
             effort: None,
             disconnected: false,
             interrupted: false,
+            // The test injects a live connection, so this chat is already bound.
+            unbound: false,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
             thinking_level: ThinkingLevel::default(),

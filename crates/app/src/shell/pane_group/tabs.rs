@@ -754,6 +754,37 @@ impl PaneGroup {
         self.push_agent_chat_view(view, cwd, model, window, cx)
     }
 
+    /// Open an **unbound** *New Agent* draft chat: no subprocess spawns until the
+    /// first message. Seeds the provider-agnostic default (Claude stream-json);
+    /// the composer's agent picker can retarget it before the first send, which
+    /// binds the chosen transport. Shares the tab-push path with the bound
+    /// [`open_agent_chat_tab`].
+    pub fn open_agent_chat_tab_unbound(
+        &mut self,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cwd_for_view = cwd.clone();
+        let backend = oximux_agents::thread::ChatBackend::stream_json();
+        let view = cx.new(|cx| {
+            crate::shell::agent_chat::AgentChatView::new_unbound(
+                cwd_for_view,
+                None,
+                backend,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        self.push_agent_chat_view(view, cwd, None, window, cx)
+    }
+
     /// Restore an Agent Chat tab: rehydrate the transcript and spawn the
     /// subprocess with `--resume <session_id>` (via `new_resumed`). Shares the
     /// tab-push path with [`open_agent_chat_tab`]; only the view construction

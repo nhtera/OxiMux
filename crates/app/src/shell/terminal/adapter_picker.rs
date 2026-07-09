@@ -55,6 +55,11 @@ pub enum AdapterSelection {
     NewTerminal,
     /// Quick action — opens an embedded browser tab at the default URL.
     NewBrowserTab,
+    /// Quick action — opens a unified **New Agent** draft chat: an unbound chat
+    /// whose agent + model are picked in the composer and whose transport binds
+    /// on the first message. Distinct from the per-agent rows below, which bind
+    /// eagerly to a specific agent.
+    NewAgentDraft,
     /// One of the registry's available agent adapters.
     Adapter {
         kind: AgentAdapter,
@@ -341,6 +346,23 @@ impl AdapterPicker {
             typography.clone(),
             cx.listener(|this, _: &MouseDownEvent, window, cx| {
                 (this.on_select)(AdapterSelection::NewBrowserTab, window, cx);
+                this.close(cx);
+            }),
+        ));
+        // Unified draft: pick the agent + model in the composer, bind on first
+        // send. Sits with the quick actions since it's provider-agnostic, above
+        // the per-agent rows that bind eagerly.
+        card = card.child(picker_row(
+            "new-agent-draft",
+            Some("icons/sparkles.svg"),
+            SharedString::from("New Agent"),
+            None,
+            RowState::Active,
+            theme,
+            density,
+            typography.clone(),
+            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                (this.on_select)(AdapterSelection::NewAgentDraft, window, cx);
                 this.close(cx);
             }),
         ));
