@@ -157,7 +157,7 @@ fn to_agents_transport(t: oximux_settings::Transport) -> oximux_agents::thread::
 /// mapped transport plus, for an ACP adapter, its configured command + args
 /// (shell-split). Non-ACP adapters carry an empty command — the factory ignores
 /// the `acp_*` fields for them.
-fn chat_backend_for(
+pub(crate) fn chat_backend_for(
     settings: &oximux_settings::AgentLaunchSettings,
     adapter_id: &str,
 ) -> oximux_agents::thread::ChatBackend {

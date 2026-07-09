@@ -161,11 +161,11 @@ use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
     connect, AgentConnection, AssistantMessage, ChatBackend, ChatImage, ChatThread, ConnectSpec,
-    PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus,
-    TurnUsage,
+    ModelChoice, PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent,
+    ToolCallStatus, Transport, TurnUsage,
 };
 use oximux_git::GitCmd;
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
 pub struct AgentChatView {
     /// The conversation model. Owned directly (not a nested entity) — the view
@@ -243,6 +243,12 @@ pub struct AgentChatView {
     /// agent (see [`Self::bind_now`]). A chat opened via a per-agent quick-launch
     /// starts already bound (`false`), so its lifecycle is unchanged.
     unbound: bool,
+    /// While `unbound`, the adapter id of the *currently picked* agent (the
+    /// composer's agent dropdown selection) — e.g. `claude-code`/`codex`/
+    /// `opencode`. Drives the pre-bind model vocab and the post-bind tab label.
+    /// `None` for a chat that started bound. Retained (not cleared) after binding
+    /// so the label resolution still finds the roster display name.
+    unbound_agent_id: Option<String>,
     /// Assistant entry indices the user manually EXPANDED (per-entry override,
     /// meaningful in `ThinkingLevel::Auto`).
     expanded_thinking: HashSet<usize>,
@@ -438,7 +444,7 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::assemble(
+        let view = Self::assemble(
             cwd,
             model,
             backend,
@@ -449,7 +455,11 @@ impl AgentChatView {
             typography,
             window,
             cx,
-        )
+        );
+        // Seed the composer's agent + model pickers from the chat roster so the
+        // draft offers the choice on its first paint (before any subprocess).
+        view.sync_unbound_composer(cx);
+        view
     }
 
     /// Rebuild a chat view on session restore: seed the thread from the
@@ -539,6 +549,7 @@ impl AgentChatView {
                     this.change_permission_mode(mode.clone(), cx)
                 }
                 ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
+                ComposerEvent::AgentPicked(id) => this.change_agent(id.clone(), cx),
                 ComposerEvent::MentionOpened => this.refresh_context_sources(cx),
                 ComposerEvent::CaptureContext(request) => {
                     this.capture_context(request.clone(), cx)
@@ -672,6 +683,18 @@ impl AgentChatView {
             .detach();
         }
 
+        // The unbound draft's initial agent id, derived from the seed backend's
+        // transport (a New Agent draft defaults to Claude; the composer's agent
+        // picker can switch it before the first send). `None` when bound.
+        let unbound_agent_id = (!connect_now).then(|| {
+            match backend.transport {
+                Transport::StreamJson => "claude-code",
+                Transport::AppServer => "codex",
+                Transport::Acp => "cursor",
+            }
+            .to_string()
+        });
+
         Self {
             thread,
             connection,
@@ -695,6 +718,7 @@ impl AgentChatView {
             disconnected,
             interrupted: false,
             unbound: !connect_now,
+            unbound_agent_id,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
             thinking_level: ThinkingLevel::default(),
@@ -809,7 +833,85 @@ impl AgentChatView {
             c.set_state(disconnected, turn_active, cx);
             c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_slash_commands(slash_commands, cx);
+            // A bound chat never shows the agent picker (its transport is fixed);
+            // clearing here is what hides it after `bind_now` (cheap no-op once
+            // already cleared).
+            c.set_agent_picker(false, Vec::new(), None, cx);
         });
+    }
+
+    /// Seed the composer for an unbound *New Agent* draft: push the chat roster
+    /// into the agent dropdown, mark the current pick, and offer the picked
+    /// agent's static pre-bind model vocabulary (so the model picker has choices
+    /// before any subprocess exists). Mode + effort pickers stay hidden until the
+    /// connection binds and advertises its real capabilities. Called on
+    /// construction and after every agent/model pick while unbound.
+    fn sync_unbound_composer(&self, cx: &mut Context<Self>) {
+        let roster = roster::chat_roster_from_cx(cx);
+        let agents: Vec<(String, String)> =
+            roster.iter().map(|e| (e.id.clone(), e.display.clone())).collect();
+        let current = self.unbound_agent_id.as_ref().and_then(|id| {
+            roster.iter().find(|e| &e.id == id).map(|e| (e.id.clone(), e.display.clone()))
+        });
+        // The picked agent's static model list becomes the pre-bind vocab; ACP
+        // presets carry none (their models come from session negotiation), so the
+        // model picker simply hides until bound.
+        let vocab = self
+            .unbound_agent_id
+            .as_ref()
+            .and_then(|id| roster.iter().find(|e| &e.id == id))
+            .map(|e| ControlVocab {
+                models: e.models.iter().map(|m| ModelChoice { wire: m.clone() }).collect(),
+                permission_modes: Vec::new(),
+                efforts: Vec::new(),
+                default_model: e.default_model().map(str::to_string),
+                default_mode: None,
+                default_effort: None,
+            })
+            .unwrap_or_default();
+        let model = self.model.clone();
+        self.composer.update(cx, |c, cx| {
+            c.set_agent_picker(true, agents, current, cx);
+            // Pre-bind: only the model picker (no modes/effort until the live conn).
+            c.set_controls(model, None, None, false, false, vocab, cx);
+        });
+    }
+
+    /// The display name of the currently-picked unbound agent (from the roster),
+    /// used to relabel the tab after binding. `None` when bound / unresolved.
+    fn unbound_agent_display(&self, cx: &App) -> Option<String> {
+        let id = self.unbound_agent_id.as_ref()?;
+        roster::chat_roster_from_cx(cx).into_iter().find(|e| &e.id == id).map(|e| e.display)
+    }
+
+    /// Switch the *picked* agent on an unbound draft: rebuild the backend
+    /// (transport + ACP command/args) for the new adapter id, preselect that
+    /// agent's default model, and re-seed the composer's agent + model pickers.
+    /// No subprocess is touched — binding still waits for the first send. No-op
+    /// once bound (a live session's transport is fixed) or when unchanged.
+    fn change_agent(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.unbound || self.unbound_agent_id.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        // Resolve the backend for this id from the live settings global (mirrors
+        // the launcher's own preset resolution).
+        self.backend = match cx.try_global::<AgentLaunchSettings>() {
+            Some(settings) => crate::workspace_root::chat_backend_for(settings, &id),
+            None => crate::workspace_root::chat_backend_for(&AgentLaunchSettings::default(), &id),
+        };
+        // Preselect the new agent's default model; drop the prior mode/effort so
+        // the draft doesn't carry a selector the new agent may not support.
+        let roster = roster::chat_roster_from_cx(cx);
+        self.model = roster
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.default_model().map(str::to_string));
+        self.thread.model = self.model.clone();
+        self.permission_mode = None;
+        self.effort = None;
+        self.unbound_agent_id = Some(id);
+        self.sync_unbound_composer(cx);
+        cx.notify();
     }
 
     /// Stage image files dropped onto the chat surface into the composer. The
@@ -1036,13 +1138,18 @@ impl AgentChatView {
         }
         self.unbound = false;
         self.respawn(cx);
-        // Pick up the now-live connection's capability-gated pickers + vocab.
+        // Pick up the now-live connection's capability-gated pickers + vocab (this
+        // also clears the agent picker, since the chat is now bound).
         self.sync_composer(cx);
-        // Relabel the tab to the bound provider (a user rename still wins; see the
-        // host's `TitleChanged` handling).
-        cx.emit(AgentChatEvent::TitleChanged(
-            self.backend.provider_display_name().to_string(),
-        ));
+        // Relabel the tab to the picked agent's name (`Cursor`/`OpenCode`/`Codex`/
+        // `Claude`), which is more specific than the transport's generic
+        // `provider_display_name` (ACP → "Agent"). Falls back to the transport
+        // name if the roster can't resolve it. A user rename still wins; see the
+        // host's `TitleChanged` handling.
+        let label = self
+            .unbound_agent_display(cx)
+            .unwrap_or_else(|| self.backend.provider_display_name().to_string());
+        cx.emit(AgentChatEvent::TitleChanged(label));
     }
 
     /// Reap the current child and spawn a fresh one resuming the same session
@@ -1101,6 +1208,14 @@ impl AgentChatView {
         }
         self.model = Some(model.clone());
         self.thread.model = Some(model.clone());
+        // On an unbound draft there's no subprocess to respawn — just record the
+        // pick and re-seed so the picker's checkmark moves. The choice binds when
+        // the first message spawns the agent.
+        if self.unbound {
+            self.sync_unbound_composer(cx);
+            cx.notify();
+            return;
+        }
         self.respawn(cx);
         self.sync_composer(cx); // reflect the new model in the toolbar label
         cx.emit(AgentChatEvent::ModelChanged(model));
@@ -1114,6 +1229,11 @@ impl AgentChatView {
     /// (respawning an ACP child would drop the live session). Not persisted (see
     /// the field note). No-op when the mode is unchanged.
     fn change_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
+        // Unreachable pre-bind (the mode picker is hidden on an unbound draft),
+        // but guard anyway so a stray pick can't early-spawn the subprocess.
+        if self.unbound {
+            return;
+        }
         // The baseline ("no flag") mode comes from the backend, not a const —
         // Claude's is "default"; another provider advertises its own.
         let default_mode = self
@@ -1144,6 +1264,11 @@ impl AgentChatView {
     /// spawn (like `--model`), so a live switch respawns resumed on the new
     /// level. Not persisted, so no host event is raised. No-op when unchanged.
     fn change_effort(&mut self, effort: String, cx: &mut Context<Self>) {
+        // Unreachable pre-bind (the effort picker is hidden on an unbound draft),
+        // but guard anyway so a stray pick can't early-spawn the subprocess.
+        if self.unbound {
+            return;
+        }
         // The "current when unset" effort comes from the backend, not a const.
         let default_effort = self
             .connection
@@ -1326,6 +1451,7 @@ impl AgentChatView {
             interrupted: false,
             // The test injects a live connection, so this chat is already bound.
             unbound: false,
+            unbound_agent_id: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
             thinking_level: ThinkingLevel::default(),
@@ -1355,6 +1481,38 @@ impl AgentChatView {
             rail_hover: false,
             menu_hover: false,
         }
+    }
+
+    /// Test-only: put this view into the unbound *New Agent* draft state (no
+    /// connection, Claude picked) so a `#[gpui::test]` can drive `change_agent` /
+    /// `change_model` on a draft without spawning a subprocess.
+    #[cfg(test)]
+    fn make_unbound_for_test(&mut self) {
+        self.connection = None;
+        self.unbound = true;
+        self.unbound_agent_id = Some("claude-code".to_string());
+        self.backend = ChatBackend::stream_json();
+        self.model = Some("opus".to_string());
+    }
+
+    #[cfg(test)]
+    fn backend_transport_for_test(&self) -> Transport {
+        self.backend.transport
+    }
+
+    #[cfg(test)]
+    fn model_for_test(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    #[cfg(test)]
+    fn unbound_agent_id_for_test(&self) -> Option<&str> {
+        self.unbound_agent_id.as_deref()
+    }
+
+    #[cfg(test)]
+    fn is_bound_for_test(&self) -> bool {
+        !self.unbound && self.connection.is_some()
     }
 
     /// Bridge the connection's blocking `std::mpsc` receiver onto the
@@ -4204,6 +4362,58 @@ mod tests {
             }),
             _ => None,
         })
+    }
+
+    /// An unbound *New Agent* draft switches its picked agent + model in place —
+    /// rebuilding the backend transport and preselecting the new agent's default
+    /// model — WITHOUT spawning a subprocess (binding waits for the first send).
+    #[gpui::test]
+    async fn unbound_draft_switches_agent_and_model_without_binding(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                // Drop into the draft state: Claude picked, no subprocess.
+                view.make_unbound_for_test();
+                assert_eq!(view.backend_transport_for_test(), Transport::StreamJson);
+                assert_eq!(view.model_for_test(), Some("opus"));
+                assert!(!view.is_bound_for_test(), "a draft has no connection");
+
+                // Pick Codex: transport flips to app-server, model resets to
+                // Codex's default — and still no subprocess is spawned.
+                view.change_agent("codex".into(), cx);
+                assert_eq!(view.backend_transport_for_test(), Transport::AppServer);
+                assert_eq!(view.model_for_test(), Some("gpt-5-codex"));
+                assert_eq!(view.unbound_agent_id_for_test(), Some("codex"));
+                assert!(!view.is_bound_for_test(), "picking an agent must not bind");
+
+                // Pick an ACP preset: transport becomes ACP; presets carry no
+                // static model list, so the draft holds no model until bound.
+                view.change_agent("opencode".into(), cx);
+                assert_eq!(view.backend_transport_for_test(), Transport::Acp);
+                assert_eq!(view.model_for_test(), None);
+                assert!(!view.is_bound_for_test());
+
+                // Back to Claude, then switch the model on the draft: it records
+                // the pick (no respawn) and still hasn't bound.
+                view.change_agent("claude-code".into(), cx);
+                assert_eq!(view.model_for_test(), Some("opus"));
+                view.change_model("sonnet".into(), cx);
+                assert_eq!(view.model_for_test(), Some("sonnet"));
+                assert!(!view.is_bound_for_test(), "a model pick on a draft must not bind");
+            })
+            .expect("window update");
     }
 }
 

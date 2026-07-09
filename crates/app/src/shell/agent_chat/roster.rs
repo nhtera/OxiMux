@@ -19,12 +19,14 @@
 //! each other — the app is the one place both are visible, alongside the sibling
 //! resolver `chat_backend_for`.
 
-// The composer wiring (unified agent+model picker) consumes this in a later
-// phase; until then the roster is exercised only by its unit tests, so allow
-// the staged dead code. Remove when the composer reads `chat_roster`.
+// A few roster fields (e.g. `efforts`) are carried for completeness and future
+// phases but not yet read by the composer's pre-bind pickers (which offer agent
+// + model only); allow the staged dead code rather than dropping fields that
+// belong on the vocabulary.
 #![allow(dead_code)]
 
-use oximux_agents::RegistryEntry;
+use gpui::App;
+use oximux_agents::{AdapterRegistry, RegistryEntry};
 use oximux_settings::{AgentLaunchSettings, Transport, ACP_PRESETS};
 
 /// One pickable coding agent in the unified composer, with its pre-connection
@@ -101,6 +103,20 @@ pub(crate) fn chat_roster(
     }
 
     roster
+}
+
+/// Assemble the chat roster synchronously from live app state: the built-in
+/// adapters (Claude/Codex, carrying their static model vocab) plus the ACP
+/// presets, filtered by the current [`AgentLaunchSettings`] global. Built
+/// without async which-detection — the unbound composer needs the agent + model
+/// choices immediately, and a missing binary surfaces at spawn, not here. Falls
+/// back to default settings when the global isn't installed (tests / early boot).
+pub(crate) fn chat_roster_from_cx(cx: &App) -> Vec<ChatRosterEntry> {
+    let detected = AdapterRegistry::with_builtin_adapters().entries_without_detection();
+    match cx.try_global::<AgentLaunchSettings>() {
+        Some(settings) => chat_roster(&detected, settings),
+        None => chat_roster(&detected, &AgentLaunchSettings::default()),
+    }
 }
 
 #[cfg(test)]

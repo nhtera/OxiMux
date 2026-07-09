@@ -180,6 +180,27 @@ impl AdapterRegistry {
         }
         entries
     }
+
+    /// One [`RegistryEntry`] per registered adapter WITHOUT running `detect()`,
+    /// every entry marked `available: true`. For synchronous, pre-launch
+    /// consumers (like the unified chat roster) that need each adapter's id,
+    /// display name, and static model/effort vocab but do NOT gate on whether
+    /// the binary is on PATH — the composer's agent picker offers the choice
+    /// regardless, and the spawn attempt surfaces a missing binary. Mirrors
+    /// [`Self::detect_available`] minus the async which-detection.
+    pub fn entries_without_detection(&self) -> Vec<RegistryEntry> {
+        self.slots
+            .iter()
+            .map(|slot| RegistryEntry {
+                adapter_id: slot.adapter.id(),
+                display_name: slot.adapter.name(),
+                adapter_enum: slot.kind,
+                available: true,
+                models: slot.adapter.models(),
+                efforts: slot.adapter.efforts(),
+            })
+            .collect()
+    }
 }
 
 // No `Default` impl on purpose. Rust convention says `Default` is the
@@ -288,6 +309,19 @@ mod tests {
             ],
             "dropdown order is significant; Custom must remain last"
         );
+    }
+
+    #[test]
+    fn entries_without_detection_reports_every_builtin_as_available() {
+        let reg = AdapterRegistry::with_builtin_adapters();
+        let entries = reg.entries_without_detection();
+        // One per slot, in registration order, all forced available (no detect).
+        let ids: Vec<&str> = entries.iter().map(|e| e.adapter_id).collect();
+        assert_eq!(ids, ["claude-code", "codex", "aider", "custom"]);
+        assert!(entries.iter().all(|e| e.available));
+        // Static vocab rides along (the roster's pre-bind model source).
+        let claude = entries.iter().find(|e| e.adapter_id == "claude-code").unwrap();
+        assert_eq!(claude.models, ["opus", "sonnet", "haiku"]);
     }
 
     #[test]

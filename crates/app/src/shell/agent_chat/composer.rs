@@ -143,6 +143,10 @@ pub enum ComposerEvent {
     PermissionModePicked(String),
     /// The user picked a reasoning-effort level in the bottom toolbar.
     EffortPicked(String),
+    /// The user picked a coding agent in the unbound *New Agent* draft's agent
+    /// dropdown (an adapter id, e.g. `codex`/`opencode`). The parent rebuilds the
+    /// backend + default model and re-pushes the picker. Only fired while unbound.
+    AgentPicked(String),
     /// The `@` overlay just opened. The parent refreshes the composer's context
     /// sources (esp. the live sibling-terminal list) in response, so the "Context"
     /// section is current without the composer reaching into the pane group.
@@ -183,6 +187,17 @@ pub struct ComposerView {
     /// [`Self::set_controls`]. The pickers render from this (no hardcoded
     /// provider vocab); empty until a connection is attached.
     vocab: ControlVocab,
+    /// True while this is an unbound *New Agent* draft — the agent picker is
+    /// shown so the user can choose the coding agent before the first send binds
+    /// it. Cleared once bound (a live session's transport can't be hot-swapped).
+    /// Pushed by the parent via [`Self::set_agent_picker`].
+    unbound: bool,
+    /// The pickable coding agents for the unbound draft's dropdown, `(id,
+    /// display)` in roster order. Empty when bound.
+    agent_options: Vec<(String, String)>,
+    /// The currently-picked agent `(id, display)`, for the agent-picker button
+    /// label + the menu checkmark. `None` when bound / not yet seeded.
+    current_agent: Option<(String, String)>,
     /// Images staged for the next send (via the paperclip, ⌘V, or drag-drop).
     /// Each holds both its wire/persist [`ChatImage`] and a pre-decoded thumbnail
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
@@ -296,6 +311,9 @@ impl ComposerView {
             supports_modes: false,
             supports_effort: false,
             vocab: ControlVocab::default(),
+            unbound: false,
+            agent_options: Vec::new(),
+            current_agent: None,
             pending_images: Vec::new(),
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
@@ -442,6 +460,29 @@ impl ComposerView {
             self.supports_modes = supports_modes;
             self.supports_effort = supports_effort;
             self.vocab = vocab;
+            cx.notify();
+        }
+    }
+
+    /// Push the unbound *New Agent* draft's agent roster + current selection. The
+    /// parent owns the truth (it rebuilds the backend on a pick and re-pushes);
+    /// this view only renders the dropdown and emits [`ComposerEvent::AgentPicked`].
+    /// `unbound = false` hides the agent picker (a bound chat never shows it).
+    /// Only repaints when something actually changed.
+    pub fn set_agent_picker(
+        &mut self,
+        unbound: bool,
+        agents: Vec<(String, String)>,
+        current: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.unbound != unbound
+            || self.agent_options != agents
+            || self.current_agent != current
+        {
+            self.unbound = unbound;
+            self.agent_options = agents;
+            self.current_agent = current;
             cx.notify();
         }
     }
@@ -784,6 +825,12 @@ impl ComposerView {
         cx.emit(ComposerEvent::EffortPicked(effort));
     }
 
+    /// Ask the parent to switch the *picked* coding agent on the unbound draft
+    /// (the parent rebuilds the backend + default model and re-pushes the picker).
+    fn pick_agent(&mut self, id: String, cx: &mut Context<Self>) {
+        cx.emit(ComposerEvent::AgentPicked(id));
+    }
+
     /// Read + clear the draft. When the agent is idle this emits
     /// [`ComposerEvent::Submit`] straight away; while a turn is still streaming it
     /// **queues** the message instead — parked in [`Self::queued`] and drained by
@@ -992,6 +1039,51 @@ impl ComposerView {
     /// the draft untouched so the user can send it once the turn is stopped.
     fn request_stop(&mut self, cx: &mut Context<Self>) {
         cx.emit(ComposerEvent::Stop);
+    }
+
+    /// The agent control in the bottom toolbar of an unbound *New Agent* draft:
+    /// a flat ghost button labeled with the picked agent, opening the chat roster
+    /// upward. Picking an agent rebinds the model picker beside it (the parent
+    /// pushes that agent's static model vocab). Shown only while unbound — a bound
+    /// chat's transport is fixed. Sits just before the model picker so the two
+    /// read together ("Claude ▾  opus ▾").
+    fn render_agent_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let agents = self.agent_options.clone();
+        let current_id =
+            self.current_agent.as_ref().map(|(id, _)| id.clone()).unwrap_or_default();
+        let current_label = self
+            .current_agent
+            .as_ref()
+            .map(|(_, d)| d.clone())
+            .unwrap_or_else(|| "Agent".to_string());
+        Button::new("chat-agent-btn")
+            .label(current_label)
+            .ghost()
+            .small()
+            .dropdown_caret(true)
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
+                for (id, display) in &agents {
+                    let selected = current_id == *id;
+                    let text = if selected {
+                        format!("\u{2713} {display}")
+                    } else {
+                        format!("   {display}")
+                    };
+                    let choice = id.to_string();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_w, _c| div().child(text.clone())).on_click(
+                            window.listener_for(
+                                &entity,
+                                move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
+                                    view.pick_agent(choice.clone(), cx);
+                                },
+                            ),
+                        ),
+                    );
+                }
+                menu
+            })
     }
 
     /// The model control in the bottom toolbar: a flat ghost button (no box —
@@ -1770,8 +1862,14 @@ impl Render for ComposerView {
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }
-        // Spacer pushes the model/effort cluster to the far right.
+        // Spacer pushes the agent/model/effort cluster to the far right.
         controls = controls.child(div().flex_1());
+        // Unbound *New Agent* draft: the agent picker precedes the model picker so
+        // the user chooses which agent, then which model, before the first send
+        // binds a subprocess. Hidden once bound (transport is fixed at spawn).
+        if self.unbound && !self.agent_options.is_empty() {
+            controls = controls.child(self.render_agent_picker(cx));
+        }
         // Show the model picker only when the backend advertises models (like the
         // mode/effort pickers). A vocab-less/disconnected state hides it rather
         // than rendering a blank button.
