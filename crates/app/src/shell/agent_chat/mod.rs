@@ -119,6 +119,36 @@ pub enum AgentChatEvent {
         slash_commands: Vec<String>,
         thinking_level: ThinkingLevel,
     },
+    /// The user asked to switch this chat to its companion terminal view (the
+    /// composer's terminal button). The host owns the runtime, so it spawns the
+    /// `--resume` terminal (if not already) and flips the view mode via
+    /// [`AgentChatView::attach_terminal`] / [`AgentChatView::set_view_mode`].
+    ToggleTerminalRequested,
+}
+
+/// Which surface an agent-chat tab is showing: its structured chat, or a
+/// companion raw-PTY terminal running the same agent session resumed
+/// interactively (`claude --resume <id>`). The companion is spawned lazily on
+/// the first switch and reaped when the tab closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatViewMode {
+    #[default]
+    Chat,
+    Terminal,
+}
+
+/// Everything the host needs to spawn a companion terminal that resumes THIS
+/// chat's session interactively. Returned by [`AgentChatView::terminal_launch_spec`]
+/// (which the host reads because only it owns the `CliRuntime` that spawns).
+#[derive(Debug, Clone)]
+pub struct ChatTerminalSpec {
+    pub adapter: AgentAdapter,
+    pub adapter_id: &'static str,
+    /// The chat's session id to `--resume` into the interactive CLI.
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// How assistant thinking blocks are shown across the whole chat.
@@ -156,6 +186,7 @@ use composer::{ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, EntryDisplay};
+use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
@@ -164,7 +195,10 @@ use oximux_agents::thread::{
     ModelChoice, PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent,
     ToolCallStatus, Transport, TurnUsage,
 };
+use oximux_agents::SharedBackend;
+use oximux_core::{AgentAdapter, AgentSessionId};
 use oximux_git::GitCmd;
+use oximux_pty::TerminalSessionId;
 use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
 pub struct AgentChatView {
@@ -249,6 +283,19 @@ pub struct AgentChatView {
     /// `None` for a chat that started bound. Retained (not cleared) after binding
     /// so the label resolution still finds the roster display name.
     unbound_agent_id: Option<String>,
+    /// Whether the tab shows the chat or its companion terminal.
+    view_mode: ChatViewMode,
+    /// Companion interactive terminal — the same agent session resumed in a raw
+    /// PTY (`--resume`), spawned lazily on the first switch to Terminal view.
+    /// `None` until then; the chat process keeps running independently underneath.
+    terminal: Option<Entity<TerminalView>>,
+    /// The daemon session id of the companion terminal, kept so the host can reap
+    /// it (`runtime.cancel`) when the tab closes — else switching to terminal view
+    /// then closing the tab would orphan a live CLI. `None` when no companion.
+    companion_session: Option<AgentSessionId>,
+    /// Repaints this view when the companion terminal notifies (PTY output /
+    /// scroll). Held alongside `terminal`; dropped when the companion is dropped.
+    _terminal_observer: Option<Subscription>,
     /// Assistant entry indices the user manually EXPANDED (per-entry override,
     /// meaningful in `ThinkingLevel::Auto`).
     expanded_thinking: HashSet<usize>,
@@ -550,6 +597,7 @@ impl AgentChatView {
                 }
                 ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
                 ComposerEvent::AgentPicked(id) => this.change_agent(id.clone(), cx),
+                ComposerEvent::ToggleTerminal => this.request_toggle_terminal(cx),
                 ComposerEvent::MentionOpened => this.refresh_context_sources(cx),
                 ComposerEvent::CaptureContext(request) => {
                     this.capture_context(request.clone(), cx)
@@ -611,10 +659,17 @@ impl AgentChatView {
                 _ => None,
             })
             .collect();
+        // A restored bound chat with a session can open its terminal view right
+        // away; an unbound draft or a session-less chat can't yet (mirrors
+        // `terminal_launch_spec`, which `Self` can't call before construction).
+        let terminal_available = connect_now
+            && thread.session_id.is_some()
+            && matches!(backend.transport, Transport::StreamJson | Transport::AppServer);
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_slash_commands(seed_slash, cx);
+            c.set_terminal_available(terminal_available, cx);
             c.seed_history(history_seed);
         });
 
@@ -719,6 +774,10 @@ impl AgentChatView {
             interrupted: false,
             unbound: !connect_now,
             unbound_agent_id,
+            view_mode: ChatViewMode::Chat,
+            terminal: None,
+            companion_session: None,
+            _terminal_observer: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
             thinking_level: ThinkingLevel::default(),
@@ -809,6 +868,180 @@ impl AgentChatView {
         self.unbound
     }
 
+    /// The current view mode (chat vs. companion terminal).
+    pub fn view_mode(&self) -> ChatViewMode {
+        self.view_mode
+    }
+
+    /// Whether a companion terminal has already been spawned for this chat.
+    pub fn has_companion_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    /// The companion terminal's daemon session id, so the host can reap it when
+    /// the tab closes. `None` when no companion was ever spawned.
+    pub fn companion_session_id(&self) -> Option<AgentSessionId> {
+        self.companion_session
+    }
+
+    /// Parameters for spawning a companion terminal that resumes THIS chat's
+    /// session interactively, or `None` when the chat can't be mirrored to a
+    /// terminal: it's an unbound draft, hasn't minted a session id yet, or runs
+    /// over a transport with no interactive `--resume` CLI wired (ACP presets).
+    /// The host reads this because only it owns the runtime that spawns.
+    pub fn terminal_launch_spec(&self) -> Option<ChatTerminalSpec> {
+        if self.unbound {
+            return None;
+        }
+        let session_id = self.thread.session_id.clone()?;
+        let (adapter, adapter_id) = match self.backend.transport {
+            Transport::StreamJson => (AgentAdapter::ClaudeCode, "claude-code"),
+            Transport::AppServer => (AgentAdapter::Codex, "codex"),
+            // No interactive resume CLI wired for ACP agents yet.
+            Transport::Acp => return None,
+        };
+        Some(ChatTerminalSpec {
+            adapter,
+            adapter_id,
+            session_id,
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        })
+    }
+
+    /// Mount a freshly-spawned companion terminal (the host did the async
+    /// `start_session`) and switch to Terminal view. Builds the `TerminalView`
+    /// from this chat's own theme/density/typography, observes it for repaint,
+    /// and remembers the session id for reaping on close.
+    pub fn attach_terminal(
+        &mut self,
+        session: AgentSessionId,
+        backend: SharedBackend,
+        term_id: TerminalSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let terminal = cx.new(|cx| {
+            TerminalView::mount(backend, term_id, ids, theme, density, typography, window, cx)
+        });
+        self._terminal_observer = Some(cx.observe(&terminal, |_this, _tv, cx| cx.notify()));
+        self.terminal = Some(terminal);
+        self.companion_session = Some(session);
+        self.view_mode = ChatViewMode::Terminal;
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    /// Switch between chat and terminal view. Terminal requires the companion to
+    /// already exist (the host spawns it first via [`Self::attach_terminal`]); a
+    /// request for Terminal with no companion is a no-op. Focuses the newly-active
+    /// surface.
+    pub fn set_view_mode(
+        &mut self,
+        mode: ChatViewMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if mode == ChatViewMode::Terminal && self.terminal.is_none() {
+            return;
+        }
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    /// Focus the surface the active mode shows: the companion terminal in
+    /// Terminal view, the composer in Chat view.
+    fn focus_active_surface(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_focus_handle(cx).focus(window, cx);
+    }
+
+    /// The focus handle for whichever surface is currently shown — the host's
+    /// `PaneContent::AgentChat` focus routing delegates here so keystrokes land in
+    /// the terminal while it's up, and back in the composer otherwise.
+    pub fn active_focus_handle(&self, cx: &App) -> FocusHandle {
+        match (self.view_mode, &self.terminal) {
+            (ChatViewMode::Terminal, Some(tv)) => tv.read(cx).focus_handle(cx),
+            _ => self.composer.read(cx).focus_handle(cx),
+        }
+    }
+
+    /// Raise a request for the host to toggle this chat's terminal view (the host
+    /// owns the runtime that spawns the companion). From the composer's terminal
+    /// button; ⌃⇧V routes through the host directly.
+    fn request_toggle_terminal(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AgentChatEvent::ToggleTerminalRequested);
+    }
+
+    /// Render the companion terminal full-body with a slim header carrying a
+    /// "return to chat" button (the click target for the ⌃⇧V toggle). Only reached
+    /// when `view_mode` is Terminal and the companion exists.
+    fn render_terminal_mode(
+        &self,
+        terminal: Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme.bg_base)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .flex_none()
+                    .px(px(density.pad_panel))
+                    .py(px(density.pad_row))
+                    .border_b_1()
+                    .border_color(theme.border_inactive)
+                    .child(
+                        div()
+                            .text_size(px(typo.t_body_sm))
+                            .text_color(theme.fg_muted)
+                            .child(SharedString::from(format!(
+                                "{} · terminal",
+                                self.provider_label()
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id("chat-return-to-chat")
+                            .flex_none()
+                            .px(px(density.pad_panel))
+                            .py(px(density.gap_inline * 0.5))
+                            .rounded(px(8.0))
+                            .cursor_pointer()
+                            .bg(theme.bg_panel_alt)
+                            .text_color(theme.fg_base)
+                            .text_size(px(typo.t_body_sm))
+                            .hover(|s| s.bg(theme.hover_overlay))
+                            .child(SharedString::from("Chat  ⌃⇧V"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e, window, cx| {
+                                    this.set_view_mode(ChatViewMode::Chat, window, cx)
+                                }),
+                            ),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(terminal))
+    }
+
     /// FocusHandle of the inner composer — the pane focuses this on activate so
     /// keystrokes land in the draft without a click first.
     pub fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
@@ -836,10 +1069,14 @@ impl AgentChatView {
         // commands (Claude does; others send an empty list, which disables it).
         let slash_commands =
             if caps.supports_slash { self.thread.slash_commands.clone() } else { Vec::new() };
+        // The terminal-view toggle lights up once the chat can spawn a resume
+        // terminal (bound + has a session id + resumable transport).
+        let terminal_available = self.terminal_launch_spec().is_some();
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
             c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_slash_commands(slash_commands, cx);
+            c.set_terminal_available(terminal_available, cx);
             // A bound chat never shows the agent picker (its transport is fixed);
             // clearing here is what hides it after `bind_now` (cheap no-op once
             // already cleared).
@@ -1459,6 +1696,10 @@ impl AgentChatView {
             // The test injects a live connection, so this chat is already bound.
             unbound: false,
             unbound_agent_id: None,
+            view_mode: ChatViewMode::Chat,
+            terminal: None,
+            companion_session: None,
+            _terminal_observer: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
             thinking_level: ThinkingLevel::default(),
@@ -2939,6 +3180,14 @@ impl Focusable for AgentChatView {
 
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Terminal view: show the companion terminal full-body (the headless chat
+        // process keeps running underneath). Returns early so none of the chat's
+        // transcript/composer setup runs while the terminal is up.
+        if self.view_mode == ChatViewMode::Terminal
+            && let Some(terminal) = self.terminal.clone()
+        {
+            return self.render_terminal_mode(terminal, cx).into_any_element();
+        }
         let theme = self.theme;
         // Create/drop the interactive question cards to match the thread before
         // the (immutable) transcript render reads them. Needs `window` for the
@@ -3107,6 +3356,7 @@ impl Render for AgentChatView {
             .child(self.composer.clone())
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
+            .into_any_element()
     }
 }
 
@@ -4419,6 +4669,49 @@ mod tests {
                 view.change_model("sonnet".into(), cx);
                 assert_eq!(view.model_for_test(), Some("sonnet"));
                 assert!(!view.is_bound_for_test(), "a model pick on a draft must not bind");
+            })
+            .expect("window update");
+    }
+
+    /// The companion-terminal launch spec is offered only for a bound chat that
+    /// has minted a session on a resumable transport; a draft, a session-less
+    /// chat, and (implicitly) an unbound draft all decline. `set_view_mode` to
+    /// Terminal is a no-op until the host attaches a companion.
+    #[gpui::test]
+    async fn terminal_launch_spec_gates_on_bound_session(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                // Bound (stub) Claude chat, but no session id yet → no terminal.
+                assert!(view.terminal_launch_spec().is_none(), "no session → no terminal");
+                assert_eq!(view.view_mode(), ChatViewMode::Chat);
+
+                // A session id makes the resume terminal available.
+                view.thread.session_id = Some("sid-1".into());
+                let spec = view.terminal_launch_spec().expect("bound + session → resumable");
+                assert_eq!(spec.adapter_id, "claude-code");
+                assert_eq!(spec.session_id, "sid-1");
+
+                // Switching to Terminal is a no-op until the host attaches one.
+                view.set_view_mode(ChatViewMode::Terminal, window, cx);
+                assert_eq!(view.view_mode(), ChatViewMode::Chat, "no companion → stays chat");
+
+                // An unbound draft never offers a terminal, even with a session.
+                view.make_unbound_for_test();
+                view.thread.session_id = Some("sid-2".into());
+                assert!(view.terminal_launch_spec().is_none(), "unbound draft → no terminal");
             })
             .expect("window update");
     }

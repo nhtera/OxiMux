@@ -578,6 +578,9 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &ToggleFloatingTerminal, window, cx| {
                 this.toggle_floating_terminal(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleChatTerminalView, window, cx| {
+                this.toggle_chat_terminal_view(window, cx);
+            }))
             .on_action(
                 cx.listener(|this, action: &RequestOpenAdapterPicker, window, cx| {
                     // Anchor precedence:

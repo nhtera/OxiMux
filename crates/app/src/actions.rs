@@ -542,6 +542,10 @@ actions!(
         /// dispatches show/hide it (the PTY persists across hides). The card's
         /// close button tears the PTY down.
         ToggleFloatingTerminal,
+        /// Toggle the active agent-chat tab between its chat and a companion
+        /// terminal running the same session resumed interactively (Ctrl+Shift+V).
+        /// No-op unless the active tab is an agent chat with a session to resume.
+        ToggleChatTerminalView,
         /// Navigate BACK through the per-window workspace-activation history
         /// (browser-style). Bound to Cmd+Alt+Left. No-op at the oldest entry.
         NavWorkspaceBack,

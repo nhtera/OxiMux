@@ -59,8 +59,9 @@ impl PaneContent {
             Self::Diff(view) => view.read(cx).focus_handle(cx),
             Self::Browser(view) => view.read(cx).focus_handle(cx),
             Self::Tasks(view) => view.read(cx).focus_handle(cx),
-            // Focus the composer so keystrokes land in the draft immediately.
-            Self::AgentChat(view) => view.read(cx).composer_focus_handle(cx),
+            // Focus the composer in chat view, or the companion terminal when the
+            // chat is toggled to terminal view — whichever surface is showing.
+            Self::AgentChat(view) => view.read(cx).active_focus_handle(cx),
         }
     }
 

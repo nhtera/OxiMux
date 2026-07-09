@@ -20,8 +20,8 @@ use crate::actions::{
     ReloadCustomCommands, Search, SelectExplorerTab, SelectHistoryTab, SelectSearchTab,
     SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
-    SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleFloatingTerminal, ToggleLeftSidebar,
-    ToggleRightSidebar, ToggleZoomSubPane,
+    SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleChatTerminalView,
+    ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
 };
 use crate::menu::{HideApp, HideOthers, Minimize, Quit};
 use oximux_editor::{EditorZoomIn, EditorZoomOut, EditorZoomReset, SaveFile};
@@ -61,6 +61,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         Global,
         "cmd-shift-t",
         ToggleFloatingTerminal
+    ),
+    entry!(
+        "toggle_chat_terminal_view",
+        "Toggle chat/terminal view",
+        Global,
+        "ctrl-shift-v",
+        ToggleChatTerminalView
     ),
     entry!("save_file", "Save file", Global, "cmd-s", SaveFile),
     entry!("editor_zoom_in", "Zoom in editor", Global, "cmd-=", EditorZoomIn),

@@ -1,5 +1,11 @@
 use super::*;
 
+use crate::shell::agent_chat::{ChatTerminalSpec, ChatViewMode};
+use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS};
+use oximux_agents::AgentSessionConfig;
+use oximux_core::SessionResumption;
+use oximux_settings::AgentLaunchSettings;
+
 impl PaneGroup {
 
     /// Schedule a one-frame-deferred re-pin to the strip's right edge.
@@ -948,7 +954,144 @@ impl PaneGroup {
                     cx,
                 );
             }
+            crate::shell::agent_chat::AgentChatEvent::ToggleTerminalRequested => {
+                let view = view.clone();
+                self.toggle_terminal_for_chat(view, window, cx);
+            }
         }
+    }
+
+    /// Toggle the ACTIVE tab between chat and its companion terminal view — the
+    /// ⌃⇧V action, routed here by the workspace root. No-op unless the active tab
+    /// is an agent chat.
+    pub fn toggle_active_chat_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let PaneContent::AgentChat(view) = &tab.content else {
+            return;
+        };
+        let view = view.clone();
+        self.toggle_terminal_for_chat(view, window, cx);
+    }
+
+    /// Toggle a specific agent-chat view between chat and its companion terminal.
+    /// Switching to terminal spawns the resume terminal on first use (async, via
+    /// the runtime); switching back just flips the mode (the terminal stays alive
+    /// underneath so a re-toggle is instant). Shared by the ⌃⇧V action and the
+    /// composer's terminal button.
+    fn toggle_terminal_for_chat(
+        &mut self,
+        view: Entity<crate::shell::agent_chat::AgentChatView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // In terminal view → back to chat (no spawn).
+        if view.read(cx).view_mode() == ChatViewMode::Terminal {
+            view.update(cx, |v, cx| v.set_view_mode(ChatViewMode::Chat, window, cx));
+            self.focus_active(window, cx);
+            return;
+        }
+        // Companion already exists → just show it.
+        if view.read(cx).has_companion_terminal() {
+            view.update(cx, |v, cx| v.set_view_mode(ChatViewMode::Terminal, window, cx));
+            self.focus_active(window, cx);
+            return;
+        }
+        // First switch: spawn the resume terminal, then attach it.
+        let Some(spec) = view.read(cx).terminal_launch_spec() else {
+            crate::shell::toast::toast_op_error(
+                cx,
+                "Terminal view",
+                "Send a message first — the terminal resumes this chat's session.",
+            );
+            return;
+        };
+        self.spawn_companion_terminal(view, spec, window, cx);
+    }
+
+    /// Spawn a companion terminal that resumes the chat's session interactively
+    /// (`--resume`), then hand it to the chat view. Mirrors `spawn_agent_tab`'s
+    /// runtime dance but mounts into the existing chat tab instead of a new tab,
+    /// and skips status-hook injection + session-row persistence (the companion
+    /// isn't a tracked agent tab — it's reaped when the chat tab closes).
+    fn spawn_companion_terminal(
+        &mut self,
+        view: Entity<crate::shell::agent_chat::AgentChatView>,
+        spec: ChatTerminalSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let runtime = self.cli_runtime.clone();
+        // Per-agent launch defaults (model fallback + extra args).
+        let (model, extra_args) = {
+            let defaults = cx.try_global::<AgentLaunchSettings>();
+            (
+                spec.model.clone().or_else(|| defaults.and_then(|d| d.model_for(spec.adapter_id))),
+                defaults.map(|d| d.args_for(spec.adapter_id)).unwrap_or_default(),
+            )
+        };
+        let adapter = spec.adapter;
+        let adapter_id = spec.adapter_id;
+        let effort = spec.effort.clone();
+        let cwd = spec.cwd.clone();
+        let session_id = spec.session_id.clone();
+        cx.spawn_in(window, async move |group, cx| {
+            let cfg = AgentSessionConfig {
+                adapter,
+                worktree_path: cwd,
+                prompt: None,
+                model,
+                effort,
+                extra_args,
+                env: Vec::new(),
+                cols: DEFAULT_COLS,
+                rows: DEFAULT_ROWS,
+                custom_command: None,
+                resumption: SessionResumption::Resume { id: session_id },
+            };
+            let session = match runtime.start_session(cfg).await {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        adapter = adapter_id,
+                        "companion terminal start_session failed"
+                    );
+                    let _ = cx.update(|_, cx| {
+                        crate::shell::toast::toast_op_error(cx, "Terminal view", &err.to_string());
+                    });
+                    return;
+                }
+            };
+            let backend = match runtime.backend_for(session) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(?err, "companion terminal backend_for failed");
+                    let _ = runtime.cancel(session).await;
+                    return;
+                }
+            };
+            let term_id = match runtime.terminal_session_id(session) {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::warn!(?err, "companion terminal terminal_session_id failed");
+                    let _ = runtime.cancel(session).await;
+                    return;
+                }
+            };
+            let attached = view.update_in(cx, |v, window, cx| {
+                v.attach_terminal(session, backend, term_id, window, cx);
+            });
+            if attached.is_err() {
+                // The chat tab was dropped mid-spawn — reap the orphan session.
+                let _ = runtime.cancel(session).await;
+                return;
+            }
+            // Route focus to the freshly-shown terminal.
+            let _ = group.update_in(cx, |g, window, cx| g.focus_active(window, cx));
+        })
+        .detach();
     }
 
     /// Open a past session (chosen in the Session History side panel) as a chat tab.
@@ -1561,6 +1704,20 @@ impl PaneGroup {
             cx.spawn_in(window, async move |_this, _cx| {
                 if let Err(err) = runtime.cancel(session_id).await {
                     tracing::warn!(?err, "pane-group close_tab: agent cancel failed");
+                }
+            })
+            .detach();
+        }
+        // A chat tab may have spawned a companion terminal (its own daemon
+        // session); reap it too so toggling to terminal view then closing the tab
+        // doesn't orphan a live CLI.
+        if let PaneContent::AgentChat(view) = &removed.content
+            && let Some(companion) = view.read(cx).companion_session_id()
+        {
+            let runtime = self.cli_runtime.clone();
+            cx.spawn_in(window, async move |_this, _cx| {
+                if let Err(err) = runtime.cancel(companion).await {
+                    tracing::warn!(?err, "pane-group close_tab: companion terminal cancel failed");
                 }
             })
             .detach();

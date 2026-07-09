@@ -1074,6 +1074,25 @@ impl WorkspaceRoot {
         .detach();
     }
 
+    /// Toggle the active agent-chat tab between its chat and a companion terminal
+    /// (the ⌃⇧V action). Routes to the active group, which owns the `CliRuntime`
+    /// that spawns the resume terminal. No-op unless the active tab is an agent
+    /// chat with a session to resume.
+    pub(crate) fn toggle_chat_terminal_view(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panes) = self.active_project_panes() else {
+            return;
+        };
+        panes.update(cx, |p, cx| {
+            if let Some(group) = p.active_group() {
+                group.update(cx, |g, cx| g.toggle_active_chat_terminal(window, cx));
+            }
+        });
+    }
+
     /// Accessor for the workspace's CLI agent runtime. Used by the (future)
     /// settings panel + tests; the main consumer is the per-project
     /// `ProjectPanes`, which receives its own `Arc` clone at construction.

@@ -147,6 +147,9 @@ pub enum ComposerEvent {
     /// dropdown (an adapter id, e.g. `codex`/`opencode`). The parent rebuilds the
     /// backend + default model and re-pushes the picker. Only fired while unbound.
     AgentPicked(String),
+    /// The user clicked the "Terminal view" button — switch this chat to its
+    /// companion raw-PTY terminal (the parent owns the runtime that spawns it).
+    ToggleTerminal,
     /// The `@` overlay just opened. The parent refreshes the composer's context
     /// sources (esp. the live sibling-terminal list) in response, so the "Context"
     /// section is current without the composer reaching into the pane group.
@@ -198,6 +201,9 @@ pub struct ComposerView {
     /// The currently-picked agent `(id, display)`, for the agent-picker button
     /// label + the menu checkmark. `None` when bound / not yet seeded.
     current_agent: Option<(String, String)>,
+    /// Whether this chat can open a companion terminal view (bound, has a session
+    /// id, resumable transport). Drives the visibility of the terminal button.
+    terminal_available: bool,
     /// Images staged for the next send (via the paperclip, ⌘V, or drag-drop).
     /// Each holds both its wire/persist [`ChatImage`] and a pre-decoded thumbnail
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
@@ -314,6 +320,7 @@ impl ComposerView {
             unbound: false,
             agent_options: Vec::new(),
             current_agent: None,
+            terminal_available: false,
             pending_images: Vec::new(),
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
@@ -483,6 +490,15 @@ impl ComposerView {
             self.unbound = unbound;
             self.agent_options = agents;
             self.current_agent = current;
+            cx.notify();
+        }
+    }
+
+    /// Push whether a companion terminal view is available (bound + has a session
+    /// + resumable transport). Shows/hides the terminal button. Repaints on change.
+    pub fn set_terminal_available(&mut self, available: bool, cx: &mut Context<Self>) {
+        if self.terminal_available != available {
+            self.terminal_available = available;
             cx.notify();
         }
     }
@@ -1253,6 +1269,19 @@ impl ComposerView {
             .on_click(cx.listener(|_this, _ev, _window, cx| cx.emit(ComposerEvent::NewChat)))
     }
 
+    /// "Terminal view" — switch this chat to a companion raw-PTY terminal running
+    /// the same session resumed interactively. Raises [`ComposerEvent::ToggleTerminal`];
+    /// the parent spawns the terminal (it owns the runtime). Shown only when
+    /// available (bound + has a session + resumable transport).
+    fn render_terminal_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("chat-terminal-btn")
+            .icon(Icon::default().path("icons/square-terminal.svg"))
+            .ghost()
+            .small()
+            .tooltip("Terminal view (⌃⇧V)")
+            .on_click(cx.listener(|_this, _ev, _window, cx| cx.emit(ComposerEvent::ToggleTerminal)))
+    }
+
     /// Staged-attachment chips shown above the input pill: a small thumbnail per
     /// pending image, each with a ✕ to remove it. Rendered only when something is
     /// staged. Thumbnails come pre-decoded (see [`PendingImage`]) so this row is
@@ -1859,6 +1888,10 @@ impl Render for ComposerView {
         // Paperclip/image attach anchors the far left, before the safety mode.
         controls = controls.child(self.render_attach_button(cx));
         controls = controls.child(self.render_new_chat_button(cx));
+        // Terminal-view toggle, shown once the chat can open one (bound + session).
+        if self.terminal_available {
+            controls = controls.child(self.render_terminal_button(cx));
+        }
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }

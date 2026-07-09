@@ -85,8 +85,8 @@ use crate::actions::{
     SelectFilesTab, SelectHistoryTab,
     SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
-    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleFloatingTerminal, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleChatTerminalView, ToggleFloatingTerminal,
+    ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
