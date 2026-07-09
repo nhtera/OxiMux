@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, SessionConfigOption, SessionId, SessionModeState,
+    CancelNotification, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionModeState,
 };
 use agent_client_protocol::{Agent, ConnectionTo};
 use anyhow::{Result, anyhow};
@@ -38,7 +40,7 @@ use futures::channel::mpsc as fmpsc;
 use futures::channel::oneshot;
 use serde_json::Value;
 
-use super::connection::{AgentCapabilities, AgentConnection, ModeChoice};
+use super::connection::{AgentCapabilities, AgentConnection, ModeChoice, ModelChoice};
 use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionDecision;
 
@@ -113,6 +115,51 @@ fn modes_to_choices(modes: &SessionModeState) -> Vec<ModeChoice> {
         .iter()
         .map(|mode| ModeChoice { wire: mode.id.0.to_string(), label: mode.name.clone() })
         .collect()
+}
+
+/// The agent's model selector, if it advertised one. ACP has no first-class
+/// model concept; by convention a model list is exposed as a `Select` config
+/// option tagged with the `Model` semantic category (`SessionConfigOptionCategory`).
+/// Returns the option (for its id, the `set_config` key) + its select payload
+/// (for the choices + current value).
+fn model_select(options: &[SessionConfigOption]) -> Option<(&SessionConfigOption, &SessionConfigSelect)> {
+    options.iter().find_map(|opt| {
+        if !matches!(opt.category, Some(SessionConfigOptionCategory::Model)) {
+            return None;
+        }
+        match &opt.kind {
+            SessionConfigKind::Select(select) => Some((opt, select)),
+            // Boolean (and any future non-select kind) can't be a model list.
+            _ => None,
+        }
+    })
+}
+
+/// Flatten a select's options — grouped or ungrouped — into `&SessionConfigSelectOption`
+/// in advertised order (the order the agent listed them).
+fn flatten_select(options: &SessionConfigSelectOptions) -> Vec<&SessionConfigSelectOption> {
+    match options {
+        SessionConfigSelectOptions::Ungrouped(opts) => opts.iter().collect(),
+        SessionConfigSelectOptions::Grouped(groups) => {
+            groups.iter().flat_map(|g| g.options.iter()).collect()
+        }
+        // A future option-list shape we don't understand yields no choices.
+        _ => Vec::new(),
+    }
+}
+
+/// The model picker vocabulary from the agent's `Model` select option, in
+/// advertised order. `wire` is the value id the agent expects back via
+/// `set_config`; the picker shows it verbatim. Empty when the agent advertises
+/// no model selector (the picker then stays hidden — honest).
+fn model_choices(options: &[SessionConfigOption]) -> Vec<ModelChoice> {
+    match model_select(options) {
+        Some((_opt, select)) => flatten_select(&select.options)
+            .into_iter()
+            .map(|opt| ModelChoice { wire: opt.value.0.to_string() })
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// A live chat connection to an ACP agent.
@@ -208,6 +255,41 @@ impl AgentConnection for AcpConnection {
             .map_err(|_| anyhow!("acp worker is gone"))
     }
 
+    /// The model choices the agent advertised via its `Model`-category select
+    /// config option. Empty until the handshake stashes `config_options` (and
+    /// empty forever for an agent that offers no model selector) — the picker
+    /// then stays hidden, which is honest for ACP.
+    fn models(&self) -> Vec<ModelChoice> {
+        self.state.lock().map(|s| model_choices(&s.config_options)).unwrap_or_default()
+    }
+
+    /// The agent's currently-selected model (the `Model` select's `current_value`),
+    /// shown as current when the user hasn't picked one this session.
+    fn default_model(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|s| model_select(&s.config_options).map(|(_o, sel)| sel.current_value.0.to_string()))
+    }
+
+    /// Switch the model in-session by writing the picked value to the agent's
+    /// `Model` select config option (`session/set_config_option`). Returning `Ok`
+    /// tells the app to skip the Claude-style respawn (which would drop the live
+    /// ACP session). Bails when the agent exposes no model selector — but then
+    /// `models()` is empty and the picker is hidden, so this is unreachable in
+    /// practice.
+    fn set_model(&self, model: &str) -> Result<()> {
+        let option_id = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| model_select(&s.config_options).map(|(opt, _sel)| opt.id.0.to_string()));
+        match option_id {
+            Some(id) => self.set_config(&id, Value::String(model.to_string())),
+            None => Err(anyhow!("this ACP agent does not expose a model selector")),
+        }
+    }
+
     /// Interrupt the in-flight turn (`session/cancel`). Fire-and-forget: the
     /// worker is parked on the prompt future, so we signal the agent directly via
     /// the stashed connection and let the prompt resolve.
@@ -236,7 +318,10 @@ impl Drop for AcpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{SessionConfigOption, SessionMode, SessionModeState};
+    use agent_client_protocol::schema::v1::{
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionMode,
+        SessionModeState,
+    };
 
     fn mode_state() -> SessionModeState {
         SessionModeState::new(
@@ -281,5 +366,50 @@ mod tests {
         assert_eq!(choices[0], ModeChoice { wire: "default".into(), label: "Ask every time".into() });
         assert_eq!(choices[1], ModeChoice { wire: "acceptEdits".into(), label: "Accept edits".into() });
         assert_eq!(choices[2].wire, "bypassPermissions");
+    }
+
+    #[test]
+    fn model_choices_read_the_model_category_select_in_advertised_order() {
+        // ACP has no model primitive: a model list is a `Model`-category select
+        // config option. Its option values become the picker `wire`s (in order),
+        // its `current_value` is the default, and its `id` is the `set_config` key.
+        // A sibling mode-select + boolean toggle must be ignored by the lookup.
+        let mode_select = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "ask",
+            vec![SessionConfigSelectOption::new("ask", "Ask")],
+        )
+        .category(SessionConfigOptionCategory::Mode);
+        let model_select_opt = SessionConfigOption::select(
+            "model",
+            "Model",
+            "sonnet",
+            vec![
+                SessionConfigSelectOption::new("opus", "Claude Opus"),
+                SessionConfigSelectOption::new("sonnet", "Claude Sonnet"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let toggle = SessionConfigOption::boolean("reasoning", "Reasoning", true);
+        let options = vec![toggle, mode_select, model_select_opt];
+
+        let choices = model_choices(&options);
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].wire, "opus");
+        assert_eq!(choices[1].wire, "sonnet");
+
+        let (opt, select) = model_select(&options).expect("model select present");
+        assert_eq!(opt.id.0.as_ref(), "model");
+        assert_eq!(select.current_value.0.as_ref(), "sonnet");
+    }
+
+    #[test]
+    fn model_choices_empty_when_no_model_selector() {
+        // An agent that advertises only a boolean toggle has no model list → the
+        // picker stays hidden (empty choices, no select).
+        let toggle = SessionConfigOption::boolean("reasoning", "Reasoning", false);
+        assert!(model_choices(&[toggle]).is_empty());
+        assert!(model_select(&[]).is_none());
     }
 }

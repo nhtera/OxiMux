@@ -135,6 +135,16 @@ pub trait AgentConnection: Send {
         anyhow::bail!("this agent does not support runtime configuration")
     }
 
+    /// Switch the model at runtime. ACP has no first-class model concept, so an
+    /// ACP backend maps this to its `Model`-category select config option
+    /// (`session/set_config_option`) — the switch stays in-session. Unsupported
+    /// by default → the app falls back to a resume-respawn on the new `--model`
+    /// (Claude/Codex fix the model at spawn). Returning `Ok` is what tells the
+    /// app to skip that respawn.
+    fn set_model(&self, _model: &str) -> Result<()> {
+        anyhow::bail!("this agent does not support changing model at runtime")
+    }
+
     /// The model choices this backend offers in the model picker. Default: none
     /// (the picker then shows only the current model as static text).
     fn models(&self) -> Vec<ModelChoice> {

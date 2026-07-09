@@ -1460,9 +1460,24 @@ impl AgentChatView {
             cx.notify();
             return;
         }
-        self.respawn(cx);
+        // Prefer an in-session model switch (an ACP agent maps a model pick to
+        // its `Model`-category config option); fall back to the resume-respawn
+        // path when the backend fixes `--model` at spawn (Claude/Codex).
+        // Respawning an ACP child would drop the live session.
+        let switched_live = self
+            .connection
+            .as_ref()
+            .is_some_and(|c| c.set_model(&model).is_ok());
+        if !switched_live {
+            self.respawn(cx);
+        }
         self.sync_composer(cx); // reflect the new model in the toolbar label
-        cx.emit(AgentChatEvent::ModelChanged(model));
+        // Persist only for spawn-fixed backends: an ACP model is a session-local
+        // config value the spawn ignores on restore (mirrors the mode path, which
+        // also switches live and isn't persisted).
+        if !switched_live {
+            cx.emit(AgentChatEvent::ModelChanged(model));
+        }
         cx.notify();
     }
 
