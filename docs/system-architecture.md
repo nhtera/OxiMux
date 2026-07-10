@@ -690,6 +690,7 @@ Separate from the raw-PTY terminal runtime above, the **chat** view runs a struc
 |---|---|---|---|
 | assistant text / thinking (+ deltas) | ✓ | ✓ | ✓ |
 | tool call + result | ✓ | ✓ | ✓ |
+| rich tool card by kind | ✓ (by name) | ✓ (renamed→name) | ✓ (via `ToolKind`) |
 | server/MCP tool calls | ✓ (as `tool_use`) | ✓ | ✓ |
 | 6× `*_tool_result` variants | ✓ (fwd-compat) | — | — |
 | inline tool-result image | ✓ | ○ | ✓ |
@@ -703,7 +704,7 @@ Separate from the raw-PTY terminal runtime above, the **chat** view runs a struc
 | usage footer | ✓ | ✓ | ○ |
 | embedded terminal | — | — | ✓ (`terminal/*` → inline `TerminalView`) |
 
-The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`; Claude and ACP tool-result images both emit `ToolResultImages`. ACP embedded terminals invert the crate boundary: the domain-layer `terminal/*` handlers delegate to an app-installed `AcpTerminalHost` that owns the real PTY (relay/in-process) and the inline `TerminalView`. Remaining ACP gaps (tool-kind classification, permission option-label buttons) are P5 (+ a P3 follow-up) in `plans/260710-1022-agent-chat-acp-parity-research/`.
+The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`; Claude and ACP tool-result images both emit `ToolResultImages`. Tool cards likewise normalize through one classifier: `ToolDetail::classify` (`tool_detail.rs`) maps a Claude name, a Codex renamed name, or an ACP `ToolKind` into a single archetype (`Shell`/`Read`/`Edit`/`Search`/`Fetch`/…) the renderer switches on, so an ACP `Execute` renders the same shell card as a Claude `Bash` instead of a generic key:value fallback. ACP threads its kind to the card via a follow-up `ToolKind` event (Claude/Codex classify by name, leaving `ToolCall.kind` unset). ACP embedded terminals invert the crate boundary: the domain-layer `terminal/*` handlers delegate to an app-installed `AcpTerminalHost` that owns the real PTY (relay/in-process) and the inline `TerminalView`. The remaining ACP polish item is permission option-label buttons (a P3 follow-up) in `plans/260710-1022-agent-chat-acp-parity-research/`.
 
 ---
 

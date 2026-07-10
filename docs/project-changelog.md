@@ -4,6 +4,20 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-10 — Agent Chat: normalized tool-detail classifier (P5)
+
+**Touches**: `crates/agents/src/thread/{tool_detail (new),tool_call,event,state,mod,acp/map}.rs`, `crates/app/src/shell/agent_chat/tool_bodies.rs`, `docs/system-architecture.md`
+
+Turns ACP's generic key:value tool fallback into the same rich cards Claude and Codex already get, via one provider-agnostic classifier. Claude rendering is byte-identical (each Claude name classifies to the archetype that maps back to its original body — locked by the dispatch test).
+
+- **`ToolDetail` classifier (`tool_detail.rs`).** A pure `classify(name, acp_kind, input) -> ToolDetail` collapses all three providers into one archetype (`Shell`/`Read`/`Edit`/`Write`/`Search`/`Fetch`/`WebSearch`/`SubAgent`/`Mcp`/`Plan`/`Plain`/`Unknown`). Claude classifies by name; Codex by its already-renamed name (so its `web_search` finally reaches the rich WebSearch card, not a generic one); ACP by its typed `ToolKind` — authoritative because an ACP tool's `name` is a freeform human title that can't be pattern-matched. Conservative by design: an ambiguous or unrecognized signal (`switch_mode`, `other`, any future `#[non_exhaustive]` kind) resolves to `Unknown` → the clean generic card, never a wrong-body guess.
+- **Threading the ACP kind.** `ToolCall` gained `#[serde(default)] kind: Option<String>`; ACP surfaces it via a follow-up `ToolKind` event (the same idiom as `ToolTerminal`/`ToolResultImages`, so the ~26 `ToolCallStarted` construction sites stay untouched), emitted from both the tool-call and tool-call-update paths and folded onto the card. Claude/Codex never emit it (classify by name).
+- **Renderer.** `render_tool_body` dispatches on `ToolDetail::classify` instead of raw name matching; `render_bash` gained a generic-input fallback so an ACP `Execute` whose input uses a non-`command` key still shows its raw input (no information loss) above the output.
+
+Gates: `cargo test --workspace --no-fail-fast` green; agents `+9` tests (classify table across Claude/Codex/ACP + conservative-unknown cases; ACP `ToolKind` emit + fold) + app cross-provider dispatch test proving Codex `web_search` / ACP `execute`/`read` route to rich cards while unclassified ACP tools stay generic. A `code-reviewer` pass returned **no findings** (Claude rendering byte-identical for real payloads; classifier conservative + future-proof against the `#[non_exhaustive]` `ToolKind`; persistence provably intact). Plan: `plans/260710-1022-agent-chat-acp-parity-research/` (P5). The one remaining ACP polish item is permission option-label buttons (a P3 follow-up).
+
+---
+
 ### 2026-07-10 — Agent Chat: ACP embedded terminal (P4)
 
 **Touches**: `crates/agents/src/thread/{acp/{client_terminal,map,mod,worker},event,state,tool_call}.rs`, `crates/app/src/{main,shell/agent_chat/{acp_terminal_host,mod},shell/terminal/terminal_view/mod}.rs`, `docs/system-architecture.md`
