@@ -51,3 +51,13 @@ path = "examples/stream_json_probe.rs"
 [[example]]
 name = "acp_smoke"
 path = "examples/acp_smoke.rs"
+
+# Deterministic mock ACP agent that drives the client's `terminal/*` path, and a
+# headless driver that asserts the embedded-terminal flow end-to-end (not shipped).
+[[example]]
+name = "mock_acp_terminal_agent"
+path = "examples/mock_acp_terminal_agent.rs"
+
+[[example]]
+name = "acp_terminal_smoke"
+path = "examples/acp_terminal_smoke.rs"
