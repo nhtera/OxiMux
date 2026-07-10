@@ -20,13 +20,14 @@
 
 mod approvals;
 mod client_fs;
+mod client_terminal;
 mod map;
 mod worker;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use agent_client_protocol::schema::v1::{
@@ -43,6 +44,29 @@ use serde_json::Value;
 use super::connection::{AgentCapabilities, AgentConnection, ModeChoice, ModelChoice};
 use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionDecision;
+
+pub use client_terminal::{
+    AcpTerminalHost, TerminalExitLite, TerminalOutputLite, TerminalSpawnSpec,
+};
+
+/// Process-wide backing for ACP embedded terminals, installed once by the app at
+/// boot (mirrors the app's `SHARED_BACKEND` terminal global). When unset the ACP
+/// client advertises `terminal:false` and the `terminal/*` handlers reject, so a
+/// headless/test build has no terminal surface.
+static TERMINAL_HOST: OnceLock<Arc<dyn AcpTerminalHost>> = OnceLock::new();
+
+/// Install the app's embedded-terminal host so ACP agents can drive live inline
+/// terminals. Call once at app boot, before any ACP chat connects; a later call
+/// is ignored (the first host wins), matching the `OnceLock` install idiom.
+pub fn install_terminal_host(host: Arc<dyn AcpTerminalHost>) {
+    let _ = TERMINAL_HOST.set(host);
+}
+
+/// The installed embedded-terminal host, if any. Read by the worker to gate the
+/// `terminal` capability at the handshake and to serve the `terminal/*` methods.
+pub(crate) fn terminal_host() -> Option<Arc<dyn AcpTerminalHost>> {
+    TERMINAL_HOST.get().cloned()
+}
 
 /// Commands the sync `AgentConnection` methods push to the async worker.
 pub(crate) enum Outbound {

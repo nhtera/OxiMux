@@ -15,11 +15,15 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest, NewSessionRequest,
-    PromptRequest, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+    ClientCapabilities, ContentBlock, CreateTerminalRequest, CreateTerminalResponse,
+    FileSystemCapabilities, InitializeRequest, KillTerminalRequest, KillTerminalResponse,
+    NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOptionValue,
     SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, TextContent, UsageUpdate, WriteTextFileRequest, WriteTextFileResponse,
+    SetSessionModeRequest, TerminalOutputRequest, TerminalOutputResponse, TextContent, UsageUpdate,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use futures::StreamExt;
@@ -28,7 +32,7 @@ use futures::channel::oneshot;
 use serde_json::Value;
 
 use super::map::map_session_update;
-use super::{AcpState, Outbound, approvals, client_fs};
+use super::{AcpState, Outbound, approvals, client_fs, client_terminal};
 use crate::thread::event::{ThreadEvent, TurnUsage};
 use crate::thread::tool_call::PermissionDecision;
 
@@ -172,14 +176,94 @@ async fn session(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // Serve `terminal/create`: spawn the agent's command on the app-provided
+        // embedded-terminal host (reusing the app's PTY/relay stack). Each handler
+        // reads the process-global host; when none is installed it rejects (the
+        // handshake also advertised `terminal:false`, so an honest agent never
+        // reaches here).
+        .on_receive_request(
+            |req: CreateTerminalRequest,
+             responder: Responder<CreateTerminalResponse>,
+             _cx: ConnectionTo<Agent>| async move {
+                match super::terminal_host() {
+                    Some(host) => match client_terminal::create(host.as_ref(), &req) {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    },
+                    None => responder.respond_with_error(client_terminal::no_host_error()),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // Serve `terminal/output`: current captured output + exit status.
+        .on_receive_request(
+            |req: TerminalOutputRequest,
+             responder: Responder<TerminalOutputResponse>,
+             _cx: ConnectionTo<Agent>| async move {
+                match super::terminal_host() {
+                    Some(host) => match client_terminal::output(host.as_ref(), &req) {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    },
+                    None => responder.respond_with_error(client_terminal::no_host_error()),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // Serve `terminal/wait_for_exit`: await the command's exit (async).
+        .on_receive_request(
+            |req: WaitForTerminalExitRequest,
+             responder: Responder<WaitForTerminalExitResponse>,
+             _cx: ConnectionTo<Agent>| async move {
+                match super::terminal_host() {
+                    Some(host) => match client_terminal::wait_for_exit(host.as_ref(), &req).await {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    },
+                    None => responder.respond_with_error(client_terminal::no_host_error()),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // Serve `terminal/kill`: terminate but keep the terminal readable.
+        .on_receive_request(
+            |req: KillTerminalRequest,
+             responder: Responder<KillTerminalResponse>,
+             _cx: ConnectionTo<Agent>| async move {
+                match super::terminal_host() {
+                    Some(host) => match client_terminal::kill(host.as_ref(), &req) {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    },
+                    None => responder.respond_with_error(client_terminal::no_host_error()),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // Serve `terminal/release`: kill (if running) and free resources.
+        .on_receive_request(
+            |req: ReleaseTerminalRequest,
+             responder: Responder<ReleaseTerminalResponse>,
+             _cx: ConnectionTo<Agent>| async move {
+                match super::terminal_host() {
+                    Some(host) => match client_terminal::release(host.as_ref(), &req) {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    },
+                    None => responder.respond_with_error(client_terminal::no_host_error()),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         // Advertise the client-side file capabilities we serve so an agent that
         // delegates file IO (per ACP client-capabilities) can call `fs/*` instead
-        // of getting an automatic "method not found". `terminal` stays off until a
-        // consumer is observed (deferred follow-up).
+        // of getting an automatic "method not found". `terminal` is advertised
+        // only when the app installed an embedded-terminal host (else the agent
+        // must run commands itself); the five handlers above serve it.
         .connect_with(agent, move |cx: ConnectionTo<Agent>| async move {
-            let init_caps = ClientCapabilities::new().fs(
-                FileSystemCapabilities::new().read_text_file(true).write_text_file(true),
-            );
+            let init_caps = ClientCapabilities::new()
+                .fs(FileSystemCapabilities::new().read_text_file(true).write_text_file(true))
+                .terminal(super::terminal_host().is_some());
             let _init = cx
                 .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(init_caps))
                 .block_task()

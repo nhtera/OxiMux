@@ -46,6 +46,14 @@ pub struct ToolCall {
     /// `#[serde(default)]` keeps older persisted transcript blobs loadable.
     #[serde(default)]
     pub images: Vec<ChatImage>,
+    /// The ACP embedded-terminal id when this tool call hosts a live terminal
+    /// (`ToolCallContent::Terminal`); the app mounts an inline `TerminalView`
+    /// bound to it inside the card. `None` for the common non-terminal tool (all
+    /// Claude/Codex calls). `#[serde(default)]` keeps older persisted blobs
+    /// loadable; the live PTY is not itself persisted, so a restored transcript
+    /// shows the tool card without a re-attached terminal.
+    #[serde(default)]
+    pub terminal_id: Option<String>,
 }
 
 impl ToolCall {
@@ -58,6 +66,7 @@ impl ToolCall {
             result: None,
             structured: None,
             images: Vec::new(),
+            terminal_id: None,
         }
     }
 }

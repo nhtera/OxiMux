@@ -252,6 +252,14 @@ impl ChatThread {
                     }
                 }
             }
+            ThreadEvent::ToolTerminal { tool_call_id, terminal_id } => {
+                // Bind the ACP embedded terminal to its card so the app mounts an
+                // inline `TerminalView`. An unknown id is dropped (no card yet) —
+                // the `ToolCallStarted` for a terminal tool always precedes it.
+                if let Some(tc) = self.tool_call_mut(tool_call_id) {
+                    tc.terminal_id = Some(terminal_id.clone());
+                }
+            }
             ThreadEvent::PermissionRequested {
                 request_id, tool_use_id, tool_name, input, description, suggestions,
             } => {
@@ -1007,6 +1015,32 @@ mod tests {
             ThreadEntry::User { checkpoint, .. } => assert!(checkpoint.is_none()),
             other => panic!("expected User, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_terminal_binds_terminal_id_to_its_card() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "call-t".into(),
+            name: "Run build".into(),
+            input: json!({}),
+        });
+        t.apply(&ThreadEvent::ToolTerminal {
+            tool_call_id: "call-t".into(),
+            terminal_id: "term-7".into(),
+        });
+        match t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == "call-t" => Some(tc),
+            _ => None,
+        }) {
+            Some(tc) => assert_eq!(tc.terminal_id.as_deref(), Some("term-7")),
+            None => panic!("terminal tool card missing"),
+        }
+        // An orphan bind (no matching card) is dropped, not a panic.
+        t.apply(&ThreadEvent::ToolTerminal {
+            tool_call_id: "nope".into(),
+            terminal_id: "x".into(),
+        });
     }
 
     #[test]

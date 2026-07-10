@@ -99,6 +99,14 @@ pub enum ThreadEvent {
         id: String,
         chunk: String,
     },
+    /// An ACP tool call embeds a live terminal created via `terminal/create`
+    /// (`ToolCallContent::Terminal`). Correlated to its card by `tool_call_id`;
+    /// carries the client-minted `terminal_id` the app uses to mount an inline
+    /// `TerminalView` bound to that PTY. ACP-only — Claude/Codex never emit it.
+    ToolTerminal {
+        tool_call_id: String,
+        terminal_id: String,
+    },
     /// A tool needs the user's permission (`can_use_tool` control request).
     PermissionRequested {
         request_id: String,

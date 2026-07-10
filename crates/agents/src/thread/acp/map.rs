@@ -17,7 +17,7 @@
 //! delivers usage out-of-band, not per-turn).
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, Diff, Plan, PlanEntryPriority, PlanEntryStatus, SessionUpdate, ToolCall,
+    ContentBlock, Diff, Plan, PlanEntryPriority, PlanEntryStatus, SessionUpdate, Terminal, ToolCall,
     ToolCallContent, ToolCallStatus, ToolCallUpdate,
 };
 use serde_json::{Value, json};
@@ -114,6 +114,15 @@ fn map_tool_call(tc: ToolCall) -> Vec<ThreadEvent> {
         None => (tc.title.clone(), tc.raw_input.clone().unwrap_or(Value::Null)),
     };
     let mut out = vec![ThreadEvent::ToolCallStarted { id: id.clone(), name, input }];
+    // An embedded terminal binds to the just-opened card (the app mounts an
+    // inline `TerminalView`). Emitted regardless of status — the terminal is
+    // usually live while the tool call is still in progress.
+    if let Some(term) = first_terminal(&tc.content) {
+        out.push(ThreadEvent::ToolTerminal {
+            tool_call_id: id.clone(),
+            terminal_id: term.terminal_id.0.to_string(),
+        });
+    }
     if is_terminal(&tc.status) {
         let images = content_images(&tc.content);
         out.push(ThreadEvent::ToolResult {
@@ -136,36 +145,54 @@ fn map_tool_call(tc: ToolCall) -> Vec<ThreadEvent> {
 /// the update rides in the structured slot so the diff card fires even when the
 /// edit's diff only arrives at completion (after the card was already opened).
 fn map_tool_call_update(tcu: ToolCallUpdate) -> Vec<ThreadEvent> {
-    match tcu.fields.status {
-        Some(status) if is_terminal(&status) => {
-            let structured = tcu
-                .fields
-                .content
-                .as_deref()
-                .and_then(first_diff)
-                .map(diff_structured)
-                .or(tcu.fields.raw_output);
-            let id = tcu.tool_call_id.0.to_string();
-            let images = tcu.fields.content.as_deref().map(content_images).unwrap_or_default();
-            let mut out = vec![ThreadEvent::ToolResult {
-                tool_use_id: id.clone(),
-                content: tcu.fields.content.as_deref().map(content_text).unwrap_or_default(),
-                is_error: matches!(status, ToolCallStatus::Failed),
-                structured,
-            }];
-            if !images.is_empty() {
-                out.push(ThreadEvent::ToolResultImages { tool_use_id: id, images });
-            }
-            out
-        }
-        _ => Vec::new(),
+    let id = tcu.tool_call_id.0.to_string();
+    let mut out = Vec::new();
+    // An embedded terminal can arrive on the update that attaches it (the agent
+    // opened the card first, then bound the terminal) — surface it regardless of
+    // status so the app mounts the inline `TerminalView`.
+    if let Some(term) = tcu.fields.content.as_deref().and_then(first_terminal) {
+        out.push(ThreadEvent::ToolTerminal {
+            tool_call_id: id.clone(),
+            terminal_id: term.terminal_id.0.to_string(),
+        });
     }
+    if let Some(status) = tcu.fields.status
+        && is_terminal(&status)
+    {
+        let structured = tcu
+            .fields
+            .content
+            .as_deref()
+            .and_then(first_diff)
+            .map(diff_structured)
+            .or(tcu.fields.raw_output);
+        let images = tcu.fields.content.as_deref().map(content_images).unwrap_or_default();
+        out.push(ThreadEvent::ToolResult {
+            tool_use_id: id.clone(),
+            content: tcu.fields.content.as_deref().map(content_text).unwrap_or_default(),
+            is_error: matches!(status, ToolCallStatus::Failed),
+            structured,
+        });
+        if !images.is_empty() {
+            out.push(ThreadEvent::ToolResultImages { tool_use_id: id, images });
+        }
+    }
+    out
 }
 
 /// The first file diff in a tool call's content, if any.
 fn first_diff(content: &[ToolCallContent]) -> Option<&Diff> {
     content.iter().find_map(|c| match c {
         ToolCallContent::Diff(d) => Some(d),
+        _ => None,
+    })
+}
+
+/// The first embedded terminal in a tool call's content, if any — the agent
+/// referencing a terminal it created via `terminal/create`.
+fn first_terminal(content: &[ToolCallContent]) -> Option<&Terminal> {
+    content.iter().find_map(|c| match c {
+        ToolCallContent::Terminal(t) => Some(t),
         _ => None,
     })
 }
@@ -531,6 +558,43 @@ mod tests {
                     media_type: "image/png".into(), data: "QUJD".into() }]);
             }
             other => panic!("expected ToolResultImages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_with_embedded_terminal_emits_tool_terminal() {
+        // A tool call that embeds a terminal (created via `terminal/create`)
+        // opens its card AND emits `ToolTerminal` so the app mounts an inline
+        // `TerminalView` bound to the client-minted id.
+        let tc = ToolCall::new("call-t", "Run build")
+            .content(vec![ToolCallContent::Terminal(Terminal::new("term-42"))]);
+        let evs = map_session_update(SessionUpdate::ToolCall(tc));
+        assert!(matches!(evs[0], ThreadEvent::ToolCallStarted { .. }));
+        match &evs[1] {
+            ThreadEvent::ToolTerminal { tool_call_id, terminal_id } => {
+                assert_eq!(tool_call_id, "call-t");
+                assert_eq!(terminal_id, "term-42");
+            }
+            other => panic!("expected ToolTerminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_update_attaching_terminal_emits_tool_terminal() {
+        // Some agents open the tool call first, then attach the terminal via an
+        // update while it's still running — the embed must still reach the app
+        // even though the update carries no terminal status.
+        let fields = ToolCallUpdateFields::new()
+            .content(vec![ToolCallContent::Terminal(Terminal::new("term-9"))]);
+        let tcu = ToolCallUpdate::new("call-t", fields);
+        let evs = map_session_update(SessionUpdate::ToolCallUpdate(tcu));
+        assert_eq!(evs.len(), 1, "in-progress terminal update emits only the terminal bind");
+        match &evs[0] {
+            ThreadEvent::ToolTerminal { tool_call_id, terminal_id } => {
+                assert_eq!(tool_call_id, "call-t");
+                assert_eq!(terminal_id, "term-9");
+            }
+            other => panic!("expected ToolTerminal, got {other:?}"),
         }
     }
 
