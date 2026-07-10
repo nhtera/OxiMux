@@ -684,7 +684,9 @@ impl AgentChatView {
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, vocab, cx);
-            c.set_slash_commands(seed_slash, cx);
+            // Descriptions aren't persisted — a restored session shows names only
+            // until the live agent re-advertises via SlashCommandsUpdated.
+            c.set_slash_commands(seed_slash, std::collections::HashMap::new(), cx);
             c.seed_history(history_seed);
         });
 
@@ -1078,6 +1080,11 @@ impl AgentChatView {
         // commands (Claude does; others send an empty list, which disables it).
         let slash_commands =
             if caps.supports_slash { self.thread.slash_commands.clone() } else { Vec::new() };
+        let slash_descriptions = if caps.supports_slash {
+            self.thread.slash_command_descriptions.clone()
+        } else {
+            std::collections::HashMap::new()
+        };
         // The input placeholder follows the bound agent ("Message Codex…"); a New
         // Agent draft that just bound gets its real provider name here (it was
         // constructed with the generic "Agent" placeholder).
@@ -1085,7 +1092,7 @@ impl AgentChatView {
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
             c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
-            c.set_slash_commands(slash_commands, cx);
+            c.set_slash_commands(slash_commands, slash_descriptions, cx);
             c.set_provider_label(provider_label, cx);
             // A bound chat never shows the agent picker (its transport is fixed);
             // clearing here is what hides it after `bind_now` (cheap no-op once
@@ -4172,7 +4179,11 @@ mod tests {
             .update(cx, |view, window, cx| {
                 view.composer.update(cx, |c, cx| {
                     // A backend advertising `git`, enriched with an argument hint.
-                    c.set_slash_commands(vec!["git".into(), "compact".into()], cx);
+                    c.set_slash_commands(
+                        vec!["git".into(), "compact".into()],
+                        std::collections::HashMap::new(),
+                        cx,
+                    );
                     let mut cat = CommandCatalog::new();
                     cat.insert(
                         "git".into(),

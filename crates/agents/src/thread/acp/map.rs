@@ -22,16 +22,17 @@ use agent_client_protocol::schema::v1::{
 };
 use serde_json::{Value, json};
 
+use crate::thread::entry::ChatImage;
 use crate::thread::event::{PlanEntryLite, ThreadEvent};
 
 /// Flatten one `SessionUpdate` into zero or more `ThreadEvent`s.
 pub(crate) fn map_session_update(update: SessionUpdate) -> Vec<ThreadEvent> {
     match update {
-        SessionUpdate::AgentMessageChunk(chunk) => match text_of(&chunk.content) {
+        SessionUpdate::AgentMessageChunk(chunk) => match message_chunk_text(&chunk.content) {
             Some(t) => vec![ThreadEvent::AssistantTextDelta(t)],
             None => Vec::new(),
         },
-        SessionUpdate::AgentThoughtChunk(chunk) => match text_of(&chunk.content) {
+        SessionUpdate::AgentThoughtChunk(chunk) => match message_chunk_text(&chunk.content) {
             Some(t) => vec![ThreadEvent::ThinkingDelta(t)],
             None => Vec::new(),
         },
@@ -40,6 +41,7 @@ pub(crate) fn map_session_update(update: SessionUpdate) -> Vec<ThreadEvent> {
         SessionUpdate::Plan(plan) => vec![ThreadEvent::PlanUpdated { entries: plan_entries(&plan) }],
         SessionUpdate::AvailableCommandsUpdate(u) => vec![ThreadEvent::SlashCommandsUpdated {
             commands: u.available_commands.iter().map(|c| c.name.clone()).collect(),
+            descriptions: u.available_commands.iter().map(|c| c.description.clone()).collect(),
         }],
         SessionUpdate::CurrentModeUpdate(u) => {
             vec![ThreadEvent::ModeChanged { mode_id: u.current_mode_id.0.to_string() }]
@@ -113,14 +115,18 @@ fn map_tool_call(tc: ToolCall) -> Vec<ThreadEvent> {
     };
     let mut out = vec![ThreadEvent::ToolCallStarted { id: id.clone(), name, input }];
     if is_terminal(&tc.status) {
+        let images = content_images(&tc.content);
         out.push(ThreadEvent::ToolResult {
-            tool_use_id: id,
+            tool_use_id: id.clone(),
             content: content_text(&tc.content),
             is_error: matches!(tc.status, ToolCallStatus::Failed),
             // A diff that arrives with the terminal shot also rides in the
             // structured slot so the card renders even for one-shot completions.
             structured: diff.map(diff_structured).or(tc.raw_output),
         });
+        if !images.is_empty() {
+            out.push(ThreadEvent::ToolResultImages { tool_use_id: id, images });
+        }
     }
     out
 }
@@ -139,12 +145,18 @@ fn map_tool_call_update(tcu: ToolCallUpdate) -> Vec<ThreadEvent> {
                 .and_then(first_diff)
                 .map(diff_structured)
                 .or(tcu.fields.raw_output);
-            vec![ThreadEvent::ToolResult {
-                tool_use_id: tcu.tool_call_id.0.to_string(),
+            let id = tcu.tool_call_id.0.to_string();
+            let images = tcu.fields.content.as_deref().map(content_images).unwrap_or_default();
+            let mut out = vec![ThreadEvent::ToolResult {
+                tool_use_id: id.clone(),
                 content: tcu.fields.content.as_deref().map(content_text).unwrap_or_default(),
                 is_error: matches!(status, ToolCallStatus::Failed),
                 structured,
-            }]
+            }];
+            if !images.is_empty() {
+                out.push(ThreadEvent::ToolResultImages { tool_use_id: id, images });
+            }
+            out
         }
         _ => Vec::new(),
     }
@@ -194,6 +206,64 @@ fn text_of(block: &ContentBlock) -> Option<String> {
     }
 }
 
+/// A displayable text rendering of a message `ContentBlock` — the richer mapping
+/// used for `AgentMessageChunk`/`AgentThoughtChunk`, so an agent that streams a
+/// resource link or an image isn't silently dropped. `Text` passes through;
+/// `ResourceLink` becomes a Markdown link (`[name](uri)`) the chat renderer makes
+/// clickable; `Image`/`Audio` become a muted placeholder (true inline image in a
+/// message is a follow-up — the common image path is a tool result, handled by
+/// `content_images`). Returns `None` only for a block that carries nothing worth
+/// showing.
+fn message_chunk_text(block: &ContentBlock) -> Option<String> {
+    match block {
+        ContentBlock::Text(t) => Some(t.text.clone()),
+        ContentBlock::ResourceLink(r) => {
+            let uri = r.uri.clone();
+            let name = if r.name.is_empty() { uri.clone() } else { r.name.clone() };
+            Some(format!("[{name}]({uri})"))
+        }
+        ContentBlock::Image(_) => Some("[image]".to_string()),
+        ContentBlock::Audio(_) => Some("[audio]".to_string()),
+        // Embedded resource: surface its text when it carries any, else a link
+        // placeholder. Kept defensive against the variant's inner shape.
+        ContentBlock::Resource(_) => embedded_resource_text(block),
+        _ => None,
+    }
+}
+
+/// Best-effort text for an embedded `Resource` block via its JSON shape (the
+/// inner union differs across schema revisions): a `text` field if present, else
+/// a `[resource: uri]` placeholder, else nothing. Never panics on an unexpected
+/// shape.
+fn embedded_resource_text(block: &ContentBlock) -> Option<String> {
+    let v = serde_json::to_value(block).ok()?;
+    let res = v.get("resource")?;
+    if let Some(t) = res.get("text").and_then(Value::as_str) {
+        return Some(t.to_string());
+    }
+    res.get("uri").and_then(Value::as_str).map(|u| format!("[resource: {u}]"))
+}
+
+/// Extract inline base64 `image` blocks from a tool call's content as
+/// [`ChatImage`]s — the ACP counterpart of the Claude tool-result image path, so
+/// an ACP tool that returns an image (a screenshot tool) renders a thumbnail
+/// instead of dropping the pixels. Non-image content yields an empty vec.
+fn content_images(items: &[ToolCallContent]) -> Vec<ChatImage> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ToolCallContent::Content(c) => match &c.content {
+                ContentBlock::Image(img) => Some(ChatImage {
+                    media_type: img.mime_type.clone(),
+                    data: img.data.clone(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// Flatten a tool call's content items into a legible result body: text blocks
 /// verbatim. File diffs are skipped here — they render as the rich diff card
 /// (normalized into `__acp_diff__`), so flattening them into the result text
@@ -215,9 +285,9 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
         AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, ContentChunk,
-        CurrentModeUpdate, Diff, PlanEntry, SessionConfigOption, SessionConfigOptionCategory,
-        SessionConfigSelectOption, SessionInfoUpdate, TextContent, ToolCallUpdateFields,
-        UsageUpdate,
+        CurrentModeUpdate, Diff, ImageContent, PlanEntry, ResourceLink, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfoUpdate, TextContent,
+        ToolCallUpdateFields, UsageUpdate,
     };
 
     fn text_chunk(s: &str) -> ContentChunk {
@@ -313,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn available_commands_map_to_names_only() {
+    fn available_commands_map_names_with_descriptions() {
         let update = AvailableCommandsUpdate::new(vec![
             AvailableCommand::new("create_plan", "Draft a plan"),
             AvailableCommand::new("research", "Research the codebase"),
@@ -323,6 +393,7 @@ mod tests {
             evs,
             vec![ThreadEvent::SlashCommandsUpdated {
                 commands: vec!["create_plan".into(), "research".into()],
+                descriptions: vec!["Draft a plan".into(), "Research the codebase".into()],
             }]
         );
     }
@@ -438,6 +509,50 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_result_image_emits_images_event() {
+        use crate::thread::ChatImage;
+        // An ACP tool that returns an image (a screenshot tool) → the tool result
+        // PLUS a follow-up ToolResultImages carrying the pixels for a thumbnail.
+        let tc = ToolCall::new("call-i", "Screenshot")
+            .content(vec![ToolCallContent::from(ContentBlock::Image(ImageContent::new(
+                "QUJD", "image/png",
+            )))])
+            .status(ToolCallStatus::Completed);
+        let evs = map_session_update(SessionUpdate::ToolCall(tc));
+        assert!(matches!(evs[0], ThreadEvent::ToolCallStarted { .. }));
+        assert!(matches!(evs[1], ThreadEvent::ToolResult { .. }));
+        match &evs[2] {
+            ThreadEvent::ToolResultImages { tool_use_id, images } => {
+                assert_eq!(tool_use_id, "call-i");
+                assert_eq!(images, &vec![ChatImage {
+                    media_type: "image/png".into(), data: "QUJD".into() }]);
+            }
+            other => panic!("expected ToolResultImages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_chunk_resource_link_becomes_markdown_link() {
+        let chunk = ContentChunk::new(ContentBlock::ResourceLink(ResourceLink::new(
+            "spec.md", "file:///docs/spec.md",
+        )));
+        let evs = map_session_update(SessionUpdate::AgentMessageChunk(chunk));
+        assert_eq!(
+            evs,
+            vec![ThreadEvent::AssistantTextDelta("[spec.md](file:///docs/spec.md)".into())]
+        );
+    }
+
+    #[test]
+    fn message_chunk_image_becomes_placeholder_not_dropped() {
+        // An image streamed in a message isn't rendered inline yet, but it must
+        // not silently vanish — a muted placeholder marks it.
+        let chunk = ContentChunk::new(ContentBlock::Image(ImageContent::new("QUJD", "image/png")));
+        let evs = map_session_update(SessionUpdate::AgentMessageChunk(chunk));
+        assert_eq!(evs, vec![ThreadEvent::AssistantTextDelta("[image]".into())]);
     }
 
     #[test]

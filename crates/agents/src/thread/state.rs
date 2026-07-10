@@ -29,6 +29,12 @@ pub struct ChatThread {
     /// backend advertises none. Rides the restore snapshot so a resumed session
     /// keeps its palette without waiting for a fresh init.
     pub slash_commands: Vec<String>,
+    /// One-line description per slash command, keyed by command name (ACP agents
+    /// like Cursor advertise them; Claude/Codex don't). Ephemeral — NOT persisted;
+    /// repopulated when the agent re-advertises via `SlashCommandsUpdated`, so a
+    /// restored session shows names-only until the live refresh arrives. The
+    /// palette renders a muted description under a command when one is present.
+    pub slash_command_descriptions: std::collections::HashMap<String, String>,
     /// The agent's current execution plan (ACP `Plan` session update), rendered as
     /// a pinned checklist. `None` when there's no plan (or it was cleared). Held
     /// in-memory only — a restored chat starts planless and re-renders when the
@@ -110,7 +116,14 @@ impl ChatThread {
         let model = self.model.take();
         let permission_mode = self.permission_mode.take();
         let slash_commands = std::mem::take(&mut self.slash_commands);
-        *self = Self { model, permission_mode, slash_commands, ..Self::default() };
+        let slash_command_descriptions = std::mem::take(&mut self.slash_command_descriptions);
+        *self = Self {
+            model,
+            permission_mode,
+            slash_commands,
+            slash_command_descriptions,
+            ..Self::default()
+        };
     }
 
     /// Record a user prompt (called when we send one to the agent).
@@ -367,11 +380,19 @@ impl ChatThread {
                 // plan card rather than pinning an empty one.
                 self.plan = (!entries.is_empty()).then(|| entries.clone());
             }
-            ThreadEvent::SlashCommandsUpdated { commands } => {
+            ThreadEvent::SlashCommandsUpdated { commands, descriptions } => {
                 // An explicit mid-session refresh is authoritative (unlike the
                 // keep-last-non-empty `SessionInit` seed): the agent is telling us
                 // its current command set.
                 self.slash_commands = commands.clone();
+                // Rebuild the description lookup from the parallel list (only the
+                // entries the agent actually described; a blank one is skipped).
+                self.slash_command_descriptions = commands
+                    .iter()
+                    .zip(descriptions.iter())
+                    .filter(|(_, d)| !d.is_empty())
+                    .map(|(c, d)| (c.clone(), d.clone()))
+                    .collect();
             }
             ThreadEvent::ModeChanged { mode_id } => {
                 self.permission_mode = Some(mode_id.clone());
@@ -1112,12 +1133,19 @@ mod tests {
             ],
         });
         // Slash refresh replaces the palette; mode + title update their fields.
-        t.apply(&ThreadEvent::SlashCommandsUpdated { commands: vec!["plan".into(), "review".into()] });
+        // `plan` carries a description; `review` is blank → only the described one
+        // lands in the lookup map.
+        t.apply(&ThreadEvent::SlashCommandsUpdated {
+            commands: vec!["plan".into(), "review".into()],
+            descriptions: vec!["Draft a plan".into(), String::new()],
+        });
         t.apply(&ThreadEvent::ModeChanged { mode_id: "acceptEdits".into() });
         t.apply(&ThreadEvent::TitleUpdated { title: "Fix auth".into() });
 
         assert_eq!(t.plan.as_ref().map(|p| p.len()), Some(2));
         assert_eq!(t.slash_commands, vec!["plan".to_string(), "review".to_string()]);
+        assert_eq!(t.slash_command_descriptions.get("plan").map(String::as_str), Some("Draft a plan"));
+        assert!(!t.slash_command_descriptions.contains_key("review"), "blank description skipped");
         assert_eq!(t.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(t.title.as_deref(), Some("Fix auth"));
 

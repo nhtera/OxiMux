@@ -171,8 +171,12 @@ pub enum ThreadEvent {
     /// The backend published/changed its slash commands mid-session (ACP
     /// `available_commands_update`) — e.g. Cursor, which advertises them
     /// asynchronously after session start. Refreshes the composer's palette.
+    /// `descriptions` is parallel to `commands` (same order/length) when the
+    /// backend supplies them (ACP), else empty (Claude/Codex advertise names
+    /// only) — the palette shows a description under the name when present.
     SlashCommandsUpdated {
         commands: Vec<String>,
+        descriptions: Vec<String>,
     },
     /// The session's permission/edit mode changed (ACP `current_mode_update`),
     /// whether the user picked it or the agent switched it itself. Keeps the mode

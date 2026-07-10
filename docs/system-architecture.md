@@ -692,15 +692,17 @@ Separate from the raw-PTY terminal runtime above, the **chat** view runs a struc
 | tool call + result | ✓ | ✓ | ✓ |
 | server/MCP tool calls | ✓ (as `tool_use`) | ✓ | ✓ |
 | 6× `*_tool_result` variants | ✓ (fwd-compat) | — | — |
-| inline tool-result image | ✓ | ○ | ○ (P3) |
+| inline tool-result image | ✓ | ○ | ✓ |
+| message resource-link / image | — | — | ✓ (link→md, image→placeholder) |
+| slash-command descriptions | ○ | — | ✓ (`available_commands_update`) |
 | live tool-output streaming | ○ | ✓ (`outputDelta`) | ○ |
 | plan panel | ✓ (`TodoWrite`) | ✓ (`turn/plan/updated`) | ✓ (`Plan`) |
 | clarifying question card | ✓ (`AskUserQuestion`) | ✓ (`requestUserInput`) | ○ |
-| permission card | ✓ | ✓ | ✓ |
+| permission card | ✓ | ✓ | ✓ (option-label buttons: P3 follow-up) |
 | compaction divider | ✓ (`compact_boundary`) | ✓ (`thread/compacted`) | — |
 | usage footer | ✓ | ✓ | ○ |
 
-The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`. Remaining ACP gaps (image/resource content, embedded terminal, tool-kind classification) are P3–P5 in `plans/260710-1022-agent-chat-acp-parity-research/`.
+The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`; Claude and ACP tool-result images both emit `ToolResultImages`. Remaining ACP gaps (embedded terminal, tool-kind classification, permission option-label buttons) are P4–P5 (+ a P3 follow-up) in `plans/260710-1022-agent-chat-acp-parity-research/`.
 
 ---
 

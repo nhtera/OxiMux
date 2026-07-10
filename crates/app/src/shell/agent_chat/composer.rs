@@ -308,6 +308,11 @@ pub struct ComposerView {
     /// discovered off the main thread and pushed in when ready. Empty until then;
     /// names without an entry render bare under Built-in.
     slash_catalog: CommandCatalog,
+    /// Descriptions the backend itself advertised for its commands (ACP
+    /// `available_commands_update`), keyed by name. Preferred over the on-disk
+    /// `slash_catalog` in the palette (the agent knows its own commands best);
+    /// empty for backends that advertise names only (Claude/Codex).
+    slash_descriptions: std::collections::HashMap<String, String>,
     /// The open slash-command palette, or `None` when the caret isn't inside a
     /// `/token` (or the palette is otherwise suppressed).
     palette: Option<SlashPaletteState>,
@@ -441,6 +446,7 @@ impl ComposerView {
             pending_images: Vec::new(),
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
+            slash_descriptions: std::collections::HashMap::new(),
             palette: None,
             mention_candidates: Vec::new(),
             mention_candidates_loaded: false,
@@ -625,9 +631,15 @@ impl ComposerView {
     /// Push the backend's advertised slash-command names (from `SessionInit`).
     /// A non-empty list enables the palette; an empty one disables it. Recomputes
     /// in case the caret already sits in a `/token` when the list arrives.
-    pub fn set_slash_commands(&mut self, commands: Vec<String>, cx: &mut Context<Self>) {
-        if self.slash_commands != commands {
+    pub fn set_slash_commands(
+        &mut self,
+        commands: Vec<String>,
+        descriptions: std::collections::HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.slash_commands != commands || self.slash_descriptions != descriptions {
             self.slash_commands = commands;
+            self.slash_descriptions = descriptions;
             self.recompute_slash_palette(cx);
             cx.notify();
         }
@@ -1675,7 +1687,14 @@ impl ComposerView {
             // Description (muted) fills the middle when present, clipped to a
             // SINGLE line with an ellipsis so a long description never wraps and
             // pushes the row taller (which broke the panel's uniform row height).
-            if let Some(desc) = meta.and_then(|m| m.description.as_deref()) {
+            // The backend's own advertised description (ACP) wins over the on-disk
+            // catalog — the agent knows its commands best.
+            let desc = self
+                .slash_descriptions
+                .get(name)
+                .map(String::as_str)
+                .or_else(|| meta.and_then(|m| m.description.as_deref()));
+            if let Some(desc) = desc {
                 inner = inner.child(
                     div()
                         .flex_1()

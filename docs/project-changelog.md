@@ -4,6 +4,21 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-10 — Agent Chat: ACP content richness (P3, 3 of 4 items)
+
+**Touches**: `crates/agents/src/thread/{acp/map,event,state}.rs`, `crates/app/src/shell/agent_chat/{composer,mod}.rs`, `docs/system-architecture.md`
+
+Lifts the ACP adapter closer to the Claude/Codex bar (verified against `agent-client-protocol-schema 1.4.0`, `schema::v1`). Decoder-side, low-risk; Claude/Codex paths byte-identical.
+
+- **ACP tool-result images.** `content_images()` extracts `ContentBlock::Image` (base64 + mime) from a tool call's content and emits the P1 `ToolResultImages` event alongside the result, so an ACP tool that returns an image (a screenshot tool) renders a thumbnail (reusing P1's tool-card renderer + lightbox) instead of dropping the pixels.
+- **ACP message content richness.** The agent message/thought chunk path swapped `text_of` for `message_chunk_text`: `ResourceLink` → a clickable `[name](uri)` Markdown link, `Image`/`Audio` → a muted placeholder (no longer silently dropped), embedded `Resource` → its text (a defensive JSON shape-probe that degrades to `[resource: uri]`).
+- **Slash-command descriptions.** `SlashCommandsUpdated` gained a parallel `descriptions` list (ACP `available_commands_update` fills it; Claude/Codex send empty). `ChatThread` holds them in an **ephemeral, non-persisted** `slash_command_descriptions` map (blank entries skipped); the composer palette prefers the agent's own description over the on-disk catalog. The persisted `slash_commands: Vec<String>` schema is unchanged.
+- **Deferred:** ACP permission option-label buttons (P3's 4th item) — it touches the shared permission card (Claude/Codex regression risk) for cosmetic value that Allow/Deny already covers; tracked as a P3 follow-up.
+
+Gates: `cargo test --workspace --no-fail-fast` green (2792/0); agents `+3` decoder tests (ACP image, resource-link, image-placeholder) + a slash-description fold assertion. A `code-reviewer` pass returned **no findings** (all ACP field accesses verified against the schema; no wire-data panics; Claude/Codex + persistence provably untouched). Plan: `plans/260710-1022-agent-chat-acp-parity-research/` (P3). GUI verification pending (needs a live ACP agent emitting image/resource content).
+
+---
+
 ### 2026-07-10 — Agent Chat: Claude taxonomy + Codex plan/output/question parity (P1+P2)
 
 **Touches**: `crates/agents/src/thread/{event,state,stream_json,tool_call,question}.rs`, `crates/agents/src/thread/codex/{map,approvals,mod}.rs`, `crates/agents/src/thread/testdata/stream_json_richtools.jsonl` (new), `crates/app/src/shell/agent_chat/{mod,question_card}.rs`, `crates/app/tests/right_sidebar_tab.rs`
