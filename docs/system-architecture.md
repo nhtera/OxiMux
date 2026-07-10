@@ -701,8 +701,9 @@ Separate from the raw-PTY terminal runtime above, the **chat** view runs a struc
 | permission card | ✓ | ✓ | ✓ (option-label buttons: P3 follow-up) |
 | compaction divider | ✓ (`compact_boundary`) | ✓ (`thread/compacted`) | — |
 | usage footer | ✓ | ✓ | ○ |
+| embedded terminal | — | — | ✓ (`terminal/*` → inline `TerminalView`) |
 
-The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`; Claude and ACP tool-result images both emit `ToolResultImages`. Remaining ACP gaps (embedded terminal, tool-kind classification, permission option-label buttons) are P4–P5 (+ a P3 follow-up) in `plans/260710-1022-agent-chat-acp-parity-research/`.
+The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`; Claude and ACP tool-result images both emit `ToolResultImages`. ACP embedded terminals invert the crate boundary: the domain-layer `terminal/*` handlers delegate to an app-installed `AcpTerminalHost` that owns the real PTY (relay/in-process) and the inline `TerminalView`. Remaining ACP gaps (tool-kind classification, permission option-label buttons) are P5 (+ a P3 follow-up) in `plans/260710-1022-agent-chat-acp-parity-research/`.
 
 ---
 

@@ -4,6 +4,19 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-10 — Agent Chat: ACP embedded terminal (P4)
+
+**Touches**: `crates/agents/src/thread/{acp/{client_terminal,map,mod,worker},event,state,tool_call}.rs`, `crates/app/src/{main,shell/agent_chat/{acp_terminal_host,mod},shell/terminal/terminal_view/mod}.rs`, `docs/system-architecture.md`
+
+Gives ACP agents a true chat+terminal experience: an agent can create a terminal, run a command, and embed it **live and inline** in a tool card. Wire shapes locked against `agent-client-protocol-schema 1.4.0` (`schema::v1`). Claude/Codex and existing ACP paths byte-identical.
+
+- **Protocol layer (`oximux-agents`, commit f73146e).** Advertise the ACP `terminal` capability and serve all five `terminal/*` methods (create/output/wait_for_exit/kill/release) by delegating to an app-installed `AcpTerminalHost` trait — dependency inversion that keeps the domain crate free of the UI/relay stack, mirroring the `AgentConnection`/`TerminalBackend` seams. `ToolCallContent::Terminal` maps to a new `ToolTerminal` event that binds the client-minted terminal id to its tool card. Inert until a host is installed (capability advertises false, handlers reject).
+- **App backing + inline UI (`oximux-app`, commit e9ed321).** `EmbeddedTerminalHost` spawns a real PTY through the app's own terminal stack (`spawn_embedded_command`: relay daemon when up, in-process fallback), with a per-terminal watcher thread draining the PTY's independent status-event stream into an output ring + exit latch (so `terminal/output`/`wait_for_exit` answer off the renderer's queue). The chat view mounts a live inline `TerminalView` per tool-call id (mirroring the question-card reconcile), bounded-height inside the card, and reaps on tab close + when the card leaves the transcript. Background mount so a mid-turn spawn never steals composer focus; reaping releases the host entry by its own terminal id (a distinct id-space from the tool-call id).
+
+Gates: `cargo test --workspace --no-fail-fast` green (2804/0); `+12` tests (agents: `terminal/*` handler translation, `ToolTerminal` map + fold; app: host registry edge cases + output-ring truncation). A `code-reviewer` pass caught two real defects — a reap id-space mismatch (host entry leaked because release was called with the tool id, not the terminal id) and a focus-theft on mount — both fixed before commit. Static verification confirmed the relay/in-process PTY plumbing (both back `subscribe_status_events` + `capture_status_events`), and that `create()` on the ACP worker's non-tokio thread is safe (relay owns its runtime handle). Plan: `plans/260710-1022-agent-chat-acp-parity-research/` (P4). **GUI verification pending** — no live ACP agent that emits `terminal/*` was available this session.
+
+---
+
 ### 2026-07-10 — Agent Chat: ACP content richness (P3, 3 of 4 items)
 
 **Touches**: `crates/agents/src/thread/{acp/map,event,state}.rs`, `crates/app/src/shell/agent_chat/{composer,mod}.rs`, `docs/system-architecture.md`
