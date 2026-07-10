@@ -373,6 +373,55 @@ fn spawn_fallback_portable(
     Some((Arc::new(Mutex::new(boxed)), session_id))
 }
 
+/// Spawn an ACP embedded-terminal command — a specific program + argv, not an
+/// interactive login shell — through the same relay-then-fallback path as
+/// [`spawn_local_pty`]. The independent status-event stream is enabled
+/// (`capture_status_events`) so the ACP terminal host can observe raw output +
+/// exit off the renderer's queue, and shell integration is deliberately NOT
+/// injected (this is a one-shot command the agent drives, not a shell that wants
+/// prompt marks). Returns the shared backend + session id the caller mounts a
+/// `TerminalView` on and polls for output.
+pub fn spawn_embedded_command(
+    command: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+) -> Option<(SharedBackend, TerminalSessionId)> {
+    let build_cfg = || SpawnConfig {
+        shell: command.clone(),
+        args: args.clone(),
+        cwd: cwd.clone(),
+        env: env.clone(),
+        scrollback: spawn_scrollback(),
+        capture_status_events: true,
+        ..SpawnConfig::default()
+    };
+    if let Some(shared) = SHARED_BACKEND.get() {
+        let _nap = crate::app_nap::prevent("acp embedded terminal spawn");
+        let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.spawn(build_cfg()) {
+            Ok(session_id) => {
+                drop(guard);
+                return Some((Arc::clone(shared), session_id));
+            }
+            Err(err) => {
+                drop(guard);
+                tracing::warn!(?err, "relay embedded-terminal spawn failed; falling back");
+            }
+        }
+    }
+    let mut backend = PortablePtyBackend::new();
+    let session_id = match backend.spawn(build_cfg()) {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(?err, "embedded-terminal pty spawn failed");
+            return None;
+        }
+    };
+    let boxed: Box<dyn TerminalBackend> = Box::new(backend);
+    Some((Arc::new(Mutex::new(boxed)), session_id))
+}
+
 /// F3.4: spawn a dormant session — grid emulator wired up but no PTY
 /// child. The caller is expected to prefill the grid with restored
 /// scrollback and then call `TerminalView::respawn` when the user

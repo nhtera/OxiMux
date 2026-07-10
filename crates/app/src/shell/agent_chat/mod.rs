@@ -15,6 +15,7 @@ mod background_tasks_panel;
 mod bubble;
 mod composer;
 mod composer_history;
+mod acp_terminal_host;
 mod context_providers;
 mod diff_card;
 mod error_card;
@@ -33,6 +34,10 @@ mod slash_palette;
 mod tool_bodies;
 mod tool_card;
 mod tool_grouping;
+
+/// Install the ACP embedded-terminal host at app boot so ACP agents can drive
+/// live inline terminals (re-exported for `main` to call once).
+pub use acp_terminal_host::install as install_acp_terminal_host;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -63,6 +68,11 @@ pub(super) const CONTENT_MAX_W: f32 = 720.0;
 /// Width of the left timeline gutter (the message tick-rail). The reading column
 /// sits to its right; overlays (jump dropdown, hover preview) offset by this.
 pub(super) const RAIL_W: f32 = 30.0;
+
+/// Fixed height of an inline ACP embedded terminal inside a tool card. Bounded
+/// so a live terminal can't stretch the transcript; its own scrollback scrolls
+/// past the cap.
+const EMBEDDED_TERMINAL_HEIGHT: f32 = 260.0;
 
 /// How many frames to keep re-pinning the transcript to the bottom after a
 /// content change (see [`AgentChatView::follow_frames`]). ~10 frames (≈160ms at
@@ -353,6 +363,16 @@ pub struct AgentChatView {
     question_cards: HashMap<String, Entity<QuestionCard>>,
     /// Event subscriptions for the cards above, kept alive alongside each card.
     question_card_subs: HashMap<String, Subscription>,
+    /// Live inline terminals for ACP tool calls that embed one
+    /// (`ToolCallContent::Terminal`), keyed by **tool-call id**. The value pairs
+    /// the host's **terminal id** (a distinct id-space — the client-minted
+    /// `acp-term-N` the host registry is keyed by) with the `TerminalView`
+    /// mounted on that PTY. The terminal id is retained so reaping releases the
+    /// host entry with the id it actually stored, not the tool id. Reconciled
+    /// from the thread each render; reaped on tab close.
+    embedded_terminals: HashMap<String, (String, Entity<TerminalView>)>,
+    /// Repaint observers for the terminals above, one per mounted terminal.
+    embedded_terminal_subs: HashMap<String, Subscription>,
     /// Git checkpoint engine for this chat's `cwd`, or `None` when the dir isn't
     /// a git repo (or git is too old). Shared into background tasks via `Arc`.
     checkpoint_engine: Option<Arc<oximux_git::checkpoint::CheckpointEngine>>,
@@ -807,6 +827,8 @@ impl AgentChatView {
             _subscriptions: subscriptions,
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
+            embedded_terminals: HashMap::new(),
+            embedded_terminal_subs: HashMap::new(),
             checkpoint_engine: None,
             pre_turn_checkpoint: None,
             rewind_confirm: None,
@@ -1883,6 +1905,8 @@ impl AgentChatView {
             _subscriptions: Vec::new(),
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
+            embedded_terminals: HashMap::new(),
+            embedded_terminal_subs: HashMap::new(),
             checkpoint_engine: None,
             pre_turn_checkpoint: None,
             rewind_confirm: None,
@@ -2464,6 +2488,82 @@ impl AgentChatView {
             self.question_cards.insert(tool_id.clone(), card);
             self.question_card_subs.insert(tool_id, sub);
         }
+    }
+
+    /// Mount / reap the inline `TerminalView`s for ACP tool calls that embed a
+    /// terminal (`tc.terminal_id`), mirroring [`Self::reconcile_question_cards`].
+    /// Runs each render (needs `window` to build the view) and is idempotent once
+    /// a terminal is mounted. A tool call that leaves the transcript (e.g.
+    /// `/clear`) drops its view and releases the PTY on the host so nothing leaks.
+    fn reconcile_embedded_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let live: Vec<(String, String)> = self
+            .thread
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::ToolCall(tc) => {
+                    tc.terminal_id.as_ref().map(|t| (tc.id.clone(), t.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let live_ids: HashSet<&String> = live.iter().map(|(id, _)| id).collect();
+        // Reap terminals whose tool call is gone: release the PTY (by the host's
+        // terminal id, NOT the tool id) + drop the view.
+        let dropped: Vec<String> =
+            self.embedded_terminals.keys().filter(|id| !live_ids.contains(id)).cloned().collect();
+        for tool_id in dropped {
+            if let Some((terminal_id, _view)) = self.embedded_terminals.remove(&tool_id) {
+                acp_terminal_host::release_embedded(&terminal_id);
+            }
+            self.embedded_terminal_subs.remove(&tool_id);
+        }
+        // Mount any newly-embedded terminal on the PTY its host spawned. Use the
+        // background mount variant so this render-time mount never yanks keyboard
+        // focus off the composer (it fires mid-turn, with no user click).
+        let (theme, density, typo) = (self.theme, self.density, self.typography.clone());
+        let cwd_label = self.cwd.to_string_lossy().into_owned();
+        for (tool_id, terminal_id) in live {
+            if self.embedded_terminals.contains_key(&tool_id) {
+                continue;
+            }
+            let Some((backend, term_id)) =
+                acp_terminal_host::embedded_terminal_backend(&terminal_id)
+            else {
+                // Host not installed, or the terminal was already released.
+                continue;
+            };
+            let ids = SurfaceIds::fresh(cwd_label.clone());
+            let terminal = cx.new(|cx| {
+                TerminalView::mount_background(
+                    backend, term_id, ids, theme, density, typo.clone(), window, cx,
+                )
+            });
+            let sub = cx.observe(&terminal, |_this, _tv, cx| cx.notify());
+            self.embedded_terminals.insert(tool_id.clone(), (terminal_id, terminal));
+            self.embedded_terminal_subs.insert(tool_id, sub);
+        }
+    }
+
+    /// The inline terminal element for a tool call that embeds one, bounded to a
+    /// fixed height (its own scrollback scrolls inside). `None` when the tool has
+    /// no mounted terminal.
+    fn render_embedded_terminal(&self, tool_id: &str) -> Option<AnyElement> {
+        let (_terminal_id, terminal) = self.embedded_terminals.get(tool_id)?;
+        let (theme, density) = (self.theme, self.density);
+        Some(
+            div()
+                .mt(px(density.pad_row))
+                .w_full()
+                .h(px(EMBEDDED_TERMINAL_HEIGHT))
+                .overflow_hidden()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border_inactive)
+                .bg(theme.bg_base)
+                .child(terminal.clone())
+                .into_any_element(),
+        )
     }
 
     /// Answer a pending `AskUserQuestion` by tool id: look up its request +
@@ -3052,20 +3152,23 @@ impl AgentChatView {
                             &typo,
                             cx,
                         );
-                        // Append inline result-image thumbnails below the card
-                        // (a Read of an image, a screenshot) — the pixels the
-                        // `[image]` placeholder in the body stands in for.
-                        match self.render_tool_result_images(idx, &tc.images, cx) {
-                            Some(thumbs) => Some(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .w_full()
-                                    .child(card)
-                                    .child(thumbs)
-                                    .into_any_element(),
-                            ),
-                            None => Some(card.into_any_element()),
+                        // Append inline result-image thumbnails (a Read of an
+                        // image, a screenshot) and/or an ACP embedded terminal
+                        // below the card. Both are optional; a plain tool renders
+                        // the bare card.
+                        let thumbs = self.render_tool_result_images(idx, &tc.images, cx);
+                        let terminal = self.render_embedded_terminal(&tc.id);
+                        if thumbs.is_some() || terminal.is_some() {
+                            let mut col = div().flex().flex_col().w_full().child(card);
+                            if let Some(thumbs) = thumbs {
+                                col = col.child(thumbs);
+                            }
+                            if let Some(terminal) = terminal {
+                                col = col.child(terminal);
+                            }
+                            Some(col.into_any_element())
+                        } else {
+                            Some(card.into_any_element())
                         }
                     }
                 }
@@ -3414,6 +3517,12 @@ impl Drop for AgentChatView {
         if let Some(conn) = &self.connection {
             conn.shutdown();
         }
+        // Reap any ACP embedded terminals (kill their PTYs + stop watchers) so a
+        // closed tab doesn't leave orphaned processes. Release by the host's
+        // terminal id (the value), not the tool id (the key).
+        for (terminal_id, _view) in self.embedded_terminals.values() {
+            acp_terminal_host::release_embedded(terminal_id);
+        }
     }
 }
 
@@ -3440,6 +3549,9 @@ impl Render for AgentChatView {
         // the (immutable) transcript render reads them. Needs `window` for the
         // cards' text inputs, so it lives here rather than in `render_transcript`.
         self.reconcile_question_cards(window, cx);
+        // Same reconcile for ACP embedded terminals: mount a live inline
+        // `TerminalView` for any tool call that bound one, reap ones that left.
+        self.reconcile_embedded_terminals(window, cx);
         // Keyboard focus must live on the composer, not this view's root. The
         // pane focuses the composer on open, but an inline focus during action/
         // click dispatch is clobbered onto the root's tracked handle — so

@@ -178,6 +178,11 @@ fn main() {
         "boot: relay supervisor handshake"
     );
 
+    // Install the ACP embedded-terminal host so ACP agents can drive live inline
+    // terminals in chat. It spawns through the shared relay backend when present
+    // (installed just above), falling back to an in-process PTY otherwise.
+    oximux_app::shell::agent_chat::install_acp_terminal_host();
+
     // `with_assets` registers our composite SVG source: local app icons
     // (e.g. `icons/git-branch.svg`) first, falling through to gpui-component's
     // bundled `IconName::*` catalog. Without this, both sets paint blank.
