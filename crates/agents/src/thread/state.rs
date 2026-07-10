@@ -346,6 +346,10 @@ impl ChatThread {
             ThreadEvent::TitleUpdated { title } => {
                 self.title = Some(title.clone());
             }
+            // A pure UI-refresh signal: the live vocabulary lives on the connection
+            // (which the worker already updated), and the view re-pulls it. Nothing
+            // in the transcript changes, so the fold is a no-op.
+            ThreadEvent::ControlsUpdated => {}
             ThreadEvent::Error(msg) => {
                 self.last_error = Some(msg.clone());
                 self.turn_active = false;

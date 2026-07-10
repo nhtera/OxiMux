@@ -42,10 +42,19 @@ pub struct AgentCapabilities {
 }
 
 /// One selectable model for the model picker. `wire` is passed to the backend
-/// as-is (Claude: `--model opus`) and shown verbatim in the menu.
+/// as-is (Claude: `--model opus`); `label` is the human-readable name shown in
+/// the menu (the toolbar trigger strips any `provider/` namespace off it). For
+/// backends without a distinct display name, `label` mirrors `wire`.
+///
+/// `description` is an optional one-line capability blurb ("Most capable",
+/// "Fastest", or an ACP agent's own model description) rendered muted beneath the
+/// name in the searchable picker, and also matched by search. `None` renders a
+/// single-line row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
     pub wire: String,
+    pub label: String,
+    pub description: Option<String>,
 }
 
 /// One permission/edit mode for the mode picker: `wire` is the backend value,

@@ -26,7 +26,9 @@
 #![allow(dead_code)]
 
 use gpui::App;
+use oximux_agents::thread::{claude_model_choices, ModelChoice};
 use oximux_agents::{AdapterRegistry, RegistryEntry};
+use oximux_core::AgentAdapter;
 use oximux_settings::{AgentLaunchSettings, Transport, ACP_PRESETS};
 
 /// One pickable coding agent in the unified composer, with its pre-connection
@@ -42,16 +44,42 @@ pub(crate) struct ChatRosterEntry {
     pub display: String,
     /// Which backend a first-message bind will speak.
     pub transport: Transport,
-    /// Static pre-bind model selectors (`[]` = no model row until bound).
-    pub models: Vec<String>,
+    /// Static pre-bind model selectors (`[]` = no model row until bound). Carried
+    /// as [`ModelChoice`] so the unbound draft shows the same pretty labels and
+    /// capability descriptions a bound session does (Claude fills these; agents
+    /// whose vocab only arrives post-bind carry bare wire/label, no description).
+    pub models: Vec<ModelChoice>,
     /// Static pre-bind reasoning-effort selectors (`[]` = no effort row).
     pub efforts: Vec<String>,
 }
 
 impl ChatRosterEntry {
-    /// The default model to preselect: the first declared model, if any.
+    /// The default model to preselect: the first declared model's wire, if any.
     pub fn default_model(&self) -> Option<&str> {
-        self.models.first().map(String::as_str)
+        self.models.first().map(|m| m.wire.as_str())
+    }
+}
+
+/// The pre-bind model vocabulary for a built-in adapter. Claude's static list
+/// carries pretty labels + capability blurbs (the single source lives in
+/// `oximux-agents`).
+///
+/// Codex offers **no** pre-bind models on purpose: its real catalog only arrives
+/// from the `codex app-server` `model/list` handshake, and its terminal-launcher
+/// static list (`gpt-5-codex`/`o3`) is stale — drafting one of those would carry
+/// an unknown model into the bind, which `codex app-server` rejects (the turn
+/// fails). Like the ACP presets, it shows no model row until bound, when the live
+/// default is selected. Any other built-in falls back to its registry-declared
+/// wires as bare `label == wire`.
+fn builtin_chat_models(entry: &RegistryEntry) -> Vec<ModelChoice> {
+    match entry.adapter_enum {
+        AgentAdapter::ClaudeCode => claude_model_choices(),
+        AgentAdapter::Codex => Vec::new(),
+        _ => entry
+            .models
+            .iter()
+            .map(|m| ModelChoice { wire: (*m).to_string(), label: (*m).to_string(), description: None })
+            .collect(),
     }
 }
 
@@ -81,7 +109,7 @@ pub(crate) fn chat_roster(
             id: entry.adapter_id.to_string(),
             display: entry.display_name.to_string(),
             transport: settings.transport_for(entry.adapter_id),
-            models: entry.models.iter().map(|m| m.to_string()).collect(),
+            models: builtin_chat_models(entry),
             efforts: entry.efforts.iter().map(|e| e.to_string()).collect(),
         });
     }
@@ -179,12 +207,21 @@ mod tests {
         let roster = chat_roster(&builtin_entries(), &s);
         let claude = roster.iter().find(|e| e.id == "claude-code").unwrap();
         assert_eq!(claude.transport, Transport::StreamJson);
-        assert_eq!(claude.models, ["opus", "sonnet", "haiku"]);
+        // Claude's pre-bind vocab is the rich shared list: pretty labels + blurbs,
+        // not the bare registry wires.
+        let claude_wires: Vec<&str> = claude.models.iter().map(|m| m.wire.as_str()).collect();
+        assert_eq!(claude_wires, ["opus", "sonnet", "haiku"]);
+        assert_eq!(claude.models[0].label, "Opus");
+        assert!(claude.models[0].description.is_some(), "Claude models carry a blurb pre-bind");
         assert_eq!(claude.efforts, ["high", "medium", "low"]);
         assert_eq!(claude.default_model(), Some("opus"));
+        // Codex offers no pre-bind models: its stale terminal-launcher list would
+        // draft an unknown model that `codex app-server` rejects on bind, so the
+        // real catalog only loads post-handshake (mirrors the ACP presets).
         let codex = roster.iter().find(|e| e.id == "codex").unwrap();
         assert_eq!(codex.transport, Transport::AppServer);
-        assert_eq!(codex.models, ["gpt-5-codex", "o3"]);
+        assert!(codex.models.is_empty(), "Codex has no static pre-bind models");
+        assert_eq!(codex.default_model(), None);
         assert!(codex.efforts.is_empty());
     }
 

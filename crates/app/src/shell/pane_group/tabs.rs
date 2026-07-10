@@ -954,11 +954,50 @@ impl PaneGroup {
                     cx,
                 );
             }
-            crate::shell::agent_chat::AgentChatEvent::ToggleTerminalRequested => {
-                let view = view.clone();
-                self.toggle_terminal_for_chat(view, window, cx);
+            crate::shell::agent_chat::AgentChatEvent::OpenLoginTerminalRequested {
+                adapter_id,
+                cwd,
+            } => {
+                // Drop the user into the agent's interactive CLI at the chat's
+                // cwd so `/login` is one command away. The bare binary is the
+                // robust choice — it always lands where auth happens, without
+                // guessing a login subcommand per CLI.
+                let program = match *adapter_id {
+                    "claude-code" => "claude",
+                    "codex" => "codex",
+                    // No interactive login binary wired for other adapters.
+                    _ => return,
+                };
+                self.open_script_terminal_tab(
+                    cwd.clone(),
+                    SharedString::from("Sign in"),
+                    program,
+                    window,
+                    cx,
+                );
             }
         }
+    }
+
+    /// Toggle the agent-chat tab at insertion-order `ix` between chat and its
+    /// companion terminal. The tab-header view-options menu's target: unlike the
+    /// ⌃⇧V action (which hits the active tab), this addresses a specific tab so
+    /// the menu works even if the click didn't first activate it. No-op unless the
+    /// tab at `ix` is an agent chat.
+    pub fn toggle_chat_terminal_at(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(ix) else {
+            return;
+        };
+        let PaneContent::AgentChat(view) = &tab.content else {
+            return;
+        };
+        let view = view.clone();
+        self.toggle_terminal_for_chat(view, window, cx);
     }
 
     /// Toggle the ACTIVE tab between chat and its companion terminal view — the

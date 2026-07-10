@@ -189,7 +189,16 @@ impl AgentConnection for CodexAppServerConnection {
     fn models(&self) -> Vec<ModelChoice> {
         self.state
             .lock()
-            .map(|s| s.models.iter().map(|m| ModelChoice { wire: m.wire.clone() }).collect())
+            .map(|s| {
+                s.models
+                    .iter()
+                    .map(|m| ModelChoice {
+                        wire: m.wire.clone(),
+                        label: m.display.clone(),
+                        description: m.description.clone(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

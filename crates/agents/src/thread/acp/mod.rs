@@ -150,13 +150,18 @@ fn flatten_select(options: &SessionConfigSelectOptions) -> Vec<&SessionConfigSel
 
 /// The model picker vocabulary from the agent's `Model` select option, in
 /// advertised order. `wire` is the value id the agent expects back via
-/// `set_config`; the picker shows it verbatim. Empty when the agent advertises
-/// no model selector (the picker then stays hidden — honest).
+/// `set_config`; `label` is the option's human-readable `name` (what the picker
+/// shows). Empty when the agent advertises no model selector (the picker then
+/// stays hidden — honest).
 fn model_choices(options: &[SessionConfigOption]) -> Vec<ModelChoice> {
     match model_select(options) {
         Some((_opt, select)) => flatten_select(&select.options)
             .into_iter()
-            .map(|opt| ModelChoice { wire: opt.value.0.to_string() })
+            .map(|opt| ModelChoice {
+                wire: opt.value.0.to_string(),
+                label: opt.name.clone(),
+                description: opt.description.clone(),
+            })
             .collect(),
         None => Vec::new(),
     }
@@ -398,6 +403,9 @@ mod tests {
         assert_eq!(choices.len(), 2);
         assert_eq!(choices[0].wire, "opus");
         assert_eq!(choices[1].wire, "sonnet");
+        // `label` carries the option's human-readable `name` (what the picker shows).
+        assert_eq!(choices[0].label, "Claude Opus");
+        assert_eq!(choices[1].label, "Claude Sonnet");
 
         let (opt, select) = model_select(&options).expect("model select present");
         assert_eq!(opt.id.0.as_ref(), "model");

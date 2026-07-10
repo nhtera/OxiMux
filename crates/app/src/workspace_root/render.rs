@@ -738,6 +738,17 @@ impl Render for WorkspaceRoot {
                             }
                         })
                         .unwrap_or(false);
+                    // For the compact view-options menu (eye button): whether the
+                    // agent-chat tab can open its companion terminal yet (needs a
+                    // resumable session). `None` when the tab isn't a chat.
+                    let chat_terminal_available = group_ref.tabs().get(tab_idx).and_then(|tab| {
+                        if let crate::shell::pane_content::PaneContent::AgentChat(v) = &tab.content {
+                            Some(v.read(cx).terminal_launch_spec().is_some())
+                        } else {
+                            None
+                        }
+                    });
+                    let view_only = action.view_only;
                     let weak = group.downgrade();
                     let x = action.x;
                     let y = action.y;
@@ -755,6 +766,8 @@ impl Render for WorkspaceRoot {
                             tab_kind,
                             is_pinned,
                             can_tear_off,
+                            view_only,
+                            chat_terminal_available,
                             cx,
                         )
                     });

@@ -50,9 +50,13 @@ pub(crate) fn map_session_update(update: SessionUpdate) -> Vec<ThreadEvent> {
             Some(title) => vec![ThreadEvent::TitleUpdated { title: title.clone() }],
             None => Vec::new(),
         },
+        // The agent replaced its config options (models / reasoning + current
+        // values). The worker has already swapped them into session state; emit a
+        // signal so the composer re-pulls its pickers from the live connection.
+        SessionUpdate::ConfigOptionUpdate(_) => vec![ThreadEvent::ControlsUpdated],
         // `UsageUpdate` is stashed by the worker (folded into `TurnEnded.usage`),
         // not mapped here. `UserMessageChunk` is the client's own prompt echoed
-        // back — never re-rendered. `ConfigOptionUpdate` has no UI consumer yet.
+        // back — never re-rendered.
         _ => Vec::new(),
     }
 }
@@ -210,8 +214,10 @@ fn content_text(items: &[ToolCallContent]) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        AvailableCommand, AvailableCommandsUpdate, ContentChunk, CurrentModeUpdate, Diff,
-        PlanEntry, SessionInfoUpdate, TextContent, ToolCallUpdateFields, UsageUpdate,
+        AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, ContentChunk,
+        CurrentModeUpdate, Diff, PlanEntry, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelectOption, SessionInfoUpdate, TextContent, ToolCallUpdateFields,
+        UsageUpdate,
     };
 
     fn text_chunk(s: &str) -> ContentChunk {
@@ -350,6 +356,26 @@ mod tests {
         // emits nothing for it (no standalone usage event).
         let evs = map_session_update(SessionUpdate::UsageUpdate(UsageUpdate::new(1000, 200_000)));
         assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn config_option_update_signals_controls_refresh() {
+        // An agent that repopulates its model list mid-session (e.g. after auth)
+        // pushes the full option set; the worker absorbs it into state and the
+        // mapper emits the single refresh signal so the composer re-pulls pickers.
+        let model_select = SessionConfigOption::select(
+            "model",
+            "Model",
+            "opus",
+            vec![
+                SessionConfigSelectOption::new("opus", "Claude Opus"),
+                SessionConfigSelectOption::new("sonnet", "Claude Sonnet"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let update = ConfigOptionUpdate::new(vec![model_select]);
+        let evs = map_session_update(SessionUpdate::ConfigOptionUpdate(update));
+        assert_eq!(evs, vec![ThreadEvent::ControlsUpdated]);
     }
 
     #[test]

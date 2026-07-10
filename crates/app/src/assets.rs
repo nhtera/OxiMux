@@ -38,6 +38,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/square-terminal.svg",
         include_bytes!("../assets/icons/square-terminal.svg"),
     ),
+    // Eye glyph for the chat tab's view-switcher menu button.
+    ("icons/eye.svg", include_bytes!("../assets/icons/eye.svg")),
     // Locate glyph for the left rail's scroll-to-current-workspace button.
     (
         "icons/crosshair.svg",

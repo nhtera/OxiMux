@@ -154,6 +154,14 @@ pub enum ThreadEvent {
     ModeChanged {
         mode_id: String,
     },
+    /// The agent replaced its session config options at runtime (ACP
+    /// `config_option_update`) — the full set of models / reasoning options and
+    /// their current values. Some agents advertise no models at session start and
+    /// populate them only after auth or a workspace probe, or switch the current
+    /// model themselves; this signal tells the UI to re-pull the composer's model
+    /// and reasoning pickers from the live connection. Carries no payload: the
+    /// backend has already absorbed the new options, so the view re-reads them.
+    ControlsUpdated,
     /// The session title changed (ACP `session_info_update`), for the tab label.
     TitleUpdated {
         title: String,

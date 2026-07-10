@@ -21,6 +21,7 @@ mod error_card;
 mod find_bar;
 mod image_attach;
 mod jump_menu;
+mod login_card;
 mod message_rail;
 mod pending_edit;
 mod plan_panel;
@@ -95,6 +96,17 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
     }
 }
 
+/// One dynamic agent's pre-bind catalog-probe state, cached per adapter id on
+/// the draft. `Loading` while the off-thread probe runs, `Ready` with the fetched
+/// models once it lands, `Failed` when the agent couldn't be probed (not
+/// installed, auth needed, timeout) — `Failed`/`Loading` both leave the model
+/// picker hidden, matching an agent that advertises no models.
+enum ProbeState {
+    Loading,
+    Ready(ProbedCatalog),
+    Failed,
+}
+
 /// Decoded user-attached image thumbnails, memoized by `(entry index, image
 /// index)`. Interior-mutable so the immutable `render` path can fill it lazily.
 type ImageCache = RefCell<HashMap<(usize, usize), Option<Arc<Image>>>>;
@@ -119,11 +131,11 @@ pub enum AgentChatEvent {
         slash_commands: Vec<String>,
         thinking_level: ThinkingLevel,
     },
-    /// The user asked to switch this chat to its companion terminal view (the
-    /// composer's terminal button). The host owns the runtime, so it spawns the
-    /// `--resume` terminal (if not already) and flips the view mode via
-    /// [`AgentChatView::attach_terminal`] / [`AgentChatView::set_view_mode`].
-    ToggleTerminalRequested,
+    /// The signed-out banner's "Open terminal to sign in" control was clicked;
+    /// the host should spawn a terminal tab running this agent's interactive CLI
+    /// at `cwd` so the user can run `/login`. Carries the CLI adapter id so the
+    /// host picks the right binary.
+    OpenLoginTerminalRequested { adapter_id: &'static str, cwd: PathBuf },
 }
 
 /// Which surface an agent-chat tab is showing: its structured chat, or a
@@ -191,9 +203,9 @@ use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
-    connect, AgentConnection, AssistantMessage, ChatBackend, ChatImage, ChatThread, ConnectSpec,
-    ModelChoice, PermissionDecision, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent,
-    ToolCallStatus, Transport, TurnUsage,
+    connect, probe_catalog, AgentConnection, AssistantMessage, ChatBackend, ChatImage, ChatThread,
+    ConnectSpec, PermissionDecision, ProbedCatalog, QuestionAnswers, QuestionRequest, ThreadEntry,
+    ThreadEvent, ToolCallStatus, Transport, TurnUsage,
 };
 use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -283,6 +295,12 @@ pub struct AgentChatView {
     /// `None` for a chat that started bound. Retained (not cleared) after binding
     /// so the label resolution still finds the roster display name.
     unbound_agent_id: Option<String>,
+    /// Pre-bind model catalogs for dynamic-model agents (Codex/ACP), keyed by
+    /// adapter id, so the *New Agent* draft can offer a real model picker before
+    /// the user commits. A throwaway probe (spawn → read `model/list` / session
+    /// config → drop) fills these off-thread on agent pick; Claude isn't here
+    /// (its models are static in the roster). Only consulted while `unbound`.
+    probed_catalogs: HashMap<String, ProbeState>,
     /// Whether the tab shows the chat or its companion terminal.
     view_mode: ChatViewMode,
     /// Companion interactive terminal — the same agent session resumed in a raw
@@ -491,7 +509,7 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let view = Self::assemble(
+        let mut view = Self::assemble(
             cwd,
             model,
             backend,
@@ -504,8 +522,13 @@ impl AgentChatView {
             cx,
         );
         // Seed the composer's agent + model pickers from the chat roster so the
-        // draft offers the choice on its first paint (before any subprocess).
+        // draft offers the choice on its first paint (before any subprocess). If
+        // the seed agent is dynamic-model (unusual — the entry defaults to Claude),
+        // kick its catalog probe so the picker still fills.
         view.sync_unbound_composer(cx);
+        if let Some(id) = view.unbound_agent_id.clone() {
+            view.maybe_probe_catalog(id, cx);
+        }
         view
     }
 
@@ -590,14 +613,12 @@ impl AgentChatView {
                     }
                 }
                 ComposerEvent::Stop => this.stop_turn(cx),
-                ComposerEvent::NewChat => this.new_chat(cx),
                 ComposerEvent::ModelPicked(model) => this.change_model(model.clone(), cx),
                 ComposerEvent::PermissionModePicked(mode) => {
                     this.change_permission_mode(mode.clone(), cx)
                 }
                 ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
                 ComposerEvent::AgentPicked(id) => this.change_agent(id.clone(), cx),
-                ComposerEvent::ToggleTerminal => this.request_toggle_terminal(cx),
                 ComposerEvent::MentionOpened => this.refresh_context_sources(cx),
                 ComposerEvent::CaptureContext(request) => {
                     this.capture_context(request.clone(), cx)
@@ -660,16 +681,10 @@ impl AgentChatView {
             })
             .collect();
         // A restored bound chat with a session can open its terminal view right
-        // away; an unbound draft or a session-less chat can't yet (mirrors
-        // `terminal_launch_spec`, which `Self` can't call before construction).
-        let terminal_available = connect_now
-            && thread.session_id.is_some()
-            && matches!(backend.transport, Transport::StreamJson | Transport::AppServer);
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_slash_commands(seed_slash, cx);
-            c.set_terminal_available(terminal_available, cx);
             c.seed_history(history_seed);
         });
 
@@ -774,6 +789,7 @@ impl AgentChatView {
             interrupted: false,
             unbound: !connect_now,
             unbound_agent_id,
+            probed_catalogs: HashMap::new(),
             view_mode: ChatViewMode::Chat,
             terminal: None,
             companion_session: None,
@@ -974,13 +990,6 @@ impl AgentChatView {
         }
     }
 
-    /// Raise a request for the host to toggle this chat's terminal view (the host
-    /// owns the runtime that spawns the companion). From the composer's terminal
-    /// button; ⌃⇧V routes through the host directly.
-    fn request_toggle_terminal(&mut self, cx: &mut Context<Self>) {
-        cx.emit(AgentChatEvent::ToggleTerminalRequested);
-    }
-
     /// Render the companion terminal full-body with a slim header carrying a
     /// "return to chat" button (the click target for the ⌃⇧V toggle). Only reached
     /// when `view_mode` is Terminal and the companion exists.
@@ -1069,14 +1078,15 @@ impl AgentChatView {
         // commands (Claude does; others send an empty list, which disables it).
         let slash_commands =
             if caps.supports_slash { self.thread.slash_commands.clone() } else { Vec::new() };
-        // The terminal-view toggle lights up once the chat can spawn a resume
-        // terminal (bound + has a session id + resumable transport).
-        let terminal_available = self.terminal_launch_spec().is_some();
+        // The input placeholder follows the bound agent ("Message Codex…"); a New
+        // Agent draft that just bound gets its real provider name here (it was
+        // constructed with the generic "Agent" placeholder).
+        let provider_label = self.provider_label().to_string();
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
             c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_slash_commands(slash_commands, cx);
-            c.set_terminal_available(terminal_available, cx);
+            c.set_provider_label(provider_label, cx);
             // A bound chat never shows the agent picker (its transport is fixed);
             // clearing here is what hides it after `bind_now` (cheap no-op once
             // already cleared).
@@ -1097,20 +1107,29 @@ impl AgentChatView {
         let current = self.unbound_agent_id.as_ref().and_then(|id| {
             roster.iter().find(|e| &e.id == id).map(|e| (e.id.clone(), e.display.clone()))
         });
-        // The picked agent's static model list becomes the pre-bind vocab; ACP
-        // presets carry none (their models come from session negotiation), so the
-        // model picker simply hides until bound.
+        // The picked agent's model vocab: a landed catalog probe (Codex/ACP dynamic
+        // models) wins; otherwise the static roster list (Claude). A dynamic agent
+        // still probing / failed / unprobed yields an empty list, so the model
+        // picker simply stays hidden until its catalog lands.
         let vocab = self
             .unbound_agent_id
             .as_ref()
-            .and_then(|id| roster.iter().find(|e| &e.id == id))
-            .map(|e| ControlVocab {
-                models: e.models.iter().map(|m| ModelChoice { wire: m.clone() }).collect(),
-                permission_modes: Vec::new(),
-                efforts: Vec::new(),
-                default_model: e.default_model().map(str::to_string),
-                default_mode: None,
-                default_effort: None,
+            .and_then(|id| {
+                let entry = roster.iter().find(|e| &e.id == id)?;
+                let (models, default_model) = match self.probed_catalogs.get(id) {
+                    Some(ProbeState::Ready(catalog)) => {
+                        (catalog.models.clone(), catalog.default_model.clone())
+                    }
+                    _ => (entry.models.clone(), entry.default_model().map(str::to_string)),
+                };
+                Some(ControlVocab {
+                    models,
+                    permission_modes: Vec::new(),
+                    efforts: Vec::new(),
+                    default_model,
+                    default_mode: None,
+                    default_effort: None,
+                })
             })
             .unwrap_or_default();
         let model = self.model.clone();
@@ -1153,9 +1172,55 @@ impl AgentChatView {
         self.thread.model = self.model.clone();
         self.permission_mode = None;
         self.effort = None;
-        self.unbound_agent_id = Some(id);
+        self.unbound_agent_id = Some(id.clone());
+        // A dynamic-model agent (Codex/ACP) has no static roster models — fetch its
+        // real catalog off-thread so the picker fills before the first send.
+        self.maybe_probe_catalog(id, cx);
         self.sync_unbound_composer(cx);
         cx.notify();
+    }
+
+    /// Kick off a throwaway catalog probe for the picked agent so the draft's
+    /// model picker can fill before the user commits. No-op for an agent with a
+    /// static roster list (Claude) or one already probed/probing. The blocking
+    /// probe runs on a dedicated thread — the connection spawns its own workers,
+    /// so no GPUI executor or tokio reactor is touched — and its result is folded
+    /// back on the UI thread, re-syncing the composer only if the pick still holds.
+    fn maybe_probe_catalog(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.probed_catalogs.contains_key(&id) {
+            return; // already probing, ready, or a settled failure — don't re-run
+        }
+        let roster = roster::chat_roster_from_cx(cx);
+        match roster.iter().find(|e| e.id == id) {
+            // A static model list (Claude) needs no probe; an unknown id is skipped.
+            Some(entry) if entry.models.is_empty() => {}
+            _ => return,
+        }
+        let spec = ConnectSpec::for_backend(&self.backend, self.cwd.clone(), None, None, None, None);
+        self.probed_catalogs.insert(id.clone(), ProbeState::Loading);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_catalog(spec));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                let state = match result {
+                    Ok(catalog) => ProbeState::Ready(catalog),
+                    Err(e) => {
+                        tracing::warn!(agent = %id, error = %e, "pre-bind catalog probe failed");
+                        ProbeState::Failed
+                    }
+                };
+                this.probed_catalogs.insert(id.clone(), state);
+                // Only refresh the picker if this agent is still the draft's pick.
+                if this.unbound && this.unbound_agent_id.as_deref() == Some(id.as_str()) {
+                    this.sync_unbound_composer(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Stage image files dropped onto the chat surface into the composer. The
@@ -1319,12 +1384,96 @@ impl AgentChatView {
             .on_click(cx.listener(|this, _e, _window, cx| this.retry_last_turn(cx)))
     }
 
-    /// Start a fresh conversation in this tab without closing it (Claude-Desktop
-    /// "New chat" / the CLI's `/clear`). Blanks the transcript, drops any
-    /// transient UI bound to it, and respawns a **non-resumed** session (the
-    /// cleared thread has no session id, so `respawn` starts clean and reaps the
-    /// old child). A fresh session mints its own id on the first turn, so the tab
-    /// persists empty until then (`transcript_snapshot` returns `None`).
+    /// True when the latest turn looks like an auth failure the user can fix by
+    /// signing in from a terminal. Some CLIs answer with a plain "Not logged in
+    /// · Please run /login" reply that settles as an ordinary assistant turn
+    /// (no error), so the last assistant text is scanned alongside `last_error`.
+    /// Matched case-insensitively and kept broad on purpose across providers.
+    fn is_signed_out(&self) -> bool {
+        const SIGNATURES: &[&str] = &[
+            "please run /login",
+            "not logged in",
+            "logged out",
+            "signed out",
+            "invalid api key",
+            "authentication_error",
+        ];
+        let hit = |s: &str| {
+            let l = s.to_ascii_lowercase();
+            SIGNATURES.iter().any(|sig| l.contains(sig))
+        };
+        if self.thread.last_error.as_deref().is_some_and(hit) {
+            return true;
+        }
+        // Only the most recent assistant reply counts — an old sign-in prompt
+        // must not keep the banner up after a later turn succeeds.
+        self.thread
+            .entries
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                ThreadEntry::Assistant(m) => Some(hit(&m.text)),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    /// The CLI adapter id for this chat's transport when it has an interactive
+    /// binary the user can sign into in a terminal. `None` for ACP presets,
+    /// whose sign-in flow isn't a bundled CLI. Gates the signed-out banner.
+    fn login_adapter_id(&self) -> Option<&'static str> {
+        match self.backend.transport {
+            Transport::StreamJson => Some("claude-code"),
+            Transport::AppServer => Some("codex"),
+            Transport::Acp => None,
+        }
+    }
+
+    /// The signed-out banner's action: a link-styled control that asks the host
+    /// to open a terminal running this agent's CLI so `/login` is reachable.
+    fn open_login_terminal_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let typo = &self.typography;
+        div()
+            .id("chat-open-login-terminal")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(theme.status_info.opacity(0.15))
+            .text_size(px(typo.t_body_sm))
+            .text_color(theme.status_info)
+            .hover(|s| s.bg(theme.status_info.opacity(0.28)))
+            .child(
+                Icon::default()
+                    .path("icons/square-terminal.svg")
+                    .size(px(13.0))
+                    .text_color(theme.status_info),
+            )
+            .child(SharedString::from("Open terminal to sign in"))
+            .on_click(cx.listener(|this, _e, _window, cx| this.request_open_login_terminal(cx)))
+    }
+
+    /// Ask the host to spawn a terminal tab running this agent's CLI at the
+    /// chat's cwd. No-op for transports with no interactive login binary (ACP).
+    fn request_open_login_terminal(&mut self, cx: &mut Context<Self>) {
+        if let Some(adapter_id) = self.login_adapter_id() {
+            cx.emit(AgentChatEvent::OpenLoginTerminalRequested {
+                adapter_id,
+                cwd: self.cwd.clone(),
+            });
+        }
+    }
+
+    /// Start a fresh conversation in this tab without closing it (the CLI's
+    /// `/clear`). Blanks the transcript, drops any transient UI bound to it, and
+    /// respawns a **non-resumed** session (the cleared thread has no session id,
+    /// so `respawn` starts clean and reaps the old child). A fresh session mints
+    /// its own id on the first turn, so the tab persists empty until then.
     fn new_chat(&mut self, cx: &mut Context<Self>) {
         // A rewind in flight will, on completion, overwrite this tab's session id
         // with its forked id and respawn again — which would silently resurrect
@@ -1691,6 +1840,7 @@ impl AgentChatView {
             connection: Some(connection),
             backend: ChatBackend::stream_json(),
             composer,
+            probed_catalogs: HashMap::new(),
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             stick_to_bottom: true,
@@ -2957,6 +3107,21 @@ impl AgentChatView {
                         .child(working_indicator(self.provider_label(), theme, &typo)),
                 );
             }
+        } else if self.is_signed_out() && self.login_adapter_id().is_some() {
+            // The turn settled (or errored) on an auth failure whose fix is a
+            // terminal sign-in. Turn the dead-end reply into an action: a banner
+            // that opens a terminal running the agent CLI, where `/login` works.
+            // Takes precedence over the plain error card below since it's the
+            // actionable version of the same state.
+            let action = self.open_login_terminal_button(cx);
+            scroll = scroll.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(CONTENT_MAX_W))
+                    .child(login_card::login_card(self.provider_label(), theme, &typo, action)),
+            );
         } else if let Some(err) = self.thread.last_error.clone() {
             // An idle turn that ended in error: surface it inline at the tail
             // with a Retry. This is the ONLY place a failure after the first
@@ -4662,11 +4827,13 @@ mod tests {
                 assert_eq!(view.model_for_test(), Some("opus"));
                 assert!(!view.is_bound_for_test(), "a draft has no connection");
 
-                // Pick Codex: transport flips to app-server, model resets to
-                // Codex's default — and still no subprocess is spawned.
+                // Pick Codex: transport flips to app-server. Codex carries no
+                // static pre-bind model (its real catalog arrives from the
+                // `model/list` handshake), so the draft holds no model until bound
+                // — and still no subprocess is spawned.
                 view.change_agent("codex".into(), cx);
                 assert_eq!(view.backend_transport_for_test(), Transport::AppServer);
-                assert_eq!(view.model_for_test(), Some("gpt-5-codex"));
+                assert_eq!(view.model_for_test(), None);
                 assert_eq!(view.unbound_agent_id_for_test(), Some("codex"));
                 assert!(!view.is_bound_for_test(), "picking an agent must not bind");
 
@@ -4727,6 +4894,63 @@ mod tests {
                 view.make_unbound_for_test();
                 view.thread.session_id = Some("sid-2".into());
                 assert!(view.terminal_launch_spec().is_none(), "unbound draft → no terminal");
+            })
+            .expect("window update");
+    }
+
+    /// The signed-out banner tracks only the LATEST assistant reply (or a turn
+    /// error), and offers a terminal sign-in only on a transport with an
+    /// interactive login CLI.
+    #[gpui::test]
+    async fn signed_out_detection_tracks_latest_turn(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                // A fresh Claude chat with no auth-failure reply isn't signed out,
+                // and Claude has an interactive login CLI.
+                assert!(!view.is_signed_out());
+                assert_eq!(view.login_adapter_id(), Some("claude-code"));
+
+                // A "Please run /login" reply settles as an ordinary assistant
+                // turn (no error) yet must trip detection.
+                view.thread.entries.push(ThreadEntry::Assistant(AssistantMessage {
+                    text: "Not logged in · Please run /login".into(),
+                    thinking: String::new(),
+                }));
+                assert!(view.is_signed_out(), "login-prompt reply → signed out");
+
+                // A later successful reply clears it — only the latest turn counts.
+                view.thread.entries.push(ThreadEntry::User {
+                    text: "retry".into(),
+                    images: Vec::new(),
+                    checkpoint: None,
+                });
+                view.thread.entries.push(ThreadEntry::Assistant(AssistantMessage {
+                    text: "Hello! How can I help?".into(),
+                    thinking: String::new(),
+                }));
+                assert!(!view.is_signed_out(), "a later good reply clears the banner");
+
+                // A login-flavored turn error also trips detection.
+                view.thread.last_error = Some("API Error: authentication_error".into());
+                assert!(view.is_signed_out(), "auth error text → signed out");
+
+                // ACP presets carry no bundled login CLI → no terminal sign-in.
+                view.make_unbound_for_test();
+                view.change_agent("opencode".into(), cx);
+                assert_eq!(view.login_adapter_id(), None);
             })
             .expect("window update");
     }

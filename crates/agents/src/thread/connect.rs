@@ -4,14 +4,15 @@
 //! the ACP arm is a discoverable stub a later phase fills.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use super::acp::AcpConnection;
 use super::claude_stream_json::ClaudeStreamJsonConnection;
 use super::codex::CodexAppServerConnection;
-use super::connection::AgentConnection;
+use super::connection::{AgentConnection, ModelChoice};
 use super::event::ThreadEvent;
 use super::transport::Transport;
 
@@ -133,6 +134,54 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
     }
 }
 
+/// The model vocabulary a short-lived *catalog probe* pulls from an agent whose
+/// models are only known after it spawns (Codex, ACP) — so the unbound *New
+/// Agent* draft can offer a real model picker before the user commits. Claude's
+/// models are static (declared in the roster) and never probed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbedCatalog {
+    pub models: Vec<ModelChoice>,
+    /// The backend's default/current model wire, so the picker preselects it.
+    pub default_model: Option<String>,
+}
+
+/// Upper bound on how long a probe waits for the agent's handshake. Generous —
+/// a cold `codex app-server` or an ACP agent behind an `npx` download / auth can
+/// take a while — but bounded so a wedged agent can't hang the probe thread.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Open `spec`'s connection, wait for its `SessionInit` (which the transports
+/// emit once the handshake has populated the model catalog — no prompt needed),
+/// read the models + default, then drop the connection so its process is reaped
+/// (Codex `reap()` / ACP worker shutdown). The live chat still spawns fresh on
+/// first send; this is a throwaway catalog fetch.
+///
+/// Blocking (it waits on the handshake) — run it off the UI thread. Errors when
+/// the agent can't spawn, the handshake fails, the process exits early, or the
+/// probe times out; the caller renders those as "no models" rather than a picker.
+pub fn probe_catalog(spec: ConnectSpec) -> Result<ProbedCatalog> {
+    let (conn, rx) = connect(spec)?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("catalog probe timed out"))?;
+        match rx.recv_timeout(remaining) {
+            Ok(ThreadEvent::SessionInit { .. }) => {
+                return Ok(ProbedCatalog { models: conn.models(), default_model: conn.default_model() });
+            }
+            Ok(ThreadEvent::Error(e)) => return Err(anyhow::anyhow!(e)),
+            // Pre-init chatter is rare but harmless — keep waiting for init.
+            Ok(_) => continue,
+            Err(RecvTimeoutError::Timeout) => return Err(anyhow::anyhow!("catalog probe timed out")),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::anyhow!("agent exited before session init"))
+            }
+        }
+    }
+    // `conn` drops here → the transport tears its subprocess down.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +210,24 @@ mod tests {
                 assert!(err.to_string().contains("acp_command"), "unexpected error: {err}")
             }
         }
+    }
+
+    #[test]
+    fn probe_catalog_fails_fast_without_a_command() {
+        // `probe_catalog` opens a connection first, so an ACP spec with no command
+        // surfaces the same fast failure — no process is spawned, nothing to wait
+        // on. (The happy path spawns a real agent, so it's a live smoke test.)
+        let spec = ConnectSpec {
+            transport: Transport::Acp,
+            cwd: PathBuf::from("."),
+            model: None,
+            resume_session_id: None,
+            permission_mode: None,
+            effort: None,
+            acp_command: None,
+            acp_args: vec![],
+        };
+        let err = probe_catalog(spec).expect_err("probe must fail without a command");
+        assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");
     }
 }

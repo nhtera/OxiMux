@@ -30,9 +30,9 @@ pub mod tool_call;
 pub mod transport;
 
 pub use acp::AcpConnection;
-pub use claude_stream_json::{build_args, ClaudeStreamJsonConnection};
+pub use claude_stream_json::{build_args, claude_model_choices, ClaudeStreamJsonConnection};
 pub use codex::CodexAppServerConnection;
-pub use connect::{connect, ChatBackend, ConnectSpec};
+pub use connect::{connect, probe_catalog, ChatBackend, ConnectSpec, ProbedCatalog};
 pub use connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
     AgentCapabilities, AgentConnection, EffortChoice, ModeChoice, ModelChoice, StubConnection,

@@ -32,9 +32,30 @@ use super::tool_call::PermissionDecision;
 // speaks them (not the view) so the composer can render whatever the live
 // connection advertises. Surfaced through the `AgentConnection` accessors below.
 
-/// Claude model aliases offered in the model picker. The CLI accepts these
-/// short aliases directly as `--model`.
-const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+/// Claude model aliases offered in the model picker, as `(wire, label, blurb)`.
+/// The CLI accepts the `wire` alias directly as `--model`; the `label` is the
+/// capitalized name shown in the picker; the `blurb` is a one-line capability
+/// hint rendered muted beneath the name (and matched by the model search).
+const CLAUDE_MODELS: &[(&str, &str, &str)] = &[
+    ("opus", "Opus", "Most capable — deep reasoning & hard tasks"),
+    ("sonnet", "Sonnet", "Balanced speed and quality for everyday work"),
+    ("haiku", "Haiku", "Fastest — quick edits and lightweight tasks"),
+];
+
+/// The static Claude chat-model vocabulary as [`ModelChoice`]s (pretty label +
+/// capability blurb). Shared by the live connection's `models()` **and** the
+/// pre-bind roster, so the unbound "New Agent" draft shows the same names and
+/// descriptions a bound Claude session does — one source, no drift.
+pub fn claude_model_choices() -> Vec<ModelChoice> {
+    CLAUDE_MODELS
+        .iter()
+        .map(|(wire, label, blurb)| ModelChoice {
+            wire: (*wire).to_string(),
+            label: (*label).to_string(),
+            description: Some((*blurb).to_string()),
+        })
+        .collect()
+}
 
 /// Permission modes as `(wire, label)`: `wire` → `--permission-mode`, `label`
 /// is shown to the user.
@@ -66,7 +87,7 @@ const CLAUDE_EFFORTS: &[(&str, &str)] = &[
 const DEFAULT_EFFORT: &str = "high";
 
 /// The model shown as current when none is chosen — Claude's mid alias
-/// (`CLAUDE_MODELS[1]`, "sonnet").
+/// (`CLAUDE_MODELS[1].0`, "sonnet").
 const DEFAULT_MODEL: &str = "sonnet";
 
 /// Flags for the persistent, structured, interactive Claude session. Pure so
@@ -257,10 +278,7 @@ impl AgentConnection for ClaudeStreamJsonConnection {
     }
 
     fn models(&self) -> Vec<ModelChoice> {
-        CLAUDE_MODELS
-            .iter()
-            .map(|m| ModelChoice { wire: (*m).to_string() })
-            .collect()
+        claude_model_choices()
     }
 
     fn permission_modes(&self) -> Vec<ModeChoice> {

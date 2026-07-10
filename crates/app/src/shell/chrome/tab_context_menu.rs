@@ -74,6 +74,14 @@ struct TabContextTarget {
     /// excluded: split tabs require a more complex cross-window handoff;
     /// editor/diff tabs hold window-bound entities that cannot move.
     can_tear_off: bool,
+    /// When `true`, render the compact tab-header **view-options** menu (just
+    /// "Switch to Terminal View") instead of the full right-click context menu.
+    /// Set by the agent-chat tab's eye button.
+    view_only: bool,
+    /// For an agent-chat tab: whether its companion terminal can be opened yet
+    /// (`Some(true)`), needs a first message (`Some(false)`), or the tab isn't a
+    /// chat (`None`). Drives the terminal-view row's enabled state + hint.
+    chat_terminal_available: Option<bool>,
 }
 
 pub struct TabContextMenu {
@@ -118,6 +126,8 @@ impl TabContextMenu {
         kind: TabContextKind,
         is_pinned: bool,
         can_tear_off: bool,
+        view_only: bool,
+        chat_terminal_available: Option<bool>,
         cx: &mut Context<Self>,
     ) {
         self.x_px = x_px;
@@ -130,6 +140,8 @@ impl TabContextMenu {
             kind,
             is_pinned,
             can_tear_off,
+            view_only,
+            chat_terminal_available,
         });
         self.open = true;
         cx.notify();
@@ -138,6 +150,93 @@ impl TabContextMenu {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         cx.notify();
+    }
+
+    /// Render the compact tab-header view-options card: one "Switch to Terminal
+    /// View" row. Enabled when the chat's companion terminal can spawn; otherwise
+    /// greyed with a "Send a message first" hint beneath (matching Superconductor).
+    #[allow(clippy::too_many_arguments)]
+    fn render_view_options(
+        &self,
+        target: &TabContextTarget,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        x_px: f32,
+        y_px: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use gpui::IntoElement;
+        let available = target.chat_terminal_available.unwrap_or(false);
+        let group = target.group.clone();
+        let ix = target.tab_idx;
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .p(px(density.pad_overlay))
+            .floating_chrome(&theme, &density)
+            .shadow_lg();
+        if available {
+            card = card.child(menu_row(
+                "tab-view-terminal",
+                "Switch to Terminal View",
+                true,
+                theme,
+                density,
+                typography.clone(),
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if let Some(g) = group.upgrade() {
+                        g.update(cx, |g, cx| g.toggle_chat_terminal_at(ix, window, cx));
+                    }
+                    this.close(cx);
+                }),
+            ));
+        } else {
+            // Greyed label + a muted "Send a message first" hint beneath.
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(density.h_overlay_item))
+                    .px(px(ROW_PADDING_X))
+                    .text_size(px(typography.t_body_md))
+                    .text_color(theme.fg_subtle)
+                    .child("Switch to Terminal View"),
+            );
+            card = card.child(
+                div()
+                    .px(px(ROW_PADDING_X))
+                    .pb(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.fg_subtle)
+                    .child("Send a message first"),
+            );
+        }
+
+        let left_px = (x_px - MENU_WIDTH).max(0.0);
+        let card_container = div()
+            .absolute()
+            .top(px(y_px))
+            .left(px(left_px))
+            .w(px(MENU_WIDTH))
+            .child(card);
+        div()
+            .absolute()
+            .inset_0()
+            .size_full()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close(cx)),
+            )
+            .child(card_container)
+            .into_any_element()
     }
 }
 
@@ -154,6 +253,14 @@ impl Render for TabContextMenu {
         let typography = self.typography.clone();
         let x_px = self.x_px;
         let y_px = self.y_px;
+
+        // Compact tab-header view-options menu (agent-chat eye button): a single
+        // "Switch to Terminal View" row, disabled with a "Send a message first"
+        // hint until the chat has a resumable session. Mirrors Superconductor's
+        // per-tab view menu; the full context menu (right-click) is below.
+        if target.view_only {
+            return self.render_view_options(&target, theme, density, typography, x_px, y_px, cx);
+        }
 
         let has_multiple = target.tab_count > 1;
         let has_right = target.tab_idx + 1 < target.tab_count;

@@ -85,6 +85,16 @@ async fn session(
                             }
                             return Ok(());
                         }
+                        // A runtime config push carries the FULL option set (models /
+                        // reasoning + current values). Swap it into state so
+                        // `models()`/`current_model()` read the live vocabulary, then
+                        // fall through: the mapper emits `ControlsUpdated` so the
+                        // composer re-pulls its pickers.
+                        if let SessionUpdate::ConfigOptionUpdate(u) = &n.update {
+                            if let Ok(mut s) = st.lock() {
+                                s.config_options = u.config_options.clone();
+                            }
+                        }
                         for ev in map_session_update(n.update) {
                             let _ = tx.send(ev);
                         }

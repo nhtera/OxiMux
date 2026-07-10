@@ -1251,6 +1251,7 @@ fn render_tab_chip(
                         y: f32::from(pos.y),
                         group_id: group_id.0,
                         tab_idx: ix as u32,
+                        view_only: false,
                     }),
                     cx,
                 );
@@ -1476,6 +1477,19 @@ fn render_tab_chip(
                     .child(suffix),
             )
         })
+        // Agent-chat tabs carry a view-options "eye" button (Superconductor-style)
+        // before the close button — opens the compact "Switch to Terminal View"
+        // menu. Revealed on the active tab / on hover like the close button.
+        .when(matches!(marker, PaneTabKindMarker::AgentChat), |s| {
+            s.child(chat_view_menu_button(
+                entity_id_raw,
+                group_id,
+                ix,
+                is_active,
+                group_name.clone(),
+                theme,
+            ))
+        })
         .child(if is_pinned {
             pin_indicator(entity_id_raw, ix, theme).into_any_element()
         } else {
@@ -1484,6 +1498,60 @@ fn render_tab_chip(
         .when_some(drag_edge, |s, side| {
             s.child(insertion_bar(entity_id_raw, ix, side, theme))
         })
+}
+
+/// The agent-chat tab's view-options button — a small terminal glyph that opens
+/// the compact tab-header menu ("Switch to Terminal View"), mirroring
+/// Superconductor's per-tab eye menu. Unlike the close button it stays
+/// **persistently visible** on every chat tab (not hover-gated) so the terminal
+/// switch is always discoverable; the active tab reads at full strength, inactive
+/// tabs a touch dimmer, and hover brings any of them to full. On click it
+/// dispatches [`OpenTabContextMenuAt`] in view-only mode at the cursor so
+/// `WorkspaceRoot` opens the shared menu against this tab.
+fn chat_view_menu_button(
+    entity_id_raw: u64,
+    group_id: PaneGroupId,
+    ix: usize,
+    is_active: bool,
+    group_name: SharedString,
+    theme: Theme,
+) -> impl IntoElement {
+    let glyph = svg()
+        .path("icons/eye.svg")
+        .size(px(11.0))
+        .text_color(theme.fg_muted);
+    // Mirror the close button: visible on the active tab, revealed on hover for
+    // inactive tabs so idle chips stay uncluttered.
+    let initial_opacity = if is_active { 1.0 } else { 0.0 };
+    div()
+        .id(SharedString::from(format!(
+            "pane-group-tab-viewmenu-{entity_id_raw}-{ix}"
+        )))
+        .w(px(CLOSE_BUTTON_SIZE_PX))
+        .h(px(CLOSE_BUTTON_SIZE_PX))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .opacity(initial_opacity)
+        .group_hover(group_name, |s| s.opacity(1.0))
+        .hover(|s| s.bg(theme.hover_overlay))
+        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {
+            let pos = ev.position;
+            window.dispatch_action(
+                Box::new(OpenTabContextMenuAt {
+                    x: f32::from(pos.x),
+                    y: f32::from(pos.y),
+                    group_id: group_id.0,
+                    tab_idx: ix as u32,
+                    view_only: true,
+                }),
+                cx,
+            );
+            cx.stop_propagation();
+        })
+        .child(glyph)
 }
 
 /// Pin-state indicator that replaces the close button on a pinned tab.

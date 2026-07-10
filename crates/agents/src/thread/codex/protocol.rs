@@ -112,6 +112,10 @@ pub fn model_from_start_response(result: &Value) -> Option<String> {
 pub struct CodexModel {
     pub wire: String,
     pub display: String,
+    /// The app-server's one-line capability blurb for this model, when present
+    /// (e.g. "Frontier model for complex coding, research, and agentic tasks").
+    /// Rendered muted beneath the name in the picker; `None` renders single-line.
+    pub description: Option<String>,
     pub efforts: Vec<String>,
     pub default_effort: String,
     pub is_default: bool,
@@ -137,6 +141,7 @@ pub fn parse_model_list(result: &Value) -> Vec<CodexModel> {
                 .unwrap_or_default();
             Some(CodexModel {
                 display: m.get("displayName").and_then(|v| v.as_str()).unwrap_or(&wire).to_string(),
+                description: m.get("description").and_then(|v| v.as_str()).map(String::from),
                 default_effort: m.get("defaultReasoningEffort").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                 is_default: m.get("isDefault").and_then(|v| v.as_bool()).unwrap_or(false),
                 efforts,
@@ -179,16 +184,24 @@ mod tests {
     fn parses_model_list_catalog() {
         let result = json!({"data": [
             {"id": "gpt-5.5", "displayName": "GPT-5.5", "isDefault": true, "hidden": false,
+             "description": "Frontier model for complex coding, research, and agentic tasks.",
              "defaultReasoningEffort": "medium",
              "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}]},
+            {"id": "o3", "displayName": "o3", "hidden": false},
             {"id": "secret", "displayName": "Secret", "hidden": true},
         ]});
         let models = parse_model_list(&result);
-        assert_eq!(models.len(), 1, "hidden models are dropped");
+        assert_eq!(models.len(), 2, "hidden models are dropped");
         assert_eq!(models[0].wire, "gpt-5.5");
         assert!(models[0].is_default);
         assert_eq!(models[0].efforts, vec!["low", "high"]);
         assert_eq!(models[0].default_effort, "medium");
+        // The app-server blurb is surfaced; a model without one parses to `None`.
+        assert_eq!(
+            models[0].description.as_deref(),
+            Some("Frontier model for complex coding, research, and agentic tasks.")
+        );
+        assert_eq!(models[1].description, None);
     }
 
     #[test]

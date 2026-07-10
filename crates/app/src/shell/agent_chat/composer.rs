@@ -25,6 +25,8 @@ use gpui_component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
 };
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::searchable_list::{SearchableListItem, SearchableVec};
+use gpui_component::select::{Select, SelectEvent, SelectState};
 use oximux_agents::thread::{
     prepend_context, ChatImage, ContextChip, EffortChoice, ModeChoice, ModelChoice,
 };
@@ -49,6 +51,7 @@ use super::context_providers::{ContextRequest, ContextSource};
 use super::image_attach::{self, PendingImage, pending_from_bytes, pending_from_path};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
 use super::slash_palette::{completed_command, detect_slash_trigger, rank_commands};
+use crate::shell::agent_ui::agent_presentation::adapter_icon_path;
 use crate::shell::compose_bar::mention_parser::pending_mention;
 use crate::shell::compose_bar::mention_resolver::{MAX_SUGGESTIONS, rank as rank_mentions};
 
@@ -81,6 +84,82 @@ struct MentionState {
 enum MentionMatch {
     Context(usize),
     File(String),
+}
+
+/// The compact model label for the toolbar trigger: strip any `provider/`
+/// namespace so `openai/gpt-5.5` reads as `gpt-5.5`. The full label still shows
+/// in the dropdown menu. (Mirrors Paseo's `shortModelLabel`.)
+fn short_model_label(label: &str) -> &str {
+    match label.rfind('/') {
+        Some(i) => &label[i + 1..],
+        None => label,
+    }
+}
+
+/// One row in the searchable model `Select`. `wire` is the value handed back on
+/// pick; `label` is the full human name the dropdown shows and search matches
+/// against; the trigger renders the namespace-stripped short form. `description`
+/// is an optional capability blurb rendered muted beneath the name (and also
+/// searched), so a query like "fastest" or "1M" surfaces the right model.
+#[derive(Clone)]
+struct ModelItem {
+    wire: String,
+    label: String,
+    description: Option<String>,
+}
+
+impl SearchableListItem for ModelItem {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone().into()
+    }
+
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(
+            div()
+                .child(SharedString::from(short_model_label(&self.label).to_string()))
+                .into_any_element(),
+        )
+    }
+
+    /// A two-line row (Paseo-style): the model name on top, its capability blurb
+    /// muted beneath. Rows without a blurb render the name alone. The blurb is
+    /// clipped with an ellipsis so a long description never widens the menu.
+    fn render(&self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        use gpui_component::ActiveTheme as _;
+        let name = short_model_label(&self.label).to_string();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .child(SharedString::from(name))
+            .when_some(self.description.clone(), |this, desc| {
+                this.child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(SharedString::from(desc)),
+                )
+            })
+    }
+
+    /// Match the model name *or* its description, so a capability search
+    /// ("fastest", "reasoning") finds a model even when the query isn't in the name.
+    fn matches(&self, query: &str) -> bool {
+        let q = query.to_lowercase();
+        self.label.to_lowercase().contains(&q)
+            || self
+                .description
+                .as_deref()
+                .is_some_and(|d| d.to_lowercase().contains(&q))
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.wire
+    }
 }
 
 /// Rank the context providers against the `@query` (case-insensitive): prefix
@@ -134,9 +213,6 @@ pub enum ComposerEvent {
     },
     /// The user pressed Stop while a turn was streaming — interrupt it.
     Stop,
-    /// The user asked to start a fresh conversation in this tab ("New chat").
-    /// The parent blanks the transcript and respawns a non-resumed session.
-    NewChat,
     /// The user picked a model in the bottom toolbar (a Claude alias).
     ModelPicked(String),
     /// The user picked a permission mode in the bottom toolbar (a wire value).
@@ -147,9 +223,6 @@ pub enum ComposerEvent {
     /// dropdown (an adapter id, e.g. `codex`/`opencode`). The parent rebuilds the
     /// backend + default model and re-pushes the picker. Only fired while unbound.
     AgentPicked(String),
-    /// The user clicked the "Terminal view" button — switch this chat to its
-    /// companion raw-PTY terminal (the parent owns the runtime that spawns it).
-    ToggleTerminal,
     /// The `@` overlay just opened. The parent refreshes the composer's context
     /// sources (esp. the live sibling-terminal list) in response, so the "Context"
     /// section is current without the composer reaching into the pane group.
@@ -171,6 +244,27 @@ pub struct ComposerView {
     theme: Theme,
     density: Density,
     typography: Typography,
+    /// The bound agent's display name, driving the input placeholder ("Message
+    /// {label}…"). Pushed by the parent on bind via [`Self::set_provider_label`];
+    /// while unbound the placeholder follows the picked agent instead.
+    provider_label: String,
+    /// The placeholder string currently applied to the input, so `render` only
+    /// re-pushes it (which needs a `Window`) when the derived value changes.
+    applied_placeholder: Option<String>,
+    /// Persistent searchable model dropdown (Paseo-style filter-as-you-type),
+    /// held for the composer's life and re-seeded only when the advertised model
+    /// set changes. A Confirm pick routes to `pick_model`. Rendered in place of a
+    /// flat menu so long ACP model lists (OpenCode) stay navigable.
+    model_select: Entity<SelectState<SearchableVec<ModelItem>>>,
+    /// The `(wire, label, description)` set last pushed into `model_select`, so
+    /// `render` only rebuilds its items when the advertised models actually change
+    /// (a new blurb re-seeds too, so descriptions land as soon as they arrive).
+    model_select_sig: Vec<(String, String, Option<String>)>,
+    /// The model wire last applied as `model_select`'s selection, so `render`
+    /// re-syncs it only when it drifts (not every paint).
+    model_select_current: Option<String>,
+    /// Routes the model dropdown's Confirm event to `pick_model`.
+    _model_select_sub: Subscription,
     /// Mirrors the parent's connection state, for the status line + Send button.
     disconnected: bool,
     turn_active: bool,
@@ -201,9 +295,6 @@ pub struct ComposerView {
     /// The currently-picked agent `(id, display)`, for the agent-picker button
     /// label + the menu checkmark. `None` when bound / not yet seeded.
     current_agent: Option<(String, String)>,
-    /// Whether this chat can open a companion terminal view (bound, has a session
-    /// id, resumable transport). Drives the visibility of the terminal button.
-    terminal_available: bool,
     /// Images staged for the next send (via the paperclip, ⌘V, or drag-drop).
     /// Each holds both its wire/persist [`ChatImage`] and a pre-decoded thumbnail
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
@@ -262,6 +353,7 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let placeholder = format!("Message {provider_label}…  (↵ send · ⇧↵ newline)");
+        let initial_placeholder = placeholder.clone();
         let input = cx.new(|cx| {
             // MULTI-LINE field that GROWS with the draft up to MAX_COMPOSER_ROWS,
             // then holds height and scrolls (Claude-Desktop feel). ↵ submits; ⇧↵
@@ -304,11 +396,37 @@ impl ComposerView {
                 _ => {}
             }
         });
+        // The searchable model dropdown is created once (it needs a `Window`) with
+        // an empty list and re-seeded lazily in `render` when models arrive. A
+        // Confirm pick routes to `pick_model` exactly like the old menu did.
+        let model_select = cx.new(|cx| {
+            // Filter-as-you-type is on; the search box only shows inside the open
+            // dropdown, so short lists (Claude/Codex) stay uncluttered while long
+            // ACP lists (OpenCode) become searchable.
+            SelectState::new(SearchableVec::new(Vec::<ModelItem>::new()), None, window, cx)
+                .searchable(true)
+        });
+        let model_select_sub = cx.subscribe(
+            &model_select,
+            |this, _state, ev: &SelectEvent<SearchableVec<ModelItem>>, cx| {
+                // Programmatic `set_selected_value` (the render-time sync) does not
+                // emit Confirm, so this only fires on a real user pick — no loop.
+                if let SelectEvent::Confirm(Some(wire)) = ev {
+                    this.pick_model(wire.clone(), cx);
+                }
+            },
+        );
         Self {
             input,
             theme,
             density,
             typography,
+            provider_label: provider_label.to_string(),
+            applied_placeholder: Some(initial_placeholder),
+            model_select,
+            model_select_sig: Vec::new(),
+            model_select_current: None,
+            _model_select_sub: model_select_sub,
             disconnected: false,
             turn_active: false,
             model: None,
@@ -320,7 +438,6 @@ impl ComposerView {
             unbound: false,
             agent_options: Vec::new(),
             current_agent: None,
-            terminal_available: false,
             pending_images: Vec::new(),
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
@@ -471,6 +588,17 @@ impl ComposerView {
         }
     }
 
+    /// Push the bound agent's display name so the input placeholder reads "Message
+    /// {label}…". Called by the parent on bind (and new-chat); the actual
+    /// placeholder swap happens in `render`, which has the `Window` that
+    /// `InputState::set_placeholder` requires. Repaints on change.
+    pub fn set_provider_label(&mut self, label: String, cx: &mut Context<Self>) {
+        if self.provider_label != label {
+            self.provider_label = label;
+            cx.notify();
+        }
+    }
+
     /// Push the unbound *New Agent* draft's agent roster + current selection. The
     /// parent owns the truth (it rebuilds the backend on a pick and re-pushes);
     /// this view only renders the dropdown and emits [`ComposerEvent::AgentPicked`].
@@ -490,15 +618,6 @@ impl ComposerView {
             self.unbound = unbound;
             self.agent_options = agents;
             self.current_agent = current;
-            cx.notify();
-        }
-    }
-
-    /// Push whether a companion terminal view is available (bound + has a session
-    /// + resumable transport). Shows/hides the terminal button. Repaints on change.
-    pub fn set_terminal_available(&mut self, available: bool, cx: &mut Context<Self>) {
-        if self.terminal_available != available {
-            self.terminal_available = available;
             cx.notify();
         }
     }
@@ -1073,22 +1192,38 @@ impl ComposerView {
             .as_ref()
             .map(|(_, d)| d.clone())
             .unwrap_or_else(|| "Agent".to_string());
+        // The picked agent's brand glyph (Claude/Codex marks; a generic sparkles
+        // for agents without one), mirroring Paseo's provider icon on the control.
+        let trigger_icon = adapter_icon_path(&current_id);
         Button::new("chat-agent-btn")
+            .icon(Icon::default().path(trigger_icon))
             .label(current_label)
             .ghost()
             .small()
+            .tooltip("Coding agent")
             .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
                 for (id, display) in &agents {
                     let selected = current_id == *id;
+                    // Each row leads with the agent's glyph, then a ✓ on the pick.
+                    let icon_path = adapter_icon_path(id);
                     let text = if selected {
                         format!("\u{2713} {display}")
                     } else {
-                        format!("   {display}")
+                        display.clone()
                     };
                     let choice = id.to_string();
                     menu = menu.item(
-                        PopupMenuItem::element(move |_w, _c| div().child(text.clone())).on_click(
+                        PopupMenuItem::element(move |_w, _c| {
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(Icon::default().path(icon_path).size(px(14.0)))
+                                .child(text.clone())
+                        })
+                        .on_click(
                             window.listener_for(
                                 &entity,
                                 move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
@@ -1102,46 +1237,26 @@ impl ComposerView {
             })
     }
 
-    /// The model control in the bottom toolbar: a flat ghost button (no box —
-    /// just the label + a subtle caret, like Claude Desktop) that opens the
-    /// Claude aliases upward (the composer sits at the bottom, so the menu
-    /// anchors to the button's bottom-right).
-    fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity();
-        let models: Vec<String> = self.vocab.models.iter().map(|m| m.wire.clone()).collect();
-        let current = self
-            .model
-            .clone()
-            .or_else(|| self.vocab.default_model.clone())
-            .unwrap_or_default();
-        let current_for_menu = current.clone();
-        Button::new("chat-model-btn")
-            .label(current)
-            .ghost()
-            .small()
-            .dropdown_caret(true)
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
-                for m in &models {
-                    let selected = current_for_menu == *m;
-                    let display = if selected {
-                        format!("\u{2713} {m}")
-                    } else {
-                        format!("   {m}")
-                    };
-                    let choice = m.to_string();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
-                            window.listener_for(
-                                &entity,
-                                move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
-                                    view.pick_model(choice.clone(), cx);
-                                },
-                            ),
-                        ),
-                    );
-                }
-                menu
-            })
+    /// The model control in the bottom toolbar: a borderless (`appearance(false)`)
+    /// searchable dropdown so it reads like the sibling ghost pickers while giving
+    /// long ACP model lists (OpenCode advertises dozens) a filter box. The trigger
+    /// shows the current model's short (namespace-stripped) label; the dropdown
+    /// rows show full labels. State + selection are seeded from `render`; a pick
+    /// routes through the Confirm subscription to `pick_model`.
+    fn render_model_select(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        // `flex_none` (no explicit width) lets the borderless Select hug its
+        // content — a compact "label ⌄" trigger like Paseo's model control and the
+        // sibling ghost pickers, rather than stretching across the toolbar. The
+        // dropdown itself stays a fixed, searchable width.
+        div().flex_none().child(
+            Select::new(&self.model_select)
+                // Wide enough that a model's one-line capability blurb (the muted
+                // second row) fits without clipping to an ellipsis.
+                .appearance(false)
+                .small()
+                .menu_width(px(320.0))
+                .search_placeholder("Search models…"),
+        )
     }
 
     /// The permission-mode control in the bottom toolbar: a flat ghost button
@@ -1170,6 +1285,7 @@ impl ComposerView {
             .label(current_label)
             .ghost()
             .small()
+            .tooltip("Permission mode")
             .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
                 for (wire, label) in &modes {
@@ -1221,6 +1337,7 @@ impl ComposerView {
             .label(current_label)
             .ghost()
             .small()
+            .tooltip("Reasoning effort")
             .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
                 for (wire, label) in &efforts {
@@ -1256,30 +1373,6 @@ impl ComposerView {
             .small()
             .tooltip("Attach image")
             .on_click(cx.listener(|this, _ev, _window, cx| this.attach_from_picker(cx)))
-    }
-
-    /// "New chat" — blank the transcript and start a fresh session in this tab.
-    /// Raises [`ComposerEvent::NewChat`]; the parent does the reset.
-    fn render_new_chat_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("chat-new-btn")
-            .icon(Icon::default().path("icons/plus.svg"))
-            .ghost()
-            .small()
-            .tooltip("New chat")
-            .on_click(cx.listener(|_this, _ev, _window, cx| cx.emit(ComposerEvent::NewChat)))
-    }
-
-    /// "Terminal view" — switch this chat to a companion raw-PTY terminal running
-    /// the same session resumed interactively. Raises [`ComposerEvent::ToggleTerminal`];
-    /// the parent spawns the terminal (it owns the runtime). Shown only when
-    /// available (bound + has a session + resumable transport).
-    fn render_terminal_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("chat-terminal-btn")
-            .icon(Icon::default().path("icons/square-terminal.svg"))
-            .ghost()
-            .small()
-            .tooltip("Terminal view (⌃⇧V)")
-            .on_click(cx.listener(|_this, _ev, _window, cx| cx.emit(ComposerEvent::ToggleTerminal)))
     }
 
     /// Staged-attachment chips shown above the input pill: a small thumbnail per
@@ -1802,6 +1895,52 @@ impl ComposerView {
 
 impl Render for ComposerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep the input placeholder in step with the active agent: an unbound
+        // draft follows the picked agent; once bound it follows the connected
+        // provider. `InputState::set_placeholder` needs the `Window` we only have
+        // here, so apply it lazily and only when the derived text changes (this
+        // runs before any `&self` borrow below).
+        let desired_label = if self.unbound {
+            self.current_agent
+                .as_ref()
+                .map(|(_, d)| d.clone())
+                .unwrap_or_else(|| "Agent".to_string())
+        } else {
+            self.provider_label.clone()
+        };
+        let desired_placeholder = format!("Message {desired_label}…  (↵ send · ⇧↵ newline)");
+        if self.applied_placeholder.as_deref() != Some(desired_placeholder.as_str()) {
+            self.input
+                .update(cx, |s, cx| s.set_placeholder(desired_placeholder.clone(), window, cx));
+            self.applied_placeholder = Some(desired_placeholder);
+        }
+
+        // Re-seed the searchable model dropdown when the advertised set changes and
+        // keep its selection in step with the current model. Both need the `Window`
+        // only available here; the signature guards make this a no-op most paints.
+        let model_sig: Vec<(String, String, Option<String>)> = self
+            .vocab
+            .models
+            .iter()
+            .map(|m| (m.wire.clone(), m.label.clone(), m.description.clone()))
+            .collect();
+        if self.model_select_sig != model_sig {
+            self.model_select_sig = model_sig.clone();
+            let items: Vec<ModelItem> = model_sig
+                .iter()
+                .map(|(w, l, d)| ModelItem { wire: w.clone(), label: l.clone(), description: d.clone() })
+                .collect();
+            self.model_select.update(cx, |s, cx| s.set_items(SearchableVec::new(items), window, cx));
+            self.model_select_current = None; // re-apply selection against the new list
+        }
+        let current_model = self.model.clone().or_else(|| self.vocab.default_model.clone());
+        if self.model_select_current != current_model {
+            self.model_select_current = current_model.clone();
+            if let Some(wire) = current_model {
+                self.model_select.update(cx, |s, cx| s.set_selected_value(&wire, window, cx));
+            }
+        }
+
         let theme = self.theme;
         let density = self.density;
         let typo = &self.typography;
@@ -1886,12 +2025,8 @@ impl Render for ComposerView {
             .px(px(density.pad_row))
             .gap(px(density.gap_inline));
         // Paperclip/image attach anchors the far left, before the safety mode.
+        // (New-chat + terminal-view moved to the tab header's view-options menu.)
         controls = controls.child(self.render_attach_button(cx));
-        controls = controls.child(self.render_new_chat_button(cx));
-        // Terminal-view toggle, shown once the chat can open one (bound + session).
-        if self.terminal_available {
-            controls = controls.child(self.render_terminal_button(cx));
-        }
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
         }
@@ -1905,9 +2040,9 @@ impl Render for ComposerView {
         }
         // Show the model picker only when the backend advertises models (like the
         // mode/effort pickers). A vocab-less/disconnected state hides it rather
-        // than rendering a blank button.
+        // than rendering a blank control.
         if !self.vocab.models.is_empty() {
-            controls = controls.child(self.render_model_picker(cx));
+            controls = controls.child(self.render_model_select(cx));
         }
         if self.supports_effort {
             controls = controls.child(self.render_effort_picker(cx));
@@ -2115,6 +2250,40 @@ impl ComposerView {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn short_model_label_strips_provider_namespace() {
+        // The toolbar trigger drops any `provider/` prefix; the full label is kept
+        // for the dropdown row + search.
+        assert_eq!(short_model_label("openai/gpt-5.5"), "gpt-5.5");
+        assert_eq!(short_model_label("opencode/big-pickle"), "big-pickle");
+        // No namespace → unchanged; only the last segment survives nesting.
+        assert_eq!(short_model_label("Sonnet"), "Sonnet");
+        assert_eq!(short_model_label("a/b/c"), "c");
+    }
+
+    #[test]
+    fn model_item_search_matches_name_or_description() {
+        let opus = ModelItem {
+            wire: "opus".into(),
+            label: "Opus".into(),
+            description: Some("Most capable — deep reasoning & hard tasks".into()),
+        };
+        // Name match (case-insensitive).
+        assert!(opus.matches("opus"));
+        assert!(opus.matches("OP"));
+        // Description match: a capability query finds it even though "reasoning"
+        // isn't in the name.
+        assert!(opus.matches("reasoning"));
+        assert!(opus.matches("capable"));
+        // Neither → no match.
+        assert!(!opus.matches("haiku"));
+
+        // A model without a blurb only matches on its name.
+        let bare = ModelItem { wire: "o3".into(), label: "o3".into(), description: None };
+        assert!(bare.matches("o3"));
+        assert!(!bare.matches("reasoning"));
+    }
 
     /// Build a bare composer in a test window (no parent needed).
     fn test_composer(cx: &mut TestAppContext) -> gpui::WindowHandle<ComposerView> {

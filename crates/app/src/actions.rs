@@ -53,6 +53,11 @@ pub struct OpenTabContextMenuAt {
     pub y: f32,
     pub group_id: u64,
     pub tab_idx: u32,
+    /// When `true`, open the compact tab-header **view-options** menu (just
+    /// "Switch to Terminal View") instead of the full right-click context menu.
+    /// Fired by the agent-chat tab's eye button; the right-click path leaves it
+    /// `false` for the full menu.
+    pub view_only: bool,
 }
 
 /// Payload action fired by a right-click inside the terminal GRID (not the
