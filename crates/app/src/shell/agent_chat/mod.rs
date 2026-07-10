@@ -2671,8 +2671,56 @@ impl AgentChatView {
             Some(ThreadEntry::User { images, .. }) if !images.is_empty() => {
                 self.decoded_images(entry_idx, images)
             }
+            // A tool result that returned images (a `Read` of an image file, a
+            // screenshot tool) — same lightbox pager as user-prompt images.
+            Some(ThreadEntry::ToolCall(tc)) if !tc.images.is_empty() => {
+                self.decoded_images(entry_idx, &tc.images)
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// Inline thumbnails for a tool result's images, each clickable to open the
+    /// full-size lightbox (reusing the user-image preview path). `None` when the
+    /// tool returned no images or none decoded.
+    fn render_tool_result_images(
+        &self,
+        idx: usize,
+        images: &[ChatImage],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let decoded = self.decoded_images(idx, images);
+        if decoded.is_empty() {
+            return None;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let mut thumbs = div().flex().flex_row().flex_wrap().gap(px(6.0)).mt(px(4.0));
+        for (i, im) in decoded.iter().enumerate() {
+            thumbs = thumbs.child(
+                div()
+                    .id(SharedString::from(format!("tool-img-{idx}-{i}")))
+                    .w(px(200.0))
+                    .h(px(150.0))
+                    .flex_none()
+                    .rounded(px(density.r_card))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(theme.border_inactive)
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme.focus_ring))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| this.open_image_preview(idx, i, cx)),
+                    )
+                    .child(
+                        img(ImageSource::Image(im.clone()))
+                            .size_full()
+                            .object_fit(ObjectFit::Cover),
+                    ),
+            );
+        }
+        Some(thumbs.into_any_element())
     }
 
     /// Open the full-size lightbox on one message's image.
@@ -2988,18 +3036,30 @@ impl AgentChatView {
                             .into_any_element())
                     } else {
                         let expanded = self.expanded_tool_calls.contains(&tc.id);
-                        Some(
-                            tool_card::render_tool_card(
-                                tc,
-                                expanded,
-                                self.provider_label(),
-                                theme,
-                                density,
-                                &typo,
-                                cx,
-                            )
-                            .into_any_element(),
-                        )
+                        let card = tool_card::render_tool_card(
+                            tc,
+                            expanded,
+                            self.provider_label(),
+                            theme,
+                            density,
+                            &typo,
+                            cx,
+                        );
+                        // Append inline result-image thumbnails below the card
+                        // (a Read of an image, a screenshot) — the pixels the
+                        // `[image]` placeholder in the body stands in for.
+                        match self.render_tool_result_images(idx, &tc.images, cx) {
+                            Some(thumbs) => Some(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .w_full()
+                                    .child(card)
+                                    .child(thumbs)
+                                    .into_any_element(),
+                            ),
+                            None => Some(card.into_any_element()),
+                        }
                     }
                 }
                 ThreadEntry::ContextCompaction { summary } => {

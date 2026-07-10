@@ -10,7 +10,7 @@
 
 use serde_json::{json, Value};
 
-use super::super::event::{ThreadEvent, TurnUsage};
+use super::super::event::{PlanEntryLite, ThreadEvent, TurnUsage};
 use super::CodexState;
 
 /// Map one server → client notification to zero-or-more `ThreadEvent`s,
@@ -27,6 +27,19 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
             .map(ThreadEvent::ThinkingDelta)
             .into_iter()
             .collect(),
+
+        // --- plan + live command output --------------------------------------
+        // The agent replaced its plan checklist → the same pinned plan panel
+        // Claude/ACP feed. A missing `plan` key is skipped; a present-but-empty
+        // list clears the card (matches the ACP full-replacement semantics).
+        "turn/plan/updated" => match params.get("plan").and_then(|v| v.as_array()) {
+            Some(steps) => vec![ThreadEvent::PlanUpdated { entries: plan_entries(steps) }],
+            None => Vec::new(),
+        },
+        // A command's output streams live before completion; append each chunk to
+        // the open card keyed by `itemId`. `item/completed` later replaces the
+        // accumulated text with the authoritative `aggregatedOutput`.
+        "item/commandExecution/outputDelta" => output_delta(params),
 
         // --- item lifecycle -----------------------------------------------
         "item/started" => match params.get("item") {
@@ -89,11 +102,55 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
 
         "error" => vec![ThreadEvent::Error(error_message(params))],
 
+        // The backend compacted earlier context — mirror Claude's divider.
+        "thread/compacted" => vec![ThreadEvent::CompactBoundary {
+            summary: "Context compacted".to_string(),
+        }],
+
         // Housekeeping / telemetry / not-yet-surfaced — intentionally ignored:
-        // thread/started, thread/*, turn/diff/updated, turn/plan/updated,
-        // item/*/outputDelta, mcpServer/*, skills/changed, remoteControl/*, …
+        // thread/started, thread/*, turn/diff/updated, item/fileChange/outputDelta,
+        // mcpServer/*, skills/changed, remoteControl/*, …
         _ => Vec::new(),
     }
+}
+
+/// Map Codex `turn/plan/updated` steps into the gpui-free `PlanEntryLite` the
+/// plan panel renders. Codex reports no per-step priority, so all rows default
+/// to `medium` (the renderer's neutral weight).
+fn plan_entries(steps: &[Value]) -> Vec<PlanEntryLite> {
+    steps
+        .iter()
+        .filter_map(|s| {
+            let content = s.get("step").and_then(|v| v.as_str())?.to_string();
+            let status = plan_status_wire(s.get("status").and_then(|v| v.as_str()).unwrap_or(""));
+            Some(PlanEntryLite {
+                content,
+                status: status.to_string(),
+                priority: "medium".to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Codex `TurnPlanStepStatus` (camelCase) → the `TodoWrite`-compatible wire
+/// string the plan panel maps. Unknown/future values degrade to `pending`.
+fn plan_status_wire(status: &str) -> &'static str {
+    match status {
+        "inProgress" => "in_progress",
+        "completed" => "completed",
+        _ => "pending",
+    }
+}
+
+/// `item/commandExecution/outputDelta` → a live output-append event keyed by
+/// `itemId`. Empty id or empty delta yields nothing.
+fn output_delta(params: &Value) -> Vec<ThreadEvent> {
+    let id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or_default();
+    let chunk = params.get("delta").and_then(|v| v.as_str()).unwrap_or_default();
+    if id.is_empty() || chunk.is_empty() {
+        return Vec::new();
+    }
+    vec![ThreadEvent::ToolOutputDelta { id: id.to_string(), chunk: chunk.to_string() }]
 }
 
 /// `.delta` string from a `*/delta` notification.
@@ -397,5 +454,57 @@ mod tests {
     #[test]
     fn unknown_method_is_ignored() {
         assert!(map_notification("thread/settings/updated", &json!({}), &mut st()).is_empty());
+    }
+
+    #[test]
+    fn plan_updated_maps_steps_and_status() {
+        // Codex `inProgress` (camelCase) maps to the panel's `in_progress`; each
+        // row defaults to `medium` priority (Codex reports none).
+        let evs = map_notification(
+            "turn/plan/updated",
+            &json!({"threadId":"t","turnId":"u","plan":[
+                {"step":"scaffold","status":"completed"},
+                {"step":"wire api","status":"inProgress"},
+                {"step":"tests","status":"pending"}]}),
+            &mut st(),
+        );
+        match &evs[..] {
+            [ThreadEvent::PlanUpdated { entries }] => {
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].status, "completed");
+                assert_eq!(entries[1].status, "in_progress");
+                assert_eq!(entries[1].content, "wire api");
+                assert_eq!(entries[2].status, "pending");
+                assert!(entries.iter().all(|e| e.priority == "medium"));
+            }
+            other => panic!("expected PlanUpdated, got {other:?}"),
+        }
+        // An empty plan clears the card; a missing plan key emits nothing.
+        assert_eq!(
+            map_notification("turn/plan/updated", &json!({"plan":[]}), &mut st()),
+            vec![ThreadEvent::PlanUpdated { entries: vec![] }],
+        );
+        assert!(map_notification("turn/plan/updated", &json!({}), &mut st()).is_empty());
+    }
+
+    #[test]
+    fn command_output_delta_appends_live() {
+        let evs = map_notification(
+            "item/commandExecution/outputDelta",
+            &json!({"itemId":"it1","threadId":"t","turnId":"u","delta":"line1\n"}),
+            &mut st(),
+        );
+        assert_eq!(evs, vec![ThreadEvent::ToolOutputDelta { id: "it1".into(), chunk: "line1\n".into() }]);
+        // Empty delta or missing id → nothing.
+        assert!(map_notification("item/commandExecution/outputDelta",
+            &json!({"itemId":"it1","delta":""}), &mut st()).is_empty());
+        assert!(map_notification("item/commandExecution/outputDelta",
+            &json!({"delta":"x"}), &mut st()).is_empty());
+    }
+
+    #[test]
+    fn thread_compacted_emits_divider() {
+        let evs = map_notification("thread/compacted", &json!({"threadId":"t"}), &mut st());
+        assert!(matches!(&evs[..], [ThreadEvent::CompactBoundary { .. }]));
     }
 }

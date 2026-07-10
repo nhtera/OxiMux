@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::entry::ChatImage;
 use super::question::QuestionRequest;
 
 /// A single tool invocation inside an assistant turn.
@@ -39,6 +40,12 @@ pub struct ToolCall {
     /// `#[serde(default)]` keeps older persisted transcript blobs loadable.
     #[serde(default)]
     pub structured: Option<Value>,
+    /// Inline images the tool returned (a `Read` of an image, a screenshot),
+    /// decoded from the result's `image` content blocks and rendered as
+    /// thumbnails in the card body. Empty for the common text-only result.
+    /// `#[serde(default)]` keeps older persisted transcript blobs loadable.
+    #[serde(default)]
+    pub images: Vec<ChatImage>,
 }
 
 impl ToolCall {
@@ -50,6 +57,7 @@ impl ToolCall {
             status: ToolCallStatus::InProgress,
             result: None,
             structured: None,
+            images: Vec::new(),
         }
     }
 }
@@ -98,6 +106,34 @@ pub fn flatten_tool_result_content(c: Option<&Value>) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Extract inline base64 `image` blocks from a `tool_result.content` array (a
+/// `Read` of an image file, a screenshot tool) as [`ChatImage`]s for inline
+/// rendering — the actual pixels the flattened `[image]` placeholder stands in
+/// for. Only base64 `source`s are inlined; a plain-string content, a non-image
+/// array, or a URL-sourced image yields an empty vec. Shape verified against the
+/// live CLI (`Read` of a PNG → `content:[{type:"image",source:{type:"base64",
+/// media_type,data}}]`).
+pub fn extract_tool_result_images(c: Option<&Value>) -> Vec<ChatImage> {
+    let Some(Value::Array(arr)) = c else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|b| {
+            if b.get("type").and_then(Value::as_str) != Some("image") {
+                return None;
+            }
+            let src = b.get("source")?;
+            if src.get("type").and_then(Value::as_str) != Some("base64") {
+                return None;
+            }
+            Some(ChatImage {
+                media_type: src.get("media_type").and_then(Value::as_str)?.to_string(),
+                data: src.get("data").and_then(Value::as_str)?.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Lifecycle of a tool call. `WaitingForConfirmation` carries the pending

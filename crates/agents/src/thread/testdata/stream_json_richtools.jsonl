@@ -1,0 +1,10 @@
+{"type":"system","subtype":"init","session_id":"sid-rich","model":"claude-opus-4-8","permissionMode":"default","slash_commands":["compact"]}
+{"type":"assistant","message":{"content":[{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"latest rust version"}}]}}
+{"type":"user","message":{"content":[{"type":"web_search_tool_result","tool_use_id":"srv_1","content":[{"type":"text","text":"Rust 1.95.0 is the latest stable release."}]}]}}
+{"type":"assistant","message":{"content":[{"type":"mcp_tool_use","id":"mcp_1","name":"query-docs","server_name":"context7","input":{"q":"tokio"}}]}}
+{"type":"user","message":{"content":[{"type":"mcp_tool_result","tool_use_id":"mcp_1","content":[{"type":"text","text":"tokio is an async runtime."}]}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01QQuQESAQdiugq3rrv1rQ4J","name":"Read","input":{"file_path":"./red.png"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_01QQuQESAQdiugq3rrv1rQ4J", "content": [{"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mNk+M9Qz0BkYBxUAgBHBQr9Wj6PIQAAAABJRU5ErkJggg==", "media_type": "image/png"}}]}]}, "tool_use_result": {"type": "image", "file": {"base64": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mNk+M9Qz0BkYBxUAgBHBQr9Wj6PIQAAAABJRU5ErkJggg==", "type": "image/png", "originalSize": 76}}}
+{"type":"assistant","message":{"content":[{"type":"redacted_thinking","data":"EncryptedCiphertextThatMustNeverRender=="}]}}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":150000}}
+{"type":"result","subtype":"success","is_error":false,"result":"Done.","total_cost_usd":0.05,"usage":{"input_tokens":10,"output_tokens":5}}

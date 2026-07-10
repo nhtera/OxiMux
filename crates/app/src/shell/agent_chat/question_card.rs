@@ -396,6 +396,7 @@ impl Render for QuestionCard {
         let header = q.header.clone();
         let question = q.question.clone();
         let multi = q.multi_select();
+        let is_secret = q.is_secret;
         let options: Vec<(usize, String, String)> = q
             .options
             .iter()
@@ -430,6 +431,17 @@ impl Render for QuestionCard {
                 .text_color(theme.fg_base)
                 .child(SharedString::from(question)),
         );
+        // Sensitive-answer hint (Codex `isSecret`): the answer still rides back to
+        // the agent, so warn the user it's treated as a credential. Full input
+        // masking + transcript no-persist is a follow-up.
+        if is_secret {
+            title = title.child(
+                div()
+                    .text_size(px(typo.t_label_xs))
+                    .text_color(theme.status_warn)
+                    .child(SharedString::from("🔒 Sensitive — your answer is sent to the agent")),
+            );
+        }
         if multi {
             title = title.child(
                 div()
@@ -663,6 +675,7 @@ mod tests {
             ],
             kind: QuestionKind::SingleSelect,
             other_allowed: true,
+            is_secret: false,
         }
     }
 

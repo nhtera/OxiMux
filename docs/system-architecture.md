@@ -676,6 +676,34 @@ on_drop
 
 ---
 
+## Agent Chat adapters (structured chat view)
+
+Separate from the raw-PTY terminal runtime above, the **chat** view runs a structured conversation model (`crates/agents/src/thread/`). Three provider adapters each decode their own wire protocol into one transport-agnostic vocabulary — `ThreadEvent` (`event.rs`) — which `ChatThread::apply` (`state.rs`) folds into a `Vec<ThreadEntry>` the view renders. Each adapter satisfies the `AgentConnection` trait (`connection.rs`); the factory in `connect.rs` picks one. The view never learns which backend produced an event.
+
+- **Claude** — hand-parsed `stream-json` (`stream_json.rs`); no official Rust SDK, so the taxonomy is tracked manually. Native surface (AskUserQuestion, effort/modes, background tasks) kept — not wrapped as ACP.
+- **Codex** — `codex app-server` JSON-RPC v2 (`codex/`); shapes verified via `generate-json-schema`.
+- **ACP** — `agent-client-protocol` 1.2 crate (`acp/`); the generic tail for other agents (Cursor, Amp, …).
+
+**Adapter coverage matrix** (✓ handled · — n/a for that protocol · ○ not yet):
+
+| Capability | Claude | Codex | ACP |
+|---|---|---|---|
+| assistant text / thinking (+ deltas) | ✓ | ✓ | ✓ |
+| tool call + result | ✓ | ✓ | ✓ |
+| server/MCP tool calls | ✓ (as `tool_use`) | ✓ | ✓ |
+| 6× `*_tool_result` variants | ✓ (fwd-compat) | — | — |
+| inline tool-result image | ✓ | ○ | ○ (P3) |
+| live tool-output streaming | ○ | ✓ (`outputDelta`) | ○ |
+| plan panel | ✓ (`TodoWrite`) | ✓ (`turn/plan/updated`) | ✓ (`Plan`) |
+| clarifying question card | ✓ (`AskUserQuestion`) | ✓ (`requestUserInput`) | ○ |
+| permission card | ✓ | ✓ | ✓ |
+| compaction divider | ✓ (`compact_boundary`) | ✓ (`thread/compacted`) | — |
+| usage footer | ✓ | ✓ | ○ |
+
+The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`. Remaining ACP gaps (image/resource content, embedded terminal, tool-kind classification) are P3–P5 in `plans/260710-1022-agent-chat-acp-parity-research/`.
+
+---
+
 ## Deferred / not in v1
 
 | Feature | Deferred to |

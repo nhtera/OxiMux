@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use approvals::ServerRequestAction;
 use super::connection::{AgentCapabilities, AgentConnection, EffortChoice, ModelChoice};
 use super::event::{ThreadEvent, TurnUsage};
+use super::question::{AskQuestion, QuestionAnswers};
 use super::tool_call::PermissionDecision;
 use transport::{Inbound, RpcClient};
 
@@ -172,6 +173,27 @@ impl AgentConnection for CodexAppServerConnection {
             Some(id) => self
                 .rpc
                 .respond(id, json!({ "decision": approvals::to_codex_decision(&decision) })),
+            None => Ok(()),
+        }
+    }
+
+    fn answer_question(
+        &self,
+        request_id: &str,
+        questions: &[AskQuestion],
+        answers: &QuestionAnswers,
+    ) -> Result<()> {
+        // Look up the stashed JSON-RPC id for this question (shares the pending
+        // map with permissions — ids are unique) and reply with the Codex
+        // `{answers: {<qid>: {answers: [..]}}}` shape. A no-op if already answered.
+        let id = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("codex state poisoned"))?
+            .pending_approvals
+            .remove(request_id);
+        match id {
+            Some(id) => self.rpc.respond(id, approvals::codex_answers_json(questions, answers)),
             None => Ok(()),
         }
     }

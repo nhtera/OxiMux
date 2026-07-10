@@ -4,6 +4,19 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-10 — Agent Chat: Claude taxonomy + Codex plan/output/question parity (P1+P2)
+
+**Touches**: `crates/agents/src/thread/{event,state,stream_json,tool_call,question}.rs`, `crates/agents/src/thread/codex/{map,approvals,mod}.rs`, `crates/agents/src/thread/testdata/stream_json_richtools.jsonl` (new), `crates/app/src/shell/agent_chat/{mod,question_card}.rs`, `crates/app/tests/right_sidebar_tab.rs`
+
+Brings two of the three chat adapters closer to completeness. Architecture unchanged — decoders still normalize into `ThreadEvent`; this is taxonomy coverage + one renderer add. Wire shapes were locked empirically first (the plan's mandated gate): Codex via `codex app-server generate-json-schema` (0.141.0), Claude via a live `claude` 2.1.205 stream-json capture.
+
+- **P1 — Claude stream-json taxonomy.** `decode_assistant` gained `server_tool_use`/`mcp_tool_use` (mcp qualifies as `<server>.<tool>`) and a muted `redacted_thinking` marker (never renders the ciphertext). `decode_user` accepts the 6 `*_tool_result` variants (mcp/web_search/web_fetch/code_execution/bash_code_execution/text_editor) and **extracts inline base64 images** → a new `ToolResultImages` event, rendered as clickable thumbnails in the tool card (reusing the user-image lightbox) instead of the `[image]` placeholder. `compact_boundary` → a new `CompactBoundary` divider (reuses the `ContextCompaction` render). A debug-only unhandled-block log tripwires SDK drift. *Empirical note:* the live CLI wraps WebSearch/MCP as plain `tool_use`/`tool_result`, so the `server_tool_use`/`*_tool_result` arms are forward-compatible coverage; the confirmed daily win is inline images.
+- **P2 — Codex app-server.** `turn/plan/updated` → the shared `PlanUpdated` plan panel (maps Codex `inProgress`→`in_progress`; no per-step priority → `medium`). `item/commandExecution/outputDelta` → a new `ToolOutputDelta` that streams live command output into the open card (completion still replaces with the authoritative `aggregatedOutput`, but a **blank** final no longer erases already-streamed text). `item/tool/requestUserInput` (was auto-answered empty) now renders the interactive question card and routes selections back via a Codex-shaped `answer_question` (`{answers:{<qid>:{answers:[..]}}}`, keyed by the backend's native question id — distinct from Claude's text-keyed shape). Codex's `isSecret` flag is threaded through `AskQuestion` and shown as a "🔒 Sensitive" card hint (full input-masking + no-persist is a tracked follow-up). `thread/compacted` → the same compaction divider.
+
+Gates: `cargo test -p oximux-agents` green (479, +15 incl. a fixture-replay over the full new Claude taxonomy and Codex plan/output/question round-trips); `cargo check -p oximux-app` clean; `cargo test --workspace --no-fail-fast` green after fixing the long-stale `right_sidebar_tab` test (a `History` tab added in dd24107 was never reflected there — unrelated to this change). A `code-reviewer` pass returned 1 high (verified a non-issue against the 18-variant Codex `ThreadItem` schema + render path), 1 medium (`isSecret`, now handled), 3 low (2 fixed, 1 pre-existing spun off as a task). Plan: `plans/260710-1022-agent-chat-acp-parity-research/`. GUI verification pending (stale-binary rule).
+
+---
+
 ### 2026-07-07 — Agent Chat: Claude-Desktop completion tail (6 view-layer gaps)
 
 **Touches**: `crates/app/src/shell/agent_chat/{mod,bubble,tool_bodies,rewind_menu,composer,error_card (new),find_bar (new)}.rs`, `crates/agents/src/thread/state.rs`, `crates/app/src/assets.rs`

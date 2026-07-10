@@ -7,6 +7,7 @@
 
 use serde_json::Value;
 
+use super::entry::ChatImage;
 use super::question::AskQuestion;
 use super::tool_call::PermissionSuggestion;
 
@@ -80,6 +81,24 @@ pub enum ThreadEvent {
         /// same way they enrich imported history.
         structured: Option<Value>,
     },
+    /// Inline images carried by a tool result — the actual base64 pixels the
+    /// flattened `[image]` placeholder stands in for (a `Read` of an image file,
+    /// a screenshot tool, …). Emitted right after the matching `ToolResult` so
+    /// the tool card renders a thumbnail instead of the placeholder text.
+    /// Correlated by `tool_use_id`. Claude-only today; Codex/ACP never emit it.
+    ToolResultImages {
+        tool_use_id: String,
+        images: Vec<ChatImage>,
+    },
+    /// A chunk of live tool output streaming before completion (Codex
+    /// `item/commandExecution/outputDelta`). Appended to the open tool card's
+    /// result body as it arrives, keyed by the tool-call `id`. The authoritative
+    /// full output still lands in `ToolResult` at completion, which replaces the
+    /// accumulated chunks (so out-of-order interleaving can't corrupt the final).
+    ToolOutputDelta {
+        id: String,
+        chunk: String,
+    },
     /// A tool needs the user's permission (`can_use_tool` control request).
     PermissionRequested {
         request_id: String,
@@ -102,6 +121,13 @@ pub enum ThreadEvent {
     TurnSummary {
         detail: String,
         category: String,
+    },
+    /// The backend compacted earlier context to reclaim window space (Claude
+    /// `system/compact_boundary`, Codex `thread/compacted`). Rendered as a subtle
+    /// centered divider (reusing the session-import `ContextCompaction` entry) so
+    /// the gap in history is visible rather than silent.
+    CompactBoundary {
+        summary: String,
     },
     /// The turn finished (`result`). `usage` carries the token/cost breakdown
     /// when the result reports it (see [`TurnUsage`]).

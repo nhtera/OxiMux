@@ -16,6 +16,8 @@ fn visible_tabs_with_repo_returns_explorer_search_source_control() {
             RightTab::Explorer,
             RightTab::Search,
             RightTab::SourceControl,
+            // History is repo-independent and always trails the tab row.
+            RightTab::History,
         ]
     );
 }
@@ -23,7 +25,8 @@ fn visible_tabs_with_repo_returns_explorer_search_source_control() {
 #[test]
 fn visible_tabs_without_repo_omits_source_control_and_files() {
     let tabs = visible_tabs(TabVisibility { has_repo: false });
-    assert_eq!(tabs, vec![RightTab::Explorer, RightTab::Search]);
+    // Source Control drops without a repo; History stays (repo-independent).
+    assert_eq!(tabs, vec![RightTab::Explorer, RightTab::Search, RightTab::History]);
 }
 
 #[test]

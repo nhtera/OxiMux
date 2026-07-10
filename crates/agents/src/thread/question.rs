@@ -36,8 +36,10 @@ pub enum QuestionKind {
 /// One clarifying question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AskQuestion {
-    /// Stable id for keying draft answers in the UI (`q-{idx}`); remapped to
-    /// `question` text at the wire boundary.
+    /// Stable id for keying draft answers in the UI. Claude synthesizes it as
+    /// `q-{idx}` (remapped to `question` text at the wire boundary); Codex
+    /// supplies its own native question id here and the answer keys by it
+    /// directly. Either way it's an opaque map key — nothing parses the format.
     pub id: String,
     /// Short label chip (the tool caps it at ≤12 chars).
     pub header: String,
@@ -48,6 +50,13 @@ pub struct AskQuestion {
     /// Whether a free-text "Other" answer is offered. Always `true` for
     /// AskUserQuestion; a field so a future adapter can disable it.
     pub other_allowed: bool,
+    /// The backend flagged this question's answer as sensitive (Codex
+    /// `isSecret`) — a secret/credential the UI should treat with care (shown
+    /// with a "sensitive" hint; full input-masking + no-persist is a follow-up).
+    /// Always `false` for Claude AskUserQuestion. `#[serde(default)]` keeps older
+    /// persisted transcript blobs loadable.
+    #[serde(default)]
+    pub is_secret: bool,
 }
 
 impl AskQuestion {
@@ -173,6 +182,7 @@ pub fn parse_questions(input: &Value) -> Vec<AskQuestion> {
                 options,
                 kind: if multi { QuestionKind::MultiSelect } else { QuestionKind::SingleSelect },
                 other_allowed: true,
+                is_secret: false,
             }
         })
         .collect()
@@ -217,6 +227,7 @@ mod tests {
                 .collect(),
             kind: if multi { QuestionKind::MultiSelect } else { QuestionKind::SingleSelect },
             other_allowed: true,
+            is_secret: false,
         }
     }
 

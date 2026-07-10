@@ -11,7 +11,9 @@ use serde_json::Value;
 use super::background_task::BackgroundTaskKind;
 use super::event::{ThreadEvent, TurnUsage};
 use super::question::parse_questions;
-use super::tool_call::{PermissionSuggestion, flatten_tool_result_content};
+use super::tool_call::{
+    PermissionSuggestion, extract_tool_result_images, flatten_tool_result_content,
+};
 
 /// Decode one newline-delimited stream-json line. Returns the events it
 /// yields (possibly empty for noise: `system/hook_*`, `system/status`,
@@ -78,6 +80,21 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
         }],
         Some("task_updated") => decode_task_updated(v),
         Some("task_notification") => decode_task_notification(v),
+        // The CLI summarized earlier history to reclaim context — surface a
+        // divider so the gap is visible. `compact_metadata.trigger` ("auto" /
+        // "manual") labels why; absent → a plain "Context compacted".
+        Some("compact_boundary") => {
+            let trigger = v
+                .get("compact_metadata")
+                .and_then(|m| m.get("trigger"))
+                .and_then(Value::as_str);
+            let summary = match trigger {
+                Some("manual") => "Context compacted (manual)".to_string(),
+                Some("auto") => "Context compacted (auto)".to_string(),
+                _ => "Context compacted".to_string(),
+            };
+            vec![ThreadEvent::CompactBoundary { summary }]
+        }
         // hook_started / hook_response / thinking_tokens → noise.
         // TODO(chat-ui polish): `system/status` (spinner text) and init's
         // tools/mcp_servers/agents/cwd are dropped for now; surface them when
@@ -167,31 +184,108 @@ fn decode_assistant(v: &Value) -> Vec<ThreadEvent> {
                     name: str_field(b, "name"),
                     input: b.get("input").cloned().unwrap_or(Value::Null),
                 }),
-                _ => {}
+                // Server-side tools (Anthropic Messages-API `server_tool_use`,
+                // e.g. web_search/web_fetch/code_execution) and MCP tools
+                // (`mcp_tool_use`) are the same id/name/input shape as `tool_use`
+                // — route them to the same card. The `claude` CLI currently
+                // wraps these as plain `tool_use`, so these arms are forward-
+                // compatible coverage (the Messages API and future CLIs emit the
+                // distinct block types) rather than a hot path today.
+                Some("server_tool_use") => out.push(ThreadEvent::ToolCallStarted {
+                    id: str_field(b, "id"),
+                    name: str_field(b, "name"),
+                    input: b.get("input").cloned().unwrap_or(Value::Null),
+                }),
+                Some("mcp_tool_use") => {
+                    // Qualify with the server so two servers' same-named tools
+                    // stay distinct: `<server>.<tool>` (falls back to the bare
+                    // tool name when no server is present).
+                    let tool = str_field(b, "name");
+                    let name = match b.get("server_name").and_then(Value::as_str) {
+                        Some(s) if !s.is_empty() => format!("{s}.{tool}"),
+                        _ => tool,
+                    };
+                    out.push(ThreadEvent::ToolCallStarted {
+                        id: str_field(b, "id"),
+                        name,
+                        input: b.get("input").cloned().unwrap_or(Value::Null),
+                    });
+                }
+                // Extended-thinking that the API redacted: render a muted marker,
+                // never the ciphertext `data`.
+                Some("redacted_thinking") => {
+                    out.push(ThreadEvent::AssistantThinking("[redacted reasoning]".to_string()));
+                }
+                other => log_unhandled_block("assistant", other),
             }
         }
     }
     out
 }
 
+/// Debug-only breadcrumb for an assistant/user content-block `type` the decoder
+/// doesn't map — so SDK drift surfaces in dev without ever panicking or logging
+/// in release. A `None` type (missing key) is noise and skipped.
+#[inline]
+fn log_unhandled_block(channel: &str, block_type: Option<&str>) {
+    #[cfg(debug_assertions)]
+    if let Some(t) = block_type {
+        tracing::debug!(channel, block_type = t, "stream-json: unhandled content block type");
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (channel, block_type);
+}
+
 fn decode_user(v: &Value) -> Vec<ThreadEvent> {
     let mut out = Vec::new();
     if let Some(blocks) = v["message"]["content"].as_array() {
         for b in blocks {
-            if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+            let bt = b.get("type").and_then(Value::as_str);
+            if is_tool_result_block(bt) {
+                let tool_use_id = str_field(b, "tool_use_id");
+                let content = b.get("content");
                 // The structured result sits at the line's top level (a sibling
                 // of `message`), not inside the content block — same shape as
                 // the on-disk `toolUseResult`, just snake_cased on the wire.
                 out.push(ThreadEvent::ToolResult {
-                    tool_use_id: str_field(b, "tool_use_id"),
-                    content: flatten_tool_result_content(b.get("content")),
+                    tool_use_id: tool_use_id.clone(),
+                    content: flatten_tool_result_content(content),
                     is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
                     structured: v.get("tool_use_result").cloned(),
                 });
+                // Carry any inline image pixels so the card renders a thumbnail
+                // rather than the flattened `[image]` placeholder alone.
+                let images = extract_tool_result_images(content);
+                if !images.is_empty() {
+                    out.push(ThreadEvent::ToolResultImages { tool_use_id, images });
+                }
+            } else {
+                log_unhandled_block("user", bt);
             }
         }
     }
     out
+}
+
+/// Whether a `user`-message content block is a tool result. Beyond the common
+/// `tool_result`, the Messages API has a family of server-/MCP-tool result block
+/// types (web_search, web_fetch, code execution, MCP) that carry the same
+/// `tool_use_id` + `content` shape and route identically. The `claude` CLI wraps
+/// these as plain `tool_result` today, so the extra names are forward-compatible
+/// coverage rather than a hot path.
+fn is_tool_result_block(block_type: Option<&str>) -> bool {
+    matches!(
+        block_type,
+        Some(
+            "tool_result"
+                | "mcp_tool_result"
+                | "web_search_tool_result"
+                | "web_fetch_tool_result"
+                | "code_execution_tool_result"
+                | "bash_code_execution_tool_result"
+                | "text_editor_code_execution_tool_result"
+        )
+    )
 }
 
 fn decode_control_request(v: &Value) -> Vec<ThreadEvent> {
@@ -483,6 +577,120 @@ mod tests {
             ThreadEvent::TurnEnded { is_error, .. } => assert!(*is_error),
             other => panic!("expected TurnEnded error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_server_and_mcp_tool_use() {
+        // server_tool_use keeps its name; mcp_tool_use qualifies with the server.
+        let srv = json!({"type":"assistant","message":{"content":[
+            {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"x"}}]}}).to_string();
+        assert_eq!(decode_line(&srv), vec![ThreadEvent::ToolCallStarted {
+            id: "srv_1".into(), name: "web_search".into(), input: json!({"query":"x"}) }]);
+        let mcp = json!({"type":"assistant","message":{"content":[
+            {"type":"mcp_tool_use","id":"mcp_1","name":"query-docs","server_name":"context7","input":{"q":"tokio"}}]}}).to_string();
+        assert_eq!(decode_line(&mcp), vec![ThreadEvent::ToolCallStarted {
+            id: "mcp_1".into(), name: "context7.query-docs".into(), input: json!({"q":"tokio"}) }]);
+        // mcp_tool_use without a server_name falls back to the bare tool name.
+        let mcp_bare = json!({"type":"assistant","message":{"content":[
+            {"type":"mcp_tool_use","id":"mcp_2","name":"solo","input":{}}]}}).to_string();
+        match &decode_line(&mcp_bare)[0] {
+            ThreadEvent::ToolCallStarted { name, .. } => assert_eq!(name, "solo"),
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_all_tool_result_variants_as_tool_result() {
+        // The server-/MCP-tool result block types route identically to the plain
+        // `tool_result` (same tool_use_id + content shape).
+        for ty in [
+            "tool_result", "mcp_tool_result", "web_search_tool_result", "web_fetch_tool_result",
+            "code_execution_tool_result", "bash_code_execution_tool_result",
+            "text_editor_code_execution_tool_result",
+        ] {
+            let l = json!({"type":"user","message":{"content":[
+                {"type":ty,"tool_use_id":"tu","content":[{"type":"text","text":"out"}]}]}}).to_string();
+            assert_eq!(
+                decode_line(&l),
+                vec![ThreadEvent::ToolResult {
+                    tool_use_id: "tu".into(), content: "out".into(), is_error: false, structured: None }],
+                "variant {ty} must decode to ToolResult",
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_tool_result_image_emits_images_event() {
+        use crate::thread::ChatImage;
+        // A tool_result carrying an inline base64 image → the flattened
+        // `[image]` placeholder PLUS a follow-up ToolResultImages with the pixels.
+        let l = json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"ti","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}]}]}}).to_string();
+        assert_eq!(decode_line(&l), vec![
+            ThreadEvent::ToolResult {
+                tool_use_id: "ti".into(), content: "[image]".into(), is_error: false, structured: None },
+            ThreadEvent::ToolResultImages {
+                tool_use_id: "ti".into(),
+                images: vec![ChatImage { media_type: "image/png".into(), data: "QUJD".into() }] },
+        ]);
+        // A URL-sourced image is NOT inlined (no base64) — only the placeholder.
+        let url = json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"tu2","content":[
+                {"type":"image","source":{"type":"url","url":"http://x/y.png"}}]}]}}).to_string();
+        assert!(matches!(decode_line(&url).as_slice(), [ThreadEvent::ToolResult { .. }]));
+    }
+
+    #[test]
+    fn decodes_redacted_thinking_as_muted_marker() {
+        // Never render the ciphertext `data`; emit a fixed muted marker instead.
+        let l = json!({"type":"assistant","message":{"content":[
+            {"type":"redacted_thinking","data":"SECRET_CIPHERTEXT=="}]}}).to_string();
+        assert_eq!(decode_line(&l), vec![ThreadEvent::AssistantThinking("[redacted reasoning]".into())]);
+    }
+
+    #[test]
+    fn decodes_compact_boundary_divider() {
+        let auto = json!({"type":"system","subtype":"compact_boundary",
+            "compact_metadata":{"trigger":"auto","pre_tokens":150000}}).to_string();
+        assert_eq!(decode_line(&auto), vec![ThreadEvent::CompactBoundary {
+            summary: "Context compacted (auto)".into() }]);
+        // Absent metadata → the plain label, no panic.
+        let bare = json!({"type":"system","subtype":"compact_boundary"}).to_string();
+        assert_eq!(decode_line(&bare), vec![ThreadEvent::CompactBoundary {
+            summary: "Context compacted".into() }]);
+    }
+
+    /// Fixture replay: a turn exercising the full new taxonomy (server/mcp tool
+    /// use + results, a real image Read, redacted thinking, compaction) decodes
+    /// to the expected event sequence with the image pixels carried through.
+    #[test]
+    fn richtools_fixture_decodes_full_taxonomy() {
+        use crate::thread::ChatImage;
+        let fixture = include_str!("testdata/stream_json_richtools.jsonl");
+        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
+
+        // Two tool calls surface (web_search, context7.query-docs, Read).
+        let names: Vec<&str> = events.iter().filter_map(|e| match e {
+            ThreadEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(names, ["web_search", "context7.query-docs", "Read"]);
+
+        // The image Read produced a ToolResultImages with the real PNG.
+        let imgs: Vec<&ChatImage> = events.iter().filter_map(|e| match e {
+            ThreadEvent::ToolResultImages { images, .. } => images.first(),
+            _ => None,
+        }).collect();
+        assert_eq!(imgs.len(), 1, "exactly one inline tool-result image");
+        assert_eq!(imgs[0].media_type, "image/png");
+        assert!(imgs[0].data.starts_with("iVBOR"), "carries the base64 PNG pixels");
+
+        // Redacted thinking became the muted marker; a compaction divider fired.
+        assert!(events.contains(&ThreadEvent::AssistantThinking("[redacted reasoning]".into())));
+        assert!(events.iter().any(|e| matches!(e, ThreadEvent::CompactBoundary { .. })));
+        // Exactly one turn end.
+        assert_eq!(events.iter().filter(|e| matches!(e, ThreadEvent::TurnEnded { .. })).count(), 1);
     }
 
     #[test]

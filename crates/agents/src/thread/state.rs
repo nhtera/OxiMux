@@ -199,7 +199,13 @@ impl ChatThread {
                 // tool call to attach it to) rather than mutating the wrong
                 // entry — see the `tool_result_for_unknown_id_is_ignored` test.
                 if let Some(tc) = self.tool_call_mut(tool_use_id) {
-                    tc.result = Some(content.clone());
+                    // Completion replaces the streamed body — but a blank final
+                    // (a cancelled/partial Codex command whose `aggregatedOutput`
+                    // is empty) must not erase text the user already saw stream in
+                    // via `ToolOutputDelta`.
+                    if !content.is_empty() || tc.result.is_none() {
+                        tc.result = Some(content.clone());
+                    }
                     // Only overwrite when the wire actually carried a structured
                     // sibling — a bare result must not wipe one captured earlier.
                     if structured.is_some() {
@@ -210,6 +216,27 @@ impl ChatThread {
                     } else {
                         ToolCallStatus::Completed
                     };
+                }
+            }
+            ThreadEvent::ToolResultImages { tool_use_id, images } => {
+                // Attach the tool result's inline images to the matching card.
+                // Arrives right after `ToolResult`; an unknown id is dropped like
+                // an orphan result (no card to attach to).
+                if !images.is_empty()
+                    && let Some(tc) = self.tool_call_mut(tool_use_id)
+                {
+                    tc.images = images.clone();
+                }
+            }
+            ThreadEvent::ToolOutputDelta { id, chunk } => {
+                // Live output streaming before completion: append to the open
+                // card's result body. `ToolResult` at completion replaces this
+                // with the authoritative full output.
+                if let Some(tc) = self.tool_call_mut(id) {
+                    match &mut tc.result {
+                        Some(existing) => existing.push_str(chunk),
+                        None => tc.result = Some(chunk.clone()),
+                    }
                 }
             }
             ThreadEvent::PermissionRequested {
@@ -271,6 +298,12 @@ impl ChatThread {
             ThreadEvent::TurnSummary { detail, .. } => {
                 self.last_summary = Some(detail.clone());
                 self.end_assistant_window();
+            }
+            ThreadEvent::CompactBoundary { summary } => {
+                // Close the current assistant block and drop in a divider so the
+                // reclaimed-context gap reads as a boundary, not a silent jump.
+                self.end_assistant_window();
+                self.entries.push(ThreadEntry::ContextCompaction { summary: summary.clone() });
             }
             ThreadEvent::TurnEnded { is_error, result, usage } => {
                 self.turn_active = false;
@@ -1138,5 +1171,84 @@ mod tests {
         assert_eq!(t.model.as_deref(), Some("claude-opus"), "model kept");
         assert_eq!(t.permission_mode.as_deref(), Some("acceptEdits"), "mode kept");
         assert_eq!(t.slash_commands, vec!["clear".to_string(), "compact".to_string()]);
+    }
+
+    #[test]
+    fn tool_result_images_attach_to_the_matching_card() {
+        use crate::thread::ChatImage;
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::ToolCallStarted { id: "ti".into(), name: "Read".into(), input: json!({}) });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "ti".into(), content: "[image]".into(), is_error: false, structured: None });
+        t.apply(&ThreadEvent::ToolResultImages {
+            tool_use_id: "ti".into(),
+            images: vec![ChatImage { media_type: "image/png".into(), data: "QUJD".into() }] });
+        match t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == "ti" => Some(tc),
+            _ => None,
+        }) {
+            Some(tc) => {
+                assert_eq!(tc.images.len(), 1);
+                assert_eq!(tc.images[0].data, "QUJD");
+            }
+            None => panic!("tool card missing"),
+        }
+        // Images for an unknown id are dropped (no card to attach to).
+        t.apply(&ThreadEvent::ToolResultImages {
+            tool_use_id: "nope".into(),
+            images: vec![ChatImage { media_type: "image/png".into(), data: "X".into() }] });
+    }
+
+    #[test]
+    fn tool_output_delta_appends_then_result_replaces() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::ToolCallStarted { id: "c1".into(), name: "Bash".into(), input: json!({}) });
+        t.apply(&ThreadEvent::ToolOutputDelta { id: "c1".into(), chunk: "line1\n".into() });
+        t.apply(&ThreadEvent::ToolOutputDelta { id: "c1".into(), chunk: "line2\n".into() });
+        // Mid-stream the card shows the accumulated chunks.
+        let tc = t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == "c1" => Some(tc), _ => None }).unwrap();
+        assert_eq!(tc.result.as_deref(), Some("line1\nline2\n"));
+        // Completion replaces with the authoritative full output.
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "c1".into(), content: "line1\nline2\n".into(), is_error: false, structured: None });
+        let tc = t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == "c1" => Some(tc), _ => None }).unwrap();
+        assert_eq!(tc.result.as_deref(), Some("line1\nline2\n"));
+        assert!(matches!(tc.status, ToolCallStatus::Completed));
+    }
+
+    #[test]
+    fn blank_completion_does_not_erase_streamed_output() {
+        // A partial/cancelled command with empty aggregatedOutput must keep the
+        // text the user already saw stream in (still marking the terminal status).
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::ToolCallStarted { id: "c2".into(), name: "Bash".into(), input: json!({}) });
+        t.apply(&ThreadEvent::ToolOutputDelta { id: "c2".into(), chunk: "partial output".into() });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "c2".into(), content: String::new(), is_error: true, structured: None });
+        let tc = t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == "c2" => Some(tc), _ => None }).unwrap();
+        assert_eq!(tc.result.as_deref(), Some("partial output"), "streamed output preserved");
+        assert!(matches!(tc.status, ToolCallStatus::Failed(_)));
+        // A tool with NO prior stream still records an empty result (unchanged).
+        t.apply(&ThreadEvent::ToolCallStarted { id: "c3".into(), name: "Bash".into(), input: json!({}) });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "c3".into(), content: String::new(), is_error: false, structured: None });
+        let tc = t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == "c3" => Some(tc), _ => None }).unwrap();
+        assert_eq!(tc.result.as_deref(), Some(""), "no prior stream → empty result recorded");
+    }
+
+    #[test]
+    fn compact_boundary_pushes_a_divider() {
+        let mut t = ChatThread::new();
+        t.push_user_message("hi");
+        t.apply(&ThreadEvent::AssistantText("working".into()));
+        t.apply(&ThreadEvent::CompactBoundary { summary: "Context compacted".into() });
+        match t.entries.last() {
+            Some(ThreadEntry::ContextCompaction { summary }) => assert_eq!(summary, "Context compacted"),
+            other => panic!("expected a compaction divider, got {other:?}"),
+        }
     }
 }
