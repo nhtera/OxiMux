@@ -260,6 +260,14 @@ impl ChatThread {
                     tc.terminal_id = Some(terminal_id.clone());
                 }
             }
+            ThreadEvent::ToolKind { tool_call_id, kind } => {
+                // Record the ACP tool kind on its card so the renderer can
+                // classify it into a rich body. Follows `ToolCallStarted`; an
+                // unknown id is dropped (no card to annotate).
+                if let Some(tc) = self.tool_call_mut(tool_call_id) {
+                    tc.kind = Some(kind.clone());
+                }
+            }
             ThreadEvent::PermissionRequested {
                 request_id, tool_use_id, tool_name, input, description, suggestions,
             } => {
@@ -1041,6 +1049,29 @@ mod tests {
             tool_call_id: "nope".into(),
             terminal_id: "x".into(),
         });
+    }
+
+    #[test]
+    fn tool_kind_binds_kind_to_its_card() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "call-k".into(),
+            name: "Run the build".into(),
+            input: json!({}),
+        });
+        t.apply(&ThreadEvent::ToolKind {
+            tool_call_id: "call-k".into(),
+            kind: "execute".into(),
+        });
+        match t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == "call-k" => Some(tc),
+            _ => None,
+        }) {
+            Some(tc) => assert_eq!(tc.kind.as_deref(), Some("execute")),
+            None => panic!("kind tool card missing"),
+        }
+        // An orphan kind (no matching card) is dropped, not a panic.
+        t.apply(&ThreadEvent::ToolKind { tool_call_id: "nope".into(), kind: "read".into() });
     }
 
     #[test]

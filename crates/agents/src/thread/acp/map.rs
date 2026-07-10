@@ -18,7 +18,7 @@
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, Diff, Plan, PlanEntryPriority, PlanEntryStatus, SessionUpdate, Terminal, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use serde_json::{Value, json};
 
@@ -114,6 +114,12 @@ fn map_tool_call(tc: ToolCall) -> Vec<ThreadEvent> {
         None => (tc.title.clone(), tc.raw_input.clone().unwrap_or(Value::Null)),
     };
     let mut out = vec![ThreadEvent::ToolCallStarted { id: id.clone(), name, input }];
+    // Carry the ACP tool kind (when the agent classified the call) as a follow-up
+    // so the renderer can route this tool — whose `name` is a freeform human
+    // title — to a rich body instead of the generic card.
+    if let Some(kind) = acp_kind_wire(tc.kind) {
+        out.push(ThreadEvent::ToolKind { tool_call_id: id.clone(), kind: kind.to_string() });
+    }
     // An embedded terminal binds to the just-opened card (the app mounts an
     // inline `TerminalView`). Emitted regardless of status — the terminal is
     // usually live while the tool call is still in progress.
@@ -147,6 +153,11 @@ fn map_tool_call(tc: ToolCall) -> Vec<ThreadEvent> {
 fn map_tool_call_update(tcu: ToolCallUpdate) -> Vec<ThreadEvent> {
     let id = tcu.tool_call_id.0.to_string();
     let mut out = Vec::new();
+    // A kind can arrive on an update (the agent opened the card first, then
+    // classified it) — surface it so the card upgrades from the generic body.
+    if let Some(kind) = tcu.fields.kind.and_then(acp_kind_wire) {
+        out.push(ThreadEvent::ToolKind { tool_call_id: id.clone(), kind: kind.to_string() });
+    }
     // An embedded terminal can arrive on the update that attaches it (the agent
     // opened the card first, then bound the terminal) — surface it regardless of
     // status so the app mounts the inline `TerminalView`.
@@ -223,6 +234,24 @@ fn diff_body(d: &Diff) -> Value {
 /// `Completed`/`Failed` are terminal; `Pending`/`InProgress` are not.
 fn is_terminal(status: &ToolCallStatus) -> bool {
     matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
+}
+
+/// The ACP `ToolKind` as its snake_case wire string for the tool-detail
+/// classifier — or `None` for the default `Other`, `SwitchMode`, and any future
+/// kind, which carry no useful body classification and would only add event
+/// noise (a missing kind classifies the same as `Other`: the generic card).
+fn acp_kind_wire(kind: ToolKind) -> Option<&'static str> {
+    match kind {
+        ToolKind::Execute => Some("execute"),
+        ToolKind::Read => Some("read"),
+        ToolKind::Edit => Some("edit"),
+        ToolKind::Delete => Some("delete"),
+        ToolKind::Move => Some("move"),
+        ToolKind::Search => Some("search"),
+        ToolKind::Fetch => Some("fetch"),
+        ToolKind::Think => Some("think"),
+        _ => None,
+    }
 }
 
 /// The plain text of a `ContentBlock`, when it carries any.
@@ -314,7 +343,7 @@ mod tests {
         AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, ContentChunk,
         CurrentModeUpdate, Diff, ImageContent, PlanEntry, ResourceLink, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfoUpdate, TextContent,
-        ToolCallUpdateFields, UsageUpdate,
+        ToolCallUpdateFields, ToolKind, UsageUpdate,
     };
 
     fn text_chunk(s: &str) -> ContentChunk {
@@ -595,6 +624,53 @@ mod tests {
                 assert_eq!(terminal_id, "term-9");
             }
             other => panic!("expected ToolTerminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_with_kind_emits_tool_kind_after_start() {
+        // An ACP tool with a classified kind emits `ToolKind` right after
+        // `ToolCallStarted`, so the renderer can route its freeform-titled card
+        // to a rich body.
+        let tc = ToolCall::new("call-k", "Run the build")
+            .kind(ToolKind::Execute)
+            .raw_input(serde_json::json!({"command": "make"}));
+        let evs = map_session_update(SessionUpdate::ToolCall(tc));
+        assert!(matches!(evs[0], ThreadEvent::ToolCallStarted { .. }));
+        match &evs[1] {
+            ThreadEvent::ToolKind { tool_call_id, kind } => {
+                assert_eq!(tool_call_id, "call-k");
+                assert_eq!(kind, "execute");
+            }
+            other => panic!("expected ToolKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_other_kind_emits_no_tool_kind() {
+        // The default `Other` kind carries no useful classification — no event
+        // (keeps the generic-card behavior for unclassified ACP tools).
+        let tc = ToolCall::new("call-o", "Do a thing")
+            .raw_input(serde_json::json!({"x": 1}));
+        let evs = map_session_update(SessionUpdate::ToolCall(tc));
+        assert_eq!(evs.len(), 1, "only ToolCallStarted for an Other-kind tool");
+        assert!(matches!(evs[0], ThreadEvent::ToolCallStarted { .. }));
+    }
+
+    #[test]
+    fn tool_call_update_with_kind_emits_tool_kind() {
+        // A kind that arrives on an update (agent classified the call after
+        // opening it) still reaches the card.
+        let fields = ToolCallUpdateFields::new().kind(ToolKind::Read);
+        let tcu = ToolCallUpdate::new("call-k", fields);
+        let evs = map_session_update(SessionUpdate::ToolCallUpdate(tcu));
+        assert_eq!(evs.len(), 1, "in-progress kind update emits only the kind");
+        match &evs[0] {
+            ThreadEvent::ToolKind { tool_call_id, kind } => {
+                assert_eq!(tool_call_id, "call-k");
+                assert_eq!(kind, "read");
+            }
+            other => panic!("expected ToolKind, got {other:?}"),
         }
     }
 

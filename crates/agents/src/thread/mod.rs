@@ -27,6 +27,7 @@ pub mod session_import;
 pub mod state;
 pub mod stream_json;
 pub mod tool_call;
+pub mod tool_detail;
 pub mod transport;
 
 pub use acp::AcpConnection;
@@ -52,3 +53,4 @@ pub use stream_json::decode_line;
 pub use tool_call::{
     PermissionDecision, PermissionRequest, PermissionSuggestion, ToolCall, ToolCallStatus,
 };
+pub use tool_detail::ToolDetail;

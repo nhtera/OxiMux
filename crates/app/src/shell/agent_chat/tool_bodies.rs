@@ -9,7 +9,7 @@
 //! can't blow up layout.
 
 use gpui::{AnyElement, Hsla, IntoElement, ParentElement, SharedString, Styled, div, px};
-use oximux_agents::thread::ToolCall;
+use oximux_agents::thread::{ToolCall, ToolDetail};
 use oximux_settings::{Density, Theme, Typography};
 use serde_json::Value;
 
@@ -22,24 +22,40 @@ const MAX_CHARS: usize = 8000;
 
 /// Dispatch a tool call to its bespoke body, or `None` to fall back to the
 /// generic key:value view ([`render_generic_input`]).
+///
+/// Dispatch runs through the provider-agnostic [`ToolDetail`] classifier so a
+/// Claude `Bash`, a Codex command, and an ACP `Execute` all reach the same
+/// shell body — turning ACP's former generic fallback into rich cards. Claude's
+/// routing is unchanged (each Claude name classifies to the archetype that maps
+/// back to its original body — see the dispatch test).
 pub(super) fn render_tool_body(
     tc: &ToolCall,
     theme: Theme,
     density: Density,
     typo: &Typography,
 ) -> Option<AnyElement> {
-    match tc.name.as_str() {
-        "Bash" => Some(render_bash(tc, theme, density, typo)),
-        "Read" => Some(render_read(tc, theme, density, typo)),
-        "Grep" => Some(render_matches(tc, "match", theme, density, typo)),
-        "Glob" => Some(render_matches(tc, "file", theme, density, typo)),
-        "Agent" | "Task" => Some(render_agent(tc, theme, density, typo)),
-        "WebFetch" => Some(render_webfetch(tc, theme, density, typo)),
-        "WebSearch" => Some(render_websearch(tc, theme, density, typo)),
+    match ToolDetail::classify(&tc.name, tc.kind.as_deref(), &tc.input) {
+        ToolDetail::Shell => Some(render_bash(tc, theme, density, typo)),
+        ToolDetail::Read => Some(render_read(tc, theme, density, typo)),
+        // Preserve Claude's `Glob` "file" noun; every other search reads "match".
+        ToolDetail::Search => {
+            let noun = if tc.name == "Glob" { "file" } else { "match" };
+            Some(render_matches(tc, noun, theme, density, typo))
+        }
+        ToolDetail::Fetch => Some(render_webfetch(tc, theme, density, typo)),
+        ToolDetail::WebSearch => Some(render_websearch(tc, theme, density, typo)),
+        ToolDetail::SubAgent => Some(render_agent(tc, theme, density, typo)),
         // MCP tools are journaled as `mcp__<server>__<tool>`; the header already
         // humanizes the name, so the body stays a terse input+result view.
-        name if name.starts_with("mcp__") => Some(render_mcp(tc, theme, density, typo)),
-        _ => None,
+        ToolDetail::Mcp => Some(render_mcp(tc, theme, density, typo)),
+        // Edit/Write render as the diff card (built in `tool_card` before this is
+        // reached); Plan feeds the pinned plan panel; Plain/Unknown use the clean
+        // generic key:value card.
+        ToolDetail::Edit
+        | ToolDetail::Write
+        | ToolDetail::Plan
+        | ToolDetail::Plain
+        | ToolDetail::Unknown => None,
     }
 }
 
@@ -91,15 +107,22 @@ fn input_str<'a>(tc: &'a ToolCall, key: &str) -> &'a str {
 /// shown as one block.
 fn render_bash(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let cmd = input_str(tc, "command");
-    let prompted = cmd
-        .lines()
-        .enumerate()
-        .map(|(i, l)| if i == 0 { format!("$ {l}") } else { format!("  {l}") })
-        .collect::<Vec<_>>()
-        .join("\n");
-
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
-    col = col.child(code_block(&prompted, theme.status_info, theme, density, typo));
+
+    if !cmd.trim().is_empty() {
+        let prompted = cmd
+            .lines()
+            .enumerate()
+            .map(|(i, l)| if i == 0 { format!("$ {l}") } else { format!("  {l}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        col = col.child(code_block(&prompted, theme.status_info, theme, density, typo));
+    } else if matches!(&tc.input, Value::Object(m) if !m.is_empty()) {
+        // A shell-classified tool that doesn't use Claude's `command` key (an ACP
+        // `Execute` whose input is agent-specific) — show its raw input as
+        // key:value so nothing is lost, then its output below.
+        col = col.child(render_generic_input(tc, theme, density, typo));
+    }
 
     let stdout = structured_str(tc, "stdout").filter(|s| !s.trim().is_empty());
     let stderr = structured_str(tc, "stderr").filter(|s| !s.trim().is_empty());
@@ -342,6 +365,44 @@ mod tests {
                 "{t} should fall back to the generic card"
             );
         }
+    }
+
+    #[test]
+    fn cross_provider_tools_route_through_the_classifier() {
+        let (theme, density, typo) = (Theme::default(), Density::default(), Typography::default());
+
+        // Codex names its web search `web_search` (not Claude's `WebSearch`); it
+        // now reaches the rich WebSearch body via the classifier.
+        let mut codex_search = ToolCall::new("t", "web_search", json!({"query": "gpui focus"}));
+        codex_search.result = Some("1. Title — https://a".into());
+        assert!(render_tool_body(&codex_search, theme, density, &typo).is_some());
+
+        // An ACP `Execute` tool: freeform title, kind carried on `tc.kind`, and an
+        // agent-specific input key (not Claude's `command`). It routes to the
+        // shell body AND must not lose its raw input.
+        let mut acp_exec = ToolCall::new("t", "Run the build", json!({"cmd": "cargo build"}));
+        acp_exec.kind = Some("execute".into());
+        acp_exec.result = Some("Compiling…".into());
+        assert!(
+            render_tool_body(&acp_exec, theme, density, &typo).is_some(),
+            "ACP execute should render a shell card, not the generic fallback"
+        );
+
+        // An ACP `Read` tool routes to the read body from its kind alone.
+        let mut acp_read = ToolCall::new("t", "Read src/main.rs", json!({"path": "src/main.rs"}));
+        acp_read.kind = Some("read".into());
+        acp_read.result = Some("fn main() {}".into());
+        assert!(render_tool_body(&acp_read, theme, density, &typo).is_some());
+
+        // An unclassified ACP tool (freeform title, no kind) still falls to the
+        // generic card — conservative, never a wrong-body guess.
+        let acp_unknown = ToolCall::new("t", "Do something novel", json!({"opt": true}));
+        assert!(render_tool_body(&acp_unknown, theme, density, &typo).is_none());
+
+        // An ACP tool whose kind is unrecognized (mode switch / future) → generic.
+        let mut acp_switch = ToolCall::new("t", "Switch mode", json!({}));
+        acp_switch.kind = Some("switch_mode".into());
+        assert!(render_tool_body(&acp_switch, theme, density, &typo).is_none());
     }
 
     #[test]

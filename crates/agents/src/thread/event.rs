@@ -107,6 +107,16 @@ pub enum ThreadEvent {
         tool_call_id: String,
         terminal_id: String,
     },
+    /// An ACP tool call's `ToolKind` (`execute`, `read`, `edit`, `search`,
+    /// `fetch`, …), emitted as a follow-up to `ToolCallStarted` so the widely
+    /// constructed start event stays untouched. Correlated by `tool_call_id`;
+    /// the fold stashes it on `ToolCall.kind`, feeding the tool-detail classifier
+    /// so an ACP tool (whose `name` is a freeform human title) still routes to a
+    /// rich body. ACP-only — Claude/Codex classify by `name` and never emit it.
+    ToolKind {
+        tool_call_id: String,
+        kind: String,
+    },
     /// A tool needs the user's permission (`can_use_tool` control request).
     PermissionRequested {
         request_id: String,

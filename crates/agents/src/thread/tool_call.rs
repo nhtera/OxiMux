@@ -54,6 +54,15 @@ pub struct ToolCall {
     /// shows the tool card without a re-attached terminal.
     #[serde(default)]
     pub terminal_id: Option<String>,
+    /// The ACP `ToolKind` (snake_case wire string: `execute`, `read`, `edit`,
+    /// `search`, `fetch`, …) when the backend classified this call. Only ACP
+    /// populates it — Claude/Codex classify by `name` and leave it `None`. Feeds
+    /// the provider-agnostic tool-detail classifier so an ACP tool whose
+    /// freeform `name` (a human title) can't be pattern-matched still routes to
+    /// the right rich body. `#[serde(default)]` keeps older persisted blobs
+    /// loadable.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 impl ToolCall {
@@ -67,6 +76,7 @@ impl ToolCall {
             structured: None,
             images: Vec::new(),
             terminal_id: None,
+            kind: None,
         }
     }
 }
