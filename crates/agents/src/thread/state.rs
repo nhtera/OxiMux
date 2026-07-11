@@ -58,6 +58,20 @@ pub struct ChatThread {
     /// Latest per-turn token/cost usage (from the most recent `TurnEnded`), for
     /// the usage footer. `None` until a turn reports usage.
     pub usage: Option<TurnUsage>,
+    /// Live, mid-turn token usage (from `LiveUsage`), for the composer's context
+    /// meter. Separate from [`Self::usage`] (turn-settled): cleared at the start
+    /// of each new turn so a stale meter never lingers with no data yet.
+    pub live_usage: Option<TurnUsage>,
+    /// The last context-window size seen from ANY usage (live or settled) — the
+    /// denominator cache for the % meter. Claude's live events omit the window,
+    /// so this is seeded from a settled turn and reused for the current turn's
+    /// live %. Never cleared on a new turn (the window doesn't change per turn).
+    pub last_known_context_window: Option<u64>,
+    /// Cumulative USD spend across every settled turn THIS app-session ("cost
+    /// since open"). Resets to zero on restore (persisted entries carry no
+    /// per-turn cost) and deliberately does NOT decrement on rewind — money spent
+    /// doesn't come back, so a cost meter keeps counting all real spend.
+    pub session_cost_usd: f64,
     /// Background tasks (subagents + background bash) folded from `task_*` events,
     /// in start order, for the Background Tasks panel. In-memory only (not
     /// persisted): a task's output files are ephemeral, so a restored chat starts
@@ -70,6 +84,11 @@ pub struct ChatThread {
     text_streaming: bool,
     /// Same, for the thinking block.
     thinking_streaming: bool,
+    /// A stderr diagnostic emitted just before an error `TurnEnded`, held until
+    /// that `TurnEnded` folds it into `last_error`. Transient: the `TurnEnded`
+    /// handler `take()`s it regardless of outcome so a stray diagnostic can
+    /// never leak into a later turn's error text.
+    pending_diagnostic: Option<String>,
 }
 
 impl ChatThread {
@@ -152,6 +171,7 @@ impl ChatThread {
         // Clearing `last_error` too dismisses a prior turn's error card the
         // moment the user sends again (a fresh send is an implicit retry).
         self.usage = None;
+        self.live_usage = None;
         self.last_summary = None;
         self.last_error = None;
         self.turn_active = true;
@@ -345,10 +365,28 @@ impl ChatThread {
                 self.turn_active = false;
                 self.end_assistant_window();
                 if let Some(u) = usage {
+                    // Accumulate real spend (cost is known only at turn-end) and
+                    // refresh the window-size cache the live meter reads.
+                    if let Some(cost) = u.cost_usd {
+                        self.session_cost_usd += cost;
+                    }
+                    if let Some(w) = u.context_window {
+                        self.last_known_context_window = Some(w);
+                    }
                     self.usage = Some(u.clone());
                 }
+                // Consume any stashed diagnostic unconditionally — even on a
+                // successful turn — so it can't survive to a later error turn.
+                let diagnostic = self.pending_diagnostic.take();
                 if *is_error {
-                    self.last_error = result.clone().or(Some("turn ended with error".into()));
+                    let mut msg = result.clone().unwrap_or_else(|| "turn ended with error".into());
+                    // The diagnostic arrived already de-duped against this text,
+                    // so append it as extra detail when it adds something.
+                    if let Some(diag) = diagnostic.filter(|d| !d.is_empty()) {
+                        msg.push_str("\n\n");
+                        msg.push_str(&diag);
+                    }
+                    self.last_error = Some(msg);
                 }
             }
             ThreadEvent::BackgroundTaskStarted { task_id, tool_use_id, kind, description } => {
@@ -429,6 +467,33 @@ impl ChatThread {
             }
             ThreadEvent::TitleUpdated { title } => {
                 self.title = Some(title.clone());
+            }
+            // Live mid-turn usage → the composer's context meter. Kept separate
+            // from the settled `usage` footer; a window size (Codex/ACP carry it
+            // live) refreshes the denominator cache.
+            ThreadEvent::LiveUsage(u) => {
+                if let Some(w) = u.context_window {
+                    self.last_known_context_window = Some(w);
+                }
+                self.live_usage = Some(u.clone());
+            }
+            // Stash the stderr diagnostic; the next error `TurnEnded` folds it in.
+            ThreadEvent::Diagnostic(text) => {
+                self.pending_diagnostic = Some(text.clone());
+            }
+            // A `--resume` hit a session the CLI no longer has. Clear the dead id
+            // ONLY when it still equals the one we tried to resume — a fresh id an
+            // interleaved `SessionInit` minted (before this error arrived) must
+            // survive — then drop a divider notice so the next send omits
+            // `--resume` and starts a clean session.
+            ThreadEvent::SessionResumeStale { attempted_id } => {
+                if self.session_id.as_deref() == Some(attempted_id.as_str()) {
+                    self.session_id = None;
+                }
+                self.end_assistant_window();
+                self.entries.push(ThreadEntry::ContextCompaction {
+                    summary: "Session no longer resumable — starting fresh".into(),
+                });
             }
             // A pure UI-refresh signal: the live vocabulary lives on the connection
             // (which the worker already updated), and the view re-pulls it. Nothing
@@ -1363,5 +1428,88 @@ mod tests {
             Some(ThreadEntry::ContextCompaction { summary }) => assert_eq!(summary, "Context compacted"),
             other => panic!("expected a compaction divider, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_usage_tracks_and_clears_per_turn_and_caches_window() {
+        let mut t = ChatThread::new();
+        t.push_user_message("go");
+        // A live event mid-turn populates live_usage without touching the footer.
+        t.apply(&ThreadEvent::LiveUsage(TurnUsage {
+            input_tokens: 100, output_tokens: 5, context_window: Some(200_000), ..Default::default()
+        }));
+        assert!(t.turn_active, "still mid-turn");
+        assert_eq!(t.live_usage.as_ref().unwrap().input_tokens, 100);
+        assert_eq!(t.last_known_context_window, Some(200_000), "window cached as denominator");
+        assert!(t.usage.is_none(), "settled footer untouched by a live event");
+        // A new turn clears the live meter but keeps the cached window.
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false });
+        t.push_user_message("next");
+        assert!(t.live_usage.is_none(), "live meter cleared at new turn");
+        assert_eq!(t.last_known_context_window, Some(200_000), "window survives the turn boundary");
+    }
+
+    #[test]
+    fn session_cost_accumulates_only_from_settled_turns() {
+        let mut t = ChatThread::new();
+        t.push_user_message("a");
+        t.apply(&ThreadEvent::TurnEnded {
+            result: None, is_error: false,
+            usage: Some(TurnUsage { cost_usd: Some(0.10), ..Default::default() }),
+        });
+        t.push_user_message("b");
+        t.apply(&ThreadEvent::TurnEnded {
+            result: None, is_error: false,
+            usage: Some(TurnUsage { cost_usd: Some(0.25), ..Default::default() }),
+        });
+        assert!((t.session_cost_usd - 0.35).abs() < 1e-9, "cost sums across turns: {}", t.session_cost_usd);
+        // A turn with no cost (Codex reports None) doesn't change the accumulator.
+        t.push_user_message("c");
+        t.apply(&ThreadEvent::TurnEnded {
+            result: None, is_error: false,
+            usage: Some(TurnUsage { cost_usd: None, ..Default::default() }),
+        });
+        assert!((t.session_cost_usd - 0.35).abs() < 1e-9, "None cost is a no-op");
+    }
+
+    #[test]
+    fn diagnostic_folds_into_error_turn_then_clears() {
+        let mut t = ChatThread::new();
+        // A diagnostic stashed before an error TurnEnded appends to last_error.
+        t.apply(&ThreadEvent::Diagnostic("stderr: connection reset".into()));
+        t.apply(&ThreadEvent::TurnEnded { result: Some("api error".into()), usage: None, is_error: true });
+        let err = t.last_error.clone().expect("error recorded");
+        assert!(err.contains("api error"));
+        assert!(err.contains("stderr: connection reset"), "diagnostic folded in: {err}");
+
+        // A stashed diagnostic must NOT leak into a LATER turn's error text.
+        t.apply(&ThreadEvent::Diagnostic("stale noise".into()));
+        // This turn succeeds → the stash is consumed (dropped), not shown.
+        t.apply(&ThreadEvent::TurnEnded { result: Some("done".into()), usage: None, is_error: false });
+        t.push_user_message("again");
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: true });
+        let err2 = t.last_error.clone().expect("second error");
+        assert!(!err2.contains("stale noise"), "old diagnostic leaked into a later turn: {err2}");
+        assert_eq!(err2, "turn ended with error", "generic fallback, no leaked stash");
+    }
+
+    #[test]
+    fn session_resume_stale_clears_only_the_attempted_id() {
+        // The stored id still equals the attempted one → cleared, notice pushed.
+        let mut t = ChatThread::new();
+        t.session_id = Some("dead-sid".into());
+        t.apply(&ThreadEvent::SessionResumeStale { attempted_id: "dead-sid".into() });
+        assert!(t.session_id.is_none(), "dead id cleared so the next send omits --resume");
+        assert!(matches!(
+            t.entries.last(),
+            Some(ThreadEntry::ContextCompaction { summary }) if summary.contains("no longer resumable")
+        ), "recovery notice pushed");
+
+        // A fresh id minted by an interleaved SessionInit must SURVIVE a stale
+        // event that names the OLD id.
+        let mut t2 = ChatThread::new();
+        t2.session_id = Some("fresh-sid".into());
+        t2.apply(&ThreadEvent::SessionResumeStale { attempted_id: "old-sid".into() });
+        assert_eq!(t2.session_id.as_deref(), Some("fresh-sid"), "fresh id preserved");
     }
 }

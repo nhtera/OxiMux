@@ -266,6 +266,33 @@ pub enum ThreadEvent {
     TitleUpdated {
         title: String,
     },
+    /// Live, mid-turn token usage — emitted BEFORE `TurnEnded` for all three
+    /// adapters where the counts are already on the wire (Claude
+    /// `message_start`/`message_delta`; Codex `thread/tokenUsage/updated`; ACP
+    /// `UsageUpdate`). Drives the composer's live context meter. Reuses
+    /// [`TurnUsage`]; `cost_usd` stays `None` (cost is known only at turn-end) and
+    /// `context_window` is `None` for Claude (its live events omit the window
+    /// size) but present for Codex/ACP. Additive to — never a replacement for —
+    /// the settled `TurnEnded.usage` that feeds the transcript footer.
+    LiveUsage(TurnUsage),
+    /// A best-effort diagnostic (the drained tail of the child's stderr)
+    /// explaining the error turn it immediately precedes. The Claude reader
+    /// thread emits it just before an error `TurnEnded`, already de-duplicated
+    /// against the turn's own error text and redacted of secret-shaped values.
+    /// `state.rs` stashes it and folds it into `last_error` on the next error
+    /// `TurnEnded`, clearing the stash regardless so it can't leak into a later
+    /// turn. Attribution is best-effort, not turn-precise: stdout and stderr are
+    /// independently scheduled OS pipes with no happens-before between them.
+    Diagnostic(String),
+    /// A `--resume <session_id>` targeted a session the CLI no longer has
+    /// (deleted, expired, or a bad restore). Carries the id whose resume was
+    /// attempted; the fold clears the stored `session_id` ONLY when it still
+    /// equals this (a fresh id an interleaved `SessionInit` minted must survive)
+    /// and drops a one-line transcript notice so the next send starts fresh
+    /// instead of looping the same error. Claude-only.
+    SessionResumeStale {
+        attempted_id: String,
+    },
     /// A protocol/parse/transport error to surface in the thread.
     Error(String),
 }

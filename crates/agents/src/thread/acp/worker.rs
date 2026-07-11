@@ -118,11 +118,15 @@ async fn session(
                     async move {
                         // Usage arrives out-of-band, not per-turn: stash the latest
                         // (lossy map) so the prompt loop can fold it into the next
-                        // `TurnEnded.usage`, keeping the footer turn-scoped.
+                        // `TurnEnded.usage`, keeping the footer turn-scoped. ALSO
+                        // emit it live so the composer's context meter updates
+                        // mid-turn — ACP carries the window size, so the % is real.
                         if let SessionUpdate::UsageUpdate(u) = &n.update {
+                            let usage = usage_from_acp(u);
                             if let Ok(mut s) = st.lock() {
-                                s.last_usage = Some(usage_from_acp(u));
+                                s.last_usage = Some(usage.clone());
                             }
+                            let _ = tx.send(ThreadEvent::LiveUsage(usage));
                             return Ok(());
                         }
                         // A runtime config push carries the FULL option set (models /

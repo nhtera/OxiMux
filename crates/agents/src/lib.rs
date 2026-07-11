@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod runtime_impl;
 pub mod session_log;
 pub mod status_machine;
+pub mod tab_title;
 pub mod thread;
 
 pub use agent_title::{agent_label_from_title, classify_agent_title};

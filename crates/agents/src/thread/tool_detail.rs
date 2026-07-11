@@ -84,7 +84,13 @@ impl ToolDetail {
             "WebFetch" => ToolDetail::Fetch,
             // Codex names its web search `web_search`; Claude's is `WebSearch`.
             "WebSearch" | "web_search" => ToolDetail::WebSearch,
-            "Agent" | "Task" | "sub_agent" => ToolDetail::SubAgent,
+            // Codex sub-agent items pass their raw type name (the 0.144.1
+            // `collabAgentToolCall.tool` field is a freeform collab-tool name, so
+            // the type is the stable SubAgent signal); `sub_agent` covers the
+            // no-`tool` fallback.
+            "Agent" | "Task" | "sub_agent" | "collabAgentToolCall" | "subAgentActivity" => {
+                ToolDetail::SubAgent
+            }
             "TodoWrite" => ToolDetail::Plan,
             _ => ToolDetail::Unknown,
         }
@@ -141,6 +147,10 @@ mod tests {
         assert_eq!(c("apply_patch", None), ToolDetail::Edit);
         assert_eq!(c("web_search", None), ToolDetail::WebSearch);
         assert_eq!(c("sub_agent", None), ToolDetail::SubAgent);
+        // Sub-agent items pass their raw 0.144.1 type name (the `tool` field can
+        // be populated, so the type is the stable SubAgent signal).
+        assert_eq!(c("collabAgentToolCall", None), ToolDetail::SubAgent);
+        assert_eq!(c("subAgentActivity", None), ToolDetail::SubAgent);
     }
 
     #[test]

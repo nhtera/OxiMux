@@ -47,6 +47,7 @@ pub struct ControlVocab {
 use oximux_settings::{Density, Theme, Typography};
 
 use super::composer_history::PromptHistory;
+use super::context_meter;
 use super::context_providers::{ContextRequest, ContextSource};
 use super::image_attach::{self, PendingImage, pending_from_bytes, pending_from_path};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
@@ -346,6 +347,17 @@ pub struct ComposerView {
     /// Messages the user lined up while a turn was streaming, oldest first. The
     /// parent drains one per completed turn via [`Self::take_next_queued`].
     queued: Vec<QueuedMessage>,
+    /// Context tokens used this turn (input + cache + output), pushed by the
+    /// parent from live usage. `None` until any usage has arrived this session —
+    /// the meter stays hidden so a brand-new chat doesn't flash an empty meter.
+    meter_used_tokens: Option<u64>,
+    /// The model's context-window size (the meter denominator), cached across
+    /// turns. `None` when not yet known (Claude's first live turn) — the meter
+    /// then shows a raw token count, no percentage.
+    meter_window: Option<u64>,
+    /// Cumulative USD spend this app-session ("cost since open"). Shown in the
+    /// meter tooltip only when > 0 (Codex reports no cost, so it stays hidden).
+    meter_cost: f64,
     /// Repaints this view (only) on each keystroke so the draft stays visible.
     _sub: Subscription,
 }
@@ -460,6 +472,9 @@ impl ComposerView {
             context_chips: Vec::new(),
             history: PromptHistory::new(),
             queued: Vec::new(),
+            meter_used_tokens: None,
+            meter_window: None,
+            meter_cost: 0.0,
             _sub: sub,
         }
     }
@@ -597,6 +612,60 @@ impl ComposerView {
             self.vocab = vocab;
             cx.notify();
         }
+    }
+
+    /// Push the live context-meter inputs from the parent: tokens used this turn
+    /// (`None` until any usage has arrived — keeps the meter hidden on a fresh
+    /// chat), the cached window size (`None` = no denominator yet → count-only
+    /// state), and cumulative session cost. Repaints only on a real change.
+    pub fn set_usage_meter(
+        &mut self,
+        used_tokens: Option<u64>,
+        context_window: Option<u64>,
+        session_cost_usd: f64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.meter_used_tokens != used_tokens
+            || self.meter_window != context_window
+            || self.meter_cost != session_cost_usd
+        {
+            self.meter_used_tokens = used_tokens;
+            self.meter_window = context_window;
+            self.meter_cost = session_cost_usd;
+            cx.notify();
+        }
+    }
+
+    /// Build the context meter for the controls row, or `None` when no usage has
+    /// arrived yet this session (hidden state). Computes the percent + tooltip
+    /// from the pushed-down live usage; falls back to a count-only state when the
+    /// window size isn't known.
+    fn render_context_meter(&self) -> Option<impl IntoElement> {
+        let used = self.meter_used_tokens?;
+        let fraction = self
+            .meter_window
+            .filter(|w| *w > 0)
+            .map(|w| used as f32 / w as f32);
+        let label = match fraction {
+            Some(f) => format!("{}%", (f * 100.0).round() as u32),
+            None => context_meter::compact_tokens(used),
+        };
+        // Tooltip: exact %, used/max tokens, and "cost since open" (only when a
+        // cost has actually accrued — Codex/most ACP report none, and a $0.00
+        // line would mislead).
+        let mut tip = match self.meter_window.filter(|w| *w > 0) {
+            Some(w) => format!(
+                "Context: {} of {} used ({}%)",
+                context_meter::compact_tokens(used),
+                context_meter::compact_tokens(w),
+                fraction.map(|f| (f * 100.0).round() as u32).unwrap_or(0),
+            ),
+            None => format!("Context: {} tokens (window size unknown)", context_meter::compact_tokens(used)),
+        };
+        if self.meter_cost > 0.0 {
+            tip.push_str(&format!("\nCost since open: ${:.2}", self.meter_cost));
+        }
+        Some(context_meter::context_meter(fraction, label, tip, &self.theme, &self.typography))
     }
 
     /// Push the bound agent's display name so the input placeholder reads "Message
@@ -1143,6 +1212,64 @@ impl ComposerView {
         }
     }
 
+    /// A queued chip's "send now" (↑). While a turn is streaming there is nothing
+    /// to safely interrupt, so move the message to the FRONT — it becomes the very
+    /// next one auto-drained when the turn ends (a no-op if already at the front).
+    /// While IDLE (the restored-queue case — no active turn to interrupt) genuinely
+    /// dequeue it and submit right away, which is exactly what the user is asking.
+    fn send_queued_now(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.queued.len() {
+            return;
+        }
+        if self.turn_active {
+            if idx != 0 {
+                let m = self.queued.remove(idx);
+                self.queued.insert(0, m);
+                cx.notify();
+            }
+            return;
+        }
+        // Idle: no turn to interrupt — dequeue and send it now.
+        let QueuedMessage { text, images, context } = self.queued.remove(idx);
+        self.history.record(&text);
+        let images: Vec<ChatImage> = images.into_iter().map(|p| p.chat).collect();
+        let wire = prepend_context(&context, &text);
+        cx.notify();
+        cx.emit(ComposerEvent::Submit { text: wire, images });
+    }
+
+    /// The text of each queued message, oldest first, for persistence. Text-only
+    /// (staged images/context aren't persisted); an image-only queued message
+    /// (blank text) is skipped since it can't be faithfully restored.
+    pub fn queued_texts(&self) -> Vec<String> {
+        self.queued.iter().map(|m| m.text.clone()).filter(|t| !t.trim().is_empty()).collect()
+    }
+
+    /// Seed the draft from restored text, but ONLY when the composer is empty —
+    /// never clobber text the user is already typing (mirrors the edit-queued
+    /// no-clobber guard). An empty `text` is a no-op.
+    pub fn seed_draft(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !text.trim().is_empty() && self.draft_is_empty(cx) {
+            self.set_draft_end(text, window, cx);
+        }
+    }
+
+    /// Re-seed queued chips from restored text (text-only, no images/context).
+    /// Never auto-sends — a restored app must not fire billed sends without a user
+    /// action; the chips sit visible with their edit/cancel/send-now affordances.
+    pub fn seed_queued(&mut self, texts: Vec<String>, cx: &mut Context<Self>) {
+        for text in texts {
+            if self.queued.len() >= MAX_QUEUED {
+                break;
+            }
+            if text.trim().is_empty() {
+                continue;
+            }
+            self.queued.push(QueuedMessage { text, images: Vec::new(), context: Vec::new() });
+        }
+        cx.notify();
+    }
+
     /// Whether the caret sits on the first visual line of the draft (no newline
     /// before it) — the entry condition for ↑ recalling history rather than
     /// moving the caret up a line in a multi-line draft.
@@ -1525,6 +1652,7 @@ impl ComposerView {
         // chip replaces the composer contents, so it must not clobber a draft
         // in progress (matches the ↑-to-edit guard).
         let draft_empty = self.draft_is_empty(cx);
+        let turn_active = self.turn_active;
         for (idx, m) in self.queued.iter().enumerate() {
             // Prefer the caption; fall back to an image count for an image-only
             // queued message so its chip isn't blank.
@@ -1563,6 +1691,30 @@ impl ComposerView {
                         .text_color(theme.fg_muted)
                         .child(SharedString::from(preview)),
                 )
+                // "Send now" (↑): while a turn streams it jumps this message to
+                // the front of the queue (hidden at index 0, already next);
+                // while idle it dequeues + sends immediately. Shown in both
+                // states except the mid-turn already-at-front no-op.
+                .when(!turn_active || idx != 0, |row| {
+                    row.child(
+                        div()
+                            .id(("chat-queued-send-now", idx))
+                            .flex_none()
+                            .size(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme.fg_subtle)
+                            .text_size(px(typo.t_body_sm))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.fg_base))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _e, _w, cx| this.send_queued_now(idx, cx)),
+                            )
+                            .child(SharedString::from("↑")),
+                    )
+                })
                 .when(draft_empty, |row| {
                     row.child(
                         div()
@@ -2068,6 +2220,11 @@ impl Render for ComposerView {
         }
         // Spacer pushes the agent/model/effort cluster to the far right.
         controls = controls.child(div().flex_1());
+        // The live context meter leads the far-right cluster (hidden until any
+        // usage has arrived this session).
+        if let Some(meter) = self.render_context_meter() {
+            controls = controls.child(meter);
+        }
         // Unbound *New Agent* draft: the agent picker precedes the model picker so
         // the user chooses which agent, then which model, before the first send
         // binds a subprocess. Hidden once bound (transport is fixed at spawn).
@@ -2394,6 +2551,49 @@ mod tests {
                 let next = c.take_next_queued(cx);
                 assert_eq!(next.map(|(t, _)| t), Some("queued one".to_string()));
                 assert_eq!(c.queued_len_for_test(), 0);
+            })
+            .expect("window update");
+    }
+
+    /// "Send now" while a turn streams moves a queued message to the FRONT (next
+    /// to auto-drain) without sending; it's a no-op at index 0.
+    #[gpui::test]
+    async fn send_queued_now_moves_to_front_mid_turn(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                c.set_state(false, true, cx); // streaming turn
+                for t in ["one", "two", "three"] {
+                    c.set_draft_for_test(t, window, cx);
+                    c.submit(window, cx);
+                }
+                assert_eq!(c.queued_texts(), vec!["one", "two", "three"]);
+                // Jump the third to the front.
+                c.send_queued_now(2, cx);
+                assert_eq!(c.queued_texts(), vec!["three", "one", "two"], "moved to front, none sent");
+                // No-op at index 0.
+                c.send_queued_now(0, cx);
+                assert_eq!(c.queued_texts(), vec!["three", "one", "two"], "index 0 is a no-op");
+            })
+            .expect("window update");
+    }
+
+    /// Restored queued chips (`seed_queued`) re-render without auto-sending; a
+    /// seeded draft respects the no-clobber guard.
+    #[gpui::test]
+    async fn seed_queue_and_draft_restore_without_clobber(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                // Restored queue: chips appear, nothing sent (no active turn).
+                c.seed_queued(vec!["a".into(), "b".into(), "  ".into()], cx);
+                assert_eq!(c.queued_texts(), vec!["a", "b"], "blank entry skipped, none sent");
+                // seed_draft into an empty composer applies.
+                c.seed_draft("restored draft".into(), window, cx);
+                assert_eq!(c.draft_for_test(cx), "restored draft");
+                // seed_draft into a NON-empty composer is ignored (no clobber).
+                c.seed_draft("should be ignored".into(), window, cx);
+                assert_eq!(c.draft_for_test(cx), "restored draft", "in-progress text preserved");
             })
             .expect("window update");
     }

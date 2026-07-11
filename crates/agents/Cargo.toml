@@ -12,6 +12,9 @@ oximux-core = { workspace = true }
 oximux-pty = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# Encodes Codex image-item file bytes (imageView/imageGeneration paths) into the
+# standard-base64 `ChatImage` shape the transcript + thumbnail renderer expect.
+base64 = { workspace = true }
 chrono = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

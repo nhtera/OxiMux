@@ -263,6 +263,22 @@ pub enum PersistedTabKind {
         model: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
+        /// Unsent composer draft text, restored into the same chat so a typed
+        /// follow-up survives a tab close / app quit. `None`/absent = no draft.
+        #[serde(default)]
+        draft: Option<String>,
+        /// Messages the user queued mid-turn (text-only) but that never sent.
+        /// Restored as visible queued chips — NEVER auto-sent on relaunch (a
+        /// restored app must not fire billed sends without a user action).
+        #[serde(default)]
+        queued: Vec<String>,
+        /// True when this was an unbound *New Agent* draft (never bound a
+        /// session). Restore routes it back to the unbound picker shape rather
+        /// than a bound chat. `#[serde(default)]` = `false` for old blobs (which
+        /// were always bound). Explicit — a bound chat that errored before
+        /// minting a session ALSO has `session_id: None`, so it can't be inferred.
+        #[serde(default)]
+        unbound: bool,
     },
 }
 
@@ -965,5 +981,33 @@ mod tests {
             restored.in_order_leaves(),
             vec![PaneGroupId(10), PaneGroupId(11)]
         );
+    }
+
+    #[test]
+    fn agent_chat_kind_back_compat_and_round_trip() {
+        // An OLD blob (no draft/queued/unbound) deserializes with defaults, so a
+        // layout saved before this feature still loads.
+        let old = r#"{"AgentChat":{"cwd":"/p","model":"opus","session_id":"sid"}}"#;
+        let kind: PersistedTabKind = serde_json::from_str(old).expect("old blob loads");
+        match &kind {
+            PersistedTabKind::AgentChat { draft, queued, unbound, .. } => {
+                assert_eq!(draft, &None);
+                assert!(queued.is_empty());
+                assert!(!unbound, "old blobs were always bound");
+            }
+            _ => panic!("expected AgentChat"),
+        }
+        // New fields round-trip losslessly.
+        let full = PersistedTabKind::AgentChat {
+            cwd: "/p".into(),
+            model: None,
+            session_id: None,
+            draft: Some("unsent".into()),
+            queued: vec!["q1".into(), "q2".into()],
+            unbound: true,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: PersistedTabKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, full);
     }
 }

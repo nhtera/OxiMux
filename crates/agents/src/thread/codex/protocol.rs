@@ -1,12 +1,12 @@
 //! Codex `app-server` (v2) wire protocol — the minimal slice OxiMux drives.
 //!
-//! Verified against the local binary `codex-cli 0.141.0` via
+//! Verified against the local binary `codex-cli 0.144.1` via
 //! `codex app-server generate-json-schema` / `generate-ts` (NOT reverse-engineered).
 //! Only the fields OxiMux actually sends/reads are modeled; everything is built as
 //! `serde_json::Value` so unknown/added fields on the wire are tolerated. Framing is
 //! newline-delimited JSON (one value per `\n`), NOT Content-Length.
 //!
-//! Method names + shapes (codex 0.141.0):
+//! Method names + shapes (codex 0.144.1):
 //! - `initialize` → `{ clientInfo:{name,title,version}, capabilities:{experimentalApi,requestAttestation} }`
 //! - `initialized` (client notification, no params)
 //! - `thread/start` → `{ model?, cwd?, approvalPolicy?, sandbox? }` ; resp `{ thread:{id,..}, model, .. }`

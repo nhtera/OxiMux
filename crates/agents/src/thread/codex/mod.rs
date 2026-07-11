@@ -17,6 +17,7 @@
 //! approvals + `workspace-write` sandbox (`supports_modes = false`).
 
 mod approvals;
+mod image_items;
 mod map;
 pub mod protocol;
 pub mod transport;
@@ -56,6 +57,10 @@ struct CodexState {
     thread_id: Option<String>,
     current_turn_id: Option<String>,
     last_usage: Option<TurnUsage>,
+    /// The session's working directory, seeded at spawn. Used to contain the
+    /// file paths `imageView`/`imageGeneration` items carry — an image is only
+    /// inlined when its canonicalized path stays within this directory.
+    cwd: std::path::PathBuf,
     /// Tool items (commandExecution / fileChange) by itemId, so a later approval
     /// request — which carries only the itemId — can show the command / changes.
     cmd_items: HashMap<String, Value>,
@@ -103,6 +108,7 @@ impl CodexAppServerConnection {
         if let Ok(mut s) = state.lock() {
             s.current_model = model.map(str::to_string);
             s.current_effort = effort.map(str::to_string);
+            s.cwd = cwd.to_path_buf();
         }
 
         let mapper = {

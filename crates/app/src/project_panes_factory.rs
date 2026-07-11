@@ -340,22 +340,34 @@ pub(crate) fn build_project_panes(
                     p.place_restored_last_tab(None, meta, cx);
                 });
             }
-            PersistedTabKind::AgentChat { cwd: chat_cwd, model, session_id } => {
+            PersistedTabKind::AgentChat { cwd: chat_cwd, model, session_id, draft, queued, unbound } => {
                 let chat_cwd = PathBuf::from(chat_cwd);
                 let model = model.clone();
                 let session_id = session_id.clone();
-                let entries = restore_chat_entries(&snap, session_id.as_deref());
-                let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
-                let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
-                let backend = restore_chat_backend(&snap, session_id.as_deref());
+                let draft = draft.clone();
+                let queued = queued.clone();
+                let unbound = *unbound;
                 panes_entity.update(cx, |p, cx| {
                     if let Some(group) = p.active_group() {
-                        group.update(cx, |g, cx| {
-                            g.open_agent_chat_tab_restored(
-                                chat_cwd, model, backend, session_id, entries, slash_commands,
-                                thinking_level, window, cx,
-                            );
-                        });
+                        // An unbound *New Agent* draft restores to the unbound
+                        // picker shape (never as a bound Claude chat); a bound
+                        // chat rehydrates its transcript + resumes the session.
+                        if unbound {
+                            group.update(cx, |g, cx| {
+                                g.open_agent_chat_tab_unbound_restored(chat_cwd, draft, queued, window, cx);
+                            });
+                        } else {
+                            let entries = restore_chat_entries(&snap, session_id.as_deref());
+                            let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
+                            let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
+                            let backend = restore_chat_backend(&snap, session_id.as_deref());
+                            group.update(cx, |g, cx| {
+                                g.open_agent_chat_tab_restored(
+                                    chat_cwd, model, backend, session_id, entries, slash_commands,
+                                    thinking_level, draft, queued, window, cx,
+                                );
+                            });
+                        }
                     }
                     p.place_restored_last_tab(None, meta, cx);
                 });
@@ -509,19 +521,26 @@ fn restore_multi_group(
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
                 }
-                PersistedTabKind::AgentChat { cwd: chat_cwd, model, session_id } => {
+                PersistedTabKind::AgentChat { cwd: chat_cwd, model, session_id, draft, queued, unbound } => {
                     let chat_cwd = PathBuf::from(chat_cwd);
                     let model = model.clone();
                     let session_id = session_id.clone();
-                    let entries = restore_chat_entries(&snap, session_id.as_deref());
-                    let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
-                    let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
-                    let backend = restore_chat_backend(&snap, session_id.as_deref());
+                    let draft = draft.clone();
+                    let queued = queued.clone();
+                    let unbound = *unbound;
                     panes_entity.update(cx, |p, cx| {
-                        p.open_agent_chat_in_group_restore(
-                            group_id, chat_cwd, model, backend, session_id, entries, slash_commands,
-                            thinking_level, window, cx,
-                        );
+                        if unbound {
+                            p.open_agent_chat_unbound_in_group_restore(group_id, chat_cwd, draft, queued, window, cx);
+                        } else {
+                            let entries = restore_chat_entries(&snap, session_id.as_deref());
+                            let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
+                            let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
+                            let backend = restore_chat_backend(&snap, session_id.as_deref());
+                            p.open_agent_chat_in_group_restore(
+                                group_id, chat_cwd, model, backend, session_id, entries, slash_commands,
+                                thinking_level, draft, queued, window, cx,
+                            );
+                        }
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
                 }
@@ -1963,6 +1982,9 @@ mod tests {
                     cwd: "/tmp/proj".into(),
                     model: Some("opus".into()),
                     session_id: Some(sid.into()),
+                    draft: None,
+                    queued: vec![],
+                    unbound: false,
                 },
                 ..PersistedTab::default()
             }],

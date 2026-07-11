@@ -5192,6 +5192,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "futures",
  "libc",

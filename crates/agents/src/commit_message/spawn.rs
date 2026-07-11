@@ -86,6 +86,7 @@ pub async fn run_plan(
     plan: CommitMessagePlan,
     cwd: &Path,
     cancel: Arc<AtomicBool>,
+    timeout_after: Duration,
 ) -> Result<String, GenerationError> {
     if cancel.load(Ordering::SeqCst) {
         return Err(GenerationError::Canceled { label: plan.label });
@@ -161,7 +162,7 @@ pub async fn run_plan(
     let output = tokio::select! {
         // Tokio's `wait_with_output` takes ownership of the child;
         // it returns `Output { status, stdout, stderr }` on completion.
-        result = timeout(GENERATION_TIMEOUT, child.wait_with_output()) => {
+        result = timeout(timeout_after, child.wait_with_output()) => {
             match result {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) => return Err(GenerationError::Io {
@@ -170,7 +171,7 @@ pub async fn run_plan(
                 }),
                 Err(_) => return Err(GenerationError::Timeout {
                     label,
-                    seconds: GENERATION_TIMEOUT.as_secs(),
+                    seconds: timeout_after.as_secs(),
                 }),
             }
         }
@@ -233,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn run_plan_returns_binary_not_found_for_missing_command() {
         let plan = plan_for("oximux-non-existent-binary-xyz", vec![], None);
-        let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false))).await;
+        let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT).await;
         match result {
             Err(GenerationError::BinaryNotFound { .. }) => {}
             other => panic!("expected BinaryNotFound, got {other:?}"),
@@ -244,7 +245,7 @@ mod tests {
     async fn run_plan_returns_empty_when_echo_returns_blank() {
         // /bin/echo of an empty arg → "" on stdout → cleaned → empty.
         let plan = plan_for("/bin/echo", vec!["-n"], None);
-        let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false))).await;
+        let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT).await;
         match result {
             Err(GenerationError::EmptyOutput { .. }) => {}
             other => panic!("expected EmptyOutput, got {other:?}"),
@@ -254,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn run_plan_returns_message_when_echo_returns_text() {
         let plan = plan_for("/bin/echo", vec!["feat: hello"], None);
-        let message = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)))
+        let message = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT)
             .await
             .expect("echo should succeed");
         assert_eq!(message, "feat: hello");
@@ -264,7 +265,7 @@ mod tests {
     async fn run_plan_pipes_stdin_payload() {
         // cat reads stdin and writes to stdout — round-trip the payload.
         let plan = plan_for("/bin/cat", vec![], Some("feat: from stdin"));
-        let message = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)))
+        let message = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT)
             .await
             .expect("cat should succeed");
         assert_eq!(message, "feat: from stdin");
@@ -275,7 +276,7 @@ mod tests {
         // `false` exits 1 with no stdout/stderr → AgentFailed with
         // generic detail (no ERROR: line to extract).
         let plan = plan_for("/usr/bin/false", vec![], None);
-        let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false))).await;
+        let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT).await;
         match result {
             Err(GenerationError::AgentFailed { .. }) => {}
             other => panic!("expected AgentFailed, got {other:?}"),
@@ -286,7 +287,7 @@ mod tests {
     async fn run_plan_honours_cancel_flag_set_before_start() {
         let cancel = Arc::new(AtomicBool::new(true));
         let plan = plan_for("/bin/echo", vec!["hello"], None);
-        let result = run_plan(plan, &tmp_cwd(), cancel).await;
+        let result = run_plan(plan, &tmp_cwd(), cancel, GENERATION_TIMEOUT).await;
         match result {
             Err(GenerationError::Canceled { .. }) => {}
             other => panic!("expected Canceled, got {other:?}"),
@@ -307,7 +308,7 @@ mod tests {
             cancel_setter.store(true, Ordering::SeqCst);
         });
 
-        let result = run_plan(plan, &cwd, cancel).await;
+        let result = run_plan(plan, &cwd, cancel, GENERATION_TIMEOUT).await;
         setter.await.expect("setter task");
         match result {
             Err(GenerationError::Canceled { .. }) => {}

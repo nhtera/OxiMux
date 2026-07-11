@@ -17,6 +17,7 @@ mod bubble;
 mod composer;
 mod composer_history;
 mod acp_terminal_host;
+mod context_meter;
 mod context_providers;
 mod diff_card;
 mod error_card;
@@ -178,6 +179,21 @@ pub struct ChatTerminalSpec {
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+/// Why the "Switch to Terminal View" affordance is (un)available for a chat —
+/// distinguishing the two "unavailable" reasons so the hint isn't misleading.
+/// A bound ACP chat that HAS sent a message is `NoInteractiveResume`, not
+/// `NoSessionYet` — telling that user to "send a message first" is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAvailability {
+    /// A companion terminal can be spawned (bound, has a session, resumable CLI).
+    Available,
+    /// No session yet (unbound draft, or never sent) — send a message first.
+    NoSessionYet,
+    /// Bound + has a session, but this agent has no interactive resume CLI wired
+    /// (the ACP presets today). Sending another message won't help.
+    NoInteractiveResume,
 }
 
 /// How assistant thinking blocks are shown across the whole chat.
@@ -446,6 +462,14 @@ pub struct AgentChatView {
     rail_hover: bool,
     /// Pointer is over the expanded jump-to-message list. See [`Self::rail_hover`].
     menu_hover: bool,
+    /// Whether a one-shot LLM tab title has already been generated (or is being
+    /// generated) for this chat — guards a single fire per session. Set true by a
+    /// native ACP `TitleUpdated` too, so a provider title always wins. In-memory
+    /// only (a restored chat with history initializes this true; see the trigger).
+    title_generated: bool,
+    /// The in-flight title-generation task, owned so a tab close drops it (which
+    /// prevents an emit into a dead view). `None` when idle.
+    title_task: Option<Task<()>>,
     /// Weak handle to the owning pane group, set after construction by the tab
     /// factory. Lets the `@terminal` context provider enumerate sibling terminal
     /// tabs and pull their scrollback. Weak so it never keeps the group alive (the
@@ -603,6 +627,9 @@ impl AgentChatView {
             cwd, model, backend, thread, true, theme, density, typography, window, cx,
         );
         view.thinking_level = thinking_level;
+        // A resumed chat that already has history must NOT regenerate (or
+        // overwrite) its label on the next send — mark it already-titled.
+        view.title_generated = !view.thread.entries.is_empty();
         view
     }
 
@@ -873,6 +900,8 @@ impl AgentChatView {
             find_bar: None,
             rail_hover: false,
             menu_hover: false,
+            title_generated: false,
+            title_task: None,
         }
     }
 
@@ -935,6 +964,39 @@ impl AgentChatView {
         self.unbound
     }
 
+    /// The unsent composer draft text, for the layout snapshot (so a typed but
+    /// unsent message survives a tab close / app quit).
+    pub fn draft_text(&self, cx: &App) -> String {
+        self.composer.read(cx).current_draft(cx)
+    }
+
+    /// The text of each queued-but-unsent message (oldest first), for the layout
+    /// snapshot. Text-only — staged images/context aren't persisted.
+    pub fn queued_texts(&self, cx: &App) -> Vec<String> {
+        self.composer.read(cx).queued_texts()
+    }
+
+    /// Seed a restored draft + queued messages into the composer after
+    /// construction. The draft seed is no-clobber-guarded; queued messages are
+    /// re-shown as chips and NEVER auto-sent (a restored app must not fire billed
+    /// sends without a user action).
+    pub fn seed_draft_and_queue(
+        &mut self,
+        draft: Option<String>,
+        queued: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |c, cx| {
+            if let Some(text) = draft {
+                c.seed_draft(text, window, cx);
+            }
+            if !queued.is_empty() {
+                c.seed_queued(queued, cx);
+            }
+        });
+    }
+
     /// The current view mode (chat vs. companion terminal).
     pub fn view_mode(&self) -> ChatViewMode {
         self.view_mode
@@ -975,6 +1037,23 @@ impl AgentChatView {
             model: self.model.clone(),
             effort: self.effort.clone(),
         })
+    }
+
+    /// Why the companion-terminal toggle is (un)available, so the view-options
+    /// hint can distinguish "send a message first" (no session yet) from "no
+    /// interactive terminal for this agent" (a bound ACP chat). Keeps
+    /// [`Self::terminal_launch_spec`]'s `Option` return stable for its other
+    /// callers — this is the richer reason computed alongside it.
+    pub fn terminal_availability(&self) -> TerminalAvailability {
+        if self.terminal_launch_spec().is_some() {
+            TerminalAvailability::Available
+        } else if self.unbound || self.thread.session_id.is_none() {
+            TerminalAvailability::NoSessionYet
+        } else {
+            // Bound with a session, but the transport has no interactive resume
+            // CLI wired (ACP presets today).
+            TerminalAvailability::NoInteractiveResume
+        }
     }
 
     /// Mount a freshly-spawned companion terminal (the host did the async
@@ -1144,9 +1223,24 @@ impl AgentChatView {
         // Agent draft that just bound gets its real provider name here (it was
         // constructed with the generic "Agent" placeholder).
         let provider_label = self.provider_label().to_string();
+        // Live context-meter inputs: prefer the mid-turn `live_usage`, fall back
+        // to the settled `usage`; total token occupancy = input + cache + output
+        // (ACP folds its whole "used" count into `input_tokens`). The window is
+        // the cross-turn cached denominator; cost is the session accumulator.
+        let meter_used = self
+            .thread
+            .live_usage
+            .as_ref()
+            .or(self.thread.usage.as_ref())
+            .map(|u| {
+                u.input_tokens + u.cache_read_tokens + u.cache_creation_tokens + u.output_tokens
+            });
+        let meter_window = self.thread.last_known_context_window;
+        let meter_cost = self.thread.session_cost_usd;
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
             c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
+            c.set_usage_meter(meter_used, meter_window, meter_cost, cx);
             c.set_slash_commands(slash_commands, slash_descriptions, slash_hints, cx);
             c.set_provider_label(provider_label, cx);
             // A bound chat never shows the agent picker (its transport is fixed);
@@ -1346,6 +1440,21 @@ impl AgentChatView {
         // blocks the send). The user entry we just pushed is the last one.
         let user_index = self.thread.entries.len() - 1;
         self.take_checkpoint_for(user_index, cx);
+        // After the FIRST user message on a Claude/Codex chat, kick off a one-shot
+        // LLM title. ACP chats are skipped — their agents push a native title
+        // through the same sink, which a haiku result would race/clobber.
+        let auto_title = cx
+            .try_global::<AgentLaunchSettings>()
+            .map(|s| s.auto_title_enabled)
+            .unwrap_or(true);
+        if user_index == 0
+            && !self.title_generated
+            && auto_title
+            && !matches!(self.backend.transport, Transport::Acp)
+        {
+            self.title_generated = true; // guard a fast double-send from re-firing
+            self.spawn_title_generation(text.clone(), cx);
+        }
         if let Some(conn) = &self.connection
             && let Err(e) = conn.send_user_message_with_images(&text, &images)
         {
@@ -1356,6 +1465,34 @@ impl AgentChatView {
         self.list_scroll.scroll_to_bottom();
         self.sync_composer(cx);
         cx.notify();
+    }
+
+    /// Kick off a one-shot LLM title generation for this chat's first message.
+    /// Owned on `title_task` so a tab close drops it. The generation runs a child
+    /// process needing a tokio reactor, so it's handed to the tokio runtime and
+    /// bridged back via a oneshot (the proven `source_control::ai_generation`
+    /// pattern); a bounded 10s timeout + `kill_on_drop` cap any lingering child.
+    /// Any failure (missing `claude`, timeout, non-JSON reply) silently keeps the
+    /// counter label. On success the result rides the existing, already-safe
+    /// `TitleChanged` sink (a manual rename still wins in the header render).
+    fn spawn_title_generation(&mut self, first_message: String, cx: &mut Context<Self>) {
+        let cwd = self.cwd.clone();
+        self.title_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            handle.spawn(async move {
+                let title = oximux_agents::tab_title::generate_title(&first_message, &cwd, cancel).await;
+                let _ = tx.send(title);
+            });
+            if let Ok(Some(title)) = rx.await {
+                let _ = this.update(cx, |_view, cx| {
+                    cx.emit(AgentChatEvent::TitleChanged(title));
+                });
+            }
+        }));
     }
 
     /// Re-send the last user prompt after a turn ended in error (or the child
@@ -1803,6 +1940,11 @@ impl AgentChatView {
         self.flash_entry = None;
         self.flash_frames = 0;
         self.recently_copied = None;
+        // A fresh conversation should re-title from its own first message — clear
+        // the one-shot guard (and drop any in-flight generation) so the tab isn't
+        // stuck on the previous topic's title.
+        self.title_generated = false;
+        self.title_task = None;
         // Respawn reads the now-`None` session id → a fresh session, and clears
         // `disconnected`/`interrupted`/`last_error` itself on success.
         self.respawn(cx);
@@ -2244,6 +2386,8 @@ impl AgentChatView {
             find_bar: None,
             rail_hover: false,
             menu_hover: false,
+            title_generated: false,
+            title_task: None,
         }
     }
 
@@ -2328,6 +2472,9 @@ impl AgentChatView {
                 self.permission_mode = (*mode_id != default_mode).then(|| mode_id.clone());
             }
             ThreadEvent::TitleUpdated { title } => {
+                // A provider-native title wins: mark titled so a later haiku
+                // generation (if one ever races for this transport) can't clobber it.
+                self.title_generated = true;
                 cx.emit(AgentChatEvent::TitleChanged(title.clone()));
             }
             // The agent needs login: mount/refresh the auth card. A retained
@@ -5452,8 +5599,10 @@ mod tests {
 
         window
             .update(cx, |view, window, cx| {
-                // Bound (stub) Claude chat, but no session id yet → no terminal.
+                // Bound (stub) Claude chat, but no session id yet → no terminal,
+                // and the availability reason is "no session yet".
                 assert!(view.terminal_launch_spec().is_none(), "no session → no terminal");
+                assert_eq!(view.terminal_availability(), TerminalAvailability::NoSessionYet);
                 assert_eq!(view.view_mode(), ChatViewMode::Chat);
 
                 // A session id makes the resume terminal available.
@@ -5461,6 +5610,19 @@ mod tests {
                 let spec = view.terminal_launch_spec().expect("bound + session → resumable");
                 assert_eq!(spec.adapter_id, "claude-code");
                 assert_eq!(spec.session_id, "sid-1");
+                assert_eq!(view.terminal_availability(), TerminalAvailability::Available);
+
+                // A bound ACP chat WITH a session has no interactive resume CLI
+                // wired — the toggle stays disabled, but the reason is distinct
+                // from "no session yet" (the GUI-found misleading-hint bug).
+                view.backend.transport = Transport::Acp;
+                assert!(view.terminal_launch_spec().is_none(), "ACP → no companion terminal");
+                assert_eq!(
+                    view.terminal_availability(),
+                    TerminalAvailability::NoInteractiveResume,
+                    "sent a message but ACP has no resume CLI — not 'send a message first'"
+                );
+                view.backend.transport = Transport::StreamJson;
 
                 // Switching to Terminal is a no-op until the host attaches one.
                 view.set_view_mode(ChatViewMode::Terminal, window, cx);

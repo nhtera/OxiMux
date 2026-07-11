@@ -7,11 +7,12 @@
 //! user messages and `control_response`s. Relaunch-survival is provided later by
 //! transcript persistence + `--resume`, not the relay.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
@@ -206,21 +207,48 @@ impl ClaudeStreamJsonConnection {
         let mut child = cmd.spawn().context("spawn agent process")?;
         let stdout = child.stdout.take().context("agent stdout missing")?;
         let stdin = child.stdin.take().context("agent stdin missing")?;
+        let stderr = child.stderr.take().context("agent stderr missing")?;
+
+        // A bounded ring the stderr thread continuously drains into. Draining is
+        // what removes a latent deadlock: an unread stderr pipe fills its ~64 KiB
+        // OS buffer and blocks the child the moment it writes enough. The stdout
+        // thread snapshots this ring to attach a diagnostic on error paths.
+        let ring: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let ring_err = ring.clone();
+        thread::spawn(move || drain_stderr(stderr, &ring_err));
 
         let (tx, rx) = mpsc::channel();
+        let ring_out = ring.clone();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let Ok(line) = line else { break }; // read error — treat as EOF
                 for ev in decode_line(&line) {
+                    // Attach a best-effort stderr diagnostic just BEFORE an error
+                    // turn-end (state.rs folds it into that turn's error text),
+                    // de-duped against the turn's own error string + redacted.
+                    if let ThreadEvent::TurnEnded { is_error: true, result, .. } = &ev
+                        && let Some(diag) = take_stderr_diagnostic(&ring_out, result.as_deref())
+                        && tx.send(ThreadEvent::Diagnostic(diag)).is_err()
+                    {
+                        return;
+                    }
                     if tx.send(ev).is_err() {
                         return; // consumer gone — stop reading
                     }
                 }
             }
-            // stdout closed: the sender drops here, so the consumer observes a
-            // disconnect. The app treats a disconnect with a pending permission
-            // as a fail-closed Reject.
+            // stdout closed. If the child died WITHOUT emitting an error result
+            // (a crash / failed exec / unexpected early exit), its stderr is the
+            // only diagnostic there is — surface it directly as an Error (not a
+            // stashed Diagnostic, which would have no TurnEnded to fold it). A
+            // clean exit leaves stderr empty, so nothing spurious shows.
+            if let Some(diag) = take_stderr_diagnostic(&ring_out, None) {
+                let _ = tx.send(ThreadEvent::Error(diag));
+            }
+            // The sender drops here, so the consumer observes a disconnect. The
+            // app treats a disconnect with a pending permission as a fail-closed
+            // Reject.
         });
 
         Ok((
@@ -242,6 +270,98 @@ impl ClaudeStreamJsonConnection {
         writeln!(stdin, "{v}").context("write to agent stdin")?;
         stdin.flush().context("flush agent stdin")?;
         Ok(())
+    }
+}
+
+/// Last N bytes of child stderr retained in the diagnostic ring. Bounded so the
+/// memory stays flat regardless of how noisy the child is; 8 KiB comfortably
+/// holds a panic message or an API-error dump.
+const STDERR_RING_CAP: usize = 8 * 1024;
+
+/// Continuously drain the child's stderr into the bounded ring, dropping the
+/// oldest bytes past the cap. Runs on its own thread for the child's lifetime;
+/// exits on EOF or a read error. Draining (not the ring itself) is what prevents
+/// a full-pipe deadlock.
+fn drain_stderr(stderr: ChildStderr, ring: &Arc<Mutex<VecDeque<u8>>>) {
+    let mut reader = BufReader::new(stderr);
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if let Ok(mut guard) = ring.lock() {
+                    for &b in &buf[..n] {
+                        if guard.len() >= STDERR_RING_CAP {
+                            guard.pop_front();
+                        }
+                        guard.push_back(b);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot-and-clear the stderr ring, returning a redacted diagnostic ONLY when
+/// it adds new information. `error_text` (the turn's own error string) drives the
+/// de-dupe: the stale-resume stderr is byte-identical to the `errors[]`-derived
+/// text, so appending both would print the same sentence twice. Returns `None`
+/// when the ring is empty, whitespace-only, or a duplicate of `error_text`.
+/// Best-effort: stdout and stderr are independent pipes, so the snapshot may
+/// include bytes from a nearby turn (accepted — attribution is not turn-precise).
+fn take_stderr_diagnostic(ring: &Arc<Mutex<VecDeque<u8>>>, error_text: Option<&str>) -> Option<String> {
+    let raw: Vec<u8> = {
+        let mut guard = ring.lock().ok()?;
+        if guard.is_empty() {
+            return None;
+        }
+        guard.drain(..).collect()
+    };
+    let text = String::from_utf8_lossy(&raw).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(err) = error_text {
+        let err = err.trim();
+        if err == text || err.contains(&text) {
+            return None; // stderr duplicates the turn's own error text
+        }
+    }
+    Some(redact_secrets(&text))
+}
+
+/// Strip secret-shaped values from a diagnostic before it reaches any UI or
+/// persisted surface. The child inherits OxiMux's full environment (no
+/// `env_clear`), so an auth/config error could echo a live token. Redacts (a)
+/// the value of every currently-set `*_API_KEY` / `*_TOKEN` / `*_SECRET` env var
+/// and (b) known secret-shaped tokens (`sk-ant-…`, `sk-…`).
+fn redact_secrets(text: &str) -> String {
+    let mut out = text.to_string();
+    for (name, value) in std::env::vars() {
+        let upper = name.to_ascii_uppercase();
+        let secretish = upper.ends_with("_API_KEY")
+            || upper.ends_with("_TOKEN")
+            || upper.ends_with("_SECRET");
+        // Guard on a minimum length so a short/empty value (e.g. `TOKEN=""` or a
+        // one-char flag) can't blanket-replace common substrings.
+        if secretish && value.len() >= 8 && out.contains(&value) {
+            out = out.replace(&value, "[redacted]");
+        }
+    }
+    redact_prefixed(&mut out, "sk-ant-");
+    redact_prefixed(&mut out, "sk-");
+    out
+}
+
+/// Replace every `prefix`-led token (the prefix plus the following run of
+/// non-whitespace) with `[redacted]`. Terminates because the replacement never
+/// contains `prefix`.
+fn redact_prefixed(text: &mut String, prefix: &str) {
+    while let Some(pos) = text.find(prefix) {
+        let rest = &text[pos + prefix.len()..];
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let end = pos + prefix.len() + tok_len;
+        text.replace_range(pos..end, "[redacted]");
     }
 }
 
@@ -475,6 +595,61 @@ mod tests {
         assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max"]);
         assert_eq!(conn.default_effort().as_deref(), Some("high"));
         assert!(conn.capabilities().supports_rewind);
+    }
+
+    #[test]
+    fn redact_secrets_strips_env_values_and_sk_tokens() {
+        // A planted secret-suffixed env var value must be stripped from a
+        // diagnostic; so must a bare sk-ant token that isn't sourced from env.
+        // SAFETY: single-threaded test, restored immediately after.
+        unsafe { std::env::set_var("OXIMUX_TEST_API_KEY", "supersecretvalue12345") };
+        let dirty = "auth failed for key supersecretvalue12345 and token sk-ant-abc123XYZ.";
+        let clean = redact_secrets(dirty);
+        unsafe { std::env::remove_var("OXIMUX_TEST_API_KEY") };
+        assert!(!clean.contains("supersecretvalue12345"), "env secret leaked: {clean}");
+        assert!(!clean.contains("sk-ant-abc123XYZ"), "sk-ant token leaked: {clean}");
+        assert!(clean.contains("[redacted]"));
+        // A too-short env value must not blanket-replace common substrings.
+        unsafe { std::env::set_var("OXIMUX_TEST_TOKEN", "ab") };
+        let benign = redact_secrets("about the abstract abbey");
+        unsafe { std::env::remove_var("OXIMUX_TEST_TOKEN") };
+        assert_eq!(benign, "about the abstract abbey", "short value must not redact");
+    }
+
+    #[test]
+    fn take_stderr_diagnostic_dedupes_against_error_text() {
+        // stderr byte-identical to the turn's error text → no diagnostic (the
+        // stale-resume case, where appending both prints the sentence twice).
+        let err = "No conversation found with session ID: x";
+        let ring: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(err.bytes().collect()));
+        assert_eq!(take_stderr_diagnostic(&ring, Some(err)), None, "duplicate stderr suppressed");
+        // Distinct stderr → returned (redacted). Ring re-filled since drain clears.
+        let ring2: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(b"unrelated panic: boom".to_vec().into()));
+        assert_eq!(take_stderr_diagnostic(&ring2, Some(err)).as_deref(), Some("unrelated panic: boom"));
+        // Empty ring → None.
+        let empty: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+        assert_eq!(take_stderr_diagnostic(&empty, None), None);
+    }
+
+    /// A child that floods stderr with far more than the OS pipe buffer (~64 KiB)
+    /// before exiting must NOT deadlock — proves the drain thread keeps the pipe
+    /// clear. The ring keeps only a bounded tail.
+    #[test]
+    fn large_stderr_does_not_block_child() {
+        let mut cmd = Command::new("sh");
+        // 200 KiB to stderr, one stream-json result line to stdout, then exit.
+        cmd.arg("-c").arg(
+            "yes ERRORLINE | head -c 200000 1>&2; \
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\"}'",
+        );
+        let (_conn, rx) = ClaudeStreamJsonConnection::spawn_command(cmd).expect("spawn");
+        let mut saw_turn_end = false;
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(10)) {
+            if matches!(ev, ThreadEvent::TurnEnded { .. }) {
+                saw_turn_end = true;
+            }
+        }
+        assert!(saw_turn_end, "child that floods stderr still reaches TurnEnded (no deadlock)");
     }
 
     /// Spawn a FAKE program that prints two stream-json lines; the reader

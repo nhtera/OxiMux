@@ -503,32 +503,44 @@ impl ProjectPanes {
                     // to its own settings key by `save_persisted_tabs`). A chat
                     // with no session id yet restores fresh.
                     PaneGroupTabKind::AgentChat { cwd, model } => {
-                        let session_id = if let crate::shell::pane_content::PaneContent::AgentChat(
-                            view,
-                        ) = &tab.content
-                        {
-                            let v = view.read(cx);
-                            // An unbound *New Agent* draft never spawned a
-                            // subprocess and has no session or messages — nothing
-                            // to restore. Skip it (like Diff/Tasks) so it doesn't
-                            // mis-restore as a bound Claude chat; the user reopens
-                            // a fresh draft from the launcher.
-                            if v.is_unbound() {
-                                continue;
-                            }
-                            if let Some(t) = v.transcript_snapshot() {
-                                chat_transcripts.push(t);
-                            }
-                            v.session_id().map(str::to_string)
-                        } else {
-                            None
-                        };
+                        let (session_id, draft, queued, unbound) =
+                            if let crate::shell::pane_content::PaneContent::AgentChat(view) =
+                                &tab.content
+                            {
+                                let v = view.read(cx);
+                                let draft = {
+                                    let d = v.draft_text(cx);
+                                    (!d.trim().is_empty()).then_some(d)
+                                };
+                                let queued = v.queued_texts(cx);
+                                let unbound = v.is_unbound();
+                                // An unbound *New Agent* draft with nothing typed
+                                // or queued isn't worth restoring — skip it (like
+                                // Diff/Tasks). One WITH unsent text keeps its own
+                                // entry so the text isn't silently lost.
+                                if unbound && draft.is_none() && queued.is_empty() {
+                                    continue;
+                                }
+                                // Bound chats persist their transcript blob; an
+                                // unbound draft has none (no completed turn).
+                                if !unbound
+                                    && let Some(t) = v.transcript_snapshot()
+                                {
+                                    chat_transcripts.push(t);
+                                }
+                                (v.session_id().map(str::to_string), draft, queued, unbound)
+                            } else {
+                                (None, None, Vec::new(), false)
+                            };
                         (
                             None,
                             PersistedTabKind::AgentChat {
                                 cwd: cwd.display().to_string(),
                                 model: model.clone(),
                                 session_id,
+                                draft,
+                                queued,
+                                unbound,
                             },
                         )
                     }
@@ -967,6 +979,8 @@ impl ProjectPanes {
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
         thinking_level: crate::shell::agent_chat::ThinkingLevel,
+        draft: Option<String>,
+        queued: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -975,8 +989,28 @@ impl ProjectPanes {
         };
         group.update(cx, |g, cx| {
             g.open_agent_chat_tab_restored(
-                cwd, model, backend, session_id, entries, slash_commands, thinking_level, window, cx,
+                cwd, model, backend, session_id, entries, slash_commands, thinking_level, draft,
+                queued, window, cx,
             );
+        });
+    }
+
+    /// Restore an UNBOUND *New Agent* draft into a SPECIFIC group (multi-group
+    /// restore). No-op when `group_id` isn't registered.
+    pub fn open_agent_chat_unbound_in_group_restore(
+        &mut self,
+        group_id: PaneGroupId,
+        cwd: PathBuf,
+        draft: Option<String>,
+        queued: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.groups.get(&group_id).cloned() else {
+            return;
+        };
+        group.update(cx, |g, cx| {
+            g.open_agent_chat_tab_unbound_restored(cwd, draft, queued, window, cx);
         });
     }
 

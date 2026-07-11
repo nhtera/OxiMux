@@ -142,9 +142,20 @@ fn is_terminal_status(s: &str) -> bool {
 
 fn decode_stream_event(v: &Value) -> Vec<ThreadEvent> {
     let ev = &v["event"];
-    if ev.get("type").and_then(Value::as_str) != Some("content_block_delta") {
-        return Vec::new();
+    match ev.get("type").and_then(Value::as_str) {
+        Some("content_block_delta") => decode_content_block_delta(ev),
+        // Live usage: `message_start.message.usage` seeds the turn's input/cache
+        // counts; `message_delta.usage` carries the running totals (output grows).
+        // Neither carries a context-window size (verified live) — the state-side
+        // denominator cache fills that gap.
+        Some("message_start") => live_usage(ev.get("message").and_then(|m| m.get("usage"))),
+        Some("message_delta") => live_usage(ev.get("usage")),
+        _ => Vec::new(),
     }
+}
+
+/// A `content_block_delta` → the streamed text/thinking delta it carries.
+fn decode_content_block_delta(ev: &Value) -> Vec<ThreadEvent> {
     let delta = &ev["delta"];
     match delta.get("type").and_then(Value::as_str) {
         Some("text_delta") => match delta.get("text").and_then(Value::as_str) {
@@ -158,6 +169,22 @@ fn decode_stream_event(v: &Value) -> Vec<ThreadEvent> {
         // signature_delta / input_json_delta → not rendered.
         _ => Vec::new(),
     }
+}
+
+/// Build a `LiveUsage` from a Claude streaming `usage` object. `None`/absent →
+/// no event. `context_window` is always `None` here (Claude's live events omit
+/// it); `cost_usd` too (cost is known only at turn-end).
+fn live_usage(usage: Option<&Value>) -> Vec<ThreadEvent> {
+    let Some(u) = usage else { return Vec::new() };
+    let count = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    vec![ThreadEvent::LiveUsage(TurnUsage {
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        cache_read_tokens: count("cache_read_input_tokens"),
+        cache_creation_tokens: count("cache_creation_input_tokens"),
+        context_window: None,
+        cost_usd: None,
+    })]
 }
 
 fn decode_assistant(v: &Value) -> Vec<ThreadEvent> {
@@ -335,11 +362,43 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
         .and_then(Value::as_str)
         .is_some_and(|s| s.starts_with("error"))
         || v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-    vec![ThreadEvent::TurnEnded {
-        result: v.get("result").and_then(Value::as_str).map(str::to_string),
-        usage: decode_usage(v),
-        is_error,
-    }]
+    // Prefer the `errors[]` array (the API/CLI error carrier) over the plain
+    // `result` string. A real turn error — e.g. a stale `--resume` — leaves
+    // `result` absent and puts the message under `errors`; without this arm that
+    // shape falls through to the generic "turn ended with error" string in the
+    // state machine. A populated `result` (e.g. a bad-model 404) is the fallback.
+    let result = decode_errors(v).or_else(|| v.get("result").and_then(Value::as_str).map(str::to_string));
+    let mut out = Vec::new();
+    // A stale `--resume` (session gone) needs recovery, not just a message: emit
+    // an additive event so the fold clears the dead session id and the next send
+    // starts fresh instead of looping the same error. The attempted id is the
+    // one the error result echoes back.
+    if is_error
+        && let Some(text) = result.as_deref()
+        && is_stale_resume_error(text)
+    {
+        out.push(ThreadEvent::SessionResumeStale {
+            attempted_id: str_field(v, "session_id"),
+        });
+    }
+    out.push(ThreadEvent::TurnEnded { result, usage: decode_usage(v), is_error });
+    out
+}
+
+/// Join a result's `errors[]` string entries (the CLI's primary error-text
+/// carrier) with newlines. `None` when the key is absent or the array holds no
+/// strings — the decoder then falls back to the plain `result` field.
+fn decode_errors(v: &Value) -> Option<String> {
+    let arr = v.get("errors")?.as_array()?;
+    let joined: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+    (!joined.is_empty()).then(|| joined.join("\n"))
+}
+
+/// Whether an error's text is the CLI's "session not found" shape from a
+/// `--resume` against a session it no longer has. Matched against the captured
+/// wire wording (`testdata/stream_json_error_stale_resume.jsonl`), not a guess.
+fn is_stale_resume_error(text: &str) -> bool {
+    text.contains("No conversation found with session ID")
 }
 
 /// Decode the token/cost breakdown from a `result` event. Present when the
@@ -577,6 +636,117 @@ mod tests {
             ThreadEvent::TurnEnded { is_error, .. } => assert!(*is_error),
             other => panic!("expected TurnEnded error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn message_start_and_delta_emit_live_usage() {
+        // message_start seeds input/cache; message_delta carries the running
+        // totals (output grows). Neither carries a context window.
+        let start = json!({"type":"stream_event","event":{"type":"message_start",
+            "message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":500,
+                "cache_read_input_tokens":20,"output_tokens":1}}}}).to_string();
+        match &decode_line(&start)[..] {
+            [ThreadEvent::LiveUsage(u)] => {
+                assert_eq!(u.input_tokens, 10);
+                assert_eq!(u.cache_creation_tokens, 500);
+                assert_eq!(u.cache_read_tokens, 20);
+                assert_eq!(u.output_tokens, 1);
+                assert_eq!(u.context_window, None, "Claude live events omit the window");
+                assert_eq!(u.cost_usd, None);
+            }
+            other => panic!("expected LiveUsage, got {other:?}"),
+        }
+        let delta = json!({"type":"stream_event","event":{"type":"message_delta",
+            "usage":{"input_tokens":10,"cache_read_input_tokens":20,
+                "cache_creation_input_tokens":500,"output_tokens":160}}}).to_string();
+        match &decode_line(&delta)[..] {
+            [ThreadEvent::LiveUsage(u)] => assert_eq!(u.output_tokens, 160),
+            other => panic!("expected LiveUsage, got {other:?}"),
+        }
+        // A message_delta with no usage object → nothing.
+        let bare = json!({"type":"stream_event","event":{"type":"message_delta","delta":{}}}).to_string();
+        assert!(decode_line(&bare).is_empty());
+    }
+
+    #[test]
+    fn decode_result_prefers_errors_array_over_result_field() {
+        // The `errors[]` array is the primary error carrier; a `result` string,
+        // when both are present, is the fallback. Here only `errors[]` exists.
+        let l = json!({"type":"result","subtype":"error_during_execution","is_error":true,
+            "session_id":"sid-x",
+            "errors":["boom one","boom two"]}).to_string();
+        let evs = decode_line(&l);
+        let te = evs.iter().find(|e| matches!(e, ThreadEvent::TurnEnded { .. })).expect("TurnEnded");
+        match te {
+            ThreadEvent::TurnEnded { result, is_error, .. } => {
+                assert!(is_error);
+                assert_eq!(result.as_deref(), Some("boom one\nboom two"), "errors[] joined with newline");
+            }
+            _ => unreachable!(),
+        }
+        // A `result` field with no `errors[]` still decodes as before.
+        let plain = json!({"type":"result","subtype":"success","is_error":true,
+            "result":"model not found"}).to_string();
+        match decode_line(&plain).into_iter().next().unwrap() {
+            ThreadEvent::TurnEnded { result, .. } => assert_eq!(result.as_deref(), Some("model not found")),
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_resume_fixture_emits_recovery_event_before_turn_end() {
+        // The captured real stale-`--resume` error: no `result` field, the text
+        // rides in `errors[]`, and `session_id` echoes the attempted id. Decode
+        // must surface both a SessionResumeStale (carrying that id) AND the
+        // error TurnEnded, in that order.
+        let fixture = include_str!("testdata/stream_json_error_stale_resume.jsonl");
+        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ThreadEvent::SessionResumeStale { .. },
+                ThreadEvent::TurnEnded { is_error: true, .. },
+            ]
+        ), "got {events:?}");
+        match &events[0] {
+            ThreadEvent::SessionResumeStale { attempted_id } => {
+                assert_eq!(attempted_id, "00000000-0000-0000-0000-000000000000");
+            }
+            _ => unreachable!(),
+        }
+        match &events[1] {
+            ThreadEvent::TurnEnded { result, .. } => {
+                assert_eq!(
+                    result.as_deref(),
+                    Some("No conversation found with session ID: 00000000-0000-0000-0000-000000000000"),
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn api_error_fixture_surfaces_result_text_not_generic() {
+        // A generic API error (bad model) carries its message in `result`, no
+        // `errors[]`, and must NOT be mistaken for a stale-resume.
+        let fixture = include_str!("testdata/stream_json_error_api.jsonl");
+        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
+        assert!(!events.iter().any(|e| matches!(e, ThreadEvent::SessionResumeStale { .. })));
+        let te = events.iter().find(|e| matches!(e, ThreadEvent::TurnEnded { .. })).expect("TurnEnded");
+        match te {
+            ThreadEvent::TurnEnded { result, is_error, .. } => {
+                assert!(is_error);
+                assert!(result.as_deref().unwrap().contains("selected model"), "actual error text surfaced");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn is_stale_resume_error_matches_captured_wording() {
+        assert!(is_stale_resume_error("No conversation found with session ID: abc-123"));
+        assert!(!is_stale_resume_error("There's an issue with the selected model"));
+        assert!(!is_stale_resume_error("turn ended with error"));
     }
 
     #[test]

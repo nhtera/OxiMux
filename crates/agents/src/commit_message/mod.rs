@@ -141,7 +141,7 @@ async fn generate_agent(
         &prompt_text,
     )?;
     let workdir: &Path = context.workdir.as_path();
-    let message = run_plan(plan, workdir, cancel).await?;
+    let message = run_plan(plan, workdir, cancel, GENERATION_TIMEOUT).await?;
     Ok(message)
 }
 

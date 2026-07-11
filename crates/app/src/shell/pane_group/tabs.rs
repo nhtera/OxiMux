@@ -805,6 +805,8 @@ impl PaneGroup {
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
         thinking_level: crate::shell::agent_chat::ThinkingLevel,
+        draft: Option<String>,
+        queued: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -829,7 +831,45 @@ impl PaneGroup {
                 cx,
             )
         });
+        if draft.is_some() || !queued.is_empty() {
+            view.update(cx, |v, cx| v.seed_draft_and_queue(draft, queued, window, cx));
+        }
         self.push_agent_chat_view(view, cwd, model, window, cx)
+    }
+
+    /// Restore an UNBOUND *New Agent* draft: rebuild the unbound picker shape
+    /// (no session, "New Agent" label, agent/model picker) and seed the persisted
+    /// draft + queued text. Distinct from [`Self::open_agent_chat_tab_restored`],
+    /// which restores an already-bound chat via `new_resumed`.
+    pub fn open_agent_chat_tab_unbound_restored(
+        &mut self,
+        cwd: PathBuf,
+        draft: Option<String>,
+        queued: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cwd_for_view = cwd.clone();
+        let backend = oximux_agents::thread::ChatBackend::stream_json();
+        let view = cx.new(|cx| {
+            crate::shell::agent_chat::AgentChatView::new_unbound(
+                cwd_for_view,
+                None,
+                backend,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        if draft.is_some() || !queued.is_empty() {
+            view.update(cx, |v, cx| v.seed_draft_and_queue(draft, queued, window, cx));
+        }
+        self.push_agent_chat_view(view, cwd, None, window, cx)
     }
 
     /// Shared tab-push for a freshly-built chat view (new or restored): assigns
@@ -950,6 +990,8 @@ impl PaneGroup {
                     entries.clone(),
                     slash_commands.clone(),
                     *thinking_level,
+                    None,
+                    Vec::new(),
                     window,
                     cx,
                 );
@@ -1170,6 +1212,8 @@ impl PaneGroup {
             entries,
             Vec::new(),
             crate::shell::agent_chat::ThinkingLevel::default(),
+            None,
+            Vec::new(),
             window,
             cx,
         );

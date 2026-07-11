@@ -147,6 +147,13 @@ pub(super) fn render_launch_card(
         typography,
     ));
     rows.push(setting_row_desc(
+        "Auto-name chats",
+        "Generate a short chat title from your first message via a quick haiku call. On by default; ACP agents use their own titles.",
+        auto_title_toggle(modal, theme, cx),
+        theme,
+        typography,
+    ));
+    rows.push(setting_row_desc(
         "Default agent",
         "Surfaced first in the launcher.",
         default_agent_chips(modal, theme, density, typography, cx),
@@ -220,6 +227,25 @@ fn status_hooks_toggle(
         theme,
         |this, _w, cx| {
             this.agent_launch.status_hooks_enabled = !this.agent_launch.status_hooks_enabled;
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    )
+}
+
+/// The auto-title toggle: when on, a new Claude/Codex chat generates a short LLM
+/// title from its first message. Global; ACP chats always use their native title.
+fn auto_title_toggle(
+    modal: &SettingsModal,
+    theme: Theme,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    toggle_switch(
+        "launch-auto-title",
+        modal.agent_launch.auto_title_enabled,
+        theme,
+        |this, _w, cx| {
+            this.agent_launch.auto_title_enabled = !this.agent_launch.auto_title_enabled;
             this.persist_agent_launch(cx);
         },
         cx,

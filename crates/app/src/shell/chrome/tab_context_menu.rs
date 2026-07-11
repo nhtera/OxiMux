@@ -78,10 +78,11 @@ struct TabContextTarget {
     /// "Switch to Terminal View") instead of the full right-click context menu.
     /// Set by the agent-chat tab's eye button.
     view_only: bool,
-    /// For an agent-chat tab: whether its companion terminal can be opened yet
-    /// (`Some(true)`), needs a first message (`Some(false)`), or the tab isn't a
-    /// chat (`None`). Drives the terminal-view row's enabled state + hint.
-    chat_terminal_available: Option<bool>,
+    /// For an agent-chat tab: whether its companion terminal can be opened —
+    /// `Some(Available)`, `Some(NoSessionYet)`, `Some(NoInteractiveResume)` — or
+    /// `None` when the tab isn't a chat. Drives the terminal-view row's enabled
+    /// state and which hint the disabled row shows.
+    chat_terminal_available: Option<crate::shell::agent_chat::TerminalAvailability>,
 }
 
 pub struct TabContextMenu {
@@ -127,7 +128,7 @@ impl TabContextMenu {
         is_pinned: bool,
         can_tear_off: bool,
         view_only: bool,
-        chat_terminal_available: Option<bool>,
+        chat_terminal_available: Option<crate::shell::agent_chat::TerminalAvailability>,
         cx: &mut Context<Self>,
     ) {
         self.x_px = x_px;
@@ -166,8 +167,12 @@ impl TabContextMenu {
         y_px: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        use crate::shell::agent_chat::TerminalAvailability;
         use gpui::IntoElement;
-        let available = target.chat_terminal_available.unwrap_or(false);
+        let availability = target
+            .chat_terminal_available
+            .unwrap_or(TerminalAvailability::NoSessionYet);
+        let available = availability == TerminalAvailability::Available;
         let group = target.group.clone();
         let ix = target.tab_idx;
 
@@ -205,13 +210,22 @@ impl TabContextMenu {
                     .text_color(theme.fg_subtle)
                     .child("Switch to Terminal View"),
             );
+            // Honest hint per reason: "send a message first" ONLY when there's
+            // genuinely no session yet — a bound agent with no interactive resume
+            // CLI (ACP) gets a distinct message (sending again wouldn't help).
+            let hint = match availability {
+                TerminalAvailability::NoInteractiveResume => {
+                    "No interactive terminal for this agent"
+                }
+                _ => "Send a message first",
+            };
             card = card.child(
                 div()
                     .px(px(ROW_PADDING_X))
                     .pb(px(4.0))
                     .text_size(px(11.0))
                     .text_color(theme.fg_subtle)
-                    .child("Send a message first"),
+                    .child(hint),
             );
         }
 

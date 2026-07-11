@@ -165,6 +165,13 @@ pub struct AgentLaunchSettings {
     /// adapter is unaffected. Serde-default `Terminal`, so existing configs and
     /// the classic new-agent flow are unchanged on upgrade.
     pub default_open_mode: OpenMode,
+    /// Auto-generate a short LLM tab title after the first message on a
+    /// Claude/Codex chat (a one-shot `claude -p --model haiku` call, ~10s-capped,
+    /// haiku-priced). **On by default**; a user can disable it in Settings →
+    /// Agents to avoid the per-chat billed spawn. ACP chats are always skipped
+    /// (their agents push a native title). A missing key picks up this `true`
+    /// default via the container-level `#[serde(default)]`.
+    pub auto_title_enabled: bool,
     /// Per-agent overrides keyed by adapter id.
     pub agents: BTreeMap<String, PerAgentLaunch>,
 }
@@ -178,6 +185,8 @@ impl Default for AgentLaunchSettings {
             // TOML still wins (a present value overrides this default).
             status_hooks_enabled: true,
             default_open_mode: OpenMode::Terminal,
+            // On by default — see the field docs. An explicit `false` still wins.
+            auto_title_enabled: true,
             agents: BTreeMap::new(),
         }
     }
@@ -711,5 +720,18 @@ also_unknown = true
         let s = AgentLaunchSettings::from_toml_str(toml).expect("parse");
         assert_eq!(s.default_agent, "codex");
         assert_eq!(s.args_for("codex"), vec!["-m", "gpt-5.5"]);
+    }
+
+    #[test]
+    fn auto_title_defaults_on_and_back_compat() {
+        // Default is ON.
+        assert!(AgentLaunchSettings::default().auto_title_enabled);
+        // A config with no `auto_title_enabled` key (pre-feature) still loads with
+        // the `true` default (container-level `#[serde(default)]`).
+        let old = AgentLaunchSettings::from_toml_str("default_agent = \"claude\"").expect("parse");
+        assert!(old.auto_title_enabled, "missing key → default on");
+        // An explicit `false` wins.
+        let off = AgentLaunchSettings::from_toml_str("auto_title_enabled = false").expect("parse");
+        assert!(!off.auto_title_enabled);
     }
 }
