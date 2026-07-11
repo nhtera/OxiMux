@@ -18,6 +18,8 @@ Design: `AcpPreset` gains `interactive_resume: Option<fn(&str) -> Vec<String>>` 
 
 Gate `cargo test --workspace --no-fail-fast` green at **2868 / 0** (+2: opencode-wiring + session-id-charset tests). A `code-reviewer` pass (independent `cargo check`/`clippy` + a rustc repro confirming the dropped-`PartialEq` rationale) returned clean — no Critical/High/Medium; two informational edge notes (the `Custom` adapter ignores `model`/`args` overrides — now doc-noted; preset resolution matches by command and fails closed for a user-overridden wrapper — correct-by-design).
 
+**GUI-verified end-to-end** (computer-use, live app): opened an OpenCode chat, sent a message → bound (session id minted, live context meter visible); ⌃⇧V spawned a real `opencode --session <id>` terminal (exact argv confirmed via `ps`) that replayed the exact transcript — the same session, not a fork (gate 1 live). A concurrent chat-side send with the terminal attached left both turns intact and `opencode export` valid JSON with all messages (gate 2 live). Closing the chat tab reaped the companion.
+
 ---
 
 ### 2026-07-11 — Agent Chat round-3 completion: adapter correctness + chat-UI gaps
