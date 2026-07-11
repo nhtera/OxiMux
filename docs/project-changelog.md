@@ -4,6 +4,35 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-11 — Agent Chat: functional ACP EnvVar auth (respawn-with-env)
+
+**Touches**: `crates/agents/{src/thread/{connect,acp/{mod,worker}}.rs,examples/{mock_acp_env_auth_agent,acp_env_auth_smoke}.rs (new),Cargo.toml}`, `crates/app/src/shell/agent_chat/{mod,auth_card}.rs`
+
+Turns EnvVar-kind ACP auth from an instructions-only card into a working sign-in. The card now shows a **masked secret field per advertised variable**; on submit OxiMux **respawns the agent subprocess with those values in its environment**, then authenticates — the only way an env-credentialed agent can sign in, since a running process can't pick up env after it spawned and `AuthenticateRequest` carries no credential values.
+
+- **Agent side.** `ConnectSpec` gained `env` + `auth_method`; `AcpConnection::spawn` is now a thin wrapper over `spawn_with_env` (existing callers unchanged). The worker builds the child via `AcpAgent::from_args` with leading `NAME=value` tokens so the secrets land in the process **environment, never argv** (no `ps` leak); the no-env path still uses `from_str` (byte-identical). After a respawn the worker `authenticate`s the seeded method **once** on the first `AuthRequired`, then retries the open (falling through to the interactive card on failure).
+- **App side.** Masked `InputState` fields are reconciled from the card in `render` (the event fold has no `Window`); `submit_env_auth` reads them straight into the respawn's in-flight `ConnectSpec.env` and **never** into the persisted transcript. Plain `respawn` (Stop→resume, live switch) is unchanged — it's `respawn_with_env(vec![], None)`.
+
+Gates: `cargo test --workspace --no-fail-fast` green (**2833/0**). New `acp_env_auth_smoke` + `mock_acp_env_auth_agent` prove the env reaches the child and the auto-authenticate opens the session; the existing `acp_auth_smoke` (Agent-kind, no respawn) stays green. A `code-reviewer` pass found no secret leak (traced the argv/env split into the vendored `agent-client-protocol` source) and three non-blocking issues — a multi-EnvVar-method field-sharing edge, a spawn-failure card-precedence edge, and doc drift — all addressed. Closes the deferred follow-up from `plans/260710-2327-acp-round2-correctness-ux/` phase 4.
+
+---
+
+### 2026-07-11 — Agent Chat: ACP round-2 correctness + UX (P1–P5)
+
+**Touches**: `crates/agents/{Cargo.toml,src/thread/{acp/{mod,worker,approvals,map,auth (new)},connect,connection,event,mod,state}.rs,examples/*}`, `crates/app/src/shell/agent_chat/{mod,composer,acp_terminal_host,auth_card (new)}.rs`, `docs/system-architecture.md`
+
+Closes the five round-2 ACP client-side correctness gaps + the UX tail found after P1–P5 shipped. Claude/Codex paths byte-identical throughout; wire shapes against `agent-client-protocol-schema 1.4.0`.
+
+- **P1 — turn correctness.** `session/prompt`'s `stop_reason` is no longer discarded: `Refusal`/`MaxTokens`/`MaxTurnRequests` end the turn with the error banner + a human reason (they used to render as clean turns); `EndTurn`/`Cancelled` (+ any future `#[non_exhaustive]` reason) stay clean. `cancel()` now drains the parked `session/request_permission` responders (drop-to-resolve), so a Stop while a permission card is pending answers the agent `Cancelled` instead of leaving its next turn wedged (the ACP child isn't respawned on Stop).
+- **P2 — prompt richness.** Attached images now ride an ACP prompt as base64 `ContentBlock::Image`, gated on `prompt_capabilities.image` (text-only fallback when absent — no rejected turns). Agent-spawned embedded terminals default `PAGER=""`/`GIT_PAGER=cat` so `git log` &c. can't hang on a pager. `mcpServers: []` serialization locked by a tripwire test.
+- **P3 — true session restore.** A restored ACP tab resumes the agent's real context via `session/load` when it advertises `loadSession`; a `replaying` gate drops the agent's history replay (OxiMux repaints its own persisted blob — one code path for all agents, instant paint) while letting control updates through. Non-auth load failure falls back to a fresh session with a visible notice (worst case = today's amnesiac behavior, now explicit).
+- **P4 — auth flow.** A logged-out agent (`AuthRequired`/-32000) is no longer a dead end: its `auth_methods` render an auth card — Agent pill (`authenticate`), Terminal inline login (runs the agent's login command in an embedded terminal), EnvVar instructions — and `authenticate` retries the session on the **same connection** (no respawn). Enables the `unstable_auth_methods` cargo feature (the env-var/terminal `AuthMethod` variants are feature-gated at the pinned schema; the plan's validation log had wrongly assumed they were stable). EnvVar landed instructions-only here; its functional respawn-with-env sign-in shipped in the follow-up above.
+- **P5 — UX tail.** Permission requests surface the agent's **extra allow-kind options** as pills that answer with their exact `option_id` (reject-kind stays behind the base Reject button; Claude's card byte-identical — empty suggestions for a plain allow/reject request). A `ThoughtLevel`-category config option drives the reasoning-effort picker in-session (mirroring the ACP model picker; the Model-only extractor generalized to `select_for(category)`). Slash-command argument hints (`AvailableCommand.input`) feed the composer's existing usage-hint strip.
+
+Gates: `cargo test --workspace --no-fail-fast` green (**2833/0**, +29). Six new headless smokes + mock agents (`acp_{cancel,load,auth}_smoke`) exercise the real regressions each phase fixes; the existing `acp_terminal_smoke` stays green. A `code-reviewer` pass confirmed P1/P2/P3/P5 solid and caught two real P4 bugs — a composer lockup (a prompt sent while the auth card showed wedged `turn_active` forever + left a phantom transcript entry) and a dropped `AuthMethodTerminal.env` — both fixed (Send now gates on a pending auth prompt + the worker seals a raced prompt as an error turn; terminal-login env threaded through). Plan: `plans/260710-2327-acp-round2-correctness-ux/`.
+
+---
+
 ### 2026-07-10 — Agent Chat: normalized tool-detail classifier (P5)
 
 **Touches**: `crates/agents/src/thread/{tool_detail (new),tool_call,event,state,mod,acp/map}.rs`, `crates/app/src/shell/agent_chat/tool_bodies.rs`, `docs/system-architecture.md`

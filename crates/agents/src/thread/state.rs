@@ -35,6 +35,11 @@ pub struct ChatThread {
     /// restored session shows names-only until the live refresh arrives. The
     /// palette renders a muted description under a command when one is present.
     pub slash_command_descriptions: std::collections::HashMap<String, String>,
+    /// Argument hint per slash command, keyed by command name (ACP
+    /// `AvailableCommand.input`) — shown as trailing muted text in the palette.
+    /// Ephemeral like [`Self::slash_command_descriptions`]: NOT persisted,
+    /// repopulated on the live `SlashCommandsUpdated` refresh.
+    pub slash_command_hints: std::collections::HashMap<String, String>,
     /// The agent's current execution plan (ACP `Plan` session update), rendered as
     /// a pinned checklist. `None` when there's no plan (or it was cleared). Held
     /// in-memory only — a restored chat starts planless and re-renders when the
@@ -117,11 +122,13 @@ impl ChatThread {
         let permission_mode = self.permission_mode.take();
         let slash_commands = std::mem::take(&mut self.slash_commands);
         let slash_command_descriptions = std::mem::take(&mut self.slash_command_descriptions);
+        let slash_command_hints = std::mem::take(&mut self.slash_command_hints);
         *self = Self {
             model,
             permission_mode,
             slash_commands,
             slash_command_descriptions,
+            slash_command_hints,
             ..Self::default()
         };
     }
@@ -396,7 +403,7 @@ impl ChatThread {
                 // plan card rather than pinning an empty one.
                 self.plan = (!entries.is_empty()).then(|| entries.clone());
             }
-            ThreadEvent::SlashCommandsUpdated { commands, descriptions } => {
+            ThreadEvent::SlashCommandsUpdated { commands, descriptions, hints } => {
                 // An explicit mid-session refresh is authoritative (unlike the
                 // keep-last-non-empty `SessionInit` seed): the agent is telling us
                 // its current command set.
@@ -409,6 +416,13 @@ impl ChatThread {
                     .filter(|(_, d)| !d.is_empty())
                     .map(|(c, d)| (c.clone(), d.clone()))
                     .collect();
+                // Same for the parallel argument-hint list.
+                self.slash_command_hints = commands
+                    .iter()
+                    .zip(hints.iter())
+                    .filter(|(_, h)| !h.is_empty())
+                    .map(|(c, h)| (c.clone(), h.clone()))
+                    .collect();
             }
             ThreadEvent::ModeChanged { mode_id } => {
                 self.permission_mode = Some(mode_id.clone());
@@ -420,6 +434,9 @@ impl ChatThread {
             // (which the worker already updated), and the view re-pulls it. Nothing
             // in the transcript changes, so the fold is a no-op.
             ThreadEvent::ControlsUpdated => {}
+            // Auth is ephemeral, view-owned card state (mounted by the app's event
+            // handler, never persisted in the transcript) — the fold is a no-op.
+            ThreadEvent::AuthRequired { .. } | ThreadEvent::AuthTerminal { .. } => {}
             ThreadEvent::Error(msg) => {
                 self.last_error = Some(msg.clone());
                 self.turn_active = false;
@@ -1198,11 +1215,12 @@ mod tests {
             ],
         });
         // Slash refresh replaces the palette; mode + title update their fields.
-        // `plan` carries a description; `review` is blank → only the described one
-        // lands in the lookup map.
+        // `plan` carries a description + an argument hint; `review` is blank →
+        // only the described/hinted one lands in each lookup map.
         t.apply(&ThreadEvent::SlashCommandsUpdated {
             commands: vec!["plan".into(), "review".into()],
             descriptions: vec!["Draft a plan".into(), String::new()],
+            hints: vec!["what to plan".into(), String::new()],
         });
         t.apply(&ThreadEvent::ModeChanged { mode_id: "acceptEdits".into() });
         t.apply(&ThreadEvent::TitleUpdated { title: "Fix auth".into() });
@@ -1211,6 +1229,8 @@ mod tests {
         assert_eq!(t.slash_commands, vec!["plan".to_string(), "review".to_string()]);
         assert_eq!(t.slash_command_descriptions.get("plan").map(String::as_str), Some("Draft a plan"));
         assert!(!t.slash_command_descriptions.contains_key("review"), "blank description skipped");
+        assert_eq!(t.slash_command_hints.get("plan").map(String::as_str), Some("what to plan"));
+        assert!(!t.slash_command_hints.contains_key("review"), "blank hint skipped");
         assert_eq!(t.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(t.title.as_deref(), Some("Fix auth"));
 

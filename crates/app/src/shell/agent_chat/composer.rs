@@ -313,6 +313,10 @@ pub struct ComposerView {
     /// `slash_catalog` in the palette (the agent knows its own commands best);
     /// empty for backends that advertise names only (Claude/Codex).
     slash_descriptions: std::collections::HashMap<String, String>,
+    /// Argument hints the backend advertised for its commands (ACP
+    /// `AvailableCommand.input`), keyed by name — shown as trailing muted text in
+    /// the palette row. Empty for backends that advertise no argument spec.
+    slash_hints: std::collections::HashMap<String, String>,
     /// The open slash-command palette, or `None` when the caret isn't inside a
     /// `/token` (or the palette is otherwise suppressed).
     palette: Option<SlashPaletteState>,
@@ -447,6 +451,7 @@ impl ComposerView {
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
             slash_descriptions: std::collections::HashMap::new(),
+            slash_hints: std::collections::HashMap::new(),
             palette: None,
             mention_candidates: Vec::new(),
             mention_candidates_loaded: false,
@@ -635,11 +640,16 @@ impl ComposerView {
         &mut self,
         commands: Vec<String>,
         descriptions: std::collections::HashMap<String, String>,
+        hints: std::collections::HashMap<String, String>,
         cx: &mut Context<Self>,
     ) {
-        if self.slash_commands != commands || self.slash_descriptions != descriptions {
+        if self.slash_commands != commands
+            || self.slash_descriptions != descriptions
+            || self.slash_hints != hints
+        {
             self.slash_commands = commands;
             self.slash_descriptions = descriptions;
+            self.slash_hints = hints;
             self.recompute_slash_palette(cx);
             cx.notify();
         }
@@ -1864,7 +1874,14 @@ impl ComposerView {
         }
         let draft = self.input.read(cx).value();
         let name = completed_command(draft.as_ref())?;
-        let hint = self.slash_catalog.get(name)?.argument_hint.clone()?;
+        // The backend's own advertised hint (ACP `AvailableCommand.input`) wins
+        // over the on-disk catalog's `argument-hint`, mirroring the palette
+        // description precedence — the agent knows its commands best.
+        let hint = self
+            .slash_hints
+            .get(name)
+            .cloned()
+            .or_else(|| self.slash_catalog.get(name).and_then(|m| m.argument_hint.clone()))?;
         Some((name.to_string(), hint))
     }
 

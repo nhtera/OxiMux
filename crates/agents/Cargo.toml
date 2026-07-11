@@ -23,9 +23,11 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 # ACP (Agent Client Protocol) client — drives an external agent subprocess
-# (Gemini `--experimental-acp`) over stdio. Core is stable since 1.0.0; no
-# `unstable` features (Gemini needs neither token-usage nor session-fork).
-agent-client-protocol = "1.2"
+# (Gemini `--experimental-acp`) over stdio. Core is stable since 1.0.0.
+# `unstable_auth_methods` is enabled for the env-var / terminal `AuthMethod`
+# variants the auth-flow card renders (the `Agent` variant is stable; the other
+# two are gated behind this feature at the pinned schema).
+agent-client-protocol = { version = "1.2", features = ["unstable_auth_methods"] }
 futures = { workspace = true }
 
 # Unix signal delivery (SIGINT to the headless `claude` child on Stop, so it
@@ -61,3 +63,47 @@ path = "examples/mock_acp_terminal_agent.rs"
 [[example]]
 name = "acp_terminal_smoke"
 path = "examples/acp_terminal_smoke.rs"
+
+# Deterministic mock ACP agent that parks a permission request, and a headless
+# driver that asserts a client cancel resolves it with a Cancelled outcome
+# instead of hanging (not shipped).
+[[example]]
+name = "mock_acp_cancel_agent"
+path = "examples/mock_acp_cancel_agent.rs"
+
+[[example]]
+name = "acp_cancel_smoke"
+path = "examples/acp_cancel_smoke.rs"
+
+# Deterministic mock ACP agent that advertises loadSession + replays history, and
+# a headless driver that asserts session/load resumes the id, suppresses the
+# replayed transcript, and still renders live updates (not shipped).
+[[example]]
+name = "mock_acp_load_agent"
+path = "examples/mock_acp_load_agent.rs"
+
+[[example]]
+name = "acp_load_smoke"
+path = "examples/acp_load_smoke.rs"
+
+# Deterministic mock ACP agent that requires auth, and a headless driver that
+# asserts the client surfaces the methods, authenticates, and opens the session
+# on the same connection (not shipped).
+[[example]]
+name = "mock_acp_auth_agent"
+path = "examples/mock_acp_auth_agent.rs"
+
+[[example]]
+name = "acp_auth_smoke"
+path = "examples/acp_auth_smoke.rs"
+
+# Deterministic mock ACP agent that requires an ENV-VAR credential, and a headless
+# driver that asserts the EnvVar method surfaces bare and a respawn-with-env opens
+# the session (the "set env, then authenticate" flow; not shipped).
+[[example]]
+name = "mock_acp_env_auth_agent"
+path = "examples/mock_acp_env_auth_agent.rs"
+
+[[example]]
+name = "acp_env_auth_smoke"
+path = "examples/acp_env_auth_smoke.rs"

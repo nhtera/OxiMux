@@ -17,8 +17,9 @@
 //! delivers usage out-of-band, not per-turn).
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, Diff, Plan, PlanEntryPriority, PlanEntryStatus, SessionUpdate, Terminal, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    AvailableCommand, AvailableCommandInput, ContentBlock, Diff, Plan, PlanEntryPriority,
+    PlanEntryStatus, SessionUpdate, Terminal, ToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 use serde_json::{Value, json};
 
@@ -42,6 +43,7 @@ pub(crate) fn map_session_update(update: SessionUpdate) -> Vec<ThreadEvent> {
         SessionUpdate::AvailableCommandsUpdate(u) => vec![ThreadEvent::SlashCommandsUpdated {
             commands: u.available_commands.iter().map(|c| c.name.clone()).collect(),
             descriptions: u.available_commands.iter().map(|c| c.description.clone()).collect(),
+            hints: u.available_commands.iter().map(command_hint).collect(),
         }],
         SessionUpdate::CurrentModeUpdate(u) => {
             vec![ThreadEvent::ModeChanged { mode_id: u.current_mode_id.0.to_string() }]
@@ -60,6 +62,17 @@ pub(crate) fn map_session_update(update: SessionUpdate) -> Vec<ThreadEvent> {
         // not mapped here. `UserMessageChunk` is the client's own prompt echoed
         // back — never re-rendered.
         _ => Vec::new(),
+    }
+}
+
+/// The argument hint an ACP command advertises (`AvailableCommand.input`) as a
+/// parallel string for the palette — the placeholder shown after the command name
+/// (e.g. `<what to plan>`). Empty when the command takes no argument / no input
+/// spec, or a future input variant we don't render.
+fn command_hint(cmd: &AvailableCommand) -> String {
+    match &cmd.input {
+        Some(AvailableCommandInput::Unstructured(u)) => u.hint.clone(),
+        _ => String::new(),
     }
 }
 
@@ -439,9 +452,14 @@ mod tests {
     }
 
     #[test]
-    fn available_commands_map_names_with_descriptions() {
+    fn available_commands_map_names_with_descriptions_and_hints() {
+        use agent_client_protocol::schema::v1::{AvailableCommandInput, UnstructuredCommandInput};
         let update = AvailableCommandsUpdate::new(vec![
-            AvailableCommand::new("create_plan", "Draft a plan"),
+            // A command with an argument hint (via its input spec).
+            AvailableCommand::new("create_plan", "Draft a plan").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("what to plan")),
+            ),
+            // A command with no argument → empty hint.
             AvailableCommand::new("research", "Research the codebase"),
         ]);
         let evs = map_session_update(SessionUpdate::AvailableCommandsUpdate(update));
@@ -450,6 +468,7 @@ mod tests {
             vec![ThreadEvent::SlashCommandsUpdated {
                 commands: vec!["create_plan".into(), "research".into()],
                 descriptions: vec!["Draft a plan".into(), "Research the codebase".into()],
+                hints: vec!["what to plan".into(), String::new()],
             }]
         );
     }

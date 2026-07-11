@@ -70,7 +70,7 @@ fn main() {
     }
     let cwd = std::env::current_dir().expect("cwd");
     println!("spawning mock agent: {}", agent_bin.display());
-    let (conn, rx) = AcpConnection::spawn(&agent_bin.to_string_lossy(), &[], &cwd)
+    let (conn, rx) = AcpConnection::spawn(&agent_bin.to_string_lossy(), &[], &cwd, None)
         .expect("spawn AcpConnection");
 
     let mut prompted = false;

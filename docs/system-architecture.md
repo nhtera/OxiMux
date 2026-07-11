@@ -695,16 +695,22 @@ Separate from the raw-PTY terminal runtime above, the **chat** view runs a struc
 | 6× `*_tool_result` variants | ✓ (fwd-compat) | — | — |
 | inline tool-result image | ✓ | ○ | ✓ |
 | message resource-link / image | — | — | ✓ (link→md, image→placeholder) |
-| slash-command descriptions | ○ | — | ✓ (`available_commands_update`) |
+| slash-command descriptions + arg hints | ○ | — | ✓ (`available_commands_update` desc + `input` hint) |
 | live tool-output streaming | ○ | ✓ (`outputDelta`) | ○ |
 | plan panel | ✓ (`TodoWrite`) | ✓ (`turn/plan/updated`) | ✓ (`Plan`) |
 | clarifying question card | ✓ (`AskUserQuestion`) | ✓ (`requestUserInput`) | ○ |
-| permission card | ✓ | ✓ | ✓ (option-label buttons: P3 follow-up) |
+| permission card | ✓ | ✓ | ✓ (+ allow-kind option pills) |
+| stop-reason surfacing | ✓ | ✓ | ✓ (`Refusal`/`MaxTokens`/`MaxTurnRequests` → banner) |
+| cancel resolves pending permission | ✓ | — | ✓ (drain → `Cancelled` outcome) |
+| image prompt input | ✓ | — | ✓ (gated on `prompt_capabilities.image`) |
+| reasoning-effort picker | ✓ (`--effort`, respawn) | ✓ (respawn) | ✓ (`ThoughtLevel` config, in-session) |
+| session restore | ✓ (`--resume`) | ✓ (`--resume`) | ✓ (`session/load` + replay-suppress; else fresh + notice) |
+| auth flow | — (own `/login`) | — (own) | ✓ (`AuthRequired` → method card → `authenticate`, same conn) |
 | compaction divider | ✓ (`compact_boundary`) | ✓ (`thread/compacted`) | — |
 | usage footer | ✓ | ✓ | ○ |
 | embedded terminal | — | — | ✓ (`terminal/*` → inline `TerminalView`) |
 
-The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`; Claude and ACP tool-result images both emit `ToolResultImages`. Tool cards likewise normalize through one classifier: `ToolDetail::classify` (`tool_detail.rs`) maps a Claude name, a Codex renamed name, or an ACP `ToolKind` into a single archetype (`Shell`/`Read`/`Edit`/`Search`/`Fetch`/…) the renderer switches on, so an ACP `Execute` renders the same shell card as a Claude `Bash` instead of a generic key:value fallback. ACP threads its kind to the card via a follow-up `ToolKind` event (Claude/Codex classify by name, leaving `ToolCall.kind` unset). ACP embedded terminals invert the crate boundary: the domain-layer `terminal/*` handlers delegate to an app-installed `AcpTerminalHost` that owns the real PTY (relay/in-process) and the inline `TerminalView`. The remaining ACP polish item is permission option-label buttons (a P3 follow-up) in `plans/260710-1022-agent-chat-acp-parity-research/`.
+The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary`, Codex `thread/compacted`, and the import path all emit `CompactBoundary`; Claude `TodoWrite`, Codex `turn/plan/updated`, and ACP `Plan` all emit `PlanUpdated`; Claude and ACP tool-result images both emit `ToolResultImages`. Tool cards likewise normalize through one classifier: `ToolDetail::classify` (`tool_detail.rs`) maps a Claude name, a Codex renamed name, or an ACP `ToolKind` into a single archetype (`Shell`/`Read`/`Edit`/`Search`/`Fetch`/…) the renderer switches on, so an ACP `Execute` renders the same shell card as a Claude `Bash` instead of a generic key:value fallback. ACP threads its kind to the card via a follow-up `ToolKind` event (Claude/Codex classify by name, leaving `ToolCall.kind` unset). ACP embedded terminals invert the crate boundary: the domain-layer `terminal/*` handlers delegate to an app-installed `AcpTerminalHost` that owns the real PTY (relay/in-process) and the inline `TerminalView`. The round-2 correctness pass (`plans/260710-2327-acp-round2-correctness-ux/`) closed the remaining client-side gaps: turn stop-reasons now surface as error banners; a Stop mid-permission drains the parked responder so the agent gets a `Cancelled` outcome (no wedge); attached images ride the prompt when the agent advertises `prompt_capabilities.image`; a restored tab resumes via `session/load` (with a `replaying` gate that drops the agent's history replay since OxiMux repaints its own persisted blob) and falls back to a fresh session with a visible notice when the agent lacks `loadSession`; a logged-out agent (`AuthRequired`/-32000) renders an auth-method card (Agent pill / Terminal inline login / EnvVar secret form) whose `authenticate` retries the session; and permission requests surface the agent's extra allow-kind options as pills. The `agent-client-protocol` dep enables the `unstable_auth_methods` feature for the env-var/terminal `AuthMethod` variants (schema 1.4.0 gates them). The Agent/Terminal methods authenticate on the same connection; the **EnvVar** method takes masked secret values in the card and **respawns** the agent with them in its environment (via `spawn_with_env` → `AcpAgent::from_args`, so the credentials ride the child's env, not argv, and never reach the persisted transcript), then auto-authenticates the seeded method — the only sign-in that works when the credential is delivered by environment. Deferred: a usage footer.
 
 ---
 

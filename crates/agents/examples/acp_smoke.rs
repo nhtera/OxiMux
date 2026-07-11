@@ -24,7 +24,7 @@ fn main() {
     println!("spawning `{cmdline}` in {}", cwd.display());
 
     let (conn, rx) =
-        AcpConnection::spawn(command, args, &cwd).expect("spawn AcpConnection");
+        AcpConnection::spawn(command, args, &cwd, None).expect("spawn AcpConnection");
 
     let mut prompted = false;
     let deadline = Instant::now() + Duration::from_secs(90);

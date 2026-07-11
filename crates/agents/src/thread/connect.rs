@@ -69,6 +69,15 @@ pub struct ConnectSpec {
     pub acp_command: Option<String>,
     /// argv appended after `acp_command` (only read by the `Acp` arm).
     pub acp_args: Vec<String>,
+    /// Extra environment overrides for the spawned ACP subprocess (only read by
+    /// the `Acp` arm). Carries the EnvVar-auth credentials the user typed, so a
+    /// respawned agent reads them at launch. Held only in-flight — never written
+    /// to the persisted chat blob. Empty for every non-EnvVar launch.
+    pub env: Vec<(String, String)>,
+    /// An auth method to `authenticate` once, automatically, right after an
+    /// env-carrying respawn still reports `AuthRequired` — the "set env, then
+    /// authenticate" EnvVar flow, so the user isn't re-prompted. `None` otherwise.
+    pub auth_method: Option<String>,
 }
 
 impl ConnectSpec {
@@ -93,6 +102,10 @@ impl ConnectSpec {
             effort,
             acp_command: backend.acp_command.clone(),
             acp_args: backend.acp_args.clone(),
+            // Set only by the EnvVar-auth respawn (see `respawn_with_env`);
+            // every other launch carries no extra env and no auto-authenticate.
+            env: Vec::new(),
+            auth_method: None,
         }
     }
 }
@@ -128,7 +141,14 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
                 .as_deref()
                 .filter(|c| !c.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("ACP transport requires an acp_command"))?;
-            let (conn, rx) = AcpConnection::spawn(command, &spec.acp_args, &spec.cwd)?;
+            let (conn, rx) = AcpConnection::spawn_with_env(
+                command,
+                &spec.acp_args,
+                &spec.cwd,
+                spec.resume_session_id.clone(),
+                spec.env.clone(),
+                spec.auth_method.clone(),
+            )?;
             Ok((Box::new(conn), rx))
         }
     }
@@ -201,6 +221,8 @@ mod tests {
             effort: None,
             acp_command: None,
             acp_args: vec![],
+            env: vec![],
+            auth_method: None,
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -226,6 +248,8 @@ mod tests {
             effort: None,
             acp_command: None,
             acp_args: vec![],
+            env: vec![],
+            auth_method: None,
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

@@ -8,20 +8,22 @@
 //! no Tokio reactor), so a plain `block_on` on an owned thread mirrors the
 //! Claude/Codex reader-thread ownership without pulling in a runtime.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, ContentBlock, CreateTerminalRequest, CreateTerminalResponse,
-    FileSystemCapabilities, InitializeRequest, KillTerminalRequest, KillTerminalResponse,
-    NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOptionValue,
-    SessionModeId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, TerminalOutputRequest, TerminalOutputResponse, TextContent, UsageUpdate,
+    AuthenticateRequest, ClientCapabilities, ContentBlock, CreateTerminalRequest,
+    CreateTerminalResponse,
+    FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest, KillTerminalResponse,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOption,
+    SessionConfigOptionValue, SessionId, SessionModeId, SessionModeState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, UsageUpdate,
     WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
@@ -32,8 +34,9 @@ use futures::channel::oneshot;
 use serde_json::Value;
 
 use super::map::map_session_update;
-use super::{AcpState, Outbound, approvals, client_fs, client_terminal};
-use crate::thread::event::{ThreadEvent, TurnUsage};
+use super::{AcpState, Outbound, approvals, auth, client_fs, client_terminal};
+use crate::thread::entry::ChatImage;
+use crate::thread::event::{AuthMethodInfo, AuthMethodKind, ThreadEvent, TurnUsage};
 use crate::thread::tool_call::PermissionDecision;
 
 /// Run the whole ACP session to completion (blocks the worker thread). A spawn
@@ -43,30 +46,63 @@ pub(crate) fn run(
     command: String,
     args: Vec<String>,
     cwd: PathBuf,
+    resume_session_id: Option<String>,
+    env: Vec<(String, String)>,
+    auth_method: Option<String>,
     event_tx: Sender<ThreadEvent>,
     outbound_rx: fmpsc::UnboundedReceiver<Outbound>,
     state: Arc<Mutex<AcpState>>,
 ) {
-    let result =
-        futures::executor::block_on(session(command, args, cwd, event_tx.clone(), outbound_rx, state));
+    let result = futures::executor::block_on(session(
+        command,
+        args,
+        cwd,
+        resume_session_id,
+        env,
+        auth_method,
+        event_tx.clone(),
+        outbound_rx,
+        state,
+    ));
     if let Err(e) = result {
         let _ = event_tx.send(ThreadEvent::Error(e));
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session(
     command: String,
     args: Vec<String>,
     cwd: PathBuf,
+    resume_session_id: Option<String>,
+    env: Vec<(String, String)>,
+    auth_method: Option<String>,
     event_tx: Sender<ThreadEvent>,
     mut outbound_rx: fmpsc::UnboundedReceiver<Outbound>,
     state: Arc<Mutex<AcpState>>,
 ) -> Result<(), String> {
-    // `AcpAgent::from_str` splits on whitespace into program + argv (verified in
-    // the crate's `yolo_one_shot_client` example), so join command + args.
-    let cmdline =
-        if args.is_empty() { command } else { format!("{} {}", command, args.join(" ")) };
-    let agent = AcpAgent::from_str(&cmdline).map_err(|e| format!("spawn `{cmdline}`: {e}"))?;
+    // Keep `command` (the agent binary) — a terminal-kind auth method runs it with
+    // the advertised login args in an embedded terminal.
+    let agent = if env.is_empty() {
+        // No env override → the original cmdline path (byte-identical): join the
+        // command + args and let `AcpAgent::from_str` split them into program+argv
+        // (verified in the crate's `yolo_one_shot_client` example).
+        let cmdline = if args.is_empty() {
+            command.clone()
+        } else {
+            format!("{} {}", command, args.join(" "))
+        };
+        AcpAgent::from_str(&cmdline).map_err(|e| format!("spawn `{cmdline}`: {e}"))?
+    } else {
+        // EnvVar auth: leading `NAME=value` tokens become the child's ENVIRONMENT
+        // (via `AcpAgent::from_args`), never argv — so the typed secret can't leak
+        // onto the process command line / `ps`. The first non-`NAME=value` token is
+        // the command; the rest are its argv.
+        let mut parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        parts.push(command.clone());
+        parts.extend(args.iter().cloned());
+        AcpAgent::from_args(parts).map_err(|e| format!("spawn `{command}`: {e}"))?
+    };
 
     let connect = Client
         .builder()
@@ -99,7 +135,16 @@ async fn session(
                                 s.config_options = u.config_options.clone();
                             }
                         }
+                        // During a `session/load` replay, drop transcript-bearing
+                        // updates: OxiMux repaints from its own persisted blob, so
+                        // replayed message/tool events would double-render. Control
+                        // updates (mode/model/slash/title) still pass — they re-sync
+                        // live pickers, not history.
+                        let replaying = st.lock().map(|s| s.replaying).unwrap_or(false);
                         for ev in map_session_update(n.update) {
+                            if replaying && is_transcript_event(&ev) {
+                                continue;
+                            }
                             let _ = tx.send(ev);
                         }
                         Ok(())
@@ -264,39 +309,86 @@ async fn session(
             let init_caps = ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new().read_text_file(true).write_text_file(true))
                 .terminal(super::terminal_host().is_some());
-            let _init = cx
+            let init = cx
                 .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(init_caps))
                 .block_task()
                 .await?;
-            let sess = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?;
-            let session_id = sess.session_id.clone();
+            // Whether this agent accepts image content blocks in a prompt. Off →
+            // attached images are dropped (text-only) rather than erroring the turn.
+            let supports_image = init.agent_capabilities.prompt_capabilities.image;
+
+            // Stash the advertised auth methods so the auth loop can map a picked
+            // method id to its kind (e.g. a terminal method's login args).
+            let auth_methods: Vec<AuthMethodInfo> =
+                init.auth_methods.iter().map(auth::auth_method_info).collect();
+            if let Ok(mut s) = state.lock() {
+                s.auth_methods = auth_methods.clone();
+            }
+
+            // Open the session, wrapped in an auth-retry loop: when the agent
+            // reports `AuthRequired` (-32000) it needs login, so surface its
+            // methods, park for the user's pick, authenticate, and retry — all on
+            // the same connection (no respawn). Any other error is fatal.
+            let load_id = resume_session_id.filter(|_| init.agent_capabilities.load_session);
+            // A respawn that seeded EnvVar-auth credentials also carries the method
+            // to authenticate; spend it on the FIRST `AuthRequired` so the env-seeded
+            // agent signs in without re-showing the card. Consumed once.
+            let mut auto_auth = auth_method;
+            let (session_id, modes, config_options) = loop {
+                match open_session(&cx, load_id.as_deref(), &cwd, &state, &event_tx).await {
+                    Ok(opened) => break opened,
+                    Err(e) if auth::is_auth_required(&e) => {
+                        // The env is set now, so `authenticate` can succeed on this
+                        // same process (unlike an in-place authenticate on the old
+                        // env-less one). On success retry the open; on failure fall
+                        // through to the interactive card so the user re-enters.
+                        if let Some(method_id) = auto_auth.take()
+                            && cx
+                                .send_request(AuthenticateRequest::new(method_id))
+                                .block_task()
+                                .await
+                                .is_ok()
+                        {
+                            continue;
+                        }
+                        match run_auth(&cx, &auth_methods, &mut outbound_rx, &event_tx, &command, &cwd)
+                            .await
+                        {
+                            // Authenticated (or terminal login done) → retry the open.
+                            AuthOutcome::Retry => continue,
+                            // Shutdown arrived while the card was up → end quietly.
+                            AuthOutcome::Aborted => return Ok(()),
+                        }
+                    }
+                    // Any non-auth error is fatal; the outer `map_err` wraps it.
+                    Err(e) => return Err(e),
+                }
+            };
 
             // Resolve capabilities from what the agent actually advertised at the
             // handshake (modes → picker, config_options → config control). Slash +
             // usage are wired via `session/update`s, so the cap is on and the
             // affordance stays empty/hidden until one arrives.
-            let config_options = sess.config_options.clone().unwrap_or_default();
-            let caps = super::caps_from_handshake(sess.modes.as_ref(), &config_options);
+            let caps = super::caps_from_handshake(modes.as_ref(), &config_options);
 
             // Stash the live connection + session id (so `cancel()`/`set_mode()`
             // can fire out-of-band) AND the discovered modes/config/caps BEFORE
             // `SessionInit` is emitted — so the app reads real caps the moment it
-            // processes init and lights up the pickers.
+            // processes init and lights up the pickers. A fallback-minted fresh id
+            // rides here too, so persistence overwrites the stale one on SessionInit.
+            let permission_mode =
+                modes.as_ref().map(|m| m.current_mode_id.0.to_string()).unwrap_or_default();
             if let Ok(mut s) = state.lock() {
                 s.session_id = Some(session_id.clone());
                 s.connection = Some(cx.clone());
-                s.modes = sess.modes.clone();
+                s.modes = modes;
                 s.config_options = config_options;
                 s.caps = caps;
             }
             let _ = event_tx.send(ThreadEvent::SessionInit {
                 session_id: session_id.0.to_string(),
                 model: String::new(),
-                permission_mode: sess
-                    .modes
-                    .as_ref()
-                    .map(|m| m.current_mode_id.0.to_string())
-                    .unwrap_or_default(),
+                permission_mode,
                 slash_commands: Vec::new(),
             });
 
@@ -305,27 +397,31 @@ async fn session(
             // concurrently). Draining the sender (all clones gone) also ends it.
             while let Some(msg) = outbound_rx.next().await {
                 match msg {
-                    Outbound::Prompt(text) => {
+                    Outbound::Prompt { text, images } => {
+                        // Defensive: a live turn's updates must never be gated by a
+                        // stale replay flag (belt-and-suspenders — the flag is
+                        // already cleared when `session/load` resolved).
+                        if let Ok(mut s) = state.lock() {
+                            s.replaying = false;
+                        }
                         let resp = cx
                             .send_request(PromptRequest::new(
                                 session_id.clone(),
-                                vec![ContentBlock::Text(TextContent::new(text))],
+                                prompt_blocks(text, &images, supports_image),
                             ))
                             .block_task()
                             .await;
                         // The streamed chunks are authoritative and already built
                         // the assistant blocks; `TurnEnded` seals the window (no
                         // finalized text — that would clobber tool-interleaved text).
+                        // The stop reason decides whether the turn is a success or
+                        // wears the error banner (a Refusal/limit renders a reason).
                         // Fold the latest stashed usage (cloned, not taken — the
                         // context readout is cumulative, so it stays accurate on a
                         // later turn that reports no fresh usage).
-                        let err = resp.err();
+                        let (result, is_error) = turn_outcome(resp);
                         let usage = state.lock().ok().and_then(|s| s.last_usage.clone());
-                        let _ = event_tx.send(ThreadEvent::TurnEnded {
-                            result: err.as_ref().map(|e| e.to_string()),
-                            usage,
-                            is_error: err.is_some(),
-                        });
+                        let _ = event_tx.send(ThreadEvent::TurnEnded { result, usage, is_error });
                     }
                     Outbound::SetMode(mode) => {
                         // Fire-and-forget: a rejected mode change just leaves the
@@ -351,6 +447,9 @@ async fn session(
                                 .await;
                         }
                     }
+                    // The session is already open — a stray Authenticate (e.g. a
+                    // double-click before the card cleared) is a no-op.
+                    Outbound::Authenticate(_) => {}
                     Outbound::Shutdown => break,
                 }
             }
@@ -358,6 +457,229 @@ async fn session(
         });
 
     connect.await.map_err(|e| format!("acp connection: {e}"))
+}
+
+/// Open a fresh ACP session (`session/new`) and pull the id + advertised
+/// modes/config out of the response — the shared handshake continuation both the
+/// new-session path and the `session/load` fallback feed into.
+async fn new_session(
+    cx: &ConnectionTo<Agent>,
+    cwd: PathBuf,
+) -> Result<(SessionId, Option<SessionModeState>, Vec<SessionConfigOption>), agent_client_protocol::Error>
+{
+    let sess = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?;
+    Ok((sess.session_id.clone(), sess.modes.clone(), sess.config_options.clone().unwrap_or_default()))
+}
+
+/// The opened-session tuple the handshake continuation consumes.
+type Opened = (SessionId, Option<SessionModeState>, Vec<SessionConfigOption>);
+
+/// Open the session for the handshake: `session/load` when handed a resumable id
+/// (guarding the history replay), else `session/new`. A NON-auth load failure
+/// (unknown session, method not found) falls back to a fresh session with a
+/// visible notice; an auth failure (-32000) propagates so the caller runs the
+/// auth flow and retries.
+async fn open_session(
+    cx: &ConnectionTo<Agent>,
+    load_id: Option<&str>,
+    cwd: &Path,
+    state: &Mutex<AcpState>,
+    event_tx: &Sender<ThreadEvent>,
+) -> Result<Opened, agent_client_protocol::Error> {
+    let Some(id) = load_id else {
+        return new_session(cx, cwd.to_path_buf()).await;
+    };
+    let sid = SessionId::new(id);
+    // Guard the replay: per spec the agent re-sends its history as
+    // `session/update`s BEFORE this response resolves; the notification handler
+    // drops those while `replaying` is set.
+    if let Ok(mut s) = state.lock() {
+        s.replaying = true;
+    }
+    let loaded =
+        cx.send_request(LoadSessionRequest::new(sid.clone(), cwd.to_path_buf())).block_task().await;
+    if let Ok(mut s) = state.lock() {
+        s.replaying = false;
+    }
+    match loaded {
+        Ok(resp) => Ok((sid, resp.modes, resp.config_options.unwrap_or_default())),
+        // Auth needed → let the caller run the auth flow and retry the load.
+        Err(e) if auth::is_auth_required(&e) => Err(e),
+        Err(e) => {
+            let _ = event_tx.send(ThreadEvent::Error(format!(
+                "couldn't resume the previous agent session ({e}); starting fresh"
+            )));
+            new_session(cx, cwd.to_path_buf()).await
+        }
+    }
+}
+
+/// The result of the auth card loop.
+enum AuthOutcome {
+    /// The user authenticated (or finished a terminal login) — retry the open.
+    Retry,
+    /// The connection is shutting down — end the worker quietly.
+    Aborted,
+}
+
+/// Drive the auth card: surface the advertised methods, park for the user's pick,
+/// and authenticate. An Agent/EnvVar method runs `authenticate`; a Terminal method
+/// runs the agent's login command in an embedded terminal first. Returns `Retry`
+/// once the user has acted (the caller retries the open) or `Aborted` on shutdown.
+async fn run_auth(
+    cx: &ConnectionTo<Agent>,
+    methods: &[AuthMethodInfo],
+    outbound_rx: &mut fmpsc::UnboundedReceiver<Outbound>,
+    event_tx: &Sender<ThreadEvent>,
+    command: &str,
+    cwd: &Path,
+) -> AuthOutcome {
+    let mut error: Option<String> = None;
+    loop {
+        let _ = event_tx
+            .send(ThreadEvent::AuthRequired { methods: methods.to_vec(), error: error.take() });
+        // Park for the user's pick. Before the session opens any other outbound (a
+        // queued prompt, a mode/config change) has nowhere to go, so it's dropped;
+        // Shutdown or a closed channel aborts.
+        let method_id = loop {
+            match outbound_rx.next().await {
+                Some(Outbound::Authenticate(id)) => break id,
+                Some(Outbound::Shutdown) | None => return AuthOutcome::Aborted,
+                // A prompt that raced in before the composer gated on the auth card
+                // must be sealed as an error turn, else the app's optimistic
+                // `turn_active` would wedge the composer forever. The user signs in
+                // first; other outbound (mode/config) has no session yet, so drop it.
+                Some(Outbound::Prompt { .. }) => {
+                    let _ = event_tx.send(ThreadEvent::TurnEnded {
+                        result: Some("sign in to continue".to_string()),
+                        usage: None,
+                        is_error: true,
+                    });
+                }
+                Some(_) => continue,
+            }
+        };
+        // A terminal-kind method authenticates via an interactive login TUI: run
+        // the agent's login command inline, then retry the open — the login itself
+        // is the authentication (no `authenticate` call).
+        if let Some(AuthMethodKind::Terminal { args, env }) =
+            methods.iter().find(|m| m.id == method_id).map(|m| &m.kind)
+        {
+            run_login_terminal(command, args, env, cwd, event_tx).await;
+            return AuthOutcome::Retry;
+        }
+        // Agent / EnvVar → authenticate on the connection, then retry the open. On
+        // failure, re-emit the card with the error note so the user can retry.
+        match cx.send_request(AuthenticateRequest::new(method_id)).block_task().await {
+            Ok(_) => return AuthOutcome::Retry,
+            Err(e) => error = Some(e.to_string()),
+        }
+    }
+}
+
+/// Run a terminal-kind auth method's login command (the agent binary + advertised
+/// args) in an embedded terminal, mount it inline via [`ThreadEvent::AuthTerminal`],
+/// and block until the user finishes the login. Degrades to a notice (not a hang)
+/// when no terminal host is installed or the spawn fails; the caller still retries
+/// the open, so a stuck login re-shows the card rather than wedging the tab.
+async fn run_login_terminal(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: &Path,
+    event_tx: &Sender<ThreadEvent>,
+) {
+    let Some(host) = super::terminal_host() else {
+        let _ = event_tx.send(ThreadEvent::Error(
+            "terminal login isn't available in this build".to_string(),
+        ));
+        return;
+    };
+    let spec = client_terminal::TerminalSpawnSpec {
+        command: command.to_string(),
+        args: args.to_vec(),
+        cwd: Some(cwd.to_path_buf()),
+        // The method's advertised env vars for the login command (per spec).
+        env: env.to_vec(),
+        output_byte_limit: None,
+    };
+    match host.create(spec) {
+        Ok(term_id) => {
+            let _ = event_tx.send(ThreadEvent::AuthTerminal { terminal_id: term_id.clone() });
+            // Block until the login command exits; then the caller retries the open.
+            let _ = host.wait_for_exit(&term_id).await;
+        }
+        Err(e) => {
+            let _ = event_tx
+                .send(ThreadEvent::Error(format!("couldn't start the login terminal: {e}")));
+        }
+    }
+}
+
+/// Whether a mapped event carries transcript content (assistant/thought text,
+/// tool activity, plan) as opposed to control state (mode, slash commands, model
+/// config, title). During `session/load` replay we drop the former — OxiMux
+/// already repainted its persisted blob — but let control updates through, since
+/// they re-sync live pickers rather than re-render history.
+fn is_transcript_event(ev: &ThreadEvent) -> bool {
+    matches!(
+        ev,
+        ThreadEvent::AssistantTextDelta(_)
+            | ThreadEvent::ThinkingDelta(_)
+            | ThreadEvent::AssistantText(_)
+            | ThreadEvent::AssistantThinking(_)
+            | ThreadEvent::ToolCallStarted { .. }
+            | ThreadEvent::ToolKind { .. }
+            | ThreadEvent::ToolTerminal { .. }
+            | ThreadEvent::ToolResult { .. }
+            | ThreadEvent::ToolResultImages { .. }
+            | ThreadEvent::ToolOutputDelta { .. }
+            | ThreadEvent::PlanUpdated { .. }
+    )
+}
+
+/// Build the `session/prompt` content blocks: the text block followed by one
+/// base64 `Image` block per attachment. Images are included only when the agent
+/// advertised `prompt_capabilities.image` — otherwise they're dropped and the
+/// prompt carries text alone (the pre-image behavior), so a text-only agent sees
+/// an unchanged request rather than a rejected turn. An image-only prompt (empty
+/// text + images) omits the empty text block, mirroring the Claude image path.
+fn prompt_blocks(text: String, images: &[ChatImage], supports_image: bool) -> Vec<ContentBlock> {
+    let include_images = supports_image && !images.is_empty();
+    let mut blocks = Vec::new();
+    if !text.is_empty() || !include_images {
+        blocks.push(ContentBlock::Text(TextContent::new(text)));
+    }
+    if include_images {
+        for img in images {
+            blocks.push(ContentBlock::Image(ImageContent::new(
+                img.data.clone(),
+                img.media_type.clone(),
+            )));
+        }
+    }
+    blocks
+}
+
+/// Decide a turn's `(result, is_error)` from the `session/prompt` outcome. A
+/// protocol/transport error is fatal (today's behavior). Otherwise the response's
+/// `stop_reason` decides: `Refusal`/`MaxTokens`/`MaxTurnRequests` end the turn
+/// with the error banner + a human-readable reason (previously these rendered as
+/// clean turns); `EndTurn`, `Cancelled` (the user's own Stop — mirrors the Claude
+/// suppressed-interrupt convention), and any future `#[non_exhaustive]` variant
+/// seal the turn cleanly.
+fn turn_outcome(resp: Result<PromptResponse, agent_client_protocol::Error>) -> (Option<String>, bool) {
+    match resp {
+        Err(e) => (Some(e.to_string()), true),
+        Ok(r) => match r.stop_reason {
+            StopReason::Refusal => (Some("the agent refused the request".to_string()), true),
+            StopReason::MaxTokens => (Some("the turn hit the agent's token limit".to_string()), true),
+            StopReason::MaxTurnRequests => {
+                (Some("the turn hit the agent's request limit".to_string()), true)
+            }
+            _ => (None, false),
+        },
+    }
 }
 
 /// Map an ACP `UsageUpdate{used,size,cost}` into our `TurnUsage`. ACP reports
@@ -392,6 +714,122 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::UsageUpdate;
     use serde_json::json;
+
+    #[test]
+    fn end_turn_and_cancelled_seal_the_turn_cleanly() {
+        // A normal completion and a user-initiated cancel both render as a clean
+        // turn (no error banner) — the Cancelled case mirrors Claude's suppressed
+        // interrupt.
+        assert_eq!(turn_outcome(Ok(PromptResponse::new(StopReason::EndTurn))), (None, false));
+        assert_eq!(turn_outcome(Ok(PromptResponse::new(StopReason::Cancelled))), (None, false));
+    }
+
+    #[test]
+    fn refusal_and_limits_end_with_the_error_banner() {
+        // Refusal / token limit / request limit previously rendered as successful
+        // turns; each now ends with the error banner and a human-readable reason.
+        let (msg, is_error) = turn_outcome(Ok(PromptResponse::new(StopReason::Refusal)));
+        assert!(is_error);
+        assert_eq!(msg.as_deref(), Some("the agent refused the request"));
+
+        let (msg, is_error) = turn_outcome(Ok(PromptResponse::new(StopReason::MaxTokens)));
+        assert!(is_error);
+        assert_eq!(msg.as_deref(), Some("the turn hit the agent's token limit"));
+
+        let (msg, is_error) = turn_outcome(Ok(PromptResponse::new(StopReason::MaxTurnRequests)));
+        assert!(is_error);
+        assert_eq!(msg.as_deref(), Some("the turn hit the agent's request limit"));
+    }
+
+    fn img(mime: &str, data: &str) -> ChatImage {
+        ChatImage { media_type: mime.to_string(), data: data.to_string() }
+    }
+
+    fn as_image(block: &ContentBlock) -> &ImageContent {
+        match block {
+            ContentBlock::Image(ic) => ic,
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_blocks_text_only_is_a_single_text_block() {
+        let blocks = prompt_blocks("hi".into(), &[], true);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text == "hi"));
+    }
+
+    #[test]
+    fn prompt_blocks_text_plus_two_images_builds_three_blocks() {
+        let imgs = [img("image/png", "QUJD"), img("image/gif", "R0lG")];
+        let blocks = prompt_blocks("look".into(), &imgs, true);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text == "look"));
+        // mime + data survive intact, in order.
+        assert_eq!(as_image(&blocks[1]).mime_type, "image/png");
+        assert_eq!(as_image(&blocks[1]).data, "QUJD");
+        assert_eq!(as_image(&blocks[2]).mime_type, "image/gif");
+        assert_eq!(as_image(&blocks[2]).data, "R0lG");
+    }
+
+    #[test]
+    fn prompt_blocks_image_only_omits_empty_text_block() {
+        let blocks = prompt_blocks(String::new(), &[img("image/png", "QUJD")], true);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(as_image(&blocks[0]).data, "QUJD");
+    }
+
+    #[test]
+    fn prompt_blocks_drops_images_when_capability_off() {
+        // An agent without `prompt_capabilities.image` gets a text-only request
+        // (images dropped) rather than a rejected turn.
+        let blocks = prompt_blocks("look".into(), &[img("image/png", "QUJD")], false);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text == "look"));
+    }
+
+    #[test]
+    fn transcript_events_are_gated_but_control_events_pass_during_replay() {
+        // Transcript-bearing updates are dropped during session/load replay;
+        // control updates (mode/slash/model/title) always pass so live pickers
+        // stay synced.
+        assert!(is_transcript_event(&ThreadEvent::AssistantTextDelta("hi".into())));
+        assert!(is_transcript_event(&ThreadEvent::ThinkingDelta("hm".into())));
+        assert!(is_transcript_event(&ThreadEvent::ToolCallStarted {
+            id: "c".into(),
+            name: "Read".into(),
+            input: json!({}),
+        }));
+        assert!(is_transcript_event(&ThreadEvent::PlanUpdated { entries: vec![] }));
+
+        assert!(!is_transcript_event(&ThreadEvent::ModeChanged { mode_id: "x".into() }));
+        assert!(!is_transcript_event(&ThreadEvent::ControlsUpdated));
+        assert!(!is_transcript_event(&ThreadEvent::TitleUpdated { title: "t".into() }));
+        assert!(!is_transcript_event(&ThreadEvent::SlashCommandsUpdated {
+            commands: vec![],
+            descriptions: vec![],
+            hints: vec![],
+        }));
+    }
+
+    #[test]
+    fn new_session_request_serializes_empty_mcp_servers() {
+        // Some ACP agents reject a `session/new` that omits `mcpServers`. v1
+        // NewSessionRequest has no skip_serializing_if, so `::new(cwd)` already
+        // serializes `[]`; lock it so a future crate bump can't silently regress.
+        let v = serde_json::to_value(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+            .expect("serialize NewSessionRequest");
+        assert_eq!(v["mcpServers"], json!([]));
+    }
+
+    #[test]
+    fn transport_error_stays_fatal() {
+        // A protocol/transport failure is surfaced as an error turn (unchanged).
+        let (msg, is_error) =
+            turn_outcome(Err(agent_client_protocol::Error::new(-32603, "boom")));
+        assert!(is_error);
+        assert!(msg.unwrap().contains("boom"));
+    }
 
     #[test]
     fn usage_maps_context_lossily() {

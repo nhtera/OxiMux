@@ -19,6 +19,7 @@
 //! `false` (no on-disk session log to truncate-fork).
 
 mod approvals;
+mod auth;
 mod client_fs;
 mod client_terminal;
 mod map;
@@ -41,7 +42,8 @@ use futures::channel::mpsc as fmpsc;
 use futures::channel::oneshot;
 use serde_json::Value;
 
-use super::connection::{AgentCapabilities, AgentConnection, ModeChoice, ModelChoice};
+use super::connection::{AgentCapabilities, AgentConnection, EffortChoice, ModeChoice, ModelChoice};
+use super::entry::ChatImage;
 use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionDecision;
 
@@ -70,14 +72,19 @@ pub(crate) fn terminal_host() -> Option<Arc<dyn AcpTerminalHost>> {
 
 /// Commands the sync `AgentConnection` methods push to the async worker.
 pub(crate) enum Outbound {
-    /// Start a turn with this user text (`session/prompt`).
-    Prompt(String),
+    /// Start a turn with this user text plus any attached images (`session/prompt`).
+    /// Images are dropped by the worker when the agent didn't advertise
+    /// `prompt_capabilities.image`, so a text-only agent sees an unchanged request.
+    Prompt { text: String, images: Vec<ChatImage> },
     /// Switch the session's permission/edit mode at runtime (`session/set_mode`).
     /// ACP switches modes in-session, so this never respawns the child.
     SetMode(String),
     /// Set a session config option (`session/set_config_option`). `value` is a
     /// select value-id (string) or a boolean toggle.
     SetConfig { id: String, value: Value },
+    /// Authenticate with the method the user picked from the auth card, then retry
+    /// opening the session on the same connection (`authenticate`).
+    Authenticate(String),
     /// Break the worker loop → the connection drops → the child exits on EOF.
     Shutdown,
 }
@@ -110,6 +117,17 @@ pub(crate) struct AcpState {
     /// Latest `UsageUpdate` mapped to our usage shape, folded into the next
     /// `TurnEnded.usage` at turn end (ACP delivers usage out-of-band, not per-turn).
     pub last_usage: Option<TurnUsage>,
+    /// Auth methods the agent advertised at `initialize` (mirrors how modes/config
+    /// are stashed). Read by the worker's auth loop to map a picked method id to
+    /// its kind (e.g. a terminal method's login args). Empty when the agent needs
+    /// no login.
+    pub auth_methods: Vec<super::event::AuthMethodInfo>,
+    /// Set while a `session/load` is replaying the agent's history: per spec the
+    /// agent re-sends its full transcript as ordinary `session/update`
+    /// notifications BEFORE the load response resolves. OxiMux already repaints
+    /// its own persisted blob, so the notification handler drops those
+    /// transcript-bearing replays while this is set (control updates still pass).
+    pub replaying: bool,
 }
 
 /// Derive `AgentCapabilities` from what the agent advertised at the ACP
@@ -131,6 +149,14 @@ fn caps_from_handshake(
     }
 }
 
+/// Drain every parked permission responder out of the state, returning the
+/// senders. Dropping them resolves each handler's `orx.await` to `Err`, which the
+/// permission handler answers as `Cancelled` — the mechanism [`AcpConnection::cancel`]
+/// uses to unwedge an agent's outstanding `session/request_permission` on Stop.
+fn drain_pending(state: &Mutex<AcpState>) -> Vec<oneshot::Sender<PermissionDecision>> {
+    state.lock().map(|mut s| s.pending.drain().map(|(_, tx)| tx).collect()).unwrap_or_default()
+}
+
 /// Map an ACP `SessionModeState` into the picker's `ModeChoice` vocabulary
 /// (`SessionMode{id,name}` → `{wire,label}`).
 fn modes_to_choices(modes: &SessionModeState) -> Vec<ModeChoice> {
@@ -141,22 +167,51 @@ fn modes_to_choices(modes: &SessionModeState) -> Vec<ModeChoice> {
         .collect()
 }
 
-/// The agent's model selector, if it advertised one. ACP has no first-class
-/// model concept; by convention a model list is exposed as a `Select` config
-/// option tagged with the `Model` semantic category (`SessionConfigOptionCategory`).
-/// Returns the option (for its id, the `set_config` key) + its select payload
-/// (for the choices + current value).
-fn model_select(options: &[SessionConfigOption]) -> Option<(&SessionConfigOption, &SessionConfigSelect)> {
+/// The agent's `Select` config option tagged with `category`, if it advertised
+/// one. ACP has no first-class model/effort concept; by convention it exposes
+/// each as a `Select` config option tagged with a semantic category
+/// (`SessionConfigOptionCategory`). Returns the option (for its id, the
+/// `set_config` key) + its select payload (for the choices + current value).
+fn select_for(
+    options: &[SessionConfigOption],
+    category: SessionConfigOptionCategory,
+) -> Option<(&SessionConfigOption, &SessionConfigSelect)> {
     options.iter().find_map(|opt| {
-        if !matches!(opt.category, Some(SessionConfigOptionCategory::Model)) {
+        if opt.category.as_ref() != Some(&category) {
             return None;
         }
         match &opt.kind {
             SessionConfigKind::Select(select) => Some((opt, select)),
-            // Boolean (and any future non-select kind) can't be a model list.
+            // Boolean (and any future non-select kind) can't be a picker list.
             _ => None,
         }
     })
+}
+
+/// The model selector (a `Model`-category select).
+fn model_select(options: &[SessionConfigOption]) -> Option<(&SessionConfigOption, &SessionConfigSelect)> {
+    select_for(options, SessionConfigOptionCategory::Model)
+}
+
+/// The reasoning-effort selector (a `ThoughtLevel`-category select). ACP maps the
+/// effort picker to this; empty for an agent that advertises no reasoning levels.
+fn thought_level_select(
+    options: &[SessionConfigOption],
+) -> Option<(&SessionConfigOption, &SessionConfigSelect)> {
+    select_for(options, SessionConfigOptionCategory::ThoughtLevel)
+}
+
+/// The effort-picker vocabulary from the agent's `ThoughtLevel` select, in
+/// advertised order (`value` → `wire`, `name` → `label`). Empty when the agent
+/// advertises no reasoning-level selector (the picker then stays hidden).
+fn effort_choices(options: &[SessionConfigOption]) -> Vec<EffortChoice> {
+    match thought_level_select(options) {
+        Some((_opt, select)) => flatten_select(&select.options)
+            .into_iter()
+            .map(|opt| EffortChoice { wire: opt.value.0.to_string(), label: opt.name.clone() })
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Flatten a select's options — grouped or ungrouped — into `&SessionConfigSelectOption`
@@ -203,7 +258,36 @@ impl AcpConnection {
     /// streaming decoded events. Returns immediately; the ACP handshake runs on
     /// the worker thread and emits [`ThreadEvent::SessionInit`] once the session
     /// opens (or [`ThreadEvent::Error`] if the agent can't be spawned).
-    pub fn spawn(command: &str, args: &[String], cwd: &Path) -> Result<(Self, Receiver<ThreadEvent>)> {
+    ///
+    /// `resume_session_id` continues a persisted session: when the agent
+    /// advertises `loadSession` the worker sends `session/load` with that id
+    /// instead of `session/new`; when it doesn't (or the load fails), the worker
+    /// falls back to a fresh session and emits a one-line notice. `None` always
+    /// opens a fresh session.
+    pub fn spawn(
+        command: &str,
+        args: &[String],
+        cwd: &Path,
+        resume_session_id: Option<String>,
+    ) -> Result<(Self, Receiver<ThreadEvent>)> {
+        Self::spawn_with_env(command, args, cwd, resume_session_id, Vec::new(), None)
+    }
+
+    /// Like [`Self::spawn`], but seeds the subprocess with extra `env` overrides
+    /// and (optionally) an `auth_method` to `authenticate` once if the freshly
+    /// spawned agent still reports `AuthRequired`. This backs the EnvVar-auth
+    /// respawn: the user's typed credentials ride in `env` (delivered to the child
+    /// as real environment, never argv), and `auth_method` closes the "set env,
+    /// then authenticate" loop without re-prompting. `spawn` is this with no
+    /// extra env and no auto-authenticate, so every existing caller is unchanged.
+    pub fn spawn_with_env(
+        command: &str,
+        args: &[String],
+        cwd: &Path,
+        resume_session_id: Option<String>,
+        env: Vec<(String, String)>,
+        auth_method: Option<String>,
+    ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
         let (out_tx, out_rx) = fmpsc::unbounded::<Outbound>();
         let state = Arc::new(Mutex::new(AcpState::default()));
@@ -213,7 +297,19 @@ impl AcpConnection {
             let args = args.to_vec();
             let cwd = cwd.to_path_buf();
             let state = state.clone();
-            thread::spawn(move || worker::run(command, args, cwd, event_tx, out_rx, state))
+            thread::spawn(move || {
+                worker::run(
+                    command,
+                    args,
+                    cwd,
+                    resume_session_id,
+                    env,
+                    auth_method,
+                    event_tx,
+                    out_rx,
+                    state,
+                )
+            })
         };
 
         Ok((Self { outbound: out_tx, state, _worker: worker }, event_rx))
@@ -223,7 +319,17 @@ impl AcpConnection {
 impl AgentConnection for AcpConnection {
     fn send_user_message(&self, text: &str) -> Result<()> {
         self.outbound
-            .unbounded_send(Outbound::Prompt(text.to_string()))
+            .unbounded_send(Outbound::Prompt { text: text.to_string(), images: Vec::new() })
+            .map_err(|_| anyhow!("acp worker is gone"))
+    }
+
+    /// Send a prompt carrying attached images. The worker maps each [`ChatImage`]
+    /// to a base64 `ContentBlock::Image` alongside the text block — gated on the
+    /// agent's `prompt_capabilities.image` so a text-only agent falls back to
+    /// text (mirroring the trait default) rather than erroring the turn.
+    fn send_user_message_with_images(&self, text: &str, images: &[ChatImage]) -> Result<()> {
+        self.outbound
+            .unbounded_send(Outbound::Prompt { text: text.to_string(), images: images.to_vec() })
             .map_err(|_| anyhow!("acp worker is gone"))
     }
 
@@ -284,6 +390,15 @@ impl AgentConnection for AcpConnection {
             .map_err(|_| anyhow!("acp worker is gone"))
     }
 
+    /// Authenticate with the picked method from the auth card. Routed to the
+    /// worker (which owns `cx` and the parked handshake), which runs
+    /// `authenticate` and retries the session open on the same connection.
+    fn authenticate(&self, method_id: &str) -> Result<()> {
+        self.outbound
+            .unbounded_send(Outbound::Authenticate(method_id.to_string()))
+            .map_err(|_| anyhow!("acp worker is gone"))
+    }
+
     /// The model choices the agent advertised via its `Model`-category select
     /// config option. Empty until the handshake stashes `config_options` (and
     /// empty forever for an agent that offers no model selector) — the picker
@@ -319,15 +434,58 @@ impl AgentConnection for AcpConnection {
         }
     }
 
+    /// The reasoning-effort levels the agent advertised via its `ThoughtLevel`
+    /// select config option. Empty until the handshake stashes `config_options`
+    /// (and empty forever for an agent with no reasoning selector) — the picker
+    /// then stays hidden, which is honest for ACP.
+    fn efforts(&self) -> Vec<EffortChoice> {
+        self.state.lock().map(|s| effort_choices(&s.config_options)).unwrap_or_default()
+    }
+
+    /// The agent's currently-selected reasoning level (the `ThoughtLevel` select's
+    /// `current_value`), shown as current when the user hasn't picked one.
+    fn default_effort(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|s| {
+            thought_level_select(&s.config_options).map(|(_o, sel)| sel.current_value.0.to_string())
+        })
+    }
+
+    /// Switch the reasoning effort in-session by writing the picked value to the
+    /// agent's `ThoughtLevel` select config option (`session/set_config_option`).
+    /// Returning `Ok` tells the app to skip the Claude-style respawn (which would
+    /// drop the live ACP session). Bails when the agent exposes no reasoning
+    /// selector — but then `efforts()` is empty and the picker is hidden, so this
+    /// is unreachable in practice.
+    fn set_effort(&self, effort: &str) -> Result<()> {
+        let option_id = self.state.lock().ok().and_then(|s| {
+            thought_level_select(&s.config_options).map(|(opt, _sel)| opt.id.0.to_string())
+        });
+        match option_id {
+            Some(id) => self.set_config(&id, Value::String(effort.to_string())),
+            None => Err(anyhow!("this ACP agent does not expose a reasoning-effort selector")),
+        }
+    }
+
     /// Interrupt the in-flight turn (`session/cancel`). Fire-and-forget: the
     /// worker is parked on the prompt future, so we signal the agent directly via
     /// the stashed connection and let the prompt resolve.
+    ///
+    /// Also resolves every parked permission responder: the ACP child is NOT
+    /// respawned on Stop, so a spec-imperfect agent that left a
+    /// `session/request_permission` outstanding could otherwise wedge its next
+    /// turn awaiting a decision that will never come. Dropping the drained senders
+    /// resolves each handler's `orx.await` to `Err`, which it already answers as
+    /// `Cancelled` on the wire (`worker.rs`).
     fn cancel(&self) -> Result<()> {
         if let Ok(s) = self.state.lock()
             && let (Some(conn), Some(sid)) = (s.connection.as_ref(), s.session_id.as_ref())
         {
             let _ = conn.send_notification(CancelNotification::new(sid.clone()));
         }
+        // Drop the senders OUTSIDE the state lock: dropping wakes each parked
+        // permission handler, which then answers `Cancelled` — the same drop-to-
+        // resolve trick Zed uses.
+        drop(drain_pending(&self.state));
         Ok(())
     }
 
@@ -434,6 +592,59 @@ mod tests {
         let (opt, select) = model_select(&options).expect("model select present");
         assert_eq!(opt.id.0.as_ref(), "model");
         assert_eq!(select.current_value.0.as_ref(), "sonnet");
+    }
+
+    #[test]
+    fn drain_pending_resolves_parked_responders_to_err() {
+        // A parked permission responder awaits its oneshot; draining (what
+        // `cancel()` does on Stop) drops the sender, resolving the receiver to
+        // `Err` — the worker's handler maps that to a `Cancelled` outcome, so the
+        // agent's request is answered rather than left hanging.
+        let state = Mutex::new(AcpState::default());
+        let (tx, rx) = oneshot::channel::<PermissionDecision>();
+        state.lock().unwrap().pending.insert("rid-1".to_string(), tx);
+
+        let drained = drain_pending(&state);
+        assert_eq!(drained.len(), 1);
+        assert!(state.lock().unwrap().pending.is_empty(), "pending is emptied by the drain");
+        drop(drained);
+        // The receiver now resolves to Err (sender dropped) rather than pending.
+        assert!(futures::executor::block_on(rx).is_err());
+    }
+
+    #[test]
+    fn effort_choices_read_the_thought_level_select() {
+        // A ThoughtLevel-category select becomes the effort picker vocabulary
+        // (value → wire, name → label); a sibling Model select is ignored.
+        let model = SessionConfigOption::select(
+            "model",
+            "Model",
+            "sonnet",
+            vec![SessionConfigSelectOption::new("sonnet", "Sonnet")],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let thought = SessionConfigOption::select(
+            "reasoning",
+            "Reasoning",
+            "medium",
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+                SessionConfigSelectOption::new("high", "High"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel);
+        let options = vec![model, thought];
+
+        let efforts = effort_choices(&options);
+        assert_eq!(efforts.len(), 3);
+        assert_eq!(efforts[0].wire, "low");
+        assert_eq!(efforts[1].label, "Medium");
+        let (opt, sel) = thought_level_select(&options).expect("thought select present");
+        assert_eq!(opt.id.0.as_ref(), "reasoning");
+        assert_eq!(sel.current_value.0.as_ref(), "medium");
+        // No ThoughtLevel select → empty picker.
+        assert!(effort_choices(&[]).is_empty());
     }
 
     #[test]

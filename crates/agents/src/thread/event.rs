@@ -25,6 +25,38 @@ pub struct TurnUsage {
     pub cost_usd: Option<f64>,
 }
 
+/// One authentication method an ACP agent advertises when it needs login, in a
+/// gpui-free shape mirroring ACP's `AuthMethod` union. Rendered by the auth card
+/// as a pill (Agent/Terminal) or an instructions block (EnvVar).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthMethodInfo {
+    /// The method id echoed back in `authenticate` / used to route the click.
+    pub id: String,
+    /// Human-readable label for the pill/heading.
+    pub name: String,
+    /// Optional one-line description shown muted.
+    pub description: Option<String>,
+    /// How this method authenticates — decides the card affordance + worker flow.
+    pub kind: AuthMethodKind,
+}
+
+/// The authentication style of an [`AuthMethodInfo`], mirroring the ACP
+/// `AuthMethod` variants. Drives both the card rendering and the worker's
+/// per-kind flow.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthMethodKind {
+    /// The agent handles login itself — clicking the pill runs `authenticate`.
+    Agent,
+    /// The user sets environment variables the agent reads, then re-authenticates.
+    /// Instructions-only: the card lists the variable names (+ optional docs
+    /// `link`) and a Retry pill; OxiMux never stores the secret values.
+    EnvVar { vars: Vec<String>, link: Option<String> },
+    /// The client runs the agent binary with `args` (and extra `env`) in an
+    /// embedded terminal so the user logs in via a TUI; on exit the session is
+    /// retried.
+    Terminal { args: Vec<String>, env: Vec<(String, String)> },
+}
+
 /// One entry of an agent execution plan, in a gpui-free shape mirroring ACP's
 /// `PlanEntry` (`content` + a three-state status + a priority). Rendered by the
 /// plan panel as a checklist row.
@@ -192,9 +224,29 @@ pub enum ThreadEvent {
     /// `descriptions` is parallel to `commands` (same order/length) when the
     /// backend supplies them (ACP), else empty (Claude/Codex advertise names
     /// only) — the palette shows a description under the name when present.
+    /// `hints` is likewise parallel: the argument hint an ACP command advertises
+    /// (`AvailableCommand.input`), shown as trailing muted text in the palette;
+    /// empty entry (or empty list) when the command takes no argument.
     SlashCommandsUpdated {
         commands: Vec<String>,
         descriptions: Vec<String>,
+        hints: Vec<String>,
+    },
+    /// The ACP agent requires authentication before a session can open
+    /// (`session/new`/`session/load` failed with JSON-RPC `-32000`). Carries the
+    /// advertised methods for the auth card; `error` is set when a prior
+    /// `authenticate` attempt failed, so the card shows a retry state. ACP-only —
+    /// Claude/Codex never emit it. Ephemeral (not persisted): a restored mid-auth
+    /// tab fails closed to a fresh AuthRequired.
+    AuthRequired {
+        methods: Vec<AuthMethodInfo>,
+        error: Option<String>,
+    },
+    /// A terminal-kind auth method launched the agent's login command in an
+    /// embedded terminal; the app mounts an inline `TerminalView` bound to
+    /// `terminal_id` inside the auth card while the user logs in. ACP-only.
+    AuthTerminal {
+        terminal_id: String,
     },
     /// The session's permission/edit mode changed (ACP `current_mode_update`),
     /// whether the user picked it or the agent switched it itself. Keeps the mode

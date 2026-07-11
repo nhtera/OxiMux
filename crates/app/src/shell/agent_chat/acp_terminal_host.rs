@@ -86,7 +86,10 @@ impl AcpTerminalHost for EmbeddedTerminalHost {
         let cwd = spec
             .cwd
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
-        let (backend, session_id) = spawn_embedded_command(spec.command, spec.args, cwd, spec.env)
+        // Default PAGER/GIT_PAGER to non-interactive so an agent-run command
+        // (e.g. `git log`) can't wedge the turn behind an interactive pager.
+        let env = with_pager_defaults(spec.env);
+        let (backend, session_id) = spawn_embedded_command(spec.command, spec.args, cwd, env)
             .ok_or_else(|| "failed to spawn embedded terminal".to_string())?;
         // Enable the independent Output/Exit stream this host observes (the
         // renderer keeps its own queue untouched).
@@ -169,6 +172,19 @@ impl AcpTerminalHost for EmbeddedTerminalHost {
         }
         Ok(())
     }
+}
+
+/// Ensure an agent-spawned command can't hang behind an interactive pager:
+/// default `PAGER` (empty → no pager) and `GIT_PAGER` (`cat`) unless the agent
+/// already set them (its explicit choice wins). Mirrors Zed's embedded-terminal
+/// env; order-independent so it's robust across the relay/portable-pty spawn paths.
+fn with_pager_defaults(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    for (key, val) in [("PAGER", ""), ("GIT_PAGER", "cat")] {
+        if !env.iter().any(|(k, _)| k == key) {
+            env.push((key.to_string(), val.to_string()));
+        }
+    }
+    env
 }
 
 /// Drain the terminal's status stream into its observation until it exits or is
@@ -284,6 +300,21 @@ mod tests {
     fn release_unknown_id_is_noop() {
         let host = EmbeddedTerminalHost::default();
         assert!(host.release("nope").is_ok());
+    }
+
+    #[test]
+    fn pager_defaults_added_when_absent_and_agent_choice_preserved() {
+        // Empty env → both non-interactive defaults are injected.
+        let env = with_pager_defaults(Vec::new());
+        assert_eq!(env.iter().find(|(k, _)| k == "PAGER").map(|(_, v)| v.as_str()), Some(""));
+        assert_eq!(env.iter().find(|(k, _)| k == "GIT_PAGER").map(|(_, v)| v.as_str()), Some("cat"));
+
+        // An agent that set PAGER explicitly keeps its value; GIT_PAGER still gets
+        // the default. No duplicate PAGER entry is added.
+        let env = with_pager_defaults(vec![("PAGER".into(), "less".into())]);
+        let pagers: Vec<&String> = env.iter().filter(|(k, _)| k == "PAGER").map(|(_, v)| v).collect();
+        assert_eq!(pagers, vec![&"less".to_string()]);
+        assert_eq!(env.iter().find(|(k, _)| k == "GIT_PAGER").map(|(_, v)| v.as_str()), Some("cat"));
     }
 
     #[test]

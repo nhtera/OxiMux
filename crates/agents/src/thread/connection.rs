@@ -144,6 +144,15 @@ pub trait AgentConnection: Send {
         anyhow::bail!("this agent does not support runtime configuration")
     }
 
+    /// Authenticate with the backend using the method the user picked from an
+    /// [`ThreadEvent::AuthRequired`] card (ACP `authenticate`). The backend then
+    /// retries the session open on the SAME connection (no respawn). Unsupported
+    /// by default (Claude/Codex handle their own login out of band), so those
+    /// backends compile unchanged.
+    fn authenticate(&self, _method_id: &str) -> Result<()> {
+        anyhow::bail!("this agent does not support in-app authentication")
+    }
+
     /// Switch the model at runtime. ACP has no first-class model concept, so an
     /// ACP backend maps this to its `Model`-category select config option
     /// (`session/set_config_option`) — the switch stays in-session. Unsupported
@@ -152,6 +161,15 @@ pub trait AgentConnection: Send {
     /// app to skip that respawn.
     fn set_model(&self, _model: &str) -> Result<()> {
         anyhow::bail!("this agent does not support changing model at runtime")
+    }
+
+    /// Switch the reasoning effort at runtime. ACP maps this to its
+    /// `ThoughtLevel`-category select config option (`session/set_config_option`),
+    /// keeping the switch in-session. Unsupported by default → the app falls back
+    /// to a resume-respawn on the new `--effort` (Claude fixes effort at spawn).
+    /// Returning `Ok` is what tells the app to skip that respawn.
+    fn set_effort(&self, _effort: &str) -> Result<()> {
+        anyhow::bail!("this agent does not support changing effort at runtime")
     }
 
     /// The model choices this backend offers in the model picker. Default: none

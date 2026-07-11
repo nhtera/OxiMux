@@ -11,6 +11,7 @@
 //! Fail-closed: if the subprocess dies (stdout EOF) while a permission is
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
+mod auth_card;
 mod background_tasks_panel;
 mod bubble;
 mod composer;
@@ -58,6 +59,7 @@ use gpui::{
 use gpui_component::Icon;
 use gpui_component::input::Enter as InputEnter;
 use gpui_component::input::Escape as InputEscape;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::Scrollbar;
 
 /// Max width of the reading column (transcript + composer). Wider windows keep
@@ -73,6 +75,11 @@ pub(super) const RAIL_W: f32 = 30.0;
 /// so a live terminal can't stretch the transcript; its own scrollback scrolls
 /// past the cap.
 const EMBEDDED_TERMINAL_HEIGHT: f32 = 260.0;
+
+/// Synthetic `embedded_terminals` key for the ACP auth login terminal — not a
+/// tool-call id, so it can't collide with one; lets the auth card reuse the same
+/// mount/reap machinery as tool-call terminals.
+const AUTH_TERMINAL_KEY: &str = "__acp_auth_terminal__";
 
 /// How many frames to keep re-pinning the transcript to the bottom after a
 /// content change (see [`AgentChatView::follow_frames`]). ~10 frames (≈160ms at
@@ -213,9 +220,9 @@ use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
-    connect, probe_catalog, AgentConnection, AssistantMessage, ChatBackend, ChatImage, ChatThread,
-    ConnectSpec, PermissionDecision, ProbedCatalog, QuestionAnswers, QuestionRequest, ThreadEntry,
-    ThreadEvent, ToolCallStatus, Transport, TurnUsage,
+    connect, probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend,
+    ChatImage, ChatThread, ConnectSpec, PermissionDecision, ProbedCatalog, QuestionAnswers,
+    QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus, Transport, TurnUsage,
 };
 use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -373,6 +380,18 @@ pub struct AgentChatView {
     embedded_terminals: HashMap<String, (String, Entity<TerminalView>)>,
     /// Repaint observers for the terminals above, one per mounted terminal.
     embedded_terminal_subs: HashMap<String, Subscription>,
+    /// A pending ACP auth prompt (agent needs login), folded from
+    /// `ThreadEvent::AuthRequired`. `None` when the session is authenticated;
+    /// cleared on `SessionInit`. Ephemeral — never persisted.
+    auth: Option<auth_card::AuthPrompt>,
+    /// Masked secret fields for an EnvVar-kind auth method, one per advertised
+    /// variable (`(VAR_NAME, input)`), reconciled from `auth` in `render` (which
+    /// owns the `Window` `InputState::new` needs). The typed values live ONLY here
+    /// and in the respawn's in-flight `ConnectSpec.env` — never persisted to the
+    /// transcript blob. Empty whenever the card isn't an EnvVar prompt.
+    env_inputs: Vec<(String, Entity<gpui_component::input::InputState>)>,
+    /// Repaint observers for the env inputs above, one per field.
+    env_input_subs: Vec<Subscription>,
     /// Git checkpoint engine for this chat's `cwd`, or `None` when the dir isn't
     /// a git repo (or git is too old). Shared into background tasks via `Arc`.
     checkpoint_engine: Option<Arc<oximux_git::checkpoint::CheckpointEngine>>,
@@ -704,9 +723,14 @@ impl AgentChatView {
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, vocab, cx);
-            // Descriptions aren't persisted — a restored session shows names only
-            // until the live agent re-advertises via SlashCommandsUpdated.
-            c.set_slash_commands(seed_slash, std::collections::HashMap::new(), cx);
+            // Descriptions + hints aren't persisted — a restored session shows
+            // names only until the live agent re-advertises via SlashCommandsUpdated.
+            c.set_slash_commands(
+                seed_slash,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                cx,
+            );
             c.seed_history(history_seed);
         });
 
@@ -829,6 +853,9 @@ impl AgentChatView {
             question_card_subs: HashMap::new(),
             embedded_terminals: HashMap::new(),
             embedded_terminal_subs: HashMap::new(),
+            env_inputs: Vec::new(),
+            env_input_subs: Vec::new(),
+            auth: None,
             checkpoint_engine: None,
             pre_turn_checkpoint: None,
             rewind_confirm: None,
@@ -1085,10 +1112,11 @@ impl AgentChatView {
     /// composer so its status line, Send button, and bottom-toolbar pickers all
     /// reflect reality. Cheap no-op when nothing changed (both setters guard).
     fn sync_composer(&self, cx: &mut Context<Self>) {
-        // A rewind in flight disables the composer just like a disconnect until
-        // it resolves (respawn or error).
+        // A rewind in flight — or a pending ACP auth prompt (the session can't
+        // accept input until the user signs in) — disables the composer just like
+        // a disconnect until it resolves.
         let (disconnected, turn_active) =
-            (self.disconnected || self.rewinding, self.thread.turn_active);
+            (self.disconnected || self.rewinding || self.auth.is_some(), self.thread.turn_active);
         // Advertise controls by capability, not by hard-coding the provider.
         let caps = self
             .connection
@@ -1107,6 +1135,11 @@ impl AgentChatView {
         } else {
             std::collections::HashMap::new()
         };
+        let slash_hints = if caps.supports_slash {
+            self.thread.slash_command_hints.clone()
+        } else {
+            std::collections::HashMap::new()
+        };
         // The input placeholder follows the bound agent ("Message Codex…"); a New
         // Agent draft that just bound gets its real provider name here (it was
         // constructed with the generic "Agent" placeholder).
@@ -1114,7 +1147,7 @@ impl AgentChatView {
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
             c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
-            c.set_slash_commands(slash_commands, slash_descriptions, cx);
+            c.set_slash_commands(slash_commands, slash_descriptions, slash_hints, cx);
             c.set_provider_label(provider_label, cx);
             // A bound chat never shows the agent picker (its transport is fixed);
             // clearing here is what hides it after `bind_now` (cheap no-op once
@@ -1299,6 +1332,13 @@ impl AgentChatView {
         }
         if self.disconnected {
             return; // unrecoverable (a crash, or the resume failed) — nothing to send to
+        }
+        // The agent needs sign-in before it can accept a prompt — the auth card is
+        // the only actionable state. Don't push a phantom user entry the parked
+        // handshake would silently drop (which would wedge `turn_active` forever);
+        // the composer is also gated on this in `sync_composer`.
+        if self.auth.is_some() {
+            return;
         }
         // Optimistically record the prompt; the reply streams in via `on_event`.
         self.thread.push_user_message_with_images(text.clone(), images.clone());
@@ -1498,6 +1538,249 @@ impl AgentChatView {
         }
     }
 
+    /// Authenticate with the ACP method the user picked from the auth card: mark
+    /// it pending (spinner), then call the connection's `authenticate`, which runs
+    /// on the worker and retries the session open on the same connection. A
+    /// terminal-kind method mounts its login terminal via a follow-up
+    /// `AuthTerminal` event; success clears the card on `SessionInit`.
+    fn request_authenticate(&mut self, method_id: String, cx: &mut Context<Self>) {
+        if let Some(auth) = self.auth.as_mut() {
+            auth.pending = Some(method_id.clone());
+            auth.error = None;
+        }
+        if let Some(conn) = self.connection.as_ref()
+            && let Err(e) = conn.authenticate(&method_id)
+        {
+            if let Some(auth) = self.auth.as_mut() {
+                auth.pending = None;
+                auth.error = Some(e.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    /// One clickable auth pill (Agent/Terminal name, or an EnvVar "Retry"). While
+    /// its method is authenticating it renders a muted "Authenticating…" label
+    /// instead of a button.
+    fn auth_pill(
+        &self,
+        method_id: &str,
+        label: &str,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
+        if pending {
+            return div()
+                .px(px(10.0))
+                .py(px(3.0))
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(SharedString::from("Authenticating…"))
+                .into_any_element();
+        }
+        let id = method_id.to_string();
+        let on_click = cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
+            this.request_authenticate(id.clone(), cx);
+        });
+        tool_card::pill_button(
+            format!("acp-auth-{method_id}"),
+            label.to_string(),
+            theme.status_info,
+            density,
+            &typo,
+            on_click,
+        )
+    }
+
+    /// Build the ACP auth card from the pending prompt: a pill per Agent/Terminal
+    /// method, an instructions block + Retry for an EnvVar method, an optional
+    /// inline login terminal, and a retry-state error note.
+    fn render_auth_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
+        let provider = self.provider_label();
+        let Some(auth) = self.auth.as_ref() else {
+            return div().into_any_element();
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        // `reconcile_env_inputs` builds the masked fields for the FIRST EnvVar
+        // method only, so render the interactive form for that one and skip any
+        // further EnvVar methods — otherwise a second would reuse the first's
+        // fields and submit the wrong variable names. (An agent advertising two
+        // simultaneous EnvVar methods is unheard of; this just fails safe.)
+        let mut env_form_done = false;
+        for m in &auth.methods {
+            let is_pending = auth.pending.as_deref() == Some(m.id.as_str());
+            match &m.kind {
+                // EnvVar: an interactive secret form — a masked field per advertised
+                // variable (built in `reconcile_env_inputs`, so the values never
+                // touch the transcript) + a submit pill that respawns the agent WITH
+                // those values in its env, then authenticates.
+                AuthMethodKind::EnvVar { .. } if env_form_done => continue,
+                AuthMethodKind::EnvVar { link, .. } => {
+                    env_form_done = true;
+                    let field_rows: Vec<AnyElement> = self
+                        .env_inputs
+                        .iter()
+                        .map(|(name, input)| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .w_full()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .font_family("monospace")
+                                        .text_size(px(typo.t_label_xs))
+                                        .text_color(theme.fg_base)
+                                        .child(SharedString::from(name.clone())),
+                                )
+                                .child(Input::new(input))
+                                .into_any_element()
+                        })
+                        .collect();
+                    let submit = self.env_submit_pill(&m.id, is_pending, cx);
+                    rows.push(auth_card::env_var_form(
+                        m.description.as_deref(),
+                        link.as_deref(),
+                        field_rows,
+                        submit,
+                        theme,
+                        &typo,
+                        density,
+                    ));
+                }
+                // Agent / Terminal → a single labeled pill (+ its description).
+                _ => {
+                    let pill = self.auth_pill(&m.id, &m.name, is_pending, cx);
+                    let row = match m.description.as_deref() {
+                        Some(desc) => div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(pill)
+                            .child(
+                                div()
+                                    .text_size(px(typo.t_label_xs))
+                                    .text_color(theme.fg_muted)
+                                    .child(SharedString::from(desc.to_string())),
+                            )
+                            .into_any_element(),
+                        None => pill,
+                    };
+                    rows.push(row);
+                }
+            }
+        }
+        let terminal =
+            auth.terminal_id.as_ref().and_then(|_| self.render_embedded_terminal(AUTH_TERMINAL_KEY));
+        auth_card::auth_card(provider, auth.error.as_deref(), rows, terminal, theme, &typo, density)
+    }
+
+    /// The EnvVar-auth submit button: visually a [`Self::auth_pill`], but on click
+    /// it reads the typed secrets and respawns the agent WITH them in its env
+    /// (rather than authenticating the current, env-less process). Renders a muted
+    /// "Connecting…" while that respawn is in flight.
+    fn env_submit_pill(&self, method_id: &str, pending: bool, cx: &mut Context<Self>) -> AnyElement {
+        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
+        if pending {
+            return div()
+                .px(px(10.0))
+                .py(px(3.0))
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(SharedString::from("Connecting…"))
+                .into_any_element();
+        }
+        let id = method_id.to_string();
+        let on_click = cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
+            this.submit_env_auth(id.clone(), cx);
+        });
+        tool_card::pill_button(
+            format!("acp-env-auth-{method_id}"),
+            "Sign in".to_string(),
+            theme.status_info,
+            density,
+            &typo,
+            on_click,
+        )
+    }
+
+    /// Ensure the masked secret fields match the current EnvVar-auth prompt: one
+    /// [`InputState`] per advertised variable while an EnvVar method is up, torn
+    /// down once the card clears or turns non-EnvVar. Lives here (not the event
+    /// fold) because `InputState::new` needs the `Window`. Rebuilds only when the
+    /// variable set actually changes, so a half-typed secret survives repaints.
+    fn reconcile_env_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Variables the current card wants, in advertised order (first EnvVar method).
+        let wanted: Vec<String> = self
+            .auth
+            .as_ref()
+            .and_then(|a| {
+                a.methods.iter().find_map(|m| match &m.kind {
+                    AuthMethodKind::EnvVar { vars, .. } => Some(vars.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        // Already in sync (same vars, same order) → keep the live fields untouched.
+        if self.env_inputs.len() == wanted.len()
+            && self.env_inputs.iter().zip(&wanted).all(|((name, _), w)| name == w)
+        {
+            return;
+        }
+        self.env_inputs.clear();
+        self.env_input_subs.clear();
+        for (i, name) in wanted.iter().enumerate() {
+            let input =
+                cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(name.clone()));
+            // Repaint the chat view on edits so the masked dots appear live (an
+            // embedded `Input` doesn't self-repaint its owner).
+            let sub = cx.subscribe(&input, |_this, _input, _ev: &InputEvent, cx| cx.notify());
+            // Focus the first field so the user can type without clicking first. The
+            // render-time composer-focus fallback only fires when the ROOT holds
+            // focus, so this stays put.
+            if i == 0 {
+                input.read(cx).focus_handle(cx).focus(window, cx);
+            }
+            self.env_inputs.push((name.clone(), input));
+            self.env_input_subs.push(sub);
+        }
+    }
+
+    /// Collect the typed EnvVar-auth secrets and respawn the agent WITH them in its
+    /// environment (which then authenticates) — the only way an env-credentialed
+    /// agent can sign in, since a running process can't gain env after it spawned.
+    /// The values are read straight into the respawn's in-flight `ConnectSpec.env`
+    /// and never persisted. Blank fields are skipped (the agent re-prompts if it
+    /// actually needed them); an all-blank submit keeps the card up with a nudge.
+    fn submit_env_auth(&mut self, method_id: String, cx: &mut Context<Self>) {
+        let env: Vec<(String, String)> = self
+            .env_inputs
+            .iter()
+            .filter_map(|(name, input)| {
+                let value = input.read(cx).value().to_string();
+                (!value.is_empty()).then(|| (name.clone(), value))
+            })
+            .collect();
+        if env.is_empty() {
+            if let Some(auth) = self.auth.as_mut() {
+                auth.error = Some("enter the required value(s) to continue".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(auth) = self.auth.as_mut() {
+            auth.pending = Some(method_id.clone());
+            auth.error = None;
+        }
+        // The fresh connection emits SessionInit (→ card clears) on success, or
+        // AuthRequired again (→ card re-shows) if the credential was wrong.
+        self.respawn_with_env(env, Some(method_id), cx);
+        cx.notify();
+    }
+
     /// Start a fresh conversation in this tab without closing it (the CLI's
     /// `/clear`). Blanks the transcript, drops any transient UI bound to it, and
     /// respawns a **non-resumed** session (the cleared thread has no session id,
@@ -1582,6 +1865,22 @@ impl AgentChatView {
     /// `self.permission_mode` / `self.effort`, so callers set those first.
     /// Degrades to a read-only error state if the respawn fails.
     fn respawn(&mut self, cx: &mut Context<Self>) {
+        self.respawn_with_env(Vec::new(), None, cx);
+    }
+
+    /// Like [`Self::respawn`], but seeds the fresh connection with extra `env`
+    /// overrides and (optionally) a method to auto-`authenticate` — the EnvVar-auth
+    /// flow: the user's typed credentials reach the newly spawned agent's
+    /// environment, then it signs in without re-prompting. Plain [`Self::respawn`]
+    /// is this with no extra env and no auto-authenticate, so the Stop→resume and
+    /// live-switch paths are unchanged. The `env` values are held only in the
+    /// in-flight `ConnectSpec` — never written to the persisted transcript.
+    fn respawn_with_env(
+        &mut self,
+        env: Vec<(String, String)>,
+        auth_method: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         // Reap the old connection before replacing it — `Child`'s Drop neither
         // kills nor waits, so after a Stop this harvests the already-dead child
         // (and hard-kills it if somehow still alive).
@@ -1592,14 +1891,17 @@ impl AgentChatView {
         let model = self.model.clone();
         let permission_mode = self.permission_mode.clone();
         let effort = self.effort.clone();
-        match connect(ConnectSpec::for_backend(
+        let mut spec = ConnectSpec::for_backend(
             &self.backend,
             self.cwd.clone(),
             model,
             session_id,
             permission_mode,
             effort,
-        )) {
+        );
+        spec.env = env;
+        spec.auth_method = auth_method;
+        match connect(spec) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
                 // Reassigning drops the old drain task, cancelling its foreground
@@ -1615,6 +1917,13 @@ impl AgentChatView {
                 self.thread.last_error = Some(format!("Failed to resume agent: {e}"));
                 self.disconnected = true;
                 self.interrupted = false;
+                // A synchronous spawn failure is terminal for this attempt, so drop
+                // any auth card — otherwise the tail-card chain (disconnected before
+                // auth) would render the error card while the auth prompt lingered in
+                // state. The error card's Retry re-runs a plain respawn, which yields
+                // a fresh AuthRequired if the agent still needs login. No-op for the
+                // ordinary (non-auth) respawn, where `auth` is already `None`.
+                self.auth = None;
             }
         }
     }
@@ -1697,9 +2006,12 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Switch the reasoning effort for this chat tab. `--effort` is fixed at
-    /// spawn (like `--model`), so a live switch respawns resumed on the new
-    /// level. Not persisted, so no host event is raised. No-op when unchanged.
+    /// Switch the reasoning effort for this chat tab. Two backends, two paths:
+    /// Claude fixes `--effort` at spawn, so a live switch respawns resumed on the
+    /// new level; an ACP agent switches in-session via its `ThoughtLevel` config
+    /// option, so its `set_effort` succeeds and we skip the respawn (respawning an
+    /// ACP child would drop the live session). Not persisted, so no host event is
+    /// raised. No-op when unchanged.
     fn change_effort(&mut self, effort: String, cx: &mut Context<Self>) {
         // Unreachable pre-bind (the effort picker is hidden on an unbound draft),
         // but guard anyway so a stray pick can't early-spawn the subprocess.
@@ -1716,8 +2028,13 @@ impl AgentChatView {
         if current == effort {
             return;
         }
-        self.effort = Some(effort);
-        self.respawn(cx);
+        self.effort = Some(effort.clone());
+        // Prefer an in-session runtime switch (ACP); fall back to the resume-respawn
+        // path when the backend fixes `--effort` at spawn (Claude's `set_effort` bails).
+        let switched_live = self.connection.as_ref().is_some_and(|c| c.set_effort(&effort).is_ok());
+        if !switched_live {
+            self.respawn(cx);
+        }
         self.sync_composer(cx); // reflect the new effort in the toolbar label
         cx.notify();
     }
@@ -1907,6 +2224,9 @@ impl AgentChatView {
             question_card_subs: HashMap::new(),
             embedded_terminals: HashMap::new(),
             embedded_terminal_subs: HashMap::new(),
+            env_inputs: Vec::new(),
+            env_input_subs: Vec::new(),
+            auth: None,
             checkpoint_engine: None,
             pre_turn_checkpoint: None,
             rewind_confirm: None,
@@ -2009,6 +2329,29 @@ impl AgentChatView {
             }
             ThreadEvent::TitleUpdated { title } => {
                 cx.emit(AgentChatEvent::TitleChanged(title.clone()));
+            }
+            // The agent needs login: mount/refresh the auth card. A retained
+            // terminal id (mid terminal-login) survives a re-emit carrying an
+            // error note, so the login terminal keeps rendering.
+            ThreadEvent::AuthRequired { methods, error } => {
+                let terminal_id = self.auth.as_ref().and_then(|a| a.terminal_id.clone());
+                self.auth = Some(auth_card::AuthPrompt {
+                    methods: methods.clone(),
+                    error: error.clone(),
+                    pending: None,
+                    terminal_id,
+                });
+            }
+            // A terminal-kind method launched its login command — bind the inline
+            // terminal so `reconcile_embedded_terminals` mounts it in the card.
+            ThreadEvent::AuthTerminal { terminal_id } => {
+                if let Some(auth) = self.auth.as_mut() {
+                    auth.terminal_id = Some(terminal_id.clone());
+                }
+            }
+            // The session opened → auth is done; drop the card.
+            ThreadEvent::SessionInit { .. } => {
+                self.auth = None;
             }
             _ => {}
         }
@@ -2496,7 +2839,7 @@ impl AgentChatView {
     /// a terminal is mounted. A tool call that leaves the transcript (e.g.
     /// `/clear`) drops its view and releases the PTY on the host so nothing leaks.
     fn reconcile_embedded_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let live: Vec<(String, String)> = self
+        let mut live: Vec<(String, String)> = self
             .thread
             .entries
             .iter()
@@ -2507,6 +2850,11 @@ impl AgentChatView {
                 _ => None,
             })
             .collect();
+        // The ACP auth login terminal mounts through the same path, under a
+        // synthetic key so it's reaped when the auth card clears (or the tab does).
+        if let Some(term_id) = self.auth.as_ref().and_then(|a| a.terminal_id.clone()) {
+            live.push((AUTH_TERMINAL_KEY.to_string(), term_id));
+        }
         let live_ids: HashSet<&String> = live.iter().map(|(id, _)| id).collect();
         // Reap terminals whose tool call is gone: release the PTY (by the host's
         // terminal id, NOT the tool id) + drop the view.
@@ -3006,9 +3354,24 @@ impl AgentChatView {
             // Even the empty state rides the scroll box + overlay so the layout
             // is identical once messages arrive; the scrollbar auto-hides when
             // content fits.
-            return self
-                .wrap_scroll(scroll.child(self.render_empty_hint(&theme, &typo)))
-                .into_any_element();
+            //
+            // A sign-in requirement is surfaced BEFORE any session opens, so the
+            // transcript is still empty when it lands — render the auth card here
+            // too, or it would never reach the tail-card chain below (which only
+            // runs once there are entries) and the empty greeting would shadow it.
+            let body = if self.auth.is_some() {
+                let card = self.render_auth_card(cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(CONTENT_MAX_W))
+                    .child(card)
+                    .into_any_element()
+            } else {
+                self.render_empty_hint(&theme, &typo)
+            };
+            return self.wrap_scroll(scroll.child(body)).into_any_element();
         }
 
         // Flatten the transcript: each turn is a DIRECT child of the tracked
@@ -3262,6 +3625,16 @@ impl AgentChatView {
                     .w_full()
                     .max_w(px(CONTENT_MAX_W))
                     .child(error_card::error_card(&msg, theme, &typo, retry)),
+            );
+        } else if self.auth.is_some() {
+            // The agent needs login before a session can open — the auth card is
+            // the only actionable state, so it takes precedence over the working
+            // indicator and the plain error/signed-out cards BELOW it. (The
+            // `disconnected` error card above wins over it, but a failed
+            // EnvVar-auth respawn clears `self.auth`, so the two never coexist.)
+            let card = self.render_auth_card(cx);
+            scroll = scroll.child(
+                div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(card),
             );
         } else if self.thread.turn_active {
             // While a question card is pending, the agent isn't working — it's
@@ -3552,6 +3925,9 @@ impl Render for AgentChatView {
         // Same reconcile for ACP embedded terminals: mount a live inline
         // `TerminalView` for any tool call that bound one, reap ones that left.
         self.reconcile_embedded_terminals(window, cx);
+        // Build (or tear down) the masked secret fields for an EnvVar-auth card —
+        // here because `InputState::new` needs the `Window` the event fold lacks.
+        self.reconcile_env_inputs(window, cx);
         // Keyboard focus must live on the composer, not this view's root. The
         // pane focuses the composer on open, but an inline focus during action/
         // click dispatch is clobbered onto the root's tracked handle — so
@@ -4290,9 +4666,11 @@ mod tests {
         window
             .update(cx, |view, window, cx| {
                 view.composer.update(cx, |c, cx| {
-                    // A backend advertising `git`, enriched with an argument hint.
+                    // A backend advertising `git`, enriched with an argument hint
+                    // from the on-disk catalog (no backend-advertised hint here).
                     c.set_slash_commands(
                         vec!["git".into(), "compact".into()],
+                        std::collections::HashMap::new(),
                         std::collections::HashMap::new(),
                         cx,
                     );
@@ -4322,6 +4700,21 @@ mod tests {
                     assert_eq!(
                         c.usage_hint_for_test(cx),
                         Some(("git".to_string(), "cm|cp|pr|merge [args]".to_string())),
+                    );
+
+                    // A backend-advertised hint (ACP `AvailableCommand.input`) wins
+                    // over the on-disk catalog's argument-hint.
+                    c.set_slash_commands(
+                        vec!["git".into(), "compact".into()],
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::from([("git".to_string(), "<subcommand>".to_string())]),
+                        cx,
+                    );
+                    c.recompute_overlays_for_test(cx);
+                    assert_eq!(
+                        c.usage_hint_for_test(cx),
+                        Some(("git".to_string(), "<subcommand>".to_string())),
+                        "ACP-advertised hint wins over the catalog argument-hint",
                     );
 
                     // Typing an argument hides the hint again.
