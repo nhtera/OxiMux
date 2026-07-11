@@ -4,6 +4,47 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-12 — Agent Chat: disk-persisted model-catalog cache for the New Agent picker
+
+**What shipped:** a process-wide, disk-persisted cache of each dynamic-model
+agent's model catalog, so the *New Agent* draft's model picker paints instantly
+instead of waiting on a cold backend spawn.
+
+**Why:** Codex and ACP agents (OpenCode, Cursor, Amp) don't declare a static
+model list — the New Agent draft learns it by cold-starting a throwaway "catalog
+probe" backend just to read the models. That probe is ~0.1s for Codex (a Rust
+binary) but ~5s for a Node ACP agent like OpenCode (interpreter start + plugin
+load + a 50-model `session/new`). Before this change the cost was paid *every*
+time a draft picked that agent, because each draft view started with an empty
+per-view probe map.
+
+**How (stale-while-revalidate, mirrors `GitStateCache`):**
+- New `CatalogCache` GPUI `Global` (`crates/app/src/session_restore/catalog_cache.rs`)
+  keyed by adapter id: `entries` (last-known catalog, persisted as JSON under
+  `agent_catalog_cache_v1`) + `fresh` (adapters re-probed live this session,
+  in-memory only).
+- `ModelChoice` / `ProbedCatalog` gained `serde` derives so the catalog can be
+  persisted and rehydrated.
+- Boot seeds the cache from disk (`main.rs`, next to `GitStateCache`); quit
+  persists it. A missing/corrupt/legacy blob degrades to an empty cache (one
+  cold probe, then self-heals) — persistence never blocks boot.
+- `maybe_probe_catalog` now seeds the picker from the cache: a fresh entry is
+  trusted with no re-probe; a disk seed paints instantly and revalidates exactly
+  once; a miss falls back to the normal `Loading` state. The revalidation
+  fold-back (`fold_probe_result`) never lets an empty/failed re-probe clobber a
+  good seed.
+
+**Scope / follow-up:** covers the *New Agent → pick agent* path (the throwaway
+probe shown in the model-picker screenshot). The direct-launcher path
+(clicking Codex/OpenCode/Cursor/Amp straight from the launcher) opens a bound
+view that eager-connects a real backend and learns models via the live session
+handshake — that path is unchanged and is a documented follow-up.
+
+**Verification:** `cargo test --workspace --no-fail-fast` green; new `catalog_cache`
+unit tests (round-trip, fresh-marking, empty/corrupt degradation) + a
+`fold_probe_result` regression test guarding the good-seed-vs-empty-revalidation
+case; GUI-confirmed the OpenCode probe returns a non-empty 50-model catalog.
+
 ### 2026-07-11 — Agent Chat: ACP interactive-resume terminal for OpenCode (Phase 7 mechanism)
 
 **Touches**: `crates/settings/src/agent_launch.rs`, `crates/app/src/shell/agent_chat/mod.rs`, `crates/app/src/shell/pane_group/tabs.rs`

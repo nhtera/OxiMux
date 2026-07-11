@@ -7,6 +7,7 @@
 //! `app` crate — foldering keeps them in `app`; only a cross-crate move would
 //! hit the orphan rule. Re-exported at the crate root to preserve paths.
 
+pub mod catalog_cache;
 pub mod git_state_cache;
 pub mod persisted_chat;
 pub mod persisted_terminals;

@@ -50,7 +50,9 @@ pub struct AgentCapabilities {
 /// "Fastest", or an ACP agent's own model description) rendered muted beneath the
 /// name in the searchable picker, and also matched by search. `None` renders a
 /// single-line row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Serializable so the process-wide catalog cache can persist a probed model
+// list to disk and seed the picker instantly on the next launch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelChoice {
     pub wire: String,
     pub label: String,

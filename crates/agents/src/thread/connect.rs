@@ -158,7 +158,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
 /// models are only known after it spawns (Codex, ACP) — so the unbound *New
 /// Agent* draft can offer a real model picker before the user commits. Claude's
 /// models are static (declared in the roster) and never probed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProbedCatalog {
     pub models: Vec<ModelChoice>,
     /// The backend's default/current model wire, so the picker preselects it.

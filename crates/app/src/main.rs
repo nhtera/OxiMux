@@ -267,6 +267,14 @@ fn main() {
         cx.set_global(oximux_app::git_state_cache::GitStateCache::load_from(
             app_state.settings_repo(),
         ));
+        // Process-wide model-catalog cache for dynamic-model agents (Codex/ACP).
+        // Seeded from disk so a New Agent draft paints its model picker from the
+        // last session's catalog instantly (stale-while-revalidate) instead of
+        // waiting on a cold backend spawn (~5s for a Node ACP agent). A fresh
+        // install has no blob → empty cache → one cold probe, then self-heals.
+        cx.set_global(oximux_app::catalog_cache::CatalogCache::load_from(
+            app_state.settings_repo(),
+        ));
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu
@@ -365,6 +373,11 @@ fn install_app_lifecycle(
         if let Some(cache) =
             cx.try_global::<oximux_app::git_state_cache::GitStateCache>()
         {
+            cache.save_to(&quit_settings_repo);
+        }
+        // Persist the probed model catalogs so the next launch seeds the New
+        // Agent picker instantly instead of paying a cold backend spawn.
+        if let Some(cache) = cx.try_global::<oximux_app::catalog_cache::CatalogCache>() {
             cache.save_to(&quit_settings_repo);
         }
         async {}

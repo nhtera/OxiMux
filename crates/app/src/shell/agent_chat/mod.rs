@@ -125,6 +125,29 @@ enum ProbeState {
     Failed,
 }
 
+/// Fold a completed catalog probe into the next per-view [`ProbeState`] and the
+/// catalog worth caching, if any. Crucially it preserves an already-good seed (a
+/// non-empty `Ready`, e.g. one painted from the disk cache): an empty success or
+/// a failure on *revalidation* returns `None` for the state — "keep what's
+/// shown" — so a transient/empty re-probe never blanks the picker out from under
+/// a mid-draft user. Only a non-empty success is returned for caching.
+fn fold_probe_result(
+    has_good_seed: bool,
+    result: anyhow::Result<ProbedCatalog>,
+) -> (Option<ProbeState>, Option<ProbedCatalog>) {
+    match result {
+        // A real catalog: adopt it and hand it back to warm the shared cache.
+        Ok(catalog) if !catalog.models.is_empty() => {
+            (Some(ProbeState::Ready(catalog.clone())), Some(catalog))
+        }
+        // Empty success: adopt it (an agent with genuinely no models) only when
+        // there was nothing good to show; otherwise keep the seed. Never cached.
+        Ok(catalog) => ((!has_good_seed).then_some(ProbeState::Ready(catalog)), None),
+        // Failure: mark `Failed` only on a true miss; keep a seed otherwise.
+        Err(_) => ((!has_good_seed).then_some(ProbeState::Failed), None),
+    }
+}
+
 /// Decoded user-attached image thumbnails, memoized by `(entry index, image
 /// index)`. Interior-mutable so the immutable `render` path can fill it lazily.
 type ImageCache = RefCell<HashMap<(usize, usize), Option<Arc<Image>>>>;
@@ -1378,8 +1401,26 @@ impl AgentChatView {
             Some(entry) if entry.models.is_empty() => {}
             _ => return,
         }
+        // Consult the process-wide catalog cache (seeded from disk at boot). A hit
+        // paints the picker instantly — the difference between a ~5s cold spawn and
+        // the models appearing on open. A this-session probe is trusted outright; a
+        // disk seed is shown immediately but revalidated once in the background.
+        let cache = cx.try_global::<crate::catalog_cache::CatalogCache>().cloned();
+        if let Some(catalog) = cache.as_ref().and_then(|c| c.get(&id)) {
+            self.probed_catalogs.insert(id.clone(), ProbeState::Ready(catalog));
+            if cache.as_ref().is_some_and(|c| c.is_fresh(&id)) {
+                // Already probed live this session — trust it, spawn nothing.
+                self.sync_unbound_composer(cx);
+                return;
+            }
+            // A stale disk seed: keep it painted, revalidate below without a
+            // `Loading` flicker.
+        } else {
+            // Nothing cached — the picker stays hidden until the probe lands.
+            self.probed_catalogs.insert(id.clone(), ProbeState::Loading);
+        }
+        self.sync_unbound_composer(cx);
         let spec = ConnectSpec::for_backend(&self.backend, self.cwd.clone(), None, None, None, None);
-        self.probed_catalogs.insert(id.clone(), ProbeState::Loading);
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             let _ = tx.send(probe_catalog(spec));
@@ -1387,14 +1428,24 @@ impl AgentChatView {
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             let _ = this.update(cx, |this, cx| {
-                let state = match result {
-                    Ok(catalog) => ProbeState::Ready(catalog),
-                    Err(e) => {
-                        tracing::warn!(agent = %id, error = %e, "pre-bind catalog probe failed");
-                        ProbeState::Failed
-                    }
-                };
-                this.probed_catalogs.insert(id.clone(), state);
+                if let Err(e) = &result {
+                    tracing::warn!(agent = %id, error = %e, "pre-bind catalog probe failed");
+                }
+                let has_good_seed = matches!(
+                    this.probed_catalogs.get(&id),
+                    Some(ProbeState::Ready(c)) if !c.models.is_empty()
+                );
+                let (next, to_cache) = fold_probe_result(has_good_seed, result);
+                // Warm the shared cache (only a non-empty success is worth caching —
+                // an empty result would hide the picker and mask a transient failure).
+                if let Some(catalog) = to_cache
+                    && let Some(c) = cx.try_global::<crate::catalog_cache::CatalogCache>()
+                {
+                    c.record(&id, catalog);
+                }
+                if let Some(state) = next {
+                    this.probed_catalogs.insert(id.clone(), state);
+                }
                 // Only refresh the picker if this agent is still the draft's pick.
                 if this.unbound && this.unbound_agent_id.as_deref() == Some(id.as_str()) {
                     this.sync_unbound_composer(cx);
@@ -4523,6 +4574,43 @@ mod tests {
     use gpui::TestAppContext;
     use oximux_agents::thread::StubConnection;
     use serde_json::json;
+
+    /// A completed catalog probe must never blank a good seed: an empty or failed
+    /// revalidation of a disk-seeded picker keeps the seed; only a non-empty
+    /// success is adopted and cached. (Regression: the `Ok(empty)` arm once
+    /// clobbered a good seed, hiding the picker mid-draft.)
+    #[test]
+    fn fold_probe_result_preserves_a_good_seed() {
+        use oximux_agents::thread::ModelChoice;
+        let full = ProbedCatalog {
+            models: vec![ModelChoice { wire: "m".into(), label: "m".into(), description: None }],
+            default_model: None,
+        };
+        let empty = ProbedCatalog::default();
+
+        // Non-empty success → adopt it AND hand it back for caching.
+        let (state, cache) = fold_probe_result(false, Ok(full.clone()));
+        assert!(matches!(state, Some(ProbeState::Ready(ref c)) if !c.models.is_empty()));
+        assert_eq!(cache, Some(full));
+
+        // Empty success WITH a good seed → keep the seed (no change, not cached).
+        let (state, cache) = fold_probe_result(true, Ok(empty.clone()));
+        assert!(state.is_none(), "empty revalidation must not clobber a good seed");
+        assert!(cache.is_none());
+
+        // Empty success WITHOUT a seed → adopt empty (agent has no models); not cached.
+        let (state, cache) = fold_probe_result(false, Ok(empty));
+        assert!(matches!(state, Some(ProbeState::Ready(ref c)) if c.models.is_empty()));
+        assert!(cache.is_none(), "an empty catalog is never cached");
+
+        // Error WITH a good seed → keep the seed.
+        let (state, _) = fold_probe_result(true, Err(anyhow::anyhow!("boom")));
+        assert!(state.is_none(), "a probe error must not clobber a good seed");
+
+        // Error WITHOUT a seed → Failed.
+        let (state, _) = fold_probe_result(false, Err(anyhow::anyhow!("boom")));
+        assert!(matches!(state, Some(ProbeState::Failed)));
+    }
 
     #[test]
     fn user_child_indices_map_ordinals_to_scroll_children() {
