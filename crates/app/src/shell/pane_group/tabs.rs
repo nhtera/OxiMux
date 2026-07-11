@@ -1117,6 +1117,18 @@ impl PaneGroup {
         let effort = spec.effort.clone();
         let cwd = spec.cwd.clone();
         let session_id = spec.session_id.clone();
+        // A wired ACP preset (opencode) resumes through the generic `Custom`
+        // adapter, which spawns `custom_command`'s `(program, argv)` verbatim and
+        // ignores `resumption` (and `model`/`effort`/`extra_args` — a resume
+        // replays the session as-is, so per-agent model/flag overrides
+        // deliberately don't re-apply here). Its resume id already rides in the
+        // argv (`opencode --session <id>`). Claude/Codex keep `custom_command:
+        // None` and resume through their own `--resume` via `resumption`.
+        let is_custom = adapter == AgentAdapter::Custom;
+        let custom_command = is_custom
+            .then(|| oximux_settings::acp_preset(adapter_id))
+            .flatten()
+            .and_then(|p| p.interactive_resume.map(|f| (p.command.to_string(), f(&session_id))));
         cx.spawn_in(window, async move |group, cx| {
             let cfg = AgentSessionConfig {
                 adapter,
@@ -1128,8 +1140,12 @@ impl PaneGroup {
                 env: Vec::new(),
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
-                custom_command: None,
-                resumption: SessionResumption::Resume { id: session_id },
+                custom_command,
+                resumption: if is_custom {
+                    SessionResumption::None
+                } else {
+                    SessionResumption::Resume { id: session_id }
+                },
             };
             let session = match runtime.start_session(cfg).await {
                 Ok(s) => s,

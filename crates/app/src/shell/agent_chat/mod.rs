@@ -196,6 +196,19 @@ pub enum TerminalAvailability {
     NoInteractiveResume,
 }
 
+/// Whether an ACP-agent-supplied session id is safe to splice into an
+/// interactive-resume command's argv. The id is an EXTERNAL string minted by the
+/// agent (`acp/worker.rs`), so it is validated before it ever reaches a spawned
+/// process: non-empty, no leading `-` (so it can't be parsed as a flag), and
+/// only `[A-Za-z0-9_-]` (opencode ids look like `ses_0aea7d2e3ffe…`). A reject
+/// leaves the companion-terminal toggle disabled rather than passing an
+/// attacker-influenceable token to a CLI.
+fn is_safe_resume_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// How assistant thinking blocks are shown across the whole chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ThinkingLevel {
@@ -1026,8 +1039,21 @@ impl AgentChatView {
         let (adapter, adapter_id) = match self.backend.transport {
             Transport::StreamJson => (AgentAdapter::ClaudeCode, "claude-code"),
             Transport::AppServer => (AgentAdapter::Codex, "codex"),
-            // No interactive resume CLI wired for ACP agents yet.
-            Transport::Acp => return None,
+            Transport::Acp => {
+                // An ACP chat gets a companion terminal only when its preset has
+                // a confirmed interactive-resume TUI (opencode today) AND the
+                // agent-supplied session id is safe to place on a command line.
+                // The resume runs through the generic `Custom` adapter, which
+                // spawns `custom_command`'s argv verbatim.
+                let cmd = self.backend.acp_command.as_deref()?;
+                let preset = oximux_settings::ACP_PRESETS.iter().find(|p| p.command == cmd)?;
+                if preset.interactive_resume.is_none()
+                    || !is_safe_resume_session_id(&session_id)
+                {
+                    return None;
+                }
+                (AgentAdapter::Custom, preset.id)
+            }
         };
         Some(ChatTerminalSpec {
             adapter,
@@ -5612,16 +5638,40 @@ mod tests {
                 assert_eq!(spec.session_id, "sid-1");
                 assert_eq!(view.terminal_availability(), TerminalAvailability::Available);
 
-                // A bound ACP chat WITH a session has no interactive resume CLI
-                // wired — the toggle stays disabled, but the reason is distinct
-                // from "no session yet" (the GUI-found misleading-hint bug).
+                // A bound ACP chat WITH a session but NO resolved preset command
+                // has no interactive resume CLI wired — the toggle stays disabled,
+                // but the reason is distinct from "no session yet" (the GUI-found
+                // misleading-hint bug).
                 view.backend.transport = Transport::Acp;
-                assert!(view.terminal_launch_spec().is_none(), "ACP → no companion terminal");
+                assert!(view.terminal_launch_spec().is_none(), "ACP w/o preset → no terminal");
                 assert_eq!(
                     view.terminal_availability(),
                     TerminalAvailability::NoInteractiveResume,
                     "sent a message but ACP has no resume CLI — not 'send a message first'"
                 );
+
+                // opencode: a wired preset with a confirmed interactive-resume TUI
+                // → the companion terminal is offered via the Custom adapter.
+                view.backend.acp_command = Some("opencode".into());
+                let spec = view.terminal_launch_spec().expect("opencode → resumable");
+                assert_eq!(spec.adapter, AgentAdapter::Custom);
+                assert_eq!(spec.adapter_id, "opencode");
+                assert_eq!(spec.session_id, "sid-1");
+                assert_eq!(view.terminal_availability(), TerminalAvailability::Available);
+
+                // amp: not confirmed → no toggle (distinct binary + unverified id).
+                view.backend.acp_command = Some("amp-acp".into());
+                assert!(view.terminal_launch_spec().is_none(), "amp preset unwired → no terminal");
+                assert_eq!(view.terminal_availability(), TerminalAvailability::NoInteractiveResume);
+
+                // A wired preset but an UNSAFE agent-supplied session id (leading
+                // dash could be parsed as a flag) is rejected — toggle disabled.
+                view.backend.acp_command = Some("opencode".into());
+                view.thread.session_id = Some("-boom".into());
+                assert!(view.terminal_launch_spec().is_none(), "unsafe session id → no terminal");
+                view.thread.session_id = Some("sid-1".into());
+
+                view.backend.acp_command = None;
                 view.backend.transport = Transport::StreamJson;
 
                 // Switching to Terminal is a no-op until the host attaches one.
@@ -5634,6 +5684,23 @@ mod tests {
                 assert!(view.terminal_launch_spec().is_none(), "unbound draft → no terminal");
             })
             .expect("window update");
+    }
+
+    /// The ACP session id is an external, agent-supplied string; only ids safe to
+    /// place on a resume command line are accepted (the rest leave the toggle off).
+    #[test]
+    fn resume_session_id_charset_is_validated() {
+        // Real opencode ids (alnum + `_`) and dashed ids pass.
+        assert!(is_safe_resume_session_id("ses_0aea7d2e3ffeBkIyWpDmBmZ93W"));
+        assert!(is_safe_resume_session_id("sid-1"));
+        assert!(is_safe_resume_session_id("abc123"));
+        // Empty, leading-dash (flag injection), and shell metacharacters reject.
+        assert!(!is_safe_resume_session_id(""));
+        assert!(!is_safe_resume_session_id("-boom"));
+        assert!(!is_safe_resume_session_id("a b"));
+        assert!(!is_safe_resume_session_id("a;rm -rf"));
+        assert!(!is_safe_resume_session_id("$(whoami)"));
+        assert!(!is_safe_resume_session_id("a/b"));
     }
 
     /// The signed-out banner tracks only the LATEST assistant reply (or a turn

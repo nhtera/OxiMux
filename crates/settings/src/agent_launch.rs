@@ -92,7 +92,10 @@ pub enum OpenMode {
 /// configured that id — so the agent is one-click without any TOML, while a user
 /// entry for the same id still wins (see the resolution accessors). Presets are
 /// **data, not new adapters**: they drive the generic ACP chat path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `PartialEq`/`Eq`: the `interactive_resume` fn-pointer field has no
+// meaningful equality (addresses aren't stable across codegen units), and no
+// caller compares presets — they're matched by `id`/`command` instead.
+#[derive(Debug, Clone, Copy)]
 pub struct AcpPreset {
     /// Stable id (used as the adapter id in resolution + the launcher row).
     pub id: &'static str,
@@ -102,6 +105,29 @@ pub struct AcpPreset {
     pub command: &'static str,
     /// Space-separated argv fragment after `command` (e.g. `acp`).
     pub args: &'static str,
+    /// How to resume THIS agent's session in an interactive terminal, so a chat
+    /// can offer a companion "Terminal view" the way Claude/Codex do with
+    /// `--resume`. `None` = no known interactive-resume TUI for this agent, so
+    /// the toggle stays disabled. `Some(f)` = `f(session_id)` returns the FULL
+    /// argv (replacing `args`) run as `command` + that argv. The session id is
+    /// the same id the ACP `session/new` minted — safe to resume with because
+    /// it IS the agent's own native session id (verified for opencode: an ACP
+    /// `sessionId` round-trips through `opencode export <id>` and resumes via
+    /// `opencode --session <id>`). Only populated for presets whose ACP binary
+    /// and interactive-resume binary are the same program.
+    pub interactive_resume: Option<fn(session_id: &str) -> Vec<String>>,
+}
+
+/// Interactive resume argv for an opencode session: `opencode --session <id>`.
+/// The `<id>` is the `ses_…` id opencode's ACP `session/new` returns, which is
+/// its native session id (verified resumable via `opencode export <id>`);
+/// transcript replay is on by default, mirroring the Claude/Codex `--resume`
+/// companion. opencode's on-disk store is append-only file-per-message, so a
+/// live headless ACP connection and this interactive resume writing the same
+/// session don't corrupt history (only the session-metadata blob is
+/// last-writer-wins).
+fn opencode_interactive_resume(session_id: &str) -> Vec<String> {
+    vec!["--session".to_string(), session_id.to_string()]
 }
 
 /// The built-in ACP presets, surfaced one-click in the launcher.
@@ -113,11 +139,25 @@ pub struct AcpPreset {
 ///   invocation is pinned from research and should be re-confirmed live.
 /// - **OpenCode** — `opencode acp` is a built-in ACP server (verified live end
 ///   to end: handshake, streamed chunks, tool cards, usage, slash commands).
-///   The `which opencode` detection greys it when absent.
+///   The `which opencode` detection greys it when absent. Its interactive
+///   resume (`opencode --session <id>`) is wired for the chat's Terminal-view
+///   companion — same binary, and the ACP session id IS an opencode session id.
+///
+/// `interactive_resume` is `Some` only where the ACP session id is a verified
+/// resumable native id AND the resume TUI is the same binary as the ACP server.
+/// Cursor/Amp stay `None`: amp's resume uses a *different* binary
+/// (`amp threads continue`) than its ACP wrapper, and neither's ACP-id↔resume-id
+/// equivalence is confirmed — an unconfirmed row must not offer a broken toggle.
 pub const ACP_PRESETS: &[AcpPreset] = &[
-    AcpPreset { id: "cursor", title: "Cursor", command: "cursor-agent", args: "acp" },
-    AcpPreset { id: "amp", title: "Amp", command: "amp-acp", args: "" },
-    AcpPreset { id: "opencode", title: "OpenCode", command: "opencode", args: "acp" },
+    AcpPreset { id: "cursor", title: "Cursor", command: "cursor-agent", args: "acp", interactive_resume: None },
+    AcpPreset { id: "amp", title: "Amp", command: "amp-acp", args: "", interactive_resume: None },
+    AcpPreset {
+        id: "opencode",
+        title: "OpenCode",
+        command: "opencode",
+        args: "acp",
+        interactive_resume: Some(opencode_interactive_resume),
+    },
 ];
 
 /// The preset for `id`, if one is built in.
@@ -552,6 +592,18 @@ acp_args = "--experimental-acp --foo"
         // A non-preset, non-builtin adapter is still terminal-only.
         assert!(!s.chat_capable("aider"));
         assert_eq!(s.open_mode_for("aider"), OpenMode::Terminal);
+    }
+
+    #[test]
+    fn only_opencode_has_interactive_resume_wired() {
+        // opencode is the only preset with a confirmed interactive-resume TUI on
+        // the same binary; its argv is `--session <id>` (replacing `acp`).
+        let oc = acp_preset("opencode").expect("opencode preset");
+        let f = oc.interactive_resume.expect("opencode has interactive resume");
+        assert_eq!(f("ses_0aea7d2e3ffeBk"), vec!["--session", "ses_0aea7d2e3ffeBk"]);
+        // Cursor/Amp are not confirmed → no toggle offered (see field docs).
+        assert!(acp_preset("cursor").unwrap().interactive_resume.is_none());
+        assert!(acp_preset("amp").unwrap().interactive_resume.is_none());
     }
 
     #[test]
