@@ -83,6 +83,11 @@ struct TabContextTarget {
     /// `None` when the tab isn't a chat. Drives the terminal-view row's enabled
     /// state and which hint the disabled row shows.
     chat_terminal_available: Option<crate::shell::agent_chat::TerminalAvailability>,
+    /// For the view-options menu: whether the chat tab is CURRENTLY showing its
+    /// companion terminal (vs the chat). Flips the toggle row's label between
+    /// "Switch to Chat View" and "Switch to Terminal View" so it names the
+    /// destination, not a fixed direction. `false` for non-chat tabs.
+    chat_in_terminal_view: bool,
 }
 
 pub struct TabContextMenu {
@@ -129,6 +134,7 @@ impl TabContextMenu {
         can_tear_off: bool,
         view_only: bool,
         chat_terminal_available: Option<crate::shell::agent_chat::TerminalAvailability>,
+        chat_in_terminal_view: bool,
         cx: &mut Context<Self>,
     ) {
         self.x_px = x_px;
@@ -143,6 +149,7 @@ impl TabContextMenu {
             can_tear_off,
             view_only,
             chat_terminal_available,
+            chat_in_terminal_view,
         });
         self.open = true;
         cx.notify();
@@ -175,6 +182,13 @@ impl TabContextMenu {
         let available = availability == TerminalAvailability::Available;
         let group = target.group.clone();
         let ix = target.tab_idx;
+        // Name the DESTINATION, not a fixed direction: in terminal view the row
+        // switches back to chat, and vice versa.
+        let toggle_label = if target.chat_in_terminal_view {
+            "Switch to Chat View"
+        } else {
+            "Switch to Terminal View"
+        };
 
         let mut card = div()
             .flex()
@@ -185,7 +199,7 @@ impl TabContextMenu {
         if available {
             card = card.child(menu_row(
                 "tab-view-terminal",
-                "Switch to Terminal View",
+                toggle_label,
                 true,
                 theme,
                 density,
@@ -208,7 +222,7 @@ impl TabContextMenu {
                     .px(px(ROW_PADDING_X))
                     .text_size(px(typography.t_body_md))
                     .text_color(theme.fg_subtle)
-                    .child("Switch to Terminal View"),
+                    .child(toggle_label),
             );
             // Honest hint per reason: "send a message first" ONLY when there's
             // genuinely no session yet — a bound agent with no interactive resume

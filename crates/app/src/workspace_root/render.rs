@@ -749,6 +749,14 @@ impl Render for WorkspaceRoot {
                             None
                         }
                     });
+                    // Whether the chat tab is currently showing its companion
+                    // terminal — flips the view-options row label toward the
+                    // opposite destination ("Switch to Chat View" when in terminal).
+                    let chat_in_terminal_view = group_ref.tabs().get(tab_idx).is_some_and(|tab| {
+                        matches!(&tab.content, crate::shell::pane_content::PaneContent::AgentChat(v)
+                            if v.read(cx).view_mode()
+                                == crate::shell::agent_chat::ChatViewMode::Terminal)
+                    });
                     let view_only = action.view_only;
                     let weak = group.downgrade();
                     let x = action.x;
@@ -769,6 +777,7 @@ impl Render for WorkspaceRoot {
                             can_tear_off,
                             view_only,
                             chat_terminal_available,
+                            chat_in_terminal_view,
                             cx,
                         )
                     });
