@@ -9,10 +9,7 @@
 //! denominator: the meter shows the raw token count with no bar and a neutral
 //! color (a designed state, not a missing feature).
 
-use gpui::{
-    div, px, relative, Hsla, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled,
-};
+use gpui::{div, px, relative, Hsla, InteractiveElement, IntoElement, ParentElement, Styled};
 use oximux_settings::{Theme, Typography};
 
 /// Threshold color for the fraction of the context window USED (the inverse of
@@ -49,6 +46,10 @@ pub fn context_meter(
 ) -> impl IntoElement {
     let mut pill = div()
         .id("chat-context-meter")
+        // `relative` + `group` anchor the centered hover tooltip below; the pill
+        // itself is not absolutely positioned, so this doesn't clobber layout.
+        .relative()
+        .group("chat-context-meter-grp")
         .flex()
         .flex_row()
         .items_center()
@@ -58,9 +59,6 @@ pub fn context_meter(
         .rounded(px(8.0))
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_muted)
-        .tooltip(move |window, cx| {
-            gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, cx)
-        })
         .child(div().child(label));
     if let Some(f) = used_fraction {
         let fill = meter_color(f, theme);
@@ -79,7 +77,45 @@ pub fn context_meter(
                 ),
         );
     }
-    pill
+    // Centered hover tooltip above the meter. gpui's native `.tooltip()` anchors
+    // to the mouse CURSOR, so it drifted off to the meter's side; this hand-rolled
+    // overlay is full-width + center-justified so it centers over the pill without
+    // measuring the label, and `group_hover` reveals it on hover. Each `\n`-split
+    // line is a nowrap row so the optional "Cost since open" line wraps correctly.
+    pill.child(
+        div()
+            .absolute()
+            .bottom_full()
+            .left_0()
+            .w_full()
+            .pb(px(6.0))
+            .flex()
+            .justify_center()
+            .invisible()
+            .group_hover("chat-context-meter-grp", |s| s.visible())
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(6.0))
+                    .bg(theme.bg_overlay)
+                    .border_1()
+                    .border_color(theme.border_inactive)
+                    .text_color(theme.fg_base)
+                    .text_size(px(typography.t_body_sm))
+                    .shadow_md()
+                    .children(
+                        tooltip_text
+                            .split('\n')
+                            .map(|line| div().whitespace_nowrap().child(line.to_string()))
+                            .collect::<Vec<_>>(),
+                    ),
+            ),
+    )
 }
 
 #[cfg(test)]

@@ -521,14 +521,23 @@ impl ProjectPanes {
                                 if unbound && draft.is_none() && queued.is_empty() {
                                     continue;
                                 }
-                                // Bound chats persist their transcript blob; an
-                                // unbound draft has none (no completed turn).
-                                if !unbound
-                                    && let Some(t) = v.transcript_snapshot()
-                                {
+                                // Bound chats persist their transcript blob (an
+                                // unbound draft has none — no completed turn). Source
+                                // the tab's session-id pointer FROM that blob so the
+                                // pointer and blob stay in lockstep. A bound chat with
+                                // a session id but no blob (empty history — e.g. an
+                                // ACP session minted at connect, before any completed
+                                // turn) persists NO pointer, so restore reopens it
+                                // fresh instead of handing an orphaned, provider-
+                                // unknown id to `--resume` (which fails "Agent
+                                // unavailable").
+                                let transcript =
+                                    (!unbound).then(|| v.transcript_snapshot()).flatten();
+                                let session_id = transcript.as_ref().map(|t| t.session_id.clone());
+                                if let Some(t) = transcript {
                                     chat_transcripts.push(t);
                                 }
-                                (v.session_id().map(str::to_string), draft, queued, unbound)
+                                (session_id, draft, queued, unbound)
                             } else {
                                 (None, None, Vec::new(), false)
                             };

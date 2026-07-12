@@ -228,6 +228,20 @@ fn restore_chat_backend(
         .unwrap_or_default()
 }
 
+/// The session id to `--resume` on restore — `Some` only when a matching
+/// transcript blob exists. The blob is what ties a session id to the provider
+/// that minted it (and to its history); without it the pointer is orphaned
+/// (lost history, unknown provider). Returning `None` for an orphan makes the
+/// tab reopen fresh rather than handing a foreign, non-UUID id (e.g. an ACP
+/// `ses_...`) to the default Claude backend's `--resume`, which fails with
+/// "Agent unavailable". Heals layouts written before the save path kept the
+/// pointer and blob in lockstep.
+fn restore_chat_resume_id(snap: &PersistedTabs, session_id: Option<&str>) -> Option<String> {
+    session_id
+        .filter(|sid| snap.chat_transcripts.iter().any(|t| t.session_id == *sid))
+        .map(str::to_string)
+}
+
 // The factory threads the full project-pane construction context (cwd,
 // snapshot, runtime handles, callbacks); a bag struct would only relocate the
 // argument list without simplifying the single call site.
@@ -361,9 +375,10 @@ pub(crate) fn build_project_panes(
                             let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                             let backend = restore_chat_backend(&snap, session_id.as_deref());
+                            let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
                             group.update(cx, |g, cx| {
                                 g.open_agent_chat_tab_restored(
-                                    chat_cwd, model, backend, session_id, entries, slash_commands,
+                                    chat_cwd, model, backend, resume_id, entries, slash_commands,
                                     thinking_level, draft, queued, window, cx,
                                 );
                             });
@@ -536,8 +551,9 @@ fn restore_multi_group(
                             let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                             let backend = restore_chat_backend(&snap, session_id.as_deref());
+                            let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
                             p.open_agent_chat_in_group_restore(
-                                group_id, chat_cwd, model, backend, session_id, entries, slash_commands,
+                                group_id, chat_cwd, model, backend, resume_id, entries, slash_commands,
                                 thinking_level, draft, queued, window, cx,
                             );
                         }
@@ -2014,5 +2030,44 @@ mod tests {
             }
             _ => panic!("expected snapshot with rehydrated transcript"),
         }
+    }
+
+    #[test]
+    fn resume_id_none_for_orphaned_pointer_but_carried_when_blob_present() {
+        // A tab pointer whose transcript blob is absent is orphaned — the blob
+        // held the history AND the provider, so without it the id can't be
+        // resumed. `restore_chat_resume_id` must return None so restore reopens
+        // the tab fresh rather than `--resume`ing a foreign id (the "Agent
+        // unavailable" bug: an ACP `ses_...` id reaching the default Claude
+        // backend). Heals layouts written before the save-side lockstep.
+        use crate::persisted_chat::PersistedChatTranscript;
+        let present = PersistedChatTranscript {
+            session_id: "72def46c-08c6-413f-9777-2c321bfbb56c".into(),
+            model: None,
+            entries: vec![],
+            slash_commands: vec![],
+            thinking_level: Default::default(),
+            provider: oximux_agents::thread::Transport::StreamJson,
+            acp_command: None,
+            acp_args: vec![],
+        };
+        let snap =
+            PersistedTabs { chat_transcripts: vec![present.clone()], ..PersistedTabs::default() };
+
+        // Blob present → the resume id is carried through unchanged.
+        assert_eq!(
+            restore_chat_resume_id(&snap, Some(&present.session_id)),
+            Some(present.session_id.clone())
+        );
+        // Orphaned pointer (no matching blob — e.g. an ACP `ses_...` id) → None,
+        // and the backend falls back to the default instead of resuming it.
+        let orphan = "ses_0abea54daffeD0XIbY7b2Cpslg";
+        assert_eq!(restore_chat_resume_id(&snap, Some(orphan)), None);
+        assert_eq!(
+            restore_chat_backend(&snap, Some(orphan)),
+            oximux_agents::thread::ChatBackend::default()
+        );
+        // No pointer at all (a bound chat that never minted a session) → None.
+        assert_eq!(restore_chat_resume_id(&snap, None), None);
     }
 }
