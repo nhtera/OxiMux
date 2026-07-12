@@ -74,6 +74,53 @@ pub struct EffortChoice {
     pub label: String,
 }
 
+/// One selectable option for a `Select`-kind [`FeatureControl`]. `wire` is the
+/// value echoed back to the backend on change; `label` is what the user sees;
+/// `description` is an optional muted blurb. Mirrors [`ModelChoice`] so the same
+/// searchable-row rendering can be reused.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeatureSelectOption {
+    pub wire: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// The shape of a generic composer feature control. `Toggle` renders as an
+/// icon button that flips on/off; `Select` renders as a labeled dropdown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FeatureKind {
+    Toggle { on: bool },
+    Select { options: Vec<FeatureSelectOption>, selected: Option<String> },
+}
+
+/// One backend-advertised control in the composer's feature cluster — the
+/// generic seam behind fast mode, plan mode, auto-accept, agent-profile, and any
+/// other per-provider switch. Backends fill [`AgentConnection::features`] with
+/// whatever they support; the view renders whatever comes back, so no
+/// per-provider vocabulary lives in the UI.
+///
+/// `id` is the stable key echoed back on change (for ACP it is the
+/// `session/set_config_option` option id). `icon` is a *semantic* glyph hint
+/// (e.g. `"zap"`, `"plan"`, `"bot"`, `"settings"`) — kept as a string so this
+/// crate carries no UI asset path; the view maps it to an icon.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeatureControl {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub kind: FeatureKind,
+}
+
+/// The value a feature control carries back to the backend on change: a boolean
+/// for a toggle, a chosen option `wire` for a select. Serializable so a session's
+/// picked feature values can be persisted and replayed on restore.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FeatureValue {
+    Bool(bool),
+    Choice(String),
+}
+
 /// The user-facing control surface for one chat session.
 ///
 /// Everything past the first three methods is **default-implemented** so
@@ -206,6 +253,23 @@ pub trait AgentConnection: Send {
     /// The reasoning effort shown as current when unset. Default: none.
     fn default_effort(&self) -> Option<String> {
         None
+    }
+
+    /// The generic feature controls this backend offers in the composer's
+    /// feature cluster (fast mode, plan mode, auto-accept, agent-profile, …).
+    /// Default: none → the cluster stays hidden. A backend fills this with
+    /// whatever it advertises; the view renders each without any hardcoded
+    /// per-provider knowledge.
+    fn features(&self) -> Vec<FeatureControl> {
+        Vec::new()
+    }
+
+    /// Apply a feature-control change at runtime. ACP maps this to a
+    /// `session/set_config_option` write (in-session, no respawn). Unsupported by
+    /// default → the app falls back to a resume-respawn that folds the new value
+    /// into spawn args. Returning `Ok` tells the app to skip that respawn.
+    fn set_feature(&self, _id: &str, _value: FeatureValue) -> Result<()> {
+        anyhow::bail!("this agent does not support changing features at runtime")
     }
 }
 

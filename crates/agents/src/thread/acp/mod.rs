@@ -42,7 +42,10 @@ use futures::channel::mpsc as fmpsc;
 use futures::channel::oneshot;
 use serde_json::Value;
 
-use super::connection::{AgentCapabilities, AgentConnection, EffortChoice, ModeChoice, ModelChoice};
+use super::connection::{
+    AgentCapabilities, AgentConnection, EffortChoice, FeatureControl, FeatureKind,
+    FeatureSelectOption, FeatureValue, ModeChoice, ModelChoice,
+};
 use super::entry::ChatImage;
 use super::event::{ThreadEvent, TurnUsage};
 use super::tool_call::PermissionDecision;
@@ -244,6 +247,67 @@ fn model_choices(options: &[SessionConfigOption]) -> Vec<ModelChoice> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// A semantic icon hint for a config-option surfaced as a generic feature — a
+/// keyword match on its id+name (kept UI-asset-free; the view maps the hint to a
+/// glyph). Plan / fast / auto-accept / agent-profile get distinct hints; the
+/// rest fall back to a neutral settings glyph.
+fn feature_icon_hint(id: &str, name: &str) -> &'static str {
+    let h = format!("{id} {name}").to_lowercase();
+    if h.contains("plan") {
+        "plan"
+    } else if h.contains("fast") || h.contains("turbo") {
+        "zap"
+    } else if h.contains("accept") || h.contains("auto") || h.contains("yolo") {
+        "check"
+    } else if h.contains("agent") || h.contains("profile") {
+        "bot"
+    } else {
+        "settings"
+    }
+}
+
+/// Derive the generic feature-control cluster from the agent's config options.
+/// Every option that is NOT the dedicated model/effort selector becomes a
+/// [`FeatureControl`]: a `Boolean` option → a toggle; any other `Select` (a
+/// `Mode`-category profile, a `ModelConfig`, or a custom `_`-category option) → a
+/// labeled select. `Model` and `ThoughtLevel` keep their dedicated pickers and
+/// are skipped here so they aren't double-surfaced. The option `id` is the
+/// `set_config` key echoed back on change.
+fn feature_controls(options: &[SessionConfigOption]) -> Vec<FeatureControl> {
+    options
+        .iter()
+        .filter(|opt| {
+            !matches!(
+                opt.category,
+                Some(SessionConfigOptionCategory::Model)
+                    | Some(SessionConfigOptionCategory::ThoughtLevel)
+            )
+        })
+        .filter_map(|opt| {
+            let kind = match &opt.kind {
+                SessionConfigKind::Select(select) => FeatureKind::Select {
+                    options: flatten_select(&select.options)
+                        .into_iter()
+                        .map(|o| FeatureSelectOption {
+                            wire: o.value.0.to_string(),
+                            label: o.name.clone(),
+                            description: o.description.clone(),
+                        })
+                        .collect(),
+                    selected: Some(select.current_value.0.to_string()),
+                },
+                SessionConfigKind::Boolean(b) => FeatureKind::Toggle { on: b.current_value },
+                // A future option kind we don't understand is silently skipped.
+                _ => return None,
+            };
+            let id = opt.id.0.to_string();
+            let label = opt.name.clone();
+            let icon = Some(feature_icon_hint(&id, &label).to_string());
+            Some(FeatureControl { id, label, description: opt.description.clone(), icon, kind })
+        })
+        .collect()
 }
 
 /// A live chat connection to an ACP agent.
@@ -466,6 +530,25 @@ impl AgentConnection for AcpConnection {
         }
     }
 
+    /// The generic feature controls the agent advertised via its config options
+    /// (every option that isn't the dedicated model/effort selector). Empty until
+    /// the handshake stashes `config_options`.
+    fn features(&self) -> Vec<FeatureControl> {
+        self.state.lock().map(|s| feature_controls(&s.config_options)).unwrap_or_default()
+    }
+
+    /// Apply a feature-control change in-session by writing it to the matching
+    /// config option (`session/set_config_option`) — a bool for a toggle, the
+    /// chosen value id for a select. Returning `Ok` tells the app to skip the
+    /// respawn (ACP applies config live).
+    fn set_feature(&self, id: &str, value: FeatureValue) -> Result<()> {
+        let json = match value {
+            FeatureValue::Bool(b) => Value::Bool(b),
+            FeatureValue::Choice(s) => Value::String(s),
+        };
+        self.set_config(id, json)
+    }
+
     /// Interrupt the in-flight turn (`session/cancel`). Fire-and-forget: the
     /// worker is parked on the prompt future, so we signal the agent directly via
     /// the stashed connection and let the prompt resolve.
@@ -592,6 +675,55 @@ mod tests {
         let (opt, select) = model_select(&options).expect("model select present");
         assert_eq!(opt.id.0.as_ref(), "model");
         assert_eq!(select.current_value.0.as_ref(), "sonnet");
+    }
+
+    #[test]
+    fn feature_controls_surface_non_model_effort_options() {
+        // A Mode-category select and a Boolean toggle both become generic feature
+        // controls; the Model and ThoughtLevel selectors keep their dedicated
+        // pickers and are excluded here (no double-surfacing).
+        let mode_select = SessionConfigOption::select(
+            "permission",
+            "Permission",
+            "ask",
+            vec![
+                SessionConfigSelectOption::new("ask", "Ask"),
+                SessionConfigSelectOption::new("auto", "Auto"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode);
+        let model = SessionConfigOption::select(
+            "model",
+            "Model",
+            "sonnet",
+            vec![SessionConfigSelectOption::new("sonnet", "Sonnet")],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let thought = SessionConfigOption::select(
+            "thought",
+            "Thinking",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel);
+        let toggle = SessionConfigOption::boolean("auto_accept", "Auto accept", true);
+        let options = vec![model, thought, mode_select, toggle];
+
+        let feats = feature_controls(&options);
+        assert_eq!(feats.len(), 2, "only the mode-select + toggle surface as features");
+
+        let perm = feats.iter().find(|f| f.id == "permission").expect("mode select present");
+        match &perm.kind {
+            FeatureKind::Select { options, selected } => {
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].wire, "ask");
+                assert_eq!(selected.as_deref(), Some("ask"));
+            }
+            _ => panic!("expected a select feature"),
+        }
+
+        let auto = feats.iter().find(|f| f.id == "auto_accept").expect("toggle present");
+        assert!(matches!(auto.kind, FeatureKind::Toggle { on: true }));
     }
 
     #[test]

@@ -12,23 +12,26 @@
 use std::ops::Range;
 
 use gpui::{
-    Anchor, App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ImageSource, InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, img,
-    prelude::FluentBuilder, px,
+    Anchor, App, AppContext, ClipboardEntry, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, ImageSource, InteractiveElement, IntoElement, MouseButton, ObjectFit,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, img, prelude::FluentBuilder, px,
 };
 use gpui::StyledImage as _;
 use gpui_component::Icon;
+use gpui_component::Selectable as _;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
 };
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::popover::Popover;
 use gpui_component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use oximux_agents::thread::{
-    prepend_context, ChatImage, ContextChip, EffortChoice, ModeChoice, ModelChoice,
+    prepend_context, ChatImage, ContextChip, EffortChoice, FeatureControl, FeatureKind,
+    FeatureValue, ModeChoice, ModelChoice,
 };
 
 /// The model/mode/effort options plus their "current when unset" defaults,
@@ -40,6 +43,11 @@ pub struct ControlVocab {
     pub models: Vec<ModelChoice>,
     pub permission_modes: Vec<ModeChoice>,
     pub efforts: Vec<EffortChoice>,
+    /// Generic backend-advertised controls (fast/plan/auto-accept/agent-profile)
+    /// rendered in the composer's feature cluster. Each carries its own current
+    /// value (toggle on/off, select selected), so the view renders them straight
+    /// from the vocab — the backend is the source of truth.
+    pub features: Vec<FeatureControl>,
     pub default_model: Option<String>,
     pub default_mode: Option<String>,
     pub default_effort: Option<String>,
@@ -220,6 +228,10 @@ pub enum ComposerEvent {
     PermissionModePicked(String),
     /// The user picked a reasoning-effort level in the bottom toolbar.
     EffortPicked(String),
+    /// The user changed a generic feature control in the bottom toolbar (a
+    /// toggle flip or a select pick). Carries the control's stable `id` and its
+    /// new value. The parent applies it live (ACP `set_config`) or via respawn.
+    FeaturePicked { id: String, value: FeatureValue },
     /// The user picked a coding agent in the unbound *New Agent* draft's agent
     /// dropdown (an adapter id, e.g. `codex`/`opencode`). The parent rebuilds the
     /// backend + default model and re-pushes the picker. Only fired while unbound.
@@ -285,6 +297,11 @@ pub struct ComposerView {
     /// [`Self::set_controls`]. The pickers render from this (no hardcoded
     /// provider vocab); empty until a connection is attached.
     vocab: ControlVocab,
+    /// Id of the footer dropdown whose menu is currently open (e.g. `"chat-effort"`),
+    /// or `None` when all are closed. Driven by each dropdown's `on_open_change`.
+    /// Used to suppress a control's hover tooltip while its menu is open, so the
+    /// tooltip never paints over the options (matching Paseo/Radix).
+    open_dropdown: Option<SharedString>,
     /// True while this is an unbound *New Agent* draft — the agent picker is
     /// shown so the user can choose the coding agent before the first send binds
     /// it. Cleared once bound (a live session's transport can't be hot-swapped).
@@ -448,6 +465,7 @@ impl ComposerView {
             model_select_sig: Vec::new(),
             model_select_current: None,
             _model_select_sub: model_select_sub,
+            open_dropdown: None,
             disconnected: false,
             turn_active: false,
             model: None,
@@ -1051,6 +1069,12 @@ impl ComposerView {
         cx.emit(ComposerEvent::EffortPicked(effort));
     }
 
+    /// Ask the parent to apply a feature-control change (toggle flip or select
+    /// pick). The parent applies it live or via respawn and re-pushes the vocab.
+    fn pick_feature(&mut self, id: String, value: FeatureValue, cx: &mut Context<Self>) {
+        cx.emit(ComposerEvent::FeaturePicked { id, value });
+    }
+
     /// Ask the parent to switch the *picked* coding agent on the unbound draft
     /// (the parent rebuilds the backend + default model and re-pushes the picker).
     fn pick_agent(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1344,17 +1368,19 @@ impl ComposerView {
         // The picked agent's brand glyph (Claude/Codex marks; a generic sparkles
         // for agents without one), mirroring Paseo's provider icon on the control.
         let trigger_icon = adapter_icon_path(&current_id);
-        Button::new("chat-agent-btn")
+        let trigger = Button::new("chat-agent-btn")
             .icon(Icon::default().path(trigger_icon))
             .label(current_label)
             .ghost()
             .small()
-            .tooltip("Coding agent")
-            .dropdown_caret(true)
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
+            .dropdown_caret(true);
+        // Icon-bearing rows (each agent's brand glyph + a ✓ on the pick), so this
+        // can't reuse `render_labeled_dropdown`'s plain rows — but it shares the
+        // same Popover + centered/self-hiding tooltip via `render_dropdown_shell`.
+        let build_menu =
+            move |mut menu: PopupMenu, window: &mut Window, _cx: &mut Context<PopupMenu>| {
                 for (id, display) in &agents {
                     let selected = current_id == *id;
-                    // Each row leads with the agent's glyph, then a ✓ on the pick.
                     let icon_path = adapter_icon_path(id);
                     let text = if selected {
                         format!("\u{2713} {display}")
@@ -1362,6 +1388,7 @@ impl ComposerView {
                         display.clone()
                     };
                     let choice = id.to_string();
+                    let entity = entity.clone();
                     menu = menu.item(
                         PopupMenuItem::element(move |_w, _c| {
                             div()
@@ -1372,18 +1399,17 @@ impl ComposerView {
                                 .child(Icon::default().path(icon_path).size(px(14.0)))
                                 .child(text.clone())
                         })
-                        .on_click(
-                            window.listener_for(
-                                &entity,
-                                move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
-                                    view.pick_agent(choice.clone(), cx);
-                                },
-                            ),
-                        ),
+                        .on_click(window.listener_for(
+                            &entity,
+                            move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
+                                view.pick_agent(choice.clone(), cx);
+                            },
+                        )),
                     );
                 }
                 menu
-            })
+            };
+        self.render_dropdown_shell("chat-agent".into(), "Coding agent".into(), trigger, build_menu, cx)
     }
 
     /// The model control in the bottom toolbar: a borderless (`appearance(false)`)
@@ -1408,11 +1434,185 @@ impl ComposerView {
         )
     }
 
+    /// The shared shell behind every footer dropdown (permission / effort /
+    /// feature-select / agent picker): a ghost trigger button that opens a menu
+    /// upward, plus a hover tooltip centered directly above the control and
+    /// SUPPRESSED while its own menu is open (matching Paseo/Radix, which hides a
+    /// trigger's tooltip when its dropdown opens). Callers pass the fully-built
+    /// trigger and a `build_menu` closure so each control keeps its own row shape
+    /// (plain checkmark rows for the labeled pickers, icon rows for the agent
+    /// picker); this owns the `Popover` + open-state tracking + tooltip so the
+    /// behavior stays identical across every control.
+    fn render_dropdown_shell(
+        &self,
+        ctrl_id: SharedString,
+        tooltip_text: SharedString,
+        trigger: Button,
+        build_menu: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let view = cx.entity();
+        let is_open = self.open_dropdown.as_deref() == Some(ctrl_id.as_ref());
+
+        let menu_key = SharedString::from(format!("{ctrl_id}-menu"));
+        let wrap_id = SharedString::from(format!("{ctrl_id}-wrap"));
+        let pop_id = SharedString::from(format!("{ctrl_id}-pop"));
+        let build_menu = std::rc::Rc::new(build_menu);
+
+        let popover = Popover::new(pop_id)
+            .appearance(false)
+            .overlay_closable(false)
+            .anchor(Anchor::BottomRight)
+            .trigger(trigger)
+            .on_open_change({
+                let view = view.clone();
+                let ctrl_id = ctrl_id.clone();
+                move |open: &bool, _window, cx| {
+                    let open = *open;
+                    let ctrl_id = ctrl_id.clone();
+                    view.update(cx, |v, cx| {
+                        if open {
+                            v.open_dropdown = Some(ctrl_id);
+                        } else if v.open_dropdown.as_deref() == Some(ctrl_id.as_ref()) {
+                            v.open_dropdown = None;
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .content({
+                let build_menu = build_menu.clone();
+                move |_state, window, cx| {
+                    // Build (and cache) the menu once; rebuild on dismiss so the
+                    // checkmark tracks the current value on the next open.
+                    let menu_state = window
+                        .use_keyed_state(menu_key.clone(), cx, |_, _| None::<Entity<PopupMenu>>);
+                    match menu_state.read(cx).clone() {
+                        Some(menu) => menu,
+                        None => {
+                            let build_menu = build_menu.clone();
+                            let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                                build_menu(menu, window, cx)
+                            });
+                            // Close the popover + drop the cache when the menu
+                            // dismisses (pick, escape, click-away) — this also
+                            // fires `on_open_change(false)`, clearing the tooltip
+                            // suppression.
+                            let popover_entity = cx.entity();
+                            let menu_state2 = menu_state.clone();
+                            window
+                                .subscribe(&menu, cx, move |_, _: &DismissEvent, window, cx| {
+                                    popover_entity.update(cx, |st, cx| st.dismiss(window, cx));
+                                    menu_state2.update(cx, |s, _| *s = None);
+                                })
+                                .detach();
+                            menu_state.update(cx, |s, _| *s = Some(menu.clone()));
+                            menu
+                        }
+                    }
+                }
+            });
+
+        // Hover tooltip, centered directly above the control and suppressed while
+        // the menu is open. It is an absolute, full-width, center-justified overlay
+        // so it centers over the button WITHOUT measuring the label, and
+        // `group_hover` reveals it on hover. gpui's native `.tooltip()` anchors to
+        // the mouse cursor (so it drifted off to the button's side); the managed
+        // Button tooltip centers but can't be hidden when the upward menu opens —
+        // this hand-rolled one gives both centering AND open-time suppression.
+        let theme = self.theme;
+        let body_sm = self.typography.t_body_sm;
+        let group_name = SharedString::from(format!("{ctrl_id}-grp"));
+        let mut wrap = div().id(wrap_id).relative().group(group_name.clone()).child(popover);
+        if !is_open {
+            wrap = wrap.child(
+                div()
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .w_full()
+                    .pb(px(6.0))
+                    .flex()
+                    .justify_center()
+                    .invisible()
+                    .group_hover(group_name, |s| s.visible())
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .bg(theme.bg_overlay)
+                            .border_1()
+                            .border_color(theme.border_inactive)
+                            .text_color(theme.fg_base)
+                            .text_size(px(body_sm))
+                            .shadow_md()
+                            .child(tooltip_text.clone()),
+                    ),
+            );
+        }
+        wrap
+    }
+
+    /// A footer dropdown control (the shared shape behind permission / effort /
+    /// feature-select): an icon + current-label ghost button that opens a
+    /// checkmarked menu upward. Builds the trigger and the plain (checkmark +
+    /// label) rows, then delegates the Popover + tooltip behavior to
+    /// [`Self::render_dropdown_shell`].
+    fn render_labeled_dropdown(
+        &self,
+        ctrl_id: SharedString,
+        icon_path: &'static str,
+        tooltip_text: SharedString,
+        current_label: String,
+        current_wire: String,
+        items: Vec<(String, String)>,
+        on_pick: std::rc::Rc<dyn Fn(&mut ComposerView, String, &mut Context<ComposerView>)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let view = cx.entity();
+        let trigger = Button::new(SharedString::from(format!("{ctrl_id}-btn")))
+            .icon(Icon::default().path(icon_path))
+            .label(current_label)
+            .ghost()
+            .small()
+            .dropdown_caret(true);
+        let items = std::rc::Rc::new(items);
+        let current = current_wire;
+        let build_menu =
+            move |mut menu: PopupMenu, window: &mut Window, _cx: &mut Context<PopupMenu>| {
+                for (wire, label) in items.iter() {
+                    let selected = *wire == current;
+                    let display = if selected {
+                        format!("\u{2713} {label}")
+                    } else {
+                        format!("   {label}")
+                    };
+                    let wire = wire.clone();
+                    let on_pick = on_pick.clone();
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
+                            window.listener_for(
+                                &view,
+                                move |v: &mut ComposerView, _e: &gpui::ClickEvent, _w, cx| {
+                                    on_pick(v, wire.clone(), cx);
+                                },
+                            ),
+                        ),
+                    );
+                }
+                menu
+            };
+        self.render_dropdown_shell(ctrl_id, tooltip_text, trigger, build_menu, cx)
+    }
+
     /// The permission-mode control in the bottom toolbar: a flat ghost button
     /// (label + subtle caret) labeled with the current mode, opening the
     /// canonical mode menu upward.
     fn render_permission_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity();
         let modes: Vec<(String, String)> = self
             .vocab
             .permission_modes
@@ -1429,42 +1629,22 @@ impl ComposerView {
             .find(|(w, _)| *w == current_wire)
             .map(|(_, l)| l.clone())
             .unwrap_or_else(|| current_wire.clone());
-        let current_for_menu = current_wire.clone();
-        Button::new("chat-perm-mode-btn")
-            .label(current_label)
-            .ghost()
-            .small()
-            .tooltip("Permission mode")
-            .dropdown_caret(true)
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
-                for (wire, label) in &modes {
-                    let selected = current_for_menu == *wire;
-                    let display = if selected {
-                        format!("\u{2713} {label}")
-                    } else {
-                        format!("   {label}")
-                    };
-                    let choice = wire.to_string();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
-                            window.listener_for(
-                                &entity,
-                                move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
-                                    view.pick_permission_mode(choice.clone(), cx);
-                                },
-                            ),
-                        ),
-                    );
-                }
-                menu
-            })
+        self.render_labeled_dropdown(
+            "chat-perm-mode".into(),
+            "icons/lock.svg",
+            "Permission mode".into(),
+            current_label,
+            current_wire,
+            modes,
+            std::rc::Rc::new(|view: &mut ComposerView, wire, cx| view.pick_permission_mode(wire, cx)),
+            cx,
+        )
     }
 
     /// The reasoning-effort control in the bottom toolbar: a flat ghost button
     /// (label + subtle caret) labeled with the current effort, opening the level
     /// menu upward.
     fn render_effort_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity();
         let efforts: Vec<(String, String)> = self
             .vocab
             .efforts
@@ -1481,35 +1661,90 @@ impl ComposerView {
             .find(|(w, _)| *w == current_wire)
             .map(|(_, l)| l.clone())
             .unwrap_or_else(|| current_wire.clone());
-        let current_for_menu = current_wire.clone();
-        Button::new("chat-effort-btn")
-            .label(current_label)
-            .ghost()
-            .small()
-            .tooltip("Reasoning effort")
-            .dropdown_caret(true)
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, window, _cx| {
-                for (wire, label) in &efforts {
-                    let selected = current_for_menu == *wire;
-                    let display = if selected {
-                        format!("\u{2713} {label}")
-                    } else {
-                        format!("   {label}")
-                    };
-                    let choice = wire.to_string();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
-                            window.listener_for(
-                                &entity,
-                                move |view: &mut ComposerView, _ev: &gpui::ClickEvent, _w, cx| {
-                                    view.pick_effort(choice.clone(), cx);
-                                },
-                            ),
-                        ),
+        self.render_labeled_dropdown(
+            "chat-effort".into(),
+            "icons/sparkles.svg",
+            "Reasoning effort".into(),
+            current_label,
+            current_wire,
+            efforts,
+            std::rc::Rc::new(|view: &mut ComposerView, wire, cx| view.pick_effort(wire, cx)),
+            cx,
+        )
+    }
+
+    /// Map a backend's *semantic* feature-icon hint (e.g. `"zap"`, `"plan"`) to a
+    /// bundled asset path. The agents crate emits only the hint so it carries no
+    /// UI asset path; unknown/`None` hints fall back to a neutral settings glyph.
+    fn feature_icon_path(hint: Option<&str>) -> &'static str {
+        match hint {
+            Some("zap" | "fast") => "icons/sparkles.svg",
+            Some("plan" | "list-todo" | "list") => "icons/list-tree.svg",
+            Some("bot" | "check" | "auto-accept") => "icons/check.svg",
+            Some("shield" | "lock" | "permission") => "icons/lock.svg",
+            _ => "icons/settings-2.svg",
+        }
+    }
+
+    /// The generic feature-control cluster (fast / plan / auto-accept /
+    /// agent-profile …) the backend advertised, rendered to the right of the
+    /// effort picker. A `Toggle` is a compact icon button that shows a selected
+    /// state when on; a `Select` is a labeled dropdown (same shape as the effort
+    /// picker). Renders nothing when the backend advertises no features.
+    fn render_feature_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let density = self.density;
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline));
+        for feature in &self.vocab.features {
+            let btn_id = SharedString::from(format!("chat-feat-{}", feature.id));
+            match &feature.kind {
+                FeatureKind::Toggle { on } => {
+                    let on = *on;
+                    let id = feature.id.clone();
+                    row = row.child(
+                        Button::new(btn_id)
+                            .icon(Icon::default().path(Self::feature_icon_path(feature.icon.as_deref())))
+                            .ghost()
+                            .small()
+                            .selected(on)
+                            .tooltip(feature.label.clone())
+                            .on_click(cx.listener(move |this, _ev, _w, cx| {
+                                this.pick_feature(id.clone(), FeatureValue::Bool(!on), cx);
+                            })),
                     );
                 }
-                menu
-            })
+                FeatureKind::Select { options, selected } => {
+                    let opts: Vec<(String, String)> =
+                        options.iter().map(|o| (o.wire.clone(), o.label.clone())).collect();
+                    let current_wire = selected.clone().unwrap_or_default();
+                    let current_label = opts
+                        .iter()
+                        .find(|(w, _)| *w == current_wire)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| feature.label.clone());
+                    let fid = feature.id.clone();
+                    let on_pick: std::rc::Rc<
+                        dyn Fn(&mut ComposerView, String, &mut Context<ComposerView>),
+                    > = std::rc::Rc::new(move |view: &mut ComposerView, wire, cx| {
+                        view.pick_feature(fid.clone(), FeatureValue::Choice(wire), cx);
+                    });
+                    row = row.child(self.render_labeled_dropdown(
+                        btn_id,
+                        Self::feature_icon_path(feature.icon.as_deref()),
+                        feature.label.clone().into(),
+                        current_label,
+                        current_wire,
+                        opts,
+                        on_pick,
+                        cx,
+                    ));
+                }
+            }
+        }
+        row
     }
 
     /// The image-attach control (far left of the toolbar): a flat ghost button
@@ -2237,8 +2472,19 @@ impl Render for ComposerView {
         if !self.vocab.models.is_empty() {
             controls = controls.child(self.render_model_select(cx));
         }
-        if self.supports_effort {
+        // Show the effort picker only when the backend actually advertises effort
+        // levels — mirroring the model gate above. Gating on `supports_effort`
+        // alone leaked a blank picker: that flag tracks the generic "accepts
+        // config" capability, so an agent advertising some *other* config option
+        // (with no thought-level) rendered an effort button with an empty label.
+        if self.supports_effort && !self.vocab.efforts.is_empty() {
             controls = controls.child(self.render_effort_picker(cx));
+        }
+        // Generic backend-advertised feature controls (fast / plan / auto-accept
+        // / agent-profile …) close the far-right cluster. Renders nothing when the
+        // backend advertises no features, so providers without any stay unchanged.
+        if !self.vocab.features.is_empty() {
+            controls = controls.child(self.render_feature_controls(cx));
         }
         let controls = controls;
 

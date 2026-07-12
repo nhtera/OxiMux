@@ -441,7 +441,7 @@ async fn session(
                     }
                     Outbound::SetConfig { id, value } => {
                         if let Some(val) = config_value_from_json(value) {
-                            let _ = cx
+                            let resp = cx
                                 .send_request(SetSessionConfigOptionRequest::new(
                                     session_id.clone(),
                                     SessionConfigId::new(id),
@@ -449,6 +449,22 @@ async fn session(
                                 ))
                                 .block_task()
                                 .await;
+                            // The response carries the FULL refreshed option set —
+                            // switching the model changes which reasoning levels
+                            // (and other options) apply, and the agent returns the
+                            // new set here rather than always pushing a separate
+                            // `ConfigOptionUpdate` notification. Swap it into state
+                            // and signal the composer to re-pull its pickers so the
+                            // effort/other controls track the new model. Guard the
+                            // empty case so a terse agent reply can't wipe the vocab.
+                            if let Ok(resp) = resp {
+                                if !resp.config_options.is_empty() {
+                                    if let Ok(mut s) = state.lock() {
+                                        s.config_options = resp.config_options;
+                                    }
+                                    let _ = event_tx.send(ThreadEvent::ControlsUpdated);
+                                }
+                            }
                         }
                     }
                     // The session is already open — a stray Authenticate (e.g. a

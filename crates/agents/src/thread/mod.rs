@@ -36,7 +36,8 @@ pub use codex::CodexAppServerConnection;
 pub use connect::{connect, probe_catalog, ChatBackend, ConnectSpec, ProbedCatalog};
 pub use connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,
-    AgentCapabilities, AgentConnection, EffortChoice, ModeChoice, ModelChoice, StubConnection,
+    AgentCapabilities, AgentConnection, EffortChoice, FeatureControl, FeatureKind,
+    FeatureSelectOption, FeatureValue, ModeChoice, ModelChoice, StubConnection,
 };
 pub use transport::Transport;
 pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};

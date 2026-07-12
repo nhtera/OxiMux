@@ -106,11 +106,31 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
             models: c.models(),
             permission_modes: c.permission_modes(),
             efforts: c.efforts(),
+            features: c.features(),
             default_model: c.default_model(),
             default_mode: c.default_mode(),
             default_effort: c.default_effort(),
         },
         None => ControlVocab::default(),
+    }
+}
+
+/// Overlay the user's optimistic feature picks onto the backend-advertised
+/// feature list so the composer reflects a toggle/select change immediately —
+/// mirroring how `model`/`effort` hold the pick — rather than waiting for the
+/// backend to echo the new value (some ACP agents apply `set_config` silently).
+fn apply_feature_overrides(
+    features: &mut [FeatureControl],
+    overrides: &HashMap<String, FeatureValue>,
+) {
+    for f in features.iter_mut() {
+        match (overrides.get(&f.id), &mut f.kind) {
+            (Some(FeatureValue::Bool(b)), FeatureKind::Toggle { on }) => *on = *b,
+            (Some(FeatureValue::Choice(c)), FeatureKind::Select { selected, .. }) => {
+                *selected = Some(c.clone());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -273,8 +293,9 @@ use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
     connect, probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend,
-    ChatImage, ChatThread, ConnectSpec, PermissionDecision, ProbedCatalog, QuestionAnswers,
-    QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus, Transport, TurnUsage,
+    ChatImage, ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue,
+    PermissionDecision, ProbedCatalog, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent,
+    ToolCallStatus, Transport, TurnUsage,
 };
 use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -344,6 +365,12 @@ pub struct AgentChatView {
     /// or `None` for the CLI's own default. Like `--model` it's fixed at spawn,
     /// so a live switch respawns via `--resume`.
     effort: Option<String>,
+    /// Optimistic user picks for generic feature controls, keyed by option id.
+    /// Overlaid onto the backend-advertised feature list on every `sync_composer`
+    /// so a toggle/select reflects immediately (mirroring how `model`/`effort`
+    /// hold the pick), instead of waiting for the backend to echo the new value —
+    /// some ACP agents apply `set_config` without echoing it back.
+    feature_values: HashMap<String, oximux_agents::thread::FeatureValue>,
     /// Set once the event channel closes (process exit / EOF). Disables sending.
     disconnected: bool,
     /// True after the user pressed Stop: the turn was interrupted and the child
@@ -720,6 +747,9 @@ impl AgentChatView {
                     this.change_permission_mode(mode.clone(), cx)
                 }
                 ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
+                ComposerEvent::FeaturePicked { id, value } => {
+                    this.change_feature(id.clone(), value.clone(), cx)
+                }
                 ComposerEvent::AgentPicked(id) => this.change_agent(id.clone(), cx),
                 ComposerEvent::MentionOpened => this.refresh_context_sources(cx),
                 ComposerEvent::CaptureContext(request) => {
@@ -894,6 +924,7 @@ impl AgentChatView {
             model,
             permission_mode: None,
             effort: None,
+            feature_values: HashMap::new(),
             disconnected,
             interrupted: false,
             unbound: !connect_now,
@@ -1251,7 +1282,10 @@ impl AgentChatView {
             .as_ref()
             .map(|c| c.capabilities())
             .unwrap_or_default();
-        let vocab = control_vocab_of(self.connection.as_deref());
+        let mut vocab = control_vocab_of(self.connection.as_deref());
+        // Overlay optimistic feature picks so a toggle/select reflects the user's
+        // choice immediately, without waiting for the backend to echo it back.
+        apply_feature_overrides(&mut vocab.features, &self.feature_values);
         let (model, permission_mode, effort) =
             (self.model.clone(), self.permission_mode.clone(), self.effort.clone());
         // The command palette is offered only when the backend advertises
@@ -1331,6 +1365,7 @@ impl AgentChatView {
                     models,
                     permission_modes: Vec::new(),
                     efforts: Vec::new(),
+                    features: Vec::new(),
                     default_model,
                     default_mode: None,
                     default_effort: None,
@@ -2258,6 +2293,31 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Apply a generic feature-control change (a toggle flip or a select pick).
+    /// Prefers a live in-session write (ACP `set_config` via the backend's
+    /// `set_feature`); a backend that fixes the feature at spawn falls back to a
+    /// resume-respawn. No-op pre-bind. The new value surfaces on the next
+    /// `sync_composer` — the backend re-advertises it through `features()`.
+    fn change_feature(&mut self, id: String, value: FeatureValue, cx: &mut Context<Self>) {
+        // Unreachable pre-bind (the feature cluster is hidden on an unbound
+        // draft), but guard so a stray pick can't early-spawn the subprocess.
+        if self.unbound {
+            return;
+        }
+        // Remember the pick optimistically so the control reflects it at once,
+        // even when the backend applies the change without echoing it back.
+        self.feature_values.insert(id.clone(), value.clone());
+        let switched_live = self
+            .connection
+            .as_ref()
+            .is_some_and(|c| c.set_feature(&id, value.clone()).is_ok());
+        if !switched_live {
+            self.respawn(cx);
+        }
+        self.sync_composer(cx); // reflect the new value in the toolbar
+        cx.notify();
+    }
+
     /// Wire the owning pane group (called by the tab factory right after
     /// construction) so the `@terminal` context provider can enumerate sibling
     /// terminal tabs.
@@ -2421,6 +2481,7 @@ impl AgentChatView {
             model: None,
             permission_mode: None,
             effort: None,
+            feature_values: HashMap::new(),
             disconnected: false,
             interrupted: false,
             // The test injects a live connection, so this chat is already bound.
@@ -4574,6 +4635,48 @@ mod tests {
     use gpui::TestAppContext;
     use oximux_agents::thread::StubConnection;
     use serde_json::json;
+
+    /// An optimistic feature pick overlays the backend-advertised value so the
+    /// control reflects the user's choice immediately (a toggle flips, a select
+    /// re-points) — and an override for an id the backend no longer advertises is
+    /// harmlessly ignored.
+    #[test]
+    fn apply_feature_overrides_overlays_picks() {
+        use oximux_agents::thread::{FeatureControl, FeatureKind, FeatureSelectOption};
+        let mut features = vec![
+            FeatureControl {
+                id: "fast".into(),
+                label: "Fast".into(),
+                description: None,
+                icon: None,
+                kind: FeatureKind::Toggle { on: false },
+            },
+            FeatureControl {
+                id: "mode".into(),
+                label: "Session Mode".into(),
+                description: None,
+                icon: None,
+                kind: FeatureKind::Select {
+                    options: vec![
+                        FeatureSelectOption { wire: "a".into(), label: "A".into(), description: None },
+                        FeatureSelectOption { wire: "b".into(), label: "B".into(), description: None },
+                    ],
+                    selected: Some("a".into()),
+                },
+            },
+        ];
+        let overrides = HashMap::from([
+            ("fast".to_string(), FeatureValue::Bool(true)),
+            ("mode".to_string(), FeatureValue::Choice("b".into())),
+            ("stale".to_string(), FeatureValue::Bool(true)), // no matching feature → ignored
+        ]);
+        apply_feature_overrides(&mut features, &overrides);
+        assert!(matches!(features[0].kind, FeatureKind::Toggle { on: true }));
+        match &features[1].kind {
+            FeatureKind::Select { selected, .. } => assert_eq!(selected.as_deref(), Some("b")),
+            _ => panic!("expected select"),
+        }
+    }
 
     /// A completed catalog probe must never blank a good seed: an empty or failed
     /// revalidation of a disk-seeded picker keeps the seed; only a non-empty
