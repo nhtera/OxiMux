@@ -55,6 +55,12 @@ pub struct ChatThread {
     /// Whether a turn is currently in flight (between a user send and
     /// `TurnEnded`). Drives the composer's send/stop affordance.
     pub turn_active: bool,
+    /// Whether the backend is compacting context right now (Claude
+    /// `system/status status="compacting"`). Set on `CompactionStarted`, cleared
+    /// when the `CompactBoundary` divider lands or the turn ends without one — so
+    /// a long compaction shows a "Compacting context…" spinner instead of looking
+    /// like a hang. Transient runtime state (not persisted).
+    pub compacting: bool,
     /// Latest per-turn token/cost usage (from the most recent `TurnEnded`), for
     /// the usage footer. `None` until a turn reports usage.
     pub usage: Option<TurnUsage>,
@@ -402,14 +408,24 @@ impl ChatThread {
                 self.last_summary = Some(detail.clone());
                 self.end_assistant_window();
             }
+            // Compaction began — show the pending spinner until the boundary or
+            // turn end supersedes it.
+            ThreadEvent::CompactionStarted => {
+                self.compacting = true;
+            }
             ThreadEvent::CompactBoundary { summary } => {
                 // Close the current assistant block and drop in a divider so the
                 // reclaimed-context gap reads as a boundary, not a silent jump.
+                // The boundary supersedes any pending "Compacting…" spinner.
+                self.compacting = false;
                 self.end_assistant_window();
                 self.entries.push(ThreadEntry::ContextCompaction { summary: summary.clone() });
             }
             ThreadEvent::TurnEnded { is_error, result, usage } => {
                 self.turn_active = false;
+                // Clear a dangling compaction spinner if the turn ended without a
+                // boundary event (e.g. a compaction that failed or was aborted).
+                self.compacting = false;
                 self.end_assistant_window();
                 if let Some(u) = usage {
                     // Accumulate real spend (cost is known only at turn-end) and
@@ -548,10 +564,24 @@ impl ChatThread {
             ThreadEvent::ControlsUpdated => {}
             // Auth is ephemeral, view-owned card state (mounted by the app's event
             // handler, never persisted in the transcript) — the fold is a no-op.
-            ThreadEvent::AuthRequired { .. } | ThreadEvent::AuthTerminal { .. } => {}
+            ThreadEvent::AuthRequired { .. }
+            | ThreadEvent::AuthTerminal { .. }
+            | ThreadEvent::AuthUrl { .. }
+            | ThreadEvent::AuthOutcome { .. } => {}
+            // A child thread's completed action → append to its spawning tool
+            // card's capped log. An unknown parent id is dropped like a
+            // `ToolResult` for an unknown id — the child outlived its card, or the
+            // registration raced (Codex buffers to avoid that). Never touches the
+            // root transcript.
+            ThreadEvent::SubagentAction { parent_tool_call_id, line } => {
+                if let Some(tc) = self.tool_call_mut(parent_tool_call_id) {
+                    tc.push_subagent_action(line.clone());
+                }
+            }
             ThreadEvent::Error(msg) => {
                 self.last_error = Some(msg.clone());
                 self.turn_active = false;
+                self.compacting = false;
             }
         }
     }
@@ -822,6 +852,31 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn subagent_action_appends_to_parent_card_and_drops_unknown_parent() {
+        let mut t = ChatThread::new();
+        t.push_user_message("delegate");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_agent".into(), name: "Agent".into(), input: json!({"description":"scout"}) });
+        t.apply(&ThreadEvent::SubagentAction {
+            parent_tool_call_id: "toolu_agent".into(), line: "Read src/main.rs".into() });
+        t.apply(&ThreadEvent::SubagentAction {
+            parent_tool_call_id: "toolu_agent".into(), line: "Bash cargo test".into() });
+        // An action for a parent id with no card is dropped (no panic, no leak).
+        t.apply(&ThreadEvent::SubagentAction {
+            parent_tool_call_id: "toolu_missing".into(), line: "orphan".into() });
+
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => {
+                assert_eq!(tc.name, "Agent");
+                assert_eq!(tc.subagent_log, vec!["Read src/main.rs".to_string(), "Bash cargo test".to_string()]);
+            }
+            other => panic!("expected Agent ToolCall, got {other:?}"),
+        }
+        // No stray entry from the orphaned action.
+        assert_eq!(t.entries.len(), 2, "orphan action created no entry");
     }
 
     #[test]

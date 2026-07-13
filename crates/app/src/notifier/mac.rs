@@ -60,6 +60,53 @@ static CLICK_SENDERS: Mutex<Vec<UnboundedSender<ClickTarget>>> = Mutex::new(Vec:
 /// produces one banner for a same-instant burst.
 static BURST: Mutex<Option<BurstGate>> = Mutex::new(None);
 
+/// Process-wide count of attention banners surfaced since the window last had
+/// focus — the dock badge number. Bumped on each posted agent/bell banner;
+/// reset to 0 (badge cleared) when the window regains focus.
+static ATTENTION_BADGE: AtomicU64 = AtomicU64::new(0);
+
+/// Tab ids with an outstanding `coalesce_until_focus` banner. A second
+/// attention edge for a tab already in this set is suppressed until the window
+/// regains focus (`clear_attention` empties it) — the chat "one outstanding per
+/// tab" policy. Only chat requests populate it; ambient/bell/test never do.
+static OUTSTANDING: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+
+/// For a `coalesce_until_focus` request: `true` (and records the tab) on the
+/// first edge for a tab since the last focus, `false` while one is already
+/// outstanding. Non-coalescing requests always return `true`.
+fn coalesce_allows(req: &NotificationRequest) -> bool {
+    if !req.coalesce_until_focus {
+        return true;
+    }
+    let mut slot = match OUTSTANDING.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.get_or_insert_with(std::collections::HashSet::new).insert(req.tab_id.0)
+}
+
+/// Set the dock-tile badge to `count` (`0` clears it). A UIKit/AppKit call, so
+/// it must run on the main thread — `MainThreadMarker::new()` returns `None`
+/// off-main and the update is skipped (a badge is cosmetic; never risk a
+/// cross-thread AppKit call). Callers run on the GPUI main loop, so the common
+/// path sets it.
+///
+/// The badge is inherently app-global — macOS gives the process a single dock
+/// tile, so `ATTENTION_BADGE` / `OUTSTANDING` are process-wide, and any
+/// window regaining focus clears them (`clear_attention`). With multiple
+/// windows open this can zero the badge while a *different* unfocused window
+/// still has un-viewed attention; the already-delivered banners persist in
+/// Notification Center, so this is a cosmetic under-count, not a lost signal.
+fn set_dock_badge(count: u64) {
+    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+        return;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let tile = app.dockTile();
+    let label = (count > 0).then(|| NSString::from_str(&count.to_string()));
+    tile.setBadgeLabel(label.as_deref());
+}
+
 /// True when a banner for `workspace_key` may fire now.
 fn burst_allows(workspace_key: &str) -> bool {
     let mut slot = match BURST.lock() {
@@ -292,6 +339,12 @@ impl Notifier for MacNotifier {
         if !self.settings.should_fire(&req) {
             return;
         }
+        // One outstanding banner per tab until refocus (chat policy) — checked
+        // before the burst gate so a suppressed repeat doesn't consume the
+        // workspace's burst slot.
+        if !coalesce_allows(&req) {
+            return;
+        }
         if req.source != NotificationSource::Test && !burst_allows(&req.workspace_key) {
             return;
         }
@@ -340,6 +393,25 @@ impl Notifier for MacNotifier {
         })
         .copy();
         center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+
+        // A surfaced agent/bell banner means something happened while the user
+        // was away — bump the dock badge (the test button doesn't count). It
+        // clears when the window regains focus (`clear_attention`).
+        if req.source != NotificationSource::Test {
+            let count = ATTENTION_BADGE.fetch_add(1, Ordering::Relaxed) + 1;
+            set_dock_badge(count);
+        }
+    }
+
+    fn clear_attention(&self) {
+        ATTENTION_BADGE.store(0, Ordering::Relaxed);
+        set_dock_badge(0);
+        // Reopen the per-tab attention gate so the next edge after refocus fires.
+        if let Ok(mut slot) = OUTSTANDING.lock() {
+            if let Some(set) = slot.as_mut() {
+                set.clear();
+            }
+        }
     }
 
     fn availability(&self) -> NotifierAvailability {
@@ -356,6 +428,48 @@ impl Notifier for MacNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_req(tab: u64) -> NotificationRequest {
+        NotificationRequest {
+            source: NotificationSource::AgentState,
+            kind: super::super::NotificationKind::Done,
+            tab_id: TabId(tab),
+            workspace_key: "/wt".into(),
+            label: "chat".into(),
+            body: String::new(),
+            window_active: false,
+            pane_visible: false,
+            coalesce_until_focus: true,
+        }
+    }
+
+    #[test]
+    fn coalesce_allows_one_per_tab_until_cleared() {
+        // Reset shared state (other tests may have touched it).
+        if let Ok(mut s) = OUTSTANDING.lock() {
+            *s = None;
+        }
+        // First edge for a tab fires; a second is suppressed.
+        assert!(coalesce_allows(&chat_req(1)));
+        assert!(!coalesce_allows(&chat_req(1)));
+        // A different tab is independent.
+        assert!(coalesce_allows(&chat_req(2)));
+        // A non-coalescing request always passes.
+        let mut bell = chat_req(1);
+        bell.coalesce_until_focus = false;
+        assert!(coalesce_allows(&bell));
+        // Clearing the set reopens the gate.
+        if let Ok(mut s) = OUTSTANDING.lock() {
+            if let Some(set) = s.as_mut() {
+                set.clear();
+            }
+        }
+        assert!(coalesce_allows(&chat_req(1)));
+        // Clean up so ordering with other tests doesn't leak.
+        if let Ok(mut s) = OUTSTANDING.lock() {
+            *s = None;
+        }
+    }
 
     #[test]
     fn click_identifier_roundtrip() {

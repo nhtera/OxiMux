@@ -130,6 +130,7 @@ impl ProjectPanes {
         session_id: &str,
         path: Option<&str>,
         cwd: PathBuf,
+        adapter: oximux_core::AgentAdapter,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -144,7 +145,7 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         if let Some(target) = self.groups.get(&target_id).cloned() {
             target.update(cx, |g, cx| {
-                g.open_session_as_chat(session_id, path, cwd, window, cx);
+                g.open_session_as_chat(session_id, path, cwd, adapter, window, cx);
             });
         }
     }

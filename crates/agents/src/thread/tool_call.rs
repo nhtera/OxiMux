@@ -71,7 +71,22 @@ pub struct ToolCall {
     /// ever holds fully-formed tool calls, so this is never written or read.
     #[serde(skip)]
     pub partial_input: String,
+    /// Rolling action log of a subagent/child thread this call spawned (Claude
+    /// Task, Codex collab-subagent): one line per completed child action (a tool
+    /// call or a first-line text summary). Rendered under the card body so the
+    /// user sees "what the subagent is doing" without child bubbles leaking into
+    /// the root transcript. Capped ({@link MAX_SUBAGENT_LOG}) — the oldest lines
+    /// are evicted with a "+N earlier" marker synthesized at render time.
+    /// `#[serde(default)]` keeps older persisted transcript blobs loadable, and it
+    /// persists so a restored session shows the settled log.
+    #[serde(default)]
+    pub subagent_log: Vec<String>,
 }
+
+/// Cap on a tool call's retained [`ToolCall::subagent_log`] lines. A chatty
+/// subagent (dozens of tool calls) must not grow the card — or a persisted blob
+/// — without bound; past the cap the oldest lines are evicted.
+pub const MAX_SUBAGENT_LOG: usize = 100;
 
 impl ToolCall {
     pub fn new(id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
@@ -86,7 +101,21 @@ impl ToolCall {
             terminal_id: None,
             kind: None,
             partial_input: String::new(),
+            subagent_log: Vec::new(),
         }
+    }
+
+    /// Append a subagent action line, evicting the oldest when the log is at
+    /// [`MAX_SUBAGENT_LOG`] (a bounded ring). Empty lines are ignored.
+    pub fn push_subagent_action(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if line.is_empty() {
+            return;
+        }
+        if self.subagent_log.len() >= MAX_SUBAGENT_LOG {
+            self.subagent_log.remove(0);
+        }
+        self.subagent_log.push(line);
     }
 
     /// The best-effort preview of a still-streaming tool call's arguments: the
@@ -342,6 +371,33 @@ mod tests {
     #[test]
     fn parse_partial_json_complete_value_passes_through() {
         assert_eq!(parse_partial_json(r#"{"a":1}"#), Some(json!({"a":1})));
+    }
+
+    #[test]
+    fn push_subagent_action_caps_and_evicts_oldest() {
+        let mut tc = ToolCall::new("t", "Agent", json!({}));
+        tc.push_subagent_action(""); // empty ignored
+        assert!(tc.subagent_log.is_empty());
+        for i in 0..(MAX_SUBAGENT_LOG + 5) {
+            tc.push_subagent_action(format!("line {i}"));
+        }
+        assert_eq!(tc.subagent_log.len(), MAX_SUBAGENT_LOG, "log is a bounded ring");
+        // Oldest five evicted; newest retained.
+        assert_eq!(tc.subagent_log.first().unwrap(), "line 5");
+        assert_eq!(tc.subagent_log.last().unwrap(), &format!("line {}", MAX_SUBAGENT_LOG + 4));
+    }
+
+    #[test]
+    fn subagent_log_survives_serde_round_trip_and_defaults_on_old_blobs() {
+        let mut tc = ToolCall::new("t", "Agent", json!({}));
+        tc.push_subagent_action("Read src/main.rs");
+        let blob = serde_json::to_string(&tc).unwrap();
+        let back: ToolCall = serde_json::from_str(&blob).unwrap();
+        assert_eq!(back.subagent_log, vec!["Read src/main.rs".to_string()]);
+        // An older persisted blob (no `subagent_log` key) loads with an empty log.
+        let old = json!({"id":"t","name":"Agent","input":{},"status":"InProgress","result":null}).to_string();
+        let loaded: ToolCall = serde_json::from_str(&old).unwrap();
+        assert!(loaded.subagent_log.is_empty(), "serde default keeps old blobs loadable");
     }
 
     #[test]

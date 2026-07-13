@@ -27,6 +27,11 @@ pub const M_THREAD_FORK: &str = "thread/fork";
 pub const M_MODEL_LIST: &str = "model/list";
 pub const M_TURN_START: &str = "turn/start";
 pub const M_TURN_INTERRUPT: &str = "turn/interrupt";
+// --- Account / ChatGPT-OAuth sign-in (0.144.x native flow) ----------------
+pub const M_ACCOUNT_READ: &str = "account/read";
+pub const M_ACCOUNT_LOGIN_START: &str = "account/login/start";
+/// Server → client notification fired when a browser OAuth login resolves.
+pub const N_ACCOUNT_LOGIN_COMPLETED: &str = "account/login/completed";
 
 // --- Client → server notifications ---------------------------------------
 pub const N_INITIALIZED: &str = "initialized";
@@ -169,6 +174,42 @@ pub fn model_from_start_response(result: &Value) -> Option<String> {
     result.get("model")?.as_str().map(String::from)
 }
 
+/// `account/login/start` params for the ChatGPT OAuth flow (`codexStreamlinedLogin`
+/// = the merged ChatGPT-app browser flow). The response carries a `{loginId,
+/// authUrl}`; the client opens `authUrl` in a browser and the app-server runs the
+/// `localhost:1455` callback, then fires `account/login/completed`.
+pub fn account_login_start_chatgpt_params() -> Value {
+    json!({ "type": "chatgpt", "codexStreamlinedLogin": true })
+}
+
+/// Whether an `account/read` result says the session is signed out and needs an
+/// OpenAI sign-in (`{account: null, requiresOpenaiAuth: true}`). A present
+/// `account` (chatgpt/apiKey) is signed in.
+pub fn account_read_needs_login(result: &Value) -> bool {
+    result.get("account").map(Value::is_null).unwrap_or(true)
+        && result.get("requiresOpenaiAuth").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Pull the browser `authUrl` out of a chatgpt `account/login/start` response.
+/// `None` for the immediate `apiKey` variant (no browser step) or a malformed one.
+pub fn login_url_from_start_response(result: &Value) -> Option<String> {
+    result.get("authUrl")?.as_str().map(String::from)
+}
+
+/// Whether an `error` notification is the "logged out" 401 the model websocket
+/// raises when a turn runs without auth (`codexErrorInfo.responseStreamDisconnected
+/// .httpStatusCode == 401`). The defensive fallback to the proactive `account/read`
+/// check — the turn-time signal that a sign-in is needed.
+pub fn error_is_unauthorized(params: &Value) -> bool {
+    params
+        .get("error")
+        .and_then(|e| e.get("codexErrorInfo"))
+        .and_then(|i| i.get("responseStreamDisconnected"))
+        .and_then(|d| d.get("httpStatusCode"))
+        .and_then(Value::as_u64)
+        == Some(401)
+}
+
 /// One entry from `model/list` (the fields the picker needs). `wire` is the id
 /// passed to `turn/start`'s `model`; `efforts` are the reasoning-effort options.
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +259,47 @@ pub fn parse_model_list(result: &Value) -> Vec<CodexModel> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn account_read_detects_logged_out() {
+        // Logged out: null account + requiresOpenaiAuth.
+        assert!(account_read_needs_login(&json!({"account": null, "requiresOpenaiAuth": true})));
+        // Signed in (chatgpt) → not needing login.
+        assert!(!account_read_needs_login(
+            &json!({"account": {"type":"chatgpt","email":"x@y.z"}, "requiresOpenaiAuth": false})
+        ));
+        // A null account but auth not required (e.g. a configured base URL) → no card.
+        assert!(!account_read_needs_login(&json!({"account": null, "requiresOpenaiAuth": false})));
+    }
+
+    #[test]
+    fn login_start_params_and_url_extraction() {
+        let p = account_login_start_chatgpt_params();
+        assert_eq!(p["type"], "chatgpt");
+        assert_eq!(p["codexStreamlinedLogin"], true);
+        // The chatgpt response carries authUrl; the apiKey variant does not.
+        assert_eq!(
+            login_url_from_start_response(&json!({"type":"chatgpt","loginId":"L1","authUrl":"https://auth.openai.com/x"})),
+            Some("https://auth.openai.com/x".to_string()),
+        );
+        assert_eq!(login_url_from_start_response(&json!({"type":"apiKey"})), None);
+    }
+
+    #[test]
+    fn error_unauthorized_classifier() {
+        // The captured logged-out 401 shape.
+        assert!(error_is_unauthorized(&json!({
+            "error": {"message":"Reconnecting... 2/5",
+                "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 401}}},
+            "willRetry": true
+        })));
+        // A different HTTP status (e.g. 500) is not an auth prompt.
+        assert!(!error_is_unauthorized(&json!({
+            "error": {"codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 500}}}
+        })));
+        // A generic error with no codexErrorInfo is not auth.
+        assert!(!error_is_unauthorized(&json!({"error": {"message": "boom"}})));
+    }
 
     #[test]
     fn thread_start_omits_blank_model_and_sets_posture() {

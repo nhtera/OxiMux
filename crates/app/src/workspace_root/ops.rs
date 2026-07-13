@@ -206,11 +206,13 @@ impl WorkspaceRoot {
         let path = (!action.path.is_empty()).then(|| action.path.clone());
         let cwd = std::path::PathBuf::from(&action.cwd);
         let session_id = action.session_id.clone();
+        let adapter = action.adapter;
         panes.update(cx, |p, cx| {
             p.open_session_as_chat_in_active_group(
                 &session_id,
                 path.as_deref(),
                 cwd,
+                adapter,
                 window,
                 cx,
             );

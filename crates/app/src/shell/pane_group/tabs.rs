@@ -1021,7 +1021,50 @@ impl PaneGroup {
                     cx,
                 );
             }
+            crate::shell::agent_chat::AgentChatEvent::AttentionNeeded { kind, body } => {
+                self.notify_chat_attention(view, *kind, body.clone());
+            }
         }
+    }
+
+    /// Dispatch a chat-attention banner (turn finished / errored / needs
+    /// approval / question / auth) for the chat tab backing `view`, through the
+    /// shared notification pipeline. Mirrors `notify_terminal_bell`: the view
+    /// classified the edge; this end contributes the context the view can't see —
+    /// the tab label, the workspace burst key, whether the tab is the visible one,
+    /// and the live window-active flag. The notifier applies the master/source
+    /// gates, visible-pane suppression, the focus gate, and the dock badge.
+    fn notify_chat_attention(
+        &self,
+        view: &Entity<crate::shell::agent_chat::AgentChatView>,
+        kind: crate::notifier::NotificationKind,
+        body: String,
+    ) {
+        let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.content, PaneContent::AgentChat(v) if v.entity_id() == view.entity_id())
+        }) else {
+            return;
+        };
+        let tab = &self.tabs[idx];
+        let label = tab.custom_title.clone().unwrap_or_else(|| tab.label.clone());
+        // Visible = this chat is the group's active tab. Combined with the
+        // window-active flag, the notifier stays silent while the user is looking
+        // at this very chat.
+        let pane_visible = idx == self.active;
+        self.notifier.notify(crate::notifier::NotificationRequest {
+            source: crate::notifier::NotificationSource::AgentState,
+            kind,
+            // A stable per-view id (survives tab reorder/rename) in TabId space.
+            tab_id: TabId(view.entity_id().as_u64()),
+            workspace_key: self.cwd.to_string_lossy().into_owned(),
+            label: label.to_string(),
+            body,
+            window_active: self.window_active.load(Ordering::Relaxed),
+            pane_visible,
+            // Chat policy: one outstanding attention banner per tab until the
+            // window regains focus (cleared by `clear_attention`).
+            coalesce_until_focus: true,
+        });
     }
 
     /// Toggle the agent-chat tab at insertion-order `ix` between chat and its
@@ -1202,11 +1245,12 @@ impl PaneGroup {
         session_id: &str,
         path: Option<&str>,
         cwd: PathBuf,
+        adapter: AgentAdapter,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Dedup: if this session is already open in a chat tab, activate it
-        // rather than spawning a second `--resume` on the same session file.
+        // rather than spawning a second resume on the same session.
         if let Some(idx) = self.tabs.iter().position(|t| {
             matches!(&t.content, PaneContent::AgentChat(v) if v.read(cx).session_id() == Some(session_id))
         }) {
@@ -1216,27 +1260,68 @@ impl PaneGroup {
             cx.notify();
             return;
         }
-        // Import the transcript off the session log (bounded + capped inside).
-        let entries = match path {
-            Some(p) => oximux_agents::thread::transcript_from_jsonl(std::path::Path::new(p))
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        // Session-History reopen imports a Claude `.jsonl` session log.
-        self.open_agent_chat_tab_restored(
-            cwd,
-            None,
-            oximux_agents::thread::ChatBackend::stream_json(),
-            Some(session_id.to_string()),
-            entries,
-            Vec::new(),
-            crate::shell::agent_chat::ThinkingLevel::default(),
-            None, // codex_posture — Claude session-history reopen
-            None,
-            Vec::new(),
-            window,
-            cx,
-        );
+        match adapter {
+            // Codex: resume the thread by id (`thread/resume`) and seed the
+            // transcript from the native rollout file, located lazily by thread id
+            // (the compact session index carries no path/cwd). An unreadable /
+            // missing rollout degrades to an empty seed — the resume still works.
+            AgentAdapter::Codex => {
+                let (entries, seed_cwd) = codex_dir()
+                    .and_then(|dir| oximux_agents::thread::locate_rollout(&dir, session_id))
+                    .and_then(|p| oximux_agents::thread::import_codex_rollout(&p).ok())
+                    .map(|imp| (imp.entries, imp.cwd))
+                    .unwrap_or_default();
+                // Prefer the rollout's recorded cwd; fall back to the passed cwd
+                // (empty for Codex index rows) or, last, the process cwd.
+                let cwd = seed_cwd
+                    .filter(|c| !c.as_os_str().is_empty())
+                    .or_else(|| (!cwd.as_os_str().is_empty()).then_some(cwd))
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                self.open_agent_chat_tab_restored(
+                    cwd,
+                    None,
+                    oximux_agents::thread::ChatBackend::from(
+                        oximux_agents::thread::Transport::AppServer,
+                    ),
+                    Some(session_id.to_string()),
+                    entries,
+                    Vec::new(),
+                    crate::shell::agent_chat::ThinkingLevel::default(),
+                    // codex_posture — starts at the app default (on-request /
+                    // workspace-write); the rollout's original approval/sandbox
+                    // policy isn't re-applied, so the user re-picks via the
+                    // composer's Approvals/Sandbox controls if they want it stricter.
+                    None,
+                    None,
+                    Vec::new(),
+                    window,
+                    cx,
+                );
+            }
+            // Claude (and the default): import the `.jsonl` session log and resume
+            // via `--resume` (stream-json backend).
+            _ => {
+                let entries = match path {
+                    Some(p) => oximux_agents::thread::transcript_from_jsonl(std::path::Path::new(p))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                self.open_agent_chat_tab_restored(
+                    cwd,
+                    None,
+                    oximux_agents::thread::ChatBackend::stream_json(),
+                    Some(session_id.to_string()),
+                    entries,
+                    Vec::new(),
+                    crate::shell::agent_chat::ThinkingLevel::default(),
+                    None, // codex_posture — Claude session-history reopen
+                    None,
+                    Vec::new(),
+                    window,
+                    cx,
+                );
+            }
+        }
     }
 
     /// Open or activate a commit-detail tab. Dedup key is the full
@@ -1968,4 +2053,11 @@ impl PaneGroup {
             }
         }
     }
+}
+
+/// The Codex home directory (`~/.codex`), where native session rollouts live.
+/// `None` when the home dir can't be resolved (the reopen then degrades to an
+/// empty transcript seed — the thread resume still works).
+fn codex_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex"))
 }

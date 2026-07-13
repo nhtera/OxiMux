@@ -20,6 +20,13 @@ use super::bubble;
 const MAX_ROWS: usize = 200;
 const MAX_CHARS: usize = 8000;
 
+/// Much higher caps for the fullscreen tool sheet (`full == true`): the sheet is
+/// a deliberate "show me everything" affordance living in its own scroll region,
+/// so it lifts the tight inline guards — still bounded so a pathological
+/// 100k-line output can't spawn unbounded rows.
+const SHEET_ROWS: usize = 4000;
+const SHEET_CHARS: usize = 400_000;
+
 /// Dispatch a tool call to its bespoke body, or `None` to fall back to the
 /// generic key:value view ([`render_generic_input`]).
 ///
@@ -30,24 +37,25 @@ const MAX_CHARS: usize = 8000;
 /// back to its original body — see the dispatch test).
 pub(super) fn render_tool_body(
     tc: &ToolCall,
+    full: bool,
     theme: Theme,
     density: Density,
     typo: &Typography,
 ) -> Option<AnyElement> {
     match ToolDetail::classify(&tc.name, tc.kind.as_deref(), &tc.input) {
-        ToolDetail::Shell => Some(render_bash(tc, theme, density, typo)),
-        ToolDetail::Read => Some(render_read(tc, theme, density, typo)),
+        ToolDetail::Shell => Some(render_bash(tc, full, theme, density, typo)),
+        ToolDetail::Read => Some(render_read(tc, full, theme, density, typo)),
         // Preserve Claude's `Glob` "file" noun; every other search reads "match".
         ToolDetail::Search => {
             let noun = if tc.name == "Glob" { "file" } else { "match" };
-            Some(render_matches(tc, noun, theme, density, typo))
+            Some(render_matches(tc, noun, full, theme, density, typo))
         }
-        ToolDetail::Fetch => Some(render_webfetch(tc, theme, density, typo)),
-        ToolDetail::WebSearch => Some(render_websearch(tc, theme, density, typo)),
-        ToolDetail::SubAgent => Some(render_agent(tc, theme, density, typo)),
+        ToolDetail::Fetch => Some(render_webfetch(tc, full, theme, density, typo)),
+        ToolDetail::WebSearch => Some(render_websearch(tc, full, theme, density, typo)),
+        ToolDetail::SubAgent => Some(render_agent(tc, full, theme, density, typo)),
         // MCP tools are journaled as `mcp__<server>__<tool>`; the header already
         // humanizes the name, so the body stays a terse input+result view.
-        ToolDetail::Mcp => Some(render_mcp(tc, theme, density, typo)),
+        ToolDetail::Mcp => Some(render_mcp(tc, full, theme, density, typo)),
         // Edit/Write render as the diff card (built in `tool_card` before this is
         // reached); Plan feeds the pinned plan panel; Plain/Unknown use the clean
         // generic key:value card.
@@ -70,6 +78,7 @@ fn structured_str<'a>(tc: &'a ToolCall, key: &str) -> Option<&'a str> {
 /// a non-object input renders as a single summary row.
 pub(super) fn render_generic_input(
     tc: &ToolCall,
+    full: bool,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -82,7 +91,7 @@ pub(super) fn render_generic_input(
         other => vec![value_summary(other)],
     };
     let body = if rows.is_empty() { "(no input)".to_string() } else { rows.join("\n") };
-    code_block(&body, theme.fg_muted, theme, density, typo)
+    code_block(&body, theme.fg_muted, full, theme, density, typo)
 }
 
 /// Collapse a JSON value to a one-line summary for a key:value row. Strings keep
@@ -105,7 +114,7 @@ fn input_str<'a>(tc: &'a ToolCall, key: &str) -> &'a str {
 /// When the structured result splits stdout/stderr, stderr renders in a warn
 /// tone and an interrupted run is called out; otherwise the flattened result is
 /// shown as one block.
-fn render_bash(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+fn render_bash(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let cmd = input_str(tc, "command");
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
 
@@ -116,25 +125,25 @@ fn render_bash(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography)
             .map(|(i, l)| if i == 0 { format!("$ {l}") } else { format!("  {l}") })
             .collect::<Vec<_>>()
             .join("\n");
-        col = col.child(code_block(&prompted, theme.status_info, theme, density, typo));
+        col = col.child(code_block(&prompted, theme.status_info, full, theme, density, typo));
     } else if matches!(&tc.input, Value::Object(m) if !m.is_empty()) {
         // A shell-classified tool that doesn't use Claude's `command` key (an ACP
         // `Execute` whose input is agent-specific) — show its raw input as
         // key:value so nothing is lost, then its output below.
-        col = col.child(render_generic_input(tc, theme, density, typo));
+        col = col.child(render_generic_input(tc, full, theme, density, typo));
     }
 
     let stdout = structured_str(tc, "stdout").filter(|s| !s.trim().is_empty());
     let stderr = structured_str(tc, "stderr").filter(|s| !s.trim().is_empty());
     if stdout.is_some() || stderr.is_some() {
         if let Some(o) = stdout {
-            col = col.child(code_block(o, theme.fg_muted, theme, density, typo));
+            col = col.child(code_block(o, theme.fg_muted, full, theme, density, typo));
         }
         if let Some(e) = stderr {
-            col = col.child(code_block(e, theme.status_warn, theme, density, typo));
+            col = col.child(code_block(e, theme.status_warn, full, theme, density, typo));
         }
     } else if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
-        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+        col = col.child(code_block(out, theme.fg_muted, full, theme, density, typo));
     }
 
     let interrupted = tc
@@ -151,7 +160,7 @@ fn render_bash(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography)
 
 /// Read → the returned file slice as a code block, with a line-count caption
 /// from the structured result when present (the path is already in the header).
-fn render_read(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+fn render_read(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let body = tc.result.as_deref().unwrap_or("");
     let lines = tc
         .structured
@@ -163,20 +172,20 @@ fn render_read(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography)
     if let Some(n) = lines {
         col = col.child(caption(format!("{n} line{}", if n == 1 { "" } else { "s" }), theme, typo));
     }
-    col = col.child(code_block(body, theme.fg_muted, theme, density, typo));
+    col = col.child(code_block(body, theme.fg_muted, full, theme, density, typo));
     col.into_any_element()
 }
 
 /// Agent / Task → the subagent brief (from input) plus a summary line from the
 /// structured result (type · status · tokens · duration) and, when present, the
 /// subagent's final content. Falls back to the flattened result when unsettled.
-fn render_agent(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+fn render_agent(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
 
     let prompt = input_str(tc, "prompt");
     let brief = if prompt.is_empty() { input_str(tc, "description") } else { prompt };
     if !brief.trim().is_empty() {
-        col = col.child(code_block(brief, theme.fg_muted, theme, density, typo));
+        col = col.child(code_block(brief, theme.fg_muted, full, theme, density, typo));
     }
 
     if let Some(s) = &tc.structured {
@@ -198,29 +207,52 @@ fn render_agent(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography
         }
         if let Some(content) = s.get("content").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
         {
-            col = col.child(code_block(content, theme.fg_muted, theme, density, typo));
+            col = col.child(code_block(content, theme.fg_muted, full, theme, density, typo));
         }
     } else if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
-        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+        col = col.child(code_block(out, theme.fg_muted, full, theme, density, typo));
+    }
+
+    // The subagent's live action log (child tool calls / text summaries), shown
+    // as muted rows collapsed to the most recent few with a "+N earlier" marker,
+    // so the parent card reveals what the subagent is doing without the child
+    // events leaking into the root transcript.
+    if !tc.subagent_log.is_empty() {
+        col = col.child(caption("Subagent activity".to_string(), theme, typo));
+        col = col.child(code_block(&subagent_log_text(&tc.subagent_log), theme.fg_muted, full, theme, density, typo));
     }
     col.into_any_element()
+}
+
+/// Render the subagent action log to display text: the most recent
+/// [`SUBAGENT_LOG_VISIBLE`] lines in order, prefixed with a `+N earlier` marker
+/// when older lines were elided. Keeps the card compact for a chatty subagent.
+fn subagent_log_text(log: &[String]) -> String {
+    const SUBAGENT_LOG_VISIBLE: usize = 3;
+    let mut lines: Vec<String> = Vec::new();
+    if log.len() > SUBAGENT_LOG_VISIBLE {
+        lines.push(format!("+{} earlier", log.len() - SUBAGENT_LOG_VISIBLE));
+    }
+    let start = log.len().saturating_sub(SUBAGENT_LOG_VISIBLE);
+    lines.extend(log[start..].iter().cloned());
+    lines.join("\n")
 }
 
 /// WebFetch → the fetched URL (prominent) plus the extraction prompt and a
 /// capped slice of the returned page text. The result carries the payload, so
 /// the input is just a header here.
-fn render_webfetch(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+fn render_webfetch(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
     let url = input_str(tc, "url");
     if !url.trim().is_empty() {
-        col = col.child(code_block(url, theme.status_info, theme, density, typo));
+        col = col.child(code_block(url, theme.status_info, full, theme, density, typo));
     }
     let prompt = input_str(tc, "prompt");
     if !prompt.trim().is_empty() {
         col = col.child(caption(bubble::elide(prompt, 200), theme, typo));
     }
     if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
-        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+        col = col.child(code_block(out, theme.fg_muted, full, theme, density, typo));
     }
     col.into_any_element()
 }
@@ -229,6 +261,7 @@ fn render_webfetch(tc: &ToolCall, theme: Theme, density: Density, typo: &Typogra
 /// list (titles/URLs) is the payload, shown as a capped block.
 fn render_websearch(
     tc: &ToolCall,
+    full: bool,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -236,10 +269,10 @@ fn render_websearch(
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
     let query = input_str(tc, "query");
     if !query.trim().is_empty() {
-        col = col.child(code_block(query, theme.status_info, theme, density, typo));
+        col = col.child(code_block(query, theme.status_info, full, theme, density, typo));
     }
     if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
-        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+        col = col.child(code_block(out, theme.fg_muted, full, theme, density, typo));
     }
     col.into_any_element()
 }
@@ -248,7 +281,7 @@ fn render_websearch(
 /// (the header names the server/tool) followed by the capped result. Terser
 /// than the generic per-field view for tools whose args are position/coordinate
 /// heavy (browser/computer-use), where one line reads better than many.
-fn render_mcp(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
+fn render_mcp(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
     let summary = match &tc.input {
         Value::Null => String::new(),
@@ -256,10 +289,10 @@ fn render_mcp(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) 
         other => serde_json::to_string(other).unwrap_or_default(),
     };
     if !summary.is_empty() {
-        col = col.child(code_block(&summary, theme.fg_muted, theme, density, typo));
+        col = col.child(code_block(&summary, theme.fg_muted, full, theme, density, typo));
     }
     if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
-        col = col.child(code_block(out, theme.fg_muted, theme, density, typo));
+        col = col.child(code_block(out, theme.fg_muted, full, theme, density, typo));
     }
     col.into_any_element()
 }
@@ -268,6 +301,7 @@ fn render_mcp(tc: &ToolCall, theme: Theme, density: Density, typo: &Typography) 
 fn render_matches(
     tc: &ToolCall,
     noun: &str,
+    full: bool,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -281,7 +315,7 @@ fn render_matches(
         .gap(px(2.0))
         .w_full()
         .child(caption(header, theme, typo))
-        .child(code_block(result, theme.fg_muted, theme, density, typo))
+        .child(code_block(result, theme.fg_muted, full, theme, density, typo))
         .into_any_element()
 }
 
@@ -291,11 +325,13 @@ fn render_matches(
 fn code_block(
     text: &str,
     color: Hsla,
+    full: bool,
     theme: Theme,
     density: Density,
     typo: &Typography,
 ) -> AnyElement {
-    let capped = bubble::elide(text, MAX_CHARS);
+    let (max_chars, max_rows) = if full { (SHEET_CHARS, SHEET_ROWS) } else { (MAX_CHARS, MAX_ROWS) };
+    let capped = bubble::elide(text, max_chars);
     let lines: Vec<&str> = capped.lines().collect();
     let total = lines.len();
 
@@ -309,19 +345,19 @@ fn code_block(
         .py(px(4.0))
         .text_size(px(typo.t_body_sm))
         .text_color(color);
-    for line in lines.iter().take(MAX_ROWS) {
+    for line in lines.iter().take(max_rows) {
         // Preserve blank lines with a space so the row keeps its height.
         let shown = if line.is_empty() { " ".to_string() } else { (*line).to_string() };
         block = block.child(div().flex().flex_row().w_full().child(SharedString::from(shown)));
     }
-    if total > MAX_ROWS {
+    if total > max_rows {
         block = block.child(
             div()
                 .flex()
                 .flex_row()
                 .w_full()
                 .text_color(theme.fg_subtle)
-                .child(SharedString::from(format!("… {} more lines", total - MAX_ROWS))),
+                .child(SharedString::from(format!("… {} more lines", total - max_rows))),
         );
     }
     block.into_any_element()
@@ -353,7 +389,7 @@ mod tests {
             "mcp__chrome-devtools-mcp__click",
         ] {
             assert!(
-                render_tool_body(&mk(t), Theme::default(), Density::default(), &Typography::default()).is_some(),
+                render_tool_body(&mk(t), false, Theme::default(), Density::default(), &Typography::default()).is_some(),
                 "{t} should render a bespoke body"
             );
         }
@@ -361,7 +397,7 @@ mod tests {
         // unknown tool falls back to the generic key:value card.
         for t in ["Edit", "Write", "MultiEdit", "SomethingNew"] {
             assert!(
-                render_tool_body(&mk(t), Theme::default(), Density::default(), &Typography::default()).is_none(),
+                render_tool_body(&mk(t), false, Theme::default(), Density::default(), &Typography::default()).is_none(),
                 "{t} should fall back to the generic card"
             );
         }
@@ -375,7 +411,7 @@ mod tests {
         // now reaches the rich WebSearch body via the classifier.
         let mut codex_search = ToolCall::new("t", "web_search", json!({"query": "gpui focus"}));
         codex_search.result = Some("1. Title — https://a".into());
-        assert!(render_tool_body(&codex_search, theme, density, &typo).is_some());
+        assert!(render_tool_body(&codex_search, false, theme, density, &typo).is_some());
 
         // An ACP `Execute` tool: freeform title, kind carried on `tc.kind`, and an
         // agent-specific input key (not Claude's `command`). It routes to the
@@ -384,7 +420,7 @@ mod tests {
         acp_exec.kind = Some("execute".into());
         acp_exec.result = Some("Compiling…".into());
         assert!(
-            render_tool_body(&acp_exec, theme, density, &typo).is_some(),
+            render_tool_body(&acp_exec, false, theme, density, &typo).is_some(),
             "ACP execute should render a shell card, not the generic fallback"
         );
 
@@ -392,17 +428,36 @@ mod tests {
         let mut acp_read = ToolCall::new("t", "Read src/main.rs", json!({"path": "src/main.rs"}));
         acp_read.kind = Some("read".into());
         acp_read.result = Some("fn main() {}".into());
-        assert!(render_tool_body(&acp_read, theme, density, &typo).is_some());
+        assert!(render_tool_body(&acp_read, false, theme, density, &typo).is_some());
 
         // An unclassified ACP tool (freeform title, no kind) still falls to the
         // generic card — conservative, never a wrong-body guess.
         let acp_unknown = ToolCall::new("t", "Do something novel", json!({"opt": true}));
-        assert!(render_tool_body(&acp_unknown, theme, density, &typo).is_none());
+        assert!(render_tool_body(&acp_unknown, false, theme, density, &typo).is_none());
 
         // An ACP tool whose kind is unrecognized (mode switch / future) → generic.
         let mut acp_switch = ToolCall::new("t", "Switch mode", json!({}));
         acp_switch.kind = Some("switch_mode".into());
-        assert!(render_tool_body(&acp_switch, theme, density, &typo).is_none());
+        assert!(render_tool_body(&acp_switch, false, theme, density, &typo).is_none());
+    }
+
+    #[test]
+    fn subagent_log_text_collapses_to_recent_with_earlier_marker() {
+        assert_eq!(subagent_log_text(&["a".into(), "b".into()]), "a\nb");
+        assert_eq!(
+            subagent_log_text(&["a".into(), "b".into(), "c".into(), "d".into(), "e".into()]),
+            "+2 earlier\nc\nd\ne",
+        );
+    }
+
+    #[test]
+    fn agent_body_renders_subagent_log() {
+        let (theme, density, typo) = (Theme::default(), Density::default(), Typography::default());
+        let mut agent = ToolCall::new("t", "Agent", json!({"description": "scout the repo"}));
+        agent.push_subagent_action("Read src/main.rs");
+        agent.push_subagent_action("Bash cargo test");
+        // Renders without panic and produces a body (the log is included).
+        assert!(render_tool_body(&agent, false, theme, density, &typo).is_some());
     }
 
     #[test]
@@ -413,32 +468,33 @@ mod tests {
         // Bash with split stdout/stderr + interrupted.
         let mut bash = ToolCall::new("t", "Bash", json!({"command": "make"}));
         bash.structured = Some(json!({"stdout": "ok", "stderr": "warn: x", "interrupted": true}));
-        let _ = render_tool_body(&bash, theme, density, &typo);
+        let _ = render_tool_body(&bash, false, theme, density, &typo);
         // Read with a numLines caption.
         let mut read = ToolCall::new("t", "Read", json!({"file_path": "a.rs"}));
         read.structured = Some(json!({"file": {"numLines": 42}}));
-        let _ = render_tool_body(&read, theme, density, &typo);
+        let _ = render_tool_body(&read, false, theme, density, &typo);
         // Agent with a subagent summary.
         let mut agent = ToolCall::new("t", "Agent", json!({"prompt": "do the thing"}));
         agent.structured = Some(json!({
             "agentType": "researcher", "status": "completed",
             "totalTokens": 12345u64, "totalDurationMs": 8200u64, "content": "found it"
         }));
-        let _ = render_tool_body(&agent, theme, density, &typo);
+        let _ = render_tool_body(&agent, false, theme, density, &typo);
         // Web tools + MCP: URL/query header + result, and a compact MCP input
         // line — all must build, and must degrade gracefully on missing fields.
         let mut fetch = ToolCall::new("t", "WebFetch", json!({"url": "https://ex.com", "prompt": "get x"}));
         fetch.result = Some("page text".into());
-        let _ = render_tool_body(&fetch, theme, density, &typo);
-        let _ = render_tool_body(&ToolCall::new("t", "WebFetch", json!({})), theme, density, &typo);
+        let _ = render_tool_body(&fetch, false, theme, density, &typo);
+        let _ = render_tool_body(&ToolCall::new("t", "WebFetch", json!({})), false, theme, density, &typo);
         let mut search = ToolCall::new("t", "WebSearch", json!({"query": "gpui focus"}));
         search.result = Some("1. Title — https://a\n2. Title — https://b".into());
-        let _ = render_tool_body(&search, theme, density, &typo);
+        let _ = render_tool_body(&search, false, theme, density, &typo);
         let mut mcp = ToolCall::new("t", "mcp__chrome-devtools-mcp__click", json!({"uid": "42"}));
         mcp.result = Some("clicked".into());
-        let _ = render_tool_body(&mcp, theme, density, &typo);
+        let _ = render_tool_body(&mcp, false, theme, density, &typo);
         let _ = render_tool_body(
             &ToolCall::new("t", "mcp__x__y", json!(null)),
+            false,
             theme,
             density,
             &typo,
@@ -458,9 +514,9 @@ mod tests {
         let density = Density::default();
         let typo = Typography::default();
         let tc = ToolCall::new("t", "mcp__x__y", json!({"coordinate": [1, 2], "text": "ok"}));
-        let _ = render_generic_input(&tc, theme, density, &typo);
-        let _ = render_generic_input(&ToolCall::new("t", "n", json!({})), theme, density, &typo);
-        let _ = render_generic_input(&ToolCall::new("t", "n", json!(null)), theme, density, &typo);
+        let _ = render_generic_input(&tc, false, theme, density, &typo);
+        let _ = render_generic_input(&ToolCall::new("t", "n", json!({})), false, theme, density, &typo);
+        let _ = render_generic_input(&ToolCall::new("t", "n", json!(null)), false, theme, density, &typo);
     }
 
     #[test]
@@ -470,11 +526,11 @@ mod tests {
         let typo = Typography::default();
         // Empty: no input fields, no result — must not panic.
         let empty = ToolCall::new("t", "Bash", json!({}));
-        let _ = render_tool_body(&empty, theme, density, &typo);
-        let _ = render_tool_body(&ToolCall::new("t", "Read", json!({})), theme, density, &typo);
+        let _ = render_tool_body(&empty, false, theme, density, &typo);
+        let _ = render_tool_body(&ToolCall::new("t", "Read", json!({})), false, theme, density, &typo);
         // Oversized: 10k lines must build (capped) without panic.
         let mut big = ToolCall::new("t", "Bash", json!({"command": "seq 10000"}));
         big.result = Some((0..10_000).map(|i| i.to_string()).collect::<Vec<_>>().join("\n"));
-        let _ = render_tool_body(&big, theme, density, &typo);
+        let _ = render_tool_body(&big, false, theme, density, &typo);
     }
 }

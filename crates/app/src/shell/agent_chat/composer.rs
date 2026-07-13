@@ -1747,6 +1747,22 @@ impl ComposerView {
         row
     }
 
+    /// The "Import session" control, shown only in the unbound *New Agent* flow:
+    /// a ghost button that opens the shared session-history modal (the same list
+    /// the Cmd+Shift+H picker shows), from which a past Claude or Codex session
+    /// reopens as a chat tab. One list, two entry points.
+    fn render_import_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("chat-import-session-btn")
+            .icon(Icon::default().path("icons/history.svg"))
+            .label("Import")
+            .ghost()
+            .small()
+            .tooltip("Reopen a past Claude or Codex session as a chat")
+            .on_click(cx.listener(|_this, _ev, window, cx| {
+                window.dispatch_action(Box::new(crate::actions::OpenSessionHistory), cx);
+            }))
+    }
+
     /// The image-attach control (far left of the toolbar): a flat ghost button
     /// that opens the native image picker. Always enabled — attachments stage
     /// for the next send even while a turn streams.
@@ -2465,6 +2481,9 @@ impl Render for ComposerView {
         // binds a subprocess. Hidden once bound (transport is fixed at spawn).
         if self.unbound && !self.agent_options.is_empty() {
             controls = controls.child(self.render_agent_picker(cx));
+            // A second entry point (besides Cmd+Shift+H) into the shared
+            // session-history list — reopen a past Claude/Codex session as chat.
+            controls = controls.child(self.render_import_session_button(cx));
         }
         // Show the model picker only when the backend advertises models (like the
         // mode/effort pickers). A vocab-less/disconnected state hides it rather

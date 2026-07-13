@@ -38,7 +38,7 @@ use super::connection::{
     AgentCapabilities, AgentConnection, EffortChoice, FeatureControl, FeatureKind,
     FeatureSelectOption, FeatureValue, ModelChoice,
 };
-use super::event::{ThreadEvent, TurnUsage};
+use super::event::{AuthMethodInfo, AuthMethodKind, ThreadEvent, TurnUsage};
 use super::question::{AskQuestion, QuestionAnswers};
 use super::tool_call::PermissionDecision;
 use transport::{Inbound, RpcClient};
@@ -63,6 +63,10 @@ fn select_opt(wire: &str, label: &str, description: &str) -> FeatureSelectOption
 /// Commands the sync `AgentConnection` methods push to the worker thread.
 enum Outbound {
     Prompt(String),
+    /// Kick off a ChatGPT browser sign-in (`account/login/start`) on the worker
+    /// so the calling UI thread never blocks on the RPC; the worker emits the
+    /// resulting `AuthUrl` (or an `Error`) for the app to open.
+    StartLogin,
     Shutdown,
 }
 
@@ -112,6 +116,16 @@ struct CodexState {
     /// freshly-restored session (turns aren't replayed), which makes rewind a
     /// no-op there until the first new turn.
     user_turn_ids: Vec<String>,
+    /// Sub-agent routing: a spawned child thread id → the root-thread collab tool
+    /// call item id that spawned it (from `collabAgentToolCall.receiverThreadIds`
+    /// or `subAgentActivity.agentThreadId`). A foreign notification whose thread is
+    /// registered here routes into that parent tool card's log instead of dropping.
+    subagent_parent_by_thread: HashMap<String, String>,
+    /// Foreign child `item/completed` payloads that arrived before their thread was
+    /// registered (the collab spawn item raced), buffered per child thread and
+    /// replayed into the log on registration. Bounded per thread so a runaway child
+    /// can't grow it without limit.
+    subagent_buffer: HashMap<String, std::collections::VecDeque<Value>>,
 }
 
 pub struct CodexAppServerConnection {
@@ -295,6 +309,17 @@ impl AgentConnection for CodexAppServerConnection {
             s.current_turn_id = None;
         }
         Ok(new_id)
+    }
+
+    /// Kick off the ChatGPT browser OAuth. Non-blocking: hands the work to the
+    /// worker (which sends `account/login/start` and emits the resulting
+    /// [`ThreadEvent::AuthUrl`]) so the UI click that calls this never blocks on
+    /// the RPC. `account/login/completed` later resolves the flow via
+    /// [`ThreadEvent::AuthOutcome`].
+    fn begin_browser_login(&self) -> Result<()> {
+        self.outbound
+            .send(Outbound::StartLogin)
+            .map_err(|_| anyhow!("codex worker gone; cannot start sign-in"))
     }
 
     fn models(&self) -> Vec<ModelChoice> {
@@ -489,6 +514,17 @@ fn title_case(s: &str) -> String {
     }
 }
 
+/// The single sign-in method a logged-out Codex advertises: a browser OAuth pill
+/// ("Sign in with ChatGPT") that opens the merged ChatGPT auth flow.
+fn chatgpt_signin_method() -> AuthMethodInfo {
+    AuthMethodInfo {
+        id: "chatgpt".to_string(),
+        name: "Sign in with ChatGPT".to_string(),
+        description: Some("Opens ChatGPT in your browser to authorize Codex".to_string()),
+        kind: AuthMethodKind::BrowserOauth,
+    }
+}
+
 /// The worker: async handshake (`initialize` → cache `model/list` → `initialized`
 /// → `thread/resume` or `thread/start`), then forward prompts as `turn/start`.
 fn worker_loop(
@@ -574,6 +610,20 @@ fn worker_loop(
         slash_commands: Vec::new(),
     });
 
+    // Proactive sign-in detection: `thread/start` succeeds even when logged out,
+    // so `account/read` is what tells us the session can't actually run a turn
+    // (`{account: null, requiresOpenaiAuth: true}`). Emit the sign-in card AFTER
+    // SessionInit (which the app treats as "auth done" for ACP and would clear a
+    // card shown earlier). The turn-time 401 is the defensive fallback (map.rs).
+    if let Ok(acc) = rpc.request(protocol::M_ACCOUNT_READ, json!({}), HANDSHAKE_TIMEOUT)
+        && protocol::account_read_needs_login(&acc)
+    {
+        let _ = event_tx.send(ThreadEvent::AuthRequired {
+            methods: vec![chatgpt_signin_method()],
+            error: None,
+        });
+    }
+
     // Poll for commands, but wake periodically to notice a subprocess crash:
     // if the child died, break so `event_tx` drops and the app's disconnect
     // handler fires (a plain blocking `recv` would park here forever on a crash).
@@ -605,6 +655,25 @@ fn worker_loop(
                     protocol::turn_start_params(&tid, &text, model.as_deref(), effort.as_deref(), posture);
                 if let Err(e) = rpc.fire(protocol::M_TURN_START, params) {
                     let _ = event_tx.send(ThreadEvent::Error(format!("codex turn/start failed: {e}")));
+                }
+            }
+            // A sign-in click: send `account/login/start` here (off the UI thread)
+            // and emit the browser URL for the app to open. A failure surfaces as
+            // a plain error rather than wedging the card.
+            Ok(Outbound::StartLogin) => {
+                match rpc.request(
+                    protocol::M_ACCOUNT_LOGIN_START,
+                    protocol::account_login_start_chatgpt_params(),
+                    HANDSHAKE_TIMEOUT,
+                ) {
+                    Ok(res) => {
+                        if let Some(url) = protocol::login_url_from_start_response(&res) {
+                            let _ = event_tx.send(ThreadEvent::AuthUrl { url });
+                        }
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(ThreadEvent::Error(format!("codex sign-in failed: {e}")));
+                    }
                 }
             }
             Ok(Outbound::Shutdown) => break,

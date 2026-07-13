@@ -32,12 +32,15 @@ pub fn decode_line(line: &str) -> Vec<ThreadEvent> {
 
 fn decode_value(v: &Value) -> Vec<ThreadEvent> {
     // A subagent's internal turn streams inline, every event tagged with the
-    // spawning tool's id in `parent_tool_use_id`. Those events belong to the
-    // background-tasks surface, not the main transcript — dropping them here keeps
-    // a subagent's thinking / tool_use / tool_result from masquerading as the main
-    // agent's own. (The `system/task_*` events carry the summarized activity.)
-    if v.get("parent_tool_use_id").and_then(Value::as_str).is_some() {
-        return Vec::new();
+    // spawning tool's id in `parent_tool_use_id`. Those events must NOT fold into
+    // the main transcript as the parent agent's own — but a completed child action
+    // (a tool call, or the child's visible text) is routed into the spawning tool
+    // card's log via `SubagentAction`, so the user sees what the subagent is doing
+    // inline. Deltas, tool results, and stream framing stay dropped (the log holds
+    // completed items only, no per-delta churn). The `system/task_*` events still
+    // drive the separate Background Tasks panel.
+    if let Some(parent) = v.get("parent_tool_use_id").and_then(Value::as_str) {
+        return decode_subagent(v, parent);
     }
     match v.get("type").and_then(Value::as_str) {
         Some("system") => decode_system(v),
@@ -48,6 +51,85 @@ fn decode_value(v: &Value) -> Vec<ThreadEvent> {
         Some("result") => decode_result(v),
         _ => Vec::new(),
     }
+}
+
+/// Classify a `parent_tool_use_id`-tagged (subagent) line into zero-or-more
+/// `SubagentAction` log lines for the spawning tool card. Only an `assistant`
+/// line's completed blocks route here — a `tool_use` block becomes a
+/// `{name} {primary arg}` line; a non-empty visible `text` block becomes a
+/// first-line summary. Thinking, tool results, deltas, and stream framing are
+/// dropped (the log holds completed, user-meaningful items only — no per-delta
+/// churn). Parent id = the tag.
+fn decode_subagent(v: &Value, parent: &str) -> Vec<ThreadEvent> {
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(blocks) = v["message"]["content"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for b in blocks {
+        let line = match b.get("type").and_then(Value::as_str) {
+            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
+                subagent_tool_line(str_field(b, "name"), b.get("input"))
+            }
+            Some("text") => b
+                .get("text")
+                .and_then(Value::as_str)
+                .map(subagent_text_summary)
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        };
+        if let Some(line) = line {
+            out.push(ThreadEvent::SubagentAction {
+                parent_tool_call_id: parent.to_string(),
+                line,
+            });
+        }
+    }
+    out
+}
+
+/// A one-line subagent action label from a child tool call: `{name} {primary
+/// arg}`, where the primary arg is the tool's most salient input (a path, a
+/// command, a query). Truncated so a giant Bash command can't blow the row.
+fn subagent_tool_line(name: String, input: Option<&Value>) -> Option<String> {
+    let arg = input.and_then(subagent_primary_arg).unwrap_or_default();
+    let line = if arg.is_empty() { name } else { format!("{name} {arg}") };
+    let line = line.replace('\n', " ");
+    Some(truncate_chars(&line, 120))
+}
+
+/// The most salient single argument of a tool input, for the subagent log —
+/// the first of a small ordered set of common keys (path, command, pattern,
+/// query, url, description). `None` when none is a non-empty string.
+fn subagent_primary_arg(input: &Value) -> Option<String> {
+    for key in ["file_path", "path", "command", "pattern", "query", "url", "description", "prompt"] {
+        if let Some(s) = input.get(key).and_then(Value::as_str)
+            && !s.is_empty()
+        {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// First non-empty line of a child assistant text block, truncated — a compact
+/// "the subagent said…" log row (never the full multi-paragraph body).
+fn subagent_text_summary(text: &str) -> String {
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    truncate_chars(first, 120)
+}
+
+/// Truncate a string to at most `max` chars (char-boundary safe), appending `…`
+/// when it was cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 fn decode_system(v: &Value) -> Vec<ThreadEvent> {
@@ -95,10 +177,19 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
             };
             vec![ThreadEvent::CompactBoundary { summary }]
         }
-        // hook_started / hook_response / thinking_tokens → noise.
-        // TODO(chat-ui polish): `system/status` (spinner text) and init's
-        // tools/mcp_servers/agents/cwd are dropped for now; surface them when
-        // the spinner + session-detail UI is built.
+        // The CLI signals a long context-compaction with `status: "compacting"`
+        // (the end lands separately as `compact_boundary`). Promote just that one
+        // status so a "Compacting context…" spinner shows instead of an apparent
+        // hang; every other `system/status` (spinner text) stays dropped.
+        Some("status")
+            if v.get("status").and_then(Value::as_str) == Some("compacting") =>
+        {
+            vec![ThreadEvent::CompactionStarted]
+        }
+        // hook_started / hook_response / thinking_tokens / other status → noise.
+        // TODO(chat-ui polish): the rest of `system/status` (spinner text) and
+        // init's tools/mcp_servers/agents/cwd are dropped for now; surface them
+        // when the spinner + session-detail UI is built.
         _ => Vec::new(),
     }
 }
@@ -983,6 +1074,32 @@ mod tests {
     }
 
     #[test]
+    fn decodes_compacting_status_but_drops_other_status() {
+        // `status: "compacting"` promotes to CompactionStarted; other statuses drop.
+        let compacting = json!({"type":"system","subtype":"status","status":"compacting"}).to_string();
+        assert_eq!(decode_line(&compacting), vec![ThreadEvent::CompactionStarted]);
+        let requesting = json!({"type":"system","subtype":"status","status":"requesting"}).to_string();
+        assert!(decode_line(&requesting).is_empty());
+        // No status field → dropped.
+        assert!(decode_line(&json!({"type":"system","subtype":"status"}).to_string()).is_empty());
+    }
+
+    #[test]
+    fn compacting_flag_set_then_cleared_by_boundary_and_turn_end() {
+        use crate::thread::state::ChatThread;
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::CompactionStarted);
+        assert!(t.compacting, "spinner shows during compaction");
+        t.apply(&ThreadEvent::CompactBoundary { summary: "Context compacted".into() });
+        assert!(!t.compacting, "boundary supersedes the spinner");
+        // A compaction that never reaches a boundary clears on turn end.
+        t.apply(&ThreadEvent::CompactionStarted);
+        assert!(t.compacting);
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false });
+        assert!(!t.compacting, "turn end clears a dangling spinner");
+    }
+
+    #[test]
     fn decodes_compact_boundary_divider() {
         let auto = json!({"type":"system","subtype":"compact_boundary",
             "compact_metadata":{"trigger":"auto","pre_tokens":150000}}).to_string();
@@ -1036,21 +1153,37 @@ mod tests {
 
     // --- Background-task stream hygiene (subagents + background bash) ---
 
-    /// A subagent's internal events stream inline tagged with the spawning tool's
-    /// id; they must be dropped so they don't fold into the main transcript.
+    /// A subagent's internal `tool_use` streams inline tagged with the spawning
+    /// tool's id; it must NOT fold as the parent agent's own tool card — instead
+    /// it routes to that card's log as a `SubagentAction` line.
     #[test]
-    fn parent_tool_use_id_event_is_dropped() {
+    fn parent_tool_use_id_tool_use_routes_to_subagent_log() {
         let sub = json!({
             "type":"assistant","parent_tool_use_id":"toolu_ABC",
-            "message":{"content":[{"type":"tool_use","id":"toolu_x","name":"Read","input":{}}]}
+            "message":{"content":[{"type":"tool_use","id":"toolu_x","name":"Read","input":{"file_path":"src/main.rs"}}]}
         }).to_string();
-        assert!(decode_line(&sub).is_empty(), "subagent tool_use must not reach the main stream");
-        // The same shape WITHOUT the tag decodes normally.
+        assert_eq!(decode_line(&sub), vec![ThreadEvent::SubagentAction {
+            parent_tool_call_id: "toolu_ABC".into(), line: "Read src/main.rs".into() }]);
+        // A child text block becomes a first-line summary action.
+        let txt = json!({
+            "type":"assistant","parent_tool_use_id":"toolu_ABC",
+            "message":{"content":[{"type":"text","text":"Looking at the auth module.\nmore detail"}]}
+        }).to_string();
+        assert_eq!(decode_line(&txt), vec![ThreadEvent::SubagentAction {
+            parent_tool_call_id: "toolu_ABC".into(), line: "Looking at the auth module.".into() }]);
+        // Child deltas / tool results / thinking are still dropped (no churn).
+        let delta = json!({"type":"stream_event","parent_tool_use_id":"toolu_ABC",
+            "event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}}).to_string();
+        assert!(decode_line(&delta).is_empty(), "child delta stays dropped");
+        let result = json!({"type":"user","parent_tool_use_id":"toolu_ABC",
+            "message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"out"}]}}).to_string();
+        assert!(decode_line(&result).is_empty(), "child tool result stays dropped");
+        // The same tool_use WITHOUT the tag decodes as a real tool card.
         let main = json!({
             "type":"assistant",
             "message":{"content":[{"type":"tool_use","id":"toolu_x","name":"Read","input":{}}]}
         }).to_string();
-        assert_eq!(decode_line(&main).len(), 1);
+        assert!(matches!(decode_line(&main).as_slice(), [ThreadEvent::ToolCallStarted { .. }]));
     }
 
     /// A `result` marked `origin.kind == "task-notification"` is a background-task
@@ -1083,9 +1216,27 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Only the parent's two tool calls survive; the subagent's Read/Bash calls
-        // (which are `parent_tool_use_id`-tagged) are dropped.
+        // Only the parent's two tool calls survive as real cards; the subagent's
+        // Read/Bash calls (`parent_tool_use_id`-tagged) route to the log, not a card.
         assert_eq!(tool_names, ["Agent", "Bash"], "subagent tool calls leaked: {tool_names:?}");
+
+        // The subagent's child tool calls surface as SubagentAction lines addressed
+        // to the spawning Agent card's id — folded, they populate that card's log
+        // while the root transcript stays free of child bubbles.
+        use crate::thread::state::ChatThread;
+        let mut thread = ChatThread::new();
+        for ev in &events {
+            thread.apply(ev);
+        }
+        let agent_card = thread.entries.iter().find_map(|e| match e {
+            crate::thread::ThreadEntry::ToolCall(tc) if tc.name == "Agent" => Some(tc),
+            _ => None,
+        }).expect("Agent card exists");
+        assert!(!agent_card.subagent_log.is_empty(), "subagent log populated from child actions");
+        assert!(
+            agent_card.subagent_log.iter().any(|l| l.starts_with("Read ") || l.starts_with("Bash ")),
+            "child tool actions logged: {:?}", agent_card.subagent_log,
+        );
 
         let turn_ends: Vec<&TurnUsage> = events
             .iter()

@@ -316,7 +316,7 @@ pub struct SendTextToActiveAgent {
 /// Payload action raised by the session-history picker to relaunch a past
 /// session. The workspace resolves the adapter slug + cwd (falling back to
 /// the active project's directory when the log omits one) and threads
-/// resume/fork into the spawn. No `Default` — `AgentAdapter` has none.
+/// resume/fork into the spawn.
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = oximux, no_json)]
 pub struct ResumeAgentSession {
@@ -336,6 +336,10 @@ pub struct OpenChatSession {
     pub session_id: String,
     pub path: String,
     pub cwd: String,
+    /// Which agent produced the session — routes the reopen to the matching
+    /// transport + transcript importer (Claude `--resume` + JSONL, Codex
+    /// `thread/resume` + rollout). Defaults to Claude for older call sites.
+    pub adapter: oximux_core::AgentAdapter,
 }
 
 actions!(

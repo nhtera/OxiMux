@@ -36,6 +36,7 @@ mod slash_command_catalog;
 mod slash_palette;
 mod tool_bodies;
 mod tool_card;
+mod tool_sheet;
 mod tool_grouping;
 
 /// Install the ACP embedded-terminal host at app boot so ACP agents can drive
@@ -213,6 +214,63 @@ pub enum AgentChatEvent {
     /// at `cwd` so the user can run `/login`. Carries the CLI adapter id so the
     /// host picks the right binary.
     OpenLoginTerminalRequested { adapter_id: &'static str, cwd: PathBuf },
+    /// A live chat turn reached a state the user should be told about while they
+    /// may be looking elsewhere — the turn finished / errored, or it paused on a
+    /// permission / question / auth prompt. The host (which owns the notifier +
+    /// the window-active / visible-tab context) decides whether to raise a
+    /// desktop notification + dock badge, applying the shared notification gates.
+    /// Emitted only for LIVE events (a restored transcript seeds entries directly,
+    /// never through the event path), so it never fires during restore replay.
+    AttentionNeeded {
+        kind: crate::notifier::NotificationKind,
+        /// Short context for the banner body (tool name, error head); may be empty.
+        body: String,
+    },
+}
+
+/// Classify a live thread event into an attention notification `(kind, body)`, or
+/// `None` when it isn't attention-worthy. A turn end (finished/errored) requires a
+/// turn to have been active (`was_active`) so a stray result can't banner; an
+/// intentional Stop (`interrupted`) is not a failure. Permission / question / auth
+/// prompts always signal — they block the user. Pure classifier: the host applies
+/// the focus / visibility / per-kind gates before anything surfaces.
+fn attention_for_event(
+    ev: &ThreadEvent,
+    was_active: bool,
+    interrupted: bool,
+) -> Option<(crate::notifier::NotificationKind, String)> {
+    use crate::notifier::NotificationKind;
+    match ev {
+        // An intentional Stop suppresses BOTH shapes of turn end it can produce: a
+        // Claude interrupt arrives as `is_error: true`, but an ACP cancel replies
+        // `StopReason::Cancelled` → `TurnEnded { is_error: false }`. Either way,
+        // `interrupted` means the user pressed Stop, so no "finished"/"failed"
+        // banner should fire — check it before the error split.
+        ThreadEvent::TurnEnded { .. } if was_active && interrupted => None,
+        ThreadEvent::TurnEnded { is_error: true, result, .. } if was_active => {
+            let head = result
+                .as_deref()
+                .unwrap_or_default()
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            Some((NotificationKind::Failed, bubble::elide(head, 120)))
+        }
+        ThreadEvent::TurnEnded { is_error: false, .. } if was_active => {
+            Some((NotificationKind::Done, String::new()))
+        }
+        ThreadEvent::PermissionRequested { tool_name, .. } => {
+            Some((NotificationKind::NeedsApproval, tool_name.clone()))
+        }
+        ThreadEvent::QuestionAsked { .. } => {
+            Some((NotificationKind::NeedsApproval, "waiting for your answer".to_string()))
+        }
+        ThreadEvent::AuthRequired { .. } => {
+            Some((NotificationKind::NeedsApproval, "sign-in required".to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// Which surface an agent-chat tab is showing: its structured chat, or a
@@ -311,7 +369,7 @@ use oximux_agents::thread::{
     connect, probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend,
     ChatImage, ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue,
     PermissionDecision, PermissionSuggestion, ProbedCatalog, QuestionAnswers,
-    QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus, Transport, TurnUsage,
+    QuestionRequest, ThreadEntry, ThreadEvent, ToolCall, ToolCallStatus, Transport, TurnUsage,
 };
 use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -452,6 +510,18 @@ pub struct AgentChatView {
     /// that one message's images (a per-message group); the backdrop / ✕ clears
     /// it.
     preview: Option<(usize, usize)>,
+    /// When `Some(tool_call_id)`, a fullscreen tool-payload sheet is open on that
+    /// tool call — a large diff / shell output / read slice rendered full-height
+    /// and scrollable (virtualized for diffs). The backdrop / ✕ / Esc clears it;
+    /// the sheet reads the tool call live from the thread each render, so a
+    /// still-running tool grows in the sheet. Held as an id (not an index) so it
+    /// survives transcript growth.
+    open_tool_sheet: Option<String>,
+    /// True for a beat after the tool sheet's Copy button fires, flashing the
+    /// control to "Copied ✓". Cleared by a short timer ([`Self::_sheet_copy_task`]).
+    sheet_copied: bool,
+    /// Revert timer for [`Self::sheet_copied`]; a rapid second copy replaces it.
+    _sheet_copy_task: Option<Task<()>>,
     /// Foreground event-drain task. Dropping it only cancels the *foreground*
     /// half at its next await point — it does NOT stop the forwarder/reader OS
     /// threads or reap the subprocess. Subprocess + thread teardown is owned by
@@ -970,6 +1040,9 @@ impl AgentChatView {
             expanded_tool_runs: HashSet::new(),
             image_cache: RefCell::new(HashMap::new()),
             preview: None,
+            open_tool_sheet: None,
+            sheet_copied: false,
+            _sheet_copy_task: None,
             _drain_task: drain_task,
             _subscriptions: subscriptions,
             question_cards: HashMap::new(),
@@ -1858,6 +1931,61 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Begin a browser OAuth sign-in (Codex "Sign in with ChatGPT"): mark the
+    /// method pending and kick the connection's login (fire-and-forget — the RPC
+    /// runs on the worker, so this click never blocks the UI). The browser URL
+    /// arrives asynchronously as [`ThreadEvent::AuthUrl`] and is opened there; the
+    /// card stays pending until `account/login/completed` → [`ThreadEvent::AuthOutcome`]
+    /// resolves it. A failure to even start surfaces on the card immediately.
+    fn request_browser_login(&mut self, method_id: String, cx: &mut Context<Self>) {
+        if let Some(auth) = self.auth.as_mut() {
+            auth.pending = Some(method_id);
+            auth.error = None;
+        }
+        if let Some(Err(e)) = self.connection.as_ref().map(|c| c.begin_browser_login())
+            && let Some(auth) = self.auth.as_mut()
+        {
+            auth.pending = None;
+            auth.error = Some(e.to_string());
+        }
+        cx.notify();
+    }
+
+    /// A browser-OAuth sign-in pill (Codex). Distinct from [`Self::auth_pill`]
+    /// (which runs ACP `authenticate`): clicking this opens a browser via
+    /// [`Self::request_browser_login`]. Renders a muted "Opening browser…" while
+    /// pending.
+    fn browser_login_pill(
+        &self,
+        method_id: &str,
+        label: &str,
+        pending: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (theme, typo, density) = (self.theme, self.typography.clone(), self.density);
+        if pending {
+            return div()
+                .px(px(10.0))
+                .py(px(3.0))
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(SharedString::from("Opening browser…"))
+                .into_any_element();
+        }
+        let id = method_id.to_string();
+        let on_click = cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
+            this.request_browser_login(id.clone(), cx);
+        });
+        tool_card::pill_button(
+            format!("codex-oauth-{method_id}"),
+            label.to_string(),
+            theme.status_info,
+            density,
+            &typo,
+            on_click,
+        )
+    }
+
     /// One clickable auth pill (Agent/Terminal name, or an EnvVar "Retry"). While
     /// its method is authenticating it renders a muted "Authenticating…" label
     /// instead of a button.
@@ -1949,6 +2077,27 @@ impl AgentChatView {
                         &typo,
                         density,
                     ));
+                }
+                // BrowserOauth (Codex ChatGPT) → a pill that opens the browser,
+                // not the ACP `authenticate` path.
+                AuthMethodKind::BrowserOauth => {
+                    let pill = self.browser_login_pill(&m.id, &m.name, is_pending, cx);
+                    let row = match m.description.as_deref() {
+                        Some(desc) => div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(pill)
+                            .child(
+                                div()
+                                    .text_size(px(typo.t_label_xs))
+                                    .text_color(theme.fg_muted)
+                                    .child(SharedString::from(desc.to_string())),
+                            )
+                            .into_any_element(),
+                        None => pill,
+                    };
+                    rows.push(row);
                 }
                 // Agent / Terminal → a single labeled pill (+ its description).
                 _ => {
@@ -2275,12 +2424,13 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Switch the permission mode for this chat tab. Two backends, two paths:
-    /// Claude fixes `--permission-mode` at spawn, so a live switch respawns resumed
-    /// on the new mode; an ACP agent switches modes **in-session** via
-    /// `session/set_mode`, so its `set_mode` succeeds and we skip the respawn
-    /// (respawning an ACP child would drop the live session). Not persisted (see
-    /// the field note). No-op when the mode is unchanged.
+    /// Switch the permission mode for this chat tab **in place** — no respawn on
+    /// either backend now: Claude writes a `set_permission_mode` control request
+    /// on stdin (the Agent SDK's wire), ACP calls `session/set_mode`; both return
+    /// `Ok` from `set_mode`, so the same PID/session keeps running. The
+    /// resume-respawn is only the fallback when `set_mode` fails (an older CLI /
+    /// a backend that NAKs the request). Not persisted (see the field note).
+    /// No-op when the mode is unchanged.
     fn change_permission_mode(&mut self, mode: String, cx: &mut Context<Self>) {
         // Unreachable pre-bind (the mode picker is hidden on an unbound draft),
         // but guard anyway so a stray pick can't early-spawn the subprocess.
@@ -2551,6 +2701,9 @@ impl AgentChatView {
             expanded_tool_runs: HashSet::new(),
             image_cache: RefCell::new(HashMap::new()),
             preview: None,
+            open_tool_sheet: None,
+            sheet_copied: false,
+            _sheet_copy_task: None,
             _drain_task: None,
             _subscriptions: Vec::new(),
             question_cards: HashMap::new(),
@@ -2670,13 +2823,24 @@ impl AgentChatView {
             }
             // The agent needs login: mount/refresh the auth card. A retained
             // terminal id (mid terminal-login) survives a re-emit carrying an
-            // error note, so the login terminal keeps rendering.
+            // error note, so the login terminal keeps rendering. A retained
+            // `pending` likewise survives a re-emit so an in-flight sign-in
+            // (Codex's 401-retry burst re-emits AuthRequired several times per
+            // turn) doesn't reset the "Opening browser…"/"Authenticating…"
+            // spinner back to a clickable pill mid-login — but only when the
+            // pending method is still advertised.
             ThreadEvent::AuthRequired { methods, error } => {
-                let terminal_id = self.auth.as_ref().and_then(|a| a.terminal_id.clone());
+                let prev = self.auth.as_ref();
+                let terminal_id = prev.and_then(|a| a.terminal_id.clone());
+                let pending = prev
+                    .and_then(|a| a.pending.clone())
+                    .filter(|id| methods.iter().any(|m| &m.id == id));
                 self.auth = Some(auth_card::AuthPrompt {
                     methods: methods.clone(),
-                    error: error.clone(),
-                    pending: None,
+                    // A fresh error note wins; else keep the prior one so a retry
+                    // burst carrying `error: None` doesn't clear a real failure.
+                    error: error.clone().or_else(|| prev.and_then(|a| a.error.clone())),
+                    pending,
                     terminal_id,
                 });
             }
@@ -2685,6 +2849,23 @@ impl AgentChatView {
             ThreadEvent::AuthTerminal { terminal_id } => {
                 if let Some(auth) = self.auth.as_mut() {
                     auth.terminal_id = Some(terminal_id.clone());
+                }
+            }
+            // The worker produced the sign-in URL (Codex) → open it in the system
+            // browser. The card stays pending until `AuthOutcome` resolves it.
+            ThreadEvent::AuthUrl { url } => {
+                crate::shell::open_url::open_url(url);
+            }
+            // A browser OAuth sign-in resolved (Codex). Success → drop the card so
+            // the composer re-enables (it's disabled while `self.auth.is_some()`)
+            // and the user can send; the backend now has credentials. Failure →
+            // re-show the card with the error so the user can retry.
+            ThreadEvent::AuthOutcome { success, error } => {
+                if *success {
+                    self.auth = None;
+                } else if let Some(auth) = self.auth.as_mut() {
+                    auth.pending = None;
+                    auth.error = error.clone().or(Some("Sign-in was not completed".into()));
                 }
             }
             // The session opened → auth is done; drop the card.
@@ -2699,6 +2880,14 @@ impl AgentChatView {
         // so an intentional Stop never flashes an error banner.
         if self.interrupted {
             self.thread.last_error = None;
+        }
+        // Raise an attention signal for a live turn edge the user should hear
+        // about while looking elsewhere. The host applies the focus/visibility/
+        // per-kind gates — this only classifies the edge. Gated on `was_active`
+        // for the finished/errored kinds so a stray no-turn result can't banner,
+        // and suppressed for an intentional Stop (an interrupt isn't a failure).
+        if let Some((kind, body)) = attention_for_event(&ev, was_active, self.interrupted) {
+            cx.emit(AgentChatEvent::AttentionNeeded { kind, body });
         }
         // Following (and the actual `scroll_to_bottom`) is owned by `render` via
         // `stick_to_bottom`, so newly-arrived content — streamed text, a tall
@@ -3590,6 +3779,71 @@ impl AgentChatView {
         }
     }
 
+    /// Open the fullscreen payload sheet on a tool call. The image lightbox and
+    /// the sheet are mutually exclusive overlays — opening one closes the other.
+    /// Focus moves to the view root so Escape dispatches from here (the overlay
+    /// handlers' context) instead of being eaten by the composer input's IME —
+    /// the same "focus the dialog on open" rule the find bar follows.
+    fn open_tool_sheet(&mut self, tool_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview = None;
+        self.sheet_copied = false;
+        self.open_tool_sheet = Some(tool_id);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Dismiss the tool sheet (backdrop click, the ✕, or Escape) and return focus
+    /// to the composer so typing resumes immediately (mirrors the find bar).
+    fn close_tool_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_tool_sheet.take().is_some() {
+            self.sheet_copied = false;
+            self.composer.read(cx).focus_handle(cx).focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Flash the sheet's Copy control to "Copied ✓" for a beat.
+    fn flash_sheet_copied(&mut self, cx: &mut Context<Self>) {
+        self.sheet_copied = true;
+        cx.notify();
+        self._sheet_copy_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1400))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.sheet_copied {
+                    view.sheet_copied = false;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// The live tool call backing the open sheet, looked up by id across the
+    /// thread's tool calls each render (so a still-running tool grows in place).
+    /// `None` if no sheet is open or the id is gone (e.g. after a rewind).
+    fn open_sheet_tool_call(&self) -> Option<&ToolCall> {
+        let id = self.open_tool_sheet.as_deref()?;
+        self.thread.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.id == id => Some(tc),
+            _ => None,
+        })
+    }
+
+    /// The fullscreen tool-payload sheet, rendered over everything when
+    /// [`Self::open_tool_sheet`] names a still-present tool call.
+    fn render_tool_sheet(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tc = self.open_sheet_tool_call()?;
+        Some(tool_sheet::render_tool_sheet(
+            tc,
+            self.sheet_copied,
+            self.theme,
+            self.density,
+            &self.typography,
+            cx,
+        ))
+    }
+
     /// Step within the CURRENT message's image group, wrapping at the ends.
     fn step_image_preview(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Some((entry, img)) = self.preview {
@@ -4040,13 +4294,16 @@ impl AgentChatView {
             // blocked on the user's answer — so don't show the "working…" spinner
             // (it would also add height that pushes the card's controls down).
             if self.thread.pending_question().is_none() {
+                // While compacting, show the specific "Compacting context…"
+                // spinner instead of the generic "…is working…" so a long
+                // compaction reads as progress, not a hang.
+                let indicator = if self.thread.compacting {
+                    compacting_indicator(theme, &typo)
+                } else {
+                    working_indicator(self.provider_label(), theme, &typo)
+                };
                 scroll = scroll.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .w_full()
-                        .max_w(px(CONTENT_MAX_W))
-                        .child(working_indicator(self.provider_label(), theme, &typo)),
+                    div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(indicator),
                 );
             }
         } else if self.is_signed_out() && self.login_adapter_id().is_some() {
@@ -4399,7 +4656,24 @@ impl Render for AgentChatView {
             // consume it only when we actually had a staged edit to cancel, so
             // a normal Escape still dismisses other overlays.
             .on_action(cx.listener(|this, _: &crate::actions::DismissOverlay, window, cx| {
-                if this.find_bar.is_some() {
+                // The fullscreen sheet is the topmost overlay — Escape closes it
+                // first. Then the image lightbox, then the find bar / staged edit.
+                if this.open_tool_sheet.is_some() {
+                    // If the backing tool call vanished (a rewind truncated the
+                    // transcript), the sheet is already invisible — clear the
+                    // stale pointer but DON'T consume Escape, so it still reaches
+                    // whatever overlay is actually showing.
+                    let showing = this.open_sheet_tool_call().is_some();
+                    this.close_tool_sheet(window, cx);
+                    if showing {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                if this.preview.is_some() {
+                    this.close_image_preview(cx);
+                    cx.stop_propagation();
+                } else if this.find_bar.is_some() {
                     this.close_find(window, cx);
                     cx.stop_propagation();
                 } else if this.pending_edit.is_some() {
@@ -4454,11 +4728,26 @@ impl Render for AgentChatView {
             // A focused gpui-component input dispatches its OWN `Escape`
             // (`InputEscape`), never the app-wide `DismissOverlay`, so the
             // bubble-phase DismissOverlay handler above never sees Escape while
-            // the find input holds focus. Capture it here (ancestor-first, so it
-            // runs before the composer's own InputEscape) and close the bar; fall
-            // through otherwise so the composer keeps owning its Escape.
+            // the composer input holds focus (the common case). Capture it here
+            // (ancestor-first, so it runs before the composer's own InputEscape)
+            // and dismiss the topmost overlay; fall through otherwise so the
+            // composer keeps owning its Escape.
             .capture_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                if this.find_bar_focused(window, cx) {
+                // Same overlay priority as the DismissOverlay handler: sheet, then
+                // lightbox, then find bar. A stale sheet id (backing tool call gone
+                // after a rewind) is cleared without consuming Escape.
+                if this.open_tool_sheet.is_some() {
+                    let showing = this.open_sheet_tool_call().is_some();
+                    this.close_tool_sheet(window, cx);
+                    if showing {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                if this.preview.is_some() {
+                    this.close_image_preview(cx);
+                    cx.stop_propagation();
+                } else if this.find_bar_focused(window, cx) {
                     this.close_find(window, cx);
                     cx.stop_propagation();
                 }
@@ -4490,6 +4779,8 @@ impl Render for AgentChatView {
             .child(self.composer.clone())
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
+            // The fullscreen tool-payload sheet overlays everything when open.
+            .children(self.render_tool_sheet(cx))
             .into_any_element()
     }
 }
@@ -4536,6 +4827,20 @@ fn markdown_reveal_gap(body: &str, typo: &Typography) -> f32 {
 /// mechanical ticks/sec) plus muted text. Keeping it here rather than above the
 /// composer means the input never resizes when a turn starts or ends.
 fn working_indicator(label: &str, theme: Theme, typo: &Typography) -> AnyElement {
+    spinner_row(&format!("{label} is working…"), theme, typo)
+}
+
+/// The compaction spinner — shown in place of the generic working indicator while
+/// the backend reclaims context (Claude `system/status status="compacting"`), so
+/// a long compaction reads as progress instead of a hang. Clears when the
+/// boundary lands or the turn ends.
+fn compacting_indicator(theme: Theme, typo: &Typography) -> AnyElement {
+    spinner_row("Compacting context…", theme, typo)
+}
+
+/// A stepped rotating spinner + muted `text` — the shared body of the working /
+/// compacting tail indicators.
+fn spinner_row(text: &str, theme: Theme, typo: &Typography) -> AnyElement {
     div()
         .flex()
         .flex_row()
@@ -4560,7 +4865,7 @@ fn working_indicator(label: &str, theme: Theme, typo: &Typography) -> AnyElement
             div()
                 .text_size(px(typo.t_body_sm))
                 .text_color(theme.fg_muted)
-                .child(SharedString::from(format!("{label} is working…"))),
+                .child(SharedString::from(text.to_string())),
         )
         .into_any_element()
 }
@@ -4749,6 +5054,83 @@ mod tests {
     use gpui::TestAppContext;
     use oximux_agents::thread::StubConnection;
     use serde_json::json;
+
+    #[test]
+    fn attention_classifies_turn_permission_question_auth() {
+        use crate::notifier::NotificationKind;
+        // A finished turn (a turn was active) → Done, empty body.
+        assert_eq!(
+            attention_for_event(
+                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                true,
+                false,
+            ),
+            Some((NotificationKind::Done, String::new())),
+        );
+        // An errored turn → Failed, first-line body.
+        assert_eq!(
+            attention_for_event(
+                &ThreadEvent::TurnEnded {
+                    result: Some("boom happened\nmore".into()), usage: None, is_error: true
+                },
+                true,
+                false,
+            ),
+            Some((NotificationKind::Failed, "boom happened".to_string())),
+        );
+        // An intentional Stop (interrupted) errored turn → no banner (Claude shape).
+        assert_eq!(
+            attention_for_event(
+                &ThreadEvent::TurnEnded { result: Some("aborted".into()), usage: None, is_error: true },
+                true,
+                true,
+            ),
+            None,
+        );
+        // An intentional Stop on an ACP agent replies Cancelled → a NON-error turn
+        // end while interrupted; it must NOT fire a "finished" banner.
+        assert_eq!(
+            attention_for_event(
+                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                true,
+                true,
+            ),
+            None,
+        );
+        // A turn end with no prior active turn → no banner (stray result).
+        assert_eq!(
+            attention_for_event(
+                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                false,
+                false,
+            ),
+            None,
+        );
+        // Permission / question / auth all → NeedsApproval regardless of was_active.
+        assert!(matches!(
+            attention_for_event(
+                &ThreadEvent::PermissionRequested {
+                    request_id: "r".into(), tool_use_id: None, tool_name: "Bash".into(),
+                    input: json!({}), description: String::new(), suggestions: vec![],
+                    kind: oximux_agents::thread::PermissionKind::Tool,
+                },
+                false,
+                false,
+            ),
+            Some((NotificationKind::NeedsApproval, ref b)) if b == "Bash",
+        ));
+        assert!(matches!(
+            attention_for_event(&ThreadEvent::QuestionAsked {
+                request_id: "r".into(), tool_use_id: None, questions: vec![] }, false, false),
+            Some((NotificationKind::NeedsApproval, _)),
+        ));
+        assert!(matches!(
+            attention_for_event(&ThreadEvent::AuthRequired { methods: vec![], error: None }, false, false),
+            Some((NotificationKind::NeedsApproval, _)),
+        ));
+        // A plain text/tool event → nothing.
+        assert_eq!(attention_for_event(&ThreadEvent::AssistantText("hi".into()), true, false), None);
+    }
 
     /// An optimistic feature pick overlays the backend-advertised value so the
     /// control reflects the user's choice immediately (a toggle flips, a select

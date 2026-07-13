@@ -16,6 +16,7 @@ pub mod acp;
 pub mod background_task;
 pub mod claude_stream_json;
 pub mod codex;
+pub mod codex_session_import;
 pub mod connect;
 pub mod connection;
 pub mod context_chip;
@@ -44,6 +45,9 @@ pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
 pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES};
+pub use codex_session_import::{
+    import_codex_rollout, locate_rollout, transcript_from_codex_str, CodexRolloutImport,
+};
 pub use event::{AuthMethodInfo, AuthMethodKind, PlanEntryLite, ThreadEvent, TurnUsage};
 pub use question::{
     parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,

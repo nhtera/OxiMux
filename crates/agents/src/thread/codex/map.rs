@@ -27,15 +27,23 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
     // foreign. codex-cli 0.144.1 makes `threadId` a required field on the
     // turn/item completion notifications, so this cross-thread splice is a live
     // corruption once a session engages sub-agents — hence a defensive drop.
-    let foreign = match (
-        st.thread_id.as_deref(),
-        params.get("threadId").and_then(|v| v.as_str()),
-    ) {
+    let incoming_thread = params.get("threadId").and_then(|v| v.as_str());
+    let foreign = match (st.thread_id.as_deref(), incoming_thread) {
         (Some(root), Some(incoming)) => root != incoming,
         _ => false,
     };
-    if foreign
-        && matches!(
+    if foreign {
+        // A registered sub-agent child's item lifecycle routes into the spawning
+        // collab tool card's log rather than being dropped; an unregistered foreign
+        // item is buffered (its collab spawn item may still be racing) and replayed
+        // on registration. All OTHER foreign methods keep the tested root-state
+        // protection below (they never touch the root turn/usage/error/transcript).
+        if let Some(inc) = incoming_thread
+            && let Some(routed) = route_foreign_subagent(method, params, st, inc)
+        {
+            return routed;
+        }
+        if matches!(
             method,
             "turn/started"
                 | "turn/completed"
@@ -50,10 +58,22 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
                 | "item/completed"
                 | "item/commandExecution/outputDelta"
                 | "item/commandExecution/terminalInteraction"
-        )
-    {
-        return Vec::new();
+        ) {
+            return Vec::new();
+        }
     }
+    // Root-thread item lifecycle: after the card is (re)built by the match below,
+    // register any sub-agent children it spawns and replay their buffered actions
+    // into the just-built parent card's log.
+    let mut out = map_root_notification(method, params, st);
+    out.extend(register_subagents_and_replay(method, params, st));
+    out
+}
+
+/// The root-thread notification map — the original per-method dispatch. Split out
+/// so `map_notification` can append sub-agent registration/replay after the card
+/// exists (fold drops a `SubagentAction` whose parent card isn't built yet).
+fn map_root_notification(method: &str, params: &Value, st: &mut CodexState) -> Vec<ThreadEvent> {
     match method {
         // --- streaming deltas ---------------------------------------------
         "item/agentMessage/delta" => delta(params)
@@ -135,6 +155,14 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
                 .unwrap_or(false);
             st.current_turn_id = None;
             st.cancel_requested = false; // turn over — drop any stale Stop request
+            // The root turn can't complete while its spawned sub-agents run (the
+            // collab `wait` keeps the turn open), so by here every child this turn
+            // registered is done — clear the routing map and any un-replayed buffer
+            // so neither grows across a long session (mirrors the `cmd_items`
+            // insert/remove discipline). The parent tool cards keep their settled
+            // logs in the transcript; only the live routing state is dropped.
+            st.subagent_parent_by_thread.clear();
+            st.subagent_buffer.clear();
             let usage = st.last_usage.take();
             vec![ThreadEvent::TurnEnded { result: None, usage, is_error }]
         }
@@ -148,7 +176,26 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
             st.last_usage.clone().map(ThreadEvent::LiveUsage).into_iter().collect()
         }
 
+        // A turn that ran while logged out fails with a 401 on the model
+        // websocket (not a JSON-RPC error) — classify it as a sign-in prompt
+        // rather than a generic error bubble. This is the defensive fallback to
+        // the proactive `account/read` check; the card mount is idempotent, so a
+        // retry burst (Reconnecting 2/5 …) just re-shows the same card.
+        "error" if super::protocol::error_is_unauthorized(params) => {
+            vec![ThreadEvent::AuthRequired {
+                methods: vec![super::chatgpt_signin_method()],
+                error: None,
+            }]
+        }
         "error" => vec![ThreadEvent::Error(error_message(params))],
+
+        // A browser OAuth sign-in resolved. Clear the stashed login id and tell
+        // the view to drop the card (success) or re-show it with the error.
+        super::protocol::N_ACCOUNT_LOGIN_COMPLETED => {
+            let success = params.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let error = params.get("error").and_then(Value::as_str).map(str::to_string);
+            vec![ThreadEvent::AuthOutcome { success, error }]
+        }
 
         // The backend compacted earlier context — mirror Claude's divider.
         "thread/compacted" => vec![ThreadEvent::CompactBoundary {
@@ -160,6 +207,143 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
         // mcpServer/*, skills/changed, remoteControl/*, …
         _ => Vec::new(),
     }
+}
+
+/// Cap on buffered pre-registration child actions per thread — a runaway child
+/// must not grow the buffer without bound before its collab spawn item lands.
+const MAX_SUBAGENT_BUFFER: usize = 100;
+
+/// Route a FOREIGN (`threadId != root`) notification for a sub-agent child.
+/// Returns `Some` when the notification is a child item lifecycle event (so the
+/// caller returns immediately): registered child `item/completed` → the log line
+/// for its parent card; an `item/started` or an unregistered `item/completed` →
+/// `Some(empty)` (kept out of the root, buffered when unregistered so it replays
+/// once the collab spawn item registers the mapping). Returns `None` for every
+/// other foreign method, which then falls to the root-state-protection drop.
+fn route_foreign_subagent(
+    method: &str,
+    params: &Value,
+    st: &mut CodexState,
+    incoming: &str,
+) -> Option<Vec<ThreadEvent>> {
+    if !matches!(method, "item/started" | "item/completed") {
+        return None;
+    }
+    let item = params.get("item")?;
+    // Log completed actions only (one clean line per child action, no start/finish
+    // double-logging and no per-delta churn) — a start is kept out of root but
+    // produces no line.
+    if method == "item/started" {
+        return Some(Vec::new());
+    }
+    match st.subagent_parent_by_thread.get(incoming).cloned() {
+        Some(parent) => Some(subagent_action_line(item, &parent).into_iter().collect()),
+        None => {
+            // Registration is still racing — buffer bounded, replay on register.
+            let buf = st.subagent_buffer.entry(incoming.to_string()).or_default();
+            if buf.len() >= MAX_SUBAGENT_BUFFER {
+                buf.pop_front();
+            }
+            buf.push_back(item.clone());
+            Some(Vec::new())
+        }
+    }
+}
+
+/// When a root-thread notification carries a collab spawn item, register its
+/// child thread(s) → this collab tool card's item id, and replay any child
+/// actions that were buffered before the mapping existed. Runs AFTER the card is
+/// built by the main map (so replayed `SubagentAction`s fold onto an existing
+/// parent card).
+fn register_subagents_and_replay(method: &str, params: &Value, st: &mut CodexState) -> Vec<ThreadEvent> {
+    if !matches!(method, "item/started" | "item/completed") {
+        return Vec::new();
+    }
+    let Some(item) = params.get("item") else { return Vec::new() };
+    let item_id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    if item_id.is_empty() {
+        return Vec::new();
+    }
+    let children: Vec<String> = match item.get("type").and_then(|v| v.as_str()) {
+        // A spawn's `receiverThreadIds` are the newly spawned child thread(s).
+        Some("collabAgentToolCall") => item
+            .get("receiverThreadIds")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+            .unwrap_or_default(),
+        Some("subAgentActivity") => item
+            .get("agentThreadId")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for child in children {
+        st.subagent_parent_by_thread.insert(child.clone(), item_id.to_string());
+        if let Some(buffered) = st.subagent_buffer.remove(&child) {
+            for it in buffered {
+                out.extend(subagent_action_line(&it, item_id));
+            }
+        }
+    }
+    out
+}
+
+/// Build the `SubagentAction` log line for a completed child item, addressed to
+/// the parent card `parent`. `None` for items with no meaningful one-line summary
+/// (e.g. reasoning) so they don't clutter the log.
+fn subagent_action_line(item: &Value, parent: &str) -> Option<ThreadEvent> {
+    let line = codex_subagent_summary(item)?;
+    Some(ThreadEvent::SubagentAction {
+        parent_tool_call_id: parent.to_string(),
+        line,
+    })
+}
+
+/// A compact one-line label for a completed child item: `{tool} {primary arg}`
+/// for tool items, the first line of an `agentMessage`, `None` for reasoning and
+/// other non-actionable items. Truncated so a giant command/message can't blow
+/// the row.
+fn codex_subagent_summary(item: &Value) -> Option<String> {
+    match item.get("type").and_then(|v| v.as_str()).unwrap_or_default() {
+        "agentMessage" => {
+            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+            let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            (!first.is_empty()).then(|| truncate_chars(first, 120))
+        }
+        // Reasoning is too noisy for the parent card log.
+        "reasoning" => None,
+        _ => {
+            let (name, input) = tool_call(item)?;
+            let arg = codex_primary_arg(&input);
+            let line = if arg.is_empty() { name } else { format!("{name} {arg}") };
+            Some(truncate_chars(&line.replace('\n', " "), 120))
+        }
+    }
+}
+
+/// The most salient single argument of a child tool call's input (the shape
+/// `tool_call` builds): a command, query, or url. Empty when none applies.
+fn codex_primary_arg(input: &Value) -> String {
+    for key in ["command", "query", "url"] {
+        if let Some(s) = input.get(key).and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Truncate to at most `max` chars (char-boundary safe), appending `…` when cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// Map Codex `turn/plan/updated` steps into the gpui-free `PlanEntryLite` the
@@ -722,6 +906,169 @@ mod tests {
             &mut s,
         );
         assert!(matches!(&root_err[..], [ThreadEvent::Error(_)]), "root error still surfaces");
+    }
+
+    #[test]
+    fn collab_spawn_registers_child_and_routes_its_actions_to_parent_card() {
+        // The root issues a `spawnAgent` collab tool call; its `receiverThreadIds`
+        // name the child. The item itself becomes the parent card, and the child's
+        // later completed actions route into that card's log — never the root turn.
+        let mut s = st();
+        s.thread_id = Some("root".into());
+        let spawn = map_notification(
+            "item/started",
+            &json!({"threadId":"root","item":{"type":"collabAgentToolCall","id":"collab_1",
+                "tool":"spawnAgent","senderThreadId":"root","receiverThreadIds":["child-A"],
+                "status":"inProgress","agentsStates":{}}}),
+            &mut s,
+        );
+        // The collab item created the parent tool card.
+        assert!(matches!(&spawn[..], [ThreadEvent::ToolCallStarted { id, .. }] if id == "collab_1"));
+        assert_eq!(s.subagent_parent_by_thread.get("child-A").map(String::as_str), Some("collab_1"));
+
+        // A foreign child command completion → a routed log line for `collab_1`.
+        let child_cmd = map_notification(
+            "item/completed",
+            &json!({"threadId":"child-A","item":{"type":"commandExecution","id":"c1",
+                "status":"completed","command":"cargo test","cwd":"/tmp","aggregatedOutput":"ok"}}),
+            &mut s,
+        );
+        assert_eq!(child_cmd, vec![ThreadEvent::SubagentAction {
+            parent_tool_call_id: "collab_1".into(), line: "Bash cargo test".into() }]);
+
+        // A foreign child agent message → its first line as an action.
+        let child_msg = map_notification(
+            "item/completed",
+            &json!({"threadId":"child-A","item":{"type":"agentMessage","id":"m1",
+                "text":"Found the bug.\nmore detail"}}),
+            &mut s,
+        );
+        assert_eq!(child_msg, vec![ThreadEvent::SubagentAction {
+            parent_tool_call_id: "collab_1".into(), line: "Found the bug.".into() }]);
+
+        // A foreign child `item/started` produces no line (completed-only logging).
+        let child_start = map_notification(
+            "item/started",
+            &json!({"threadId":"child-A","item":{"type":"commandExecution","id":"c2","command":"ls"}}),
+            &mut s,
+        );
+        assert!(child_start.is_empty());
+    }
+
+    #[test]
+    fn child_actions_before_registration_are_buffered_and_replayed() {
+        // The child's completion races ahead of the collab spawn item. The early
+        // action is buffered, then replayed into the parent card log on register.
+        let mut s = st();
+        s.thread_id = Some("root".into());
+        let early = map_notification(
+            "item/completed",
+            &json!({"threadId":"child-B","item":{"type":"commandExecution","id":"e1",
+                "status":"completed","command":"rustc --version","cwd":"/tmp"}}),
+            &mut s,
+        );
+        assert!(early.is_empty(), "unregistered child action buffered, not emitted");
+        assert_eq!(s.subagent_buffer.get("child-B").map(|b| b.len()), Some(1));
+
+        // The collab spawn item lands → replay the buffered action after the card.
+        let spawn = map_notification(
+            "item/started",
+            &json!({"threadId":"root","item":{"type":"collabAgentToolCall","id":"collab_2",
+                "tool":"spawnAgent","senderThreadId":"root","receiverThreadIds":["child-B"],
+                "status":"inProgress","agentsStates":{}}}),
+            &mut s,
+        );
+        // Card first, then the replayed buffered action addressed to it.
+        assert!(matches!(&spawn[0], ThreadEvent::ToolCallStarted { id, .. } if id == "collab_2"));
+        assert!(spawn.contains(&ThreadEvent::SubagentAction {
+            parent_tool_call_id: "collab_2".into(), line: "Bash rustc --version".into() }));
+        assert!(s.subagent_buffer.get("child-B").is_none(), "buffer drained on register");
+    }
+
+    #[test]
+    fn root_turn_completion_clears_subagent_routing_state() {
+        // Registering + buffering state must not survive the root turn that owns it
+        // (the turn can't complete while its sub-agents run), so it stays bounded.
+        let mut s = st();
+        s.thread_id = Some("root".into());
+        s.subagent_parent_by_thread.insert("child-A".into(), "collab_1".into());
+        s.subagent_buffer.entry("child-B".into()).or_default().push_back(json!({}));
+        let ended = map_notification(
+            "turn/completed",
+            &json!({"threadId":"root","turn":{"status":"completed"}}),
+            &mut s,
+        );
+        assert!(matches!(&ended[..], [ThreadEvent::TurnEnded { .. }]));
+        assert!(s.subagent_parent_by_thread.is_empty(), "routing map cleared at turn end");
+        assert!(s.subagent_buffer.is_empty(), "buffer cleared at turn end");
+    }
+
+    #[test]
+    fn unauthorized_error_maps_to_signin_card() {
+        let mut s = st();
+        s.thread_id = Some("root".into());
+        // A logged-out 401 on the root thread → an AuthRequired sign-in card, not
+        // a generic error bubble.
+        let evs = map_notification("error", &json!({
+            "threadId":"root",
+            "error":{"message":"Reconnecting... 2/5",
+                "codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":401}}},
+            "willRetry":true}), &mut s);
+        match &evs[..] {
+            [ThreadEvent::AuthRequired { methods, error }] => {
+                assert_eq!(methods.len(), 1);
+                assert_eq!(methods[0].id, "chatgpt");
+                assert!(matches!(methods[0].kind, crate::thread::AuthMethodKind::BrowserOauth));
+                assert!(error.is_none());
+            }
+            other => panic!("expected AuthRequired, got {other:?}"),
+        }
+        // A non-401 error still surfaces as a generic Error.
+        let boom = map_notification("error", &json!({
+            "threadId":"root","error":{"message":"boom"}}), &mut s);
+        assert!(matches!(&boom[..], [ThreadEvent::Error(_)]));
+    }
+
+    #[test]
+    fn login_completed_maps_to_auth_outcome() {
+        let mut s = st();
+        let ok = map_notification("account/login/completed",
+            &json!({"loginId":"L1","success":true}), &mut s);
+        assert_eq!(ok, vec![ThreadEvent::AuthOutcome { success: true, error: None }]);
+        let fail = map_notification("account/login/completed",
+            &json!({"loginId":"L1","success":false,"error":"Login was not completed"}), &mut s);
+        assert_eq!(fail, vec![ThreadEvent::AuthOutcome {
+            success: false, error: Some("Login was not completed".into()) }]);
+    }
+
+    #[test]
+    fn subagent_activity_item_registers_agent_thread() {
+        // `subAgentActivity` names its child via `agentThreadId`.
+        let mut s = st();
+        s.thread_id = Some("root".into());
+        map_notification(
+            "item/started",
+            &json!({"threadId":"root","item":{"type":"subAgentActivity","id":"act_1",
+                "agentThreadId":"child-C","agentPath":"/x","kind":"started"}}),
+            &mut s,
+        );
+        assert_eq!(s.subagent_parent_by_thread.get("child-C").map(String::as_str), Some("act_1"));
+    }
+
+    #[test]
+    fn unregistered_foreign_non_item_still_dropped() {
+        // The root-state protection is unchanged for non-item foreign methods even
+        // with sub-agent routing in front of it.
+        let mut s = st();
+        s.thread_id = Some("root".into());
+        s.current_turn_id = Some("turn-1".into());
+        let ended = map_notification(
+            "turn/completed",
+            &json!({"threadId":"child-Z","turn":{"status":"completed"}}),
+            &mut s,
+        );
+        assert!(ended.is_empty(), "foreign turn/completed still dropped");
+        assert_eq!(s.current_turn_id.as_deref(), Some("turn-1"));
     }
 
     #[test]

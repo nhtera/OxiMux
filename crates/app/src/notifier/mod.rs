@@ -78,6 +78,12 @@ pub struct NotificationRequest {
     /// group. A visible pane in a frontmost window never banners — the
     /// user is already looking at it.
     pub pane_visible: bool,
+    /// When true, at most ONE banner fires for this `tab_id` until the window
+    /// regains focus (`Notifier::clear_attention`) — "one outstanding attention
+    /// per tab", the chat-thread policy. Distinct from the per-source 30s
+    /// `SuppressMap` the ambient status path uses; false there, so a long-running
+    /// agent's periodic re-prompts still surface. Default false.
+    pub coalesce_until_focus: bool,
 }
 
 /// Per-workspace burst collapse (see [`BURST_WINDOW`]). Owned by the
@@ -387,6 +393,11 @@ pub trait Notifier: Send + Sync {
     fn availability(&self) -> NotifierAvailability {
         NotifierAvailability::Available
     }
+
+    /// Reset the "needs attention" dock badge. Called when the window regains
+    /// focus — the user is back, so the accumulated count clears. Default no-op
+    /// (the null notifier / mocks have no dock tile).
+    fn clear_attention(&self) {}
 }
 
 /// The notification kind to fire for a `(prev → new)` status edge, or `None`
@@ -530,6 +541,7 @@ mod tests {
             body: String::new(),
             window_active,
             pane_visible,
+            coalesce_until_focus: false,
         }
     }
 

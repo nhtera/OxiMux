@@ -55,6 +55,13 @@ pub enum AuthMethodKind {
     /// embedded terminal so the user logs in via a TUI; on exit the session is
     /// retried.
     Terminal { args: Vec<String>, env: Vec<(String, String)> },
+    /// The agent hands back an OAuth URL the client opens in a browser (Codex's
+    /// merged ChatGPT sign-in: `account/login/start` → `authUrl`). Clicking the
+    /// pill calls [`AgentConnection::begin_browser_login`](super::connection::AgentConnection::begin_browser_login),
+    /// which returns the URL to open; a later `account/login/completed` resolves
+    /// the card via [`ThreadEvent::AuthOutcome`]. No `args`/`env`: the agent runs
+    /// its own callback server, the client only opens the URL.
+    BrowserOauth,
 }
 
 /// One entry of an agent execution plan, in a gpui-free shape mirroring ACP's
@@ -187,6 +194,12 @@ pub enum ThreadEvent {
         detail: String,
         category: String,
     },
+    /// The backend began compacting context (Claude `system/status
+    /// status="compacting"`). A long compaction is otherwise silent until the
+    /// boundary lands, so this drives a "Compacting context…" spinner; the state
+    /// clears when [`CompactBoundary`](Self::CompactBoundary) or `TurnEnded`
+    /// arrives. Claude-only.
+    CompactionStarted,
     /// The backend compacted earlier context to reclaim window space (Claude
     /// `system/compact_boundary`, Codex `thread/compacted`). Rendered as a subtle
     /// centered divider (reusing the session-import `ContextCompaction` entry) so
@@ -263,6 +276,23 @@ pub enum ThreadEvent {
     AuthTerminal {
         terminal_id: String,
     },
+    /// The agent produced a browser sign-in URL to open (Codex `account/login/
+    /// start` → `authUrl`). Emitted asynchronously by the worker after a
+    /// [`begin_browser_login`](super::connection::AgentConnection::begin_browser_login)
+    /// request (so the click that triggers it never blocks the UI on the RPC).
+    /// The app opens it in the system browser; the flow resolves later via
+    /// [`ThreadEvent::AuthOutcome`]. Ephemeral, view-owned — the fold ignores it.
+    AuthUrl {
+        url: String,
+    },
+    /// A browser OAuth sign-in resolved (Codex `account/login/completed`). On
+    /// `success` the app clears the auth card and the session continues (the
+    /// backend now has credentials); on failure it re-shows the card with
+    /// `error`. Ephemeral, view-owned — the fold ignores it, like `AuthRequired`.
+    AuthOutcome {
+        success: bool,
+        error: Option<String>,
+    },
     /// The session's permission/edit mode changed (ACP `current_mode_update`),
     /// whether the user picked it or the agent switched it itself. Keeps the mode
     /// picker in sync.
@@ -307,6 +337,21 @@ pub enum ThreadEvent {
     /// instead of looping the same error. Claude-only.
     SessionResumeStale {
         attempted_id: String,
+    },
+    /// A completed action inside a running subagent/child thread, routed into its
+    /// spawning tool card's log rather than the root transcript. Claude emits one
+    /// per `parent_tool_use_id`-tagged `tool_use`/`assistant` block (a child tool
+    /// call or a first-line text summary); Codex emits one per foreign child-thread
+    /// `item/started`/`item/completed` whose thread is registered to a collab tool
+    /// card. `line` is a short pre-formatted summary (e.g. `Read src/main.rs`); the
+    /// fold appends it to `ToolCall.subagent_log` (a capped ring). Child assistant
+    /// deltas are NOT streamed here — only completed items — so the log can't churn
+    /// the repaint loop. The root transcript stays free of child bubbles.
+    SubagentAction {
+        /// The spawning tool call's id — Claude's `parent_tool_use_id`, Codex's
+        /// registered parent-item id. The fold matches it to a `ToolCall`.
+        parent_tool_call_id: String,
+        line: String,
     },
     /// A protocol/parse/transport error to surface in the thread.
     Error(String),

@@ -69,16 +69,17 @@ pub(super) fn render_tool_card(
         card = card.py(px(2.0));
     }
 
-    card = card.child(header_row(tc, expanded, has_detail, theme, density, typo, cx));
+    let expandable = super::tool_sheet::is_sheet_expandable(tc);
+    card = card.child(header_row(tc, expanded, has_detail, expandable, theme, density, typo, cx));
 
     // Live args preview: shown regardless of expand state while streaming, so the
     // card body grows during composition (a Write's content, a Bash command).
     // Superseded by the finalized card once the `tool_use` block arrives.
     if let Some(preview) = &streaming {
-        if let Some(body) = tool_bodies::render_tool_body(preview, theme, density, typo) {
+        if let Some(body) = tool_bodies::render_tool_body(preview, false, theme, density, typo) {
             card = card.child(body);
         } else {
-            card = card.child(tool_bodies::render_generic_input(preview, theme, density, typo));
+            card = card.child(tool_bodies::render_generic_input(preview, false, theme, density, typo));
         }
         card = card.child(streaming_hint(theme, typo));
     }
@@ -114,14 +115,14 @@ pub(super) fn render_tool_card(
             if let Some(result) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
                 card = card.child(result_block(result, theme, density, typo));
             }
-        } else if let Some(body) = tool_bodies::render_tool_body(tc, theme, density, typo) {
+        } else if let Some(body) = tool_bodies::render_tool_body(tc, false, theme, density, typo) {
             // Bash/Read/Grep/Glob: a legible, tool-specific body (command +
             // output, file slice, or match list) instead of raw JSON.
             card = card.child(body);
         } else {
             // Any other tool: a key:value view of the input (not raw JSON) plus
             // any textual result.
-            card = card.child(tool_bodies::render_generic_input(tc, theme, density, typo));
+            card = card.child(tool_bodies::render_generic_input(tc, false, theme, density, typo));
             if let Some(result) = &tc.result {
                 card = card.child(result_block(result, theme, density, typo));
             }
@@ -137,6 +138,7 @@ fn header_row(
     tc: &ToolCall,
     expanded: bool,
     has_detail: bool,
+    expandable: bool,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -149,6 +151,24 @@ fn header_row(
         label.push_str(&bubble::elide(&target, 80));
     }
     let id = tc.id.clone();
+    // An "open in fullscreen sheet" control shown on cards whose payload is
+    // substantial (a large diff / long output). Sits at the row's trailing edge
+    // and stops propagation so it doesn't also toggle the inline disclosure.
+    let expand = expandable.then(|| {
+        let sheet_id = tc.id.clone();
+        div()
+            .id(SharedString::from(format!("tool-expand-{}", tc.id)))
+            .flex_none()
+            .px(px(4.0))
+            .text_color(theme.fg_subtle)
+            .cursor_pointer()
+            .hover(|s| s.text_color(theme.fg_base))
+            .on_click(cx.listener(move |this, _e, window, cx| {
+                this.open_tool_sheet(sheet_id.clone(), window, cx);
+            }))
+            .on_mouse_down(gpui::MouseButton::Left, |_e, _w, cx| cx.stop_propagation())
+            .child(SharedString::from("⤢"))
+    });
     div()
         .id(SharedString::from(format!("tool-hdr-{}", tc.id)))
         .flex()
@@ -178,6 +198,8 @@ fn header_row(
                     .child(SharedString::from(if expanded { "▾" } else { "▸" })),
             )
         })
+        // Push the expand control to the trailing edge.
+        .when_some(expand, |s, e| s.child(div().flex_1()).child(e))
         .into_any_element()
 }
 

@@ -117,6 +117,9 @@ pub fn spawn_status_task(
                         body,
                         window_active: window_active_now,
                         pane_visible,
+                        // Ambient status re-prompts rely on the 30s SuppressMap
+                        // above, not until-focus coalescing.
+                        coalesce_until_focus: false,
                     });
                 }
                 // In-app toast for terminal lifecycle edges (finished /

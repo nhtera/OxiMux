@@ -351,10 +351,10 @@ impl SessionHistoryModal {
         window.dispatch_action(Box::new(action), cx);
     }
 
-    /// Reopen the session at filtered-list position `list_idx` as a chat tab
-    /// (Claude only): dispatch [`OpenChatSession`] — which imports the
-    /// transcript and spawns a resumed chat — then close. No-op for Codex rows
-    /// (no importable transcript / chat runner) or when out of range.
+    /// Reopen the session at filtered-list position `list_idx` as a chat tab:
+    /// dispatch [`OpenChatSession`] — which imports the transcript and spawns a
+    /// resumed chat — then close. No-op for adapters without a chat runner (ACP
+    /// presets, terminal-only) or when out of range.
     fn open_as_chat(&mut self, list_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.filtered();
         let Some(&entry_idx) = order.get(list_idx) else {
@@ -368,20 +368,26 @@ impl SessionHistoryModal {
         }
         let action = OpenChatSession {
             session_id: entry.session_id.clone(),
-            // Empty when the log omits a transcript path: the handler resumes
-            // with no pre-rendered history.
+            // Empty when the log omits a transcript path: the handler imports/
+            // locates the transcript itself (Codex) or resumes with no
+            // pre-rendered history (Claude with no path).
             path: entry.path.clone().unwrap_or_default(),
             cwd: entry.cwd.clone().unwrap_or_default(),
+            adapter: entry.adapter,
         };
         self.close(cx);
         window.dispatch_action(Box::new(action), cx);
     }
 }
 
-/// Whether a session can reopen as a chat tab. Only Claude Code transcripts
-/// import into the chat surface; Codex (and other) rows resume in a terminal.
+/// Whether a session can reopen as a chat tab. Claude and Codex both import into
+/// the chat surface (Claude via `--resume` + JSONL, Codex via `thread/resume` +
+/// rollout); other adapters (ACP presets, custom terminal) resume in a terminal.
 fn entry_opens_as_chat(entry: &SessionEntry) -> bool {
-    entry.adapter == oximux_core::AgentAdapter::ClaudeCode
+    matches!(
+        entry.adapter,
+        oximux_core::AgentAdapter::ClaudeCode | oximux_core::AgentAdapter::Codex
+    )
 }
 
 impl EventEmitter<SessionHistoryEvent> for SessionHistoryModal {}

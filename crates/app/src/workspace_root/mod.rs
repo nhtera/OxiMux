@@ -933,6 +933,8 @@ impl WorkspaceRoot {
                         this.toast_layer.downgrade(),
                     );
                     this.run_diff_refresh_round(cx);
+                    // The user is back — clear the accumulated attention dock badge.
+                    this.notifier.clear_attention();
                 }
             });
 
