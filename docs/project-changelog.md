@@ -4,6 +4,52 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-13 — Agent Chat round-5 P1 wave (6 product-parity features)
+
+**What shipped:** the deferred P1 backlog from the round-4 research report plus two
+round-4 verification carry-overs, across `oximux-agents` and `oximux-app`.
+
+- **Subagent activity → parent tool card.** Claude sidechain events (matched by
+  `parent_tool_use_id`) and Codex collab child-thread activity (buffered by
+  `receiverThreadIds`, replayed on completion) now stream into the parent Agent/Task
+  card's `subagent_log` (most-recent-few + "+N earlier"), instead of being dropped —
+  the parent card reveals what the subagent is doing without child events leaking into
+  the root transcript. Both buffers clear on the root `turn/completed` (bounded).
+- **Generalized session import.** "Reopen as chat" now covers Codex, not just Claude:
+  `codex_session_import.rs` reads a finished `~/.codex` rollout (Responses-API format)
+  into a `ThreadEntry` transcript. Surfaced in both the session-history page and the
+  New Agent flow. ACP has no list API → documented unsupported.
+- **Attention notifications.** A turn finishing / erroring / needing a permission while
+  the app is unfocused posts a macOS `UNUserNotificationCenter` banner + dock badge
+  (`notifier/`), coalesced per-tab and cleared on focus; the three event types are
+  individually toggleable in Settings → Notifications. An ACP Stop (interrupted) no
+  longer fires a false "Done".
+- **Codex structured auth card.** A logged-out Codex (or a turn-time 401) now surfaces a
+  sign-in card instead of a generic error: ChatGPT-OAuth via `account/login/start` →
+  the browser opens (fire-and-forget worker emits `AuthUrl`, never blocking the main
+  thread) → completion auto-retries the turn. Secrets are never persisted.
+- **Claude compacting indicator + live mode switch.** `system/status` `compacting` now
+  promotes to a "Compacting context…" spinner that resolves into the existing
+  compaction-boundary divider (cleared on turn-end if none arrives), so a long
+  compaction reads as progress not a hang. Changing the composer permission mode now
+  writes a `set_permission_mode` control_request on the live process's stdin (the Agent
+  SDK's wire) — the mode switches **in place**, no `--resume` respawn (respawn remains
+  the fallback for model/effort). *(Spike verified against `@anthropic-ai/claude-agent-sdk@0.3.207`.)*
+- **Tool-payload fullscreen sheet.** A `⤢` on any tool card with a substantial payload
+  (a diff, or a result over 600 chars) opens a full-height overlay (`tool_sheet.rs`)
+  showing the whole payload: a large diff virtualized via `uniform_list` (fixed `h_row`
+  rows), or a long shell/read/fetch body via the shared inline renderer with its
+  row/char caps lifted (a `full: bool` size-mode threaded through `tool_bodies.rs`).
+  Copy button + Esc / backdrop / ✕ dismiss; reads its tool call live by id so a
+  still-running tool grows in place.
+
+**Verification:** `cargo test --workspace --no-fail-fast` green (known-flaky
+`spawn_args_reach_child_process` tolerated); each phase code-reviewed (findings fixed).
+Live-GUI: Phase 5 (compacting spinner → boundary divider; in-place mode switch, PID-stable,
+in-workspace Edit auto-approved) verified in the running app; remaining phases + the two
+carry-overs (mid-turn Codex rewind, live MCP elicitation via `scripts/mcp-elicitation-probe.py`)
+tracked in `plans/260713-1243-agent-chat-round5-p1-wave/reports/gui-verification.md`.
+
 ### 2026-07-13 — Agent Chat round-4 P0 parity (5 protocol-correctness gaps)
 
 **What shipped:** five P0 agent-chat parity features closing the round-4 research
