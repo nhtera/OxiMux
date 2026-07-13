@@ -125,30 +125,105 @@
         assert_eq!(entries[0].size_bytes, Some(std::fs::metadata(&path).unwrap().len()));
     }
 
+    /// A minimal Codex rollout: `session_meta` head + optional injected preamble
+    /// turns + the genuine first user prompt. Mirrors the real on-disk shape.
+    fn codex_rollout(ts: &str, cwd: &str, branch: &str, id: &str, prompt: &str) -> String {
+        let meta = format!(
+            r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"session_id":"{id}","cwd":"{cwd}","timestamp":"{ts}","git":{{"branch":"{branch}"}}}}}}"#
+        );
+        // Injected synthetic-user turns Codex prepends, which must be skipped.
+        // `r##` delimiter: the `"#` in `:"# AGENTS` would close a plain `r#`.
+        let agents = format!(
+            r##"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"# AGENTS.md instructions for /x — lots of text"}}]}}}}"##
+        );
+        let env = format!(
+            r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"<environment_context><cwd>{cwd}</cwd></environment_context>"}}]}}}}"#
+        );
+        let user = format!(
+            r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{prompt}"}}]}}}}"#
+        );
+        format!("{meta}\n{agents}\n{env}\n{user}\n")
+    }
+
+    fn write_codex_rollout(codex: &Path, day: &str, file: &str, body: &str) {
+        let dir = codex.join("sessions").join(day);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+
     #[test]
-    fn parse_codex_index_line_reads_id_thread_updated() {
-        let line = r#"{"id":"abc-123","thread_name":"fix flaky test","updated_at":"2026-06-19T09:00:00Z"}"#;
-        let e = parse_codex_index_line(line).unwrap();
+    fn codex_rollout_reads_meta_and_first_genuine_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = tmp.path().join(".codex");
+        write_codex_rollout(
+            &codex,
+            "2026/06/19",
+            "rollout-2026-06-19-abc-123.jsonl",
+            &codex_rollout(
+                "2026-06-19T09:00:00Z",
+                "/Users/x/proj",
+                "main",
+                "abc-123",
+                "fix flaky test",
+            ),
+        );
+        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
         assert_eq!(e.session_id, "abc-123");
         assert_eq!(e.adapter, AgentAdapter::Codex);
-        assert_eq!(e.cwd, None);
+        assert_eq!(e.cwd.as_deref(), Some("/Users/x/proj"));
+        assert_eq!(e.git_branch.as_deref(), Some("main"));
+        // The injected AGENTS.md + environment_context turns are skipped.
         assert_eq!(e.title.as_deref(), Some("fix flaky test"));
         assert_eq!(e.last_message_ts_ms, parse_timestamp_ms("2026-06-19T09:00:00Z"));
     }
 
     #[test]
-    fn parse_codex_index_line_accepts_epoch_seconds() {
-        let line = r#"{"id":"x","thread_name":"t","updated_at":1718784000}"#;
-        let e = parse_codex_index_line(line).unwrap();
-        assert_eq!(e.last_message_ts_ms, Some(1_718_784_000_000));
+    fn codex_rollout_reads_legacy_id_and_top_level_message() {
+        // Pre-0.14 CLI: meta keys the id as `id`, and turns are top-level
+        // `type: "message"` lines (no `response_item` wrapper).
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = tmp.path().join(".codex");
+        let body = concat!(
+            r#"{"type":"session_meta","payload":{"id":"legacy-1","cwd":"/Users/x/proj","timestamp":"2025-08-29T02:29:19Z","git":{"branch":"dev"}}}"#,
+            "\n",
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/Users/x/proj</cwd></environment_context>"}]}"#,
+            "\n",
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"port the module"}]}"#,
+            "\n",
+        );
+        write_codex_rollout(&codex, "2025/08/29", "rollout-2025-08-29-legacy-1.jsonl", body);
+        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "legacy-1");
+        assert_eq!(entries[0].git_branch.as_deref(), Some("dev"));
+        assert_eq!(entries[0].title.as_deref(), Some("port the module"));
+    }
+
+    #[test]
+    fn codex_rollout_without_session_meta_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = tmp.path().join(".codex");
+        write_codex_rollout(
+            &codex,
+            "2026/06/19",
+            "rollout-2026-06-19-noid.jsonl",
+            "{\"type\":\"event_msg\",\"payload\":{}}\n",
+        );
+        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        assert!(entries.is_empty());
     }
 
     #[test]
     fn malformed_lines_are_skipped_without_panic() {
         assert!(parse_claude_jsonl("s", "not json\n{bad").is_none());
-        assert!(parse_codex_index_line("garbage").is_none());
-        assert!(parse_codex_index_line(r#"{"thread_name":"no id"}"#).is_none());
-        assert!(parse_codex_index_line(r#"{"id":""}"#).is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        let codex = tmp.path().join(".codex");
+        // A rollout of pure noise yields no entry, never a panic.
+        write_codex_rollout(&codex, "2026/06/19", "rollout-garbage.jsonl", "garbage\n{bad\n");
+        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -158,7 +233,6 @@
         let codex = tmp.path().join(".codex");
         let proj = claude.join("projects").join("-Users-x-proj");
         std::fs::create_dir_all(&proj).unwrap();
-        std::fs::create_dir_all(&codex).unwrap();
 
         std::fs::write(
             proj.join("old.jsonl"),
@@ -170,11 +244,18 @@
             format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj", "new task")),
         )
         .unwrap();
-        std::fs::write(
-            codex.join("session_index.jsonl"),
-            "{\"id\":\"cx\",\"thread_name\":\"codex task\",\"updated_at\":\"2026-06-19T08:00:00Z\"}\n",
-        )
-        .unwrap();
+        write_codex_rollout(
+            &codex,
+            "2026/06/19",
+            "rollout-2026-06-19-cx.jsonl",
+            &codex_rollout(
+                "2026-06-19T08:00:00Z",
+                "/Users/x/proj",
+                "main",
+                "cx",
+                "codex task",
+            ),
+        );
 
         let entries = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
         assert_eq!(entries.len(), 3);
@@ -183,6 +264,7 @@
         assert_eq!(entries[0].title.as_deref(), Some("new task"));
         assert_eq!(entries[1].session_id, "cx");
         assert_eq!(entries[1].adapter, AgentAdapter::Codex);
+        assert_eq!(entries[1].title.as_deref(), Some("codex task"));
         assert_eq!(entries[2].session_id, "old");
     }
 
@@ -249,7 +331,7 @@
     }
 
     #[test]
-    fn scoped_build_excludes_codex_sessions() {
+    fn scoped_build_filters_codex_by_recorded_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let claude = tmp.path().join(".claude");
         let codex = tmp.path().join(".codex");
@@ -257,29 +339,39 @@
             .join("projects")
             .join(sanitize_project_path("/Users/x/proj"));
         std::fs::create_dir_all(&proj).unwrap();
-        std::fs::create_dir_all(&codex).unwrap();
         std::fs::write(
             proj.join("a.jsonl"),
             format!("{}\n", claude_user_line("2026-06-20T08:00:00Z", "/Users/x/proj", "hi")),
         )
         .unwrap();
-        std::fs::write(
-            codex.join("session_index.jsonl"),
-            "{\"id\":\"cx\",\"thread_name\":\"t\",\"updated_at\":\"2026-06-19T08:00:00Z\"}\n",
-        )
-        .unwrap();
+        // One Codex session in the active project, one elsewhere.
+        write_codex_rollout(
+            &codex,
+            "2026/06/19",
+            "rollout-2026-06-19-here.jsonl",
+            &codex_rollout("2026-06-19T08:00:00Z", "/Users/x/proj", "main", "here", "in proj"),
+        );
+        write_codex_rollout(
+            &codex,
+            "2026/06/19",
+            "rollout-2026-06-19-there.jsonl",
+            &codex_rollout("2026-06-19T08:00:00Z", "/Users/x/other", "main", "there", "elsewhere"),
+        );
 
-        // Codex has no cwd → only the all view shows it.
+        // Scoped to /Users/x/proj → the Claude session + the matching-cwd Codex
+        // one; the other-cwd Codex session is excluded.
         let scoped = SessionIndex::build(
             &claude,
             &codex,
             &SessionScope::Projects(vec!["/Users/x/proj".to_string()]),
         );
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].adapter, AgentAdapter::ClaudeCode);
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().any(|e| e.session_id == "here"));
+        assert!(scoped.iter().all(|e| e.session_id != "there"));
 
+        // All projects → every session regardless of cwd.
         let all = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
     }
 
     #[test]

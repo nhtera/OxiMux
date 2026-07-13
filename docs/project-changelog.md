@@ -4,6 +4,34 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-14 — Codex session history: scan real rollouts, not the legacy index
+
+**What shipped:** the session index now discovers Codex sessions from the CLI's
+rollout store instead of a stale companion file, so the `⌘⇧H` modal's **Codex**
+filter lists real, resumable sessions (previously "No Codex sessions").
+`oximux-agents` only.
+
+- **Root cause.** `collect_codex` read `~/.codex/session_index.jsonl` — a
+  cwd-less legacy/desktop index. Because it carried no cwd, Codex sessions were
+  gated to the all-projects view only, so the default cwd-scoped modal showed
+  none; and its ids weren't the CLI rollout ids `codex resume` uses.
+- **Fix.** `collect_codex` now walks
+  `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (the store `codex resume` lists
+  and `codex_session_import` already reopens), reading each rollout's
+  `session_meta` head for id + cwd + git branch + start time and its first
+  non-injected user turn for the title. With a real cwd, Codex sessions scope by
+  project exactly like Claude's. Both rollout shapes are handled — newer
+  (`response_item` payloads, `session_id`) and older (top-level `message`,
+  `id`). The injected `AGENTS.md` / `<…>`-context turns Codex prepends are
+  skipped so the title matches `codex resume`.
+- **Preview.** The history preview pane learned the rollout format too, so a
+  selected Codex session shows its opening exchange instead of a blank pane.
+- Streaming head read (early-stop at the first genuine prompt, bounded cap)
+  keeps the scan cheap despite Codex inlining a large `AGENTS.md` block as the
+  first synthetic turn. Tests: `oximux-agents` 590/0 (session_log 63/0).
+
+---
+
 ### 2026-07-13 — Session-history import: agent-type filter + mode-aware routing
 
 **What shipped:** the centered session-history / import modal (`⌘⇧H`) gained

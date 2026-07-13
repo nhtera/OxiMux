@@ -6,8 +6,11 @@
 //!   `<claude_dir>/projects/<cwd-slug>/<session-uuid>.jsonl` (the same files
 //!   [`super::activity`] tails). The file stem IS the session id; the first
 //!   `user` entry is the opening prompt; entries carry `cwd` + `timestamp`.
-//! - Codex — a compact `<codex_dir>/session_index.jsonl`, one
-//!   `{id, thread_name, updated_at}` object per line.
+//! - Codex — one rollout `.jsonl` per session under
+//!   `<codex_dir>/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` (the store
+//!   `codex resume` lists and [`crate::thread::codex_session_import`] reopens).
+//!   The head's `session_meta` line carries the id, cwd, git branch, and start
+//!   time; the first non-injected `user` message is the opening prompt.
 //!
 //! Everything degrades to "absent": unreadable dirs, malformed lines, and
 //! format drift yield fewer entries, never a crash. Reads are bounded — a
@@ -19,7 +22,8 @@
 //! thread.
 
 use std::fs;
-use std::path::Path;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -124,11 +128,9 @@ impl SessionIndex {
     pub fn build(claude_dir: &Path, codex_dir: &Path, scope: &SessionScope) -> Vec<SessionEntry> {
         let mut entries = Vec::new();
         collect_claude(claude_dir, scope, &mut entries);
-        // Codex's compact index records no cwd, so its sessions can't be tied
-        // to a project — only surface them in the unscoped (all) view.
-        if matches!(scope, SessionScope::AllProjects) {
-            collect_codex(codex_dir, &mut entries);
-        }
+        // Codex rollouts record their cwd, so they scope by project just like
+        // Claude's — no all-projects-only special case.
+        collect_codex(codex_dir, scope, &mut entries);
         // Newest first; entries without a timestamp sort to the bottom.
         entries.sort_by_key(|e| std::cmp::Reverse(e.last_message_ts_ms));
         entries
@@ -461,69 +463,222 @@ fn last_timestamp_ms(content: &str) -> Option<i64> {
 
 // --- Codex -----------------------------------------------------------------
 
-fn collect_codex(codex_dir: &Path, out: &mut Vec<SessionEntry>) {
-    let index = codex_dir.join("session_index.jsonl");
-    let Ok(content) = fs::read_to_string(&index) else {
+/// Walk `<codex_dir>/sessions/**/rollout-*.jsonl` and build one entry per
+/// rollout. A scoped build keeps only rollouts whose recorded `cwd` matches an
+/// active project path (Codex records cwd in `session_meta`, so it scopes just
+/// like Claude). An unreadable tree contributes nothing.
+fn collect_codex(codex_dir: &Path, scope: &SessionScope, out: &mut Vec<SessionEntry>) {
+    let sessions = codex_dir.join("sessions");
+    let mut files = Vec::new();
+    collect_rollout_files(&sessions, 0, &mut files);
+    for path in files {
+        let Some(entry) = build_codex_entry(&path) else {
+            continue;
+        };
+        if let SessionScope::Projects(targets) = scope {
+            let keep = entry
+                .cwd
+                .as_deref()
+                .is_some_and(|c| targets.iter().any(|t| codex_cwd_matches(c, t)));
+            if !keep {
+                continue;
+            }
+        }
+        out.push(entry);
+    }
+}
+
+/// Depth-bounded collection of every `rollout-*.jsonl` under the sessions tree.
+/// Codex nests three levels deep (`YYYY/MM/DD`); the cap guards a pathological
+/// tree from unbounded recursion. Symlinked entries are never followed.
+fn collect_rollout_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    const MAX_DEPTH: usize = 5;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(read) = fs::read_dir(dir) else {
         return;
     };
-    for line in content.lines() {
-        if let Some(entry) = parse_codex_index_line(line) {
-            out.push(entry);
+    for entry in read.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_rollout_files(&path, depth + 1, out);
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with("rollout-")
+            && name.ends_with(".jsonl")
+        {
+            out.push(path);
         }
     }
 }
 
-/// Parse one `{id, thread_name, updated_at}` line of the Codex session index.
-pub fn parse_codex_index_line(line: &str) -> Option<SessionEntry> {
-    let v = line_value(line)?;
-    let id = v.get("id").and_then(Value::as_str)?;
-    if id.is_empty() {
-        return None;
-    }
-    let title = v
-        .get("thread_name")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(truncate_prompt);
-    let last_message_ts_ms = v.get("updated_at").and_then(parse_flexible_ts);
+/// Build one [`SessionEntry`] from a Codex rollout. Reads only the head (up to
+/// the first genuine prompt) plus a bounded tail (for the newest timestamp).
+/// Returns `None` when no `session_meta` id is found (a torn or foreign file).
+fn build_codex_entry(path: &Path) -> Option<SessionEntry> {
+    let head = parse_codex_head(path)?;
+    let tail = read_tail(path, TAIL_BYTES).unwrap_or_default();
+    let last_message_ts_ms = last_timestamp_ms(&tail).or(head.created_at_ms);
+    let size_bytes = fs::metadata(path).ok().map(|m| m.len());
     Some(SessionEntry {
-        session_id: id.to_string(),
+        session_id: head.session_id,
         adapter: AgentAdapter::Codex,
-        path: None,
-        cwd: None,
-        title,
+        path: Some(path.to_string_lossy().into_owned()),
+        cwd: head.cwd,
+        title: head.title,
         custom_title: None,
-        git_branch: None,
+        git_branch: head.git_branch,
         tag: None,
-        created_at_ms: None,
+        created_at_ms: head.created_at_ms,
         last_message_ts_ms,
         message_count: None,
-        size_bytes: None,
+        size_bytes,
         entry_count: None,
     })
 }
 
-/// Codex `updated_at` shape is unconfirmed against real data, so accept the
-/// plausible forms: RFC-3339 string, integer-in-string, or numeric epoch
-/// (seconds or millis). Anything else → `None` (never panics).
-fn parse_flexible_ts(v: &Value) -> Option<i64> {
-    if let Some(s) = v.as_str() {
-        return parse_timestamp_ms(s).or_else(|| s.parse::<i64>().ok().map(normalize_epoch));
-    }
-    if let Some(n) = v.as_i64() {
-        return Some(normalize_epoch(n));
-    }
-    v.as_f64().map(|f| normalize_epoch(f as i64))
+/// The fields a rollout head yields: the `session_meta` identity plus the first
+/// genuine user prompt (the title).
+struct CodexHead {
+    session_id: String,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    created_at_ms: Option<i64>,
+    title: Option<String>,
 }
 
-/// Epoch seconds (~1.7e9 today) vs millis (~1.7e12): scale up to millis when
-/// the magnitude is clearly seconds.
-fn normalize_epoch(n: i64) -> i64 {
-    if n.abs() < 100_000_000_000 {
-        n * 1000
-    } else {
-        n
+/// Stream a rollout's leading lines to extract [`CodexHead`]. Codex inlines a
+/// large `AGENTS.md` block as the first synthetic user turn, so the real prompt
+/// can sit tens of KB in — past any fixed head window. Scanning stops as soon as
+/// the prompt is found, so a typical read is a few KB; a preamble-only or torn
+/// file is bounded by [`MAX_SCAN_BYTES`].
+fn parse_codex_head(path: &Path) -> Option<CodexHead> {
+    /// Stop scanning after this many bytes even without a genuine prompt, so a
+    /// title-less rollout never reads unbounded. Covers the observed worst-case
+    /// prompt offset with headroom.
+    const MAX_SCAN_BYTES: u64 = 512 * 1024;
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut scanned: u64 = 0;
+    let mut session_id: Option<String> = None;
+    let mut cwd = None;
+    let mut git_branch = None;
+    let mut created_at_ms = None;
+    let mut title: Option<String> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).ok()?;
+        if n == 0 {
+            break;
+        }
+        scanned += n as u64;
+        if let Some(v) = line_value(line.trim_end()) {
+            match v.get("type").and_then(Value::as_str) {
+                Some("session_meta") => {
+                    if let Some(p) = v.get("payload") {
+                        // Newer rollouts key the id as `session_id`; older ones
+                        // (pre-0.14 CLI) use `id`. Both embed it in the filename.
+                        session_id = p
+                            .get("session_id")
+                            .or_else(|| p.get("id"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        cwd = p
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        git_branch = p
+                            .pointer("/git/branch")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        created_at_ms = p
+                            .get("timestamp")
+                            .and_then(Value::as_str)
+                            .and_then(parse_timestamp_ms);
+                    }
+                }
+                // A turn: newer rollouts wrap it as `response_item.payload`;
+                // older ones emit a top-level `type: "message"`.
+                Some("response_item") if title.is_none() => {
+                    title = v.get("payload").and_then(codex_user_prompt);
+                }
+                Some("message") if title.is_none() => {
+                    title = codex_user_prompt(&v);
+                }
+                _ => {}
+            }
+        }
+        if title.is_some() || scanned >= MAX_SCAN_BYTES {
+            break;
+        }
     }
+    Some(CodexHead {
+        session_id: session_id?,
+        cwd,
+        git_branch,
+        created_at_ms,
+        title,
+    })
+}
+
+/// The genuine first user prompt from a rollout message object (a
+/// `response_item.payload` or an older top-level `message`), or `None` when it
+/// is not a user message or is injected context. Codex prepends the project
+/// `AGENTS.md` and `<…>`-wrapped context blocks (`<environment_context>`,
+/// `<user_instructions>`, `<recommended_plugins>`, …) as synthetic user turns;
+/// the title should be the human's actual first line, matching `codex resume`.
+fn codex_user_prompt(msg: &Value) -> Option<String> {
+    if msg.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    // Guard the message type when present (newer payloads carry it; older
+    // top-level message lines don't, and their `type` is the outer `message`).
+    if let Some(t) = msg.get("type").and_then(Value::as_str)
+        && t != "message"
+    {
+        return None;
+    }
+    let text = msg
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("input_text"))
+        .find_map(|b| b.get("text").and_then(Value::as_str))?;
+    if is_codex_injected_prompt(text) {
+        return None;
+    }
+    let cleaned = truncate_prompt(text);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Is this synthetic-user text an injected context block rather than a real
+/// prompt? Injected blocks are `<…>`-tag-wrapped or the `AGENTS.md` instructions.
+fn is_codex_injected_prompt(text: &str) -> bool {
+    let s = text.trim_start();
+    s.starts_with('<') || s.starts_with("# AGENTS.md")
+}
+
+/// Match a rollout's recorded `cwd` against an active project path. Exact string
+/// match first; then a canonicalized comparison so symlink-equivalent paths
+/// (e.g. `/tmp` ↔ `/private/tmp` on macOS) still scope together.
+fn codex_cwd_matches(cwd: &str, target: &str) -> bool {
+    if cwd == target {
+        return true;
+    }
+    matches!(
+        (fs::canonicalize(cwd), fs::canonicalize(target)),
+        (Ok(a), Ok(b)) if a == b
+    )
 }
 
 // --- shared helpers --------------------------------------------------------

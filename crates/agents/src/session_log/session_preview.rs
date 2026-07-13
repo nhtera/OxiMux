@@ -8,8 +8,9 @@
 //!
 //! Bounded + best-effort: a giant transcript costs one head read, malformed
 //! lines are skipped, and an unreadable file yields an empty preview (never a
-//! crash). Codex sessions have no per-session file path, so they have no
-//! transcript preview (the picker shows their metadata only).
+//! crash). Both formats are handled: Claude's `type: user`/`assistant` lines
+//! and Codex rollout `response_item` message payloads (`~/.codex/sessions/**/
+//! rollout-*.jsonl`), with Codex's injected `AGENTS.md`/context turns skipped.
 
 use std::path::Path;
 
@@ -81,10 +82,67 @@ pub fn preview_from_content(content: &str, max_messages: usize) -> Vec<PreviewMe
                     });
                 }
             }
+            // Codex rollout turns: newer rollouts wrap them as
+            // `response_item.payload`; older ones emit top-level `message`.
+            Some("response_item") => {
+                if let Some(msg) = v.get("payload").and_then(codex_preview_message) {
+                    out.push(msg);
+                }
+            }
+            Some("message") => {
+                if let Some(msg) = codex_preview_message(&v) {
+                    out.push(msg);
+                }
+            }
             _ => {}
         }
     }
     out
+}
+
+/// Extract a previewable turn from a Codex rollout message object (a
+/// `response_item.payload` or an older top-level `message`). User turns carry
+/// `input_text` blocks, assistant turns `output_text`; `developer` and other
+/// roles are plumbing, skipped. Injected synthetic-user context (the project
+/// `AGENTS.md` and `<…>`-wrapped blocks) is skipped so the preview opens on the
+/// human's actual first line, matching the row title.
+fn codex_preview_message(msg: &Value) -> Option<PreviewMessage> {
+    // Guard the message type when present (older top-level lines carry the
+    // outer `message` type; newer payloads carry an inner `message`).
+    if let Some(t) = msg.get("type").and_then(Value::as_str)
+        && t != "message"
+    {
+        return None;
+    }
+    let role = msg.get("role").and_then(Value::as_str)?;
+    let (block_type, preview_role) = match role {
+        "user" => ("input_text", PreviewRole::User),
+        "assistant" => ("output_text", PreviewRole::Assistant),
+        _ => return None,
+    };
+    let text = msg
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some(block_type))
+        .find_map(|b| b.get("text").and_then(Value::as_str))?;
+    if preview_role == PreviewRole::User && is_codex_injected_prompt(text) {
+        return None;
+    }
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(PreviewMessage {
+        role: preview_role,
+        text: truncate_preview(text),
+    })
+}
+
+/// Codex prepends context blocks as synthetic user turns — `<…>`-tag-wrapped or
+/// the `AGENTS.md` instructions. They're noise in a transcript preview.
+fn is_codex_injected_prompt(text: &str) -> bool {
+    let s = text.trim_start();
+    s.starts_with('<') || s.starts_with("# AGENTS.md")
 }
 
 /// User turns that carry no readable prose: meta/compact-summary markers and
@@ -212,5 +270,31 @@ mod tests {
     fn malformed_and_empty_never_panic() {
         assert!(preview_from_content("not json\n{bad", 8).is_empty());
         assert!(preview_from_content("", 8).is_empty());
+    }
+
+    #[test]
+    fn extracts_codex_rollout_turns_skipping_injected_preamble() {
+        let content = concat!(
+            r#"{"type":"session_meta","payload":{"session_id":"cx","cwd":"/p"}}"#,
+            "\n",
+            // Injected AGENTS.md + environment_context synthetic-user turns.
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/p</cwd></environment_context>"}]}}"#,
+            "\n",
+            // developer-role plumbing is skipped.
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions/>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the parser"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"On it."}]}}"#,
+            "\n",
+        );
+        let msgs = preview_from_content(content, 8);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, PreviewRole::User);
+        assert_eq!(msgs[0].text, "fix the parser");
+        assert_eq!(msgs[1].role, PreviewRole::Assistant);
+        assert_eq!(msgs[1].text, "On it.");
     }
 }
