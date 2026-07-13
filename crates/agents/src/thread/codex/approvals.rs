@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::super::event::ThreadEvent;
 use super::super::question::{AskQuestion, QuestionAnswers, QuestionKind, QuestionOption};
-use super::super::tool_call::PermissionDecision;
+use super::super::tool_call::{PermissionDecision, PermissionKind};
 use super::CodexState;
 
 /// What the mapper should do with a server → client request.
@@ -62,6 +62,7 @@ pub fn map_server_request(
                 "Bash",
                 json!({ "command": command, "cwd": cwd }),
                 description,
+                PermissionKind::Tool,
                 st,
             )
         }
@@ -79,6 +80,7 @@ pub fn map_server_request(
                 "apply_patch",
                 json!({ "changes": changes }),
                 reason.to_string(),
+                PermissionKind::Tool,
                 st,
             )
         }
@@ -103,20 +105,63 @@ pub fn map_server_request(
                 questions,
             }])
         }
+        // An MCP server is eliciting input/consent mid-tool. Instead of silently
+        // declining (the old catch-all behavior, which wedged any MCP consent
+        // flow), surface it as a permission card labeled by the server; the reply
+        // rides the `{action}` elicitation shape (see `to_codex_elicitation`),
+        // stashed under `pending_elicitations` so `resolve_permission` picks the
+        // right shape. A malformed payload still yields a card (message may be
+        // empty) rather than a dead-end.
+        "mcpServer/elicitation/request" => {
+            let server = params.get("serverName").and_then(|v| v.as_str()).unwrap_or("MCP server");
+            let message = params.get("message").and_then(|v| v.as_str()).unwrap_or_default();
+            let description = if message.is_empty() {
+                format!("{server} requests input")
+            } else {
+                message.to_string()
+            };
+            let key = id_key(id);
+            st.pending_elicitations.insert(key.clone(), id.clone());
+            ServerRequestAction::Emit(vec![ThreadEvent::PermissionRequested {
+                request_id: key,
+                tool_use_id: None,
+                tool_name: server.to_string(),
+                input: params.clone(),
+                description,
+                suggestions: Vec::new(),
+                kind: PermissionKind::Mcp,
+            }])
+        }
         // Everything else (legacy exec/apply-patch approvals, permissions,
-        // mcp elicitation, attestation, …): decline with the common shape.
+        // attestation, …): decline with the common shape.
         _ => ServerRequestAction::AutoRespond(json!({ "decision": "decline" })),
     }
 }
 
+/// Map an OxiMux [`PermissionDecision`] to the MCP elicitation reply shape
+/// (`{action}`, distinct from an approval's `{decision}`): an allow becomes
+/// `accept`, a deny becomes `decline`. Accept carries an empty `content` object
+/// (a consent card supplies no typed fields); decline omits content, matching the
+/// schema (`content` is nullable for decline).
+pub fn to_codex_elicitation(decision: &PermissionDecision) -> Value {
+    match decision {
+        PermissionDecision::Allow { .. } | PermissionDecision::AllowWithSuggestion { .. } => {
+            json!({ "action": "accept", "content": {} })
+        }
+        PermissionDecision::Deny { .. } => json!({ "action": "decline" }),
+    }
+}
+
 /// Emit a `PermissionRequested` and stash the request id so `resolve_permission`
-/// can answer it.
+/// can answer it. `kind` tags the card (`Tool` for exec/patch approvals, `Mcp`
+/// for an MCP elicitation).
 fn emit_permission(
     id: &Value,
     item_id: &str,
     tool_name: &str,
     input: Value,
     description: String,
+    kind: PermissionKind,
     st: &mut CodexState,
 ) -> ServerRequestAction {
     let key = id_key(id);
@@ -128,6 +173,7 @@ fn emit_permission(
         input,
         description,
         suggestions: Vec::new(),
+        kind,
     }])
 }
 
@@ -261,12 +307,53 @@ mod tests {
 
     #[test]
     fn unknown_request_is_auto_declined() {
+        // The catch-all still declines attestation/unknown methods — only
+        // elicitation was promoted out of it.
         let mut st = CodexState::default();
         match map_server_request(&json!(1), "attestation/generate", &json!({}), &mut st) {
             ServerRequestAction::AutoRespond(v) => assert_eq!(v["decision"], "decline"),
             _ => panic!("expected AutoRespond"),
         }
         assert!(st.pending_approvals.is_empty());
+        assert!(st.pending_elicitations.is_empty());
+    }
+
+    #[test]
+    fn mcp_elicitation_is_surfaced_not_declined() {
+        let mut st = CodexState::default();
+        let action = map_server_request(
+            &json!(21),
+            "mcpServer/elicitation/request",
+            &json!({"serverName": "github", "threadId": "t", "message": "Authorize repo access?", "mode": "form"}),
+            &mut st,
+        );
+        match action {
+            ServerRequestAction::Emit(evs) => match &evs[..] {
+                [ThreadEvent::PermissionRequested { request_id, tool_name, description, kind, .. }] => {
+                    assert_eq!(request_id, "21");
+                    assert_eq!(tool_name, "github");
+                    assert_eq!(description, "Authorize repo access?");
+                    assert_eq!(*kind, PermissionKind::Mcp);
+                }
+                other => panic!("expected one Mcp PermissionRequested, got {other:?}"),
+            },
+            _ => panic!("elicitation must be surfaced, not auto-declined"),
+        }
+        // Stashed under elicitations (distinct reply shape), not approvals.
+        assert_eq!(st.pending_elicitations.get("21"), Some(&json!(21)));
+        assert!(st.pending_approvals.is_empty());
+    }
+
+    #[test]
+    fn elicitation_reply_uses_action_shape() {
+        assert_eq!(
+            to_codex_elicitation(&PermissionDecision::Allow { updated_input: json!({}) }),
+            json!({ "action": "accept", "content": {} })
+        );
+        assert_eq!(
+            to_codex_elicitation(&PermissionDecision::Deny { message: "no".into() }),
+            json!({ "action": "decline" })
+        );
     }
 
     #[test]

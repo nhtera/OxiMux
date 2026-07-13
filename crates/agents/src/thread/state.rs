@@ -89,6 +89,12 @@ pub struct ChatThread {
     /// handler `take()`s it regardless of outcome so a stray diagnostic can
     /// never leak into a later turn's error text.
     pending_diagnostic: Option<String>,
+    /// The id of the tool call whose arguments are currently streaming in as
+    /// `input_json_delta` fragments. Set when a `content_block_start` opens a
+    /// tool card early; the `input_json_delta` events carry no id, so they route
+    /// to this. Cleared when the finalized `tool_use` block supersedes the
+    /// preview. Transient (Claude live tool-input only).
+    streaming_tool_id: Option<String>,
 }
 
 impl ChatThread {
@@ -225,14 +231,54 @@ impl ChatThread {
                 }
             }
             ThreadEvent::ToolCallStarted { id, name, input } => {
-                self.entries.push(ThreadEntry::ToolCall(ToolCall::new(
-                    id.clone(),
-                    name.clone(),
-                    input.clone(),
-                )));
+                // A tool card can open twice for one id: first from the live
+                // `content_block_start` (empty input, args still streaming), then
+                // from the finalized `tool_use` block (authoritative input). The
+                // second is an upgrade-in-place, not a duplicate card — reconcile
+                // onto the existing entry, replacing the streamed preview.
+                if let Some(tc) = self.tool_call_mut(id) {
+                    tc.name = name.clone();
+                    // The finalized block carries the real input; a still-empty
+                    // upgrade (defensive) keeps the streamed preview intact.
+                    if !is_empty_input(input) {
+                        tc.input = input.clone();
+                        tc.partial_input.clear();
+                        if self.streaming_tool_id.as_deref() == Some(id.as_str()) {
+                            self.streaming_tool_id = None;
+                        }
+                    }
+                } else {
+                    self.entries.push(ThreadEntry::ToolCall(ToolCall::new(
+                        id.clone(),
+                        name.clone(),
+                        input.clone(),
+                    )));
+                    // An early open (empty input) marks this call as the one live
+                    // `input_json_delta` fragments should accumulate onto.
+                    if is_empty_input(input) {
+                        self.streaming_tool_id = Some(id.clone());
+                    }
+                }
                 // A tool call ends the current assistant block; later text
                 // starts a fresh assistant message.
                 self.end_assistant_window();
+            }
+            ThreadEvent::ToolInputDelta { tool_call_id, partial_json } => {
+                // Append the streamed argument fragment to the open tool card. The
+                // delta carries no id (Claude streams one block at a time), so fall
+                // back to the tracked streaming tool call. Bounded so a giant Write
+                // can't grow the preview buffer without limit.
+                let target = if tool_call_id.is_empty() {
+                    self.streaming_tool_id.clone()
+                } else {
+                    Some(tool_call_id.clone())
+                };
+                if let Some(id) = target
+                    && let Some(tc) = self.tool_call_mut(&id)
+                    && tc.partial_input.len() < super::tool_call::MAX_PARTIAL_INPUT_BYTES
+                {
+                    tc.partial_input.push_str(partial_json);
+                }
             }
             ThreadEvent::ToolResult { tool_use_id, content, is_error, structured } => {
                 // A result for an unknown id is silently dropped (no matching
@@ -296,10 +342,11 @@ impl ChatThread {
                 }
             }
             ThreadEvent::PermissionRequested {
-                request_id, tool_use_id, tool_name, input, description, suggestions,
+                request_id, tool_use_id, tool_name, input, description, suggestions, kind,
             } => {
                 let req = PermissionRequest {
                     request_id: request_id.clone(),
+                    kind: *kind,
                     description: description.clone(),
                     suggestions: suggestions.clone(),
                 };
@@ -531,14 +578,21 @@ impl ChatThread {
     /// answered, exactly like a live disconnect.
     pub fn interrupt(&mut self) {
         self.turn_active = false;
+        // A tool whose arguments were still streaming (`content_block_start` opened
+        // the card, the finalized `tool_use` block never arrived) would otherwise
+        // show "streaming…" forever after the turn is killed. Stop tracking it and
+        // drop the partial buffer so the preview affordance clears.
+        self.streaming_tool_id = None;
         for entry in &mut self.entries {
-            if let ThreadEntry::ToolCall(tc) = entry
-                && matches!(
+            if let ThreadEntry::ToolCall(tc) = entry {
+                if matches!(
                     tc.status,
                     ToolCallStatus::WaitingForConfirmation(_) | ToolCallStatus::AwaitingAnswer(_)
-                )
-            {
-                tc.status = ToolCallStatus::Rejected;
+                ) {
+                    tc.status = ToolCallStatus::Rejected;
+                }
+                // Clear a half-streamed args buffer: no more deltas will arrive.
+                tc.partial_input.clear();
             }
         }
     }
@@ -650,9 +704,56 @@ impl ChatThread {
 }
 
 #[cfg(test)]
+mod streaming_interrupt_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn interrupt_clears_streaming_tool_preview() {
+        // A tool whose args were still streaming when Stop is pressed must not
+        // stay stuck showing a live preview forever.
+        let mut t = ChatThread::new();
+        t.push_user_message("write a file");
+        t.apply(&ThreadEvent::ToolCallStarted { id: "tw".into(), name: "Write".into(), input: json!({}) });
+        t.apply(&ThreadEvent::ToolInputDelta {
+            tool_call_id: String::new(),
+            partial_json: r#"{"file_path": "/tmp/x", "content": "abc"#.into(),
+        });
+        // Mid-stream: the card previews the growing args.
+        let streaming = t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.name == "Write" => Some(tc),
+            _ => None,
+        }).unwrap();
+        assert!(streaming.preview_input().is_some(), "previews while streaming");
+
+        t.interrupt();
+        // After Stop: no partial buffer left, nothing to preview.
+        let stopped = t.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) if tc.name == "Write" => Some(tc),
+            _ => None,
+        }).unwrap();
+        assert!(stopped.partial_input.is_empty(), "partial buffer cleared on interrupt");
+        assert!(stopped.preview_input().is_none(), "no stuck streaming preview");
+    }
+}
+
+/// Whether a tool-call `input` value carries no arguments yet — `null` or an
+/// empty object, the shape a live `content_block_start` opens a tool card with
+/// before any `input_json_delta` fragment has arrived. A finalized `tool_use`
+/// block always carries a populated (or at least non-empty) object.
+fn is_empty_input(input: &serde_json::Value) -> bool {
+    match input {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(m) => m.is_empty(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use super::super::background_task::BackgroundTaskKind;
+    use super::super::tool_call::PermissionKind;
     use serde_json::json;
 
     fn assistant_text(e: &ThreadEntry) -> &str {
@@ -782,7 +883,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "rid-1".into(), tool_use_id: Some("toolu_9".into()),
             tool_name: "Edit".into(), input: json!({}), description: "notes.txt".into(),
-            suggestions: vec![] });
+            suggestions: vec![], kind: PermissionKind::Tool });
 
         let (tool_id, req) = t.pending_permission().expect("a pending permission");
         assert_eq!(tool_id, "toolu_9");
@@ -892,7 +993,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "rid-orphan".into(), tool_use_id: None,
             tool_name: "Bash".into(), input: json!({"command":"ls"}),
-            description: "ls".into(), suggestions: vec![] });
+            description: "ls".into(), suggestions: vec![], kind: PermissionKind::Tool });
 
         let (tool_id, req) = t.pending_permission().expect("synthesized pending permission");
         assert_eq!(tool_id, "rid-orphan", "falls back to request_id as the tool id");
@@ -924,6 +1025,7 @@ mod tests {
         // answered; leaving it pending would strand an unanswerable prompt.
         let req = PermissionRequest {
             request_id: "rid".into(),
+            kind: PermissionKind::Tool,
             description: "notes.txt".into(),
             suggestions: vec![],
         };
@@ -987,7 +1089,7 @@ mod tests {
         t.apply(&ThreadEvent::PermissionRequested {
             request_id: "r1".into(), tool_use_id: Some("t1".into()),
             tool_name: "Edit".into(), input: json!({}), description: "x".into(),
-            suggestions: vec![] });
+            suggestions: vec![], kind: PermissionKind::Tool });
         assert!(t.turn_active);
         assert!(t.pending_permission().is_some());
 

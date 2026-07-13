@@ -63,6 +63,14 @@ pub struct ToolCall {
     /// loadable.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Transient accumulator for a tool call whose arguments are still streaming
+    /// in as `input_json_delta` fragments (Claude live tool-input). Holds the raw
+    /// partial-JSON string; the renderer best-effort parses it to preview the
+    /// growing args until the finalized `tool_use` block sets the authoritative
+    /// `input` and clears this. `#[serde(skip)]` — a persisted transcript only
+    /// ever holds fully-formed tool calls, so this is never written or read.
+    #[serde(skip)]
+    pub partial_input: String,
 }
 
 impl ToolCall {
@@ -77,8 +85,96 @@ impl ToolCall {
             images: Vec::new(),
             terminal_id: None,
             kind: None,
+            partial_input: String::new(),
         }
     }
+
+    /// The best-effort preview of a still-streaming tool call's arguments: the
+    /// accumulated partial JSON parsed leniently, or `None` when nothing usable
+    /// has arrived yet. Used by the card renderer to show growing args before the
+    /// finalized `tool_use` block. Once `input` is populated (finalized), callers
+    /// should prefer it — this only matters while `partial_input` is non-empty.
+    pub fn preview_input(&self) -> Option<Value> {
+        if self.partial_input.is_empty() {
+            return None;
+        }
+        parse_partial_json(&self.partial_input)
+    }
+}
+
+/// Cap on the accumulated partial-JSON buffer before we stop recomputing the
+/// preview: a multi-megabyte Write shouldn't re-parse growing JSON on every
+/// fragment. Past this the card shows a "streaming…" affordance and the
+/// authoritative input still lands at finalize.
+pub const MAX_PARTIAL_INPUT_BYTES: usize = 64 * 1024;
+
+/// Best-effort parse of a truncated JSON fragment (a prefix of a valid JSON
+/// value, as Claude streams tool args) into a `Value`. Closes any unterminated
+/// string / array / object so the partial object renders live. Returns `None`
+/// when the fragment is empty or too mangled to close (e.g. mid-escape). Pure —
+/// unit-tested against truncated objects, strings, escapes, and nested arrays.
+pub fn parse_partial_json(fragment: &str) -> Option<Value> {
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Fast path: already-complete JSON.
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        return Some(v);
+    }
+    // Repair: walk the fragment tracking string/escape state and the open
+    // bracket stack, then append the closers needed to make it parseable. A
+    // fragment ending mid-escape (`\`) drops the trailing backslash so the
+    // closing quote isn't escaped away.
+    let mut repaired = String::with_capacity(trimmed.len() + 8);
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut last_was_backslash_in_string = false;
+    for c in trimmed.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                last_was_backslash_in_string = false;
+            } else if c == '\\' {
+                escaped = true;
+                last_was_backslash_in_string = true;
+            } else if c == '"' {
+                in_string = false;
+                last_was_backslash_in_string = false;
+            }
+        } else {
+            match c {
+                '"' => in_string = true,
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        repaired.push(c);
+    }
+    // Drop a dangling backslash that would escape our closing quote.
+    if in_string && last_was_backslash_in_string {
+        repaired.pop();
+    }
+    // A trailing key with no value (`{"a":`) or a trailing comma can't be closed
+    // meaningfully — strip a dangling `:`/`,` and any incomplete `"key"` tail.
+    if in_string {
+        repaired.push('"');
+    }
+    let tail = repaired.trim_end();
+    let mut repaired = tail.to_string();
+    while repaired.ends_with([':', ',']) {
+        repaired.pop();
+        repaired = repaired.trim_end().to_string();
+    }
+    for closer in stack.iter().rev() {
+        repaired.push(*closer);
+    }
+    serde_json::from_str::<Value>(&repaired).ok()
 }
 
 /// Flatten a `tool_result.content` (a plain string, or an array of content
@@ -173,12 +269,41 @@ pub enum ToolCallStatus {
     Canceled,
 }
 
+/// What a permission request is asking for — lets the UI route a request to a
+/// dedicated card (e.g. a plan-approval card for `Plan`) instead of the generic
+/// key:value permission card. `Tool` is the common case (a tool wants to run);
+/// the rest are special channels that ride the same `can_use_tool` /
+/// server-request transport. Defaults to `Tool` so old persisted transcripts
+/// (which had no `kind`) and every unchanged decoder path stay correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionKind {
+    /// A tool wants to execute (the overwhelming majority).
+    #[default]
+    Tool,
+    /// Claude's `ExitPlanMode`: the request body is a plan the user approves or
+    /// rejects, rendered as a markdown plan-approval card.
+    Plan,
+    /// A permission/edit-mode change request.
+    Mode,
+    /// An MCP server is eliciting input/consent mid-tool (Codex
+    /// `mcpServer/elicitation/request`), labeled "MCP · <server>".
+    Mcp,
+    /// Anything else that should surface as a generic consent card.
+    Other,
+}
+
 /// A permission prompt surfaced by the agent (`can_use_tool` control request).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     /// Correlation id echoed back in the `control_response`.
     pub request_id: String,
-    /// Short human label, e.g. the file name (`description` field).
+    /// What is being requested — drives which card renders it. `#[serde(default)]`
+    /// so pre-taxonomy persisted transcripts load as `Tool`.
+    #[serde(default)]
+    pub kind: PermissionKind,
+    /// Short human label, e.g. the file name (`description` field). For a `Plan`
+    /// request this carries the plan markdown itself.
     pub description: String,
     /// Agent-offered shortcuts (e.g. "always allow edits this session",
     /// "always allow this bash pattern"), rendered as extra buttons.
@@ -207,4 +332,81 @@ pub enum PermissionDecision {
     AllowWithSuggestion { updated_input: Value, suggestion: PermissionSuggestion },
     /// Deny this call; `message` is shown to the model.
     Deny { message: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_partial_json_complete_value_passes_through() {
+        assert_eq!(parse_partial_json(r#"{"a":1}"#), Some(json!({"a":1})));
+    }
+
+    #[test]
+    fn parse_partial_json_truncated_object_and_open_string() {
+        // Mid-value fragments Claude actually streams for a Write.
+        assert_eq!(
+            parse_partial_json(r#"{"file_path": "/tmp/poem.txt"#),
+            Some(json!({"file_path": "/tmp/poem.txt"}))
+        );
+        assert_eq!(
+            parse_partial_json(r#"{"file_path": "/tmp/p.txt", "content": "Beneath the moon"#),
+            Some(json!({"file_path": "/tmp/p.txt", "content": "Beneath the moon"}))
+        );
+    }
+
+    #[test]
+    fn parse_partial_json_escapes_and_newlines_in_open_string() {
+        // A fragment ending inside a string that contains escaped quotes/newlines.
+        let v = parse_partial_json(r#"{"content": "line one\nline \"two\""#).unwrap();
+        assert_eq!(v["content"], "line one\nline \"two\"");
+    }
+
+    #[test]
+    fn parse_partial_json_dangling_backslash_is_dropped() {
+        // Ending mid-escape must not escape our synthesized closing quote.
+        let v = parse_partial_json(r#"{"content": "abc\"#).unwrap();
+        assert_eq!(v["content"], "abc");
+    }
+
+    #[test]
+    fn parse_partial_json_nested_arrays_and_objects() {
+        assert_eq!(
+            parse_partial_json(r#"{"items": [1, 2, {"k": "v"#),
+            Some(json!({"items": [1, 2, {"k": "v"}]}))
+        );
+    }
+
+    #[test]
+    fn parse_partial_json_empty_or_hopeless_returns_none() {
+        assert_eq!(parse_partial_json(""), None);
+        assert_eq!(parse_partial_json("   "), None);
+        // A trailing key with no value can't be closed meaningfully.
+        assert_eq!(parse_partial_json(r#"{"a":"#), None);
+        // A partial literal (`tr` for `true`) is unparseable.
+        assert_eq!(parse_partial_json(r#"{"a": tr"#), None);
+    }
+
+    #[test]
+    fn parse_partial_json_growing_object_stays_parseable_each_step() {
+        // Emulate the accumulating buffer never panicking / never rendering raw.
+        let full = r#"{"file_path": "/tmp/x", "content": "hello world"}"#;
+        for i in 1..=full.len() {
+            let _ = parse_partial_json(&full[..i]); // must never panic
+        }
+        assert_eq!(parse_partial_json(full), Some(json!({"file_path":"/tmp/x","content":"hello world"})));
+    }
+
+    #[test]
+    fn preview_input_reflects_accumulated_fragments() {
+        let mut tc = ToolCall::new("t1", "Write", Value::Null);
+        assert_eq!(tc.preview_input(), None, "nothing streamed yet");
+        tc.partial_input.push_str(r#"{"file_path": "/tmp/x", "content": "abc"#);
+        assert_eq!(
+            tc.preview_input(),
+            Some(json!({"file_path": "/tmp/x", "content": "abc"}))
+        );
+    }
 }

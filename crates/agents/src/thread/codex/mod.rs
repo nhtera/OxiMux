@@ -34,7 +34,10 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use approvals::ServerRequestAction;
-use super::connection::{AgentCapabilities, AgentConnection, EffortChoice, ModelChoice};
+use super::connection::{
+    AgentCapabilities, AgentConnection, EffortChoice, FeatureControl, FeatureKind,
+    FeatureSelectOption, FeatureValue, ModelChoice,
+};
 use super::event::{ThreadEvent, TurnUsage};
 use super::question::{AskQuestion, QuestionAnswers};
 use super::tool_call::PermissionDecision;
@@ -43,6 +46,19 @@ use transport::{Inbound, RpcClient};
 /// Handshake round-trips (`initialize`, `thread/start`) block the worker; a
 /// generous ceiling so a cold `codex` start (auth/network) still connects.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stable feature-control ids echoed back on a posture change (`set_feature`).
+const FEATURE_APPROVALS: &str = "codex_approval_policy";
+const FEATURE_SANDBOX: &str = "codex_sandbox";
+
+/// Build one `FeatureSelectOption` for a posture select.
+fn select_opt(wire: &str, label: &str, description: &str) -> FeatureSelectOption {
+    FeatureSelectOption {
+        wire: wire.to_string(),
+        label: label.to_string(),
+        description: Some(description.to_string()),
+    }
+}
 
 /// Commands the sync `AgentConnection` methods push to the worker thread.
 enum Outbound {
@@ -67,6 +83,10 @@ struct CodexState {
     /// Pending approvals: our permission-card `request_id` → the Codex JSON-RPC
     /// request id we must answer with a `{decision}` once the user chooses.
     pending_approvals: HashMap<String, Value>,
+    /// Pending MCP elicitations: our card `request_id` → the JSON-RPC request id.
+    /// Kept separate from `pending_approvals` because an elicitation is answered
+    /// with a different reply shape (`{action}`, not `{decision}`).
+    pending_elicitations: HashMap<String, Value>,
     /// Codex's model catalog (from `model/list`), cached after the handshake so
     /// the pickers render it.
     models: Vec<protocol::CodexModel>,
@@ -74,10 +94,24 @@ struct CodexState {
     /// these seeded). `None` = Codex's own default.
     current_model: Option<String>,
     current_effort: Option<String>,
+    /// The approval policy + sandbox mode this session runs under (the composer's
+    /// Approvals/Sandbox selects). Seeded to the default posture at spawn (or a
+    /// restored posture), updated in place by `set_feature`, and sent on every
+    /// `turn/start` as a per-turn override so a change takes effect on the next
+    /// send with no respawn.
+    approval_policy: String,
+    sandbox: String,
     /// Set when Stop was pressed before the turn id was known (the `turn/started`
     /// notification hadn't landed yet). The mapper interrupts as soon as the id
     /// arrives, so a fast Send→Stop doesn't silently no-op.
     cancel_requested: bool,
+    /// Ordered ledger of turn ids, one per turn started this session (each user
+    /// prompt drives exactly one turn). Indexed by user-message ordinal so a
+    /// conversation-rewind can address `thread/fork`'s `lastTurnId` — to rewind
+    /// *before* user message N, fork through `user_turn_ids[N-1]`. Empty on a
+    /// freshly-restored session (turns aren't replayed), which makes rewind a
+    /// no-op there until the first new turn.
+    user_turn_ids: Vec<String>,
 }
 
 pub struct CodexAppServerConnection {
@@ -98,17 +132,25 @@ impl CodexAppServerConnection {
         model: Option<&str>,
         resume_session_id: Option<&str>,
         effort: Option<&str>,
+        posture: Option<(&str, &str)>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (rpc, inbound_rx, child) = RpcClient::spawn(cwd)?;
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
         let state = Arc::new(Mutex::new(CodexState::default()));
-        // Seed the current model/effort so the first turn — and the picker
-        // labels — reflect the tab's choice.
+        // Seed the current model/effort + posture so the first turn — and the
+        // picker labels — reflect the tab's choice. A restored posture overrides
+        // the default; a fresh session starts at on-request/workspace-write.
         if let Ok(mut s) = state.lock() {
             s.current_model = model.map(str::to_string);
             s.current_effort = effort.map(str::to_string);
             s.cwd = cwd.to_path_buf();
+            s.approval_policy = posture
+                .and_then(|(a, _)| (!a.is_empty()).then(|| a.to_string()))
+                .unwrap_or_else(|| protocol::DEFAULT_APPROVAL_POLICY.to_string());
+            s.sandbox = posture
+                .and_then(|(_, sb)| (!sb.is_empty()).then(|| sb.to_string()))
+                .unwrap_or_else(|| protocol::DEFAULT_SANDBOX.to_string());
         }
 
         let mapper = {
@@ -169,13 +211,17 @@ impl AgentConnection for CodexAppServerConnection {
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         // Look up the stashed Codex JSON-RPC request id and answer it directly
         // (the reader never blocked on the decision). A no-op if already answered.
-        let id = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("codex state poisoned"))?
-            .pending_approvals
-            .remove(request_id);
+        // An MCP elicitation is answered with a different reply shape (`{action}`),
+        // so check that map first.
+        let (id, elicitation) = {
+            let mut st = self.state.lock().map_err(|_| anyhow!("codex state poisoned"))?;
+            match st.pending_elicitations.remove(request_id) {
+                Some(id) => (Some(id), true),
+                None => (st.pending_approvals.remove(request_id), false),
+            }
+        };
         match id {
+            Some(id) if elicitation => self.rpc.respond(id, approvals::to_codex_elicitation(&decision)),
             Some(id) => self
                 .rpc
                 .respond(id, json!({ "decision": approvals::to_codex_decision(&decision) })),
@@ -206,12 +252,49 @@ impl AgentConnection for CodexAppServerConnection {
 
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
-            supports_modes: false,  // fixed on-request posture in P1 (no mode picker)
-            supports_slash: false,  // no slash-command palette wired for Codex yet
-            supports_config: true,  // reasoning-effort picker (from model/list)
-            emits_usage: true,      // thread/tokenUsage/updated → the usage footer
-            supports_rewind: false, // no ~/.claude JSONL; rewind stays Claude-only
+            supports_modes: false, // fixed on-request posture in P1 (no mode picker)
+            supports_slash: false, // no slash-command palette wired for Codex yet
+            supports_config: true, // reasoning-effort picker (from model/list)
+            emits_usage: true,     // thread/tokenUsage/updated → the usage footer
+            // Conversation rewind via server-side `thread/fork` (no ~/.claude
+            // JSONL needed). The rewind UI gates light up; the flow branches on
+            // `rewind_is_server_side` to fork the live thread instead of a file.
+            supports_rewind: true,
         }
+    }
+
+    fn rewind_is_server_side(&self) -> bool {
+        true
+    }
+
+    /// Rewind by forking the thread before user message `user_ordinal`: map the
+    /// ordinal to the ledger's turn ids (fork through the turn BEFORE it, so that
+    /// message and everything after is dropped), send `thread/fork`, swap the
+    /// session's thread id to the fork, truncate the ledger, and return the new
+    /// thread id. The original thread is untouched (recoverable). Errors if the
+    /// ledger can't address the ordinal (e.g. a freshly-restored session with no
+    /// new turns yet).
+    fn fork_conversation(&self, user_ordinal: usize, total_user_messages: usize) -> Result<String> {
+        let (thread_id, last_turn_id) = {
+            let s = self.state.lock().map_err(|_| anyhow!("codex state poisoned"))?;
+            let thread_id = s.thread_id.clone().ok_or_else(|| anyhow!("no codex thread to rewind"))?;
+            let last = fork_last_turn_id(&s.user_turn_ids, user_ordinal, total_user_messages)?;
+            (thread_id, last)
+        };
+        let res = self.rpc.request(
+            protocol::M_THREAD_FORK,
+            protocol::thread_fork_params(&thread_id, last_turn_id.as_deref()),
+            HANDSHAKE_TIMEOUT,
+        )?;
+        let new_id = protocol::thread_id_from_start_response(&res)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| anyhow!("thread/fork returned no thread id"))?;
+        if let Ok(mut s) = self.state.lock() {
+            s.thread_id = Some(new_id.clone());
+            s.user_turn_ids.truncate(user_ordinal);
+            s.current_turn_id = None;
+        }
+        Ok(new_id)
     }
 
     fn models(&self) -> Vec<ModelChoice> {
@@ -260,6 +343,67 @@ impl AgentConnection for CodexAppServerConnection {
             .or_else(|| current_or_default_model(&s).map(|m| m.default_effort.clone()))
     }
 
+    /// The composer's two posture selects — Approvals and Sandbox — seeded with
+    /// the session's current posture. The `danger-full-access` / `never` options
+    /// carry a ⚠ blurb; defaults stay on-request/workspace-write.
+    fn features(&self) -> Vec<FeatureControl> {
+        let (approval, sandbox) = self
+            .state
+            .lock()
+            .map(|s| (s.approval_policy.clone(), s.sandbox.clone()))
+            .unwrap_or_default();
+        vec![
+            FeatureControl {
+                id: FEATURE_APPROVALS.to_string(),
+                label: "Approvals".to_string(),
+                description: Some("When Codex asks before running commands or edits".to_string()),
+                icon: Some("shield".to_string()),
+                kind: FeatureKind::Select {
+                    options: vec![
+                        select_opt(protocol::APPROVAL_ON_REQUEST, "On request", "Ask before commands & edits"),
+                        select_opt(protocol::APPROVAL_NEVER, "Never ask", "⚠ Run without approval prompts"),
+                    ],
+                    selected: Some(approval),
+                },
+            },
+            FeatureControl {
+                id: FEATURE_SANDBOX.to_string(),
+                label: "Sandbox".to_string(),
+                description: Some("What Codex's commands may touch".to_string()),
+                icon: Some("box".to_string()),
+                kind: FeatureKind::Select {
+                    options: vec![
+                        select_opt(protocol::SANDBOX_READ_ONLY, "Read only", "No writes"),
+                        select_opt(protocol::SANDBOX_WORKSPACE_WRITE, "Workspace write", "Write within the project"),
+                        select_opt(
+                            protocol::SANDBOX_DANGER_FULL_ACCESS,
+                            "Full access",
+                            "⚠ Unsandboxed — full disk & network",
+                        ),
+                    ],
+                    selected: Some(sandbox),
+                },
+            },
+        ]
+    }
+
+    /// Apply a posture change: stash the chosen wire value on the session so the
+    /// next `turn/start` carries it as a per-turn override (Codex applies it for
+    /// that turn and onward). Returns `Ok` so the app skips a respawn — the switch
+    /// takes effect on the next send. An unknown id or non-select value is ignored.
+    fn set_feature(&self, id: &str, value: FeatureValue) -> Result<()> {
+        let FeatureValue::Choice(wire) = value else {
+            return Ok(());
+        };
+        let mut s = self.state.lock().map_err(|_| anyhow!("codex state poisoned"))?;
+        match id {
+            FEATURE_APPROVALS => s.approval_policy = wire,
+            FEATURE_SANDBOX => s.sandbox = wire,
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Interrupt the in-flight turn (`turn/interrupt`). Fire-and-forget so the
     /// Stop button never blocks; no-op when nothing is in flight.
     fn cancel(&self) -> Result<()> {
@@ -295,6 +439,34 @@ impl Drop for CodexAppServerConnection {
         let _ = self.outbound.send(Outbound::Shutdown);
         self.reap();
     }
+}
+
+/// Resolve the `thread/fork` `lastTurnId` for rewinding before the user message
+/// at `user_ordinal` (0-based), given the session's turn `ledger` and the
+/// transcript's full user-message count. Pure so the ordinal→turn-id math is
+/// testable without a live connection.
+///
+/// - Fails closed when the ledger doesn't cover every user message (a restored
+///   session whose earlier turns weren't replayed — ordinals can't be mapped, and
+///   forking on a partial ledger could drop history).
+/// - Fails when the ordinal is past the ledger (out of sync).
+/// - `Ok(None)` = fork through no turns (rewind before the first message).
+/// - `Ok(Some(id))` = fork through the turn BEFORE the target message.
+fn fork_last_turn_id(
+    ledger: &[String],
+    user_ordinal: usize,
+    total_user_messages: usize,
+) -> Result<Option<String>> {
+    if ledger.len() != total_user_messages {
+        anyhow::bail!(
+            "rewind is unavailable for this session (its earlier turns aren't tracked — \
+             restored sessions can't be rewound until the conversation is replayed)"
+        );
+    }
+    if user_ordinal > ledger.len() {
+        anyhow::bail!("rewind target is out of sync with the conversation");
+    }
+    Ok(user_ordinal.checked_sub(1).and_then(|i| ledger.get(i)).cloned())
 }
 
 /// The current model (if the picker chose one), else the catalog default, else
@@ -342,18 +514,26 @@ fn worker_loop(
     }
     let _ = rpc.notify(protocol::N_INITIALIZED, Value::Null);
 
+    // Snapshot the seeded posture (owned, so it outlives the state lock) and
+    // send it on thread/start & thread/resume.
+    let (approval, sandbox) = match state.lock() {
+        Ok(s) => (s.approval_policy.clone(), s.sandbox.clone()),
+        Err(_) => (protocol::DEFAULT_APPROVAL_POLICY.into(), protocol::DEFAULT_SANDBOX.into()),
+    };
+    let posture = protocol::Posture { approval_policy: &approval, sandbox: &sandbox };
+
     // Resume the persisted thread when restoring; else start fresh. A failed
     // resume (thread gone / experimental) degrades to a fresh start.
     let resume_id = resume.as_deref().filter(|s| !s.is_empty());
     let started = match resume_id {
         Some(tid) => rpc.request(
             protocol::M_THREAD_RESUME,
-            protocol::thread_resume_params(tid, model.as_deref()),
+            protocol::thread_resume_params(tid, model.as_deref(), posture),
             HANDSHAKE_TIMEOUT,
         ),
         None => rpc.request(
             protocol::M_THREAD_START,
-            protocol::thread_start_params(model.as_deref(), &cwd),
+            protocol::thread_start_params(model.as_deref(), &cwd, posture),
             HANDSHAKE_TIMEOUT,
         ),
     };
@@ -363,7 +543,7 @@ fn worker_loop(
             tracing::warn!(error = %e, "codex thread/resume failed; starting a fresh thread");
             rpc.request(
                 protocol::M_THREAD_START,
-                protocol::thread_start_params(model.as_deref(), &cwd),
+                protocol::thread_start_params(model.as_deref(), &cwd, posture),
                 HANDSHAKE_TIMEOUT,
             )
             .ok()
@@ -400,17 +580,29 @@ fn worker_loop(
     loop {
         match out_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Outbound::Prompt(text)) => {
-                let (tid, model, effort) = match state.lock() {
+                let (tid, model, effort, approval, sandbox) = match state.lock() {
                     Ok(s) => (
                         s.thread_id.clone().unwrap_or_default(),
                         s.current_model.clone(),
                         s.current_effort.clone(),
+                        s.approval_policy.clone(),
+                        s.sandbox.clone(),
                     ),
-                    Err(_) => (String::new(), None, None),
+                    Err(_) => (
+                        String::new(),
+                        None,
+                        None,
+                        protocol::DEFAULT_APPROVAL_POLICY.into(),
+                        protocol::DEFAULT_SANDBOX.into(),
+                    ),
                 };
                 // Fire-and-forget: the turn's text + turnId arrive as notifications;
-                // we don't block the worker on the turn's lifetime.
-                let params = protocol::turn_start_params(&tid, &text, model.as_deref(), effort.as_deref());
+                // we don't block the worker on the turn's lifetime. The current
+                // posture rides as a per-turn override, so a mid-session Approvals/
+                // Sandbox switch takes effect on this send with no respawn.
+                let posture = protocol::Posture { approval_policy: &approval, sandbox: &sandbox };
+                let params =
+                    protocol::turn_start_params(&tid, &text, model.as_deref(), effort.as_deref(), posture);
                 if let Err(e) = rpc.fire(protocol::M_TURN_START, params) {
                     let _ = event_tx.send(ThreadEvent::Error(format!("codex turn/start failed: {e}")));
                 }
@@ -491,5 +683,34 @@ fn map_inbound(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fork_last_turn_id;
+
+    #[test]
+    fn fork_last_turn_id_maps_ordinal_to_prior_turn() {
+        let ledger = vec!["t0".to_string(), "t1".to_string(), "t2".to_string()];
+        // Rewind before the first message → fork through nothing.
+        assert_eq!(fork_last_turn_id(&ledger, 0, 3).unwrap(), None);
+        // Rewind before message 2 → fork through the turn that produced message 1.
+        assert_eq!(fork_last_turn_id(&ledger, 2, 3).unwrap().as_deref(), Some("t1"));
+        // Rewind before the last (3rd) message → fork through message 2's turn.
+        assert_eq!(fork_last_turn_id(&ledger, 2, 3).unwrap().as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn fork_last_turn_id_fails_closed_on_incomplete_ledger() {
+        // Restored session: ledger shorter than the transcript's user-message count.
+        let ledger = vec!["t0".to_string()];
+        assert!(fork_last_turn_id(&ledger, 1, 4).is_err(), "partial ledger must fail closed");
+    }
+
+    #[test]
+    fn fork_last_turn_id_rejects_out_of_range_ordinal() {
+        let ledger = vec!["t0".to_string(), "t1".to_string()];
+        assert!(fork_last_turn_id(&ledger, 3, 2).is_err(), "ordinal past the ledger is out of sync");
     }
 }

@@ -70,6 +70,12 @@ pub struct PersistedChatTranscript {
     /// `#[serde(default)]` (→ empty) for older / non-ACP blobs.
     #[serde(default)]
     pub acp_args: Vec<String>,
+    /// The Codex posture `(approval_policy, sandbox)` chosen via the composer's
+    /// Approvals/Sandbox selects, so a reopened Codex chat resumes under the same
+    /// posture. `#[serde(default)]` (→ `None`) keeps older / non-Codex blobs
+    /// loadable and defaults them to on-request / workspace-write.
+    #[serde(default)]
+    pub codex_posture: Option<(String, String)>,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -134,6 +140,7 @@ mod tests {
             provider: Transport::StreamJson,
             acp_command: None,
             acp_args: vec![],
+            codex_posture: None,
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
@@ -163,6 +170,7 @@ mod tests {
             provider: Transport::Acp,
             acp_command: Some("gemini".into()),
             acp_args: vec!["--experimental-acp".into()],
+            codex_posture: None,
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "acp-sess").unwrap();

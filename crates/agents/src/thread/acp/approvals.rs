@@ -14,7 +14,7 @@ use agent_client_protocol::schema::v1::{
 use serde_json::{Value, json};
 
 use crate::thread::event::ThreadEvent;
-use crate::thread::tool_call::{PermissionDecision, PermissionSuggestion};
+use crate::thread::tool_call::{PermissionDecision, PermissionKind, PermissionSuggestion};
 
 /// The suggestion `kind` marking a pill that carries an exact ACP `option_id`
 /// (as opposed to a Claude-style setMode/addRules suggestion).
@@ -40,6 +40,7 @@ pub(crate) fn permission_event(req: &RequestPermissionRequest, request_id: &str)
         input,
         description: label,
         suggestions: allow_option_suggestions(&req.options),
+        kind: PermissionKind::Tool,
     }
 }
 

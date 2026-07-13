@@ -360,6 +360,25 @@ src/
 - `AgentStatus` enum: `Idle | Running | WaitingForInput | NeedsApproval(String) | Done { code } | Failed(String)`
 - Helpers: `is_blocking()`, `is_terminal()`
 
+### crates/agents/src/thread/ — structured chat protocol layer (separate from the raw-PTY `cli/` runtime above)
+
+Backs the **Agent Chat** view (`crates/app/src/shell/agent_chat/`): three provider adapters (Claude, Codex, ACP) each decode their own wire protocol into one `ThreadEvent` vocabulary. Full adapter-coverage matrix in `docs/system-architecture.md` → "Agent Chat adapters".
+
+| File | Role |
+|---|---|
+| `event.rs` | `ThreadEvent` — transport-agnostic event enum all three adapters emit |
+| `state.rs` | `ChatThread::apply` folds `ThreadEvent`s into `Vec<ThreadEntry>` the view renders |
+| `connection.rs` | `AgentConnection` trait + `AgentCapabilities` (incl. `supports_rewind`, `rewind_is_server_side()`) |
+| `stream_json.rs` | Claude `stream-json` hand-parsed decoder; decodes `input_json_delta` fragments (live tool-input streaming) onto the tool card opened by `content_block_start`, ahead of the finalized `tool_use` block; routes `ExitPlanMode` requests (tagged `PermissionKind::Plan`) |
+| `tool_call.rs` | `ToolCall` + `PermissionKind` enum (`Tool` / `Plan` / `Mode` / `Mcp` / `Other`) tagging every permission request for the card router |
+| `codex/protocol.rs` | Codex `app-server` JSON-RPC v2 message builders; `thread/fork` (server-side rewind, `lastTurnId`-addressed) — `thread/rollback` is the deprecated upstream alternative, not used |
+| `codex/mod.rs` | Codex connection; `AgentCapabilities::supports_rewind = true`; `pending_elicitations` map for MCP `mcpServer/elicitation/request` (distinct `{action}` reply shape from tool approvals); `codex_approval_policy` / `codex_sandbox` `FeatureControl` selects applied per-turn via `turn/start` overrides, persisted on the session struct |
+| `codex/map.rs` | Notification → `ThreadEvent` mapper; in-session turn ledger maps user-message ordinals to turn ids for rewind addressing |
+| `codex/approvals.rs` | Approval + elicitation decision encoding (`to_codex_elicitation`) |
+| `acp/` | `agent-client-protocol` 1.2 adapter — generic tail for Cursor/Amp/other ACP agents |
+
+`crates/app/src/shell/agent_chat/` (GPUI views, not yet foldered into the Tier-1 map above): `plan_approval_card.rs` (Claude `ExitPlanMode` 3-way approval card), `tool_card.rs` (per-kind tool card renderer), `rewind_menu.rs` (shared rewind/fork UI; branches on `rewind_is_server_side()` for Claude disk-fork vs Codex connection-fork; "Fork from here" to a new tab reads Claude's on-disk `~/.claude` session log and is hidden for Codex, which has no equivalent log).
+
 ---
 
 ## crates/pty — terminal backend

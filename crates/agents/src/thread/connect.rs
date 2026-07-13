@@ -78,6 +78,11 @@ pub struct ConnectSpec {
     /// env-carrying respawn still reports `AuthRequired` — the "set env, then
     /// authenticate" EnvVar flow, so the user isn't re-prompted. `None` otherwise.
     pub auth_method: Option<String>,
+    /// The Codex posture `(approval_policy, sandbox)` to seed at spawn (only read
+    /// by the `AppServer` arm). Set from a restored chat's persisted posture so a
+    /// reopened Codex session keeps its Approvals/Sandbox choice; `None` starts at
+    /// the default posture (on-request / workspace-write).
+    pub codex_posture: Option<(String, String)>,
 }
 
 impl ConnectSpec {
@@ -106,6 +111,9 @@ impl ConnectSpec {
             // every other launch carries no extra env and no auto-authenticate.
             env: Vec::new(),
             auth_method: None,
+            // Set only when restoring a Codex chat with a persisted posture; a
+            // fresh launch starts at the default posture.
+            codex_posture: None,
         }
     }
 }
@@ -127,11 +135,16 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
             Ok((Box::new(conn), rx))
         }
         Transport::AppServer => {
+            let posture = spec
+                .codex_posture
+                .as_ref()
+                .map(|(a, s)| (a.as_str(), s.as_str()));
             let (conn, rx) = CodexAppServerConnection::spawn(
                 &spec.cwd,
                 spec.model.as_deref(),
                 spec.resume_session_id.as_deref(),
                 spec.effort.as_deref(),
+                posture,
             )?;
             Ok((Box::new(conn), rx))
         }
@@ -223,6 +236,7 @@ mod tests {
             acp_args: vec![],
             env: vec![],
             auth_method: None,
+            codex_posture: None,
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -250,6 +264,7 @@ mod tests {
             acp_args: vec![],
             env: vec![],
             auth_method: None,
+            codex_posture: None,
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

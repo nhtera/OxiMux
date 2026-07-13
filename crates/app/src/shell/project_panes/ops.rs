@@ -988,6 +988,7 @@ impl ProjectPanes {
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
         thinking_level: crate::shell::agent_chat::ThinkingLevel,
+        codex_posture: Option<(String, String)>,
         draft: Option<String>,
         queued: Vec<String>,
         window: &mut Window,
@@ -998,8 +999,8 @@ impl ProjectPanes {
         };
         group.update(cx, |g, cx| {
             g.open_agent_chat_tab_restored(
-                cwd, model, backend, session_id, entries, slash_commands, thinking_level, draft,
-                queued, window, cx,
+                cwd, model, backend, session_id, entries, slash_commands, thinking_level,
+                codex_posture, draft, queued, window, cx,
             );
         });
     }

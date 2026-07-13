@@ -271,6 +271,31 @@ pub trait AgentConnection: Send {
     fn set_feature(&self, _id: &str, _value: FeatureValue) -> Result<()> {
         anyhow::bail!("this agent does not support changing features at runtime")
     }
+
+    /// Whether this backend rewinds the conversation *server-side* on the LIVE
+    /// connection (Codex `thread/fork`), rather than the client's kill-then-fork
+    /// of an on-disk session log (Claude). The rewind flow branches on this: a
+    /// server-side backend forks BEFORE the process is stopped and needs no file
+    /// fork; a client-side backend keeps the existing kill → fork-file → respawn
+    /// path. Default `false` (Claude / file-based).
+    fn rewind_is_server_side(&self) -> bool {
+        false
+    }
+
+    /// Rewind the conversation to before the user message at `user_ordinal`
+    /// (0-based), returning the NEW session id the truncated conversation
+    /// continues under. `total_user_messages` is the transcript's full user-turn
+    /// count — the backend fails closed if its own turn ledger doesn't account for
+    /// all of them (e.g. a restored session whose prior turns weren't replayed, so
+    /// ordinals can't be mapped to turn ids), rather than forking at the wrong
+    /// point. Only meaningful for a [`Self::rewind_is_server_side`] backend — Codex
+    /// forks the thread (`thread/fork`) on the live connection and swaps to the new
+    /// thread id; the original thread is left intact. Must be called on the live
+    /// connection BEFORE any `cancel_and_wait`. Unsupported by default (Claude uses
+    /// the file-fork path instead).
+    fn fork_conversation(&self, _user_ordinal: usize, _total_user_messages: usize) -> Result<String> {
+        anyhow::bail!("this agent does not support server-side conversation rewind")
+    }
 }
 
 /// Build the stdin JSON for a user message (stream-json input format).
@@ -554,6 +579,7 @@ mod tests {
             request_id: "rid-9".into(), tool_use_id: Some("toolu_1".into()),
             tool_name: "Edit".into(), input: json!({"file_path": "notes.txt"}),
             description: "notes.txt".into(), suggestions: vec![],
+            kind: crate::thread::tool_call::PermissionKind::Tool,
         }).unwrap();
         while let Ok(ev) = rx.try_recv() {
             thread.apply(&ev);

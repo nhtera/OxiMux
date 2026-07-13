@@ -12,7 +12,7 @@ use super::background_task::BackgroundTaskKind;
 use super::event::{ThreadEvent, TurnUsage};
 use super::question::parse_questions;
 use super::tool_call::{
-    PermissionSuggestion, extract_tool_result_images, flatten_tool_result_content,
+    PermissionKind, PermissionSuggestion, extract_tool_result_images, flatten_tool_result_content,
 };
 
 /// Decode one newline-delimited stream-json line. Returns the events it
@@ -143,6 +143,7 @@ fn is_terminal_status(s: &str) -> bool {
 fn decode_stream_event(v: &Value) -> Vec<ThreadEvent> {
     let ev = &v["event"];
     match ev.get("type").and_then(Value::as_str) {
+        Some("content_block_start") => decode_content_block_start(ev),
         Some("content_block_delta") => decode_content_block_delta(ev),
         // Live usage: `message_start.message.usage` seeds the turn's input/cache
         // counts; `message_delta.usage` carries the running totals (output grows).
@@ -154,7 +155,26 @@ fn decode_stream_event(v: &Value) -> Vec<ThreadEvent> {
     }
 }
 
-/// A `content_block_delta` → the streamed text/thinking delta it carries.
+/// A `content_block_start` for a `tool_use` block → open the tool card early
+/// (id + name are known here; input is still `{}`), so the args can stream in
+/// live via `input_json_delta` before the finalized `tool_use` block. Any other
+/// block type (text/thinking) starts nothing — those stream via their deltas.
+fn decode_content_block_start(ev: &Value) -> Vec<ThreadEvent> {
+    let cb = &ev["content_block"];
+    if cb.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return Vec::new();
+    }
+    vec![ThreadEvent::ToolCallStarted {
+        id: str_field(cb, "id"),
+        name: str_field(cb, "name"),
+        // `content_block_start` carries `input: {}`; the real args stream as
+        // `input_json_delta` fragments and finalize in the `assistant` block.
+        input: cb.get("input").cloned().unwrap_or(Value::Null),
+    }]
+}
+
+/// A `content_block_delta` → the streamed text/thinking/tool-input delta it
+/// carries.
 fn decode_content_block_delta(ev: &Value) -> Vec<ThreadEvent> {
     let delta = &ev["delta"];
     match delta.get("type").and_then(Value::as_str) {
@@ -166,7 +186,17 @@ fn decode_content_block_delta(ev: &Value) -> Vec<ThreadEvent> {
             Some(t) if !t.is_empty() => vec![ThreadEvent::ThinkingDelta(t.to_string())],
             _ => Vec::new(),
         },
-        // signature_delta / input_json_delta → not rendered.
+        // A tool's arguments streaming in as partial JSON. The block index maps to
+        // the open tool card via its id — but the delta itself carries no id, so
+        // the fold correlates by the most-recently-started tool call (blocks
+        // stream one at a time). The first fragment is `""`; empty ones are noise.
+        Some("input_json_delta") => match delta.get("partial_json").and_then(Value::as_str) {
+            Some(pj) if !pj.is_empty() => {
+                vec![ThreadEvent::ToolInputDelta { tool_call_id: String::new(), partial_json: pj.to_string() }]
+            }
+            _ => Vec::new(),
+        },
+        // signature_delta → not rendered.
         _ => Vec::new(),
     }
 }
@@ -330,6 +360,26 @@ fn decode_control_request(v: &Value) -> Vec<ThreadEvent> {
             questions: parse_questions(req.get("input").unwrap_or(&Value::Null)),
         }];
     }
+    // `ExitPlanMode` arrives on the same channel when the session is in plan mode:
+    // its `input.plan` is the plan markdown the user approves (exit plan mode) or
+    // rejects (keep planning). Tag it `Plan` so the view renders a dedicated
+    // plan-approval card, and carry the plan text as the description. A missing
+    // `plan` field falls through to the generic card rather than dropping the
+    // request. Wire shape locked by `testdata/stream_json_exit_plan_mode.jsonl`.
+    if req.get("tool_name").and_then(Value::as_str) == Some("ExitPlanMode")
+        && let Some(plan) = req.get("input").and_then(|i| i.get("plan")).and_then(Value::as_str)
+        && !plan.is_empty()
+    {
+        return vec![ThreadEvent::PermissionRequested {
+            request_id: str_field(v, "request_id"),
+            tool_use_id: req.get("tool_use_id").and_then(Value::as_str).map(str::to_string),
+            tool_name: "ExitPlanMode".to_string(),
+            input: req.get("input").cloned().unwrap_or(Value::Null),
+            description: plan.to_string(),
+            suggestions: Vec::new(),
+            kind: PermissionKind::Plan,
+        }];
+    }
     let suggestions = req["permission_suggestions"]
         .as_array()
         .map(|arr| arr.iter().map(parse_suggestion).collect())
@@ -341,6 +391,7 @@ fn decode_control_request(v: &Value) -> Vec<ThreadEvent> {
         input: req.get("input").cloned().unwrap_or(Value::Null),
         description: str_field(req, "description"),
         suggestions,
+        kind: PermissionKind::Tool,
     }]
 }
 
@@ -600,6 +651,118 @@ mod tests {
             "subtype":"can_use_tool","tool_name":"Edit","input":{"file_path":"a"},"description":"a",
             "tool_use_id":"toolu_e"}}).to_string();
         assert!(matches!(decode_line(&edit)[0], ThreadEvent::PermissionRequested { .. }));
+    }
+
+    #[test]
+    fn decodes_exit_plan_mode_as_plan_permission_with_plan_markdown() {
+        // ExitPlanMode rides the can_use_tool channel; it must decode to a
+        // `Plan`-kind permission whose description carries the plan markdown, so
+        // the view routes it to the dedicated plan-approval card. Wire shape from
+        // testdata/stream_json_exit_plan_mode.jsonl.
+        let line = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/thread/testdata/stream_json_exit_plan_mode.jsonl"),
+        )
+        .unwrap();
+        let evs = decode_line(line.trim());
+        match &evs[0] {
+            ThreadEvent::PermissionRequested { tool_name, description, kind, .. } => {
+                assert_eq!(tool_name, "ExitPlanMode");
+                assert_eq!(*kind, PermissionKind::Plan);
+                assert!(description.contains("hello()"), "plan markdown is the description");
+            }
+            other => panic!("expected Plan PermissionRequested, got {other:?}"),
+        }
+        // Defensive: an ExitPlanMode with no `plan` falls back to the generic
+        // Tool card rather than dropping the request.
+        let bare = json!({"type":"control_request","request_id":"r","request":{
+            "subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{},
+            "tool_use_id":"t"}}).to_string();
+        match &decode_line(&bare)[0] {
+            ThreadEvent::PermissionRequested { kind, .. } => assert_eq!(*kind, PermissionKind::Tool),
+            other => panic!("expected fallback Tool permission, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_content_block_start_tool_use_as_early_tool_call() {
+        // The card opens here — id + name known, input still empty.
+        let l = json!({"type":"stream_event","event":{"type":"content_block_start","index":1,
+            "content_block":{"type":"tool_use","id":"toolu_9","name":"Write","input":{}}}}).to_string();
+        match &decode_line(&l)[0] {
+            ThreadEvent::ToolCallStarted { id, name, input } => {
+                assert_eq!(id, "toolu_9");
+                assert_eq!(name, "Write");
+                assert_eq!(*input, json!({}));
+            }
+            other => panic!("expected early ToolCallStarted, got {other:?}"),
+        }
+        // A text content_block_start starts nothing (text streams via deltas).
+        let text = json!({"type":"stream_event","event":{"type":"content_block_start","index":0,
+            "content_block":{"type":"text"}}}).to_string();
+        assert!(decode_line(&text).is_empty());
+    }
+
+    #[test]
+    fn decodes_input_json_delta_as_tool_input_delta() {
+        let l = json!({"type":"stream_event","event":{"type":"content_block_delta","index":1,
+            "delta":{"type":"input_json_delta","partial_json":"{\"file_path\": \"/tmp/x"}}}).to_string();
+        match &decode_line(&l)[0] {
+            ThreadEvent::ToolInputDelta { tool_call_id, partial_json } => {
+                assert!(tool_call_id.is_empty(), "delta carries no id; fold correlates it");
+                assert_eq!(partial_json, "{\"file_path\": \"/tmp/x");
+            }
+            other => panic!("expected ToolInputDelta, got {other:?}"),
+        }
+        // An empty first fragment is noise.
+        let empty = json!({"type":"stream_event","event":{"type":"content_block_delta","index":1,
+            "delta":{"type":"input_json_delta","partial_json":""}}}).to_string();
+        assert!(decode_line(&empty).is_empty());
+    }
+
+    #[test]
+    fn tool_input_delta_fixture_replays_into_growing_then_final_card() {
+        use crate::thread::state::ChatThread;
+        use crate::thread::tool_call::ToolCallStatus;
+        // Replay the captured Write fixture through the decoder + fold: the card
+        // opens early, its preview grows as fragments arrive, and the finalized
+        // tool_use block supersedes the preview with authoritative input.
+        let fixture = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/thread/testdata/stream_json_tool_input_delta.jsonl"),
+        )
+        .unwrap();
+        let mut thread = ChatThread::new();
+        let mut saw_growing_preview = false;
+        for line in fixture.lines() {
+            for ev in decode_line(line) {
+                thread.apply(&ev);
+            }
+            // Mid-stream, the open Write card should preview partial args.
+            if let Some(tc) = thread.entries.iter().rev().find_map(|e| match e {
+                crate::thread::ThreadEntry::ToolCall(tc) if tc.name == "Write" => Some(tc),
+                _ => None,
+            }) && tc.input == serde_json::Value::from(serde_json::Map::new())
+                && let Some(preview) = tc.preview_input()
+                && preview.get("file_path").is_some()
+            {
+                saw_growing_preview = true;
+            }
+        }
+        assert!(saw_growing_preview, "a partial preview rendered before finalize");
+        // Exactly one Write card, with the authoritative finalized input.
+        let writes: Vec<_> = thread
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::thread::ThreadEntry::ToolCall(tc) if tc.name == "Write" => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes.len(), 1, "no duplicate tool card for the same id");
+        let tc = writes[0];
+        assert!(tc.partial_input.is_empty(), "preview buffer cleared at finalize");
+        assert!(tc.input.get("file_path").and_then(|v| v.as_str()).is_some());
+        assert!(tc.input.get("content").and_then(|v| v.as_str()).unwrap().contains("ocean"));
+        assert!(matches!(tc.status, ToolCallStatus::InProgress | ToolCallStatus::Completed));
     }
 
     #[test]

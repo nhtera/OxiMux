@@ -128,7 +128,14 @@ impl AgentChatView {
     /// so the CLI must have flushed the last turn. The original file is never
     /// modified; the truncated copy lands under a fresh session id.
     pub(super) fn request_fork(&mut self, entry_index: usize, cx: &mut Context<Self>) {
-        if self.rewinding || self.thread.turn_active || !self.backend_supports_rewind() {
+        // Fork-to-new-tab reads the on-disk `~/.claude` session log directly, so
+        // it's client-side (Claude) only. A server-side backend (Codex) has no
+        // such log — the menu hides this entry there (see `render_fork_menu_item`).
+        if self.rewinding
+            || self.thread.turn_active
+            || !self.backend_supports_rewind()
+            || self.connection.as_ref().is_some_and(|c| c.rewind_is_server_side())
+        {
             return;
         }
         let Some(old_sid) = self.thread.session_id.clone() else { return };
@@ -285,6 +292,17 @@ impl AgentChatView {
         self.sync_composer(cx);
         cx.notify();
 
+        // Whether the backend rewinds server-side (Codex `thread/fork` on the live
+        // connection) vs the client's kill-then-file-fork (Claude) — decided
+        // before the connection is taken.
+        let server_side = self
+            .connection
+            .as_ref()
+            .is_some_and(|c| c.rewind_is_server_side());
+        // The full user-turn count, so a server-side fork can fail closed when its
+        // ledger doesn't cover the whole transcript (a restored session).
+        let total_user_msgs =
+            self.thread.entries.iter().filter(|e| matches!(e, ThreadEntry::User { .. })).count();
         // Step 1 input: the connection is MOVED into the background task so
         // `cancel_and_wait` can block there. From here the view has no live
         // connection until `finish_rewind` respawns (or restores `interrupted`).
@@ -293,7 +311,7 @@ impl AgentChatView {
         let (tx, rx) = tokio::sync::oneshot::channel::<RewindOutcome>();
         handle.spawn(async move {
             let outcome = run_rewind_background(conn, engine, old_sid, ordinal, expected_text,
-                sha_for_restore).await;
+                sha_for_restore, server_side, total_user_msgs).await;
             let _ = tx.send(outcome);
         });
         cx.spawn(async move |this, cx| {
@@ -502,7 +520,34 @@ async fn run_rewind_background(
     ordinal: usize,
     expected_text: String,
     sha_for_restore: Option<String>,
+    server_side: bool,
+    total_user_msgs: usize,
 ) -> RewindOutcome {
+    // Server-side rewind (Codex): fork the thread on the LIVE connection FIRST
+    // (the process must still be alive to answer `thread/fork`), THEN stop it —
+    // the respawn resumes the forked thread id. No session-file fork, no
+    // checkpoint restore (conversation-only). The original thread is untouched.
+    if server_side {
+        let Some(conn) = conn else {
+            return RewindOutcome::Failed("no connection to rewind".into());
+        };
+        let forked = tokio::task::spawn_blocking(move || {
+            let res = conn.fork_conversation(ordinal, total_user_msgs);
+            // Whether the fork succeeded or not, the process is stopped here —
+            // `finish_rewind` respawns (resuming the fork on success, or the
+            // original session on failure).
+            let _ = conn.cancel_and_wait();
+            conn.shutdown();
+            res
+        })
+        .await;
+        return match forked {
+            Ok(Ok(new_sid)) => RewindOutcome::Done { new_sid, files_degraded: false },
+            Ok(Err(e)) => RewindOutcome::Failed(e.to_string()),
+            Err(e) => RewindOutcome::Failed(format!("rewind task: {e}")),
+        };
+    }
+
     // Step 1: confirmed-dead child. `cancel_and_wait` blocks — hop to a
     // blocking-ok thread so the tokio worker isn't stalled.
     if let Some(conn) = conn {

@@ -4,6 +4,51 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-13 — Agent Chat round-4 P0 parity (5 protocol-correctness gaps)
+
+**What shipped:** five P0 agent-chat parity features closing the round-4 research
+gaps vs Paseo/Super Conductor, across the `oximux-agents` and `oximux-app` crates.
+
+**Claude:**
+- **Live tool-input streaming** — the decoder now handles `content_block_start`
+  (`tool_use`) and `input_json_delta`, so a tool card opens as soon as the model
+  starts composing the call and its arguments render live (a Write/Edit shows its
+  content growing) before the finalized `tool_use` block arrives. A best-effort
+  partial-JSON parser (`parse_partial_json`) closes the truncated fragment; the
+  fold accumulates fragments on the open tool call and upgrades it in place at
+  finalize (no duplicate cards), with a 64 KiB preview cap.
+- **Plan-mode approval card** — `ExitPlanMode` (which rides the `can_use_tool`
+  channel) now renders as a dedicated plan card: the plan markdown plus the CLI's
+  three choices (approve + auto-accept edits / approve + ask each time / keep
+  planning). Approve echoes a `setMode` suggestion so the CLI exits plan mode and
+  continues the turn; the composer mode chip updates optimistically (Claude sends
+  no wire mode-echo). Introduces a `PermissionKind` taxonomy
+  (`Tool`/`Plan`/`Mode`/`Mcp`/`Other`) on the permission event, serde-defaulting
+  to `Tool` so old transcripts load unchanged.
+
+**Codex:**
+- **Conversation rewind via `thread/fork`** — `supports_rewind` is now true for
+  Codex. Rewind/regenerate/edit-and-resend fork the thread server-side on the
+  live connection (`thread/fork` with `lastTurnId`, addressed by an in-session
+  turn-id ledger) before the process is stopped, then respawn resuming the fork.
+  The original thread is left intact. `thread/rollback` is deprecated upstream and
+  deliberately not used. Fork-to-new-tab stays Claude-only (it reads the on-disk
+  session log). Conversation-only — no files/checkpoint axis for Codex.
+- **MCP elicitation cards** — `mcpServer/elicitation/request` (an MCP server asking
+  for consent mid-tool) was silently auto-declined; it now surfaces as an
+  `MCP · <server>` permission card and the reply rides the elicitation
+  `{action: accept|decline}` shape (distinct from an approval's `{decision}`).
+- **Approval-policy + sandbox controls** — the composer footer exposes two selects
+  (Approvals: on-request / never; Sandbox: read-only / workspace-write /
+  danger-full-access, the dangerous options marked). Changes apply per-turn via a
+  `turn/start` posture override (no respawn) and persist per session
+  (`codex_posture` on the transcript, restored into the connection + the footer).
+
+**Verification:** `cargo test --workspace --no-fail-fast` green (known-flaky
+`spawn_args_reach_child_process` tolerated); protocol/decoder/fold covered by unit
++ fixture tests; live-GUI verification of the five features tracked in
+`plans/260713-0008-agent-chat-round4-p0-parity/reports/gui-verification.md`.
+
 ### 2026-07-12 — Agent Chat: disk-persisted model-catalog cache for the New Agent picker
 
 **What shipped:** a process-wide, disk-persisted cache of each dynamic-model

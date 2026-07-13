@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::entry::ChatImage;
 use super::question::AskQuestion;
-use super::tool_call::PermissionSuggestion;
+use super::tool_call::{PermissionKind, PermissionSuggestion};
 
 /// Per-turn token/cost usage, decoded from the final `result` event. All counts
 /// are best-effort (0 when the field is absent); `cost_usd`/`context_window` are
@@ -100,6 +100,17 @@ pub enum ThreadEvent {
         name: String,
         input: Value,
     },
+    /// A fragment of a tool call's arguments streaming in before the finalized
+    /// `tool_use` block (Claude `stream_event` `input_json_delta`). The card opens
+    /// on the earlier `content_block_start` (`ToolCallStarted` with empty input);
+    /// each fragment is appended to the accumulating partial-JSON string, which is
+    /// best-effort parsed to preview the growing args. The authoritative input
+    /// still arrives in the finalized `ToolCallStarted`, which supersedes the
+    /// preview. Correlated by the tool-call `id`. Claude-only.
+    ToolInputDelta {
+        tool_call_id: String,
+        partial_json: String,
+    },
     /// A tool produced its result (`user` tool_result echo).
     ToolResult {
         tool_use_id: String,
@@ -157,6 +168,10 @@ pub enum ThreadEvent {
         input: Value,
         description: String,
         suggestions: Vec<PermissionSuggestion>,
+        /// What the request is for — `Tool` for an ordinary approval, `Plan` for
+        /// Claude's `ExitPlanMode`, `Mcp` for a Codex MCP elicitation. Routes the
+        /// request to a dedicated card in the view.
+        kind: PermissionKind,
     },
     /// Claude called `AskUserQuestion`: a multiple-choice clarification the user
     /// answers via the interactive question card. Distinct from a permission

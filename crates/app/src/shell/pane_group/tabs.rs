@@ -805,6 +805,7 @@ impl PaneGroup {
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
         thinking_level: crate::shell::agent_chat::ThinkingLevel,
+        codex_posture: Option<(String, String)>,
         draft: Option<String>,
         queued: Vec<String>,
         window: &mut Window,
@@ -824,6 +825,7 @@ impl PaneGroup {
                 entries,
                 slash_commands,
                 thinking_level,
+                codex_posture,
                 theme,
                 density,
                 typography,
@@ -990,6 +992,7 @@ impl PaneGroup {
                     entries.clone(),
                     slash_commands.clone(),
                     *thinking_level,
+                    None, // codex_posture — Fork is Claude-only
                     None,
                     Vec::new(),
                     window,
@@ -1228,6 +1231,7 @@ impl PaneGroup {
             entries,
             Vec::new(),
             crate::shell::agent_chat::ThinkingLevel::default(),
+            None, // codex_posture — Claude session-history reopen
             None,
             Vec::new(),
             window,

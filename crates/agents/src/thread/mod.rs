@@ -52,6 +52,7 @@ pub use question::{
 pub use state::ChatThread;
 pub use stream_json::decode_line;
 pub use tool_call::{
-    PermissionDecision, PermissionRequest, PermissionSuggestion, ToolCall, ToolCallStatus,
+    PermissionDecision, PermissionKind, PermissionRequest, PermissionSuggestion, ToolCall,
+    ToolCallStatus,
 };
 pub use tool_detail::ToolDetail;

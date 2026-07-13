@@ -8,8 +8,9 @@
 //! symlink / `..` escapes; the tail (a not-yet-existing write target) is appended
 //! lexically and the final path is re-checked for containment.
 //!
-//! `terminal/*` is deliberately NOT served yet (no verified local consumer;
-//! heavier lifecycle) — see the phase's deferred follow-up.
+//! The `terminal/*` methods are served separately in `client_terminal.rs`
+//! (`terminal/create`, `output`, `wait_for_exit`, `kill`, `release`) — an ACP
+//! tool call can embed a live terminal the client hosts.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};

@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 pub const M_INITIALIZE: &str = "initialize";
 pub const M_THREAD_START: &str = "thread/start";
 pub const M_THREAD_RESUME: &str = "thread/resume";
+pub const M_THREAD_FORK: &str = "thread/fork";
 pub const M_MODEL_LIST: &str = "model/list";
 pub const M_TURN_START: &str = "turn/start";
 pub const M_TURN_INTERRUPT: &str = "turn/interrupt";
@@ -33,9 +34,29 @@ pub const N_INITIALIZED: &str = "initialized";
 // (Server → client notification method literals + their parsing live in `map.rs`,
 //  which owns the notification → ThreadEvent mapping.)
 
-// --- Fixed P1 posture (validated): on-request approvals + workspace sandbox
+// --- Approval-policy wire values (`AskForApproval`) the composer exposes.
 pub const APPROVAL_ON_REQUEST: &str = "on-request";
+pub const APPROVAL_NEVER: &str = "never";
+// --- Sandbox-mode wire values (`SandboxMode`, used on thread/start & resume).
+pub const SANDBOX_READ_ONLY: &str = "read-only";
 pub const SANDBOX_WORKSPACE_WRITE: &str = "workspace-write";
+pub const SANDBOX_DANGER_FULL_ACCESS: &str = "danger-full-access";
+
+/// The default posture a fresh Codex thread starts under (unchanged from the
+/// original fixed P1 posture): on-request approvals + workspace-write sandbox.
+pub const DEFAULT_APPROVAL_POLICY: &str = APPROVAL_ON_REQUEST;
+pub const DEFAULT_SANDBOX: &str = SANDBOX_WORKSPACE_WRITE;
+
+/// Map a `SandboxMode` string (thread/start's `sandbox`) to the tagged
+/// `SandboxPolicy` object that `turn/start`'s `sandboxPolicy` override expects.
+/// Unknown values fall back to the workspace-write policy.
+fn sandbox_policy_json(sandbox: &str) -> Value {
+    match sandbox {
+        SANDBOX_READ_ONLY => json!({ "type": "readOnly" }),
+        SANDBOX_DANGER_FULL_ACCESS => json!({ "type": "dangerFullAccess" }),
+        _ => json!({ "type": "workspaceWrite" }),
+    }
+}
 
 /// `initialize` params. `experimentalApi:true` opts into the experimental v2
 /// methods/fields the chat relies on. `version` is the agents crate version.
@@ -46,13 +67,15 @@ pub fn initialize_params() -> Value {
     })
 }
 
-/// `thread/start` params for a fresh thread under the fixed P1 posture. `model`
-/// is omitted when `None` (Codex picks its configured default).
-pub fn thread_start_params(model: Option<&str>, cwd: &Path) -> Value {
+/// `thread/start` params for a fresh thread under `posture` (approval policy +
+/// sandbox mode; the composer's Approvals/Sandbox selects, defaulting to
+/// on-request/workspace-write). `model` is omitted when `None` (Codex picks its
+/// configured default).
+pub fn thread_start_params(model: Option<&str>, cwd: &Path, posture: Posture) -> Value {
     let mut p = json!({
         "cwd": cwd.to_string_lossy(),
-        "approvalPolicy": APPROVAL_ON_REQUEST,
-        "sandbox": SANDBOX_WORKSPACE_WRITE,
+        "approvalPolicy": posture.approval_policy,
+        "sandbox": posture.sandbox,
     });
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
         p["model"] = json!(m);
@@ -60,13 +83,13 @@ pub fn thread_start_params(model: Option<&str>, cwd: &Path) -> Value {
     p
 }
 
-/// `thread/resume` params — reconnect an existing thread by id under the fixed
-/// posture, optionally overriding the model.
-pub fn thread_resume_params(thread_id: &str, model: Option<&str>) -> Value {
+/// `thread/resume` params — reconnect an existing thread by id under `posture`,
+/// optionally overriding the model.
+pub fn thread_resume_params(thread_id: &str, model: Option<&str>, posture: Posture) -> Value {
     let mut p = json!({
         "threadId": thread_id,
-        "approvalPolicy": APPROVAL_ON_REQUEST,
-        "sandbox": SANDBOX_WORKSPACE_WRITE,
+        "approvalPolicy": posture.approval_policy,
+        "sandbox": posture.sandbox,
     });
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
         p["model"] = json!(m);
@@ -74,13 +97,38 @@ pub fn thread_resume_params(thread_id: &str, model: Option<&str>) -> Value {
     p
 }
 
-/// `turn/start` params carrying one plain-text user message. The thread posture
-/// (approval/sandbox) is inherited; `model`/`effort` override per turn when set
-/// (how the model/effort pickers take effect).
-pub fn turn_start_params(thread_id: &str, text: &str, model: Option<&str>, effort: Option<&str>) -> Value {
+/// The approval policy + sandbox mode a Codex session runs under, chosen via the
+/// composer's Approvals/Sandbox selects. Borrowed wire strings (`AskForApproval`
+/// + `SandboxMode`), so no allocation to build a request.
+#[derive(Debug, Clone, Copy)]
+pub struct Posture<'a> {
+    pub approval_policy: &'a str,
+    pub sandbox: &'a str,
+}
+
+impl Default for Posture<'_> {
+    fn default() -> Self {
+        Self { approval_policy: DEFAULT_APPROVAL_POLICY, sandbox: DEFAULT_SANDBOX }
+    }
+}
+
+/// `turn/start` params carrying one plain-text user message. `model`/`effort`
+/// override per turn when set (how the model/effort pickers take effect); the
+/// `posture` (approval policy + sandbox) rides as a per-turn override too — Codex
+/// applies it "for this turn and subsequent turns", so a posture switch takes
+/// effect on the next send with no respawn.
+pub fn turn_start_params(
+    thread_id: &str,
+    text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    posture: Posture,
+) -> Value {
     let mut p = json!({
         "threadId": thread_id,
-        "input": [ { "type": "text", "text": text, "text_elements": [] } ]
+        "input": [ { "type": "text", "text": text, "text_elements": [] } ],
+        "approvalPolicy": posture.approval_policy,
+        "sandboxPolicy": sandbox_policy_json(posture.sandbox),
     });
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
         p["model"] = json!(m);
@@ -94,6 +142,21 @@ pub fn turn_start_params(thread_id: &str, text: &str, model: Option<&str>, effor
 /// `turn/interrupt` params — cancels the in-flight turn on `thread_id`/`turn_id`.
 pub fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
     json!({ "threadId": thread_id, "turnId": turn_id })
+}
+
+/// `thread/fork` params — branch `thread_id` into a NEW thread that ends at
+/// `last_turn_id` (inclusive); every turn after it is dropped from the fork. The
+/// original thread is left intact (recoverable). `None` forks through no turns
+/// (an empty conversation — used to rewind before the very first message). The
+/// posture is preserved (the fork inherits the parent's). Used for
+/// conversation-rewind: pick the turn BEFORE the target user message.
+/// (`thread/rollback` is the deprecated alternative — do not use it.)
+pub fn thread_fork_params(thread_id: &str, last_turn_id: Option<&str>) -> Value {
+    let mut p = json!({ "threadId": thread_id });
+    if let Some(tid) = last_turn_id.map(str::trim).filter(|s| !s.is_empty()) {
+        p["lastTurnId"] = json!(tid);
+    }
+    p
 }
 
 /// Pull `thread.id` out of a `thread/start` (or `thread/resume`) response.
@@ -158,26 +221,52 @@ mod tests {
 
     #[test]
     fn thread_start_omits_blank_model_and_sets_posture() {
-        let p = thread_start_params(None, &PathBuf::from("/tmp/x"));
+        let p = thread_start_params(None, &PathBuf::from("/tmp/x"), Posture::default());
         assert_eq!(p["approvalPolicy"], "on-request");
         assert_eq!(p["sandbox"], "workspace-write");
         assert!(p.get("model").is_none());
-        let p2 = thread_start_params(Some("gpt-5.5"), &PathBuf::from("/tmp/x"));
+        let p2 = thread_start_params(Some("gpt-5.5"), &PathBuf::from("/tmp/x"), Posture::default());
         assert_eq!(p2["model"], "gpt-5.5");
+        // A chosen posture flows through.
+        let p3 = thread_start_params(
+            None,
+            &PathBuf::from("/tmp/x"),
+            Posture { approval_policy: APPROVAL_NEVER, sandbox: SANDBOX_READ_ONLY },
+        );
+        assert_eq!(p3["approvalPolicy"], "never");
+        assert_eq!(p3["sandbox"], "read-only");
     }
 
     #[test]
     fn turn_start_shapes_text_input() {
-        let p = turn_start_params("th_1", "hi", None, None);
+        let p = turn_start_params("th_1", "hi", None, None, Posture::default());
         assert_eq!(p["threadId"], "th_1");
         assert_eq!(p["input"][0]["type"], "text");
         assert_eq!(p["input"][0]["text"], "hi");
         assert!(p["input"][0]["text_elements"].is_array());
         assert!(p.get("model").is_none());
+        // Default posture rides every turn as a per-turn override.
+        assert_eq!(p["approvalPolicy"], "on-request");
+        assert_eq!(p["sandboxPolicy"], json!({ "type": "workspaceWrite" }));
         // model + effort ride as per-turn overrides when set.
-        let p2 = turn_start_params("th_1", "hi", Some("gpt-5.5"), Some("high"));
+        let p2 = turn_start_params("th_1", "hi", Some("gpt-5.5"), Some("high"), Posture::default());
         assert_eq!(p2["model"], "gpt-5.5");
         assert_eq!(p2["effort"], "high");
+    }
+
+    #[test]
+    fn turn_start_posture_maps_sandbox_to_tagged_policy() {
+        let ro = turn_start_params(
+            "t", "hi", None, None,
+            Posture { approval_policy: APPROVAL_NEVER, sandbox: SANDBOX_READ_ONLY },
+        );
+        assert_eq!(ro["approvalPolicy"], "never");
+        assert_eq!(ro["sandboxPolicy"], json!({ "type": "readOnly" }));
+        let danger = turn_start_params(
+            "t", "hi", None, None,
+            Posture { approval_policy: APPROVAL_ON_REQUEST, sandbox: SANDBOX_DANGER_FULL_ACCESS },
+        );
+        assert_eq!(danger["sandboxPolicy"], json!({ "type": "dangerFullAccess" }));
     }
 
     #[test]
@@ -202,6 +291,20 @@ mod tests {
             Some("Frontier model for complex coding, research, and agentic tasks.")
         );
         assert_eq!(models[1].description, None);
+    }
+
+    #[test]
+    fn thread_fork_addresses_by_last_turn_id() {
+        // Fork through a specific turn: turns after it are dropped from the fork.
+        let p = thread_fork_params("th_1", Some("turn_5"));
+        assert_eq!(p["threadId"], "th_1");
+        assert_eq!(p["lastTurnId"], "turn_5");
+        // Rewind before the first message: no lastTurnId → fork through nothing.
+        let empty = thread_fork_params("th_1", None);
+        assert_eq!(empty["threadId"], "th_1");
+        assert!(empty.get("lastTurnId").is_none());
+        // A blank turn id is treated as absent.
+        assert!(thread_fork_params("th_1", Some("  ")).get("lastTurnId").is_none());
     }
 
     #[test]

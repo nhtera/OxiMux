@@ -11,12 +11,15 @@ use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
-use oximux_agents::thread::{PermissionDecision, PermissionRequest, ToolCall, ToolCallStatus};
+use oximux_agents::thread::{
+    PermissionDecision, PermissionKind, PermissionRequest, ToolCall, ToolCallStatus,
+};
 use oximux_settings::{Density, Theme, Typography};
 
 use super::AgentChatView;
 use super::bubble;
 use super::diff_card;
+use super::plan_approval_card;
 use super::tool_bodies;
 
 /// Cap on the rendered tool-result body so a chatty tool can't blow up a row.
@@ -34,9 +37,21 @@ pub(super) fn render_tool_card(
     typo: &Typography,
     cx: &mut Context<AgentChatView>,
 ) -> AnyElement {
+    // A plan-mode `ExitPlanMode` request renders as a dedicated plan-approval
+    // card (markdown plan + the CLI's three choices), not the generic tool card.
+    if let ToolCallStatus::WaitingForConfirmation(req) = &tc.status
+        && req.kind == PermissionKind::Plan
+    {
+        return plan_approval_card::render_plan_card(tc, req, theme, density, typo, cx);
+    }
+
     let awaiting = matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_));
+    // While a tool's arguments are still streaming in (`content_block_start`
+    // opened the card, the finalized `tool_use` block hasn't landed), preview the
+    // growing partial JSON so the user watches the args materialize.
+    let streaming = streaming_preview(tc);
     let has_detail = !tc.input.is_null() || tc.result.is_some();
-    let framed = awaiting || expanded;
+    let framed = awaiting || expanded || streaming.is_some();
 
     let mut card = div().flex().flex_col().gap(px(4.0)).w_full();
     if framed {
@@ -55,6 +70,18 @@ pub(super) fn render_tool_card(
     }
 
     card = card.child(header_row(tc, expanded, has_detail, theme, density, typo, cx));
+
+    // Live args preview: shown regardless of expand state while streaming, so the
+    // card body grows during composition (a Write's content, a Bash command).
+    // Superseded by the finalized card once the `tool_use` block arrives.
+    if let Some(preview) = &streaming {
+        if let Some(body) = tool_bodies::render_tool_body(preview, theme, density, typo) {
+            card = card.child(body);
+        } else {
+            card = card.child(tool_bodies::render_generic_input(preview, theme, density, typo));
+        }
+        card = card.child(streaming_hint(theme, typo));
+    }
 
     // Inline diff for Edit/Write: shown while awaiting (so the user sees what
     // they're approving) and whenever the card is expanded. Only build the
@@ -175,7 +202,11 @@ fn approval_row(
     // same tool call.
     let input = tc.input.clone();
 
-    let prompt = if req.description.trim().is_empty() {
+    let prompt = if req.kind == PermissionKind::Mcp {
+        // An MCP elicitation: name the server so the card reads "MCP · github:
+        // Authorize repo access?" rather than an unattributed prompt.
+        format!("MCP · {}: {}", tc.name, req.description.trim())
+    } else if req.description.trim().is_empty() {
         format!("Allow {provider} to run {}?", tc.name)
     } else {
         format!("Allow {}?", req.description.trim())
@@ -300,6 +331,32 @@ pub(super) fn pill_button(
         .hover(|s| s.bg(accent.opacity(0.12)))
         .on_click(on_click)
         .child(label.into())
+        .into_any_element()
+}
+
+/// While a tool's args are still streaming (the live `content_block_start`
+/// opened the card but the finalized `tool_use` block hasn't landed), build an
+/// effective `ToolCall` whose `input` is the best-effort preview of the growing
+/// partial JSON, so the body renderers show arguments materializing live.
+/// `None` once finalized (real input present) or when no preview parses yet.
+fn streaming_preview(tc: &ToolCall) -> Option<ToolCall> {
+    let input_empty = tc.input.is_null() || tc.input.as_object().is_some_and(|m| m.is_empty());
+    if tc.partial_input.is_empty() || !input_empty {
+        return None;
+    }
+    let preview = tc.preview_input()?;
+    let mut eff = tc.clone();
+    eff.input = preview;
+    Some(eff)
+}
+
+/// A muted "streaming…" affordance shown under the live args preview.
+fn streaming_hint(theme: Theme, typo: &Typography) -> AnyElement {
+    div()
+        .w_full()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.fg_subtle)
+        .child(SharedString::from("streaming…"))
         .into_any_element()
 }
 

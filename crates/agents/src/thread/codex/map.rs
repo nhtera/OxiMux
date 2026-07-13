@@ -116,6 +116,10 @@ pub fn map_notification(method: &str, params: &Value, st: &mut CodexState) -> Ve
         "turn/started" => {
             if let Some(tid) = params.get("turn").and_then(|t| t.get("id")).and_then(|v| v.as_str()) {
                 st.current_turn_id = Some(tid.to_string());
+                // Append to the rewind ledger (one turn per user message), so a
+                // later conversation-rewind can map a user-message ordinal to the
+                // `thread/fork` `lastTurnId`.
+                st.user_turn_ids.push(tid.to_string());
             }
             // Start each turn's usage fresh, so a turn that never reports its own
             // usage doesn't inherit the previous turn's counts on TurnEnded.
@@ -544,6 +548,19 @@ mod tests {
             &mut st(),
         );
         assert_eq!(r, vec![ThreadEvent::AssistantThinking("a\nb".into())]);
+    }
+
+    #[test]
+    fn turn_started_appends_to_rewind_ledger() {
+        // One turn id recorded per user prompt, in order — so a later
+        // conversation-rewind can map a user-message ordinal to `thread/fork`'s
+        // `lastTurnId`.
+        let mut s = st();
+        map_notification("turn/started", &json!({"turn": {"id": "turn_a"}}), &mut s);
+        map_notification("turn/completed", &json!({"turn": {"status": "completed"}}), &mut s);
+        map_notification("turn/started", &json!({"turn": {"id": "turn_b"}}), &mut s);
+        assert_eq!(s.user_turn_ids, vec!["turn_a".to_string(), "turn_b".to_string()]);
+        assert_eq!(s.current_turn_id.as_deref(), Some("turn_b"));
     }
 
     #[test]

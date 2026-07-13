@@ -27,6 +27,7 @@ mod jump_menu;
 mod login_card;
 mod message_rail;
 mod pending_edit;
+mod plan_approval_card;
 mod plan_panel;
 mod question_card;
 mod rewind_menu;
@@ -113,6 +114,21 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
         },
         None => ControlVocab::default(),
     }
+}
+
+/// Build the initial composer feature-pick overlay for a restored chat: a Codex
+/// posture `(approval_policy, sandbox)` becomes the two Approvals/Sandbox select
+/// picks so the reopened session shows (and re-persists) its choice. Empty for a
+/// fresh launch or a non-Codex backend (`None`).
+fn seed_posture_feature_values(
+    posture: Option<(String, String)>,
+) -> HashMap<String, FeatureValue> {
+    let mut map = HashMap::new();
+    if let Some((approval, sandbox)) = posture {
+        map.insert("codex_approval_policy".to_string(), FeatureValue::Choice(approval));
+        map.insert("codex_sandbox".to_string(), FeatureValue::Choice(sandbox));
+    }
+    map
 }
 
 /// Overlay the user's optimistic feature picks onto the backend-advertised
@@ -294,8 +310,8 @@ use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::{
     connect, probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend,
     ChatImage, ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue,
-    PermissionDecision, ProbedCatalog, QuestionAnswers, QuestionRequest, ThreadEntry, ThreadEvent,
-    ToolCallStatus, Transport, TurnUsage,
+    PermissionDecision, PermissionSuggestion, ProbedCatalog, QuestionAnswers,
+    QuestionRequest, ThreadEntry, ThreadEvent, ToolCallStatus, Transport, TurnUsage,
 };
 use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -611,6 +627,7 @@ impl AgentChatView {
             backend,
             ChatThread::new(),
             true,
+            None,
             theme,
             density,
             typography,
@@ -641,6 +658,7 @@ impl AgentChatView {
             backend,
             ChatThread::new(),
             false,
+            None,
             theme,
             density,
             typography,
@@ -679,6 +697,7 @@ impl AgentChatView {
         entries: Vec<ThreadEntry>,
         slash_commands: Vec<String>,
         thinking_level: ThinkingLevel,
+        codex_posture: Option<(String, String)>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -687,7 +706,7 @@ impl AgentChatView {
     ) -> Self {
         let thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
         let mut view = Self::assemble(
-            cwd, model, backend, thread, true, theme, density, typography, window, cx,
+            cwd, model, backend, thread, true, codex_posture, theme, density, typography, window, cx,
         );
         view.thinking_level = thinking_level;
         // A resumed chat that already has history must NOT regenerate (or
@@ -709,6 +728,11 @@ impl AgentChatView {
         // `false` opens an unbound **New Agent** draft: skip the subprocess spawn
         // entirely and wait for the first send to bind (see [`Self::new_unbound`]).
         connect_now: bool,
+        // A restored Codex chat's persisted posture `(approval_policy, sandbox)`,
+        // seeded into the connection spawn + the composer's feature picks so the
+        // reopened session keeps its Approvals/Sandbox choice. `None` for fresh
+        // launches and non-Codex backends.
+        codex_posture: Option<(String, String)>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -769,14 +793,17 @@ impl AgentChatView {
         // An unbound draft (`!connect_now`) spawns nothing yet — the first send
         // binds via `respawn()`, which connects `self.backend` fresh.
         if connect_now {
-            match connect(ConnectSpec::for_backend(
+            let mut spec = ConnectSpec::for_backend(
                 &backend,
                 cwd.clone(),
                 model.clone(),
                 resume_session_id.clone(),
                 None,
                 None,
-            )) {
+            );
+            // A restored Codex chat resumes under its persisted posture.
+            spec.codex_posture = codex_posture.clone();
+            match connect(spec) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
                     drain_task = Some(Self::spawn_drain(rx, cx));
@@ -924,7 +951,9 @@ impl AgentChatView {
             model,
             permission_mode: None,
             effort: None,
-            feature_values: HashMap::new(),
+            // Seed the composer's Approvals/Sandbox picks from the restored Codex
+            // posture so they display (and re-persist) the resumed choice.
+            feature_values: seed_posture_feature_values(codex_posture),
             disconnected,
             interrupted: false,
             unbound: !connect_now,
@@ -1014,7 +1043,28 @@ impl AgentChatView {
             provider: self.backend.transport,
             acp_command: self.backend.acp_command.clone(),
             acp_args: self.backend.acp_args.clone(),
+            codex_posture: self.codex_posture_snapshot(),
         })
+    }
+
+    /// The Codex posture `(approval_policy, sandbox)` the user has selected, read
+    /// from the composer's feature picks. `None` for a non-Codex chat or when the
+    /// posture was never changed from the default (nothing to persist).
+    fn codex_posture_snapshot(&self) -> Option<(String, String)> {
+        if self.backend.transport != Transport::AppServer {
+            return None;
+        }
+        let choice = |id: &str| match self.feature_values.get(id) {
+            Some(FeatureValue::Choice(wire)) => Some(wire.clone()),
+            _ => None,
+        };
+        match (choice("codex_approval_policy"), choice("codex_sandbox")) {
+            (None, None) => None,
+            (approval, sandbox) => Some((
+                approval.unwrap_or_else(|| "on-request".to_string()),
+                sandbox.unwrap_or_else(|| "workspace-write".to_string()),
+            )),
+        }
     }
 
     /// The chat's session id once Claude has minted one (after the first turn
@@ -2155,6 +2205,9 @@ impl AgentChatView {
         );
         spec.env = env;
         spec.auth_method = auth_method;
+        // Preserve the chosen Codex posture across the respawn (Stop-resume, a
+        // rewind fork), so it isn't silently reset to the default on reconnect.
+        spec.codex_posture = self.codex_posture_snapshot();
         match connect(spec) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
@@ -3075,6 +3128,61 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Approve a plan-mode `ExitPlanMode` request: allow it (echoing the request
+    /// input, required by the transport) plus a `setMode` suggestion so the CLI
+    /// exits plan mode into `mode` and continues the same turn, then optimistically
+    /// reflect the new mode in the composer chip. Claude sends no mode echo on the
+    /// wire, so the chip is the source of truth until the next respawn. `mode` is
+    /// `acceptEdits` (auto-accept edits) or `default` (ask before each edit).
+    fn approve_plan(
+        &mut self,
+        tool_id: String,
+        request_id: String,
+        input: serde_json::Value,
+        mode: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let suggestion = PermissionSuggestion {
+            kind: "setMode".to_string(),
+            label: format!("Always ({mode})"),
+            raw: serde_json::json!({ "type": "setMode", "mode": mode, "destination": "session" }),
+        };
+        self.resolve_permission(
+            tool_id,
+            request_id,
+            PermissionDecision::AllowWithSuggestion { updated_input: input, suggestion },
+            cx,
+        );
+        self.set_mode_chip(mode, cx);
+    }
+
+    /// Reject a plan-mode `ExitPlanMode` request → the agent keeps planning (stays
+    /// in plan mode; the turn continues without exiting).
+    fn reject_plan(&mut self, tool_id: String, request_id: String, cx: &mut Context<Self>) {
+        self.resolve_permission(
+            tool_id,
+            request_id,
+            PermissionDecision::Deny { message: "Keep planning".into() },
+            cx,
+        );
+    }
+
+    /// Optimistically reflect a permission-mode change in the composer chip WITHOUT
+    /// respawning — used when the backend flips the mode itself in-session (Claude's
+    /// ExitPlanMode approve applies the `setMode` suggestion server-side and
+    /// continues the same turn, so a respawn would needlessly drop it). Mirrors the
+    /// baseline-normalization in `change_permission_mode` but skips the switch.
+    fn set_mode_chip(&mut self, mode: &str, cx: &mut Context<Self>) {
+        let default_mode = self
+            .connection
+            .as_ref()
+            .and_then(|c| c.default_mode())
+            .unwrap_or_default();
+        self.permission_mode = (mode != default_mode).then(|| mode.to_string());
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
     /// Create/drop the interactive question-card entities to match the thread's
     /// `AwaitingAnswer` tool calls. Runs each render (which owns `window`, needed
     /// to build the cards' text inputs) and is idempotent once a card exists.
@@ -3309,6 +3417,10 @@ impl AgentChatView {
         // Rewind cancels the turn first, so it stays available.
         let can_rewind =
             self.thread.session_id.is_some() && !self.rewinding && self.backend_supports_rewind();
+        // Fork-to-new-tab is client-side (file-fork) only; a server-side rewind
+        // backend (Codex) hides it (it still supports in-place Rewind + Edit).
+        let fork_to_tab_server_side =
+            self.connection.as_ref().is_some_and(|c| c.rewind_is_server_side());
         let copied = self.recently_copied == Some(idx);
         let copy_text = text.to_string();
         let group = SharedString::from(format!("user-entry-{idx}"));
@@ -3363,8 +3475,10 @@ impl AgentChatView {
                     })
                     // Fork branches to a NEW tab, reading the on-disk session
                     // file directly — so it's idle-only (like Edit), whereas
-                    // Rewind cancels the turn first.
-                    .when(can_rewind && !self.thread.turn_active, |row| {
+                    // Rewind cancels the turn first. Client-side (Claude) only: a
+                    // server-side backend (Codex) has no on-disk session log to
+                    // fork into a separate tab.
+                    .when(can_rewind && !self.thread.turn_active && !fork_to_tab_server_side, |row| {
                         row.child(message_action_icon(
                             SharedString::from(format!("fork-btn-{idx}")),
                             "icons/git-branch.svg",
@@ -4823,6 +4937,7 @@ mod tests {
                     input: json!({}),
                     description: "notes.txt".into(),
                     suggestions: vec![],
+                    kind: oximux_agents::thread::PermissionKind::Tool,
                 });
                 assert!(
                     view.thread.pending_permission().is_some(),
@@ -5129,6 +5244,7 @@ mod tests {
                         input,
                         description: name.into(),
                         suggestions: vec![],
+                        kind: oximux_agents::thread::PermissionKind::Tool,
                     });
                 }
 
@@ -5268,6 +5384,7 @@ mod tests {
                     input: json!({}),
                     description: "x".into(),
                     suggestions: vec![],
+                    kind: oximux_agents::thread::PermissionKind::Tool,
                 });
                 // First answer: allow.
                 view.resolve_permission(
@@ -5332,6 +5449,7 @@ mod tests {
                     input: json!({}),
                     description: "x".into(),
                     suggestions: vec![],
+                    kind: oximux_agents::thread::PermissionKind::Tool,
                 });
                 assert!(view.thread.turn_active, "turn active before Stop");
 
