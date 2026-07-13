@@ -26,6 +26,7 @@ use gpui_component::{Icon, IconName};
 use oximux_settings::{Density, Theme, Typography};
 
 use oximux_agents::session_log::{
+    import_provider_index::load_import_provider_preview,
     now_unix_ms,
     session_index::{SessionEntry, SessionIndex, SessionScope},
     session_preview::{PreviewMessage, PreviewRole, load_session_preview},
@@ -248,9 +249,12 @@ impl SessionHistoryModal {
             let entries = executor
                 .spawn(async move {
                     match dirs::home_dir() {
-                        Some(home) => {
-                            SessionIndex::build(&home.join(".claude"), &home.join(".codex"), &scope)
-                        }
+                        Some(home) => SessionIndex::build(
+                            &home.join(".claude"),
+                            &home.join(".codex"),
+                            &home,
+                            &scope,
+                        ),
                         None => Vec::new(),
                     }
                 })
@@ -279,17 +283,23 @@ impl SessionHistoryModal {
         if self.preview_idx == Some(entry_idx) {
             return; // already showing (or loading) this session
         }
-        let path = self.entries.get(entry_idx).and_then(|e| e.path.clone());
+        let (path, preset_id, session_id) = self
+            .entries
+            .get(entry_idx)
+            .map(|e| (e.path.clone(), e.preset_id.clone(), e.session_id.clone()))
+            .unwrap_or_default();
         self.preview_idx = Some(entry_idx);
         self.preview_msgs.clear();
         self.preview_gen = self.preview_gen.wrapping_add(1);
         let generation = self.preview_gen;
-        let Some(path) = path else {
-            // Codex rows carry no transcript file — nothing to preview.
+        // Nothing to preview only when there's neither a transcript file (Claude/
+        // Pi) nor an import-provider store to read (OpenCode/Copilot). Codex rows
+        // carry no path and no preset, so they still fall through to empty.
+        if path.is_none() && preset_id.is_none() {
             self.preview_loading = false;
             cx.notify();
             return;
-        };
+        }
         self.preview_loading = true;
         let task = cx.spawn(async move |this, cx| {
             let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone()) else {
@@ -297,7 +307,24 @@ impl SessionHistoryModal {
             };
             let msgs = executor
                 .spawn(async move {
-                    load_session_preview(std::path::Path::new(&path), PREVIEW_MAX_MESSAGES)
+                    // Import-provider rows read their own store (SQLite / Pi JSONL);
+                    // native Claude rows read the transcript `.jsonl`.
+                    if let Some(preset) = preset_id {
+                        match dirs::home_dir() {
+                            Some(home) => load_import_provider_preview(
+                                &home,
+                                &preset,
+                                &session_id,
+                                path.as_deref(),
+                                PREVIEW_MAX_MESSAGES,
+                            ),
+                            None => Vec::new(),
+                        }
+                    } else if let Some(path) = path {
+                        load_session_preview(std::path::Path::new(&path), PREVIEW_MAX_MESSAGES)
+                    } else {
+                        Vec::new()
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -378,9 +405,18 @@ impl SessionHistoryModal {
         let Some(entry) = self.entries.get(entry_idx) else {
             return;
         };
+        // Pi resumes by rollout file path (`pi --session <file>`); OpenCode /
+        // Copilot resume by session id. Native rows carry no preset_id.
+        let resume_handle = if entry.preset_id.as_deref() == Some("pi") {
+            entry.path.clone().unwrap_or_else(|| entry.session_id.clone())
+        } else {
+            entry.session_id.clone()
+        };
         let action = ResumeAgentSession {
             session_id: entry.session_id.clone(),
             adapter: entry.adapter,
+            preset_id: entry.preset_id.clone(),
+            resume_handle,
             // Empty when the log omits cwd (Codex index): the handler falls
             // back to the active project's directory.
             cwd: entry.cwd.clone().unwrap_or_default(),
@@ -434,7 +470,7 @@ impl SessionHistoryModal {
         let Some(entry) = self.entries.get(entry_idx) else {
             return;
         };
-        let id = picker::adapter_slug(entry.adapter);
+        let id = picker::entry_slug(entry);
         let open_chat = entry_opens_as_chat(entry)
             && cx
                 .try_global::<oximux_settings::AgentLaunchSettings>()
@@ -547,7 +583,7 @@ impl Render for SessionHistoryModal {
                 // Codex / …), mirroring the reference import list. Fixed size,
                 // never shrinks; the text column takes the rest.
                 let icon = Icon::default()
-                    .path(adapter_icon_path(picker::adapter_slug(entry.adapter)))
+                    .path(adapter_icon_path(picker::entry_slug(entry)))
                     .size(px(15.))
                     .flex_shrink_0()
                     .text_color(theme.fg_muted);
@@ -635,7 +671,13 @@ impl Render for SessionHistoryModal {
                 };
                 preview = preview.child(preview_hint(msg, theme, &typography));
             } else {
-                let assistant_label = adapter_display(entry.adapter);
+                // Import-provider rows label the assistant side with the
+                // provider name (OpenCode/Copilot/Pi), not the generic "Assistant".
+                let assistant_label = entry
+                    .preset_id
+                    .as_deref()
+                    .map(crate::shell::agent_ui::agent_presentation::adapter_display_name)
+                    .unwrap_or_else(|| adapter_display(entry.adapter));
                 for m in &self.preview_msgs {
                     preview =
                         preview.child(preview_message(m, assistant_label, theme, &typography));

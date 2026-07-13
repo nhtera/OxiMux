@@ -4,6 +4,53 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-14 — Import session history for OpenCode, Copilot, and Pi
+
+**What shipped:** the `⌘⇧H` history / import modal now indexes and resumes
+sessions from three more agent CLIs, matching the reference import modal's
+provider set. The filter chips are now **All · Claude · Codex · Copilot ·
+OpenCode · Pi**, and each new provider's rows list, scope-by-project, and
+resume like the native ones.
+
+- **Stores scanned directly** (each degrades to "absent" — a missing store,
+  table, column, or malformed line yields fewer rows, never a crash; SQLite is
+  opened read-only):
+  - **OpenCode** — `~/.local/share/opencode/opencode.db`, the `session` table
+    (`id`, `title`, `directory` = cwd, `time_created`/`time_updated`). Resumes
+    via the existing `opencode --session <id>` preset.
+  - **Copilot** — `~/.copilot/session-store.db`, the `sessions` table
+    (`id`, `cwd`, `branch`, `summary`, `created_at`/`updated_at`) + `turns`;
+    title is the stored `summary`, else the first turn's user message; scopes by
+    the recorded `cwd` column and carries the git `branch`. Resumes via
+    `copilot --resume=<id>`. Timestamps parse both RFC 3339 and SQLite's
+    `datetime('now')` text form. (Schema is a CLI-internal detail, read
+    defensively; the store is read even when its data lives in an uncheckpointed
+    WAL.)
+  - **Pi** — `~/.pi/agent/sessions/**/*.jsonl`, header line
+    `{"type":"session","id","cwd","timestamp"}` + a `session_info.name` title.
+    Resumes via `pi --session <file>` (the rollout path is the handle).
+- **Design.** These are import-only, terminal-resume providers, so they ride
+  `AgentAdapter::Custom` plus a new `SessionEntry.preset_id` slug rather than new
+  core adapter variants (which would leak into the workspace-create dialog, the
+  CLI runtime, and persistence). The picker keys filtering, the row tag, the
+  icon, and resume routing on `preset_id`; a single `import_resume_command`
+  resolver in `oximux-settings` owns each provider's resume argv so the index,
+  picker, and spawn layer can't drift.
+- **Why disk-scan.** The reference app reaches OpenCode/Copilot over a live
+  server/RPC, but every provider keeps a local store carrying the same fields,
+  so a synchronous read matches the existing Claude/Codex indexing without
+  spawning a subprocess. Like the reference, import rows show no transcript
+  preview for the SQLite providers (their list APIs return none either).
+- **Scope.** New collectors in `oximux-agents`
+  (`session_log/import_provider_index.rs`, unit-tested for all three shapes +
+  cwd scoping); picker/routing in `oximux-app`; resolver in `oximux-settings`;
+  the three providers' brand marks (`currentColor`) registered in `assets.rs`.
+  GUI-verified against real local stores: OpenCode, Copilot, and Pi each list
+  their cwd-scoped sessions and resume in a terminal. Tests: agents 598/0,
+  settings 82/0, app picker 18/0.
+
+---
+
 ### 2026-07-14 — Codex session history: scan real rollouts, not the legacy index
 
 **What shipped:** the session index now discovers Codex sessions from the CLI's

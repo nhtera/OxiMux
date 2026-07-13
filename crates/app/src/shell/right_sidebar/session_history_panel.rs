@@ -124,9 +124,12 @@ impl SessionHistoryPanel {
             let entries = executor
                 .spawn(async move {
                     match dirs::home_dir() {
-                        Some(home) => {
-                            SessionIndex::build(&home.join(".claude"), &home.join(".codex"), &scope)
-                        }
+                        Some(home) => SessionIndex::build(
+                            &home.join(".claude"),
+                            &home.join(".codex"),
+                            &home,
+                            &scope,
+                        ),
                         None => Vec::new(),
                     }
                 })
@@ -706,6 +709,9 @@ fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -
                     Box::new(ResumeAgentSession {
                         session_id: resume_sid.clone(),
                         adapter: AgentAdapter::ClaudeCode,
+                        // Side panel lists Claude sessions only — native resume.
+                        preset_id: None,
+                        resume_handle: resume_sid.clone(),
                         cwd: resume_cwd.clone(),
                         fork: false,
                     }),

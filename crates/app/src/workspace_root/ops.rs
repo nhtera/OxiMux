@@ -921,6 +921,10 @@ impl WorkspaceRoot {
         effort: Option<String>,
         prompt: Option<String>,
         resumption: oximux_core::SessionResumption,
+        // For an import-provider resume (OpenCode/Copilot/Pi): the verbatim
+        // `(program, argv)` to spawn as a `Custom` PTY (its resume handle rides
+        // in the argv). `None` for a native launch/resume.
+        custom_command: Option<(String, Vec<String>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -967,7 +971,7 @@ impl WorkspaceRoot {
                 env: Vec::new(),
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
-                custom_command: None,
+                custom_command,
                 resumption,
             };
             let session_id = match runtime.start_session(cfg).await {

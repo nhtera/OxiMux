@@ -1,5 +1,16 @@
 use super::*;
 
+/// Static registry slug for an import-provider preset id, for the `&'static str`
+/// `adapter_id` the spawn layer + settings lookups expect.
+fn import_preset_slug(id: &str) -> &'static str {
+    match id {
+        "opencode" => "opencode",
+        "copilot" => "copilot",
+        "pi" => "pi",
+        _ => "custom",
+    }
+}
+
 impl Render for WorkspaceRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Push sidebar data down before LeftRail::render runs in the tree.
@@ -474,8 +485,30 @@ impl Render for WorkspaceRoot {
                         id: action.session_id.clone(),
                     }
                 };
-                let adapter_id =
-                    crate::shell::session_history::picker::adapter_slug(action.adapter);
+                // An import-provider row (OpenCode/Copilot/Pi) resumes as a
+                // Custom PTY running the provider's own resume TUI; native rows
+                // resume through their adapter. `adapter`/`adapter_id`/
+                // `custom_command` are set together so the two paths can't drift.
+                let (adapter, adapter_id, resumption, custom_command) = match action
+                    .preset_id
+                    .as_deref()
+                    .and_then(|id| {
+                        oximux_settings::import_resume_command(id, &action.resume_handle)
+                            .map(|cmd| (import_preset_slug(id), cmd))
+                    }) {
+                    Some((slug, cmd)) => (
+                        oximux_core::AgentAdapter::Custom,
+                        slug,
+                        oximux_core::SessionResumption::None,
+                        Some(cmd),
+                    ),
+                    None => (
+                        action.adapter,
+                        crate::shell::session_history::picker::adapter_slug(action.adapter),
+                        resumption,
+                        None,
+                    ),
+                };
                 // Codex index rows carry no cwd — root the relaunch at the
                 // active project so the agent lands in the right worktree.
                 let cwd = if action.cwd.is_empty() {
@@ -494,13 +527,14 @@ impl Render for WorkspaceRoot {
                     std::path::PathBuf::from(&action.cwd)
                 };
                 this.spawn_agent_tab(
-                    action.adapter,
+                    adapter,
                     adapter_id,
                     cwd,
                     None,
                     None,
                     None,
                     resumption,
+                    custom_command,
                     window,
                     cx,
                 );

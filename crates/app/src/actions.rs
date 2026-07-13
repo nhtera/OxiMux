@@ -322,6 +322,13 @@ pub struct SendTextToActiveAgent {
 pub struct ResumeAgentSession {
     pub session_id: String,
     pub adapter: oximux_core::AgentAdapter,
+    /// Import-provider preset id (`opencode`/`copilot`/`pi`) for a row whose
+    /// store the index scanned directly. When set, the resume spawns a `Custom`
+    /// PTY via `import_resume_command` instead of a native adapter launch.
+    pub preset_id: Option<String>,
+    /// The provider's native resume handle passed to `import_resume_command`:
+    /// the session id (OpenCode/Copilot) or the rollout file path (Pi).
+    pub resume_handle: String,
     pub cwd: String,
     pub fork: bool,
 }

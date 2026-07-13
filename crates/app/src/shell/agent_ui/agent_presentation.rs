@@ -117,6 +117,9 @@ pub fn adapter_display_name(adapter_id: &str) -> &'static str {
         "codex" => "Codex",
         "aider" => "Aider",
         "gemini" => "Gemini CLI",
+        "opencode" => "OpenCode",
+        "copilot" => "Copilot",
+        "pi" => "Pi",
         _ => "Agent",
     }
 }
@@ -142,6 +145,9 @@ pub fn adapter_icon_path(adapter_id: &str) -> &'static str {
         "claude-code" => "icons/claude-code.svg",
         "codex" => "icons/codex.svg",
         "aider" => "icons/aider.svg",
+        "opencode" => "icons/opencode.svg",
+        "copilot" => "icons/copilot.svg",
+        "pi" => "icons/pi.svg",
         _ => "icons/sparkles.svg",
     }
 }

@@ -16,6 +16,11 @@ async-trait = { workspace = true }
 # standard-base64 `ChatImage` shape the transcript + thumbnail renderer expect.
 base64 = { workspace = true }
 chrono = { workspace = true }
+# Read-only scan of ACP-preset agents' own SQLite session stores for the
+# history/import picker: OpenCode (`~/.local/share/opencode/opencode.db`) and
+# Copilot (`~/.copilot/session-store.db`). Bundled build so no system libsqlite
+# is required; already a workspace dep (storage/app).
+rusqlite = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

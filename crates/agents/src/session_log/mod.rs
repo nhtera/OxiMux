@@ -16,6 +16,7 @@
 
 pub mod activity;
 pub mod ansi_strip;
+pub mod import_provider_index;
 pub mod session_index;
 pub mod session_preview;
 pub mod usage;

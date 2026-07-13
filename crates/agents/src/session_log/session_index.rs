@@ -29,6 +29,7 @@ use serde_json::Value;
 
 use oximux_core::AgentAdapter;
 
+use super::import_provider_index;
 use super::{parse_timestamp_ms, read_tail};
 
 /// One past session, enough to list, sort, search, and resume/fork it.
@@ -37,6 +38,12 @@ pub struct SessionEntry {
     /// CLI session identifier (Claude: log file stem; Codex: index `id`).
     pub session_id: String,
     pub adapter: AgentAdapter,
+    /// Registry preset id for an ACP-preset / import-only provider whose store
+    /// this index scans directly — `"opencode"` / `"copilot"` / `"pi"`. These
+    /// carry `adapter = Custom` (they resume as a Custom terminal spawn keyed by
+    /// this string, not as a first-class core adapter). `None` for the native
+    /// Claude/Codex adapters, whose slug derives from `adapter`.
+    pub preset_id: Option<String>,
     /// On-disk path to the session log, for the preview pane. `Some` for
     /// Claude (the `.jsonl`); `None` for Codex (the compact index has no
     /// per-session file path).
@@ -125,12 +132,27 @@ fn slug_matches(dir_name: &str, sanitized_target: &str) -> bool {
 pub struct SessionIndex;
 
 impl SessionIndex {
-    pub fn build(claude_dir: &Path, codex_dir: &Path, scope: &SessionScope) -> Vec<SessionEntry> {
+    /// Build the merged index. `claude_dir`/`codex_dir` are the native CLI
+    /// state roots; `home` is the user home dir, from which the ACP-preset
+    /// import providers derive their own stores
+    /// (`~/.local/share/opencode/opencode.db`, `~/.copilot/session-store.db`,
+    /// `~/.pi/agent/sessions`). Every source records its cwd, so all scope by
+    /// project; a missing/foreign store contributes nothing.
+    pub fn build(
+        claude_dir: &Path,
+        codex_dir: &Path,
+        home: &Path,
+        scope: &SessionScope,
+    ) -> Vec<SessionEntry> {
         let mut entries = Vec::new();
         collect_claude(claude_dir, scope, &mut entries);
         // Codex rollouts record their cwd, so they scope by project just like
         // Claude's — no all-projects-only special case.
         collect_codex(codex_dir, scope, &mut entries);
+        // ACP-preset / import-only providers with their own on-disk stores.
+        import_provider_index::collect_opencode(home, scope, &mut entries);
+        import_provider_index::collect_copilot(home, scope, &mut entries);
+        import_provider_index::collect_pi(home, scope, &mut entries);
         // Newest first; entries without a timestamp sort to the bottom.
         entries.sort_by_key(|e| std::cmp::Reverse(e.last_message_ts_ms));
         entries
@@ -216,6 +238,7 @@ fn build_claude_entry(session_id: &str, path: &Path) -> Option<SessionEntry> {
     Some(SessionEntry {
         session_id: session_id.to_string(),
         adapter: AgentAdapter::ClaudeCode,
+        preset_id: None,
         path: Some(path.to_string_lossy().into_owned()),
         cwd,
         title,
@@ -242,6 +265,7 @@ pub fn parse_claude_jsonl(session_id: &str, content: &str) -> Option<SessionEntr
     Some(SessionEntry {
         session_id: session_id.to_string(),
         adapter: AgentAdapter::ClaudeCode,
+        preset_id: None,
         // Filled by `build_claude_entry` (this fn is pure over content).
         path: None,
         cwd: claude_cwd(content),
@@ -479,7 +503,7 @@ fn collect_codex(codex_dir: &Path, scope: &SessionScope, out: &mut Vec<SessionEn
             let keep = entry
                 .cwd
                 .as_deref()
-                .is_some_and(|c| targets.iter().any(|t| codex_cwd_matches(c, t)));
+                .is_some_and(|c| targets.iter().any(|t| cwd_matches(c, t)));
             if !keep {
                 continue;
             }
@@ -529,6 +553,7 @@ fn build_codex_entry(path: &Path) -> Option<SessionEntry> {
     Some(SessionEntry {
         session_id: head.session_id,
         adapter: AgentAdapter::Codex,
+        preset_id: None,
         path: Some(path.to_string_lossy().into_owned()),
         cwd: head.cwd,
         title: head.title,
@@ -668,10 +693,11 @@ fn is_codex_injected_prompt(text: &str) -> bool {
     s.starts_with('<') || s.starts_with("# AGENTS.md")
 }
 
-/// Match a rollout's recorded `cwd` against an active project path. Exact string
+/// Match a recorded `cwd` against an active project path. Exact string
 /// match first; then a canonicalized comparison so symlink-equivalent paths
-/// (e.g. `/tmp` ↔ `/private/tmp` on macOS) still scope together.
-fn codex_cwd_matches(cwd: &str, target: &str) -> bool {
+/// (e.g. `/tmp` ↔ `/private/tmp` on macOS) still scope together. Shared by the
+/// Codex rollout scan and the SQLite import providers (OpenCode/Copilot).
+pub(super) fn cwd_matches(cwd: &str, target: &str) -> bool {
     if cwd == target {
         return true;
     }
@@ -688,7 +714,7 @@ pub(super) fn line_value(line: &str) -> Option<Value> {
 }
 
 /// One-line, whitespace-collapsed, length-capped prompt preview.
-fn truncate_prompt(s: &str) -> String {
+pub(super) fn truncate_prompt(s: &str) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= PROMPT_MAX_CHARS {
         return flat;

@@ -1827,6 +1827,7 @@ impl WorkspaceRoot {
                                 None,
                                 agent_prompt.clone(),
                                 oximux_core::SessionResumption::None,
+                                None,
                                 window,
                                 cx,
                             );

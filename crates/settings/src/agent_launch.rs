@@ -165,6 +165,22 @@ pub fn acp_preset(id: &str) -> Option<&'static AcpPreset> {
     ACP_PRESETS.iter().find(|p| p.id == id)
 }
 
+/// The interactive terminal resume invocation for an import-provider session
+/// surfaced in the history picker — `(program, argv)` spawned as a `Custom` PTY.
+/// `handle` is the provider's native resume handle: the session id for OpenCode
+/// (`opencode --session <id>`) and Copilot (`copilot --resume=<id>`), or the
+/// rollout file path for Pi (`pi --session <file>`, which is non-ACP so it has
+/// no `AcpPreset` row). `None` for an unrecognized id. Keeps every provider's
+/// resume argv in one place so the index, picker, and spawn layer can't drift.
+pub fn import_resume_command(preset_id: &str, handle: &str) -> Option<(String, Vec<String>)> {
+    match preset_id {
+        "opencode" => Some(("opencode".to_string(), vec!["--session".to_string(), handle.to_string()])),
+        "copilot" => Some(("copilot".to_string(), vec![format!("--resume={handle}")])),
+        "pi" => Some(("pi".to_string(), vec!["--session".to_string(), handle.to_string()])),
+        _ => None,
+    }
+}
+
 /// The skip-permissions ("YOLO") flag seeded for each built-in agent on a
 /// fresh install, so a one-click launch starts the agent in full-autonomy
 /// mode out of the box (matching the reference cockpit's default). The user

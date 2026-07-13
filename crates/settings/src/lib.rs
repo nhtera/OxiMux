@@ -19,7 +19,7 @@ pub mod typography;
 
 pub use agent_launch::{
     ACP_PRESETS, AcpPreset, AgentLaunchSettings, OpenMode, PerAgentLaunch, Transport, acp_preset,
-    split_args,
+    import_resume_command, split_args,
 };
 pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};

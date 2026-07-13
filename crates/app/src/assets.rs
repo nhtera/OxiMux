@@ -140,6 +140,16 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ),
     ("icons/codex.svg", include_bytes!("../assets/icons/codex.svg")),
     ("icons/aider.svg", include_bytes!("../assets/icons/aider.svg")),
+    // Import-provider glyphs for the history/resume picker (generic marks).
+    (
+        "icons/opencode.svg",
+        include_bytes!("../assets/icons/opencode.svg"),
+    ),
+    (
+        "icons/copilot.svg",
+        include_bytes!("../assets/icons/copilot.svg"),
+    ),
+    ("icons/pi.svg", include_bytes!("../assets/icons/pi.svg")),
     (
         "icons/keyboard.svg",
         include_bytes!("../assets/icons/keyboard.svg"),

@@ -118,6 +118,7 @@
         let entries = SessionIndex::build(
             &tmp.path().join(".claude"),
             Path::new("/nonexistent"),
+            Path::new("/nonexistent-home"),
             &SessionScope::AllProjects,
         );
         assert_eq!(entries.len(), 1);
@@ -167,7 +168,12 @@
                 "fix flaky test",
             ),
         );
-        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        let entries = SessionIndex::build(
+            Path::new("/none"),
+            &codex,
+            Path::new("/nonexistent-home"),
+            &SessionScope::AllProjects,
+        );
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.session_id, "abc-123");
@@ -194,7 +200,12 @@
             "\n",
         );
         write_codex_rollout(&codex, "2025/08/29", "rollout-2025-08-29-legacy-1.jsonl", body);
-        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        let entries = SessionIndex::build(
+            Path::new("/none"),
+            &codex,
+            Path::new("/nonexistent-home"),
+            &SessionScope::AllProjects,
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_id, "legacy-1");
         assert_eq!(entries[0].git_branch.as_deref(), Some("dev"));
@@ -211,7 +222,12 @@
             "rollout-2026-06-19-noid.jsonl",
             "{\"type\":\"event_msg\",\"payload\":{}}\n",
         );
-        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        let entries = SessionIndex::build(
+            Path::new("/none"),
+            &codex,
+            Path::new("/nonexistent-home"),
+            &SessionScope::AllProjects,
+        );
         assert!(entries.is_empty());
     }
 
@@ -222,7 +238,12 @@
         let codex = tmp.path().join(".codex");
         // A rollout of pure noise yields no entry, never a panic.
         write_codex_rollout(&codex, "2026/06/19", "rollout-garbage.jsonl", "garbage\n{bad\n");
-        let entries = SessionIndex::build(Path::new("/none"), &codex, &SessionScope::AllProjects);
+        let entries = SessionIndex::build(
+            Path::new("/none"),
+            &codex,
+            Path::new("/nonexistent-home"),
+            &SessionScope::AllProjects,
+        );
         assert!(entries.is_empty());
     }
 
@@ -257,7 +278,12 @@
             ),
         );
 
-        let entries = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
+        let entries = SessionIndex::build(
+            &claude,
+            &codex,
+            Path::new("/nonexistent-home"),
+            &SessionScope::AllProjects,
+        );
         assert_eq!(entries.len(), 3);
         // Newest first: new (06-20) > codex (06-19) > old (06-18).
         assert_eq!(entries[0].session_id, "new");
@@ -273,6 +299,7 @@
         let entries = SessionIndex::build(
             Path::new("/nonexistent/claude"),
             Path::new("/nonexistent/codex"),
+            Path::new("/nonexistent/home"),
             &SessionScope::AllProjects,
         );
         assert!(entries.is_empty());
@@ -315,18 +342,28 @@
         let scoped = SessionIndex::build(
             &claude,
             Path::new("/none"),
+            Path::new("/nonexistent-home"),
             &SessionScope::Projects(vec!["/Users/x/proj-a".to_string()]),
         );
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].session_id, "a");
 
         // All projects → both.
-        let all = SessionIndex::build(&claude, Path::new("/none"), &SessionScope::AllProjects);
+        let all = SessionIndex::build(
+            &claude,
+            Path::new("/none"),
+            Path::new("/nonexistent-home"),
+            &SessionScope::AllProjects,
+        );
         assert_eq!(all.len(), 2);
 
         // Empty scope matches nothing (callers pass AllProjects instead).
-        let none =
-            SessionIndex::build(&claude, Path::new("/none"), &SessionScope::Projects(vec![]));
+        let none = SessionIndex::build(
+            &claude,
+            Path::new("/none"),
+            Path::new("/nonexistent-home"),
+            &SessionScope::Projects(vec![]),
+        );
         assert!(none.is_empty());
     }
 
@@ -363,6 +400,7 @@
         let scoped = SessionIndex::build(
             &claude,
             &codex,
+            Path::new("/nonexistent-home"),
             &SessionScope::Projects(vec!["/Users/x/proj".to_string()]),
         );
         assert_eq!(scoped.len(), 2);
@@ -370,7 +408,12 @@
         assert!(scoped.iter().all(|e| e.session_id != "there"));
 
         // All projects → every session regardless of cwd.
-        let all = SessionIndex::build(&claude, &codex, &SessionScope::AllProjects);
+        let all = SessionIndex::build(
+            &claude,
+            &codex,
+            Path::new("/nonexistent-home"),
+            &SessionScope::AllProjects,
+        );
         assert_eq!(all.len(), 3);
     }
 
@@ -394,6 +437,7 @@
         let entries = SessionIndex::build(
             &tmp.path().join(".claude"),
             Path::new("/nonexistent"),
+            Path::new("/nonexistent-home"),
             &SessionScope::AllProjects,
         );
         assert_eq!(entries.len(), 1);

@@ -21,25 +21,29 @@ pub enum LaunchKind {
 }
 
 /// The agent-type segment the picker is filtered to. `All` merges every
-/// adapter; the rest restrict the list to one agent family so a busy history
-/// can be narrowed the way the reference import modal does. `OpenCode` has no
-/// indexed sessions yet (its store is a SQLite DB, handled in a follow-up) —
-/// the enum reserves the segment so the chip + its "coming soon" empty state
-/// exist now.
+/// provider; the rest restrict the list to one agent family so a busy history
+/// can be narrowed the way the reference import modal does. Claude/Codex match
+/// their native core adapter; Copilot/OpenCode/Pi match the import-provider
+/// `preset_id` an indexed row carries (all three ride `adapter = Custom`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentTypeFilter {
     All,
     Claude,
     Codex,
+    Copilot,
     OpenCode,
+    Pi,
 }
 
-/// Chip order shown in the header and cycled by `Tab`.
-pub const AGENT_TYPE_FILTERS: [AgentTypeFilter; 4] = [
+/// Chip order shown in the header and cycled by `Tab` (matches the reference
+/// import modal's provider order).
+pub const AGENT_TYPE_FILTERS: [AgentTypeFilter; 6] = [
     AgentTypeFilter::All,
     AgentTypeFilter::Claude,
     AgentTypeFilter::Codex,
+    AgentTypeFilter::Copilot,
     AgentTypeFilter::OpenCode,
+    AgentTypeFilter::Pi,
 ];
 
 impl AgentTypeFilter {
@@ -49,7 +53,9 @@ impl AgentTypeFilter {
             AgentTypeFilter::All => "All",
             AgentTypeFilter::Claude => "Claude",
             AgentTypeFilter::Codex => "Codex",
+            AgentTypeFilter::Copilot => "Copilot",
             AgentTypeFilter::OpenCode => "OpenCode",
+            AgentTypeFilter::Pi => "Pi",
         }
     }
 
@@ -60,15 +66,17 @@ impl AgentTypeFilter {
         AGENT_TYPE_FILTERS[(i + 1) % AGENT_TYPE_FILTERS.len()]
     }
 
-    /// Does `adapter` belong to this segment? `All` accepts everything;
-    /// `OpenCode` matches nothing today (no OpenCode adapter identity in the
-    /// index yet), so its list stays empty until indexing lands.
-    pub fn accepts(self, adapter: AgentAdapter) -> bool {
+    /// Does `entry` belong to this segment? `All` accepts everything; the
+    /// native families match `adapter`; the import-provider families match the
+    /// row's `preset_id` slug.
+    pub fn accepts(self, entry: &SessionEntry) -> bool {
         match self {
             AgentTypeFilter::All => true,
-            AgentTypeFilter::Claude => adapter == AgentAdapter::ClaudeCode,
-            AgentTypeFilter::Codex => adapter == AgentAdapter::Codex,
-            AgentTypeFilter::OpenCode => false,
+            AgentTypeFilter::Claude => entry.adapter == AgentAdapter::ClaudeCode,
+            AgentTypeFilter::Codex => entry.adapter == AgentAdapter::Codex,
+            AgentTypeFilter::Copilot => entry.preset_id.as_deref() == Some("copilot"),
+            AgentTypeFilter::OpenCode => entry.preset_id.as_deref() == Some("opencode"),
+            AgentTypeFilter::Pi => entry.preset_id.as_deref() == Some("pi"),
         }
     }
 }
@@ -94,14 +102,28 @@ pub fn adapter_slug(adapter: AgentAdapter) -> &'static str {
     }
 }
 
-/// Short lowercase tag shown at the head of a row.
-fn adapter_tag(adapter: AgentAdapter) -> &'static str {
-    match adapter {
-        AgentAdapter::ClaudeCode => "claude",
-        AgentAdapter::Codex => "codex",
-        AgentAdapter::Aider => "aider",
-        AgentAdapter::Custom => "custom",
-    }
+/// Registry slug that identifies a row for icon lookup + resume routing. An
+/// import-provider row (OpenCode/Copilot/Pi) carries its preset id directly;
+/// native rows derive it from `adapter`.
+pub fn entry_slug(entry: &SessionEntry) -> &str {
+    entry
+        .preset_id
+        .as_deref()
+        .unwrap_or_else(|| adapter_slug(entry.adapter))
+}
+
+/// Short lowercase tag shown at the head of a non-Claude row. Import-provider
+/// rows lead with their preset id; native rows with the adapter name.
+fn provider_tag(entry: &SessionEntry) -> &str {
+    entry
+        .preset_id
+        .as_deref()
+        .unwrap_or_else(|| match entry.adapter {
+            AgentAdapter::ClaudeCode => "claude",
+            AgentAdapter::Codex => "codex",
+            AgentAdapter::Aider => "aider",
+            AgentAdapter::Custom => "custom",
+        })
 }
 
 /// Searchable + displayed title line — the session's clean prompt/summary
@@ -127,7 +149,7 @@ pub fn session_row_subtitle(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if entry.adapter != AgentAdapter::ClaudeCode {
-        parts.push(adapter_tag(entry.adapter).to_string());
+        parts.push(provider_tag(entry).to_string());
     }
     if let Some(ts) = entry.last_message_ts_ms {
         parts.push(relative_age(now_ms.saturating_sub(ts)));
@@ -185,11 +207,7 @@ pub fn filter_sessions_typed(
     let refs: Vec<&str> = haystacks.iter().map(String::as_str).collect();
     filter_and_rank(query, &refs)
         .into_iter()
-        .filter(|&i| {
-            entries
-                .get(i)
-                .is_some_and(|e| type_filter.accepts(e.adapter))
-        })
+        .filter(|&i| entries.get(i).is_some_and(|e| type_filter.accepts(e)))
         .collect()
 }
 
@@ -262,6 +280,7 @@ mod tests {
 
     struct Fields<'a> {
         adapter: AgentAdapter,
+        preset: Option<&'a str>,
         title: Option<&'a str>,
         branch: Option<&'a str>,
         ts: Option<i64>,
@@ -272,6 +291,7 @@ mod tests {
         SessionEntry {
             session_id: "id".into(),
             adapter: f.adapter,
+            preset_id: f.preset.map(str::to_string),
             path: None,
             cwd: None,
             title: f.title.map(str::to_string),
@@ -289,6 +309,7 @@ mod tests {
     fn claude(title: Option<&str>) -> SessionEntry {
         entry(Fields {
             adapter: AgentAdapter::ClaudeCode,
+            preset: None,
             title,
             branch: None,
             ts: None,
@@ -333,6 +354,7 @@ mod tests {
         let now = 10_000_000_000;
         let e = entry(Fields {
             adapter: AgentAdapter::ClaudeCode,
+            preset: None,
             title: Some("p"),
             branch: Some("main"),
             ts: Some(now - 3 * 60 * 60 * 1000), // 3 hours ago
@@ -350,6 +372,7 @@ mod tests {
         let now = 10_000_000_000;
         let mut e = entry(Fields {
             adapter: AgentAdapter::ClaudeCode,
+            preset: None,
             title: Some("p"),
             branch: Some("main"),
             ts: Some(now - 60 * 1000),
@@ -382,6 +405,7 @@ mod tests {
         let now = 10_000_000_000;
         let e = entry(Fields {
             adapter: AgentAdapter::Codex,
+            preset: None,
             title: Some("t"),
             branch: None,
             ts: Some(now - 60 * 1000), // 1 minute ago
@@ -424,6 +448,7 @@ mod tests {
     fn codex(title: Option<&str>) -> SessionEntry {
         entry(Fields {
             adapter: AgentAdapter::Codex,
+            preset: None,
             title,
             branch: None,
             ts: None,
@@ -431,26 +456,76 @@ mod tests {
         })
     }
 
-    #[test]
-    fn agent_type_filter_cycles_all_claude_codex_opencode() {
-        assert_eq!(AgentTypeFilter::All.next(), AgentTypeFilter::Claude);
-        assert_eq!(AgentTypeFilter::Claude.next(), AgentTypeFilter::Codex);
-        assert_eq!(AgentTypeFilter::Codex.next(), AgentTypeFilter::OpenCode);
-        // Wraps back to All.
-        assert_eq!(AgentTypeFilter::OpenCode.next(), AgentTypeFilter::All);
+    /// An import-provider row (adapter Custom + a preset slug), as the SQLite/
+    /// JSONL collectors build for OpenCode/Copilot/Pi.
+    fn preset_entry(slug: &str, title: Option<&str>) -> SessionEntry {
+        let mut e = entry(Fields {
+            adapter: AgentAdapter::Custom,
+            preset: Some(slug),
+            title,
+            branch: None,
+            ts: None,
+            size: None,
+        });
+        e.preset_id = Some(slug.to_string());
+        e
     }
 
     #[test]
-    fn agent_type_filter_accepts_matching_adapter_only() {
-        assert!(AgentTypeFilter::All.accepts(AgentAdapter::ClaudeCode));
-        assert!(AgentTypeFilter::All.accepts(AgentAdapter::Codex));
-        assert!(AgentTypeFilter::Claude.accepts(AgentAdapter::ClaudeCode));
-        assert!(!AgentTypeFilter::Claude.accepts(AgentAdapter::Codex));
-        assert!(AgentTypeFilter::Codex.accepts(AgentAdapter::Codex));
-        assert!(!AgentTypeFilter::Codex.accepts(AgentAdapter::ClaudeCode));
-        // OpenCode has no indexed adapter identity yet — matches nothing.
-        assert!(!AgentTypeFilter::OpenCode.accepts(AgentAdapter::ClaudeCode));
-        assert!(!AgentTypeFilter::OpenCode.accepts(AgentAdapter::Codex));
+    fn agent_type_filter_cycles_all_providers() {
+        assert_eq!(AgentTypeFilter::All.next(), AgentTypeFilter::Claude);
+        assert_eq!(AgentTypeFilter::Claude.next(), AgentTypeFilter::Codex);
+        assert_eq!(AgentTypeFilter::Codex.next(), AgentTypeFilter::Copilot);
+        assert_eq!(AgentTypeFilter::Copilot.next(), AgentTypeFilter::OpenCode);
+        assert_eq!(AgentTypeFilter::OpenCode.next(), AgentTypeFilter::Pi);
+        // Wraps back to All.
+        assert_eq!(AgentTypeFilter::Pi.next(), AgentTypeFilter::All);
+    }
+
+    #[test]
+    fn agent_type_filter_accepts_matching_family_only() {
+        let cc = claude(None);
+        let cx = codex(None);
+        let oc = preset_entry("opencode", None);
+        let co = preset_entry("copilot", None);
+        let pi = preset_entry("pi", None);
+        // All accepts everything.
+        for e in [&cc, &cx, &oc, &co, &pi] {
+            assert!(AgentTypeFilter::All.accepts(e));
+        }
+        // Native families gate on the core adapter.
+        assert!(AgentTypeFilter::Claude.accepts(&cc));
+        assert!(!AgentTypeFilter::Claude.accepts(&cx));
+        assert!(AgentTypeFilter::Codex.accepts(&cx));
+        assert!(!AgentTypeFilter::Codex.accepts(&cc));
+        // Import-provider families gate on the preset slug (all are Custom).
+        assert!(AgentTypeFilter::OpenCode.accepts(&oc));
+        assert!(!AgentTypeFilter::OpenCode.accepts(&co));
+        assert!(AgentTypeFilter::Copilot.accepts(&co));
+        assert!(AgentTypeFilter::Pi.accepts(&pi));
+        assert!(!AgentTypeFilter::Pi.accepts(&oc));
+        // A native adapter never matches an import-provider segment.
+        assert!(!AgentTypeFilter::OpenCode.accepts(&cc));
+    }
+
+    #[test]
+    fn entry_slug_prefers_preset_then_adapter() {
+        assert_eq!(entry_slug(&claude(None)), "claude-code");
+        assert_eq!(entry_slug(&codex(None)), "codex");
+        assert_eq!(entry_slug(&preset_entry("opencode", None)), "opencode");
+        assert_eq!(entry_slug(&preset_entry("copilot", None)), "copilot");
+        assert_eq!(entry_slug(&preset_entry("pi", None)), "pi");
+    }
+
+    #[test]
+    fn subtitle_leads_with_preset_slug_for_import_providers() {
+        let now = 10_000_000_000;
+        let mut e = preset_entry("opencode", Some("greeting"));
+        e.last_message_ts_ms = Some(now - 60 * 1000);
+        assert_eq!(
+            session_row_subtitle(&e, now, false, None),
+            "opencode · 1 minute ago"
+        );
     }
 
     #[test]
